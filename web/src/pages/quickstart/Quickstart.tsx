@@ -35,6 +35,8 @@ import {
   runtimeValueForSubmit,
   type RuntimeSelection,
 } from "./runtime-selection";
+import { ChannelAddForm, type StagedChannel } from "./ChannelAddForm";
+import { LabeledInput } from "./quickstart-form-controls";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -51,13 +53,6 @@ interface StagedProvider {
    *  The web surface knows nothing about which keys exist; the
    *  daemon authors them via `/api/quickstart/fields` and consumes
    *  them on the way back. */
-  fields: Record<string, string>;
-}
-
-interface StagedChannel {
-  mode: "fresh" | "existing";
-  channel_type: string;
-  alias: string;
   fields: Record<string, string>;
 }
 
@@ -102,7 +97,6 @@ const DEFAULT_FORM: FormState = {
 
 const MUTED = { color: "var(--pc-text-muted)" } as const;
 const FAINT = { color: "var(--pc-text-faint)" } as const;
-const ERROR = { color: "var(--color-status-error)" } as const;
 
 export default function Quickstart() {
   const navigate = useNavigate();
@@ -652,62 +646,6 @@ function StagedRow({
   );
 }
 
-function LabeledInput({
-  label,
-  value,
-  onChange,
-  type = "text",
-  placeholder,
-  multiline = false,
-  help,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  type?: "text" | "password";
-  placeholder?: string;
-  multiline?: boolean;
-  help?: string;
-}) {
-  return (
-    <label className="block">
-      <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-        {label}
-      </div>
-      {help ? (
-        <div className="text-xs mb-1 italic" style={MUTED}>
-          {help}
-        </div>
-      ) : null}
-      {multiline ? (
-        <textarea
-          className={`${TEXTAREA_CLASS} min-h-24`}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-        />
-      ) : (
-        <input
-          className={INPUT_CLASS}
-          type={type}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-          // Aliases, model names, API keys etc. are technical identifiers —
-          // the WebView must not autocapitalize/autocorrect them (e.g. agent
-          // aliases must be lowercase).
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-        />
-      )}
-    </label>
-  );
-}
-
 function LabeledSelect({
   label,
   value,
@@ -1017,173 +955,6 @@ function ChannelsList({
         </Button>
       )}
     </>
-  );
-}
-
-function ChannelAddForm({
-  state,
-  inConfig,
-  inFlight,
-  reusable,
-  onAdd,
-  onCancel,
-}: {
-  state: QuickstartState | null;
-  inConfig: Set<string>;
-  inFlight: Set<string>;
-  reusable: string[];
-  onAdd: (c: StagedChannel) => void;
-  onCancel: () => void;
-}) {
-  const [mode, setMode] = useState<"existing" | "fresh">(
-    reusable.length > 0 ? "existing" : "fresh",
-  );
-  const [existingRef, setExistingRef] = useState(reusable[0] ?? "");
-  const [type, setType] = useState("");
-  const [alias, setAlias] = useState("");
-  const [descriptors, setDescriptors] = useState<QuickstartFieldDescriptor[]>(
-    [],
-  );
-  const [fields, setFields] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    if (mode !== "fresh" || !type) {
-      setDescriptors([]);
-      return;
-    }
-    let cancelled = false;
-    void (async () => {
-      try {
-        const f = await quickstartFields({ section: "channel", type_key: type });
-        if (!cancelled) setDescriptors(f.fields);
-      } catch {
-        if (!cancelled) setDescriptors([]);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [mode, type]);
-
-  const freshRef = type && alias.trim() ? `${type}.${alias.trim()}` : "";
-  const conflict =
-    freshRef !== "" && (inConfig.has(freshRef) || inFlight.has(freshRef));
-  const canAdd =
-    mode === "existing"
-      ? existingRef !== ""
-      : type !== "" && alias.trim() !== "" && !conflict;
-
-  const submit = () => {
-    if (mode === "existing") {
-      const [t, a] = existingRef.split(".");
-      if (!t || !a) return;
-      onAdd({ mode: "existing", channel_type: t, alias: a, fields: {} });
-    } else {
-      onAdd({
-        mode: "fresh",
-        channel_type: type,
-        alias: alias.trim(),
-        fields,
-      });
-    }
-  };
-
-  return (
-    <Card className="p-4 space-y-3 bg-pc-elevated">
-      <div className="flex gap-2">
-        <Button
-          variant={mode === "existing" ? "primary" : "ghost"}
-          size="sm"
-          disabled={reusable.length === 0}
-          onClick={() => setMode("existing")}
-        >
-          {t("quickstart.use_existing")}
-        </Button>
-        <Button
-          variant={mode === "fresh" ? "primary" : "ghost"}
-          size="sm"
-          onClick={() => setMode("fresh")}
-        >
-          {t("quickstart.create_new")}
-        </Button>
-        <div className="flex-1" />
-        <Button variant="ghost" size="sm" onClick={onCancel}>
-          {t("common.cancel")}
-        </Button>
-      </div>
-
-      {mode === "existing" ? (
-        reusable.length === 0 ? (
-          <div className="text-xs" style={MUTED}>
-            {t("quickstart.no_unassigned_channels")}
-          </div>
-        ) : (
-          <select
-            className={INPUT_CLASS}
-            value={existingRef}
-            onChange={(e) => setExistingRef(e.target.value)}
-          >
-            {reusable.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </select>
-        )
-      ) : (
-        <>
-          <label className="block">
-            <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-              {t("quickstart.channel_type")}
-            </div>
-            <select
-              className={INPUT_CLASS}
-              value={type}
-              onChange={(e) => {
-                const next = e.target.value;
-                setType(next);
-                setAlias((prev) => (prev === "" || prev === type ? next : prev));
-                setFields({});
-              }}
-            >
-              <option value="" disabled>
-                {t("quickstart.pick_channel_type")}
-              </option>
-              {state?.channel_types.map((opt) => (
-                <option key={opt.kind} value={opt.kind}>
-                  {opt.display_name}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <LabeledInput label={t("quickstart.alias_label")} value={alias} onChange={setAlias} />
-          {conflict && (
-            <div className="text-xs" style={ERROR}>
-              <code>{freshRef}</code> {t("quickstart.already_exists")}
-            </div>
-          )}
-
-          {descriptors.map((d) => (
-            <LabeledInput
-              key={d.key}
-              label={d.label}
-              type={d.is_secret ? "password" : "text"}
-              value={fields[d.key] ?? ""}
-              onChange={(v) => setFields((x) => ({ ...x, [d.key]: v }))}
-              placeholder={d.help}
-            />
-          ))}
-        </>
-      )}
-
-      <div className="flex justify-end">
-        <Button size="sm" disabled={!canAdd} onClick={submit}>
-          <Plus className="h-3.5 w-3.5" />
-          {t("quickstart.add")}
-        </Button>
-      </div>
-    </Card>
   );
 }
 

@@ -22,7 +22,7 @@ use crate::agent::loop_::{
 use crate::skills::Skill;
 use crate::tools::{
     self, ActivatedToolSet, AllToolsResult, DelegateParentToolsHandle, PerToolChannelHandle, Tool,
-    register_skill_tools_with_context_and_runtime,
+    register_skill_tools_with_context_and_runtime_optional_nat64,
 };
 
 /// A per-agent tool registry that has been scoped and gated. The inner field is
@@ -577,12 +577,30 @@ impl ScopedToolRegistry {
             .chain(mcp_elevation_arcs.iter().cloned())
             .chain(pipeline_tool.iter().cloned())
             .collect();
-        register_skill_tools_with_context_and_runtime(
+        let nat64_prefixes = match zeroclaw_infra::net_guard::parse_nat64_prefixes(
+            &config.security.nat64_prefixes,
+            "security.nat64_prefixes",
+        ) {
+            Ok(prefixes) => Some(prefixes),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Skipping skill HTTP tools because security.nat64_prefixes is invalid"
+                );
+                None
+            }
+        };
+        register_skill_tools_with_context_and_runtime_optional_nat64(
             &mut tools_registry,
             skills,
             Arc::clone(security),
             &resolution_registry,
             runtime,
+            nat64_prefixes.as_deref(),
         );
 
         // Skills and deferred MCP helpers are registered after the built-in filter,
@@ -1108,6 +1126,63 @@ mod tests {
         })
         .await;
         out.registry.iter().map(|t| t.name().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn scoped_assembly_threads_configured_nat64_prefixes_to_skill_http() {
+        let mut config = Config::default();
+        config.security.nat64_prefixes = vec!["2001:4860:4860::/96".to_string()];
+        let skill = Skill {
+            name: "net".to_string(),
+            description: "network skill".to_string(),
+            description_localizations: Default::default(),
+            version: "1".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![SkillTool {
+                name: "fetch".to_string(),
+                description: "fetch".to_string(),
+                kind: "http".to_string(),
+                command: "https://[2001:4860:4860::a00:1]/".to_string(),
+                args: Default::default(),
+                target: None,
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let assembled = ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "default",
+            security: &security,
+            built: built_with(Vec::new()),
+            skills: std::slice::from_ref(&skill),
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: true,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+        let tool = assembled
+            .registry
+            .iter()
+            .find(|tool| tool.name() == "net__fetch")
+            .expect("HTTP skill must be registered");
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("HTTP destination rejected by network policy")
+        );
     }
 
     #[tokio::test]

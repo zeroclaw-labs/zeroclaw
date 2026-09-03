@@ -3,15 +3,16 @@ import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 import { basePath } from '@/lib/basePath';
-
-const STORAGE_KEY = 'zeroclaw-chat-workspace';
-
-interface PersistedState {
-  openChats: string[];
-  activeAlias: string;
-  layout: WorkspaceLayout;
-  splitAliases: [string, string | null];
-}
+import {
+  applySessionChange,
+  loadPersisted,
+  makeTab,
+  reservationsByKey,
+  STORAGE_KEY,
+  tabForOpenRequest,
+  type ChatTab,
+  type PersistedState,
+} from '@/pages/chatWorkspace.state';
 
 interface PaneStatus {
   /** Last message count the workspace has "seen" while this alias was visible. */
@@ -22,21 +23,6 @@ interface PaneStatus {
   streaming: boolean;
   /** New messages arrived while this alias was hidden. */
   unread: boolean;
-}
-
-function loadPersisted(): Partial<PersistedState> {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Partial<PersistedState>;
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function dedupe(aliases: string[]): string[] {
-  return Array.from(new Set(aliases.filter(Boolean)));
 }
 
 export interface ChatWorkspaceProps {
@@ -58,14 +44,40 @@ export interface ChatWorkspaceProps {
 export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   const persisted = useRef<Partial<PersistedState>>(loadPersisted());
 
-  const [openChats, setOpenChats] = useState<string[]>(() => {
-    const fromStorage = persisted.current.openChats ?? [];
-    return dedupe([...fromStorage, initialAlias]);
+  const [tabs, setTabs] = useState<ChatTab[]>(() => {
+    const stored = persisted.current.tabs ?? [];
+    // The route's agent is always open, but only add it when it is not already
+    // there — a deep link should land on the existing pane, not fork a new one.
+    return stored.some((tb) => tb.alias === initialAlias)
+      ? stored
+      : [...stored, makeTab(initialAlias)];
   });
-  const [activeAlias, setActiveAlias] = useState<string>(initialAlias);
+  // Resolved up front rather than in an effect: an empty first commit would
+  // activate tabs[0] and replaceState the URL to the wrong agent before the
+  // route settled. Prefer the pane that was active when the workspace was
+  // stored, so reloading with two panes of one agent returns to the right one.
+  const [activeKey, setActiveKey] = useState<string>(() => {
+    const preferred = persisted.current.activeKey;
+    const match =
+      tabs.find((tb) => tb.key === preferred && tb.alias === initialAlias) ??
+      tabs.find((tb) => tb.alias === initialAlias);
+    return match?.key ?? tabs[0]?.key ?? '';
+  });
   const [layout, setLayout] = useState<WorkspaceLayout>(persisted.current.layout ?? 'tabs');
-  const [splitAliases, setSplitAliases] = useState<[string, string | null]>(
-    persisted.current.splitAliases ?? [initialAlias, null],
+  const [splitKeys, setSplitKeys] = useState<[string, string | null]>(
+    persisted.current.splitKeys ?? ['', null],
+  );
+
+  const tabsRef = useRef(tabs);
+  useEffect(() => { tabsRef.current = tabs; }, [tabs]);
+
+  const activeKeyRef = useRef(activeKey);
+  useEffect(() => { activeKeyRef.current = activeKey; }, [activeKey]);
+
+  // Resolve the active tab, tolerating a stored key that no longer exists.
+  const activeTab = useMemo(
+    () => tabs.find((tb) => tb.key === activeKey) ?? tabs[0],
+    [tabs, activeKey],
   );
 
   // Per-alias streaming / unread bookkeeping. Kept in a ref (source of truth,
@@ -80,34 +92,35 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // The two aliases shown in split. Default the second to the next open chat
   // after the active one (or the active itself if it's the only chat).
   const resolvedSplit = useMemo<[string, string | null]>(() => {
-    const left = openChats.includes(splitAliases[0]) ? splitAliases[0] : activeAlias;
-    let right = splitAliases[1];
-    if (!right || !openChats.includes(right) || right === left) {
-      right = openChats.find((a) => a !== left) ?? null;
+    const has = (k: string | null): boolean => !!k && tabs.some((tb) => tb.key === k);
+    const left = has(splitKeys[0]) ? splitKeys[0] : (activeTab?.key ?? '');
+    let right = splitKeys[1];
+    if (!has(right) || right === left) {
+      right = tabs.find((tb) => tb.key !== left)?.key ?? null;
     }
     return [left, right];
-  }, [splitAliases, openChats, activeAlias]);
+  }, [splitKeys, tabs, activeTab]);
 
-  // Set of aliases currently visible (so background panes can be `hidden`).
-  const visibleAliases = useMemo<Set<string>>(() => {
+  // Keys of the panes currently visible (so background panes can be `hidden`).
+  const visibleKeys = useMemo<Set<string>>(() => {
     if (effectiveLayout === 'split') {
       return new Set([resolvedSplit[0], resolvedSplit[1]].filter(Boolean) as string[]);
     }
-    return new Set([activeAlias]);
-  }, [effectiveLayout, resolvedSplit, activeAlias]);
+    return new Set(activeTab ? [activeTab.key] : []);
+  }, [effectiveLayout, resolvedSplit, activeTab]);
 
   // Recompute the rendered indicator map from the status ref. An alias that is
   // currently visible is never shown as unread.
   const syncIndicators = useCallback(() => {
     const next: Record<string, TabIndicator> = {};
-    for (const [alias, s] of Object.entries(statusRef.current)) {
-      next[alias] = {
+    for (const [key, s] of Object.entries(statusRef.current)) {
+      next[key] = {
         streaming: s.streaming,
-        unread: s.unread && !visibleAliases.has(alias),
+        unread: s.unread && !visibleKeys.has(key),
       };
     }
     setIndicators(next);
-  }, [visibleAliases]);
+  }, [visibleKeys]);
 
   // Stable ref to the latest syncIndicators so the per-alias onStatus closures
   // (cached for identity stability) always run against current visibility.
@@ -119,16 +132,16 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // each pane receives a STABLE function identity — otherwise AgentChatInner's
   // onStatus effect would re-run on every workspace render.
   const onStatusCacheRef = useRef<Record<string, (s: AgentChatStatus) => void>>({});
-  const onStatusFor = useCallback((alias: string) => {
-    const cached = onStatusCacheRef.current[alias];
+  const onStatusFor = useCallback((key: string) => {
+    const cached = onStatusCacheRef.current[key];
     if (cached) return cached;
     const fn = (s: AgentChatStatus) => {
-      const prev = statusRef.current[alias] ?? {
+      const prev = statusRef.current[key] ?? {
         lastSeenCount: s.messageCount, liveCount: s.messageCount, streaming: false, unread: false,
       };
-      const visible = visibleAliasesRef.current.has(alias);
+      const visible = visibleKeysRef.current.has(key);
       const grew = s.messageCount > prev.lastSeenCount;
-      statusRef.current[alias] = {
+      statusRef.current[key] = {
         lastSeenCount: visible ? s.messageCount : prev.lastSeenCount,
         liveCount: s.messageCount,
         streaming: s.typing,
@@ -136,36 +149,88 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
       };
       syncIndicatorsRef.current();
     };
-    onStatusCacheRef.current[alias] = fn;
+    onStatusCacheRef.current[key] = fn;
     return fn;
   }, []);
 
-  // Keep a ref mirror of visibleAliases so the stable onStatus closure reads
+  // Keep a ref mirror of visibleKeys so the stable onStatus closure reads
   // the latest visibility without being re-created on every visibility change.
-  const visibleAliasesRef = useRef(visibleAliases);
+  const visibleKeysRef = useRef(visibleKeys);
   useEffect(() => {
-    visibleAliasesRef.current = visibleAliases;
-    // When visibility changes, clear unread for newly-visible aliases and
+    visibleKeysRef.current = visibleKeys;
+    // When visibility changes, clear unread for newly-visible panes and
     // snapshot their seen-count to the latest reported live count.
-    for (const alias of visibleAliases) {
-      const s = statusRef.current[alias];
+    for (const key of visibleKeys) {
+      const s = statusRef.current[key];
       if (s) { s.unread = false; s.lastSeenCount = s.liveCount; }
     }
     syncIndicators();
-  }, [visibleAliases, syncIndicators]);
+  }, [visibleKeys, syncIndicators]);
 
   // Open + activate the route alias on mount and on every change, without
   // remounting the workspace (the workspace is keyed by nothing volatile).
+  // Activates the agent's FIRST open pane rather than forking another: a deep
+  // link means "show me this agent", not "give me one more of it".
   useEffect(() => {
-    setOpenChats((prev) => (prev.includes(initialAlias) ? prev : [...prev, initialAlias]));
-    setActiveAlias(initialAlias);
+    // Already showing this agent — including on mount, where the initial state
+    // above resolved it. Bailing keeps this idempotent under StrictMode's
+    // double-invoked effects, which would otherwise re-activate the agent's
+    // first pane and undo the restored selection.
+    const current = tabsRef.current.find((tb) => tb.key === activeKeyRef.current);
+    if (current?.alias === initialAlias) return;
+
+    const existing = tabsRef.current.find((tb) => tb.alias === initialAlias);
+    if (existing) {
+      setActiveKey(existing.key);
+      return;
+    }
+    const tab = makeTab(initialAlias);
+    setTabs((prev) => (prev.some((tb) => tb.alias === initialAlias) ? prev : [...prev, tab]));
+    setActiveKey(tab.key);
   }, [initialAlias]);
 
   // Persist workspace shape on any structural change.
   useEffect(() => {
-    const snapshot: PersistedState = { openChats, activeAlias, layout, splitAliases: resolvedSplit };
+    if (!activeTab) return;
+    const snapshot: PersistedState = {
+      version: 2,
+      tabs,
+      activeKey: activeTab.key,
+      layout,
+      splitKeys: resolvedSplit,
+    };
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot)); } catch { /* noop */ }
-  }, [openChats, activeAlias, layout, resolvedSplit]);
+  }, [tabs, activeTab, layout, resolvedSplit]);
+
+  /** Record the conversation a pane moved to, so a reload restores it there. */
+  const handleSessionChange = useCallback((key: string, sessionId: string) => {
+    setTabs((prev) => applySessionChange(prev, key, sessionId));
+  }, []);
+
+  /**
+   * Conversations held by the *other* panes.
+   *
+   * Two sockets on one gateway session get two server-side Agents, each seeded
+   * from the snapshot taken when it connected, so their histories diverge and
+   * the persisted transcript interleaves two branches. Stop and "Clear all"
+   * also address a session by id, so one pane would cancel or wipe the other's
+   * turn. Panes therefore claim a conversation exclusively, and the picker
+   * refuses to hand one to a second pane or delete it out from under the pane
+   * that owns it. The identity array is cached so a pane's props stay stable
+   * between renders that did not change its siblings.
+   */
+  const reservedByKey = useMemo(() => reservationsByKey(tabs), [tabs]);
+
+  // Cached per tab so each pane gets a stable callback identity, matching the
+  // reason onStatusFor is cached.
+  const onSessionChangeCacheRef = useRef<Record<string, (sessionId: string) => void>>({});
+  const onSessionChangeFor = useCallback((key: string) => {
+    const cached = onSessionChangeCacheRef.current[key];
+    if (cached) return cached;
+    const fn = (sessionId: string) => handleSessionChange(key, sessionId);
+    onSessionChangeCacheRef.current[key] = fn;
+    return fn;
+  }, [handleSessionChange]);
 
   // Mirror the active alias to the URL via history.replaceState only — never a
   // React Router navigate, which would remount AgentChat and kill connections.
@@ -177,57 +242,85 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
     // reload/deep-link (Router's basename no longer matches). basePath is
     // already normalized to "" (root) or a no-trailing-slash prefix, so plain
     // concatenation can't produce a double slash.
-    const target = `${basePath}/agent/${activeAlias}`;
+    const target = `${basePath}/agent/${activeTab?.alias ?? initialAlias}`;
     if (window.location.pathname !== target) {
       try { window.history.replaceState(window.history.state, '', target); } catch { /* noop */ }
     }
-  }, [activeAlias]);
+  }, [activeTab, initialAlias]);
 
   // ── Tab bar handlers ──────────────────────────────────────────────────
-  const selectTab = useCallback((alias: string) => {
-    setActiveAlias(alias);
+  const selectTab = useCallback((key: string) => {
+    setActiveKey(key);
   }, []);
 
+  /**
+   * Open another pane for `alias`, even when one is already open — that is the
+   * point of the picker now. The extra pane starts on a brand-new conversation
+   * rather than the alias's last one, so two panes of one agent never open onto
+   * the same transcript and fight over it.
+   */
+  // Mint the tab outside the updater: React double-invokes updaters in
+  // StrictMode, which would generate two keys and activate the discarded one.
   const openChat = useCallback((alias: string) => {
-    setOpenChats((prev) => (prev.includes(alias) ? prev : [...prev, alias]));
-    setActiveAlias(alias);
+    const tab = tabForOpenRequest(tabsRef.current, alias);
+    setTabs((prev) => [...prev, tab]);
+    setActiveKey(tab.key);
   }, []);
 
-  const closeChat = useCallback((alias: string) => {
-    setOpenChats((prev) => {
-      if (prev.length <= 1) return prev; // never close the last chat
-      const next = prev.filter((a) => a !== alias);
-      // If we closed the active tab, move activation to a neighbour.
-      setActiveAlias((cur) => {
-        if (cur !== alias) return cur;
-        const idx = prev.indexOf(alias);
-        return next[Math.min(idx, next.length - 1)] ?? next[0] ?? cur;
-      });
-      return next;
+  const closeChat = useCallback((key: string) => {
+    const prev = tabsRef.current;
+    if (prev.length <= 1) return; // never close the last chat
+    const next = prev.filter((tb) => tb.key !== key);
+    setTabs(next);
+
+    // If we closed the active pane, move activation to a neighbour.
+    setActiveKey((cur) => {
+      if (cur !== key) return cur;
+      const idx = prev.findIndex((tb) => tb.key === key);
+      return next[Math.min(idx, next.length - 1)]?.key ?? next[0]?.key ?? cur;
     });
-    delete statusRef.current[alias];
-    delete onStatusCacheRef.current[alias];
+
+    delete statusRef.current[key];
+    delete onStatusCacheRef.current[key];
+    delete onSessionChangeCacheRef.current[key];
     syncIndicators();
   }, [syncIndicators]);
 
   const toggleLayout = useCallback(() => {
     setLayout((l) => (l === 'split' ? 'tabs' : 'split'));
-    // Seed split with the active alias + next open chat when entering split.
-    setSplitAliases((prev) => {
-      const left = activeAlias;
-      const right = openChats.find((a) => a !== left) ?? null;
-      return prev[0] === left && prev[1] && openChats.includes(prev[1]) ? prev : [left, right];
+    // Seed split with the active pane + the next open one when entering split.
+    setSplitKeys((prev) => {
+      const left = activeTab?.key ?? '';
+      const right = tabs.find((tb) => tb.key !== left)?.key ?? null;
+      const prevRightOpen = prev[1] && tabs.some((tb) => tb.key === prev[1]);
+      return prev[0] === left && prevRightOpen ? prev : [left, right];
     });
-  }, [activeAlias, openChats]);
+  }, [activeTab, tabs]);
 
-  // Split is only offered when there are >= 2 chats and the viewport is wide.
-  const splitDisabled = openChats.length < 2;
+  // Split is only offered when there are >= 2 panes.
+  const splitDisabled = tabs.length < 2;
+
+  // Number the panes of an agent that is open more than once, so two tabs
+  // reading "coder" can be told apart. A single pane keeps the bare alias.
+  const labelledTabs = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const tb of tabs) totals.set(tb.alias, (totals.get(tb.alias) ?? 0) + 1);
+    const seen = new Map<string, number>();
+    return tabs.map((tb) => {
+      const ordinal = (seen.get(tb.alias) ?? 0) + 1;
+      seen.set(tb.alias, ordinal);
+      return {
+        ...tb,
+        label: (totals.get(tb.alias) ?? 0) > 1 ? `${tb.alias} ${ordinal}` : tb.alias,
+      };
+    });
+  }, [tabs]);
 
   return (
     <div translate="no" className="notranslate flex flex-col h-full min-h-0">
       <ChatTabBar
-        openChats={openChats}
-        activeAlias={activeAlias}
+        tabs={labelledTabs}
+        activeKey={activeTab?.key ?? ''}
         indicators={indicators}
         layout={effectiveLayout}
         splitDisabled={splitDisabled}
@@ -241,8 +334,8 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
           visibility changes between tab/layout switches, so background sockets
           stay alive. In split layout the two visible panes share the width. */}
       <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-h-0'}>
-        {openChats.map((alias) => {
-          const visible = visibleAliases.has(alias);
+        {tabs.map((tab) => {
+          const visible = visibleKeys.has(tab.key);
           // In split, each visible pane takes an equal share of the row.
           const paneClass = visible
             ? effectiveLayout === 'split'
@@ -251,15 +344,24 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
             : 'hidden';
           return (
             <div
-              key={alias}
+              key={tab.key}
               role="tabpanel"
-              id={`chat-panel-${alias}`}
-              aria-labelledby={`chat-tab-${alias}`}
+              id={`chat-panel-${tab.key}`}
+              aria-labelledby={`chat-tab-${tab.key}`}
               aria-hidden={!visible}
               className={paneClass}
             >
-              <AgentProvider key={alias} agentAlias={alias}>
-                <AgentChatInner agentAlias={alias} onStatus={onStatusFor(alias)} />
+              {/* Keyed by the tab, not the alias, so one agent can be mounted
+                  twice — and so a conversation switch inside a pane does not
+                  remount the provider and drop its socket. */}
+              <AgentProvider
+                key={tab.key}
+                agentAlias={tab.alias}
+                initialSessionId={tab.sessionId}
+                reservedSessionIds={reservedByKey[tab.key]}
+                onSessionChange={onSessionChangeFor(tab.key)}
+              >
+                <AgentChatInner agentAlias={tab.alias} onStatus={onStatusFor(tab.key)} />
               </AgentProvider>
             </div>
           );

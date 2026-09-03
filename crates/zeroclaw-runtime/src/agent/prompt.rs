@@ -250,10 +250,11 @@ impl PromptSection for SkillsSection {
             ctx.skills_prompt_mode,
             ctx.tools.iter().any(|tool| tool.name() == "read_skill"),
         );
-        Ok(crate::skills::skills_to_prompt_with_mode(
+        Ok(crate::skills::skills_to_prompt_with_mode_and_availability(
             ctx.skills,
             ctx.workspace_dir,
             mode,
+            |name| ctx.tools.iter().any(|tool| tool.name() == name),
         ))
     }
 }
@@ -366,6 +367,7 @@ mod tests {
     zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
     zeroclaw_api::mock_tool_attribution!(ShellTestTool);
     zeroclaw_api::mock_tool_attribution!(CronAddTestTool);
+    zeroclaw_api::mock_tool_attribution!(SkillToolTestTool);
 
     struct TestTool;
     struct ReadSkillTestTool;
@@ -373,6 +375,33 @@ mod tests {
     struct ShellTestTool;
     /// Stands in for `cron_add`, which also takes a model-authored command.
     struct CronAddTestTool;
+    struct SkillToolTestTool(&'static str);
+
+    #[async_trait]
+    impl Tool for SkillToolTestTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "registered skill tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
 
     #[async_trait]
     impl Tool for ShellTestTool {
@@ -607,7 +636,8 @@ mod tests {
 
     #[test]
     fn skills_section_includes_instructions_and_tools_in_full_mode() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(SkillToolTestTool("deploy__release_checklist"))];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -658,7 +688,10 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadSkillTestTool)];
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadSkillTestTool),
+            Box::new(SkillToolTestTool("deploy__release_checklist")),
+        ];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -748,7 +781,9 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_keeps_instructions_for_always_skill() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SkillToolTestTool(
+            "security-policy__release_checklist",
+        ))];
         let skills = vec![crate::skills::Skill {
             name: "security-policy".into(),
             description: "Critical safety rules".into(),

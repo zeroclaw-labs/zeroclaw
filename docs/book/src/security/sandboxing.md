@@ -15,7 +15,14 @@ disable Grok's active OS sandbox or override its deny rules. Other permission
 modes remain fail closed. See
 [Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli).
 
-`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
+`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables the
+profile's additional OS-level sandbox wrapper. Under the native runtime, that
+leaves tools without an OS sandbox. Under `[runtime] kind = "docker"`, the
+Docker runtime remains the container boundary and is reported as
+`docker-runtime`; these settings prevent a second sandbox container from
+wrapping the runtime's own `docker run`. See the canonical
+[Minimal working example](../providers/configuration.md#minimal-working-example)
+for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
