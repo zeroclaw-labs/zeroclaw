@@ -143,13 +143,43 @@ struct NativeChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<NativeThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// The parts of a request the model generation constrains together.
+struct ResolvedRequestTuning {
+    temperature: Option<f64>,
+    thinking: Option<NativeThinkingConfig>,
+    output_config: Option<OutputConfig>,
+    max_tokens: u32,
+}
+
+impl ResolvedRequestTuning {
+    /// Whether this request names a thinking token budget, which the
+    /// streaming path cannot carry.
+    fn uses_fixed_budget(&self) -> bool {
+        self.thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.budget_tokens.is_some())
+    }
+}
+
+/// Output-level request controls. Currently only reasoning depth, which the
+/// adaptive-thinking generations take here rather than on the thinking object.
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 struct NativeThinkingConfig {
     #[serde(rename = "type")]
     kind: &'static str,
-    budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<&'static str>,
 }
 
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
@@ -1858,56 +1888,93 @@ impl AnthropicModelProvider {
         })
     }
 
-    /// Resolve thinking parameters for an API request. Returns the effective
-    /// temperature (forced to 1.0 when thinking is active), the thinking
-    /// config for the request body, and the effective max_tokens (raised to
-    /// meet budget_tokens minimum when needed).
+    /// Resolve the request tuning for one call: reasoning depth, sampling
+    /// temperature, and the output cap, all of which the model generation
+    /// constrains together.
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
         temperature: Option<f64>,
         model: &str,
-    ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
-        let fixed_budget = thinking
-            .and_then(|params| params.budget_tokens)
-            .filter(|_| {
-                crate::claude_models::claude_thinking_shape(model)
-                    == crate::claude_models::ClaudeThinkingShape::FixedBudget
-            });
-        match (fixed_budget, thinking) {
-            (Some(budget), _) => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": budget})),
-                    "Native extended thinking enabled; forcing temperature=1.0"
-                );
-                // API requires max_tokens > budget_tokens (strictly greater).
-                let min_required = budget + 1;
-                let max_tokens = self.max_tokens.max(min_required);
-                (
-                    Some(1.0),
-                    Some(NativeThinkingConfig {
-                        kind: "enabled",
-                        budget_tokens: budget,
-                    }),
-                    max_tokens,
-                )
-            }
-            (None, Some(_)) => {
-                // Caller asked for native thinking but the model rejects the
-                // fixed-budget request shape. Drop to prompt-based reasoning
-                // (the agent loop's prefix already injected) and keep the
-                // caller-supplied temperature so per-model guards still apply.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
-            }
-            (None, None) => (temperature, None, self.max_tokens),
+    ) -> ResolvedRequestTuning {
+        use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
+
+        if claude_thinking_shape(model) == ClaudeThinkingShape::FixedBudget {
+            let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
+                // No budget to spend, so the request carries no thinking at
+                // all and the caller's temperature stands.
+                return ResolvedRequestTuning {
+                    temperature,
+                    thinking: None,
+                    output_config: None,
+                    max_tokens: self.max_tokens,
+                };
+            };
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"budget_tokens": budget})),
+                "Native extended thinking enabled; forcing temperature=1.0"
+            );
+            return ResolvedRequestTuning {
+                // The API pins sampling when a budget is in play.
+                temperature: Some(1.0),
+                thinking: Some(NativeThinkingConfig {
+                    kind: "enabled",
+                    budget_tokens: Some(budget),
+                    display: None,
+                }),
+                output_config: None,
+                // The API requires max_tokens strictly above the budget.
+                max_tokens: self.max_tokens.max(budget + 1),
+            };
+        }
+
+        let effort = thinking.and_then(|params| params.effort);
+        if thinking.and_then(|params| params.budget_tokens).is_some() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"model": model})),
+                "fixed thinking budget ignored; this model generation thinks adaptively"
+            );
+        }
+        if let Some(temperature) = temperature {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "temperature": temperature,
+                    })),
+                "temperature dropped: this model generation rejects sampling parameters"
+            );
+        }
+        if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "max_tokens": self.max_tokens,
+                    })),
+                "max_tokens is at the baseline; reasoning counts toward it on this model generation, so raise it on the provider entry"
+            );
+        }
+        // Asking for the object turns thinking on for the generations that
+        // default it off, so only send it when a depth was actually chosen.
+        let thinking = effort.map(|_| NativeThinkingConfig {
+            kind: "adaptive",
+            budget_tokens: None,
+            display: None,
+        });
+        ResolvedRequestTuning {
+            temperature: None,
+            thinking,
+            output_config: effort.map(|effort| OutputConfig {
+                effort: effort.as_str(),
+            }),
+            max_tokens: self.max_tokens,
         }
     }
 
@@ -2284,6 +2351,7 @@ impl ModelProvider for AnthropicModelProvider {
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
 
         let mut request = self
@@ -2353,8 +2421,9 @@ impl ModelProvider for AnthropicModelProvider {
             system_prompt
         };
 
-        let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
+        let tuning = self.resolve_thinking(request.thinking, temperature, model);
+        let effective_temperature = tuning.temperature;
+        let effective_max_tokens = tuning.max_tokens;
 
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
@@ -2369,7 +2438,8 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking": tuning.thinking.as_ref().map(|thinking| thinking.kind),
+                        "effort": tuning.output_config.as_ref().map(|output| output.effort),
                     })),
                 "anthropic provider request prepared"
             );
@@ -2383,7 +2453,8 @@ impl ModelProvider for AnthropicModelProvider {
             tools: native_tools,
             tool_choice,
             stream: None,
-            thinking: thinking_config,
+            thinking: tuning.thinking,
+            output_config: tuning.output_config,
         };
 
         let req = self
@@ -2546,10 +2617,11 @@ impl ModelProvider for AnthropicModelProvider {
             system_prompt
         };
 
-        let (effective_temperature, thinking_config, effective_max_tokens) =
-            self.resolve_thinking(request.thinking, temperature, model);
+        let tuning = self.resolve_thinking(request.thinking, temperature, model);
+        let effective_temperature = tuning.temperature;
+        let effective_max_tokens = tuning.max_tokens;
 
-        if thinking_config.is_some() {
+        if tuning.uses_fixed_budget() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2562,7 +2634,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                     })),
-                "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
+                "fixed thinking budget requested; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
                 model: model.to_string(),
@@ -2573,7 +2645,8 @@ impl ModelProvider for AnthropicModelProvider {
                 tools: native_tools,
                 tool_choice,
                 stream: None,
-                thinking: thinking_config,
+                thinking: tuning.thinking,
+                output_config: tuning.output_config,
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -2659,7 +2732,8 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": false,
+                        "thinking": tuning.thinking.as_ref().map(|thinking| thinking.kind),
+                        "effort": tuning.output_config.as_ref().map(|output| output.effort),
                     })),
                 "anthropic streaming provider request prepared"
             );
@@ -2673,7 +2747,8 @@ impl ModelProvider for AnthropicModelProvider {
             tools: native_tools,
             tool_choice,
             stream: Some(true),
-            thinking: thinking_config,
+            thinking: tuning.thinking,
+            output_config: tuning.output_config,
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -3727,7 +3802,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn resolve_thinking_drops_native_for_opus_4_7() {
+    fn resolve_thinking_drops_the_budget_on_adaptive_generations() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
@@ -3735,20 +3810,20 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
         };
-        let (temp, config, max_tokens) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
         assert!(
-            config.is_none(),
-            "native thinking should be gated off for opus-4-7"
+            tuning.thinking.is_none(),
+            "a budget without a depth sends no thinking object on this generation"
         );
-        // Caller-supplied temperature is preserved (so per-model omit guard
-        // can still take effect downstream).
-        assert!((temp.unwrap() - 0.7_f64).abs() < f64::EPSILON);
-        assert_eq!(max_tokens, provider.max_tokens);
+        assert!(
+            tuning.temperature.is_none(),
+            "this generation rejects sampling parameters"
+        );
+        assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
 
     #[test]
-    fn resolve_thinking_keeps_native_for_supported_models() {
+    fn resolve_thinking_keeps_the_budget_on_older_generations() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
             .build();
@@ -3756,14 +3831,160 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
         };
-        let (temp, config, _) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
-        assert!(
-            config.is_some(),
-            "native thinking should activate on supported models"
-        );
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
+        assert!(tuning.uses_fixed_budget());
         // Forced to 1.0 per Anthropic native-thinking contract.
-        assert!((temp.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        assert!((tuning.temperature.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        let thinking = tuning
+            .thinking
+            .expect("a budget generation should carry the thinking object");
+        assert_eq!(thinking.kind, "enabled");
+        assert_eq!(thinking.budget_tokens, Some(10_000));
+    }
+
+    #[test]
+    fn resolve_thinking_sends_adaptive_shape_with_effort() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .max_tokens(32_000)
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: Some(ThinkingEffort::High),
+        };
+        let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("a chosen depth should carry the thinking object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(
+            thinking.budget_tokens, None,
+            "the budget must not reach this generation"
+        );
+        assert!(!tuning.uses_fixed_budget());
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high")
+        );
+        assert!(tuning.temperature.is_none());
+        assert_eq!(tuning.max_tokens, 32_000);
+    }
+
+    #[test]
+    fn resolve_thinking_sends_nothing_without_a_chosen_depth() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        assert!(tuning.thinking.is_none());
+        assert!(tuning.output_config.is_none());
+        assert!(tuning.temperature.is_none());
+    }
+
+    #[test]
+    fn resolve_thinking_maps_every_depth_to_its_wire_value() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        for (effort, expected) in [
+            (ThinkingEffort::Low, "low"),
+            (ThinkingEffort::High, "high"),
+            (ThinkingEffort::Max, "max"),
+        ] {
+            let params = NativeThinkingParams {
+                budget_tokens: None,
+                effort: Some(effort),
+            };
+            let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-5");
+            assert_eq!(
+                tuning.output_config.as_ref().map(|output| output.effort),
+                Some(expected),
+                "wire value for {effort:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_thinking_ignores_depth_on_older_generations() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+        };
+        let tuning = provider.resolve_thinking(Some(params), Some(0.3_f64), "claude-haiku-4-5");
+        assert!(tuning.thinking.is_none());
+        assert!(
+            tuning.output_config.is_none(),
+            "older generations have no depth setting"
+        );
+        assert!(
+            (tuning.temperature.unwrap() - 0.3_f64).abs() < f64::EPSILON,
+            "older generations still accept sampling parameters"
+        );
+    }
+
+    #[test]
+    fn native_chat_request_serializes_adaptive_thinking_and_effort() {
+        let req = NativeChatRequest {
+            model: "claude-fable-5-1".to_string(),
+            max_tokens: 32_000,
+            system: None,
+            messages: vec![],
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            stream: Some(true),
+            thinking: Some(NativeThinkingConfig {
+                kind: "adaptive",
+                budget_tokens: None,
+                display: Some("summarized"),
+            }),
+            output_config: Some(OutputConfig { effort: "max" }),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"adaptive","display":"summarized"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""output_config":{"effort":"max"}"#),
+            "{json}"
+        );
+        assert!(!json.contains("budget_tokens"), "{json}");
+        assert!(!json.contains("temperature"), "{json}");
+    }
+
+    #[test]
+    fn native_chat_request_serializes_the_budget_shape_unchanged() {
+        let req = NativeChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 11_000,
+            system: None,
+            messages: vec![],
+            temperature: Some(1.0),
+            tools: None,
+            tool_choice: None,
+            stream: None,
+            thinking: Some(NativeThinkingConfig {
+                kind: "enabled",
+                budget_tokens: Some(10_000),
+                display: None,
+            }),
+            output_config: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""thinking":{"type":"enabled","budget_tokens":10000}"#),
+            "{json}"
+        );
+        assert!(!json.contains("output_config"), "{json}");
+        assert!(!json.contains("display"), "{json}");
     }
 
     #[test]
@@ -3778,6 +3999,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -3799,6 +4021,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -4279,6 +4502,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -4307,6 +4531,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             tool_choice: None,
             stream: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
