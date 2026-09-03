@@ -118,7 +118,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = [
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "connect",
   "rustls-tls-webpki-roots",
-] }
+], optional = true }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 urlencoding = "2.1"
@@ -213,9 +213,10 @@ channel-email = [
   "dep:lettre",
   "dep:mail-parser",
 ]
+ws-transport = ["zeroclaw-config/ws-transport", "dep:tokio-tungstenite"]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
-channel-lark = ["dep:axum", "dep:prost"]
+channel-lark = ["dep:axum", "dep:prost", "ws-transport"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and
 # `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
@@ -239,15 +240,15 @@ whatsapp-web = [
   "image-normalization",
 ]
 # Channels with no optional deps (cfg gate only)
-channel-discord = []
-channel-slack = []
+channel-discord = ["ws-transport"]
+channel-slack = ["ws-transport"]
 channel-signal = []
-channel-mattermost = []
+channel-mattermost = ["ws-transport"]
 channel-irc = []
 channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]
-channel-dingtalk = []
-channel-qq = []
+channel-dingtalk = ["ws-transport"]
+channel-qq = ["ws-transport"]
 channel-bluesky = []
 channel-twitter = []
 channel-reddit = []
@@ -266,7 +267,7 @@ channel-wechat = [
   "dep:qrcode",
 ]
 channel-wecom = []
-channel-wecom-ws = ["dep:aes", "dep:cbc"]
+channel-wecom-ws = ["dep:aes", "dep:cbc", "ws-transport"]
 channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
