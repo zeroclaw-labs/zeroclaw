@@ -334,6 +334,13 @@ jobs:
           if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
             $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}
           fi
+          # Build the thin bootstrap MCP launcher with the same (cross-)toolchain.
+          # It ships as its OWN per-platform asset (packaged below), not inside
+          # the zeroclaw archive — its job is to exist BEFORE zeroclaw does.
+          # Skipped on Android (experimental; not a launcher host target).
+          if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
+            $BUILD_CMD --release --locked -p zeroclaw-bootstrap --target ${{ matrix.target }}
+          fi
 
       - name: Check binary size
         shell: bash
@@ -374,6 +381,34 @@ jobs:
         with:
           name: zeroclaw-${{ matrix.target }}
           path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
+          retention-days: 14
+
+      # ── Bootstrap launcher: standalone per-platform asset ─────────────
+      # Packaged as zeroclaw-bootstrap-<triple>.<ext> (raw binary, no web/dist,
+      # no zerocode) so the publish job's existing *.tar.gz / *.zip collect,
+      # attestation, and SHA256SUMS steps pick it up with no further change.
+      # install-bootstrap.sh downloads exactly this asset and verifies it
+      # against SHA256SUMS.
+      - name: Package bootstrap launcher (Unix)
+        if: runner.os != 'Windows' && matrix.target != 'aarch64-linux-android'
+        run: |
+          mkdir -p boot-staging
+          cp target/${{ matrix.target }}/release/zeroclaw-bootstrap boot-staging/
+          cd boot-staging
+          tar czf ../zeroclaw-bootstrap-${{ matrix.target }}.tar.gz zeroclaw-bootstrap
+      - name: Package bootstrap launcher (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p boot-staging
+          cp target/${{ matrix.target }}/release/zeroclaw-bootstrap.exe boot-staging/
+          cd boot-staging
+          7z a ../zeroclaw-bootstrap-${{ matrix.target }}.zip zeroclaw-bootstrap.exe
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.target != 'aarch64-linux-android'
+        with:
+          name: zeroclaw-bootstrap-${{ matrix.target }}
+          path: zeroclaw-bootstrap-${{ matrix.target }}.*
           retention-days: 14
 
   build-desktop:
@@ -792,6 +827,12 @@ jobs:
             "zeroclaw-${TAG}-sbom.spdx.json"
             "zeroclaw-${TAG}-sbom.cdx.json"
           )
+          # NOTE: the launcher assets (zeroclaw-bootstrap-<triple>) are NOT
+          # listed here. required_assets is single-sourced from the zeroclaw-dist
+          # registry (enforced by its parity test), which models the main binary
+          # targets, not launcher variants. The launcher assets still ship — they
+          # flow through the collect/attest/SHA256SUMS steps below — but are
+          # best-effort until the registry models them; gating them is a follow-up.
           missing=0
           for asset in "${required_assets[@]}"; do
             if ! find artifacts -type f -name "$asset" -print -quit | grep -q .; then
@@ -811,6 +852,7 @@ jobs:
           mkdir -p release-assets
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' -o -name '*-setup.exe' -o -name '*-sbom.spdx.json' -o -name '*-sbom.cdx.json' \) -exec cp {} release-assets/ \;
           cp install.sh release-assets/
+          cp install-bootstrap.sh release-assets/
           echo "--- Assets ---"
           ls -lh release-assets/
 
