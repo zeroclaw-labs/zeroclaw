@@ -2066,7 +2066,10 @@ mod tests {
         );
         assert_eq!(
             ZerorouterEndpoint::default().uri(),
-            "http://localhost:8080/v1"
+            "https://zerorouter.ai/v1",
+            "the default must be the hosted deployment — a localhost default \
+             gives a zero-config user a connection refusal or a stray dev \
+             instance's partial catalog"
         );
         assert!(
             !ZerorouterModelProviderConfig::default()

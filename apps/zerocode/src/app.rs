@@ -195,7 +195,7 @@ impl SgrMouseEventDecoder {
 
     fn replay_candidate(&mut self) -> Vec<Event> {
         self.candidate_started_at = None;
-        self.candidate.drain(..).collect()
+        std::mem::take(&mut self.candidate)
     }
 }
 

@@ -77,7 +77,9 @@ pub use crate::wecom_ws::WeComWsChannel;
 use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub use zeroclaw_api::channel::{
+    Channel, ChannelMessage, DraftProgress, DraftProgressKind, SendMessage,
+};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
@@ -5344,22 +5346,29 @@ fn single_message_pending_has_prefix(text: &str, prefix: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty())
 }
 
-fn single_message_pending_thinking_round(text: &str) -> Option<usize> {
-    zeroclaw_runtime::agent::loop_::thinking_status_round(text)
+fn single_message_pending_thinking_round(progress: &DraftProgress) -> Option<usize> {
+    matches!(progress.kind, DraftProgressKind::Status)
+        .then(|| zeroclaw_runtime::agent::loop_::thinking_status_round(&progress.text))
+        .flatten()
 }
 
-fn single_message_pending_is_thinking_status(text: &str) -> bool {
-    single_message_pending_thinking_round(text).is_some()
+fn single_message_pending_is_thinking_status(progress: &DraftProgress) -> bool {
+    single_message_pending_thinking_round(progress).is_some()
 }
 
-fn single_message_pending_is_reasoning(text: &str) -> bool {
-    single_message_pending_has_prefix(text, zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
-        && !single_message_pending_is_thinking_status(text)
+fn single_message_pending_is_reasoning(progress: &DraftProgress) -> bool {
+    matches!(progress.kind, DraftProgressKind::Reasoning)
+        && single_message_pending_has_prefix(
+            &progress.text,
+            zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX,
+        )
 }
 
-fn single_message_pending_visible_lines(text: &str) -> usize {
-    if single_message_pending_is_reasoning(text) {
-        text.trim_end_matches(&['\r', '\n'][..])
+fn single_message_pending_visible_lines(progress: &DraftProgress) -> usize {
+    if single_message_pending_is_reasoning(progress) {
+        progress
+            .text
+            .trim_end_matches(&['\r', '\n'][..])
             .split('\n')
             .count()
             .max(1)
@@ -5368,15 +5377,20 @@ fn single_message_pending_visible_lines(text: &str) -> usize {
     }
 }
 
-fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+fn trim_pending_visible_lines_from_front(
+    progress: &DraftProgress,
+    remove_lines: usize,
+) -> DraftProgress {
     if remove_lines == 0 {
-        return text.to_string();
+        return progress.clone();
     }
 
-    let rendered = text.trim_end_matches(&['\r', '\n'][..]);
-    let total = single_message_pending_visible_lines(rendered);
+    let rendered = progress.text.trim_end_matches(&['\r', '\n'][..]);
+    let total = single_message_pending_visible_lines(progress);
     if remove_lines >= total {
-        return String::new();
+        let mut empty = progress.clone();
+        empty.text.clear();
+        return empty;
     }
 
     let retained = rendered
@@ -5384,7 +5398,7 @@ fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> Str
         .skip(remove_lines)
         .collect::<Vec<_>>()
         .join("\n");
-    if single_message_pending_is_reasoning(text)
+    let text = if single_message_pending_is_reasoning(progress)
         && !retained.starts_with(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
     {
         format!(
@@ -5393,16 +5407,20 @@ fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> Str
         )
     } else {
         retained
+    };
+    DraftProgress {
+        kind: progress.kind,
+        text,
     }
 }
 
-fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usize) {
+fn trim_matrix_single_message_pending(pending: &mut Vec<DraftProgress>, max_lines: usize) {
     if max_lines == 0 {
         return;
     }
     let mut total_lines = pending
         .iter()
-        .map(|line| single_message_pending_visible_lines(line))
+        .map(single_message_pending_visible_lines)
         .sum::<usize>();
     while total_lines > max_lines {
         let remove_lines = total_lines - max_lines;
@@ -5417,31 +5435,37 @@ fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usiz
     }
 }
 
-fn push_matrix_single_message_pending(pending: &mut Vec<String>, text: String, max_lines: usize) {
-    if text.is_empty() {
+fn push_matrix_single_message_pending(
+    pending: &mut Vec<DraftProgress>,
+    progress: DraftProgress,
+    max_lines: usize,
+) {
+    if progress.text.is_empty() {
         return;
     }
-    if let Some(incoming_round) = single_message_pending_thinking_round(&text)
+    if let Some(incoming_round) = single_message_pending_thinking_round(&progress)
         && let Some(existing) = pending.last_mut()
         && single_message_pending_is_thinking_status(existing)
     {
         if incoming_round >= single_message_pending_thinking_round(existing).unwrap_or(0) {
-            *existing = text;
+            *existing = progress;
         }
         trim_matrix_single_message_pending(pending, max_lines);
         return;
     }
 
-    if let Some(fragment) = text.strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+    if let Some(fragment) = progress
+        .text
+        .strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
         && let Some(existing) = pending.last_mut()
         && single_message_pending_is_reasoning(existing)
     {
-        existing.push_str(fragment);
+        existing.text.push_str(fragment);
         trim_matrix_single_message_pending(pending, max_lines);
         return;
     }
 
-    pending.push(text);
+    pending.push(progress);
     trim_matrix_single_message_pending(pending, max_lines);
 }
 
@@ -5836,16 +5860,16 @@ fn matrix_progress_text(
     event: &zeroclaw_runtime::agent::loop_::StreamDelta,
     config: &Config,
     matrix_alias: &str,
-) -> Option<String> {
+) -> Option<DraftProgress> {
     use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
 
-    let text = match event {
-        StreamDelta::Status(text) => Some(matrix_scrub_progress_text(text)),
+    let progress = match event {
+        StreamDelta::Status(text) => Some(DraftProgress::status(matrix_scrub_progress_text(text))),
         StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
-            matrix_tool_progress(event, config, matrix_alias)
+            matrix_tool_progress(event, config, matrix_alias).map(DraftProgress::status)
         }
-        StreamDelta::Reasoning(text) => Some(matrix_scrub_progress_text(&format!(
-            "{REASONING_FULL_PREFIX}{text}"
+        StreamDelta::Reasoning(text) => Some(DraftProgress::reasoning(matrix_scrub_progress_text(
+            &format!("{REASONING_FULL_PREFIX}{text}"),
         ))),
         StreamDelta::Text(_) | StreamDelta::Lifecycle(_) => None,
     }?;
@@ -5856,7 +5880,10 @@ fn matrix_progress_text(
     // transport encoding, so a future dynamic field cannot bypass the guard.
     // Do not apply `scrub_credentials` again: structured-value redaction is
     // the shared authority for serialized tool arguments.
-    Some(zeroclaw_runtime::security::scrub(&text))
+    Some(DraftProgress {
+        kind: progress.kind,
+        text: zeroclaw_runtime::security::scrub(&progress.text),
+    })
 }
 
 async fn run_matrix_single_message_draft_updater(
@@ -5875,7 +5902,7 @@ async fn run_matrix_single_message_draft_updater(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
-    let mut pending = Vec::<String>::new();
+    let mut pending = Vec::<DraftProgress>::new();
     let mut rx_open = true;
     let mut flush_in_flight = false;
 
@@ -5913,7 +5940,7 @@ async fn run_matrix_single_message_draft_updater(
                 flush_in_flight = true;
                 zeroclaw_spawn::spawn!(async move {
                     let result = channel
-                        .update_draft_progress_batch(&reply_target, &draft_id, &batch)
+                        .update_typed_draft_progress_batch(&reply_target, &draft_id, &batch)
                         .await
                         .map_err(|e| e.to_string());
                     let _ = flush_tx.send(result.err()).await;
@@ -14178,8 +14205,8 @@ pub(crate) mod tests {
         )
         .expect("status renders");
 
-        assert!(!progress.contains(token));
-        assert!(progress.contains("[REDACTED"));
+        assert!(!progress.text.contains(token));
+        assert!(progress.text.contains("[REDACTED"));
     }
 
     #[test]
@@ -14202,9 +14229,9 @@ pub(crate) mod tests {
         )
         .expect("tool completion renders");
 
-        assert!(!progress.contains("-----BEGIN PRIVATE KEY-----"));
-        assert!(!progress.contains("-----END PRIVATE KEY-----"));
-        assert!(progress.contains("[REDACTED"));
+        assert!(!progress.text.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!progress.text.contains("-----END PRIVATE KEY-----"));
+        assert!(progress.text.contains("[REDACTED"));
     }
 
     #[test]
@@ -14218,8 +14245,12 @@ pub(crate) mod tests {
             } else {
                 format!("{REASONING_FULL_PREFIX} r{idx}")
             };
-            push_matrix_single_message_pending(&mut pending, fragment, 3);
-            push_matrix_single_message_pending(&mut pending, format!("tool-{idx}\n"), 3);
+            push_matrix_single_message_pending(&mut pending, DraftProgress::reasoning(fragment), 3);
+            push_matrix_single_message_pending(
+                &mut pending,
+                DraftProgress::status(format!("tool-{idx}\n")),
+                3,
+            );
         }
 
         assert!(
@@ -14227,11 +14258,11 @@ pub(crate) mod tests {
             "bounded pending buffer should honor stream_draft_lines, got {pending:?}"
         );
         assert!(
-            pending.iter().all(|line| !line.contains("r7 r8")),
+            pending.iter().all(|line| !line.text.contains("r7 r8")),
             "reasoning after tool progress must start a new entry, got {pending:?}"
         );
         assert!(
-            !pending.iter().any(|line| line == "tool-0\n"),
+            !pending.iter().any(|line| line.text == "tool-0\n"),
             "old non-reasoning progress should be trimmed first: {pending:?}"
         );
     }
@@ -14243,21 +14274,21 @@ pub(crate) mod tests {
         let mut pending = Vec::new();
         push_matrix_single_message_pending(
             &mut pending,
-            format!("{REASONING_FULL_PREFIX}before tool"),
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}before tool")),
             2,
         );
-        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2);
+        push_matrix_single_message_pending(&mut pending, DraftProgress::status("tool call"), 2);
         push_matrix_single_message_pending(
             &mut pending,
-            format!("{REASONING_FULL_PREFIX}after tool"),
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}after tool")),
             2,
         );
 
         assert_eq!(
             pending,
             vec![
-                "tool call".to_string(),
-                format!("{REASONING_FULL_PREFIX}after tool")
+                DraftProgress::status("tool call"),
+                DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}after tool"))
             ]
         );
     }
@@ -14268,11 +14299,24 @@ pub(crate) mod tests {
 
         let mut pending = Vec::new();
         let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
-        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}abcd"), 3);
-        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}efgh"), 3);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}abcd")),
+            3,
+        );
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}efgh")),
+            3,
+        );
 
-        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcdefgh")]);
-        assert!(pending.iter().any(|line| line.len() > max_bytes));
+        assert_eq!(
+            pending,
+            vec![DraftProgress::reasoning(format!(
+                "{REASONING_FULL_PREFIX}abcdefgh"
+            ))]
+        );
+        assert!(pending.iter().any(|line| line.text.len() > max_bytes));
     }
 
     #[test]
@@ -14282,19 +14326,28 @@ pub(crate) mod tests {
         let mut pending = Vec::new();
         push_matrix_single_message_pending(
             &mut pending,
-            format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}one\ntwo\nthree")),
             2,
         );
 
-        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}two\nthree")]);
+        assert_eq!(
+            pending,
+            vec![DraftProgress::reasoning(format!(
+                "{REASONING_FULL_PREFIX}two\nthree"
+            ))]
+        );
 
-        push_matrix_single_message_pending(&mut pending, "tool line\nwith detail\n".to_string(), 2);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status("tool line\nwith detail\n"),
+            2,
+        );
 
         assert_eq!(
             pending,
             vec![
-                format!("{REASONING_FULL_PREFIX}three"),
-                "tool line\nwith detail\n".to_string()
+                DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}three")),
+                DraftProgress::status("tool line\nwith detail\n")
             ]
         );
     }
@@ -14304,23 +14357,69 @@ pub(crate) mod tests {
         use zeroclaw_runtime::agent::loop_::thinking_status_text;
 
         let mut pending = Vec::new();
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3);
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status(thinking_status_text(1)),
+            3,
+        );
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status(thinking_status_text(0)),
+            3,
+        );
 
-        assert_eq!(pending, vec![thinking_status_text(1)]);
+        assert_eq!(
+            pending,
+            vec![DraftProgress::status(thinking_status_text(1))]
+        );
 
-        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3);
+        push_matrix_single_message_pending(&mut pending, DraftProgress::status("tool\n"), 3);
 
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status(thinking_status_text(2)),
+            3,
+        );
 
         assert_eq!(
             pending,
             vec![
-                thinking_status_text(1),
-                "tool\n".to_string(),
-                thinking_status_text(2)
+                DraftProgress::status(thinking_status_text(1)),
+                DraftProgress::status("tool\n"),
+                DraftProgress::status(thinking_status_text(2))
             ]
         );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_preserves_reasoning_matching_thinking_status() {
+        use zeroclaw_runtime::agent::loop_::{StreamDelta, thinking_status_text};
+
+        let config = Config::default();
+        let status = matrix_progress_text(
+            &StreamDelta::Status(thinking_status_text(0)),
+            &config,
+            "missing",
+        )
+        .expect("thinking status renders");
+        let reasoning = matrix_progress_text(
+            &StreamDelta::Reasoning("Thinking...\n".to_string()),
+            &config,
+            "missing",
+        )
+        .expect("reasoning renders");
+        let mut pending = Vec::new();
+
+        // Equal display text must remain two source-distinct progress entries.
+        push_matrix_single_message_pending(&mut pending, status.clone(), 3);
+        push_matrix_single_message_pending(&mut pending, reasoning.clone(), 3);
+
+        assert_eq!(
+            status.text, reasoning.text,
+            "the regression requires an exact display-text collision"
+        );
+        assert_ne!(status.kind, reasoning.kind);
+        assert_eq!(pending, vec![status, reasoning]);
     }
 
     struct SlowBatchChannel {

@@ -43,7 +43,9 @@ jobs:
     name: Analyze (${{ matrix.language }})
     # Results upload to this repo's Security tab; skip on forks.
     if: github.repository == 'zeroclaw-labs/zeroclaw'
-    runs-on: ubuntu-latest
+    # Keep the fast interpreted-language scan on GitHub; give only Rust the
+    # existing closed Blacksmith toggle used by compile-heavy CI jobs.
+    runs-on: ${{ matrix.language == 'rust' && vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

@@ -421,6 +421,46 @@ pub enum ProgressEvent {
     FinalizingResponse,
 }
 
+/// Origin of a rendered draft-progress entry.
+///
+/// Channels may display both variants identically, but must retain this value
+/// while coalescing updates so provider reasoning cannot be mistaken for
+/// generated status chrome when their rendered text happens to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProgressKind {
+    /// Generated lifecycle or tool-status chrome.
+    Status,
+    /// Raw provider reasoning explicitly enabled for the channel.
+    Reasoning,
+}
+
+/// Rendered draft-progress text paired with its semantic origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftProgress {
+    /// Semantic source retained independently from the display string.
+    pub kind: DraftProgressKind,
+    /// Channel-ready display text after redaction.
+    pub text: String,
+}
+
+impl DraftProgress {
+    /// Create a generated status or tool-progress entry.
+    pub fn status(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Status,
+            text: text.into(),
+        }
+    }
+
+    /// Create a provider-reasoning entry.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Reasoning,
+            text: text.into(),
+        }
+    }
+}
+
 impl RoomVisibility {
     pub const SCHEMA_VALUES: &'static [&'static str] = &["private", "public"];
 
@@ -829,6 +869,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Show a batch of progress updates without discarding their source kind.
+    ///
+    /// The default preserves compatibility for channels that only need text;
+    /// channels that coalesce semantically different progress should override
+    /// this method and keep the kind through their local draft buffer.
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> anyhow::Result<()> {
+        let texts = progress
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        self.update_draft_progress_batch(recipient, message_id, &texts)
+            .await
     }
 
     /// Show localized lifecycle progress produced from a typed runtime event.

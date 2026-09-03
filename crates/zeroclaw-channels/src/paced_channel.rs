@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ProgressEvent,
-    RoomCreationOptions, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
+    ProgressEvent, RoomCreationOptions, SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -399,6 +399,19 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        // Draft progress bypasses outbound reply pacing, but source identity
+        // must survive this wrapper for channels that coalesce by semantic kind.
+        self.inner
+            .update_typed_draft_progress_batch(recipient, message_id, progress)
+            .await
+    }
+
     async fn update_draft_lifecycle(
         &self,
         recipient: &str,
@@ -519,6 +532,7 @@ impl Channel for PacedChannel {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::channel::DraftProgressKind;
 
     /// Minimal `HasReplyPacing` for tests so we can construct pacing
     /// configs without dragging a full `*Config` literal into every
@@ -586,6 +600,8 @@ mod tests {
     struct BatchProgressChannel {
         progress_updates: AtomicUsize,
         batch_updates: AtomicUsize,
+        typed_batch_updates: AtomicUsize,
+        typed_kinds: std::sync::Mutex<Vec<DraftProgressKind>>,
     }
 
     impl Attributable for BatchProgressChannel {
@@ -624,6 +640,19 @@ mod tests {
             _texts: &[String],
         ) -> Result<()> {
             self.batch_updates.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn update_typed_draft_progress_batch(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            progress: &[DraftProgress],
+        ) -> Result<()> {
+            self.typed_batch_updates.fetch_add(1, Ordering::SeqCst);
+            // Capture only the semantic contract under test; display text is
+            // independently covered by the legacy batch delegation test.
+            *self.typed_kinds.lock().expect("typed kinds lock") =
+                progress.iter().map(|entry| entry.kind).collect();
             Ok(())
         }
     }
@@ -892,6 +921,8 @@ mod tests {
         let batch_progress = Arc::new(BatchProgressChannel {
             progress_updates: AtomicUsize::new(0),
             batch_updates: AtomicUsize::new(0),
+            typed_batch_updates: AtomicUsize::new(0),
+            typed_kinds: std::sync::Mutex::new(Vec::new()),
         });
         let inner: Arc<dyn Channel> = batch_progress.clone();
         let cfg = PacingFixture {
@@ -911,6 +942,38 @@ mod tests {
             batch_progress.progress_updates.load(Ordering::SeqCst),
             0,
             "the pacing wrapper must retain an inner channel's coalesced progress batch",
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_progress_batch_preserves_source_kind_through_pacing_wrapper() {
+        let batch_progress = Arc::new(BatchProgressChannel {
+            progress_updates: AtomicUsize::new(0),
+            batch_updates: AtomicUsize::new(0),
+            typed_batch_updates: AtomicUsize::new(0),
+            typed_kinds: std::sync::Mutex::new(Vec::new()),
+        });
+        let inner: Arc<dyn Channel> = batch_progress.clone();
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        let progress = vec![
+            DraftProgress::status("Thinking..."),
+            DraftProgress::reasoning("Thinking..."),
+        ];
+
+        paced
+            .update_typed_draft_progress_batch("alice", "msg-1", &progress)
+            .await
+            .unwrap();
+
+        assert_eq!(batch_progress.typed_batch_updates.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_progress.batch_updates.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *batch_progress.typed_kinds.lock().expect("typed kinds lock"),
+            vec![DraftProgressKind::Status, DraftProgressKind::Reasoning]
         );
     }
 

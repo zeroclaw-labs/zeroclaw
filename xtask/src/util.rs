@@ -136,13 +136,25 @@ pub fn require_tool(cmd: &str, install_hint: &str) -> anyhow::Result<()> {
 }
 
 /// Like `require_tool`, but if the binary is a cargo-installable crate that's missing,
-/// auto-install it via `cargo install --locked <crate>`. Idempotent — a no-op when present.
+/// auto-install it. Idempotent — a no-op when present.
+///
+/// `mdbook-mermaid` is pinned separately because its published lockfile still
+/// compiles against mdBook 0.5.0. Resolving its 0.5.x preprocessor dependency
+/// against the pinned mdBook release avoids a protocol-version warning during
+/// the docs build.
 pub fn ensure_cargo_tool(cmd: &str, crate_name: &str) -> anyhow::Result<()> {
     if tool_on_path(cmd) {
         return Ok(());
     }
     println!("==> installing '{crate_name}' (missing '{cmd}')");
-    run_cmd(Command::new("cargo").args(["install", "--locked", crate_name]))
+    let mut install = Command::new("cargo");
+    install.args(["install"]);
+    if cmd == "mdbook-mermaid" {
+        install.args(["--version", "0.17.1", crate_name]);
+    } else {
+        install.args(["--locked", crate_name]);
+    }
+    run_cmd(&mut install)
 }
 
 fn tool_on_path(cmd: &str) -> bool {
@@ -175,7 +187,7 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
         }
     }
     anyhow::bail!(
-        "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.0 --locked"
+        "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.4 --locked"
     )
 }
 

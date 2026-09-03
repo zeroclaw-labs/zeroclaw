@@ -1002,6 +1002,7 @@ channel-approval-group-visibility-warning =
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
+channel-telegram-approval-ack-not-accepted = Aprobación no aceptada
 channel-telegram-approval-ack-unknown = Acción desconocida
 channel-telegram-approval-ack-already-resolved = Aprobación ya resuelta
 channel-discord-approval-btn-allow-once = Permitir una vez
