@@ -948,8 +948,13 @@ impl BedrockModelProvider {
     ) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
         let mut system_blocks = Vec::new();
         let mut converse_messages = Vec::new();
+        // Same boundary rule as the Anthropic adapter: only the round still in
+        // flight replays its signed reasoning.
+        let last_exchange_start = messages.iter().enumerate().rev().find_map(|(index, msg)| {
+            (!matches!(msg.role.as_str(), "system" | "assistant" | "tool")).then_some(index)
+        });
 
-        for msg in messages {
+        for (index, msg) in messages.iter().enumerate() {
             match msg.role.as_str() {
                 "system" => {
                     if system_blocks.is_empty() {
@@ -959,7 +964,10 @@ impl BedrockModelProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    let replay_thinking = last_exchange_start.is_some_and(|start| index > start);
+                    if let Some(blocks) =
+                        Self::parse_assistant_tool_call_message(&msg.content, replay_thinking)
+                    {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: blocks,
@@ -1234,7 +1242,13 @@ impl BedrockModelProvider {
     }
 
     /// Parse assistant message containing structured tool calls.
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<ContentBlock>> {
+    /// Rebuild an assistant turn's blocks from the stored envelope.
+    /// `replay_thinking` gates the signed reasoning, which only the round
+    /// still in flight may resend.
+    fn parse_assistant_tool_call_message(
+        content: &str,
+        replay_thinking: bool,
+    ) -> Option<Vec<ContentBlock>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_calls = value
             .get("tool_calls")
@@ -1246,10 +1260,11 @@ impl BedrockModelProvider {
         // with reasoning content blocks (including signatures) before any
         // tool_use blocks. The reasoning_content field stores JSON-encoded
         // thinking blocks from the original response.
-        if let Some(reasoning) = value
-            .get("reasoning_content")
-            .and_then(serde_json::Value::as_str)
-            .filter(|r| !r.is_empty())
+        if replay_thinking
+            && let Some(reasoning) = value
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|r| !r.is_empty())
         {
             // reasoning_content may contain multiple JSON blocks joined by \n
             for part in reasoning.split('\n') {

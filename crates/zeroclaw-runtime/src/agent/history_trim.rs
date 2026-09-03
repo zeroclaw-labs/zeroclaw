@@ -253,6 +253,39 @@ pub fn breadcrumb() -> ChatMessage {
     ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
 }
 
+/// Drop replayable reasoning from the exchange still in flight.
+///
+/// Call this after editing the history of a live turn. A model that binds its
+/// reasoning to the conversation prefix rejects blocks whose prefix has since
+/// changed, and an in-loop trim changes exactly that. The text and tool calls
+/// of each turn stay; only the stored reasoning goes. Returns how many turns
+/// were touched.
+pub fn strip_in_flight_reasoning(history: &mut [ChatMessage]) -> usize {
+    let Some(exchange_start) = history
+        .iter()
+        .rposition(|msg| !matches!(msg.role.as_str(), "system" | "assistant" | "tool"))
+    else {
+        return 0;
+    };
+    let mut stripped = 0;
+    for msg in history.iter_mut().skip(exchange_start + 1) {
+        if msg.role != "assistant" {
+            continue;
+        }
+        let Ok(mut envelope) = serde_json::from_str::<serde_json::Value>(&msg.content) else {
+            continue;
+        };
+        let Some(object) = envelope.as_object_mut() else {
+            continue;
+        };
+        if object.remove("reasoning_content").is_some() {
+            msg.content = envelope.to_string();
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
 /// Insert the trim breadcrumb after the leading system messages, unless one is
 /// already sitting there.
 pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {

@@ -959,6 +959,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
+                    provider_request_model,
                     &e,
                     iteration,
                     event_tx.as_ref(),

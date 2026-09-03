@@ -629,7 +629,17 @@ impl AnthropicModelProvider {
         Some(native_tools)
     }
 
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<NativeContentOut>> {
+    /// Rebuild an assistant turn's blocks from the stored envelope.
+    ///
+    /// `replay_thinking` gates the signed reasoning blocks. Reasoning from an
+    /// earlier, finished round is not needed by the model and is not safe to
+    /// resend: a model that binds its reasoning to the conversation prefix
+    /// rejects blocks whose prefix has since changed, which any history trim
+    /// does.
+    fn parse_assistant_tool_call_message(
+        content: &str,
+        replay_thinking: bool,
+    ) -> Option<Vec<NativeContentOut>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_calls = value
             .get("tool_calls")
@@ -641,10 +651,11 @@ impl AnthropicModelProvider {
         // with thinking blocks (including signatures) before any tool_use
         // blocks. The reasoning_content field stores JSON-encoded thinking
         // blocks from the original response.
-        if let Some(reasoning) = value
-            .get("reasoning_content")
-            .and_then(serde_json::Value::as_str)
-            .filter(|r| !r.is_empty())
+        if replay_thinking
+            && let Some(reasoning) = value
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|r| !r.is_empty())
         {
             for part in reasoning.split('\n') {
                 if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
@@ -1081,10 +1092,22 @@ impl AnthropicModelProvider {
         })
     }
 
+    /// Index of the last message that opened a fresh exchange, meaning a
+    /// message the person sent rather than a system note or a tool result.
+    /// Everything after it is the tool round still in flight.
+    fn last_exchange_start(messages: &[ChatMessage]) -> Option<usize> {
+        messages.iter().enumerate().rev().find_map(|(index, msg)| {
+            let opens_exchange = !matches!(msg.role.as_str(), "system" | "assistant" | "tool");
+            (opens_exchange && !ChatMessage::should_skip_internal_pruning_marker(messages, index))
+                .then_some(index)
+        })
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> (Option<SystemPrompt>, Vec<NativeMessage>) {
         let mut system_text = None;
         let mut native_messages = Vec::new();
         let mut run = ToolResultRun::default();
+        let last_exchange_start = Self::last_exchange_start(messages);
 
         for (index, msg) in messages.iter().enumerate() {
             if ChatMessage::should_skip_internal_pruning_marker(messages, index) {
@@ -1105,7 +1128,10 @@ impl AnthropicModelProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    let replay_thinking = last_exchange_start.is_some_and(|start| index > start);
+                    if let Some(blocks) =
+                        Self::parse_assistant_tool_call_message(&msg.content, replay_thinking)
+                    {
                         run.begin(
                             blocks
                                 .iter()
@@ -5152,6 +5178,109 @@ data: {\"type\":\"message_stop\"}\n\n";
             json
         );
         assert!(json.contains(r#""data":"testdata""#), "JSON: {}", json);
+    }
+
+    #[test]
+    fn thinking_replays_only_for_the_round_still_in_flight() {
+        let envelope = |thinking: &str, signature: &str, call_id: &str| {
+            serde_json::json!({
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "name": "shell",
+                    "arguments": "{}",
+                }],
+                "reasoning_content": serde_json::json!({
+                    "thinking": thinking,
+                    "signature": signature,
+                })
+                .to_string(),
+            })
+            .to_string()
+        };
+        let messages = vec![
+            ChatMessage::user("first ask"),
+            ChatMessage::assistant(&envelope("earlier", "sig_old", "call_1")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+            ChatMessage::assistant("finished the first ask"),
+            ChatMessage::user("second ask"),
+            ChatMessage::assistant(&envelope("current", "sig_new", "call_2")),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
+                    .to_string(),
+            },
+        ];
+
+        let (_, native) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_value(&native).unwrap();
+        let assistant_turns: Vec<&serde_json::Value> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|msg| msg["role"] == "assistant")
+            .collect();
+
+        let signatures: Vec<&str> = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .filter_map(|block| block.get("signature").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            signatures,
+            vec!["sig_new"],
+            "only the in-flight round replays its reasoning: {wire:#}"
+        );
+
+        let in_flight = assistant_turns
+            .last()
+            .expect("the in-flight assistant turn must survive");
+        assert_eq!(
+            in_flight["content"][0]["type"], "thinking",
+            "an assistant message must start with its thinking: {in_flight:#}"
+        );
+    }
+
+    #[test]
+    fn thinking_replay_boundary_ignores_internal_pruning_markers() {
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": serde_json::json!({
+                "thinking": "current",
+                "signature": "sig_new",
+            })
+            .to_string(),
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("the ask"),
+            ChatMessage::assistant(&envelope),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
+                    .to_string(),
+            },
+        ];
+
+        let (_, native) = AnthropicModelProvider::convert_messages(&messages);
+        let wire = serde_json::to_value(&native).unwrap();
+        let has_signature = wire
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|msg| msg["content"].as_array().into_iter().flatten())
+            .any(|block| block.get("signature").is_some());
+        assert!(
+            has_signature,
+            "the only round present is in flight: {wire:#}"
+        );
     }
 
     #[test]
