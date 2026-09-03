@@ -537,7 +537,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let mut ctx = TurnCtx {
         observer,
         provider_name,
         model,
@@ -557,6 +557,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         agent_alias,
         parent_agent_alias,
+        serving_provider_name: None,
+        serving_model: None,
     };
 
     // Cross-agent SOP step contexts memoized for the WHOLE turn (see the
@@ -752,6 +754,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
+        // Vision routing override: set the per-iteration serving identity.
+        ctx.serving_provider_name = if vision_model_provider_box.is_some() {
+            Some(active_model_provider_name.to_string())
+        } else {
+            None
+        };
+        ctx.serving_model = if vision_model_provider_box.is_some() {
+            Some(active_model.to_string())
+        } else {
+            None
+        };
         let prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
@@ -777,6 +790,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // The hook may have changed the model actually sent; the serving identity
+        // must describe the post-hook model, not the pre-hook vision-routed one.
+        ctx.serving_model = Some(provider_request_model.to_string());
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
@@ -897,10 +913,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         // Reliable reports its actually served candidate; direct providers
-        // intentionally retain the requested route as the accounting fallback.
+        // use the vision-routing identity when present, otherwise the
+        // requested route as the accounting fallback.
         let (served_provider, served_model) = accepted_route
             .as_ref()
             .map(|route| (route.provider_ref(), route.model()))
+            .or_else(|| {
+                ctx.serving_provider_name
+                    .as_deref()
+                    .map(|p| (p, ctx.serving_model.as_deref().unwrap_or(provider_request_model)))
+            })
             .unwrap_or((ctx.provider_name, provider_request_model));
 
         // Reliable providers classify this before retries and fallback. Keep
@@ -1074,6 +1096,31 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &attempts[..attempts.len().saturating_sub(1)],
             None,
         );
+        // Emit TurnEvent::Usage for each billable rejected attempt so the
+        // gateway's usage_by_provider breakdown includes all billable attempts
+        // (accepted + rejected). This makes the breakdown the single source of
+        // truth that the done-frame cost_usd can be derived from.
+        if let Some(tx) = ctx.event_tx {
+            for billable in crate::agent::cost::billable_provider_attempts(
+                &attempts[..attempts.len().saturating_sub(1)],
+            ) {
+                let cost_usd = crate::agent::cost::compute_cost_usd(
+                    billable.attempt.provider_ref(),
+                    billable.attempt.model(),
+                    billable.usage,
+                );
+                let _ = tx
+                    .send(TurnEvent::Usage {
+                        input_tokens: billable.usage.input_tokens,
+                        cached_input_tokens: billable.usage.cached_input_tokens,
+                        output_tokens: billable.usage.output_tokens,
+                        cost_usd,
+                        provider_ref: billable.attempt.provider_ref().to_string(),
+                        model: billable.attempt.model().to_string(),
+                    })
+                    .await;
+            }
+        }
         record_accepted_chat_response(
             &ctx,
             served_provider,

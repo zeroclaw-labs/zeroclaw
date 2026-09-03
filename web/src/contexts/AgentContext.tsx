@@ -437,12 +437,22 @@ export function AgentProvider({
         }
         // Extract context window info from "done" frame (sent by gateway). See #7311.
         if (msg.type === 'done') {
-          if (typeof msg.max_context_tokens === 'number') {
-            setContextMaxTokens(msg.max_context_tokens);
+          // Prefer model_context_window (actual model capacity) for display,
+          // fall back to max_context_tokens (trim budget) for backward compat.
+          const displayMax = typeof msg.model_context_window === 'number'
+            ? msg.model_context_window
+            : msg.max_context_tokens;
+          if (typeof displayMax === 'number') {
+            setContextMaxTokens(displayMax);
           }
           // Prefer last_input_tokens (accurate per-turn prompt size) over
           // accumulated input_tokens for context-bar rendering.
-          if (typeof msg.last_input_tokens === 'number') {
+          // When last_input_tokens is explicitly null, the accepted route has no
+          // usage data; clear the input state and do NOT fall back to the
+          // accumulated input_tokens (which would be stale from a previous route).
+          if (msg.last_input_tokens === null) {
+            setContextInputTokens(null);
+          } else if (typeof msg.last_input_tokens === 'number') {
             setContextInputTokens(msg.last_input_tokens);
           } else if (typeof msg.input_tokens === 'number') {
             setContextInputTokens(msg.input_tokens);

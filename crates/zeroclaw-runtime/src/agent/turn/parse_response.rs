@@ -134,7 +134,7 @@ pub(crate) async fn interpret_chat_response(
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
+    let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
@@ -276,11 +276,31 @@ pub(crate) async fn record_accepted_chat_response(
     llm_started_at: Instant,
     iteration: usize,
 ) {
+    // The accepted_route tuple (passed as served_provider/model) is the
+    // canonical identity when Reliable wrapping produced an AcceptedRoute.
+    // ctx.serving_provider_name/ctx.serving_model are vision-routing and
+    // hook overrides that apply when vision routing selected a different
+    // provider than the base. They take precedence over the accepted_route
+    // when the accepted_route matches the base provider (indicating the
+    // accounting didn't capture the vision routing switch).
+    let effective_provider = if let Some(ref vision_provider) = ctx.serving_provider_name
+        && vision_provider != ctx.provider_name
+    {
+        vision_provider.as_str()
+    } else {
+        served_provider
+    };
+    let effective_model = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
+        ctx.serving_model.as_deref().unwrap_or(model)
+    } else {
+        model
+    };
+
     let input_tokens = usage.and_then(|usage| usage.input_tokens);
     let output_tokens = usage.and_then(|usage| usage.output_tokens);
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: served_provider.to_string(),
-        model: model.to_string(),
+        model_provider: effective_provider.to_string(),
+        model: effective_model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -293,17 +313,21 @@ pub(crate) async fn record_accepted_chat_response(
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
     let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
-    if let Some(tx) = ctx.event_tx
-        && let Some(usage) = usage
-    {
+    // Exactly-one per accepted response, even when the provider returned no
+    // usage data, so terminal identity and context-window accounting always
+    // describe the accepted serving provider/model. The caller settles
+    // rejected physical attempts separately and never reaches this point.
+    if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
+                input_tokens,
+                cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+                output_tokens,
                 cost_usd,
+                provider_ref: effective_provider.to_string(),
+                model: effective_model.to_string(),
             })
             .await;
     }
@@ -314,7 +338,7 @@ pub(crate) async fn record_accepted_chat_response(
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": model,
+                "model": effective_model,
                 "iteration": iteration + 1,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -496,6 +520,8 @@ mod cost_usd_regression_tests {
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let specs = IterationToolSpecs {
@@ -524,7 +550,7 @@ mod cost_usd_regression_tests {
         let mut log_rx = zeroclaw_log::subscribe_or_install();
         while log_rx.try_recv().is_ok() {}
 
-        // Run interpret_chat_response inside the cost scope so
+        // Parse, then record the accepted response inside the cost scope so
         // record_tool_loop_cost_usage sees the pricing map.
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -560,7 +586,7 @@ mod cost_usd_regression_tests {
         // (a) The Usage event must carry the cost.
         let event = rx
             .try_recv()
-            .expect("interpret_chat_response should emit a TurnEvent::Usage");
+            .expect("record_accepted_chat_response should emit a TurnEvent::Usage");
         match event {
             TurnEvent::Usage { cost_usd, .. } => {
                 let c = cost_usd.expect("Usage event must carry cost_usd, got None");
@@ -636,6 +662,8 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
+            serving_provider_name: None,
+            serving_model: None,
         };
         let specs = IterationToolSpecs {
             tool_specs: vec![crate::tools::ToolSpec::new(

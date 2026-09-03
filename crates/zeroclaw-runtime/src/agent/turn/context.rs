@@ -1,4 +1,6 @@
-//! Shared read-only context for the per-iteration turn step functions.
+//! Shared context for the per-iteration turn step functions. Most fields are
+//! immutable for the turn; `serving_provider_name` and `serving_model` are
+//! mutated per iteration when vision routing selects a different provider.
 
 use super::events::DraftEvent;
 use crate::approval::ApprovalManager;
@@ -34,6 +36,19 @@ pub(crate) struct TurnCtx<'a> {
     /// the EFFECTIVE agent whose policy/tools execute; this keeps the parent
     /// correlation on every emitted record. `None` for ordinary turns.
     pub(crate) parent_agent_alias: Option<&'a str>,
+    /// Per-iteration override for the provider that served the current LLM
+    /// call when vision routing resolved a different provider. Owned `String`
+    /// because the vision-resolved name's lifetime is the iteration scope.
+    /// This is only used for vision routing without Reliable wrapping;
+    /// when Reliable produces an AcceptedRoute, the AcceptedRoute tuple is
+    /// the authoritative identity and this field is ignored.
+    pub(crate) serving_provider_name: Option<String>,
+    /// Per-iteration override for the model that served the current LLM call
+    /// when vision routing selected a different model. This is only used for
+    /// vision routing without Reliable wrapping; when Reliable produces an
+    /// AcceptedRoute, the AcceptedRoute tuple is the authoritative identity
+    /// and this field is ignored.
+    pub(crate) serving_model: Option<String>,
 }
 
 /// Lightweight metadata for turn-level event emission.
