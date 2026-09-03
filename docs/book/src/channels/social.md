@@ -8,9 +8,7 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 
 Twitch chat is a thin adapter over IRC. Build it with `--features channel-twitch` or include it through `--features channels-full`; the lean default build does not include it.
 
-{{#config-fields channels.twitch}}
-
-A minimal instance looks like this:
+Configure `enabled`, `bot_username`, `oauth_token`, and the channels to join under a Twitch alias. `mention_only` is optional and defaults to `false`. A minimal instance looks like this:
 
 ```toml
 [channels.twitch.default]
