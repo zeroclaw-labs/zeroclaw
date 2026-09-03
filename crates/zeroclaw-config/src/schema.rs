@@ -1148,9 +1148,41 @@ impl ModelEndpoint for AnthropicEndpoint {
     }
 }
 
-/// Anthropic model model_provider config. No family-specific extras yet — typed
-/// slot reserved for future Anthropic-only knobs (cache_control, beta
-/// headers) so they land cleanly without another schema rework.
+/// How much of the model's reasoning comes back inside thinking blocks.
+/// Applies to the Claude generations that think adaptively; older ones ignore
+/// it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingDisplay {
+    /// Blocks arrive signed but with their text withheld, which is the API's
+    /// own default.
+    #[default]
+    Omitted,
+    /// Blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer models only.
+    Updates,
+}
+
+impl AnthropicThinkingDisplay {
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Omitted => None,
+            Self::Summarized => Some("summarized"),
+            Self::Updates => Some("updates"),
+        }
+    }
+}
+
+/// Anthropic model model_provider config. Carries the Anthropic-only reasoning
+/// visibility knob; the typed slot stays the landing place for future
+/// Anthropic-only extras (cache_control, beta headers).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.anthropic"]
@@ -1158,6 +1190,13 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// How much of the model's reasoning is returned: `summarized` for a
+    /// readable summary, `updates` for the short progress notes written
+    /// between tool calls. Leave unset for the API default, which withholds
+    /// the text. Signed reasoning is replayed within a tool round either way;
+    /// this only controls what a person can read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -29116,6 +29155,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                thinking_display: None,
             },
         );
         config.save().await.unwrap();
@@ -29307,6 +29347,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                thinking_display: None,
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -31344,6 +31385,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                thinking_display: None,
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -42627,6 +42669,50 @@ group_policy = "ignore"
                 .as_str(),
             "custom.kimi-k2-5"
         );
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_round_trips_through_toml() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+thinking_display = "summarized"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config
+            .providers
+            .models
+            .anthropic
+            .get("fable")
+            .expect("alias should exist");
+        assert_eq!(
+            entry.thinking_display,
+            Some(AnthropicThinkingDisplay::Summarized)
+        );
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(rendered.contains("thinking_display = \"summarized\""));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_is_absent_when_unset() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+model = "claude-fable-5-1"
+"#;
+        let config: Config = toml::from_str(toml).expect("config should parse");
+        let entry = config.providers.models.anthropic.get("fable").unwrap();
+        assert_eq!(entry.thinking_display, None);
+        let rendered = toml::to_string(&config).expect("config should serialize");
+        assert!(!rendered.contains("thinking_display"));
+    }
+
+    #[test]
+    async fn anthropic_thinking_display_rejects_an_unknown_value() {
+        let toml = r#"
+[providers.models.anthropic.fable]
+thinking_display = "verbose"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     #[test]
