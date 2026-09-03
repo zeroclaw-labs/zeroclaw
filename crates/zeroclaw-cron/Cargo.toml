@@ -1,0 +1,40 @@
+[package]
+name = "zeroclaw-cron"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cron scheduling and job lifecycle for ZeroClaw: schedule parsing, the job and run store, declarative reconciliation, in-flight claim ownership, precondition gates, and run-outcome classification."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-log.workspace = true
+
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+cron = "0.15"
+chrono-tz = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot = "0.12"
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.50", default-features = false, features = ["macros", "process", "rt", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7", default-features = false }
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+fluent = "0.16"
+unic-langid = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# The scheduler's delivery tests stand up a real HTTP endpoint and spawn a
+# server task, so these are test-only rather than part of the crate's surface.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+zeroclaw-spawn.workspace = true
+tempfile = "3"
+toml = "0.9"
+which = "8"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

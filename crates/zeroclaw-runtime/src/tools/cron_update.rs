@@ -1,7 +1,6 @@
 use super::cron_common::{
     AT_DESCRIPTION, CRON_TZ_DESCRIPTION, cron_job_output, deserialize_patch_arg,
 };
-use crate::cron;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -9,6 +8,7 @@ use std::sync::Arc;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_cron as cron;
 
 pub struct CronUpdateTool {
     config: Arc<Config>,
@@ -838,12 +838,12 @@ mod tests {
             &cfg,
             TEST_AGENT,
             None,
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
             "check status",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,
@@ -887,12 +887,12 @@ mod tests {
             &cfg,
             TEST_AGENT,
             None,
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
             "old prompt",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,
@@ -927,12 +927,12 @@ mod tests {
             &cfg,
             TEST_AGENT,
             None,
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".into(),
                 tz: None,
             },
             "check status",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,
@@ -965,7 +965,7 @@ mod tests {
             &cfg,
             TEST_AGENT,
             Some("morning_briefing".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 7 * * 1-5".into(),
                 tz: None,
             },
@@ -1006,17 +1006,17 @@ mod tests {
 
     /// A job owned by someone else. An agent job needs no risk profile for its
     /// owner, which keeps the fixture to the ownership boundary.
-    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+    fn other_agents_job(cfg: &Config) -> zeroclaw_cron::CronJob {
         cron::add_agent_job(
             cfg,
             "other-agent",
             Some("secret_job".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 8 * * *".into(),
                 tz: None,
             },
             "read the other agent's inbox",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,

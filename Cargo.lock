@@ -8683,6 +8683,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "165ca6e57b20e1351573e3729b958bc62f0e48025386970b6e4d29e7a7e71f3f"
 dependencies = [
  "bitflags 2.13.1",
+ "chrono",
  "fallible-iterator 0.3.0",
  "fallible-streaming-iterator",
  "hashlink",
@@ -13636,6 +13637,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-cron",
  "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
@@ -13819,6 +13821,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-cron"
+version = "0.8.4"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "fluent",
+ "futures-util",
+ "libc",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "unic-langid",
+ "uuid",
+ "which",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-log",
+ "zeroclaw-spawn",
+]
+
+[[package]]
 name = "zeroclaw-desktop"
 version = "0.8.4"
 dependencies = [
@@ -13907,6 +13938,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-cron",
  "zeroclaw-hardware",
  "zeroclaw-infra",
  "zeroclaw-log",
@@ -14194,6 +14226,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-commands",
  "zeroclaw-config",
+ "zeroclaw-cron",
  "zeroclaw-infra",
  "zeroclaw-log",
  "zeroclaw-macros",

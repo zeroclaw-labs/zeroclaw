@@ -1,4 +1,3 @@
-use crate::cron::{self, JobType};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -6,6 +5,8 @@ use std::sync::Arc;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_cron as cron;
+use zeroclaw_cron::JobType;
 
 pub struct CronRunTool {
     config: Arc<Config>,
@@ -459,17 +460,17 @@ mod tests {
 
     /// A job owned by someone else. An agent job needs no risk profile for its
     /// owner, which keeps the fixture to the ownership boundary.
-    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+    fn other_agents_job(cfg: &Config) -> zeroclaw_cron::CronJob {
         cron::add_agent_job(
             cfg,
             "other-agent",
             Some("secret_job".into()),
-            crate::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 8 * * *".into(),
                 tz: None,
             },
             "read the other agent's inbox",
-            crate::cron::SessionTarget::Isolated,
+            zeroclaw_cron::SessionTarget::Isolated,
             None,
             None,
             false,

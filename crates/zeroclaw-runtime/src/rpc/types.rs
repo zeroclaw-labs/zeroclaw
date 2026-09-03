@@ -6,7 +6,6 @@ use serde_json::Value;
 // ── Re-exports: types that already derive Serialize + Deserialize ────
 // Consumers can `use zeroclaw_runtime::rpc::types::*` and get everything.
 
-pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
@@ -14,6 +13,7 @@ pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
 pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
+pub use zeroclaw_cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 
 // ── Derive helper ────────────────────────────────────────────────────
 

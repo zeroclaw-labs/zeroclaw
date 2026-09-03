@@ -120,7 +120,7 @@ pub struct CronAddBody {
     pub command: Option<String>,
     pub job_type: Option<String>,
     pub prompt: Option<String>,
-    pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+    pub delivery: Option<zeroclaw_cron::DeliveryConfig>,
     /// Agent session context: `"isolated"` (default) or `"main"`. For agent jobs,
     /// a present value that is not one of those two names is rejected; omitted
     /// keeps the isolated default. Same contract as the `cron_add` tool. Shell
@@ -217,9 +217,9 @@ fn parse_timezone_patch(
 fn cron_schedule_from_api(
     expr: String,
     tz: Option<String>,
-) -> Result<zeroclaw_runtime::cron::Schedule, (StatusCode, Json<serde_json::Value>)> {
-    let schedule = zeroclaw_runtime::cron::Schedule::Cron { expr, tz };
-    zeroclaw_runtime::cron::validate_schedule(&schedule, chrono::Utc::now())
+) -> Result<zeroclaw_cron::Schedule, (StatusCode, Json<serde_json::Value>)> {
+    let schedule = zeroclaw_cron::Schedule::Cron { expr, tz };
+    zeroclaw_cron::validate_schedule(&schedule, chrono::Utc::now())
         .map_err(|e| bad_request(format!("Invalid cron schedule: {e}")))?;
     Ok(schedule)
 }
@@ -398,7 +398,7 @@ pub async fn handle_api_cron_list(
     }
 
     let config = state.config.read().clone();
-    match zeroclaw_runtime::cron::list_jobs(&config) {
+    match zeroclaw_cron::list_jobs(&config) {
         Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -453,7 +453,7 @@ pub async fn handle_api_cron_add(
         Ok(schedule) => schedule,
         Err(e) => return e.into_response(),
     };
-    if let Err(e) = zeroclaw_runtime::cron::validate_delivery_config(delivery.as_ref()) {
+    if let Err(e) = zeroclaw_cron::validate_delivery_config(delivery.as_ref()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
@@ -484,17 +484,17 @@ pub async fn handle_api_cron_add(
         };
 
         let session_target = match session_target {
-            Some(raw) => match zeroclaw_runtime::cron::SessionTarget::try_parse(&raw) {
+            Some(raw) => match zeroclaw_cron::SessionTarget::try_parse(&raw) {
                 Ok(target) => target,
                 Err(e) => return bad_request(e).into_response(),
             },
-            None => zeroclaw_runtime::cron::SessionTarget::Isolated,
+            None => zeroclaw_cron::SessionTarget::Isolated,
         };
 
-        let default_delete = matches!(schedule, zeroclaw_runtime::cron::Schedule::At { .. });
+        let default_delete = matches!(schedule, zeroclaw_cron::Schedule::At { .. });
         let delete_after_run = delete_after_run.unwrap_or(default_delete);
 
-        zeroclaw_runtime::cron::add_agent_job(
+        zeroclaw_cron::add_agent_job(
             &config,
             &agent_alias,
             name,
@@ -520,7 +520,7 @@ pub async fn handle_api_cron_add(
         };
 
         let fmt = shell_output_format.unwrap_or_default();
-        zeroclaw_runtime::cron::add_shell_job_with_approval_and_format(
+        zeroclaw_cron::add_shell_job_with_approval_and_format(
             &config,
             &agent_alias,
             name,
@@ -557,7 +557,7 @@ pub async fn handle_api_cron_runs(
     let config = state.config.read().clone();
 
     // Verify the job exists before listing runs.
-    if let Err(e) = zeroclaw_runtime::cron::get_job(&config, &id) {
+    if let Err(e) = zeroclaw_cron::get_job(&config, &id) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
@@ -565,7 +565,7 @@ pub async fn handle_api_cron_runs(
             .into_response();
     }
 
-    match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
+    match zeroclaw_cron::list_runs(&config, &id, limit) {
         Ok(runs) => {
             let runs_json: Vec<serde_json::Value> = runs
                 .iter()
@@ -603,7 +603,7 @@ pub async fn handle_api_cron_run(
 
     let config = state.config.read().clone();
 
-    let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
+    let job = match zeroclaw_cron::get_job(&config, &id) {
         Ok(job) => job,
         Err(e) => {
             return (
@@ -615,10 +615,10 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_cron::scheduler::run_manual_job(
         &config,
         &job,
-        zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+        zeroclaw_cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
     )
     .await;
@@ -665,7 +665,7 @@ pub async fn handle_api_cron_patch(
         Err(e) => return e.into_response(),
     };
 
-    let existing = match zeroclaw_runtime::cron::get_job(&config, &id) {
+    let existing = match zeroclaw_cron::get_job(&config, &id) {
         Ok(j) => j,
         Err(e) => {
             return (
@@ -675,7 +675,7 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
-    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    let is_agent = matches!(existing.job_type, zeroclaw_cron::JobType::Agent);
     if shell_output_format.is_some() {
         if is_agent {
             return bad_request(
@@ -713,14 +713,12 @@ pub async fn handle_api_cron_patch(
         let (expr, existing_tz) = match (&existing.schedule, new_expr) {
             (_, Some(expr)) => {
                 let existing_tz = match &existing.schedule {
-                    zeroclaw_runtime::cron::Schedule::Cron { tz, .. } => tz.clone(),
+                    zeroclaw_cron::Schedule::Cron { tz, .. } => tz.clone(),
                     _ => None,
                 };
                 (expr, existing_tz)
             }
-            (zeroclaw_runtime::cron::Schedule::Cron { expr, tz }, None) => {
-                (expr.clone(), tz.clone())
-            }
+            (zeroclaw_cron::Schedule::Cron { expr, tz }, None) => (expr.clone(), tz.clone()),
             (_, None) => {
                 return bad_request("tz can only be updated on cron schedules").into_response();
             }
@@ -743,7 +741,7 @@ pub async fn handle_api_cron_patch(
         (command.or(prompt), None)
     };
 
-    let patch = zeroclaw_runtime::cron::CronJobPatch {
+    let patch = zeroclaw_cron::CronJobPatch {
         name,
         schedule,
         command: patch_command,
@@ -751,16 +749,10 @@ pub async fn handle_api_cron_patch(
         enabled,
         uses_memory,
         shell_output_format,
-        ..zeroclaw_runtime::cron::CronJobPatch::default()
+        ..zeroclaw_cron::CronJobPatch::default()
     };
 
-    match zeroclaw_runtime::cron::update_shell_job_with_approval(
-        &config,
-        &agent_alias,
-        &id,
-        patch,
-        false,
-    ) {
+    match zeroclaw_cron::update_shell_job_with_approval(&config, &agent_alias, &id, patch, false) {
         Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -781,7 +773,7 @@ pub async fn handle_api_cron_delete(
     }
 
     let config = state.config.read().clone();
-    match zeroclaw_runtime::cron::remove_job(&config, &id) {
+    match zeroclaw_cron::remove_job(&config, &id) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3872,13 +3864,13 @@ pub(crate) mod tests {
         assert_eq!(json["status"], "ok");
 
         let config = state.config.read().clone();
-        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        let jobs = zeroclaw_cron::list_jobs(&config).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
+        assert_eq!(jobs[0].job_type, zeroclaw_cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
         assert_eq!(
             jobs[0].session_target,
-            zeroclaw_runtime::cron::SessionTarget::Isolated
+            zeroclaw_cron::SessionTarget::Isolated
         );
     }
 
@@ -3913,12 +3905,9 @@ pub(crate) mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let config = state.config.read().clone();
-        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        let jobs = zeroclaw_cron::list_jobs(&config).unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(
-            jobs[0].session_target,
-            zeroclaw_runtime::cron::SessionTarget::Main
-        );
+        assert_eq!(jobs[0].session_target, zeroclaw_cron::SessionTarget::Main);
     }
 
     #[tokio::test]
@@ -3951,11 +3940,8 @@ pub(crate) mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let jobs = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap();
-        assert_eq!(
-            jobs[0].session_target,
-            zeroclaw_runtime::cron::SessionTarget::Main
-        );
+        let jobs = zeroclaw_cron::list_jobs(&state.config.read().clone()).unwrap();
+        assert_eq!(jobs[0].session_target, zeroclaw_cron::SessionTarget::Main);
     }
 
     #[tokio::test]
@@ -3995,7 +3981,7 @@ pub(crate) mod tests {
             "error should name the field, got {error}"
         );
         assert!(
-            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+            zeroclaw_cron::list_jobs(&state.config.read().clone())
                 .unwrap()
                 .is_empty(),
             "invalid session_target must not persist a job"
@@ -4040,7 +4026,7 @@ pub(crate) mod tests {
                 .contains("session_target")
         );
         assert!(
-            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+            zeroclaw_cron::list_jobs(&state.config.read().clone())
                 .unwrap()
                 .is_empty()
         );
@@ -4076,10 +4062,10 @@ pub(crate) mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let config = state.config.read().clone();
-        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        let jobs = zeroclaw_cron::list_jobs(&config).unwrap();
         assert_eq!(
             jobs[0].schedule,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: Some("America/New_York".to_string()),
             }
@@ -4134,11 +4120,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("localized-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: Some("Europe/Berlin".to_string()),
             },
@@ -4164,11 +4150,11 @@ pub(crate) mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert_eq!(
             updated.schedule,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "30 9 * * *".to_string(),
                 tz: Some("Europe/Berlin".to_string()),
             }
@@ -4185,11 +4171,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("localized-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: Some("America/New_York".to_string()),
             },
@@ -4216,11 +4202,11 @@ pub(crate) mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert_eq!(
             updated.schedule,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "30 9 * * *".to_string(),
                 tz: Some("Asia/Tokyo".to_string()),
             }
@@ -4237,11 +4223,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("runtime-local-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: None,
             },
@@ -4267,11 +4253,11 @@ pub(crate) mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert_eq!(
             updated.schedule,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: Some("America/Chicago".to_string()),
             }
@@ -4288,11 +4274,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("localized-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: Some("America/New_York".to_string()),
             },
@@ -4337,11 +4323,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("localized-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: Some("America/New_York".to_string()),
             },
@@ -4367,11 +4353,11 @@ pub(crate) mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert_eq!(
             updated.schedule,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "0 9 * * *".to_string(),
                 tz: None,
             }
@@ -4388,11 +4374,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("toggle-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
@@ -4420,8 +4406,8 @@ pub(crate) mod tests {
             StatusCode::OK,
             "enable/disable toggle must not require an agent"
         );
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert!(!updated.enabled, "job should be disabled after the patch");
     }
 
@@ -4435,11 +4421,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("old-name".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
@@ -4470,12 +4456,12 @@ pub(crate) mod tests {
             StatusCode::OK,
             "name/schedule patch must not require an agent"
         );
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert_eq!(updated.name.as_deref(), Some("new-name"));
         assert_eq!(
             updated.schedule,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "30 9 * * *".to_string(),
                 tz: None,
             }
@@ -4492,11 +4478,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("shell-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
@@ -4547,11 +4533,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("shell-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
@@ -4615,7 +4601,7 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(add_response.status(), StatusCode::OK);
-        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+        let id = zeroclaw_cron::list_jobs(&state.config.read().clone()).unwrap()[0]
             .id
             .clone();
 
@@ -4640,8 +4626,8 @@ pub(crate) mod tests {
             StatusCode::OK,
             "agent-type prompt patch must not require an agent"
         );
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &id).expect("updated job");
         assert_eq!(updated.prompt.as_deref(), Some("new prompt"));
     }
 
@@ -4655,11 +4641,11 @@ pub(crate) mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             Some("format-job".to_string()),
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
@@ -4697,8 +4683,8 @@ pub(crate) mod tests {
             StatusCode::OK,
             "an imperative job's shell_output_format is a real, storable mutation"
         );
-        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
-            .expect("updated job");
+        let updated =
+            zeroclaw_cron::get_job(&state.config.read().clone(), &job.id).expect("updated job");
         assert_eq!(
             updated.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -4757,11 +4743,12 @@ pub(crate) mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let mut decls = std::collections::HashMap::new();
         decls.insert("decl-job".to_string(), decl.clone());
         config.cron.insert("decl-job".to_string(), decl);
-        zeroclaw_runtime::cron::sync_declarative_jobs(&config, &decls).unwrap();
+        zeroclaw_cron::sync_declarative_jobs(&config, &decls).unwrap();
         let state = test_state(config);
 
         let response = handle_api_cron_patch(
@@ -4793,8 +4780,7 @@ pub(crate) mod tests {
             error.contains("cron.decl-job.shell_output_format"),
             "error should name the exact config key to edit instead: {error}"
         );
-        let unchanged =
-            zeroclaw_runtime::cron::get_job(&state.config.read().clone(), "decl-job").unwrap();
+        let unchanged = zeroclaw_cron::get_job(&state.config.read().clone(), "decl-job").unwrap();
         assert_eq!(
             unchanged.shell_output_format,
             zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
@@ -4830,7 +4816,7 @@ pub(crate) mod tests {
         .await
         .into_response();
         assert_eq!(add_response.status(), StatusCode::OK);
-        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+        let id = zeroclaw_cron::list_jobs(&state.config.read().clone()).unwrap()[0]
             .id
             .clone();
 
@@ -4907,7 +4893,7 @@ pub(crate) mod tests {
             "error should explain the field does not apply to agent jobs"
         );
         assert!(
-            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+            zeroclaw_cron::list_jobs(&state.config.read().clone())
                 .unwrap()
                 .is_empty(),
             "a rejected create must not persist a job"
@@ -4955,11 +4941,7 @@ pub(crate) mod tests {
         );
 
         let config = state.config.read().clone();
-        assert!(
-            zeroclaw_runtime::cron::list_jobs(&config)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(zeroclaw_cron::list_jobs(&config).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4973,11 +4955,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
 
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             None,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
@@ -5008,7 +4990,7 @@ pub(crate) mod tests {
                 .contains("hello-from-manual-trigger")
         );
 
-        let runs = zeroclaw_runtime::cron::list_runs(&state.config.read().clone(), &job.id, 10)
+        let runs = zeroclaw_cron::list_runs(&state.config.read().clone(), &job.id, 10)
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
@@ -5016,7 +4998,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn cron_api_run_records_best_effort_delivery_failure_as_degraded() {
-        zeroclaw_runtime::cron::scheduler::register_delivery_fn(Box::new(
+        zeroclaw_cron::scheduler::register_delivery_fn(Box::new(
             |_config, channel, _target, _thread_id, _output| {
                 Box::pin(async move {
                     if channel == "fail-delivery" {
@@ -5036,16 +5018,16 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(with_test_agent(config));
 
-        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let job = zeroclaw_cron::add_shell_job_with_approval(
             &state.config.read().clone(),
             "test-agent",
             None,
-            zeroclaw_runtime::cron::Schedule::Cron {
+            zeroclaw_cron::Schedule::Cron {
                 expr: "*/5 * * * *".to_string(),
                 tz: None,
             },
             "echo hello-from-manual-trigger",
-            Some(zeroclaw_runtime::cron::DeliveryConfig {
+            Some(zeroclaw_cron::DeliveryConfig {
                 mode: "announce".into(),
                 channel: Some("fail-delivery".into()),
                 to: Some("123456".into()),
@@ -5074,7 +5056,7 @@ pub(crate) mod tests {
         );
 
         let config = state.config.read().clone();
-        let updated = zeroclaw_runtime::cron::get_job(&config, &job.id).expect("updated job");
+        let updated = zeroclaw_cron::get_job(&config, &job.id).expect("updated job");
         assert_eq!(updated.last_status.as_deref(), Some("degraded"));
         assert!(
             updated
@@ -5084,7 +5066,7 @@ pub(crate) mod tests {
                 .contains("delivery failed:")
         );
 
-        let runs = zeroclaw_runtime::cron::list_runs(&config, &job.id, 10).expect("runs listed");
+        let runs = zeroclaw_cron::list_runs(&config, &job.id, 10).expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "degraded");
         assert!(
