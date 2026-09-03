@@ -1,0 +1,16 @@
+zerodroid
+Copyright 2026 Jason Perlow / nclawzero (ncz-os)
+
+Native Android packaging, build tooling, and runtime config for ZeroClaw
+(https://github.com/zeroclaw-labs/zeroclaw), licensed under the Apache License,
+Version 2.0. This product includes software developed by the ZeroClaw project.
+
+The Accessibility UI-control service and floating overlay include portions
+based on CellClaw (https://github.com/zeroclaw-labs/cellclaw). CellClaw's
+copyright holder incorporated those portions through this contribution under
+ZeroClaw's repository contribution terms. See the root LICENSE-MIT and
+LICENSE-APACHE files. The zerodroid-origin portions above remain Apache-2.0.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this project except in compliance with the License. You may obtain a copy at:
+    http://www.apache.org/licenses/LICENSE-2.0

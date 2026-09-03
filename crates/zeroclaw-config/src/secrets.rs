@@ -621,10 +621,11 @@ fn is_already_exists_error(err: &anyhow::Error) -> bool {
 /// Write `key` as hex to `key_path` with restrictive permissions, using atomic
 /// no-replace publication: full content is written and durably flushed to a
 /// private temp file, hardened, then published to the final path with a
-/// create-if-absent atomic operation — `hard_link` on Unix (EEXIST if present),
-/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows
-/// (ERROR_ALREADY_EXISTS if present).  `std::fs::rename` is not used on Windows
-/// as it would replace an existing key.
+/// create-if-absent atomic operation — `renameat2(RENAME_NOREPLACE)` on Android
+/// (where SELinux forbids app hard links), `hard_link` on other Unix targets
+/// (EEXIST if present), or `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING` on Windows (ERROR_ALREADY_EXISTS if present).
+/// Plain `std::fs::rename` is not used because it may replace an existing key.
 fn write_key_file_atomic_publish(key_path: &Path, key: &[u8]) -> Result<()> {
     write_key_file_atomic_publish_with(key_path, key, |f, bytes| {
         f.write_all(bytes)?;
@@ -701,11 +702,36 @@ where
     #[cfg(not(any(unix, windows)))]
     compile_error!(
         "atomic key publication requires a platform no-replace mechanism \
-         (hard_link on Unix, MoveFileExW on Windows); unsupported target"
+         (renameat2 on Android, hard_link on other Unix, MoveFileExW on Windows); \
+         unsupported target"
     );
 
-    // Unix: hard_link(temp, final) fails with EEXIST if final exists.
-    #[cfg(unix)]
+    // Android SELinux has a blanket neverallow on hard links from untrusted
+    // apps, including inside their own app_data_file sandbox. The Linux
+    // renameat2 syscall with RENAME_NOREPLACE provides the same atomic
+    // create-if-absent contract without requiring the denied `link`
+    // permission. A missing kernel syscall fails closed rather than falling
+    // back to a replacement-capable rename.
+    #[cfg(target_os = "android")]
+    {
+        match rename_file_no_replace_android(&temp_path, key_path) {
+            Ok(()) => {
+                // The temp path was renamed away; there is nothing for the
+                // guard to clean up.
+                temp_guard.disarm();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(e)
+                    .context("Key file already exists — another process created it concurrently");
+            }
+            Err(e) => return Err(e).context("Failed to atomically publish key file on Android"),
+        }
+        sync_parent_dir(key_path)?;
+    }
+
+    // Other Unix targets: hard_link(temp, final) fails with EEXIST if final
+    // exists. Android is deliberately excluded by the SELinux rule above.
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         match std::fs::hard_link(&temp_path, key_path) {
             Ok(()) => {}
@@ -749,6 +775,45 @@ where
     }
 
     Ok(())
+}
+
+/// Android/bionic does not expose a stable libc wrapper for `renameat2` at all
+/// supported API levels, so invoke the kernel syscall directly. Android's
+/// supported kernels provide `RENAME_NOREPLACE`; returning ENOSYS/EINVAL is a
+/// hard failure because replacing an existing master key is never safe.
+#[cfg(target_os = "android")]
+fn rename_file_no_replace_android(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let src = CString::new(src.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "source path contains NUL")
+    })?;
+    let dst = CString::new(dst.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains NUL",
+        )
+    })?;
+
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the
+    // syscall; AT_FDCWD makes both paths relative to the current process.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Sync the parent directory so the new name is crash-durable.

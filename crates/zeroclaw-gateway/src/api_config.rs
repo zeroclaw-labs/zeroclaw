@@ -3916,7 +3916,11 @@ mod tests {
 
     #[test]
     fn every_gateway_secret_is_classified() {
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.webhook_secret"];
+        // Embedders/operators provision these values in config; the gateway
+        // only validates request headers and never mints, rotates or persists
+        // either credential.
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] =
+            &["gateway.loopback_admin_secret", "gateway.webhook_secret"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg
