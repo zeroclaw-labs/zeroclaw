@@ -5548,7 +5548,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         };
         let messages = vec![
             ChatMessage::user("first ask"),
-            ChatMessage::assistant(&envelope("earlier", "sig_old", "call_1")),
+            ChatMessage::assistant(envelope("earlier", "sig_old", "call_1")),
             ChatMessage {
                 role: "tool".to_string(),
                 content: serde_json::json!({"tool_call_id": "call_1", "content": "done"})
@@ -5556,7 +5556,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             },
             ChatMessage::assistant("finished the first ask"),
             ChatMessage::user("second ask"),
-            ChatMessage::assistant(&envelope("current", "sig_new", "call_2")),
+            ChatMessage::assistant(envelope("current", "sig_new", "call_2")),
             ChatMessage {
                 role: "tool".to_string(),
                 content: serde_json::json!({"tool_call_id": "call_2", "content": "done"})
