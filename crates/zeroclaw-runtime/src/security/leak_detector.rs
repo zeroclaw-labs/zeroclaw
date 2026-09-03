@@ -8,6 +8,139 @@ use zeroclaw_config::schema::LeakDetectionConfig;
 /// Minimum token length considered for high-entropy detection.
 const ENTROPY_TOKEN_MIN_LEN: usize = 24;
 
+/// Keys that announce a credential value, paired with the value length their
+/// detector needs before it matches. Word parts join with an optional `_` or
+/// `-`, mirroring the `api[_-]?key` and `aws[_-]?secret[_-]?access[_-]?key`
+/// forms. Longest first, so a key that contains a shorter one is measured
+/// against its own threshold.
+///
+/// The regex sets in `check_api_keys`, `check_aws_credentials` and
+/// `check_generic_secrets` remain the source of truth for what is a credential.
+/// This table answers a different question those regexes cannot: whether a
+/// match is *still possible* in text that has not finished arriving.
+/// `withhold_thresholds_match_the_detector_patterns` fails if the two drift.
+const CREDENTIAL_KEY_THRESHOLDS: &[(&[&str], usize)] = &[
+    (&["aws", "secret", "access", "key"], 40),
+    (&["api", "key"], 20),
+    (&["token"], 20),
+    (&["secret"], 16),
+    (&["password"], 8),
+];
+
+/// How far back from the end a partial credential can begin: the longest key,
+/// its separator and quotes, and the largest threshold, with headroom.
+const MAX_INCOMPLETE_CREDENTIAL_LEN: usize = 128;
+
+/// Whether the tail of `content` could still become a credential once more of
+/// the stream arrives, and if so the byte offset where it begins.
+///
+/// A streaming surface publishes text before the response is complete, and a
+/// detector can only recognise a credential once enough of the value is
+/// present. The text published before that point is not redacted, and a
+/// rendered frame cannot be retracted — a later edit replaces what is on
+/// screen, but a reader has already seen it. A caller that withholds from this
+/// offset publishes only text no later delta can turn into a credential, which
+/// also keeps successive frames monotonic: the withheld region is republished
+/// as the detector's replacement, which extends what was already shown rather
+/// than contradicting it.
+///
+/// Returns `None` when nothing is pending, including when a value has already
+/// reached its threshold — the detector redacts that itself, and withholding it
+/// would stall the surface for the rest of the turn.
+///
+/// Scope: keys announce these credentials, so a value with no key before it —
+/// a bare high-entropy token, a JWT — is not covered. Withholding every long
+/// unbroken run of characters would hold back ordinary text such as a URL or a
+/// hash, and those detectors are heuristic rather than keyed.
+pub fn incomplete_credential_tail(content: &str) -> Option<usize> {
+    let window_start = content.len().saturating_sub(MAX_INCOMPLETE_CREDENTIAL_LEN);
+    let bytes = content.as_bytes();
+    for start in window_start..content.len() {
+        if !content.is_char_boundary(start) {
+            continue;
+        }
+        for (parts, threshold) in CREDENTIAL_KEY_THRESHOLDS {
+            if credential_could_begin_at(bytes, start, parts, *threshold) {
+                return Some(start);
+            }
+        }
+    }
+    None
+}
+
+/// Whether a credential written with this key could begin at `start`, counting
+/// a key that is itself still arriving.
+///
+/// The key matters as much as the value. Deltas split wherever the provider
+/// happens to break, so `token` can arrive as `to` and then `ken=`. Waiting for
+/// the whole key before withholding would publish `to`, then retract it one
+/// frame later — a contradiction, and on Teams a rejected frame. Running out of
+/// input mid-key is therefore pending, like running out mid-value.
+///
+/// The cost is a few trailing characters held whenever text ends on a prefix of
+/// one of these keys, which is bounded by the longest of them and resolves on
+/// the next delta.
+fn credential_could_begin_at(bytes: &[u8], start: usize, parts: &[&str], threshold: usize) -> bool {
+    let mut pos = start;
+    for (index, part) in parts.iter().enumerate() {
+        // The separator between word parts is optional, so a byte that is not
+        // one simply belongs to the next part.
+        if index > 0 {
+            match bytes.get(pos) {
+                None => return true,
+                Some(b'_' | b'-') => pos += 1,
+                Some(_) => {}
+            }
+        }
+        for (offset, expected) in part.as_bytes().iter().enumerate() {
+            match bytes.get(pos + offset) {
+                None => return true,
+                Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+                Some(_) => return false,
+            }
+        }
+        pos += part.len();
+    }
+    value_can_still_complete(bytes, pos, threshold)
+}
+
+/// Whether `[=:]` `\s*` `['"]*` and a value of `threshold` characters could
+/// still be completed by text that has not arrived, starting at `pos`.
+///
+/// Running out of input while the shape is still intact is the pending case.
+/// A character that cannot appear where it does ends it, and so does a value
+/// that has already reached the threshold.
+fn value_can_still_complete(bytes: &[u8], pos: usize, threshold: usize) -> bool {
+    let mut pos = pos;
+    match bytes.get(pos) {
+        None => return true,
+        Some(b'=' | b':') => pos += 1,
+        Some(_) => return false,
+    }
+    while matches!(bytes.get(pos), Some(byte) if byte.is_ascii_whitespace()) {
+        pos += 1;
+    }
+    while matches!(bytes.get(pos), Some(b'"' | b'\'')) {
+        pos += 1;
+    }
+    // Deliberately wider than any single pattern's value class, since a
+    // narrower one would stop counting early and call a pending value
+    // complete. Counting past a character the real pattern rejects only
+    // publishes text that pattern would never have redacted.
+    let mut value_len = 0;
+    while let Some(byte) = bytes.get(pos) {
+        if byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'') {
+            return false;
+        }
+        value_len += 1;
+        if value_len >= threshold {
+            return false;
+        }
+        pos += 1;
+    }
+    true
+}
+
 #[derive(Debug, Clone)]
 struct CandidateToken<'a> {
     value: &'a str,
@@ -222,9 +355,14 @@ impl LeakDetector {
                         .expect("static Slack rotation token regex must compile"),
                     "Slack refresh/rotated token",
                 ),
-                // Generic
+                // Generic. Case-insensitive on the key, as the `password`,
+                // `secret` and `token` patterns are: `API_KEY=` is the
+                // conventional spelling in an environment file, and the
+                // streaming withholding in the channel layer matches keys
+                // without regard to case, so a case-sensitive pattern here
+                // would hold a value back and then publish it unredacted.
                 (
-                    Regex::new(r#"api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
+                    Regex::new(r#"(?i)api[_-]?key[=:]\s*['"]*[a-zA-Z0-9_-]{20,}"#).unwrap(),
                     "Generic API key",
                 ),
             ]
@@ -259,8 +397,11 @@ impl LeakDetector {
                     "AWS Access Key ID",
                 ),
                 (
+                    // Case-insensitive on the key for the same reason as the
+                    // generic API key above; `AWS_SECRET_ACCESS_KEY` is the
+                    // spelling the AWS SDKs read from the environment.
                     Regex::new(
-                        r#"aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
+                        r#"(?i)aws[_-]?secret[_-]?access[_-]?key[=:]\s*['"]*[a-zA-Z0-9/+=]{40}"#,
                     )
                     .unwrap(),
                     "AWS Secret Access Key",
@@ -830,6 +971,157 @@ mod tests {
                 && shannon_entropy(token.value) >= entropy_threshold
                 && has_mixed_alpha_digit(token.value)
         })
+    }
+
+    /// The withholding table carries thresholds the detector's regexes own. If
+    /// a pattern's length requirement moves and this table does not, a
+    /// streaming caller either publishes a value the detector would have
+    /// redacted or holds one back forever.
+    #[test]
+    fn withhold_thresholds_match_the_detector_patterns() {
+        // Deterministic patterns only: the entropy heuristic fires on a long
+        // enough run on its own, which would mask what this pins.
+        let detector = LeakDetector::with_config(&LeakDetectionConfig {
+            enabled: true,
+            sensitivity: 1.0,
+            high_entropy_tokens: false,
+        });
+
+        for (parts, threshold) in CREDENTIAL_KEY_THRESHOLDS {
+            let lower = parts.join("_");
+            // Both spellings, because the withholding matches a key without
+            // regard to case: a pattern that does not would hold the value
+            // back and then publish it unredacted, which is worse than never
+            // having withheld it. `API_KEY` and `AWS_SECRET_ACCESS_KEY` are
+            // also the conventional environment-variable spellings, so the
+            // uppercase form is the likelier one to arrive.
+            for key in [lower.clone(), lower.to_uppercase()] {
+                // Values end on a character that starts none of these keys, so
+                // the trailing-prefix hold does not stand in for the threshold.
+                let short = format!("{key}={}9", "a".repeat(threshold - 2));
+                let complete = format!("{key}={}9", "a".repeat(threshold - 1));
+
+                assert!(
+                    matches!(detector.scan(&short), LeakResult::Clean),
+                    "{key}: a value one short of {threshold} is below the detector, \
+                     so the tail must be withheld rather than published"
+                );
+                assert_eq!(
+                    incomplete_credential_tail(&short),
+                    Some(0),
+                    "{key}: a value one short of {threshold} can still complete"
+                );
+
+                assert!(
+                    matches!(detector.scan(&complete), LeakResult::Detected { .. }),
+                    "{key}: a value of {threshold} must be detected, or the \
+                     threshold here is larger than the pattern needs"
+                );
+                assert_eq!(
+                    incomplete_credential_tail(&complete),
+                    None,
+                    "{key}: the detector redacts a complete value, so withholding \
+                     it would stall the surface"
+                );
+            }
+        }
+    }
+
+    /// Withholding costs the reader visible text, so it has to end as soon as
+    /// a match becomes impossible. These keys are ordinary words for an agent
+    /// that talks about credentials, and holding the rest of a turn back
+    /// whenever one appears would be worse than the exposure it prevents.
+    #[test]
+    fn text_that_can_no_longer_become_a_credential_is_published() {
+        for text in [
+            // A space ends the value, and the pattern requires an unbroken run.
+            "the token: is a concept worth explaining",
+            // The pattern wants the separator against the key.
+            "I stored the password in the vault.",
+            // `key` alone announces nothing; `api[_-]?key` does.
+            "no key here at all!",
+            // Already long enough to be detected and redacted.
+            "token=abcdefghijklmnopqrstuvwx",
+        ] {
+            assert_eq!(
+                incomplete_credential_tail(text),
+                None,
+                "{text:?} has nothing pending and must publish"
+            );
+        }
+    }
+
+    /// The offset is where the key starts, not where the value does: the
+    /// detector's replacement covers the key too, so publishing `token=` and
+    /// then replacing it would contradict the frame before it.
+    #[test]
+    fn a_pending_credential_is_withheld_from_the_key() {
+        let held = incomplete_credential_tail("Here it is: token=aB3xK9mW2p")
+            .expect("a ten-character token value can still reach twenty");
+        assert_eq!(&"Here it is: token=aB3xK9mW2p"[..held], "Here it is: ");
+    }
+
+    /// The price of covering a key that arrives in pieces: text ending on a
+    /// prefix of one waits for the delta that decides the word. Bounded by the
+    /// longest key, and released as soon as the word cannot be one.
+    #[test]
+    fn a_trailing_prefix_of_a_key_waits_for_the_next_delta() {
+        assert_eq!(incomplete_credential_tail("the sec"), Some(4));
+        assert_eq!(
+            incomplete_credential_tail("the section"),
+            None,
+            "the word resolved to something that is not a key"
+        );
+    }
+
+    /// What a streaming caller publishes must only ever grow. Teams rejects a
+    /// frame that does not contain the one before it, and a reader who saw text
+    /// disappear is owed better than a protocol error either way.
+    ///
+    /// The deltas break mid-key, which is where withholding from a completed
+    /// key alone retracts what it already published: `to` goes out, then the
+    /// key resolves and the offset moves back behind it.
+    #[test]
+    fn published_prefixes_only_ever_grow() {
+        let detector = LeakDetector::with_config(&LeakDetectionConfig {
+            enabled: true,
+            sensitivity: 1.0,
+            high_entropy_tokens: false,
+        });
+
+        let mut accumulated = String::new();
+        let mut previous = String::new();
+        for delta in [
+            "Cron output: file:///tmp/report.md?to",
+            "ken=aB3xK9mW2p",
+            "Q7vL4nR8sT1yU6hD0jF5cG",
+            " Grab it soon.",
+        ] {
+            accumulated.push_str(delta);
+            let publishable = match incomplete_credential_tail(&accumulated) {
+                Some(offset) => &accumulated[..offset],
+                None => accumulated.as_str(),
+            };
+            let published = match detector.scan(publishable) {
+                LeakResult::Detected { redacted, .. } => redacted,
+                LeakResult::Clean => publishable.to_string(),
+            };
+
+            assert!(
+                published.starts_with(&previous),
+                "frame {published:?} does not contain {previous:?}"
+            );
+            assert!(
+                !published.contains("aB3x"),
+                "frame {published:?} published a raw credential prefix"
+            );
+            previous = published;
+        }
+
+        assert!(
+            previous.contains("[REDACTED") && previous.ends_with(" Grab it soon."),
+            "the last frame must carry the redacted value and the text after it: {previous:?}"
+        );
     }
 
     #[test]

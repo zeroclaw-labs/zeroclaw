@@ -39,6 +39,11 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-mattermost"),
     },
     ChannelCompileSpec {
+        schema_name: Some("Microsoft Teams"),
+        type_keys: &["msteams"],
+        compiled: cfg!(feature = "channel-msteams"),
+    },
+    ChannelCompileSpec {
         schema_name: Some("iMessage"),
         type_keys: &["imessage"],
         compiled: cfg!(feature = "channel-imessage"),

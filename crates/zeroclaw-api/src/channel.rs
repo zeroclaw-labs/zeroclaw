@@ -765,6 +765,14 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 
+    /// Whether this particular inbound message can use progressive draft
+    /// updates. Most channels have a capability-wide answer, so the default
+    /// delegates to [`Self::supports_draft_updates`]. Channels whose support
+    /// depends on conversation type can override this method.
+    fn supports_draft_updates_for(&self, _message: &ChannelMessage) -> bool {
+        self.supports_draft_updates()
+    }
+
     /// Self-loop guard for multi-agent runs: the bot's own handle/identity on
     /// this channel, so the orchestrator can drop inbound events whose
     /// `sender` matches. A bot must never respond to its own messages, even
@@ -830,11 +838,28 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
+    ///
+    /// `None` means no draft was opened and the turn runs without one, typing
+    /// indicator and tool notifications included. A channel returns it to
+    /// decline a draft it is otherwise capable of — Teams allows one stream
+    /// per chat, so a second concurrent turn there is declined by design — and
+    /// a transient failure to open one arrives the same way. Callers key the
+    /// rest of the turn on the returned handle rather than on
+    /// [`Self::supports_draft_updates_for`]: capability answers whether a
+    /// draft was possible, not whether one exists.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
     /// Update a previously sent draft message with new accumulated content.
+    ///
+    /// Each call carries the whole response so far, and successive calls may
+    /// only extend it. A transport that replaces the rendered text rather than
+    /// appending to it — Teams' streaming protocol among them — rejects a
+    /// frame that retracts what an earlier one published, and no later edit
+    /// unreads what was already on screen. A caller that filters the
+    /// accumulation therefore withholds a region still being decided instead
+    /// of publishing it and revising it in the next frame.
     async fn update_draft(
         &self,
         _recipient: &str,
