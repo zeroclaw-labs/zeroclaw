@@ -648,22 +648,25 @@ pub(crate) fn build_system_prompt_for_turn(
         &mut turn_tool_descs,
         &mut turn_deferred_section,
     );
-    let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
-        agent_workspace,
-        model_name,
-        &turn_tool_descs,
-        skills,
-        identity_config,
-        bootstrap_max_chars,
-        Some(risk_profile),
-        native_tool_specs_present,
-        skills_prompt_mode,
-        compact_context,
-        max_system_prompt_chars,
-        inject_memory,
-        show_tool_calls,
-        shell_profile,
-    );
+    let skill_tools_protocol_exposed = expose_text_tool_protocol || native_tool_specs_present;
+    let mut system_prompt =
+        crate::agent::system_prompt::build_system_prompt_with_mode_and_effective_tools(
+            agent_workspace,
+            model_name,
+            &turn_tool_descs,
+            |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
+            skills,
+            identity_config,
+            bootstrap_max_chars,
+            Some(risk_profile),
+            native_tool_specs_present,
+            skills_prompt_mode,
+            compact_context,
+            max_system_prompt_chars,
+            inject_memory,
+            show_tool_calls,
+            shell_profile,
+        );
 
     if expose_text_tool_protocol {
         system_prompt.push_str(&build_tool_instructions_for_names(
@@ -1028,18 +1031,11 @@ fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn
         return String::new();
     }
 
-    let mut instructions = String::new();
-    instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-    instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
-    instructions.push_str(
-        "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
-    );
-    instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    // The tool-call formatting guidance has one home: `agent::tool_call_format`.
+    // Do not re-type it here; layer builder-specific material (the tool
+    // listing below) around it instead.
+    let mut instructions = String::from("\n");
+    instructions.push_str(crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS);
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools {
@@ -3207,12 +3203,14 @@ pub async fn process_message(
             &mut tool_descs,
             &mut deferred_section,
         );
+        let skill_tools_protocol_exposed = expose_text_tool_protocol || native_tool_specs_present;
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut system_prompt =
-            crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
+            crate::agent::system_prompt::build_system_prompt_with_mode_and_effective_tools(
                 &agent_workspace,
                 &model_name,
                 &tool_descs,
+                |name| skill_tools_protocol_exposed && effective_tool_names.contains(name),
                 &skills,
                 Some(&agent.identity),
                 bootstrap_max_chars,
@@ -12605,6 +12603,32 @@ This is an example, not an invocation."#;
         assert!(instructions.contains("file_write"));
     }
 
+    /// The tool-call guidance lives in `agent::tool_call_format` and
+    /// must be embedded verbatim here, not re-typed. The sibling assertion
+    /// for the XML dispatcher lives in `agent::tests`; both are re-checked
+    /// together in `agent::tool_call_format`.
+    #[test]
+    fn build_tool_instructions_embeds_shared_tool_call_guidance() {
+        use crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+        use crate::security::SecurityPolicy;
+
+        let security = Arc::new(SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let tools = tools::default_tools(security);
+        let instructions = build_tool_instructions(&tools);
+
+        assert!(
+            instructions.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
+            "loop_ tool instructions drifted from the shared block:\n{instructions}"
+        );
+        assert!(
+            instructions.contains("### Available Tools\n\n"),
+            "loop_ tool instructions must still layer the tool listing on top"
+        );
+    }
+
     #[test]
     fn build_tool_instructions_empty_registry_returns_empty() {
         let tools: Vec<Box<dyn Tool>> = vec![];
@@ -13565,6 +13589,172 @@ Let me check the result."#;
         .expect("tools turn prompt should build");
         assert!(tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
         assert!(!tools_turn_prompt.contains(NO_TOOLS_TASK_FRAMING));
+    }
+
+    #[tokio::test]
+    async fn turn_prompt_skill_callable_names_follow_assembled_registry() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.security.nat64_prefixes = vec!["not-a-prefix".into()];
+        let security = Arc::new(TestPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..TestPolicy::default()
+        });
+        let risk_profile = RiskProfileConfig::default();
+        let built = crate::tools::AllToolsResult {
+            tools: vec![mock_tool("shell")],
+            delegate_handle: None,
+            ask_user_handle: None,
+            reaction_handle: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            channel_room_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+            delegate_tool: None,
+        };
+        let skill = crate::skills::Skill {
+            name: "ops".into(),
+            description: "Operations helpers".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                crate::skills::SkillTool {
+                    name: "run".into(),
+                    description: "Run an operation".into(),
+                    kind: "shell".into(),
+                    command: "echo ok".into(),
+                    args: Default::default(),
+                    target: None,
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                },
+                crate::skills::SkillTool {
+                    name: "fetch".into(),
+                    description: "Fetch an operation status".into(),
+                    kind: "http".into(),
+                    command: "https://example.com/status".into(),
+                    args: Default::default(),
+                    target: None,
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                },
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
+            crate::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "test",
+                security: &security,
+                built,
+                skills: std::slice::from_ref(&skill),
+                runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            },
+        )
+        .await;
+        let assembled_names: HashSet<&str> =
+            assembled.registry.iter().map(|tool| tool.name()).collect();
+        assert!(assembled_names.contains("ops__run"));
+        assert!(!assembled_names.contains("ops__fetch"));
+
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            "",
+            std::slice::from_ref(&skill),
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &assembled.registry,
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("turn prompt should build");
+
+        let callable_start = prompt
+            .find("<callable_tools")
+            .expect("callable skill tools should be rendered");
+        let callable_end = callable_start
+            + prompt[callable_start..]
+                .find("</callable_tools>")
+                .expect("callable skill tools should close")
+            + "</callable_tools>".len();
+        let callable_names: HashSet<&str> = prompt[callable_start..callable_end]
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("<name>")
+                    .and_then(|name| name.strip_suffix("</name>"))
+            })
+            .collect();
+        let expected_callable_names: HashSet<&str> = ["ops__run", "ops__fetch"]
+            .into_iter()
+            .filter(|name| assembled_names.contains(*name))
+            .collect();
+        assert_eq!(callable_names, expected_callable_names);
+
+        let tools_start = prompt.find("<tools>").expect("HTTP metadata should remain");
+        let tools_end = tools_start
+            + prompt[tools_start..]
+                .find("</tools>")
+                .expect("HTTP metadata should close")
+            + "</tools>".len();
+        let descriptive_tools = &prompt[tools_start..tools_end];
+        assert!(descriptive_tools.contains("<name>fetch</name>"));
+        assert!(descriptive_tools.contains("<kind>http</kind>"));
+
+        let strict_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            "",
+            std::slice::from_ref(&skill),
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &assembled.registry,
+            &[],
+            None,
+            true,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("strict turn prompt should build");
+        assert!(!strict_prompt.contains("<callable_tools"));
+        assert!(strict_prompt.contains("<name>run</name>"));
+        assert!(strict_prompt.contains("<name>fetch</name>"));
     }
 
     #[test]

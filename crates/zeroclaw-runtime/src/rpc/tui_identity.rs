@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
@@ -29,6 +30,17 @@ pub struct TuiEntry {
 
 // ── Registry ─────────────────────────────────────────────────────
 
+/// Which registration of a `tui_id` an entry is.
+///
+/// A reconnecting client re-registers its OWN id, so the id alone cannot
+/// distinguish the live registration from one that has been superseded. A
+/// connection whose teardown is still draining can therefore run AFTER its
+/// successor has been adopted, and a key-only removal would evict the live
+/// entry — taking the connected TUI's captured environment with it. This is the
+/// fact that makes the two distinguishable: a teardown quotes the epoch it
+/// registered under, so it can only ever remove its own registration.
+pub type TuiEpoch = u64;
+
 /// Daemon-wide registry of connected TUI clients.
 /// **Source of truth** for live TUI connection state. Not persisted —
 /// rebuilt on each daemon start from incoming `initialize` handshakes.
@@ -37,8 +49,12 @@ pub struct TuiRegistry {
     /// disabled — UIDs are issued unsigned and reconnects trust claimed
     /// identities without verification.
     signing_key: Option<Vec<u8>>,
-    /// Connected TUIs keyed by `tui_id`.
-    connected: Mutex<HashMap<String, TuiEntry>>,
+    /// Connected TUIs keyed by `tui_id`, each stamped with the epoch of the
+    /// registration that installed it.
+    connected: Mutex<HashMap<String, (TuiEpoch, TuiEntry)>>,
+    /// Hands out the next registration epoch. Monotonic for the life of the
+    /// registry, so an epoch identifies one registration and is never reused.
+    next_epoch: AtomicU64,
 }
 
 impl TuiRegistry {
@@ -55,6 +71,7 @@ impl TuiRegistry {
         Self {
             signing_key,
             connected: Mutex::new(HashMap::new()),
+            next_epoch: AtomicU64::new(0),
         }
     }
 
@@ -63,6 +80,7 @@ impl TuiRegistry {
         Self {
             signing_key: None,
             connected: Mutex::new(HashMap::new()),
+            next_epoch: AtomicU64::new(0),
         }
     }
 
@@ -118,20 +136,33 @@ impl TuiRegistry {
 
     // ── Registry operations ──────────────────────────────────────
 
-    /// Register a connected TUI.
-    pub fn register(&self, entry: TuiEntry) {
+    /// Register a connected TUI, displacing any earlier registration of the same
+    /// id. Returns the epoch this registration owns; the caller must quote it
+    /// back to [`Self::unregister`] so a late teardown cannot evict a successor.
+    pub fn register(&self, entry: TuiEntry) -> TuiEpoch {
+        let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed);
         self.connected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(entry.tui_id.clone(), entry);
+            .insert(entry.tui_id.clone(), (epoch, entry));
+        epoch
     }
 
-    /// Unregister a disconnected TUI.
-    pub fn unregister(&self, tui_id: &str) {
-        self.connected
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(tui_id);
+    /// Unregister a disconnected TUI, but ONLY while `epoch` is still the live
+    /// registration for that id.
+    ///
+    /// A reconnect adopts the same id under a new epoch, and the displaced
+    /// connection's teardown can run at any point after that — it may still be
+    /// draining, or parked in a bounded write. Removing by key alone would let
+    /// that late teardown evict the connection that replaced it.
+    pub fn unregister(&self, tui_id: &str, epoch: TuiEpoch) {
+        let mut connected = self.connected.lock().unwrap_or_else(|e| e.into_inner());
+        if connected
+            .get(tui_id)
+            .is_some_and(|(live, _)| *live == epoch)
+        {
+            connected.remove(tui_id);
+        }
     }
 
     /// Snapshot of all connected TUIs.
@@ -140,7 +171,7 @@ impl TuiRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .cloned()
+            .map(|(_, entry)| entry.clone())
             .collect()
     }
 
@@ -151,7 +182,7 @@ impl TuiRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(tui_id)
-            .map(|e| e.env.clone())
+            .map(|(_, entry)| entry.env.clone())
     }
 }
 
@@ -178,6 +209,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
+            next_epoch: AtomicU64::new(0),
         };
         let id = "tui_deadbeef";
         let sig = registry.sign(id).expect("signing should succeed");
@@ -189,6 +221,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
+            next_epoch: AtomicU64::new(0),
         };
         let id = "tui_deadbeef";
         let sig = registry.sign(id).unwrap();
@@ -205,6 +238,7 @@ mod tests {
         let registry = TuiRegistry {
             signing_key: Some(vec![0xAB; 32]),
             connected: Mutex::new(HashMap::new()),
+            next_epoch: AtomicU64::new(0),
         };
         let sig = registry.sign("tui_aaaaaaaa").unwrap();
         assert!(
@@ -231,7 +265,7 @@ mod tests {
         let registry = TuiRegistry::new_unsigned();
         assert!(registry.list().is_empty());
 
-        registry.register(TuiEntry {
+        let epoch = registry.register(TuiEntry {
             tui_id: "tui_aabb0011".to_string(),
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
@@ -241,14 +275,96 @@ mod tests {
         assert_eq!(registry.list().len(), 1);
         assert_eq!(registry.list()[0].tui_id, "tui_aabb0011");
 
-        registry.unregister("tui_aabb0011");
+        registry.unregister("tui_aabb0011", epoch);
         assert!(registry.list().is_empty());
+    }
+
+    fn entry(tui_id: &str, peer_label: &str) -> TuiEntry {
+        TuiEntry {
+            tui_id: tui_id.to_string(),
+            connected_at: Utc::now(),
+            peer_label: peer_label.to_string(),
+            transport: "wss".to_string(),
+            env: HashMap::new(),
+        }
+    }
+
+    // A reconnect adopts the same TUI id, so the displaced connection's teardown
+    // arrives with a stale epoch. It must not evict the live registration: doing
+    // so drops the connected TUI's captured environment while it is still using
+    // the daemon, and repeated flaps make it recur.
+    #[test]
+    fn a_superseded_teardown_cannot_evict_the_connection_that_replaced_it() {
+        let registry = TuiRegistry::new_unsigned();
+        let id = "tui_adopted1";
+
+        let epoch_a = registry.register(entry(id, "session-a"));
+        let epoch_b = registry.register(entry(id, "session-b"));
+        assert_ne!(epoch_a, epoch_b, "each registration owns its own epoch");
+
+        // Session A's cleanup finally runs, after B has been adopted.
+        registry.unregister(id, epoch_a);
+
+        let live = registry.list();
+        assert_eq!(live.len(), 1, "the live registration must survive");
+        assert_eq!(
+            live[0].peer_label, "session-b",
+            "the surviving entry must be the successor, not the displaced one"
+        );
+        assert!(
+            registry.get_env(id).is_some(),
+            "the live TUI must still resolve its captured environment"
+        );
+
+        // The normal path still works: B's own teardown removes B.
+        registry.unregister(id, epoch_b);
+        assert!(
+            registry.list().is_empty(),
+            "the live registration's own teardown must still remove it"
+        );
+    }
+
+    // Flaps accumulate displaced connections; none of their teardowns, in any
+    // order, may take the live entry with them.
+    #[test]
+    fn repeated_flaps_leave_the_current_registration_intact() {
+        let registry = TuiRegistry::new_unsigned();
+        let id = "tui_flapping";
+
+        let stale: Vec<TuiEpoch> = (0..5)
+            .map(|_| registry.register(entry(id, "stale")))
+            .collect();
+        let live = registry.register(entry(id, "live"));
+
+        for epoch in stale {
+            registry.unregister(id, epoch);
+        }
+        assert_eq!(
+            registry.list().len(),
+            1,
+            "every stale teardown must be inert"
+        );
+        assert_eq!(registry.list()[0].peer_label, "live");
+
+        registry.unregister(id, live);
+        assert!(registry.list().is_empty());
+    }
+
+    // An epoch is only ever meaningful for its own id.
+    #[test]
+    fn an_epoch_from_one_id_does_not_remove_another() {
+        let registry = TuiRegistry::new_unsigned();
+        let first = registry.register(entry("tui_first000", "a"));
+        registry.register(entry("tui_second00", "b"));
+
+        registry.unregister("tui_second00", first);
+        assert_eq!(registry.list().len(), 2, "a foreign epoch must not match");
     }
 
     #[test]
     fn unregister_unknown_is_noop() {
         let registry = TuiRegistry::new_unsigned();
-        registry.unregister("tui_nonexistent"); // must not panic
+        registry.unregister("tui_nonexistent", 0); // must not panic
     }
 
     #[test]
@@ -319,7 +435,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("SOME_VAR".to_string(), "some_value".to_string());
 
-        registry.register(TuiEntry {
+        let epoch = registry.register(TuiEntry {
             tui_id: "tui_deadbeef".to_string(),
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
@@ -328,7 +444,7 @@ mod tests {
         });
         assert_eq!(registry.list().len(), 1);
 
-        registry.unregister("tui_deadbeef");
+        registry.unregister("tui_deadbeef", epoch);
         assert!(
             registry.list().is_empty(),
             "env should be dropped with entry"
@@ -392,7 +508,7 @@ mod tests {
         let registry = TuiRegistry::new_unsigned();
         let mut env = HashMap::new();
         env.insert("SOME_VAR".to_string(), "val".to_string());
-        registry.register(TuiEntry {
+        let epoch = registry.register(TuiEntry {
             tui_id: "tui_gone0001".to_string(),
             connected_at: Utc::now(),
             peer_label: "test".to_string(),
@@ -400,7 +516,7 @@ mod tests {
             env,
         });
         assert!(registry.get_env("tui_gone0001").is_some());
-        registry.unregister("tui_gone0001");
+        registry.unregister("tui_gone0001", epoch);
         assert!(registry.get_env("tui_gone0001").is_none());
     }
 }

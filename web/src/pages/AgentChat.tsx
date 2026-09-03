@@ -1,9 +1,10 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
+import { ApiError, uploadChatImage } from '@/lib/api';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import {
@@ -19,6 +20,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
+import SessionPicker from '@/components/SessionPicker';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -116,6 +118,9 @@ export function AgentChatInner({
     modelLoading,
     deleteMessage,
     clearAllMessages,
+    startNewSession,
+    sessionId,
+    hydrated,
     addLocalMessage,
     abortSession,
     pendingApproval,
@@ -124,8 +129,44 @@ export function AgentChatInner({
     contextInputTokens,
   } = useAgent();
 
-  const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
+  const draftKey = `${DRAFT_KEY_PREFIX}.${agentAlias}.${sessionId}`;
+  const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [input, setInput] = useState(draft);
+  // Mirror of `input` for writers that run after an await (an attachment
+  // marker landing once the operator has typed more). A functional update
+  // against React state alone could not also hand the final value to the draft
+  // store, so the updater form of applyInput resolves against this instead.
+  const inputValueRef = useRef(input);
+  const writeInput = useCallback((value: string) => {
+    inputValueRef.current = value;
+    setInput(value);
+  }, []);
+
+  // `saveDraft` is bound to the conversation on screen when it was created.
+  // A deferred writer (an upload that lands after the operator switched
+  // conversations) reads the current text from `inputValueRef`, so it must
+  // also write under the current key; using the key it captured would park
+  // the text in the old conversation while showing it in the new one.
+  // Resolve both at invocation time. Whether a deferred writer should instead
+  // be dropped after a switch is the caller's decision.
+  const saveDraftRef = useRef(saveDraft);
+  saveDraftRef.current = saveDraft;
+
+  /**
+   * Single writer for the live composer text. Every change to what the
+   * operator has typed (keystrokes, slash-command completion, a marker
+   * appended by a later feature) goes through here so the per-conversation
+   * draft store stays in step with the textarea. A bare `setInput` would leave
+   * the stored draft behind and lose the change on the next conversation
+   * switch. Accepts a value or an updater over the latest text; both the text
+   * and the draft key are the ones current when it runs, not when it was
+   * captured.
+   */
+  const applyInput = useCallback((next: string | ((prev: string) => string)) => {
+    const value = typeof next === 'function' ? next(inputValueRef.current) : next;
+    writeInput(value);
+    saveDraftRef.current(value);
+  }, [writeInput]);
   const [showModelDropdown, setShowModelDropdown] = useState(false);
   // Slash-command autocomplete popover (#7137). Shown while the input begins
   // with a single '/' and the token still matches at least one command.
@@ -148,10 +189,12 @@ export function AgentChatInner({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
 
-  // Persist draft to in-memory store so it survives route changes
+  // AgentChatInner stays mounted while the selected conversation changes.
+  // Load that conversation's draft explicitly; useState's initializer only ran
+  // for the first session and cannot provide this synchronization by itself.
   useEffect(() => {
-    saveDraft(input);
-  }, [input, saveDraft]);
+    writeInput(draft);
+  }, [draftKey, draft, writeInput]);
 
   // Report live status (typing + message count) up to the host workspace so it
   // can render streaming / unread indicators in the tab bar. Fires on every
@@ -196,9 +239,17 @@ export function AgentChatInner({
         return true;
 
       case 'clear':
-      case 'new':
         clearAllMessages();
         addLocalMessage(t('agent.cmd_cleared'));
+        return true;
+
+      // Was an alias for /clear, which deleted the conversation. Now that an
+      // agent can hold several, "new" means what it says: start another one and
+      // leave this one on the gateway (issue #7543).
+      case 'new':
+        if (!startNewSession()) {
+          addLocalMessage(t('agent.sessions_unavailable'));
+        }
         return true;
 
       case 'model': {
@@ -245,7 +296,7 @@ export function AgentChatInner({
         addLocalMessage(t('agent.cmd_unknown').replace('{cmd}', `/${command}`));
         return true;
     }
-  }, [addLocalMessage, clearAllMessages, currentModel, availableModels, switchModel, modelLoading]);
+  }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -264,7 +315,7 @@ export function AgentChatInner({
       sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
     }
     setShowCommandHint(false);
-    setInput('');
+    writeInput('');
     clearDraft();
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
@@ -285,9 +336,73 @@ export function AgentChatInner({
     }
   };
 
+  // ── Image upload (picker + drag-and-drop) ──────────────────────────────
+  // Both gestures funnel into one helper: upload each file, then append the
+  // returned [IMAGE:<path>] marker to the draft so the user can add context
+  // before sending. The gateway sniffs the payload by magic bytes; the
+  // client-side type filter only spares an obviously wrong file the round
+  // trip. Failures surface as chat-local messages (same channel as unknown
+  // slash commands), never as sent messages.
+  const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // dragenter/dragleave fire per child element; a depth counter keeps the
+  // overlay stable while the pointer crosses inner boundaries.
+  const dragDepthRef = useRef(0);
+
+  const uploadImages = useCallback(async (files: Iterable<File>) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    setUploading(true);
+    try {
+      for (const file of list) {
+        if (file.type && !file.type.startsWith('image/')) {
+          addLocalMessage(t('agent.upload_not_image').replace('{name}', file.name));
+          continue;
+        }
+        try {
+          const res = await uploadChatImage(agentAlias, file);
+          applyInput((prev) => `${prev && !prev.endsWith(' ') ? `${prev} ` : prev}${res.marker} `);
+        } catch (err) {
+          const message = err instanceof ApiError
+            ? err.envelope.message
+            : err instanceof Error ? err.message : String(err);
+          addLocalMessage(t('agent.upload_failed').replace('{error}', message));
+        }
+      }
+    } finally {
+      setUploading(false);
+      inputRef.current?.focus();
+    }
+  }, [agentAlias, addLocalMessage, applyInput]);
+
+  const dragHasFiles = (e: React.DragEvent) => e.dataTransfer.types.includes('Files');
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  };
+  const handleDragOver = (e: React.DragEvent) => {
+    if (dragHasFiles(e)) e.preventDefault();
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (!dragHasFiles(e)) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    void uploadImages(e.dataTransfer.files);
+  };
+
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
-    setInput(value);
+    applyInput(value);
     // Show the command popover while typing the command token (a single
     // leading '/' with no space yet). Hide once the user moves to arguments or
     // the token no longer matches any command.
@@ -303,9 +418,10 @@ export function AgentChatInner({
   const applyCommandHint = useCallback((spec: CommandSpec) => {
     setShowCommandHint(false);
     const takesArgs = spec.usage.includes('[');
-    setInput(`/${spec.name}${takesArgs ? ' ' : ''}`);
+    const value = `/${spec.name}${takesArgs ? ' ' : ''}`;
+    applyInput(value);
     inputRef.current?.focus();
-  }, []);
+  }, [applyInput]);
 
   const matchedCommands: CommandSpec[] = /^\/[^/\s]*$/.test(input)
     ? matchCommands(input.slice(1))
@@ -406,7 +522,30 @@ export function AgentChatInner({
        Hoisting the opt-out to the outermost container covers all of them
        with a single ancestor. Static UI chrome here localizes through
        t() i18n, so losing browser translation on it is intentional. */
-    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
+    <div
+      translate="no"
+      className="notranslate relative flex flex-col h-full min-h-0"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {dragActive && (
+        <div
+          className="absolute inset-2 z-50 flex items-center justify-center pointer-events-none rounded-[var(--radius-md)]"
+          style={{
+            border: '2px dashed var(--pc-accent)',
+            background: 'color-mix(in srgb, var(--pc-accent) 10%, transparent)',
+          }}
+        >
+          <span
+            className="px-3 py-1.5 text-sm font-medium rounded-[var(--radius-md)]"
+            style={{ background: 'var(--pc-bg-surface)', color: 'var(--pc-accent)' }}
+          >
+            {t('agent.drop_to_attach')}
+          </span>
+        </div>
+      )}
       {/* Header with model selector */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-pc-border bg-pc-surface">
         <div className="flex items-center gap-2">
@@ -422,42 +561,46 @@ export function AgentChatInner({
           </Link>
         </div>
 
-        <div className="relative" ref={modelDropdownRef}>
-          <button
-            type="button"
-            onClick={() => setShowModelDropdown((v) => !v)}
-            disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-            className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
-          >
-            <span className="max-w-[180px] truncate">
-              {modelLoading
-                ? t('agent.model_switching')
-                : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
-            </span>
-            <ChevronDown className="h-3 w-3" />
-          </button>
+        <div className="flex items-center gap-2">
+          <SessionPicker agentAlias={agentAlias} />
 
-          {showModelDropdown && availableModels.length > 0 && (
-            <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
-              {availableModels.map((model) => {
-                const isActive = model === currentModel;
-                return (
-                  <button
-                    key={model}
-                    type="button"
-                    onClick={() => handleModelSwitch(model)}
-                    className={`w-full text-left px-3 py-2 text-xs transition-colors ${
-                      isActive
-                        ? 'text-pc-accent bg-pc-accent/10'
-                        : 'text-pc-text hover:bg-[var(--pc-hover)]'
-                    }`}
-                  >
-                    {model}
-                  </button>
-                );
-              })}
-            </div>
-          )}
+          <div className="relative" ref={modelDropdownRef}>
+            <button
+              type="button"
+              onClick={() => setShowModelDropdown((v) => !v)}
+              disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
+              className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+            >
+              <span className="max-w-[180px] truncate">
+                {modelLoading
+                  ? t('agent.model_switching')
+                  : (currentModel ?? (availableModels.length === 0 ? t('agent.model_loading') : t('agent.select_model')))}
+              </span>
+              <ChevronDown className="h-3 w-3" />
+            </button>
+
+            {showModelDropdown && availableModels.length > 0 && (
+              <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+                {availableModels.map((model) => {
+                  const isActive = model === currentModel;
+                  return (
+                    <button
+                      key={model}
+                      type="button"
+                      onClick={() => handleModelSwitch(model)}
+                      className={`w-full text-left px-3 py-2 text-xs transition-colors ${
+                        isActive
+                          ? 'text-pc-accent bg-pc-accent/10'
+                          : 'text-pc-text hover:bg-[var(--pc-hover)]'
+                      }`}
+                    >
+                      {model}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -512,8 +655,18 @@ export function AgentChatInner({
             <div className="h-14 w-14 rounded-[var(--radius-lg)] flex items-center justify-center mb-4 bg-pc-accent/10">
               <Bot className="h-7 w-7 text-pc-accent" />
             </div>
-            <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
-            <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+            {/* Until the transcript lands, an empty list means "still loading",
+                not "empty conversation" — saying the latter misreports a
+                conversation the operator just picked precisely because it has
+                history in it. */}
+            {hydrated ? (
+              <>
+                <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
+                <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
+              </>
+            ) : (
+              <p className="text-sm text-pc-text-muted">{t('agent.session_loading')}</p>
+            )}
           </div>
         )}
 
@@ -597,6 +750,31 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) void uploadImages(e.target.files);
+              // Reset so picking the same file again re-fires onChange.
+              e.target.value = '';
+            }}
+          />
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="flex-shrink-0 w-10 px-0"
+            aria-label={t('agent.attach_image')}
+            title={t('agent.attach_image')}
+          >
+            {uploading
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <ImagePlus className="h-4 w-4" />}
+          </Button>
           <textarea
             ref={inputRef}
             rows={1}
@@ -607,10 +785,12 @@ export function AgentChatInner({
             onCompositionEnd={() => { isComposingRef.current = false; }}
             placeholder={!connected
               ? t('agent.connecting')
-              : typing
-                ? t('agent.running')
-                : t('agent.type_message')}
-            disabled={!connected || typing}
+              : !hydrated
+                ? t('agent.session_loading')
+                : typing
+                  ? t('agent.running')
+                  : t('agent.type_message')}
+            disabled={!connected || typing || !hydrated}
             className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
             style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
           />
@@ -630,7 +810,7 @@ export function AgentChatInner({
               variant="primary"
               size="md"
               onClick={handleSend}
-              disabled={!connected || !input.trim()}
+              disabled={!connected || !hydrated || !input.trim()}
               className="flex-shrink-0 w-10 px-0"
               aria-label={t('agent.send')}
             >

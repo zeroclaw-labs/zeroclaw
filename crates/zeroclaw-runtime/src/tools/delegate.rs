@@ -4,6 +4,7 @@ use crate::agent::loop_::{
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::approval::ApprovalManager;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -2613,6 +2614,18 @@ impl DelegateTool {
             DelegateAdmission::Prevalidated => Arc::clone(&self.security),
         };
         let target_mode = self.mode_for_target(agent_name);
+        // Independent delegates are fresh, non-interactive target turns. Give the
+        // nested loop a fresh manager from the target profile so prompt-required
+        // tools fail closed before dispatch; built-in shell remains ungated here
+        // and receives approved=false for its own command-policy enforcement.
+        let approval_manager = if target_mode == DelegateExecutionMode::Independent {
+            self.root_config
+                .as_ref()
+                .and_then(|config| config.risk_profile_for_agent(agent_name))
+                .map(ApprovalManager::for_non_interactive)
+        } else {
+            None
+        };
         // Deferred-MCP side-channels for an INDEPENDENT target: its sub-agent turn must
         // inject the deferred-tools prompt section and thread the activated set, exactly as
         // a fresh target turn does. Bounded delegation leaves these empty (it starts from
@@ -2830,7 +2843,7 @@ impl DelegateTool {
                         tools_registry: &sub_tools,
                         observer: &noop_observer,
                         silent: true,
-                        approval: None,
+                        approval: approval_manager.as_ref(),
                         multimodal_config: &self.multimodal_config,
                         // Full config so the delegated sub-agent's vision route
                         // resolves the configured `vision_model_provider`'s alias
@@ -2844,7 +2857,6 @@ impl DelegateTool {
                         // an independent target with granted deferred-MCP bundles).
                         activated_tools: sub_activated.as_ref(),
                         model_switch_callback: None,
-                        // delegate subagents don't support approval
                         receipt_generator,
                     },
                     ResolvedRuntimeKnobs {
@@ -3004,7 +3016,7 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::RuntimeAdapter;
+    use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
     use std::path::{Path, PathBuf};
@@ -3371,6 +3383,89 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "OneToolThenFinalModelProvider"
+        }
+    }
+
+    #[derive(Default)]
+    struct IndependentRiskPolicyModelProvider {
+        tool_messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl IndependentRiskPolicyModelProvider {
+        fn tool_messages(&self) -> Vec<String> {
+            self.tool_messages.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for IndependentRiskPolicyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_messages: Vec<String> = request
+                .messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .map(|message| message.content.clone())
+                .collect();
+            if !tool_messages.is_empty() {
+                self.tool_messages.lock().unwrap().extend(tool_messages);
+                return Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_skill_rm".to_string(),
+                        name: "rm_marker__remove".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "call_shell_rm".to_string(),
+                        name: "shell".to_string(),
+                        arguments:
+                            r#"{"command":"rm independent-delegate-marker","approved":true}"#
+                                .to_string(),
+                        extra_content: None,
+                    },
+                ],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for IndependentRiskPolicyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "IndependentRiskPolicyModelProvider"
         }
     }
 
@@ -8857,6 +8952,143 @@ command = "echo hi"
         assert_eq!(
             independent.workspace_dir, target_ws,
             "target workspace must resolve to the configured target-workspace path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn independent_delegate_denies_prompt_required_skill_tools_without_approval_route() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let target_ws = tmp.path().join("target-workspace");
+        let marker = target_ws.join("independent-delegate-marker");
+        std::fs::create_dir_all(target_ws.join("skills/rm_marker")).unwrap();
+        std::fs::write(&marker, b"must survive").unwrap();
+        std::fs::write(
+            target_ws.join("skills/rm_marker/SKILL.toml"),
+            r#"[skill]
+name = "rm_marker"
+description = "test skill for independent approval policy"
+version = "0.1.0"
+
+[[tools]]
+name = "remove"
+description = "remove the marker"
+kind = "shell"
+command = "rm independent-delegate-marker"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Supervised,
+                allowed_commands: vec!["rm".to_string()],
+                allowed_tools: vec!["shell".to_string()],
+                block_high_risk_commands: true,
+                require_approval_for_medium_risk: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Independent,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(target_ws.clone()),
+                    ..Default::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let delegate = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(NativeRuntime::new()))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+        let target = config.agents.get("target").unwrap();
+        let provider = IndependentRiskPolicyModelProvider::default();
+
+        let result = delegate
+            .execute_agentic(
+                "target",
+                target,
+                "test",
+                "test-model",
+                &provider,
+                "remove the marker",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "target should complete after denied calls: {result:?}"
+        );
+        assert!(
+            marker.exists(),
+            "a prompt-required skill command must not dispatch without an approval route"
+        );
+        let tool_messages = provider.tool_messages();
+        assert!(
+            tool_messages.iter().any(|message| {
+                message.contains("requires approval and no operator decision was available")
+            }),
+            "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
+        );
+        assert!(
+            tool_messages.iter().any(|message| {
+                message.contains("Command requires explicit approval (approved=true)")
+            }),
+            "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
         );
     }
 

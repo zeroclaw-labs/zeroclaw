@@ -79,6 +79,23 @@ fn migrate_legacy_copy_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     true
 }
 
+fn migrate_legacy_chat_jump_binding(
+    rows: &mut HashMap<String, ChordSpec>,
+    action: ChatTabAction,
+    legacy: Chord,
+) -> bool {
+    let key = action.action_key();
+    let Some(ChordSpec::Many(chords)) = rows.get(&key) else {
+        return false;
+    };
+    if chords.as_slice() != std::slice::from_ref(&legacy) {
+        return false;
+    }
+
+    rows.insert(key, ChordSpec::Many(action.default_chords()));
+    true
+}
+
 /// The `[theme]` section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ThemeSection {
@@ -126,11 +143,36 @@ pub(crate) struct WssSection {
     pub uri: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
+    /// Reach the daemon through a nominated relay at this `host:port` instead of
+    /// connecting to `uri` directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Node-id of the target daemon to request from the relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_node: Option<String>,
+    /// How many times to try the direct address before falling back to the relay
+    /// (default 2). Only relevant when both a direct address and a relay exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_attempts: Option<u32>,
+    /// Per-attempt timeout, in seconds, for a direct connect before falling back
+    /// to the relay (default 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_timeout_secs: Option<u64>,
+    /// While connected through the relay, how often (seconds) to re-probe the
+    /// direct address and migrate back when it returns (default 30; 0 disables).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_secs: Option<u64>,
 }
 
 impl WssSection {
     fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.tls.is_empty()
+        self.uri.is_none()
+            && self.tls.is_empty()
+            && self.relay_url.is_none()
+            && self.relay_node.is_none()
+            && self.direct_attempts.is_none()
+            && self.direct_timeout_secs.is_none()
+            && self.reprobe_secs.is_none()
     }
 }
 
@@ -140,6 +182,16 @@ pub(crate) struct WssTlsSection {
     pub skip_verify: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip_verify_routes: Vec<String>,
+    /// PEM CA certificate used to verify the daemon (mutual TLS). When set, the
+    /// server certificate is verified against this CA instead of the system roots.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_cert_path: String,
+    /// PEM client certificate presented to the daemon (mutual TLS).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_cert_path: String,
+    /// PEM client private key for `client_cert_path`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_key_path: String,
 }
 
 impl WssTlsSection {
@@ -148,7 +200,11 @@ impl WssTlsSection {
     }
 
     fn is_empty(&self) -> bool {
-        !self.skip_verify && self.skip_verify_routes.is_empty()
+        !self.skip_verify
+            && self.skip_verify_routes.is_empty()
+            && self.ca_cert_path.is_empty()
+            && self.client_cert_path.is_empty()
+            && self.client_key_path.is_empty()
     }
 }
 
@@ -566,6 +622,23 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                         ChatTabAction::CopySelection.default_chords(),
                     ))
                     .context("serializing migrated Copy binding")?;
+                    let bindings = doc
+                        .get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .context("accessing parsed keybindings table")?;
+                    bindings.insert(key, value);
+                    migrated_keybindings = true;
+                }
+                for (action, legacy) in [
+                    (ChatTabAction::JumpStart, Chord::char('g')),
+                    (ChatTabAction::JumpEnd, Chord::char('G')),
+                ] {
+                    if !migrate_legacy_chat_jump_binding(&mut rows, action, legacy) {
+                        continue;
+                    }
+                    let key = action.action_key();
+                    let value = toml::Value::try_from(ChordSpec::Many(action.default_chords()))
+                        .context("serializing migrated chat jump binding")?;
                     let bindings = doc
                         .get_mut("keybindings")
                         .and_then(toml::Value::as_table_mut)
@@ -1452,6 +1525,47 @@ mod tests {
             doc["keybindings"]["chat.copy_selection"].as_str(),
             Some("y")
         );
+    }
+
+    #[test]
+    fn legacy_chat_jump_defaults_migrate_without_touching_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"g\"]\n\"chat.jump_end\" = [\"G\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            ChatTabAction::JumpStart.default_chords()
+        );
+        assert_eq!(
+            resolved["chat"]["jump_end"],
+            ChatTabAction::JumpEnd.default_chords()
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_chat_jump_bindings_are_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"alt+home\"]\n\"chat.jump_end\" = \"G\"\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            vec!["alt+home".parse::<Chord>().unwrap()]
+        );
+        assert_eq!(resolved["chat"]["jump_end"], vec![Chord::char('G')]);
     }
 
     #[test]

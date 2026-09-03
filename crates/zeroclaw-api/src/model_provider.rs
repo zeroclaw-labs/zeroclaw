@@ -523,6 +523,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities
     }
 
+    /// Name the entry that forced `vision` to `false` on this provider's
+    /// [`Self::capabilities_for_model`], for providers that aggregate several
+    /// named entries (e.g. a primary plus configured fallbacks) into one
+    /// capability set. Returns `None` when this provider is not such an
+    /// aggregate, or when nothing about it limits vision for `model`.
+    fn vision_limited_by(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// Whether the selected request can reach both native-tool and text-only
     /// candidates.
     ///
@@ -805,6 +814,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
         self.as_ref().capabilities_for_model(model)
+    }
+
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        self.as_ref().vision_limited_by(model)
     }
 
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
