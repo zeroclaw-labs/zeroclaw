@@ -2634,6 +2634,68 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
+    /// A backend that implements only the required `SessionBackend`
+    /// primitives (`load`/`append`/`remove_last`/`list_sessions`) and does
+    /// NOT override `rewrite_messages`, exercising the trait's default
+    /// replacement implementation built from those primitives.
+    struct AppendOnlyBackend {
+        messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for AppendOnlyBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn append_only_backend_durably_replaces_state_through_the_websocket_persistence_boundary() {
+        // A production `SessionBackend` that only implements the required
+        // append/remove_last primitives must still durably persist the
+        // agent's authoritative post-turn history through the WebSocket
+        // completion path — the default `rewrite_messages` must not
+        // silently no-op and drop the caller's replacement.
+        let backend = AppendOnlyBackend {
+            messages: std::sync::Mutex::new(vec![
+                zeroclaw_providers::ChatMessage::user("stale first turn"),
+                zeroclaw_providers::ChatMessage::assistant("stale reply"),
+            ]),
+        };
+        let authoritative = vec![
+            zeroclaw_providers::ChatMessage::user("trimmed second turn"),
+            zeroclaw_providers::ChatMessage::assistant("final reply"),
+        ];
+
+        replace_conversation_state_unless_deleted(&backend, "gw_append_only", &authoritative, true);
+
+        let persisted = backend.messages.lock().unwrap().clone();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            authoritative
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>(),
+            "replacement must durably overwrite the stale transcript, not silently no-op"
+        );
+    }
+
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
     /// smoke can inspect the response without a real WebSocket.
     struct CollectSink(Vec<String>);

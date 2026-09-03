@@ -94,12 +94,17 @@ pub trait SessionBackend: Send + Sync {
     /// keep the canonical stored history in sync with a caller-owned buffer
     /// that trimmed or rewrote turns in place (e.g. history-budget
     /// enforcement), rather than appending on top of a now-stale transcript.
-    /// No-op by default for backends that only support appending.
-    fn rewrite_messages(
-        &self,
-        _session_key: &str,
-        _messages: &[ChatMessage],
-    ) -> std::io::Result<()> {
+    /// The default clears the session (`clear_messages`) and re-appends
+    /// every message through the required `append` primitive, so every
+    /// backend gets real replacement semantics — a backend that never
+    /// overrides this does not silently drop the caller's authoritative
+    /// trimmed history. It is O(n) calls and not atomic; backends with a
+    /// native batch/transactional rewrite (JSONL, SQLite) override this.
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        self.clear_messages(session_key)?;
+        for message in messages {
+            self.append(session_key, message)?;
+        }
         Ok(())
     }
 
