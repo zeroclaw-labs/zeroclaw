@@ -16,6 +16,24 @@ use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
+/// What a reasoning chunk should show a person.
+///
+/// Some providers stream each reasoning block as the signed record they later
+/// expect replayed, which is machine input, not prose. Show only its text, and
+/// show nothing when the provider withheld that text. Anything else is prose
+/// already and passes through.
+pub(crate) fn reasoning_display_text(chunk: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct SignedReasoningRecord {
+        thinking: String,
+    }
+
+    match serde_json::from_str::<SignedReasoningRecord>(chunk.trim_start_matches('\n')) {
+        Ok(record) => (!record.thinking.is_empty()).then_some(record.thinking),
+        Err(_) => Some(chunk.to_string()),
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
     pub(crate) response_text: String,
@@ -224,21 +242,21 @@ pub(crate) async fn consume_provider_streaming_response(
                 if let Some(reasoning) = chunk.reasoning.as_deref()
                     && !reasoning.is_empty()
                 {
+                    // Stored verbatim: a provider may need this replayed back
+                    // exactly as it arrived. Only the display form is derived.
                     outcome.reasoning_content.push_str(reasoning);
-                    if draft_reasoning == StreamReasoningMode::Full
-                        && let Some(tx) = on_delta
-                    {
-                        let _ = tx.send(StreamDelta::Reasoning(reasoning.to_string())).await;
-                    }
-                    // Thinking is surfaced as its own TurnEvent variant; it
-                    // must never reach the Chunk/draft text surfaces.
-                    if let Some(tx) = event_tx {
-                        visible_event_output = true;
-                        let _ = tx
-                            .send(TurnEvent::Thinking {
-                                delta: reasoning.to_string(),
-                            })
-                            .await;
+                    if let Some(shown) = reasoning_display_text(reasoning) {
+                        if draft_reasoning == StreamReasoningMode::Full
+                            && let Some(tx) = on_delta
+                        {
+                            let _ = tx.send(StreamDelta::Reasoning(shown.clone())).await;
+                        }
+                        // Thinking is surfaced as its own TurnEvent variant; it
+                        // must never reach the Chunk/draft text surfaces.
+                        if let Some(tx) = event_tx {
+                            visible_event_output = true;
+                            let _ = tx.send(TurnEvent::Thinking { delta: shown }).await;
+                        }
                     }
                 }
 
@@ -330,6 +348,36 @@ pub(crate) async fn consume_provider_streaming_response(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reasoning_display_shows_only_the_text_of_a_signed_record() {
+        let record = r#"{"thinking":"  Step one","signature":"sig_a"}"#;
+        assert_eq!(
+            reasoning_display_text(record).as_deref(),
+            Some("  Step one")
+        );
+    }
+
+    #[test]
+    fn reasoning_display_shows_nothing_when_the_text_was_withheld() {
+        let record = r#"{"thinking":"","signature":"sig_b"}"#;
+        assert_eq!(reasoning_display_text(record), None);
+    }
+
+    #[test]
+    fn reasoning_display_reads_a_record_that_carries_its_separator() {
+        let record = "\n{\"thinking\":\"later\",\"signature\":\"sig_c\"}";
+        assert_eq!(reasoning_display_text(record).as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn reasoning_display_passes_plain_prose_through() {
+        assert_eq!(
+            reasoning_display_text("thinking out loud").as_deref(),
+            Some("thinking out loud")
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
