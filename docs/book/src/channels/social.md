@@ -23,7 +23,7 @@ channel = "twitch.default"
 external_peers = ["zeroclaw_user"]
 ```
 
-- **Auth:** use a Twitch user access token for the bot account. Create one with the [TMI token generator](https://twitchapps.com/tmi/) or the Twitch CLI, then store it through a protected config surface. ZeroClaw trims the value and adds the required `oauth:` prefix when it is omitted.
+- **Auth:** use a Twitch user access token for the bot account with [`chat:read` and `chat:edit`](https://dev.twitch.tv/docs/chat/irc/#authenticating-with-the-twitch-irc-server). After configuring the [Twitch CLI](https://dev.twitch.tv/docs/cli/token-command/), generate it while signed in as that account with `twitch token -u -s 'chat:read chat:edit'`, then store it through a protected config surface. ZeroClaw trims the value and adds the required `oauth:` prefix when it is omitted.
 - **Channels:** entries in `channels` may include the leading `#`; ZeroClaw adds it when missing and normalizes channel names to lowercase.
 - **Inbound and outbound:** channel messages are answered in the same channel. `mention_only = true` ignores channel messages that do not mention `bot_username`. If Twitch delivers a non-channel IRC `PRIVMSG` to the bot login, ZeroClaw replies to that sender; the adapter does not configure a separate whisper transport.
 - **Formatting:** Twitch replies use plain text and are split to fit IRC frames. Markdown formatting is not preserved.
@@ -68,6 +68,6 @@ Bots on public social networks attract adversarial input. Two precautions:
 1. **Restrict who the agent will respond to.** Gate inbound senders with a peer group (per channel, above): an empty peer set denies everyone, `["*"]` accepts anyone. Bluesky has no peer-group sender field; gate at the autonomy / tool layer instead.
 2. **Keep autonomy level at `Supervised` or lower.** A public-facing agent in `Full` autonomy is effectively a public shell. For public-facing channels, restrict the tool surface in the global tool-policy config rather than expecting per-channel `tools_allow` (no such per-channel field exists).
 
-## Rate limits and backoff
+## Rate limits
 
-All social channels are subject to aggressive rate limits. HTTP-backed social adapters use exponential backoff on `429` responses. Twitch is the IRC-backed exception described above and has no adapter-specific limiter. If you hit persistent rate-limiting, throttle the agent's posting cadence at the source rather than relying on per-channel streaming knobs (none of these channels expose draft-update intervals; their schema is intentionally minimal).
+Rate-limit handling differs by channel. Twitch writes IRC `PRIVMSG` frames directly and has no adapter-specific limiter. If you hit persistent rate-limiting, throttle the agent's posting cadence at the source rather than relying on per-channel streaming knobs (none of these channels expose draft-update intervals; their schema is intentionally minimal).
