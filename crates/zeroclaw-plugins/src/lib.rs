@@ -23,6 +23,8 @@ pub mod runtime;
 pub mod services;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
+pub mod wasi_http;
+#[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_memory;
@@ -68,6 +70,28 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
+    /// Destinations this plugin declares it needs.
+    ///
+    /// This is a signature-covered **attestation of intent**, never a grant:
+    /// nothing here confers network reach. The effective allowlist is the
+    /// operator's `plugins.entries[].egress_hosts`. Keeping the two apart is
+    /// what shuts the self-grant path — an unsigned component that writes its
+    /// own `[egress]` table still reaches nothing.
+    #[serde(default)]
+    pub egress: PluginEgressDeclaration,
+}
+
+/// The optional `[egress]` table of a plugin manifest.
+///
+/// Absent, empty, and "declares nothing" are the same state, so a manifest that
+/// predates this field parses unchanged and declares no destinations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginEgressDeclaration {
+    /// Exact hosts or `*.suffix` patterns, in the strict egress grammar
+    /// (`zeroclaw_infra::net_guard::normalize_egress_pattern`). Invalid grammar
+    /// rejects the whole manifest at discovery and at install.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// What a plugin can do.

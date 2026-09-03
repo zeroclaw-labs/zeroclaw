@@ -88,7 +88,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-webpki-roots-no-provider",
   "stream",
 ] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", optional = true, features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = [
   "logging",
   "ring",
@@ -215,7 +215,7 @@ channel-email = [
 ]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
-channel-lark = ["dep:axum", "dep:prost"]
+channel-lark = ["dep:aes", "dep:axum", "dep:cbc", "dep:prost"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and
 # `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
@@ -228,6 +228,7 @@ whatsapp-web = [
   "dep:bytes",
   "dep:prost",
   "dep:qrcode",
+  "dep:rusqlite",
   "dep:serde-big-array",
   "dep:wacore",
   "dep:wacore-binary",
@@ -244,7 +245,7 @@ channel-signal = []
 channel-mattermost = []
 channel-irc = []
 channel-twitch = ["channel-irc"]
-channel-imessage = []
+channel-imessage = ["dep:rusqlite"]
 channel-dingtalk = []
 channel-qq = []
 channel-bluesky = []
@@ -300,6 +301,7 @@ matrix-sdk = { version = "0.18", default-features = false, features = [
 ] }
 matrix-sdk-base = { version = "0.18", default-features = false, features = ["e2e-encryption"] }
 matrix-sdk-test = "0.18"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"

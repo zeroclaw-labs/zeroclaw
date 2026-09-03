@@ -40,6 +40,7 @@
           - "src/commands/**"
           - "src/alias_cli/**"
           - "src/cli_input.rs"
+          - "src/memory/cli.rs"
           - "crates/zeroclaw-commands/**"
           - "crates/zeroclaw-runtime/src/cli_input.rs"
 
@@ -391,7 +392,9 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/hardware/**"
+          - "src/peripherals/mod.rs"
           - "crates/zeroclaw-hardware/**"
+          - "crates/zeroclaw-api/src/peripherals_traits.rs"
           - "firmware/**"
 
 "web":

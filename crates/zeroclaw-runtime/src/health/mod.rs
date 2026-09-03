@@ -76,6 +76,35 @@ pub fn mark_component_ok(component: &str) {
     });
 }
 
+/// Register the component as present but not yet proven healthy.
+///
+/// Distinct from both `ok` and `error`: the component exists and has not
+/// failed, but nothing has succeeded *for its current incarnation*. Callers use
+/// this when they know a component is running and know they have no evidence it
+/// works.
+///
+/// Two things make this more than a no-op, because the registry only creates an
+/// entry when a mutation reaches it:
+///
+/// - On first call the entry is created, so the component appears in
+///   [`snapshot`] as `starting` instead of being absent from `/health`
+///   altogether.
+/// - On a later call it *invalidates* a `last_ok` left by a previous
+///   incarnation. The registry lives in a process-wide `OnceLock` and outlives
+///   a daemon reload, so a replacement component reusing the same name would
+///   otherwise inherit its predecessor's `ok` and keep reporting healthy while
+///   it has never once succeeded.
+///
+/// `last_error` is deliberately preserved: erasing a recorded failure is how
+/// a status becomes misleading, and "starting" is not evidence that a prior
+/// error has been resolved. `restart_count` is untouched.
+pub fn mark_component_starting(component: &str) {
+    upsert_component(component, |entry| {
+        entry.status = "starting".into();
+        entry.last_ok = None;
+    });
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn mark_component_error(component: &str, error: impl ToString) {
     let err = error.to_string();
@@ -174,6 +203,82 @@ mod tests {
             .expect("component should exist after restart bump");
 
         assert_eq!(entry.restart_count, 2);
+    }
+
+    #[test]
+    fn mark_component_starting_publishes_a_component_that_has_not_succeeded() {
+        // The registry only creates an entry when a mutation reaches it, so a
+        // component with nothing to report would otherwise be absent from
+        // `/health` rather than visibly not-yet-healthy.
+        let component = unique_component("health-starting");
+
+        assert!(
+            !snapshot().components.contains_key(&component),
+            "precondition: the component should not exist yet"
+        );
+
+        mark_component_starting(&component);
+
+        let snapshot = snapshot();
+        let entry = snapshot
+            .components
+            .get(&component)
+            .expect("component should be present after mark_component_starting");
+
+        assert_eq!(entry.status, "starting");
+        assert!(entry.last_ok.is_none());
+    }
+
+    #[test]
+    fn mark_component_starting_invalidates_a_previous_ok() {
+        // The registry outlives a daemon reload, so a replacement incarnation
+        // reuses the name its predecessor wrote to. Inheriting that `ok` would
+        // report a component as healthy on evidence it never produced.
+        let component = unique_component("health-starting-reset");
+
+        mark_component_ok(&component);
+        let healthy = snapshot();
+        let healthy = healthy
+            .components
+            .get(&component)
+            .expect("component should exist after mark_component_ok");
+        assert_eq!(healthy.status, "ok");
+        assert!(healthy.last_ok.is_some());
+
+        mark_component_starting(&component);
+
+        let restarted = snapshot();
+        let restarted = restarted
+            .components
+            .get(&component)
+            .expect("component should still exist");
+        assert_eq!(restarted.status, "starting");
+        assert!(
+            restarted.last_ok.is_none(),
+            "the previous incarnation's last_ok must not carry forward"
+        );
+    }
+
+    #[test]
+    fn mark_component_starting_preserves_a_recorded_error_and_restart_count() {
+        // Erasing a recorded failure is how a status becomes misleading:
+        // "starting" is not evidence that a prior error has been resolved.
+        let component = unique_component("health-starting-keeps-error");
+
+        bump_component_restart(&component);
+        mark_component_error(&component, "boom");
+
+        mark_component_starting(&component);
+
+        let snapshot = snapshot();
+        let entry = snapshot
+            .components
+            .get(&component)
+            .expect("component should exist");
+
+        assert_eq!(entry.status, "starting");
+        assert_eq!(entry.last_error.as_deref(), Some("boom"));
+        assert_eq!(entry.restart_count, 1);
     }
 
     #[test]

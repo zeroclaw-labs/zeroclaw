@@ -328,12 +328,12 @@ rpc_type! {
     pub struct SessionMessagesResult {
         pub session_id: String,
         pub messages: Vec<MessageEntry>,
-        /// Total messages persisted for this session. Lets the TUI
-        /// know how many pages remain before it reaches the head.
+        /// Total projected entries for this session. Lets the TUI know how
+        /// many pages remain before it reaches the head.
         #[serde(default)]
         pub total: usize,
-        /// Index of the first message in `messages` relative to the
-        /// full persisted history. Pair with `total` to compute
+        /// Index of the first entry in `messages` relative to the
+        /// full projected history. Pair with `total` to compute
         /// "page N of M" / "load older" affordances.
         #[serde(default)]
         pub start: usize,
@@ -350,10 +350,29 @@ rpc_type! {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+}
+
 rpc_type! {
     pub struct MessageEntry {
         pub role: String,
         pub content: String,
+        #[serde(default)]
+        pub kind: MessageEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_input: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_output: Option<String>,
     }
 }
 
