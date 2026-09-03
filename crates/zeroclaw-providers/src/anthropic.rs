@@ -81,6 +81,9 @@ const SETUP_TOKEN_BETAS: &str =
 /// Beta feature that returns the model's between-tool progress notes.
 const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
 
+/// Stop reason the API uses when its safety classifiers decline a request.
+const REFUSAL_STOP_REASON: &str = "refusal";
+
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub struct AnthropicModelProvider {
@@ -132,6 +135,15 @@ struct ContentBlock {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+}
+
+/// Why the model stopped, when it stopped for a reason that carries detail.
+/// The provider's free-text explanation is deliberately not read: it is
+/// untrusted prose that must never reach a user-facing message or a log.
+#[derive(Debug, Deserialize)]
+struct NativeStopDetails {
+    #[serde(default)]
+    category: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,6 +431,8 @@ struct NativeChatResponse {
     content: Vec<NativeContentIn>,
     #[serde(default)]
     stop_reason: Option<String>,
+    #[serde(default)]
+    stop_details: Option<NativeStopDetails>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
@@ -1811,6 +1825,43 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// Record a refusal and map its category onto the closed set.
+    ///
+    /// `streamed_output` says whether the model had already produced output,
+    /// which is what decides whether the attempt was billed.
+    fn classify_refusal(
+        raw_category: Option<&str>,
+        streamed_output: bool,
+    ) -> zeroclaw_api::model_provider::RefusalCategory {
+        let category = zeroclaw_api::model_provider::RefusalCategory::from_wire(raw_category);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "provider": "anthropic",
+                    "refusal_category": category.as_str(),
+                    "streamed_output": streamed_output,
+                    "billed": streamed_output,
+                })),
+            "provider safety classifier declined the request"
+        );
+        if category == zeroclaw_api::model_provider::RefusalCategory::Other {
+            // Recorded so the closed set can be widened later. Kept to DEBUG
+            // and never rendered, since this is provider-controlled text.
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "raw_category": raw_category.unwrap_or_default(),
+                    })),
+                "unrecognised refusal category"
+            );
+        }
+        category
+    }
+
     /// One thinking block in the form the runtime stores and later replays:
     /// a single JSON line holding the text exactly as received and the
     /// signature it was signed with. `None` when there is nothing to replay.
@@ -1825,7 +1876,9 @@ impl AnthropicModelProvider {
         })
     }
 
-    fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+    fn parse_native_response(
+        response: NativeChatResponse,
+    ) -> Result<ProviderChatResponse, zeroclaw_api::model_provider::ProviderRefusal> {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
         let mut content_block_types = Vec::with_capacity(content_block_count);
@@ -1849,6 +1902,20 @@ impl AnthropicModelProvider {
                 cached_input_tokens: u.cache_read_input_tokens,
             }
         });
+
+        // Checked before the blocks are read: a refusal before any output
+        // has empty content, which would otherwise look like a provider that
+        // simply returned nothing and get retried on the same model.
+        if stop_reason == REFUSAL_STOP_REASON {
+            let category = Self::classify_refusal(
+                response
+                    .stop_details
+                    .as_ref()
+                    .and_then(|details| details.category.as_deref()),
+                !response.content.is_empty(),
+            );
+            return Err(zeroclaw_api::model_provider::ProviderRefusal { category, usage });
+        }
 
         for block in response.content {
             let kind = block.kind;
@@ -1926,7 +1993,7 @@ impl AnthropicModelProvider {
             );
         }
 
-        parsed
+        Ok(parsed)
     }
 
     /// Project a native completion into the legacy string-only API without
@@ -2118,6 +2185,7 @@ impl AnthropicModelProvider {
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
 
+        let mut saw_content_block = false;
         let mut in_thinking_block = false;
         let mut thinking_text = String::new();
         let mut thinking_signature: Option<String> = None;
@@ -2212,6 +2280,7 @@ impl AnthropicModelProvider {
                                 .entry(block_type.to_string())
                                 .or_default() += 1;
                         }
+                        saw_content_block = true;
                         if block_type == "thinking" {
                             in_thinking_block = true;
                             thinking_text.clear();
@@ -2331,6 +2400,41 @@ impl AnthropicModelProvider {
                         .unwrap_or("none");
                     if stop_reason != "none" && collect_debug_metadata {
                         last_stop_reason = Some(stop_reason.to_string());
+                    }
+                    if stop_reason == REFUSAL_STOP_REASON {
+                        let category = Self::classify_refusal(
+                            event
+                                .get("delta")
+                                .and_then(|d| d.get("stop_details"))
+                                .and_then(|d| d.get("category"))
+                                .and_then(|c| c.as_str()),
+                            saw_content_block,
+                        );
+                        // Output already produced was billed, so report it
+                        // before ending the stream. A refusal before any
+                        // output is not billed and reports nothing.
+                        if saw_content_block {
+                            let observed_output = event
+                                .get("usage")
+                                .and_then(|u| u.get("output_tokens"))
+                                .and_then(|t| t.as_u64());
+                            if let Some(v) = observed_output {
+                                output_tokens = Some(v);
+                            }
+                            let _ = tx
+                                .send(Ok(StreamEvent::Usage(TokenUsage {
+                                    input_tokens: input_tokens.map(|uncached| {
+                                        uncached
+                                            + cached_input_tokens.unwrap_or(0)
+                                            + cache_creation_input_tokens.unwrap_or(0)
+                                    }),
+                                    output_tokens,
+                                    cached_input_tokens,
+                                })))
+                                .await;
+                        }
+                        let _ = tx.send(Err(StreamError::Refusal(category))).await;
+                        return;
                     }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
@@ -2494,7 +2598,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response);
-        Self::require_terminal_text(parsed)
+        Self::require_terminal_text(parsed?)
     }
 
     async fn chat(
@@ -2593,7 +2697,7 @@ impl ModelProvider for AnthropicModelProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+        Ok(Self::parse_native_response(native_response)?)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -2812,7 +2916,8 @@ impl ModelProvider for AnthropicModelProvider {
                     .json()
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
-                Ok(Self::parse_native_response(parsed))
+                Self::parse_native_response(parsed)
+                    .map_err(|refusal| StreamError::Refusal(refusal.category))
             })
             .flat_map(|result| match result {
                 Ok(resp) => {
@@ -3318,6 +3423,133 @@ data: {\"type\":\"message_stop\"}\n\n"
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn refusal_before_any_output_is_reported_as_a_refusal() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        let json = r#"{
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber", "explanation": "ignored"}
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let refusal = AnthropicModelProvider::parse_native_response(response)
+            .expect_err("a declined request is not an empty completion");
+        assert_eq!(refusal.category, RefusalCategory::Cyber);
+    }
+
+    #[test]
+    fn refusal_without_details_reports_an_unspecified_category() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        for json in [
+            r#"{"content": [], "stop_reason": "refusal"}"#,
+            r#"{"content": [], "stop_reason": "refusal", "stop_details": null}"#,
+            r#"{"content": [], "stop_reason": "refusal", "stop_details": {"type": "refusal"}}"#,
+        ] {
+            let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+            let refusal = AnthropicModelProvider::parse_native_response(response)
+                .expect_err("still a refusal without a category");
+            assert_eq!(refusal.category, RefusalCategory::Unspecified, "{json}");
+        }
+    }
+
+    #[test]
+    fn unrecognised_refusal_category_does_not_leak_provider_text() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        let json = r#"{
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"category": "some_new_policy"}
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let refusal = AnthropicModelProvider::parse_native_response(response).unwrap_err();
+        assert_eq!(refusal.category, RefusalCategory::Other);
+        assert!(
+            !refusal.to_string().contains("some_new_policy"),
+            "provider text must not reach the rendered error"
+        );
+    }
+
+    #[test]
+    fn stop_details_are_ignored_for_other_stop_reasons() {
+        let json = r#"{
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "stop_details": {"category": "cyber"}
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let parsed = AnthropicModelProvider::parse_native_response(response)
+            .expect("a normal completion is not a refusal");
+        assert_eq!(parsed.text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn refusal_message_avoids_the_reliability_layer_heuristics() {
+        use zeroclaw_api::model_provider::{ProviderRefusal, RefusalCategory};
+        for category in [
+            RefusalCategory::Cyber,
+            RefusalCategory::Bio,
+            RefusalCategory::ReasoningExtraction,
+            RefusalCategory::FrontierLlm,
+            RefusalCategory::Unspecified,
+            RefusalCategory::Other,
+        ] {
+            let rendered = ProviderRefusal {
+                category,
+                usage: None,
+            }
+            .to_string();
+            let has_status_number = rendered
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|run| run.len() == 3 && run.starts_with('4'));
+            assert!(!has_status_number, "{rendered}");
+            for hint in ["context", "token", "limit", "quota", "denied", "forbidden"] {
+                assert!(
+                    !rendered.to_ascii_lowercase().contains(hint),
+                    "{rendered} must not read as {hint}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_after_output_reports_usage_then_ends() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        let sse: &[u8] = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"category\":\"bio\"}},\"usage\":{\"output_tokens\":7}}\n\n";
+        let events = drain_sse(sse).await;
+
+        assert!(
+            matches!(
+                events.last(),
+                Some(Err(StreamError::Refusal(RefusalCategory::Bio)))
+            ),
+            "the stream must end on the refusal: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))),
+            "a declined turn never completes"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::Usage(_)))),
+            "output already produced was billed"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_before_output_reports_no_usage() {
+        let sse: &[u8] = b"event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n";
+        let events = drain_sse(sse).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(events[0], Err(StreamError::Refusal(_))));
     }
 
     #[tokio::test]
@@ -5026,7 +5258,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             "usage": {"input_tokens": 300, "output_tokens": 75}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
         let usage = result.usage.unwrap();
         assert_eq!(usage.input_tokens, Some(300));
         assert_eq!(usage.output_tokens, Some(75));
@@ -5044,7 +5277,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             }
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
         let usage = result.usage.expect("usage should be Some");
         assert_eq!(
             usage.input_tokens,
@@ -5064,7 +5298,8 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn native_response_parses_without_usage() {
         let json = r#"{"content": [{"type": "text", "text": "Hello"}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
         assert!(result.usage.is_none());
     }
 
@@ -5076,7 +5311,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         }"#;
         let response: NativeChatResponse = serde_json::from_str(json).unwrap();
         let error = AnthropicModelProvider::require_terminal_text(
-            AnthropicModelProvider::parse_native_response(response),
+            AnthropicModelProvider::parse_native_response(response)
+                .expect("response is not a refusal"),
         )
         .expect_err("thinking alone is not a string-only final answer");
 
@@ -5095,7 +5331,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
 
         assert!(result.is_semantically_empty_terminal());
         assert!(result.reasoning_content.is_some());
@@ -5117,7 +5354,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
         let reasoning = result.reasoning_content.expect("thinking preserved");
         let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
         assert_eq!(
@@ -5141,7 +5379,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
         let reasoning = result
             .reasoning_content
             .expect("a signed block must survive for replay");
@@ -5159,7 +5398,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ]
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let result = AnthropicModelProvider::parse_native_response(resp);
+        let result =
+            AnthropicModelProvider::parse_native_response(resp).expect("response is not a refusal");
         assert!(result.reasoning_content.is_none());
     }
 

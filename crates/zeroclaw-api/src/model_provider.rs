@@ -196,6 +196,90 @@ impl std::fmt::Display for SemanticEmptyTerminalCompletion {
 
 impl std::error::Error for SemanticEmptyTerminalCompletion {}
 
+/// Why a provider's safety classifier declined a request.
+///
+/// A closed set owned by ZeroClaw. Provider category strings are mapped on
+/// arrival and never retained, so this value is safe to render and to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusalCategory {
+    Cyber,
+    Bio,
+    ReasoningExtraction,
+    FrontierLlm,
+    /// The provider reported a refusal with no category.
+    Unspecified,
+    /// The provider reported a category this build does not recognise.
+    Other,
+}
+
+impl RefusalCategory {
+    /// Map a provider's category string onto the closed set.
+    #[must_use]
+    pub fn from_wire(category: Option<&str>) -> Self {
+        match category.map(str::trim) {
+            None | Some("") => Self::Unspecified,
+            Some("cyber") => Self::Cyber,
+            Some("bio") => Self::Bio,
+            Some("reasoning_extraction") => Self::ReasoningExtraction,
+            Some("frontier_llm") => Self::FrontierLlm,
+            Some(_) => Self::Other,
+        }
+    }
+
+    /// Stable token for structured logs and message lookups.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cyber => "cyber",
+            Self::Bio => "bio",
+            Self::ReasoningExtraction => "reasoning_extraction",
+            Self::FrontierLlm => "frontier_llm",
+            Self::Unspecified => "unspecified",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A transport-successful response the provider's safety classifier declined
+/// to answer.
+///
+/// Retrying the same request on the same model repeats the decision, so this
+/// is never retried there. The message deliberately avoids response-status
+/// numbers and capacity wording, which the reliability layer reads as hints
+/// when it classifies untyped errors.
+#[derive(Debug, Clone)]
+pub struct ProviderRefusal {
+    pub category: RefusalCategory,
+    /// Usage reported alongside the refusal. `None` when the request was
+    /// declined before any output, which the provider does not bill.
+    pub usage: Option<TokenUsage>,
+}
+
+impl std::fmt::Display for ProviderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "provider safety classifier declined the request (category={})",
+            self.category
+        )
+    }
+}
+
+impl std::error::Error for ProviderRefusal {}
+
+/// Whether an error chain carries a typed provider refusal.
+#[must_use]
+pub fn is_provider_refusal(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.is::<ProviderRefusal>())
+}
+
 impl ChatResponse {
     /// True when the LLM wants to invoke at least one tool.
     pub fn has_tool_calls(&self) -> bool {
@@ -417,6 +501,9 @@ pub enum StreamError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("model provider safety classifier declined the request (category={0})")]
+    Refusal(RefusalCategory),
 }
 
 /// Structured error returned when a requested capability is not supported.
