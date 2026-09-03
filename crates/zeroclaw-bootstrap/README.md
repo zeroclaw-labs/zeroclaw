@@ -12,6 +12,44 @@ This document is the canonical entry-point routing the harness follows. It
 describes only what the built launcher and the control binary actually do; it
 duplicates no schema, so it does not drift when either surface changes.
 
+## Obtaining the launcher and wiring it into your harness
+
+The launcher is a small standalone per-platform binary, shipped as its own
+release asset (`zeroclaw-bootstrap-<triple>.tar.gz`). Install it, then point
+**one** MCP server at it — that single server carries the whole lifecycle:
+while ZeroClaw is absent it answers the bootstrap surface, and after
+`bootstrap.handoff` it becomes `zeroclaw control --mcp` on the **same pipe**, so
+install → configure (→ update, via the control surface) is one continuous
+session with no second server and no reconnect.
+
+Install (Linux / macOS):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install-bootstrap.sh | sh
+```
+
+`ZEROCLAW_BIN_DIR` overrides the install location (default `~/.local/bin`).
+Windows: install the launcher via scoop.
+
+Register it as an MCP server — one server, no reconnect after handoff:
+
+- **Claude Code:** `claude mcp add zeroclaw-bootstrap -- zeroclaw-bootstrap mcp`
+  — or in `.mcp.json`:
+
+  ```json
+  { "mcpServers": { "zeroclaw-bootstrap": { "command": "zeroclaw-bootstrap", "args": ["mcp"] } } }
+  ```
+
+- **Codex** (`~/.codex/config.toml`):
+
+  ```toml
+  [mcp_servers.zeroclaw-bootstrap]
+  command = "zeroclaw-bootstrap"
+  args = ["mcp"]
+  ```
+
+- **Any MCP host:** run `zeroclaw-bootstrap mcp` as an stdio JSON-RPC server.
+
 ## The entry-point decision
 
 The first-run question is a single two-branch route: **is ZeroClaw installed?
