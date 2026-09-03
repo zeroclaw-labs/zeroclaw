@@ -5390,11 +5390,11 @@ async fn persist_acp_turn(
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
     match tokio::task::spawn_blocking(move || {
-        store.replace_messages(&session_id, &full_history)?;
-        // Keep the store's breadcrumb provenance flag in sync with the
-        // transcript it describes, alongside the same replace: a restore
-        // must never re-infer it from message text.
-        store.set_trim_breadcrumb(&session_id, trim_breadcrumb)
+        // One transaction covers the transcript and its breadcrumb flag
+        // together: a restore must never re-infer provenance from message
+        // text, and a crash between two separate writes could otherwise
+        // desynchronize them.
+        store.replace_messages_and_breadcrumb(&session_id, &full_history, trim_breadcrumb)
     })
     .await
     {

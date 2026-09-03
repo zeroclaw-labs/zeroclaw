@@ -1723,8 +1723,10 @@ impl AcpServer {
                     )
                 };
                 let persisted = tokio::task::spawn_blocking(move || {
-                    store.replace_messages(&sid, &full_history)?;
-                    store.set_trim_breadcrumb(&sid, crumb_present)
+                    // One transaction covers the transcript and its
+                    // breadcrumb flag together, so a crash between two
+                    // separate writes cannot desynchronize them.
+                    store.replace_messages_and_breadcrumb(&sid, &full_history, crumb_present)
                 })
                 .await;
                 if let Some(detail) = match persisted {
@@ -1773,8 +1775,10 @@ impl AcpServer {
                     )
                 };
                 let persisted = tokio::task::spawn_blocking(move || {
-                    store.replace_messages(&sid, &full_history)?;
-                    store.set_trim_breadcrumb(&sid, crumb_present)
+                    // One transaction covers the transcript and its
+                    // breadcrumb flag together, so a crash between two
+                    // separate writes cannot desynchronize them.
+                    store.replace_messages_and_breadcrumb(&sid, &full_history, crumb_present)
                 })
                 .await;
                 if let Some(detail) = match persisted {
@@ -1825,8 +1829,10 @@ impl AcpServer {
                 )
             };
             let persisted = tokio::task::spawn_blocking(move || {
-                store.replace_messages(&sid, &full_history)?;
-                store.set_trim_breadcrumb(&sid, crumb_present)
+                // One transaction covers the transcript and its breadcrumb
+                // flag together, so a crash between two separate writes
+                // cannot desynchronize them.
+                store.replace_messages_and_breadcrumb(&sid, &full_history, crumb_present)
             })
             .await;
             let error = match persisted {

@@ -27,6 +27,13 @@ impl ToolEventKind {
     }
 }
 
+/// Canonical breadcrumb text, duplicated from
+/// `zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL`.
+/// This crate sits below `zeroclaw-runtime` in the dependency graph and
+/// cannot import it; used only for one-time legacy-row migration below.
+/// Keep in sync with the runtime constant.
+const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str = "[earlier turns omitted to fit the context window]";
+
 pub struct AcpSessionStore {
     conn: Mutex<Connection>,
 }
@@ -41,8 +48,13 @@ pub struct AcpSessionData {
     pub last_activity: DateTime<Utc>,
     pub messages: Vec<ConversationMessage>,
     /// Whether `messages`' first non-system entry is the synthetic
-    /// history-trim breadcrumb, as recorded by the owning turn loop —
-    /// never inferred from message text on restore.
+    /// history-trim breadcrumb. Rows written after the `trim_breadcrumb`
+    /// column was added carry this as recorded by the owning turn loop,
+    /// never inferred from text. A row from before that column existed has
+    /// no recorded value (`NULL`); for that one-time legacy case only, it is
+    /// inferred from the first non-system message's text, matching the
+    /// interactive-session JSONL migration contract (see
+    /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`).
     pub trim_breadcrumb: bool,
 }
 
@@ -284,8 +296,13 @@ impl AcpSessionStore {
         drop(rows);
         drop(stmt);
 
+        // No `NOT NULL DEFAULT 0`: a `0` default would be indistinguishable
+        // from an explicit "no breadcrumb" recorded by the owning turn loop.
+        // Existing rows get `NULL` (unknown/legacy) and are migrated by
+        // text inference on load; every row written after this migration
+        // gets an explicit 0 or 1.
         match conn.execute(
-            "ALTER TABLE acp_sessions ADD COLUMN trim_breadcrumb INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE acp_sessions ADD COLUMN trim_breadcrumb INTEGER",
             [],
         ) {
             Ok(_) => Ok(()),
@@ -296,6 +313,28 @@ impl AcpSessionStore {
             }
             Err(e) => Err(e).context("Failed to add ACP session trim breadcrumb column"),
         }
+    }
+
+    /// One-time legacy migration for rows written before the
+    /// `trim_breadcrumb` column existed (`NULL`): infer provenance from
+    /// whether the first non-system message is exactly the canonical
+    /// breadcrumb text. A genuine user turn that happens to equal that text
+    /// is misclassified on this one-time migration only; the next explicit
+    /// write (`set_trim_breadcrumb`) replaces the inferred value with a
+    /// recorded one. This mirrors the JSONL interactive-session migration in
+    /// `zeroclaw_runtime::agent::history::load_interactive_session_history_with_crumb`,
+    /// restricted to the locale-independent canonical string because this
+    /// crate sits below the runtime i18n layer.
+    fn infer_legacy_trim_breadcrumb(messages: &[ConversationMessage]) -> bool {
+        messages
+            .iter()
+            .find_map(|m| match m {
+                ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat),
+                _ => None,
+            })
+            .is_some_and(|first| {
+                first.role == "user" && first.content == HISTORY_TRIM_BREADCRUMB_CANONICAL
+            })
     }
 
     /// Record a new session. Returns the integer `id` assigned by SQLite.
@@ -320,8 +359,8 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO acp_sessions
-               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0)",
             params![
                 session_uuid,
                 agent_alias,
@@ -376,7 +415,7 @@ impl AcpSessionStore {
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             },
         );
@@ -389,7 +428,7 @@ impl AcpSessionStore {
             token_count,
             created_at_s,
             last_activity_s,
-            trim_breadcrumb,
+            trim_breadcrumb_raw,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -400,6 +439,9 @@ impl AcpSessionStore {
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
 
         let messages = Self::load_messages(&conn, session_id)?;
+        let trim_breadcrumb = trim_breadcrumb_raw
+            .map(|v| v != 0)
+            .unwrap_or_else(|| Self::infer_legacy_trim_breadcrumb(&messages));
 
         Ok(Some(AcpSessionData {
             session_uuid: session_uuid.to_string(),
@@ -410,7 +452,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
-            trim_breadcrumb: trim_breadcrumb != 0,
+            trim_breadcrumb,
         }))
     }
 
@@ -434,7 +476,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             },
         );
@@ -448,7 +490,7 @@ impl AcpSessionStore {
             created_at_s,
             last_activity_s,
             killed_at,
-            trim_breadcrumb,
+            trim_breadcrumb_raw,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
@@ -462,6 +504,9 @@ impl AcpSessionStore {
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
         let messages = Self::load_messages(&conn, session_id)?;
+        let trim_breadcrumb = trim_breadcrumb_raw
+            .map(|v| v != 0)
+            .unwrap_or_else(|| Self::infer_legacy_trim_breadcrumb(&messages));
 
         Ok(AcpSessionRestore::Restorable(AcpSessionData {
             session_uuid: session_uuid.to_string(),
@@ -472,7 +517,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
-            trim_breadcrumb: trim_breadcrumb != 0,
+            trim_breadcrumb,
         }))
     }
 
@@ -720,6 +765,50 @@ impl AcpSessionStore {
         .context("Failed to update last_activity")?;
 
         tx.commit().context("Failed to commit replace_messages")?;
+        Ok(())
+    }
+
+    /// Replace a session's message transcript and its breadcrumb provenance
+    /// together in one transaction. `replace_messages` and
+    /// `set_trim_breadcrumb` each commit on their own; calling them back to
+    /// back (as the ACP restore/turn-completion callers used to) leaves a
+    /// window where a crash between the two commits can desynchronize the
+    /// transcript and the flag. Callers that own both values at once should
+    /// use this instead.
+    pub fn replace_messages_and_breadcrumb(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+        breadcrumb_present: bool,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
+
+        let tx = conn
+            .transaction()
+            .context("Failed to begin replace_messages_and_breadcrumb transaction")?;
+        tx.execute(
+            "DELETE FROM acp_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .context("Failed to clear prior messages")?;
+        Self::insert_messages(&tx, session_id, messages, &now)?;
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1, trim_breadcrumb = ?2 WHERE id = ?3",
+            params![now, i64::from(breadcrumb_present), session_id],
+        )
+        .context("Failed to update last_activity and trim_breadcrumb")?;
+
+        tx.commit()
+            .context("Failed to commit replace_messages_and_breadcrumb")?;
         Ok(())
     }
 
@@ -1853,6 +1942,83 @@ mod tests {
             !restored.trim_breadcrumb,
             "a genuine user message with breadcrumb-shaped text must not be \
              classified as a synthetic breadcrumb absent an explicit flag"
+        );
+    }
+
+    #[test]
+    fn legacy_null_trim_breadcrumb_is_inferred_once_then_recorded() {
+        // Simulate a row written before the `trim_breadcrumb` column
+        // existed: the column is `NULL`, not `0`. Restore must infer
+        // provenance from the leading synthetic marker on this one-time
+        // migration, not treat `NULL` the same as an explicit "no
+        // breadcrumb" and drop/miscount the marker.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-legacy-marker", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy-marker",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user(HISTORY_TRIM_BREADCRUMB_CANONICAL)),
+                    ConversationMessage::Chat(ChatMessage::user("real turn")),
+                ],
+            )
+            .unwrap();
+        // Force the column back to NULL to simulate a pre-migration row.
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE acp_sessions SET trim_breadcrumb = NULL WHERE session_uuid = ?1",
+                params!["sess-legacy-marker"],
+            )
+            .unwrap();
+
+        let restored = match store
+            .load_session_for_restore("sess-legacy-marker")
+            .unwrap()
+        {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            restored.trim_breadcrumb,
+            "a NULL (legacy) row with a leading canonical marker must be \
+             inferred as carrying the breadcrumb"
+        );
+
+        // A genuine colliding user turn (no synthetic marker at all) must
+        // NOT be misclassified when the column is legacy-NULL either.
+        store
+            .create_session("sess-legacy-no-marker", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-legacy-no-marker",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE acp_sessions SET trim_breadcrumb = NULL WHERE session_uuid = ?1",
+                params!["sess-legacy-no-marker"],
+            )
+            .unwrap();
+        let restored_clean = match store
+            .load_session_for_restore("sess-legacy-no-marker")
+            .unwrap()
+        {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            !restored_clean.trim_breadcrumb,
+            "a legacy-NULL row with no marker-shaped text must not be inferred as true"
         );
     }
 
