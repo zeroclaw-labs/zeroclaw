@@ -26,6 +26,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 cap-std = "4"
+cap-fs-ext = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
