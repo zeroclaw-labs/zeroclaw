@@ -195,7 +195,7 @@ impl SgrMouseEventDecoder {
 
     fn replay_candidate(&mut self) -> Vec<Event> {
         self.candidate_started_at = None;
-        self.candidate.drain(..).collect()
+        std::mem::take(&mut self.candidate)
     }
 }
 
@@ -549,13 +549,16 @@ async fn switch_mode(
         dashboard_pane.on_pane_blur();
     }
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
-        quickstart.dismiss_beacon().await;
+        quickstart.dismiss_beacon();
+    }
+    if *mode == Mode::Sop && next != Mode::Sop {
+        sop_pane.on_pane_blur();
     }
     if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
         match next {
             Mode::Acp => acp_pane.refresh_if_inactive().await,
             Mode::Chat => chat_pane.refresh_if_inactive().await,
-            Mode::Sop => sop_pane.refresh().await,
+            Mode::Sop => sop_pane.refresh(),
             _ => {}
         }
     }
@@ -615,6 +618,7 @@ pub async fn run(
     config_dir: &std::path::Path,
     target: &crate::ConnectTarget,
     owns_ephemeral: bool,
+    initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
@@ -627,6 +631,12 @@ pub async fn run(
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
+
+    // Which transport leg the live connection sits on, and when the direct path
+    // was last re-probed. While on the relay leg of a route that also has a
+    // direct address, the loop periodically retries direct and migrates back.
+    let mut active_leg = initial_leg;
+    let mut reprobe_last_attempt: Option<std::time::Instant> = None;
 
     // The live client handle. Reassigned in place on a successful
     // reconnect so every rebuilt pane talks to the recovered daemon.
@@ -698,11 +708,67 @@ pub async fn run(
     chrome_status.tick(&rpc);
     let mut input_decoder = SgrMouseEventDecoder::default();
 
+    // Adopt a freshly-connected client: rebuild every pane against it (a kept
+    // pane would still hold the dead client's notification receiver) while
+    // carrying the live sessions + agent aliases across the rebuild. Evaluates to
+    // `true` when the rebuild succeeded, `false` when the daemon flapped mid-init
+    // (the caller stays in its current state and retries). Shared by the
+    // disconnect-recovery path and the relay->direct re-probe migration.
+    macro_rules! adopt_client {
+        ($new_client:expr) => {{
+            // Transactional: `rpc` and the panes must always describe the SAME
+            // connection. The new client has to be installed first because the
+            // panes are built against it, so a failed rebuild puts the previous
+            // one back rather than leaving a live `rpc` beside panes that still
+            // hold the old, possibly dead, connection.
+            let previous = Arc::clone(&rpc);
+            rpc = Arc::new($new_client);
+            let resume_chat = (
+                chat_pane.current_session_id().map(String::from),
+                chat_pane.current_agent_alias().map(String::from),
+            );
+            let resume_acp = (
+                acp_pane.current_session_id().map(String::from),
+                acp_pane.current_agent_alias().map(String::from),
+            );
+            match build_panes!(resume_chat, resume_acp) {
+                Ok(mut panes) => {
+                    refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
+                    // Assigned as one tuple: every pane the builder produces is
+                    // adopted, and a pane added to `build_panes!` later cannot
+                    // be left behind on the old client without failing to
+                    // compile here.
+                    (
+                        dashboard_pane,
+                        config_app,
+                        doctor_pane,
+                        acp_pane,
+                        chat_pane,
+                        logs_pane,
+                        quickstart,
+                        sop_pane,
+                    ) = panes;
+                    // No pane holds the replaced connection any more. Nothing
+                    // else would ever stop it: its reader, writer, and relay
+                    // pump are detached tasks with no destructor to reach them.
+                    previous.shutdown();
+                    true
+                }
+                Err(_) => {
+                    let abandoned = std::mem::replace(&mut rpc, previous);
+                    abandoned.shutdown();
+                    false
+                }
+            }
+        }};
+    }
+
     'event_loop: loop {
         // Draw
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
             chrome_status.clear();
+            dashboard_pane.invalidate_daemon_data();
         } else {
             chrome_status.tick(&rpc);
         }
@@ -867,50 +933,70 @@ pub async fn run(
                     // our UID via HMAC signature verification.
                     let prev_id = rpc.tui_id().map(String::from);
                     let prev_sig = rpc.tui_sig().map(String::from);
-                    if let Ok(new_client) = target
+                    // The connect prefers the direct path and falls back to the
+                    // relay, so a reconnect lands on whichever leg is reachable.
+                    if let Ok((new_client, leg)) = target
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
-                        rpc = Arc::new(new_client);
-                        let resume_chat = (
-                            chat_pane.current_session_id().map(String::from),
-                            chat_pane.current_agent_alias().map(String::from),
-                        );
-                        let resume_acp = (
-                            acp_pane.current_session_id().map(String::from),
-                            acp_pane.current_agent_alias().map(String::from),
-                        );
-                        match build_panes!(resume_chat, resume_acp) {
-                            Ok(mut panes) => {
-                                refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
-                                dashboard_pane = panes.0;
-                                config_app = panes.1;
-                                doctor_pane = panes.2;
-                                acp_pane = panes.3;
-                                chat_pane = panes.4;
-                                logs_pane = panes.5;
-                                quickstart = panes.6;
-                                sop_pane = panes.7;
-                                chrome_status.clear();
-                                chrome_status.tick(&rpc);
-                                reconnect_last_attempt = None;
-                                ephemeral_respawn_done = false;
-                                needs_intervention = false;
-                                continue;
-                            }
-                            Err(_) => {
-                                // Daemon flapped again mid-init. Stay in the
-                                // disconnected loop and retry on the next
-                                // throttle window rather than tearing down.
-                                continue;
-                            }
+                        // A reconnect may land on a DIFFERENT leg than the one
+                        // that dropped: direct can fall back to the relay, and a
+                        // relay session can come back direct. The leg is
+                        // committed only once the panes run on that client.
+                        let adopted = adopt_client!(new_client);
+                        active_leg = leg_after_adoption(adopted, active_leg, leg);
+                        if adopted {
+                            chrome_status.clear();
+                            chrome_status.tick(&rpc);
+                            reconnect_last_attempt = None;
+                            ephemeral_respawn_done = false;
+                            needs_intervention = false;
                         }
+                        // Adopted or not, go round again: a failed rebuild means
+                        // the daemon flapped mid-init, and the previous client is
+                        // back in place for the next throttle window.
+                        continue;
                     } else if owns_ephemeral && ephemeral_respawn_done {
                         // The one permitted respawn did not come back — flag
                         // for the user. We keep polling above, so a manual
                         // daemon restart still recovers.
                         needs_intervention = true;
                     }
+                }
+            }
+        }
+
+        // Migrate back to the direct path once it becomes reachable again. Only
+        // runs while live on the relay leg of a route that also has a direct
+        // address; a successful probe adopts the direct client and rebuilds the
+        // panes against it. The probe is throttled and short-timeout, so the
+        // event loop keeps drawing between attempts.
+        if matches!(rpc.connection_state(), ConnectionState::Connected)
+            && active_leg == crate::ActiveLeg::WssRelay
+            && let crate::ConnectTarget::Wss(route) = target
+            && route.reprobe_secs > 0
+            && route.direct_url.is_some()
+        {
+            let now = std::time::Instant::now();
+            let due = reprobe_last_attempt
+                .map(|t| now.duration_since(t) >= Duration::from_secs(route.reprobe_secs))
+                .unwrap_or(true);
+            if due {
+                reprobe_last_attempt = Some(now);
+                let prev_id = rpc.tui_id().map(String::from);
+                let prev_sig = rpc.tui_sig().map(String::from);
+                if let Ok(direct) = route
+                    .connect_direct(prev_id.as_deref(), prev_sig.as_deref())
+                    .await
+                {
+                    // Committed after the rebuild, not before: a probe that
+                    // connects but cannot be adopted leaves the session on the
+                    // relay, and claiming the direct leg there would stop the
+                    // re-probe that is still the only way back.
+                    let adopted = adopt_client!(direct);
+                    active_leg =
+                        leg_after_adoption(adopted, active_leg, crate::ActiveLeg::WssDirect);
+                    continue;
                 }
             }
         }
@@ -1273,9 +1359,30 @@ pub async fn run(
 /// A reconnect rebuilds every pane around the new RPC client. The SOP list is
 /// loaded on focus rather than at construction, so an already-visible SOP pane
 /// must run that same canonical refresh before replacing the disconnected pane.
+/// The transport leg to run with after an adoption attempt.
+///
+/// `connected` is the leg the routing source of truth actually dialled, which is
+/// not necessarily the one that dropped: a direct session reconnects onto the
+/// relay when the direct address is still down, and a relay session can come
+/// back direct. It is committed ONLY when the panes were rebuilt against that
+/// client, because `active_leg` names the connection the panes hold and the
+/// re-probe and failback loops read it to decide what to try next.
+///
+/// Discarding it leaves a direct-to-relay reconnect believing it is still
+/// direct, so the failback loop that would migrate it back never runs; the
+/// mirror case leaves a relay-to-direct reconnect believing it is on the relay,
+/// which re-probes a direct path it is already using.
+fn leg_after_adoption(
+    adopted: bool,
+    current: crate::ActiveLeg,
+    connected: crate::ActiveLeg,
+) -> crate::ActiveLeg {
+    if adopted { connected } else { current }
+}
+
 async fn refresh_visible_sop_after_reconnect(mode: Mode, pane: &mut sop_pane::SopPane) {
     if mode == Mode::Sop {
-        pane.refresh().await;
+        pane.refresh();
     }
 }
 
@@ -2503,28 +2610,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mode_switch_to_sop_returns_before_a_withheld_list_response() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Config;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            switch_mode(
+                &mut mode,
+                Mode::Sop,
+                &conn_state,
+                &mut dashboard_pane,
+                &mut quickstart,
+                &mut acp_pane,
+                &mut chat_pane,
+                &mut sop_pane,
+            ),
+        )
+        .await
+        .expect("entering SOP mode must not await the list response");
+        assert_eq!(mode, Mode::Sop);
+
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("mode entry should send a list request")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+    }
+
+    #[tokio::test]
+    async fn sop_reentry_discards_pre_blur_list_and_requests_one_fresh_result() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Config;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        switch_mode(
+            &mut mode,
+            Mode::Sop,
+            &conn_state,
+            &mut dashboard_pane,
+            &mut quickstart,
+            &mut acp_pane,
+            &mut chat_pane,
+            &mut sop_pane,
+        )
+        .await;
+        let first_raw = rx.recv().await.expect("first list request");
+        let first_request: serde_json::Value = serde_json::from_str(&first_raw).unwrap();
+        let first_id = first_request["id"].as_str().unwrap().to_string();
+
+        switch_mode(
+            &mut mode,
+            Mode::Config,
+            &conn_state,
+            &mut dashboard_pane,
+            &mut quickstart,
+            &mut acp_pane,
+            &mut chat_pane,
+            &mut sop_pane,
+        )
+        .await;
+        switch_mode(
+            &mut mode,
+            Mode::Sop,
+            &conn_state,
+            &mut dashboard_pane,
+            &mut quickstart,
+            &mut acp_pane,
+            &mut chat_pane,
+            &mut sop_pane,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "single-flight re-entry must wait for the older request to settle"
+        );
+
+        outbound.dispatch_response(
+            &first_id,
+            Some(serde_json::json!([{ "name": "old" }])),
+            None,
+        );
+        let mut fresh_id = None;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            sop_pane.tick();
+            while let Ok(raw) = rx.try_recv() {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if request["method"] == crate::client::method::SOPS_LIST {
+                    fresh_id = request["id"].as_str().map(String::from);
+                }
+            }
+            if fresh_id.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            sop_pane.selected_name(),
+            None,
+            "the pre-blur response must not become authoritative after re-entry"
+        );
+        let fresh_id = fresh_id.expect("fresh list request after re-entry");
+        assert_ne!(fresh_id, first_id);
+
+        outbound.dispatch_response(
+            &fresh_id,
+            Some(serde_json::json!([{ "name": "fresh" }])),
+            None,
+        );
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            sop_pane.tick();
+            if sop_pane.selected_name() == Some("fresh") {
+                break;
+            }
+        }
+        assert_eq!(sop_pane.selected_name(), Some("fresh"));
+        while let Ok(raw) = rx.try_recv() {
+            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                request["method"],
+                crate::client::method::SOPS_LIST,
+                "only one authoritative follow-up may be sent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_switch_leaves_quickstart_for_sop_before_withheld_responses() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Quickstart;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            switch_mode(
+                &mut mode,
+                Mode::Sop,
+                &conn_state,
+                &mut dashboard_pane,
+                &mut quickstart,
+                &mut acp_pane,
+                &mut chat_pane,
+                &mut sop_pane,
+            ),
+        )
+        .await
+        .expect("leaving Quickstart must not await dismissal or SOP refresh");
+        assert_eq!(mode, Mode::Sop);
+
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .expect("mode switch should send both background requests")
+                .expect("RPC writer should remain connected");
+            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let method = request["method"].as_str().unwrap().to_string();
+            if method == crate::client::method::QUICKSTART_DISMISS {
+                assert_eq!(request["params"]["surface"], "tui");
+            }
+            methods.push(method);
+        }
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == crate::client::method::QUICKSTART_DISMISS),
+            "mode switch should send dismissal telemetry: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == crate::client::method::SOPS_LIST),
+            "mode switch should refresh SOPs: {methods:?}"
+        );
+        assert_eq!(outbound.pending_count(), 2, "both responses are withheld");
+    }
+
+    #[tokio::test]
     async fn reconnect_refreshes_the_sop_list_when_it_remains_visible() {
         let (tx, mut rx) = mpsc::channel::<String>(1);
         let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
         let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
         let mut pane = sop_pane::SopPane::new(rpc);
 
-        let responder = tokio::spawn(async move {
-            let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .expect("visible reconnect should request the SOP list")
-                .expect("RPC request channel should stay open");
-            let request: serde_json::Value =
-                serde_json::from_str(&raw).expect("RPC request should be JSON");
-            assert_eq!(request["method"], crate::client::method::SOPS_LIST);
-            let id = request["id"]
-                .as_str()
-                .expect("RPC request should carry an id");
-            outbound.dispatch_response(id, Some(serde_json::json!([{ "name": "deploy" }])), None);
-        });
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            refresh_visible_sop_after_reconnect(Mode::Sop, &mut pane),
+        )
+        .await
+        .expect("visible reconnect must not await the list response");
 
-        refresh_visible_sop_after_reconnect(Mode::Sop, &mut pane).await;
-        responder.await.expect("RPC responder should complete");
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("visible reconnect should request the SOP list")
+            .expect("RPC request channel should stay open");
+        let request: serde_json::Value =
+            serde_json::from_str(&raw).expect("RPC request should be JSON");
+        assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+        let id = request["id"]
+            .as_str()
+            .expect("RPC request should carry an id");
+        outbound.dispatch_response(id, Some(serde_json::json!([{ "name": "deploy" }])), None);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.tick();
+            if pane.selected_name().is_some() {
+                break;
+            }
+        }
 
         assert_eq!(pane.selected_name(), Some("deploy"));
     }
@@ -2822,5 +3145,71 @@ mod tests {
             Some("scout".into())
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
+}
+
+#[cfg(test)]
+mod transport_leg_tests {
+    //! What the reconnect and failback paths do with the leg the routing source
+    //! of truth returns.
+    //!
+    //! `active_leg` is not decoration: the failback loop runs only while it says
+    //! `WssRelay`, so a leg that is dropped or committed early silently disables
+    //! the migration back to the direct path.
+
+    use super::leg_after_adoption;
+    use crate::ActiveLeg;
+
+    /// A direct session whose address is still down reconnects onto the relay.
+    /// Keeping `WssDirect` here is what stops the failback loop from ever
+    /// running, stranding the session on the relay for the rest of its life.
+    #[test]
+    fn a_direct_session_that_reconnects_on_the_relay_commits_the_relay_leg() {
+        let leg = leg_after_adoption(true, ActiveLeg::WssDirect, ActiveLeg::WssRelay);
+
+        assert_eq!(leg, ActiveLeg::WssRelay);
+        assert!(
+            leg == ActiveLeg::WssRelay,
+            "the failback loop's precondition must now hold"
+        );
+    }
+
+    /// The mirror case: a relay session that comes back on the direct path must
+    /// stop re-probing a direct address it is already using.
+    #[test]
+    fn a_relay_session_that_reconnects_direct_commits_the_direct_leg() {
+        let leg = leg_after_adoption(true, ActiveLeg::WssRelay, ActiveLeg::WssDirect);
+
+        assert_eq!(leg, ActiveLeg::WssDirect);
+        assert!(
+            leg != ActiveLeg::WssRelay,
+            "a direct session must not keep re-probing the path it is on"
+        );
+    }
+
+    /// A connection that could not be adopted is not the connection the panes
+    /// hold, so its leg must not be committed: the session is still on the old
+    /// one and must keep behaving that way.
+    #[test]
+    fn a_failed_adoption_keeps_the_leg_it_is_still_running_on() {
+        assert_eq!(
+            leg_after_adoption(false, ActiveLeg::WssRelay, ActiveLeg::WssDirect),
+            ActiveLeg::WssRelay,
+            "a failed direct migration must leave the session on the relay"
+        );
+        assert_eq!(
+            leg_after_adoption(false, ActiveLeg::WssDirect, ActiveLeg::WssRelay),
+            ActiveLeg::WssDirect
+        );
+    }
+
+    /// The local socket has no legs to migrate between; adoption must not
+    /// invent one.
+    #[test]
+    fn a_local_session_keeps_its_leg() {
+        assert_eq!(
+            leg_after_adoption(true, ActiveLeg::Local, ActiveLeg::Local),
+            ActiveLeg::Local
+        );
     }
 }

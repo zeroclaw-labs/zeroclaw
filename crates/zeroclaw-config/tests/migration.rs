@@ -2079,6 +2079,59 @@ fn generate_every_version_migrates_and_validates() {
 }
 
 #[test]
+fn retired_node_transport_is_removed_when_v1_or_v2_migrates_to_current() {
+    let cases = [
+        (
+            "v1",
+            r#"[node_transport]
+shared_secret = "v1-retired-secret"
+"#,
+        ),
+        (
+            "v2",
+            r#"schema_version = 2
+
+[node_transport]
+shared_secret = "v2-retired-secret"
+"#,
+        ),
+    ];
+
+    for (name, raw) in cases {
+        let migrated = migrate_file(raw)
+            .unwrap_or_else(|error| panic!("{name} migration failed: {error:#}"))
+            .unwrap_or_else(|| panic!("{name} input should require migration"));
+        let root = migrated
+            .parse::<toml::Table>()
+            .unwrap_or_else(|error| panic!("{name} migrated TOML failed to parse: {error}"));
+        assert!(
+            !root.contains_key("node_transport"),
+            "{name} migration must remove the retired section: {migrated}"
+        );
+        assert!(
+            !migrated.contains("retired-secret"),
+            "{name} migration must not preserve the retired secret: {migrated}"
+        );
+    }
+}
+
+#[test]
+fn retired_node_transport_is_historical_v1_only_in_generated_config() {
+    for target in 1..=CURRENT_SCHEMA_VERSION {
+        let raw = generate(target, &GenerateOptions::default())
+            .unwrap_or_else(|error| panic!("generate({target}) failed: {error:#}"));
+        let root = raw
+            .parse::<toml::Table>()
+            .unwrap_or_else(|error| panic!("generate({target}) did not parse: {error}"));
+        assert_eq!(
+            root.contains_key("node_transport"),
+            target == 1,
+            "only historical V1 generation may retain node_transport"
+        );
+    }
+}
+
+#[test]
 fn generate_current_emits_at_current_schema_version() {
     let raw = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
         .expect("generate current succeeds");
