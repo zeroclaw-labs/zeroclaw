@@ -1,8 +1,11 @@
+use aes::Aes256;
 use async_trait::async_trait;
 use base64::Engine as _;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use reqwest::multipart::{Form, Part};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -703,6 +706,7 @@ async fn build_lark_file_upload_form(
 /// the card after the click so the buttons disappear.
 struct PendingApproval {
     sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    destination: String,
     /// `data.message_id` returned by the send-card POST. Empty string is a
     /// sentinel meaning "card was sent but message_id was missing from the
     /// response" — handler will skip the post-click PATCH in that case.
@@ -715,6 +719,7 @@ struct PendingApproval {
 pub struct LarkChannel {
     app_id: String,
     app_secret: String,
+    encrypt_key: Option<String>,
     verification_token: String,
     port: Option<u16>,
     /// The alias key under `[channels.lark.<alias>]` this handle is bound to.
@@ -771,29 +776,222 @@ struct LarkHttpAppState {
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
 }
 
-/// Verify an incoming URL-verification challenge token against the configured token.
+fn lark_webhook_auth_configured(verification_token: &str, encrypt_key: Option<&str>) -> bool {
+    !verification_token.is_empty() || encrypt_key.is_some_and(|key| !key.is_empty())
+}
+
+/// Verify an incoming Lark verification token against the configured token.
 /// Missing, null, non-string, and empty incoming tokens are rejected; an empty
-/// configured token also rejects all challenges.
+/// configured token also rejects all token-authenticated requests.
 fn verify_challenge_token(incoming: Option<&serde_json::Value>, configured: &str) -> bool {
     incoming
-        .and_then(|token| token.as_str())
+        .and_then(serde_json::Value::as_str)
         .is_some_and(|token| {
             !token.is_empty() && !configured.is_empty() && constant_time_eq(token, configured)
         })
 }
 
+/// Compare a computed Lark/Feishu SHA-256 hex digest with the
+/// attacker-controlled `x-lark-signature` header without short-circuiting.
+/// Missing, non-hex, or wrong-length signatures fail closed before the
+/// secret-bearing comparison.
+fn lark_signed_webhook_digest_eq(expected_hex: &str, provided: &str) -> bool {
+    let Some(normalized) = normalize_lark_hex_digest(provided) else {
+        return false;
+    };
+    constant_time_eq(expected_hex, &normalized)
+}
+
+fn normalize_lark_hex_digest(value: &str) -> Option<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+fn lark_webhook_is_encrypted(payload: &serde_json::Value) -> bool {
+    payload
+        .get("encrypt")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn verify_lark_webhook_request(
+    verification_token: &str,
+    encrypt_key: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    payload: &serde_json::Value,
+) -> bool {
+    let timestamp = headers
+        .get("x-lark-request-timestamp")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let nonce = headers
+        .get("x-lark-request-nonce")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let signature = headers
+        .get("x-lark-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let raw_envelope = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let encrypted = raw_envelope.as_ref().is_some_and(lark_webhook_is_encrypted);
+
+    let has_any_signature_header = timestamp.is_some() || nonce.is_some() || signature.is_some();
+    let encrypt_key = encrypt_key.filter(|value| !value.is_empty());
+
+    if encrypted || (has_any_signature_header && encrypt_key.is_some()) {
+        let (Some(timestamp), Some(nonce), Some(signature), Some(encrypt_key)) =
+            (timestamp, nonce, signature, encrypt_key)
+        else {
+            return false;
+        };
+
+        let mut digest = Sha256::new();
+        digest.update(timestamp.as_bytes());
+        digest.update(nonce.as_bytes());
+        digest.update(encrypt_key.as_bytes());
+        digest.update(body);
+        let expected = hex::encode(digest.finalize());
+        return lark_signed_webhook_digest_eq(&expected, signature);
+    }
+
+    // Partial signature headers are never a valid plaintext authentication
+    // mode. A complete absence of signature headers is the documented
+    // verification-token path for plaintext event subscriptions and URL
+    // verification challenges.
+    if has_any_signature_header {
+        return false;
+    }
+
+    verify_challenge_token(
+        payload
+            .pointer("/header/token")
+            .or_else(|| payload.get("token")),
+        verification_token,
+    )
+}
+
+fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let envelope: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| anyhow::Error::msg(format!("invalid webhook JSON payload: {error}")))?;
+    let Some(encrypted) = envelope
+        .get("encrypt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(body.to_vec());
+    };
+
+    let encrypt_key = encrypt_key
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::Error::msg("encrypted webhook requires encrypt_key"))?;
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .map_err(|error| {
+            anyhow::Error::msg(format!("invalid encrypted webhook payload: {error}"))
+        })?;
+    if encrypted.len() < 32 || (encrypted.len() - 16) % 16 != 0 {
+        anyhow::bail!("invalid encrypted webhook payload length");
+    }
+
+    let key = Sha256::digest(encrypt_key.as_bytes());
+    let iv = &encrypted[..16];
+    let mut ciphertext = encrypted[16..].to_vec();
+    let plaintext = cbc::Decryptor::<Aes256>::new(&key, iv.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut ciphertext)
+        .map_err(|error| {
+            anyhow::Error::msg(format!("failed to decrypt webhook payload: {error}"))
+        })?;
+    Ok(plaintext.to_vec())
+}
+
 async fn handle_lark_http_event(
     axum::extract::State(state): axum::extract::State<LarkHttpAppState>,
-    axum::Json(payload): axum::Json<serde_json::Value>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    let raw_payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Lark webhook: invalid or undecryptable payload"
+            );
+            return (StatusCode::BAD_REQUEST, "invalid webhook payload").into_response();
+        }
+    };
+    let encrypted = lark_webhook_is_encrypted(&raw_payload);
+    if encrypted
+        && !verify_lark_webhook_request(
+            &state.verification_token,
+            state.channel.encrypt_key.as_deref(),
+            &headers,
+            &body,
+            &raw_payload,
+        )
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Lark webhook: invalid authentication"
+        );
+        return (StatusCode::UNAUTHORIZED, "invalid authentication").into_response();
+    }
+
+    let decrypted_body =
+        match decrypt_lark_webhook_body(&body, state.channel.encrypt_key.as_deref()) {
+            Ok(body) => body,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Lark webhook: invalid or undecryptable payload"
+                );
+                return (StatusCode::BAD_REQUEST, "invalid webhook payload").into_response();
+            }
+        };
+
+    let payload: serde_json::Value = match serde_json::from_slice(&decrypted_body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Lark webhook: invalid decrypted JSON payload"
+            );
+            return (StatusCode::BAD_REQUEST, "invalid JSON payload").into_response();
+        }
+    };
+
+    let authenticated = encrypted
+        || verify_lark_webhook_request(
+            &state.verification_token,
+            state.channel.encrypt_key.as_deref(),
+            &headers,
+            &body,
+            &payload,
+        );
 
     if let Some(challenge_value) = payload.get("challenge") {
         let Some(challenge) = challenge_value.as_str() else {
             return (StatusCode::FORBIDDEN, "invalid challenge").into_response();
         };
-        if !verify_challenge_token(payload.get("token"), &state.verification_token) {
+        if !authenticated {
             return (StatusCode::FORBIDDEN, "invalid token").into_response();
         }
 
@@ -801,22 +999,28 @@ async fn handle_lark_http_event(
         return (StatusCode::OK, axum::Json(resp)).into_response();
     }
 
+    if !authenticated {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Lark webhook: invalid authentication"
+        );
+        return (StatusCode::UNAUTHORIZED, "invalid authentication").into_response();
+    }
+
+    // Card button click events are not message events — route them
+    // through the approval-card resolver and short-circuit before the
+    // generic message parser sees them.
     let event_type = payload
         .pointer("/header/event_type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if event_type == "card.action.trigger"
-        && let Some(inner) = payload.get("event")
+    if state
+        .channel
+        .handle_card_action_ingress(event_type, payload.get("event"))
+        .await
     {
-        if let Err(e) = state.channel.handle_card_action_event(inner).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                "Lark webhook: card action dispatch error"
-            );
-        }
         return (StatusCode::OK, "ok").into_response();
     }
 
@@ -829,6 +1033,9 @@ async fn handle_lark_http_event(
     {
         let reaction_channel = Arc::clone(&state.channel);
         let reaction_message_id = message_id.to_string();
+        // Prefer the first parsed message's reply_target as the
+        // ack target; parse_event_payload_async already filtered
+        // out unauthorized senders and non-text payloads.
         let reaction_reply_target = messages[0].reply_target.clone();
         zeroclaw_spawn::spawn!(async move {
             if let Err(e) = <LarkChannel as Channel>::add_reaction(
@@ -841,7 +1048,7 @@ async fn handle_lark_http_event(
             {
                 ::zeroclaw_log::record!(
                     DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({
                             "message_id": reaction_message_id,
                             "error": format!("{e}"),
@@ -915,6 +1122,7 @@ impl LarkChannel {
         Self {
             app_id,
             app_secret,
+            encrypt_key: None,
             verification_token,
             port,
             alias: alias.into(),
@@ -964,6 +1172,7 @@ impl LarkChannel {
             config.mention_only,
             platform,
         );
+        ch.encrypt_key = config.encrypt_key.clone();
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
         ch
@@ -1376,24 +1585,14 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "event JSON"); continue; }
                     };
-                    match event.header.event_type.as_str() {
-                        "im.message.receive_v1" => {}
-                        "card.action.trigger" => {
-                            if let Err(e) = self.handle_card_action_event(&event.event).await {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Dispatch
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                                    "Lark WS: card action dispatch error"
-                                );
-                            }
-                            continue;
-                        }
-                        _ => continue,
+                    if self
+                        .handle_card_action_ingress(&event.header.event_type, Some(&event.event))
+                        .await
+                    {
+                        continue;
+                    }
+                    if event.header.event_type != "im.message.receive_v1" {
+                        continue;
                     }
 
                     let event_payload = event.event;
@@ -2980,59 +3179,75 @@ impl Channel for LarkChannel {
         let approval_id = Uuid::new_v4().to_string();
         let card =
             build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
-
-        let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url(recipient);
-        let body = serde_json::json!({
-            "receive_id": recipient,
-            "receive_id_type": lark_receive_id_type_for(recipient),
-            "msg_type": "interactive",
-            "content": serde_json::to_string(&card)?,
-        });
-
-        let response_body = {
-            let (status, resp) = self.send_text_once(&url, &token, &body).await?;
-            if should_refresh_lark_tenant_token(status, &resp) {
-                self.invalidate_token().await;
-                let new_token = self.get_tenant_access_token().await?;
-                let (retry_status, retry_body) =
-                    self.send_text_once(&url, &new_token, &body).await?;
-                ensure_lark_send_success(retry_status, &retry_body, "approval retry")?;
-                retry_body
-            } else {
-                ensure_lark_send_success(status, &resp, "approval")?;
-                resp
-            }
-        };
-
-        let message_id = response_body
-            .pointer("/data/message_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(
-                        module_path!(),
-                        ::zeroclaw_log::Action::Note
-                    )
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
-                    "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
-                );
-                String::new()
-            });
-
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
-                message_id,
+                destination: recipient.to_string(),
+                message_id: String::new(),
                 tool_name: request.tool_name.clone(),
                 arguments_summary: request.arguments_summary.clone(),
             },
         );
+
+        let send_result = async {
+            let token = self.get_tenant_access_token().await?;
+            let url = self.send_message_url(recipient);
+            let body = serde_json::json!({
+                "receive_id": recipient,
+                "receive_id_type": lark_receive_id_type_for(recipient),
+                "msg_type": "interactive",
+                "content": serde_json::to_string(&card)?,
+            });
+
+            let response_body = {
+                let (status, resp) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &resp) {
+                    self.invalidate_token().await;
+                    let new_token = self.get_tenant_access_token().await?;
+                    let (retry_status, retry_body) =
+                        self.send_text_once(&url, &new_token, &body).await?;
+                    ensure_lark_send_success(retry_status, &retry_body, "approval retry")?;
+                    retry_body
+                } else {
+                    ensure_lark_send_success(status, &resp, "approval")?;
+                    resp
+                }
+            };
+
+            let message_id = response_body
+                .pointer("/data/message_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                        "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
+                    );
+                    String::new()
+                });
+            anyhow::Ok(message_id)
+        }
+        .await;
+
+        match send_result {
+            Ok(message_id) => {
+                if let Some(pending) = self.pending_approvals.lock().await.get_mut(&approval_id) {
+                    pending.message_id = message_id;
+                }
+            }
+            Err(err) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(err);
+            }
+        }
 
         Ok(Some(self.wait_for_decision(rx, &approval_id).await))
     }
@@ -3480,6 +3695,37 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
+    /// Route card-action envelopes before either ingress treats them as ordinary messages.
+    /// Returns `true` once the envelope is consumed, even when the callback is rejected.
+    async fn handle_card_action_ingress(
+        &self,
+        event_type: &str,
+        event_payload: Option<&serde_json::Value>,
+    ) -> bool {
+        if event_type != "card.action.trigger" {
+            return false;
+        }
+        let Some(event_payload) = event_payload else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Lark card action ingress: missing event payload"
+            );
+            return true;
+        };
+        if let Err(e) = self.handle_card_action_event(event_payload).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "Lark card action ingress: callback rejected"
+            );
+        }
+        true
+    }
+
     async fn handle_card_action_event(
         &self,
         event_payload: &serde_json::Value,
@@ -3562,7 +3808,18 @@ impl LarkChannel {
             }
         };
 
-        let pending = self.pending_approvals.lock().await.remove(approval_id);
+        let responder = event_payload
+            .pointer("/operator/open_id")
+            .or_else(|| event_payload.pointer("/operator/operator_id/open_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let destination = event_payload
+            .pointer("/context/open_chat_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let pending = self
+            .take_pending_approval(approval_id, responder, destination)
+            .await;
         let Some(pending) = pending else {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3604,6 +3861,26 @@ impl LarkChannel {
 
         Ok(())
     }
+
+    async fn take_pending_approval(
+        &self,
+        approval_id: &str,
+        responder: &str,
+        destination: &str,
+    ) -> Option<PendingApproval> {
+        if responder.is_empty() || destination.is_empty() || !self.is_user_allowed(responder) {
+            return None;
+        }
+
+        let mut pending_approvals = self.pending_approvals.lock().await;
+        let destination_matches = pending_approvals
+            .get(approval_id)
+            .is_some_and(|pending| pending.destination == destination);
+        if !destination_matches {
+            return None;
+        }
+        pending_approvals.remove(approval_id)
+    }
 }
 
 impl LarkChannel {
@@ -3613,6 +3890,22 @@ impl LarkChannel {
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        if !lark_webhook_auth_configured(&self.verification_token, self.encrypt_key.as_deref()) {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mode": "webhook",
+                        "missing": "verification_token_or_encrypt_key"
+                    })),
+                "lark: webhook mode requires verification_token or encrypt_key"
+            );
+            return Err(anyhow::Error::msg(
+                "webhook mode requires `verification_token` or `encrypt_key` to be set",
+            ));
+        }
+
         self.ensure_bot_open_id().await;
         let port = self.port.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -3980,7 +4273,7 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, body::to_bytes, extract::State, http::StatusCode};
+    use axum::{body::to_bytes, extract::State, http::StatusCode};
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
@@ -3991,7 +4284,7 @@ mod tests {
         Arc::new(move || peers.clone())
     }
 
-    fn make_channel() -> LarkChannel {
+    fn make_channel_with_peers(peers: Vec<String>) -> LarkChannel {
         with_bot_open_id(
             LarkChannel::new(
                 "cli_test_app_id".into(),
@@ -3999,11 +4292,15 @@ mod tests {
                 "test_verification_token".into(),
                 None,
                 "lark_test_alias",
-                resolver_from(vec!["ou_testuser123".into()]),
+                resolver_from(peers),
                 true,
             ),
             "ou_bot",
         )
+    }
+
+    fn make_channel() -> LarkChannel {
+        make_channel_with_peers(vec!["ou_testuser123".into()])
     }
 
     async fn post_lark_challenge(
@@ -4017,7 +4314,8 @@ mod tests {
                 channel: Arc::new(make_channel()),
                 tx,
             }),
-            Json(payload),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&payload).unwrap()),
         )
         .await;
         let status = response.status();
@@ -4124,6 +4422,196 @@ mod tests {
     fn lark_channel_name() {
         let ch = make_channel();
         assert_eq!(ch.name(), "lark");
+    }
+
+    #[test]
+    fn webhook_challenge_requires_matching_verification_token() {
+        let payload = serde_json::json!({
+            "challenge": "challenge-value",
+            "header": { "token": "verification-token" }
+        });
+        let headers = axum::http::HeaderMap::new();
+
+        assert!(verify_lark_webhook_request(
+            "verification-token",
+            None,
+            &headers,
+            br#"{"challenge":"challenge-value","header":{"token":"verification-token"}}"#,
+            &payload,
+        ));
+        assert!(!verify_lark_webhook_request(
+            "different-token",
+            None,
+            &headers,
+            br#"{"challenge":"challenge-value","header":{"token":"verification-token"}}"#,
+            &payload,
+        ));
+    }
+
+    #[test]
+    fn webhook_auth_configuration_accepts_encrypt_key_without_token() {
+        assert!(lark_webhook_auth_configured("", Some("test_encrypt_key")));
+        assert!(lark_webhook_auth_configured(
+            "test_verification_token",
+            None
+        ));
+        assert!(!lark_webhook_auth_configured("", Some("")));
+        assert!(!lark_webhook_auth_configured("", None));
+    }
+
+    #[test]
+    fn webhook_signature_matches_lark_encrypt_key_sha256_vector() {
+        let body = br#"{"encrypt":"ciphertext"}"#;
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-lark-request-timestamp",
+            axum::http::HeaderValue::from_static("1720000000"),
+        );
+        headers.insert(
+            "x-lark-request-nonce",
+            axum::http::HeaderValue::from_static("test-nonce"),
+        );
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_static(
+                "0ebf09778b90db3af9fcc6cb27780763dcec149271640bf39c1217ed20bd5a3f",
+            ),
+        );
+
+        assert!(verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_static(
+                "1ebf09778b90db3af9fcc6cb27780763dcec149271640bf39c1217ed20bd5a3f",
+            ),
+        );
+        assert!(!verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+        assert!(!verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &axum::http::HeaderMap::new(),
+            body,
+            &payload,
+        ));
+    }
+
+    #[test]
+    fn webhook_signature_accepts_uppercase_hex_and_rejects_prefix_or_suffix_changes() {
+        let body = br#"{"encrypt":"ciphertext"}"#;
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let valid = "0ebf09778b90db3af9fcc6cb27780763dcec149271640bf39c1217ed20bd5a3f";
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-lark-request-timestamp",
+            axum::http::HeaderValue::from_static("1720000000"),
+        );
+        headers.insert(
+            "x-lark-request-nonce",
+            axum::http::HeaderValue::from_static("test-nonce"),
+        );
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_static(
+                "0EBF09778B90DB3AF9FCC6CB27780763DCEC149271640BF39C1217ED20BD5A3F",
+            ),
+        );
+        assert!(verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+
+        let mut prefix = valid.to_string();
+        prefix.replace_range(0..1, "1");
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_str(&prefix).unwrap(),
+        );
+        assert!(!verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+
+        let mut suffix = valid.to_string();
+        suffix.replace_range(63..64, "0");
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_str(&suffix).unwrap(),
+        );
+        assert!(!verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_static(
+                "0ebf09778b90db3af9fcc6cb27780763dcec149271640bf39c1217ed20bd5a3",
+            ),
+        );
+        assert!(!verify_lark_webhook_request(
+            "",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+        assert!(lark_signed_webhook_digest_eq(valid, valid));
+        assert!(lark_signed_webhook_digest_eq(
+            valid,
+            "0EBF09778B90DB3AF9FCC6CB27780763DCEC149271640BF39C1217ED20BD5A3F"
+        ));
+        assert!(!lark_signed_webhook_digest_eq(valid, &prefix));
+        assert!(!lark_signed_webhook_digest_eq(valid, &suffix));
+        assert!(!lark_signed_webhook_digest_eq(
+            valid,
+            &valid[..valid.len() - 1]
+        ));
+        assert!(!lark_signed_webhook_digest_eq(valid, &format!("{valid}0")));
+    }
+
+    #[test]
+    fn webhook_plaintext_event_uses_header_token_without_signature_headers() {
+        let body = br#"{"header":{"token":"test_verification_token","event_type":"card.action.trigger"},"event":{}}"#;
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let headers = axum::http::HeaderMap::new();
+
+        assert!(verify_lark_webhook_request(
+            "test_verification_token",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
+        assert!(!verify_lark_webhook_request(
+            "different-token",
+            Some("test_encrypt_key"),
+            &headers,
+            body,
+            &payload,
+        ));
     }
 
     #[test]
@@ -4758,7 +5246,7 @@ mod tests {
             enabled: true,
             app_id: "cli_app123".into(),
             app_secret: "secret456".into(),
-            encrypt_key: None,
+            encrypt_key: Some("encrypt987".into()),
             verification_token: Some("vtoken789".into()),
             mention_only: false,
             use_feishu: false,
@@ -4779,6 +5267,7 @@ mod tests {
         assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
         assert_eq!(ch.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(ch.port, Some(9898));
+        assert_eq!(ch.encrypt_key.as_deref(), Some("encrypt987"));
     }
 
     #[test]
@@ -5869,9 +6358,13 @@ mod tests {
         ];
 
         for (name, raw, expected) in fixtures {
-            let ch = make_channel();
             let event: serde_json::Value =
                 serde_json::from_str(raw).unwrap_or_else(|e| panic!("parse {name} fixture: {e}"));
+            let responder = event
+                .pointer("/operator/open_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{name} fixture must contain an operator open_id"));
+            let ch = make_channel_with_peers(vec![responder.to_string()]);
             let approval_id = event
                 .pointer("/action/value/approval_id")
                 .and_then(|value| value.as_str())
@@ -5885,6 +6378,11 @@ mod tests {
                 approval_id.to_string(),
                 PendingApproval {
                     sender: tx,
+                    destination: event
+                        .pointer("/context/open_chat_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     message_id: String::new(),
                     tool_name: String::new(),
                     arguments_summary: String::new(),
@@ -5894,8 +6392,9 @@ mod tests {
             ch.handle_card_action_event(&event)
                 .await
                 .unwrap_or_else(|e| panic!("route {name} fixture: {e}"));
-            let result = rx
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
                 .await
+                .unwrap_or_else(|_| panic!("receive {name} decision timed out"))
                 .unwrap_or_else(|e| panic!("receive {name} decision: {e}"));
             assert_eq!(result, expected, "fixture {name}");
         }
@@ -5915,6 +6414,7 @@ mod tests {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                destination: "oc_test_chat".to_string(),
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
@@ -5928,13 +6428,332 @@ mod tests {
                     "type": "callback",
                     "value": { "approval_id": approval_id, "decision": "always" }
                 }]
-            }
+            },
+            "context": { "open_chat_id": "oc_test_chat" },
+            "operator": { "open_id": "ou_testuser123" }
         });
         ch.handle_card_action_event(&event)
             .await
             .expect("handler ok");
         let result = rx.await.expect("oneshot delivered");
         assert_eq!(result, ChannelApprovalResponse::AlwaysApprove);
+    }
+
+    #[tokio::test]
+    async fn card_action_ingress_suppresses_rejected_approval_envelopes() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = make_channel();
+        let (approved_tx, approved_rx) = tokio::sync::oneshot::channel();
+        let (wrong_chat_tx, _wrong_chat_rx) = tokio::sync::oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut approvals = ch.pending_approvals.lock().await;
+            approvals.insert(
+                "AUTH0001".to_string(),
+                PendingApproval {
+                    sender: approved_tx,
+                    destination: "oc_origin".to_string(),
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+            approvals.insert(
+                "WRONG001".to_string(),
+                PendingApproval {
+                    sender: wrong_chat_tx,
+                    destination: "oc_origin".to_string(),
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+            approvals.insert(
+                "OTHER001".to_string(),
+                PendingApproval {
+                    sender: unauthorized_tx,
+                    destination: "oc_origin".to_string(),
+                    message_id: String::new(),
+                    tool_name: String::new(),
+                    arguments_summary: String::new(),
+                },
+            );
+        }
+
+        let envelopes = [
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": "OTHER001", "decision": "deny" } },
+                    "context": { "open_chat_id": "oc_origin" },
+                    "operator": { "open_id": "ou_untrusted" }
+                }
+            }),
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": "WRONG001", "decision": "deny" } },
+                    "context": { "open_chat_id": "oc_wrong" },
+                    "operator": { "open_id": "ou_testuser123" }
+                }
+            }),
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": "AUTH0001", "decision": "approve" } },
+                    "context": { "open_chat_id": "oc_origin" },
+                    "operator": { "open_id": "ou_testuser123" }
+                }
+            }),
+        ];
+
+        for envelope in &envelopes {
+            let event_type = envelope
+                .pointer("/header/event_type")
+                .and_then(serde_json::Value::as_str)
+                .expect("outer card-action event type");
+            assert!(
+                ch.handle_card_action_ingress(event_type, envelope.get("event"))
+                    .await,
+                "card-action envelopes must be consumed before ordinary message dispatch"
+            );
+            assert!(
+                ch.parse_event_payload(envelope).await.is_empty(),
+                "card-action envelopes must not produce ChannelMessage values"
+            );
+        }
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), approved_rx)
+                .await
+                .expect("authorized callback should resolve")
+                .expect("approval sender should stay open"),
+            ChannelApprovalResponse::Approve
+        );
+        let approvals = ch.pending_approvals.lock().await;
+        assert!(approvals.contains_key("WRONG001"));
+        assert!(approvals.contains_key("OTHER001"));
+    }
+
+    #[tokio::test]
+    async fn webhook_card_action_authenticates_before_decrypting_and_resolving_approval() {
+        use axum::{
+            body::{Bytes, to_bytes},
+            extract::State,
+            http::{HeaderMap, HeaderValue, StatusCode},
+        };
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        fn signed_headers(body: &[u8], encrypt_key: &str) -> HeaderMap {
+            let timestamp = "1720000000";
+            let nonce = "test-nonce";
+            let mut digest = Sha256::new();
+            digest.update(timestamp.as_bytes());
+            digest.update(nonce.as_bytes());
+            digest.update(encrypt_key.as_bytes());
+            digest.update(body);
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-lark-request-timestamp",
+                HeaderValue::from_static(timestamp),
+            );
+            headers.insert("x-lark-request-nonce", HeaderValue::from_static(nonce));
+            headers.insert(
+                "x-lark-signature",
+                HeaderValue::from_str(&hex::encode(digest.finalize())).unwrap(),
+            );
+            headers
+        }
+
+        fn encrypted_body(plaintext: &[u8], encrypt_key: &str) -> Vec<u8> {
+            use cbc::cipher::{BlockEncryptMut, block_padding::Pkcs7};
+
+            let key = Sha256::digest(encrypt_key.as_bytes());
+            let iv = [0x42; 16];
+            let mut ciphertext = vec![0; plaintext.len() + 16];
+            ciphertext[..plaintext.len()].copy_from_slice(plaintext);
+            let ciphertext = cbc::Encryptor::<Aes256>::new(&key, (&iv).into())
+                .encrypt_padded_mut::<Pkcs7>(&mut ciphertext, plaintext.len())
+                .unwrap();
+            let mut encrypted = iv.to_vec();
+            encrypted.extend_from_slice(ciphertext);
+            serde_json::to_vec(&serde_json::json!({
+                "encrypt": base64::engine::general_purpose::STANDARD.encode(encrypted)
+            }))
+            .unwrap()
+        }
+
+        async fn post_card_action(
+            state: LarkHttpAppState,
+            mut envelope: serde_json::Value,
+            authenticate: bool,
+        ) -> axum::response::Response {
+            if authenticate {
+                envelope["header"]["token"] = serde_json::json!("test_verification_token");
+            }
+            let body = serde_json::to_vec(&envelope).unwrap();
+            let headers = HeaderMap::new();
+            handle_lark_http_event(State(state), headers, Bytes::from(body)).await
+        }
+
+        let mut configured_channel = make_channel();
+        configured_channel.encrypt_key = Some("test_encrypt_key".to_string());
+        let channel = Arc::new(configured_channel);
+        let (approved_tx, approved_rx) = tokio::sync::oneshot::channel();
+        let (wrong_chat_tx, _wrong_chat_rx) = tokio::sync::oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = tokio::sync::oneshot::channel();
+        let (forged_tx, mut forged_rx) = tokio::sync::oneshot::channel();
+        let (tampered_tx, mut tampered_rx) = tokio::sync::oneshot::channel();
+        let (encrypted_tx, encrypted_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut approvals = channel.pending_approvals.lock().await;
+            for (approval_id, sender, destination) in [
+                ("AUTH0001", approved_tx, "oc_origin"),
+                ("WRONG001", wrong_chat_tx, "oc_origin"),
+                ("OTHER001", unauthorized_tx, "oc_origin"),
+                ("FORGED01", forged_tx, "oc_origin"),
+                ("TAMPER01", tampered_tx, "oc_origin"),
+                ("ENCRYPT1", encrypted_tx, "oc_origin"),
+            ] {
+                approvals.insert(
+                    approval_id.to_string(),
+                    PendingApproval {
+                        sender,
+                        destination: destination.to_string(),
+                        message_id: String::new(),
+                        tool_name: String::new(),
+                        arguments_summary: String::new(),
+                    },
+                );
+            }
+        }
+
+        let (tx, mut messages) = tokio::sync::mpsc::channel(1);
+        let state = LarkHttpAppState {
+            verification_token: "test_verification_token".to_string(),
+            channel: Arc::clone(&channel),
+            tx,
+        };
+        let envelope = |approval_id: &str, responder: &str, destination: &str, decision: &str| {
+            serde_json::json!({
+                "header": { "event_type": "card.action.trigger" },
+                "event": {
+                    "action": { "value": { "approval_id": approval_id, "decision": decision } },
+                    "context": { "open_chat_id": destination },
+                    "operator": { "open_id": responder }
+                }
+            })
+        };
+
+        let forged = post_card_action(
+            state.clone(),
+            envelope("FORGED01", "ou_testuser123", "oc_origin", "approve"),
+            false,
+        )
+        .await;
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(
+            forged_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        for (approval_id, responder, destination, decision) in [
+            ("OTHER001", "ou_untrusted", "oc_origin", "deny"),
+            ("WRONG001", "ou_testuser123", "oc_wrong", "deny"),
+            ("AUTH0001", "ou_testuser123", "oc_origin", "approve"),
+        ] {
+            let response = post_card_action(
+                state.clone(),
+                envelope(approval_id, responder, destination, decision),
+                true,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("FORGED01")
+        );
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("WRONG001")
+        );
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("OTHER001")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), messages.recv())
+                .await
+                .is_err(),
+            "card actions must not be emitted as ordinary channel messages"
+        );
+
+        let tampered_envelope = envelope("TAMPER01", "ou_testuser123", "oc_origin", "approve");
+        let mut invalid_padding_body = encrypted_body(
+            &serde_json::to_vec(&tampered_envelope).unwrap(),
+            "test_encrypt_key",
+        );
+        let mut invalid_padding_envelope: serde_json::Value =
+            serde_json::from_slice(&invalid_padding_body).unwrap();
+        let mut ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(invalid_padding_envelope["encrypt"].as_str().unwrap())
+            .unwrap();
+        *ciphertext.last_mut().unwrap() ^= 0xff;
+        invalid_padding_envelope["encrypt"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(ciphertext));
+        invalid_padding_body = serde_json::to_vec(&invalid_padding_envelope).unwrap();
+
+        let padding_valid_non_json_body = encrypted_body(b"not JSON", "test_encrypt_key");
+        for body in [invalid_padding_body, padding_valid_non_json_body] {
+            let response =
+                handle_lark_http_event(State(state.clone()), HeaderMap::new(), Bytes::from(body))
+                    .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(response_body.as_ref(), b"invalid authentication");
+        }
+        assert!(matches!(
+            tampered_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("TAMPER01")
+        );
+
+        let encrypted_envelope = envelope("ENCRYPT1", "ou_testuser123", "oc_origin", "approve");
+        let encrypted_body = encrypted_body(
+            &serde_json::to_vec(&encrypted_envelope).unwrap(),
+            "test_encrypt_key",
+        );
+        let encrypted_response = handle_lark_http_event(
+            State(state),
+            signed_headers(&encrypted_body, "test_encrypt_key"),
+            Bytes::from(encrypted_body),
+        )
+        .await;
+        assert_eq!(encrypted_response.status(), StatusCode::OK);
+        assert_eq!(
+            encrypted_rx.await.unwrap(),
+            ChannelApprovalResponse::Approve
+        );
     }
 
     #[tokio::test]
@@ -5954,6 +6773,7 @@ mod tests {
             approval_id.clone(),
             PendingApproval {
                 sender: tx,
+                destination: String::new(),
                 message_id: String::new(),
                 tool_name: String::new(),
                 arguments_summary: String::new(),
@@ -6002,6 +6822,51 @@ mod tests {
             .await
             .expect("unknown approval id should not error");
     }
+    #[tokio::test]
+    async fn pending_approval_requires_allowed_user_and_origin_chat() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = make_channel();
+        let approval_id = "approval-test".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                destination: "oc_origin".to_string(),
+                message_id: String::new(),
+                tool_name: String::new(),
+                arguments_summary: String::new(),
+            },
+        );
+
+        for decision in ["approve", "deny", "always"] {
+            let event = serde_json::json!({
+                "action": { "value": { "approval_id": approval_id, "decision": decision } },
+                "context": { "open_chat_id": "oc_origin" },
+                "operator": { "open_id": "ou_other" }
+            });
+            ch.handle_card_action_event(&event).await.unwrap();
+            assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+        }
+
+        let wrong_chat = serde_json::json!({
+            "action": { "value": { "approval_id": approval_id, "decision": "approve" } },
+            "context": { "open_chat_id": "oc_other" },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        ch.handle_card_action_event(&wrong_chat).await.unwrap();
+        assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+
+        let authorized = serde_json::json!({
+            "action": { "value": { "approval_id": approval_id, "decision": "always" } },
+            "context": { "open_chat_id": "oc_origin" },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        ch.handle_card_action_event(&authorized).await.unwrap();
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
     async fn mount_lark_token_and_send_mocks(
         mock_server: &wiremock::MockServer,
         receive_id_type: &'static str,
@@ -6029,6 +6894,90 @@ mod tests {
             .expect(1)
             .mount(mock_server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn request_approval_registers_before_send_so_early_callback_resolves() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_api::channel::{
+            ApprovalSource, ChannelApprovalRequest, ChannelApprovalResponse,
+        };
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/im/v1/messages"))
+            .and(query_param("receive_id_type", "chat_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(800))
+                    .set_body_json(serde_json::json!({
+                        "code": 0,
+                        "data": { "message_id": "om_early_callback" }
+                    })),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(mock_server.uri());
+        ch.approval_timeout_secs = 5;
+        let ch = Arc::new(ch);
+        let request_fut = {
+            let ch = Arc::clone(&ch);
+            async move {
+                ch.request_approval_attributed(
+                    "oc_test_chat",
+                    &ChannelApprovalRequest {
+                        tool_name: "demo_tool".to_string(),
+                        arguments_summary: "demo args".to_string(),
+                        raw_arguments: None,
+                    },
+                )
+                .await
+            }
+        };
+        let callback_fut = {
+            let ch = Arc::clone(&ch);
+            async move {
+                let approval_id = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(id) = ch.pending_approvals.lock().await.keys().next().cloned() {
+                            return id;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("pending approval must be registered before the send returns");
+                ch.handle_card_action_event(&serde_json::json!({
+                    "action": { "value": { "approval_id": approval_id, "decision": "approve" } },
+                    "context": { "open_chat_id": "oc_test_chat" },
+                    "operator": { "open_id": "ou_testuser123" }
+                }))
+                .await
+                .expect("early callback should resolve the already-registered approval");
+            }
+        };
+
+        let (request_result, ()) = tokio::join!(request_fut, callback_fut);
+        let attributed = request_result
+            .expect("request_approval should succeed")
+            .expect("approval response");
+        assert_eq!(attributed.response, ChannelApprovalResponse::Approve);
+        assert_eq!(attributed.source, ApprovalSource::Operator);
+        assert!(ch.pending_approvals.lock().await.is_empty());
     }
 
     async fn assert_send_body_matches_recipient_and_text(

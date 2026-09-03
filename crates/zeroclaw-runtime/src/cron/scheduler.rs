@@ -3212,7 +3212,7 @@ mod tests {
         assert_ne!(expected_workspace, config.agent_workspace_dir(TEST_AGENT));
         let mut job = test_job("");
         job.job_type = JobType::Agent;
-        job.prompt = Some("Print the current workspace directory".into());
+        job.prompt = Some("Read the scheduler workspace marker".into());
         job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 

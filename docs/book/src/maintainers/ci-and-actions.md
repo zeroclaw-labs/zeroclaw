@@ -10,6 +10,12 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
+- **history-guard**: fetches full history and checks the commit under test
+  against `origin/master`; pull requests use the explicit
+  `github.event.pull_request.head.sha`, while trusted pushes and merge-queue
+  runs use `github.sha`. The guard and its fixture test reject an empty
+  `git merge-base`, preventing a grafted second root from collapsing
+  `git blame` after merge
 - **lint**: `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`, then `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` (rustdoc warnings are fatal via `.cargo/config.toml` `build.rustdocflags`; desktop is excluded to match `xtask build_api` / docs-deploy and avoid GTK/`glib-sys` on the lint runner), and the comment hygiene gate
 - **build**: matrix: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`
 - **check**: three warnings-fatal passes over the workspace (excluding `zeroclaw-desktop`): all features; no default features; and default features with `--all-targets`, which is the only leg that compiles test targets on the default feature surface

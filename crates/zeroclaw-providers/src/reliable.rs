@@ -2540,6 +2540,20 @@ impl ModelProvider for ReliableModelProvider {
         capabilities
     }
 
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        // Name the fallback entry that forces the ANDed `vision` above to
+        // `false`, so error sites can blame it instead of the primary. When
+        // the primary (index 0) is itself the non-vision entry there is no
+        // fallback to blame - report `None` and let the caller fall back to
+        // its ordinary "this model_provider" wording rather than mislabeling
+        // the primary's own limitation as a fallback's.
+        self.model_providers
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| !entry.provider().capabilities_for_model(model).vision)
+            .and_then(|(index, entry)| (index != 0).then(|| entry.candidate_name().to_string()))
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
         let mut has_native = false;
         let mut has_text_only = false;
@@ -10412,6 +10426,135 @@ mod tests {
             0,
         );
         assert!(provider.supports_vision());
+    }
+
+    // `vision_limited_by` names the entry an error site should blame for a
+    // non-vision aggregate, so an operator debugging "does not support
+    // vision" sees which configured entry is actually responsible instead of
+    // always seeing the primary.
+    #[test]
+    fn vision_limited_by_names_the_non_vision_fallback() {
+        struct VisionMock(bool);
+
+        #[async_trait]
+        impl ModelProvider for VisionMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_vision(&self) -> bool {
+                self.0
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for VisionMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "VisionMock"
+            }
+        }
+
+        // Vision-capable primary, non-vision fallback: the fallback is named.
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "zai.default".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "lmstudio.default".into(),
+                    Box::new(VisionMock(false)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            Some("lmstudio.default".to_string()),
+            "the non-vision fallback entry must be named as the limiter"
+        );
+
+        // Routing may deliberately share cooldown state across distinct
+        // configured candidates. Diagnostics must name the candidate the
+        // operator configured, not the internal cooldown bucket it shares.
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_with_candidate(
+                    "primary display",
+                    "shared-cooldown",
+                    "zai.primary",
+                    Box::new(VisionMock(true)),
+                ),
+                ReliableModelProviderEntry::new_with_candidate(
+                    "fallback display",
+                    "shared-cooldown",
+                    "lmstudio.fallback",
+                    Box::new(VisionMock(false)),
+                ),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            Some("lmstudio.fallback".to_string()),
+            "the configured candidate identity must not be replaced by its cooldown bucket"
+        );
+
+        // Every entry supports vision: nothing limits it.
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "zai.default".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "lmstudio.default".into(),
+                    Box::new(VisionMock(true)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            None,
+            "an all-vision chain has no limiter to name"
+        );
+
+        // Non-vision primary with no fallback to blame: `None`, not the
+        // primary's own name, so the caller keeps the ordinary
+        // "this model_provider" wording instead of mislabeling the primary
+        // as a fallback.
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "lmstudio.default".into(),
+                Box::new(VisionMock(false)) as Box<dyn ModelProvider>,
+            )],
+            0,
+            0,
+        );
+        assert_eq!(
+            provider.vision_limited_by("requested-model"),
+            None,
+            "a lone non-vision primary must not be reported as a fallback"
+        );
     }
 
     #[tokio::test]

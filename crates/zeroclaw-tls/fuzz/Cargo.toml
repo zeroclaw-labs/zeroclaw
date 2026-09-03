@@ -1,0 +1,35 @@
+# cargo-fuzz harness for the TLS crate's untrusted-input parsers (threat A12): the
+# enrollment CSR parser (sign_csr) and the outer client-cert CN reader
+# (client_cert_node_id). SEPARATE workspace (empty [workspace] table) so a normal
+# `cargo build`/clippy never compiles libfuzzer; built with
+# `cargo +nightly fuzz build` (see scripts/dev/fuzz.sh).
+[package]
+name = "zeroclaw-tls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `testing` exposes gen_ca() so the sign_csr target has a fixed real CA to sign
+# against (we fuzz the CSR bytes, not the CA).
+zeroclaw-tls = { path = "..", features = ["testing"] }
+
+[[bin]]
+name = "sign_csr"
+path = "fuzz_targets/sign_csr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_cert_node_id"
+path = "fuzz_targets/client_cert_node_id.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

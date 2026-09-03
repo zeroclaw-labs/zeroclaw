@@ -1,13 +1,13 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7
+ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-slim from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.96-slim@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523
+ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.98-slim@sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078
 # >>> end generated:base-arg-rust-slim <<<
 # >>> generated:base-arg-debian from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
+ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 # >>> end generated:base-arg-debian <<<
 # >>> generated:base-arg-distroless from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:d97bc0a941b8d4be647dc0ee75b264ddbb772f1ac5ba690a4309c00723b23775
@@ -105,6 +105,9 @@ COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # below. Its real build.rs reads web/src/contexts/themes.json and would panic in
 # this pre-fetch stage, so it is stubbed exactly like apps/tauri.
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+# apps/zerorelay: workspace member with lib+bin targets; not shipped in the
+# server image, but Cargo must be able to load its manifest during pre-fetch.
+COPY apps/zerorelay/Cargo.toml apps/zerorelay/Cargo.toml
 # tools/fill-translations and xtask are dev/build tools; copy manifests only so
 # Cargo can resolve the workspace, then stub their entry points so the
 # dependency pre-fetch step succeeds without building them into the image.
@@ -114,7 +117,7 @@ COPY xtask/Cargo.toml xtask/Cargo.toml
 # `src/bin/zeroclaw-acp-bridge.rs` is required because the `acp-bridge` feature
 # is in the root crate's default set; cargo selects the bin target during the
 # pre-fetch build even with only the workspace lib stubbed.
-RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
@@ -123,6 +126,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > apps/tauri/build.rs \
     && echo "fn main() {}" > apps/zerocode/src/main.rs \
     && echo "fn main() {}" > apps/zerocode/build.rs \
+    && echo "fn main() {}" > apps/zerorelay/src/main.rs \
+    && echo "" > apps/zerorelay/src/lib.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "" > xtask/src/lib.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \

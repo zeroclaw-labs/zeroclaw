@@ -104,6 +104,7 @@ fn context(
         })),
         signature: None,
         publisher_key: None,
+        egress: Default::default(),
     };
     let scope =
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, "main", grants)
