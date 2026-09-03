@@ -12500,6 +12500,95 @@ fn compose_channel_mcp_prompt_sections(
     expose_text_tool_protocol
 }
 
+/// Result of hydrating one session's transcript at startup.
+struct HydratedSession {
+    messages: Vec<ChatMessage>,
+    crumb_present: bool,
+    orphan_closed: bool,
+}
+
+/// Load one session's transcript for startup hydration: apply the
+/// `MAX_CHANNEL_HISTORY` cap, close a trailing orphaned user turn, and
+/// resolve breadcrumb ownership.
+///
+/// The durable `trim_breadcrumb` flag is authoritative and is never
+/// overridden by comparing message text — an explicit `false` survives even
+/// when a genuine user turn collides with the breadcrumb text. The only
+/// correction applied is structural: if the flag says the marker was
+/// present and the cap actually removed that leading message, ownership
+/// follows it down to `false`, and the truncated transcript is persisted
+/// together with the corrected flag so a later restart does not reload the
+/// untruncated transcript and resurrect the turn this pass already dropped.
+/// Legacy sessions that never recorded a flag (`None`) infer once from
+/// text, matching the per-turn cold-cache fallback in the message path.
+/// Returns `None` for an empty/missing session.
+fn hydrate_session_transcript(
+    store: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+) -> Option<HydratedSession> {
+    let mut msgs = store.load(session_key);
+    if msgs.is_empty() {
+        return None;
+    }
+    let durable_crumb = store
+        .get_session_trim_breadcrumb(session_key)
+        .ok()
+        .flatten();
+    // Structural check made BEFORE the cap below can remove it: whether the
+    // loaded transcript's leading message is physically the synthetic
+    // marker the durable flag says is present.
+    let marker_present_pre_drain = msgs.first().is_some_and(|first| {
+        first.role == "user"
+            && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+    });
+    let truncated = msgs.len() > MAX_CHANNEL_HISTORY;
+    if truncated {
+        msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
+    }
+
+    let mut orphan_closed = false;
+    if msgs.last().is_some_and(|msg| msg.role == "user") {
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        if let Err(e) = store.append(session_key, &closure) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("Failed to persist orphan closure for {session_key}")
+            );
+        }
+        msgs.push(closure);
+        orphan_closed = true;
+    }
+
+    let crumb_present = match durable_crumb {
+        Some(true) => !(truncated && marker_present_pre_drain),
+        Some(false) => false,
+        None => marker_present_pre_drain,
+    };
+    if durable_crumb != Some(crumb_present) {
+        let persist_result = if truncated {
+            store.replace_conversation_state(session_key, &msgs, crumb_present)
+        } else {
+            store.set_session_trim_breadcrumb(session_key, crumb_present)
+        };
+        if let Err(e) = persist_result {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!("Failed to reconcile stale trim breadcrumb flag for {session_key}")
+            );
+        }
+    }
+
+    Some(HydratedSession {
+        messages: msgs,
+        crumb_present,
+        orphan_closed,
+    })
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(
@@ -13219,25 +13308,11 @@ pub async fn start_channels(
                 Some(ctx) => ctx,
                 None => continue,
             };
-            let mut msgs = store.load(&m.key);
-            if msgs.is_empty() {
+            let Some(hydrated_session) = hydrate_session_transcript(store.as_ref(), &m.key) else {
                 continue;
-            }
-            if msgs.len() > MAX_CHANNEL_HISTORY {
-                msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
-            }
-            if msgs.last().is_some_and(|msg| msg.role == "user") {
-                let closure =
-                    ChatMessage::assistant("[Session interrupted — not continuing this request]");
-                if let Err(e) = store.append(&m.key, &closure) {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        &format!("Failed to persist orphan closure for {}", m.key)
-                    );
-                }
-                msgs.push(closure);
+            };
+            let mut msgs = hydrated_session.messages;
+            if hydrated_session.orphan_closed {
                 orphans_closed += 1;
             }
             let pruned =
@@ -13245,43 +13320,11 @@ pub async fn start_channels(
             if !pruned.is_empty() {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": m.channel_id.as_deref().unwrap_or(""), "session_key": m.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
             }
-
-            // The drain above can remove a leading synthetic breadcrumb
-            // marker from the in-memory transcript without touching the
-            // durable `trim_breadcrumb` flag. Recompute ownership from the
-            // ACTUAL post-drain/closure/pruning transcript — the same
-            // ground truth `conversation_histories` is about to store — and
-            // seed `history_crumb_flags` with it directly, so a cold-cache
-            // lookup never falls back to a stale durable `true` for a
-            // marker that hydration just dropped.
-            let crumb_present = msgs.first().is_some_and(|first| {
-                first.role == "user"
-                    && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(
-                        &first.content,
-                    )
-            });
             target_ctx
                 .history_crumb_flags
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .put(m.key.clone(), crumb_present);
-            if store
-                .get_session_trim_breadcrumb(&m.key)
-                .ok()
-                .flatten()
-                .is_some_and(|durable| durable != crumb_present)
-                && let Err(e) = store.set_session_trim_breadcrumb(&m.key, crumb_present)
-            {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    &format!(
-                        "Failed to reconcile stale trim breadcrumb flag for {}",
-                        m.key
-                    )
-                );
-            }
+                .put(m.key.clone(), hydrated_session.crumb_present);
 
             let mut histories = target_ctx
                 .conversation_histories
@@ -17525,6 +17568,115 @@ api_key = "anthropic-key"
         );
         assert_eq!(persisted[0].content, "first");
         assert_eq!(persisted[1].content, "ok");
+    }
+
+    fn breadcrumb_text() -> String {
+        zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    #[test]
+    fn hydration_keeps_an_explicit_false_flag_despite_a_marker_text_collision() {
+        // A genuine user turn that happens to equal the breadcrumb text,
+        // with the durable flag explicitly recorded false. Hydration must
+        // not override that explicit record with a from-scratch text guess.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_collision".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        store
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        store.set_session_trim_breadcrumb(&sender, false).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender).expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "an explicit false flag must survive a text collision"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(false),
+            "hydration must not have overwritten the explicit false flag"
+        );
+    }
+
+    #[test]
+    fn hydration_drops_ownership_when_the_cap_removes_the_owned_marker() {
+        // Durable flag says the marker is present, and the transcript
+        // exceeds MAX_CHANNEL_HISTORY so the cap removes the leading
+        // marker. Ownership must follow it down to false, and the
+        // truncated transcript must be persisted together with the
+        // corrected flag.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_capped".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        for i in 0..MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(&sender, &msg).unwrap();
+        }
+        store.set_session_trim_breadcrumb(&sender, true).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender).expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "the cap dropped the owned marker, so ownership must follow it to false"
+        );
+        assert_eq!(
+            hydrated.messages.len(),
+            MAX_CHANNEL_HISTORY,
+            "the returned transcript must already be capped"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(false),
+            "the durable flag must be corrected"
+        );
+        assert_eq!(
+            store.load(&sender).len(),
+            MAX_CHANNEL_HISTORY,
+            "the durable transcript must be truncated together with the flag, \
+             so a later restart does not reload the marker this pass dropped"
+        );
+    }
+
+    #[test]
+    fn hydration_keeps_ownership_when_the_marker_survives_the_cap() {
+        // Durable flag says the marker is present and the transcript is
+        // short enough that the cap is a no-op: ownership must stay true
+        // and nothing needs to be rewritten.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_uncapped".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        store
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        store.set_session_trim_breadcrumb(&sender, true).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender).expect("session must hydrate");
+
+        assert!(
+            hydrated.crumb_present,
+            "the marker was never dropped, so ownership must stay true"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(true),
+            "an already-correct flag must not be rewritten"
+        );
     }
 
     pub(crate) struct DummyModelProvider;
