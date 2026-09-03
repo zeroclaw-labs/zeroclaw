@@ -1765,6 +1765,20 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// One thinking block in the form the runtime stores and later replays:
+    /// a single JSON line holding the text exactly as received and the
+    /// signature it was signed with. `None` when there is nothing to replay.
+    ///
+    /// A block whose text was withheld still carries a signature, and the
+    /// signature is what the next request in the round has to send back, so
+    /// emptiness alone is not a reason to drop it.
+    fn thinking_block_record(thinking: &str, signature: Option<&str>) -> Option<String> {
+        let signature = signature.unwrap_or_default();
+        (!thinking.is_empty() || !signature.is_empty()).then(|| {
+            serde_json::json!({ "thinking": thinking, "signature": signature }).to_string()
+        })
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
@@ -1801,14 +1815,15 @@ impl AnthropicModelProvider {
                     }
                 }
                 "thinking" => {
-                    if let Some(thinking) = block.thinking.as_deref().or(block.text.as_deref())
-                        && !thinking.is_empty()
+                    let thinking = block
+                        .thinking
+                        .as_deref()
+                        .or(block.text.as_deref())
+                        .unwrap_or_default();
+                    if let Some(record) =
+                        Self::thinking_block_record(thinking, block.signature.as_deref())
                     {
-                        let json_block = serde_json::json!({
-                            "thinking": thinking,
-                            "signature": block.signature.as_deref().unwrap_or(""),
-                        });
-                        thinking_parts.push(json_block.to_string());
+                        thinking_parts.push(record);
                     }
                 }
                 "tool_use" => {
@@ -2038,6 +2053,11 @@ impl AnthropicModelProvider {
         let mut tool_name: Option<String> = None;
         let mut tool_input_json = String::new();
 
+        let mut in_thinking_block = false;
+        let mut thinking_text = String::new();
+        let mut thinking_signature: Option<String> = None;
+        let mut thinking_blocks_emitted = 0usize;
+
         let mut input_tokens: Option<u64> = None;
         let mut output_tokens: Option<u64> = None;
         let mut cached_input_tokens: Option<u64> = None;
@@ -2127,6 +2147,11 @@ impl AnthropicModelProvider {
                                 .entry(block_type.to_string())
                                 .or_default() += 1;
                         }
+                        if block_type == "thinking" {
+                            in_thinking_block = true;
+                            thinking_text.clear();
+                            thinking_signature = None;
+                        }
                         if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
@@ -2179,14 +2204,47 @@ impl AnthropicModelProvider {
                                     tool_input_json.push_str(json);
                                 }
                             }
-                            // TODO: handle "thinking_delta" events for streaming
-                            // extended thinking content. Currently thinking blocks
-                            // are only captured in non-streaming parse_native_response().
+                            "thinking_delta" => {
+                                if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                                    thinking_text.push_str(text);
+                                }
+                            }
+                            "signature_delta" => {
+                                if let Some(signature) =
+                                    delta.get("signature").and_then(|s| s.as_str())
+                                {
+                                    thinking_signature = Some(signature.to_string());
+                                }
+                            }
                             _ => {}
                         }
                     }
                 }
                 "content_block_stop" => {
+                    if std::mem::take(&mut in_thinking_block) {
+                        let record = Self::thinking_block_record(
+                            &std::mem::take(&mut thinking_text),
+                            thinking_signature.take().as_deref(),
+                        );
+                        if let Some(record) = record {
+                            // The consumer concatenates these chunks and the
+                            // replay parser reads one record per line, so every
+                            // block after the first carries its own separator.
+                            let payload = if thinking_blocks_emitted > 0 {
+                                format!("\n{record}")
+                            } else {
+                                record
+                            };
+                            thinking_blocks_emitted += 1;
+                            if tx
+                                .send(Ok(StreamEvent::TextDelta(StreamChunk::reasoning(payload))))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
                     if let Some(id) = tool_id.take() {
                         let name = tool_name.take().unwrap_or_default();
                         let input = std::mem::take(&mut tool_input_json);
@@ -3144,6 +3202,118 @@ event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n"
     }
 
+    /// Two thinking blocks around a text block, with a tool call after, so
+    /// ordering and separation are both covered.
+    fn fake_anthropic_thinking_sse() -> &'static [u8] {
+        b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"  Step \"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"one\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_a\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_b\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":2}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":9}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    async fn drain_sse(bytes: &'static [u8]) -> Vec<StreamResult<StreamEvent>> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx).await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        events
+    }
+
+    fn reasoning_records(events: &[StreamResult<StreamEvent>]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::TextDelta(chunk)) => chunk.reasoning.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_block_is_emitted_once_with_verbatim_text() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let records = reasoning_records(&events);
+        assert_eq!(records.len(), 2, "one record per thinking block");
+
+        let first: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+        assert_eq!(
+            first["thinking"], "  Step one",
+            "signatures cover the exact bytes, so leading space must survive"
+        );
+        assert_eq!(first["signature"], "sig_a");
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_block_without_text_is_kept_for_its_signature() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let records = reasoning_records(&events);
+        let second = records[1].trim_start_matches('\n');
+        let parsed: serde_json::Value = serde_json::from_str(second).unwrap();
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sig_b");
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_records_are_separated_for_replay() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let records = reasoning_records(&events);
+        // The consumer concatenates with no separator; the replay parser reads
+        // one record per line, so the joined form must split back cleanly.
+        let joined: String = records.concat();
+        let lines: Vec<&str> = joined.split('\n').collect();
+        assert_eq!(lines.len(), 2, "joined records: {joined}");
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("record must parse: {line}: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_thinking_does_not_disturb_text_or_tool_ordering() {
+        let events = drain_sse(fake_anthropic_thinking_sse()).await;
+        let labels: Vec<&str> = events
+            .iter()
+            .map(|event| match event {
+                Ok(StreamEvent::TextDelta(chunk)) if chunk.reasoning.is_some() => "reasoning",
+                Ok(StreamEvent::TextDelta(_)) => "text",
+                Ok(StreamEvent::ToolCall(_)) => "tool_call",
+                Ok(StreamEvent::Usage(_)) => "usage",
+                Ok(StreamEvent::Final) => "final",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["reasoning", "text", "reasoning", "usage", "final"]
+        );
+    }
+
     #[tokio::test]
     async fn streaming_usage_emitted_before_final() {
         // The originallive repro was Anthropic streaming; before this
@@ -3166,6 +3336,7 @@ data: {\"type\":\"message_stop\"}\n\n"
         let states: Vec<&str> = events
             .iter()
             .map(|e| match e.as_ref() {
+                Ok(StreamEvent::TextDelta(chunk)) if chunk.reasoning.is_some() => "reasoning",
                 Ok(StreamEvent::TextDelta(_)) => "text",
                 Ok(StreamEvent::ToolCall(_)) => "tool_call",
                 Ok(StreamEvent::PreExecutedToolCall { .. }) => "pre_tool_call",
@@ -4826,10 +4997,30 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn native_response_drops_empty_thinking_blocks() {
+    fn native_response_keeps_a_signature_only_thinking_block() {
+        // Withheld reasoning still arrives signed, and the signature is what
+        // the next request in the round has to replay.
         let json = r#"{
             "content": [
                 {"type": "thinking", "thinking": "", "signature": "sig_xyz"},
+                {"type": "text", "text": "hello"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+        let reasoning = result
+            .reasoning_content
+            .expect("a signed block must survive for replay");
+        let parsed: serde_json::Value = serde_json::from_str(&reasoning).unwrap();
+        assert_eq!(parsed["thinking"], "");
+        assert_eq!(parsed["signature"], "sig_xyz");
+    }
+
+    #[test]
+    fn native_response_drops_thinking_blocks_with_nothing_to_replay() {
+        let json = r#"{
+            "content": [
+                {"type": "thinking", "thinking": "", "signature": ""},
                 {"type": "text", "text": "hello"}
             ]
         }"#;
