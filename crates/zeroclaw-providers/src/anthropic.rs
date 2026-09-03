@@ -1868,30 +1868,33 @@ impl AnthropicModelProvider {
         temperature: Option<f64>,
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
-        match thinking {
-            Some(params)
-                if crate::claude_models::claude_thinking_shape(model)
-                    == crate::claude_models::ClaudeThinkingShape::FixedBudget =>
-            {
+        let fixed_budget = thinking
+            .and_then(|params| params.budget_tokens)
+            .filter(|_| {
+                crate::claude_models::claude_thinking_shape(model)
+                    == crate::claude_models::ClaudeThinkingShape::FixedBudget
+            });
+        match (fixed_budget, thinking) {
+            (Some(budget), _) => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                        .with_attrs(::serde_json::json!({"budget_tokens": budget})),
                     "Native extended thinking enabled; forcing temperature=1.0"
                 );
                 // API requires max_tokens > budget_tokens (strictly greater).
-                let min_required = params.budget_tokens + 1;
+                let min_required = budget + 1;
                 let max_tokens = self.max_tokens.max(min_required);
                 (
                     Some(1.0),
                     Some(NativeThinkingConfig {
                         kind: "enabled",
-                        budget_tokens: params.budget_tokens,
+                        budget_tokens: budget,
                     }),
                     max_tokens,
                 )
             }
-            Some(_) => {
+            (None, Some(_)) => {
                 // Caller asked for native thinking but the model rejects the
                 // fixed-budget request shape. Drop to prompt-based reasoning
                 // (the agent loop's prefix already injected) and keep the
@@ -1904,7 +1907,7 @@ impl AnthropicModelProvider {
                 );
                 (temperature, None, self.max_tokens)
             }
-            None => (temperature, None, self.max_tokens),
+            (None, None) => (temperature, None, self.max_tokens),
         }
     }
 
@@ -3729,7 +3732,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
         };
         let (temp, config, max_tokens) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
@@ -3749,7 +3753,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             .credential(Some("test-key"))
             .build();
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
-            budget_tokens: 10_000,
+            budget_tokens: Some(10_000),
+            effort: None,
         };
         let (temp, config, _) =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");

@@ -1667,30 +1667,35 @@ impl ModelProvider for BedrockModelProvider {
         // Native thinking forces temperature=1.0 (Anthropic API requirement).
         // Otherwise the caller's Option<f64> flows through verbatim; None
         // omits the field via skip_serializing_if.
-        let (effective_temperature, additional_fields, effective_max_tokens) = match request
+        let fixed_budget = request
             .thinking
-        {
-            Some(params)
-                if crate::claude_models::claude_thinking_shape(model)
-                    == crate::claude_models::ClaudeThinkingShape::FixedBudget =>
-            {
+            .and_then(|params| params.budget_tokens)
+            .filter(|_| {
+                crate::claude_models::claude_thinking_shape(model)
+                    == crate::claude_models::ClaudeThinkingShape::FixedBudget
+            });
+        let (effective_temperature, additional_fields, effective_max_tokens) = match (
+            fixed_budget,
+            request.thinking,
+        ) {
+            (Some(budget), _) => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                        .with_attrs(::serde_json::json!({"budget_tokens": budget})),
                     "Bedrock native extended thinking enabled; forcing temperature=1.0"
                 );
                 let fields = serde_json::json!({
                     "thinking": {
                         "type": "enabled",
-                        "budget_tokens": params.budget_tokens
+                        "budget_tokens": budget
                     }
                 });
-                let min_required = params.budget_tokens + 1;
+                let min_required = budget + 1;
                 let max_tokens = self.max_tokens.max(min_required);
                 (Some(1.0), Some(fields), max_tokens)
             }
-            Some(_) => {
+            (None, Some(_)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1699,7 +1704,7 @@ impl ModelProvider for BedrockModelProvider {
                 );
                 (temperature, None, self.max_tokens)
             }
-            None => (temperature, None, self.max_tokens),
+            (None, None) => (temperature, None, self.max_tokens),
         };
 
         let converse_request = ConverseRequest {

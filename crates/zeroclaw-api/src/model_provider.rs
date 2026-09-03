@@ -11,10 +11,34 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 /// resolution time gives a clearer error site than the first API call.
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
-/// Parameters for native extended thinking support.
+/// How much reasoning a model should spend on a request, for model families
+/// that take a depth setting rather than a token budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingEffort {
+    Low,
+    High,
+    Max,
+}
+
+impl ThinkingEffort {
+    /// Wire value for the provider request body.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Parameters for native extended thinking support. A model family reads
+/// whichever of the two it accepts; both are absent when the caller asked for
+/// the provider's own default depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NativeThinkingParams {
-    pub budget_tokens: u32,
+    pub budget_tokens: Option<u32>,
+    pub effort: Option<ThinkingEffort>,
 }
 
 /// A single message in a conversation.
