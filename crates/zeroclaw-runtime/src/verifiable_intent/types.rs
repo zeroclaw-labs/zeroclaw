@@ -717,7 +717,11 @@ mod tests {
         }
         .into();
         let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("payment.amount"));
+        // Compared whole. A substring test passes for any tag that merely
+        // contains this one, so it would survive a rename while proving
+        // nothing about the tag actually emitted.
+        let emitted: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(emitted["type"], "payment.amount");
         let back: Constraint = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }
@@ -733,7 +737,8 @@ mod tests {
         }
         .into();
         let json = serde_json::to_string(&c).unwrap();
-        assert!(json.contains("mandate.checkout.allowed_merchant"));
+        let emitted: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(emitted["type"], "mandate.checkout.allowed_merchant");
         let back: Constraint = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }
@@ -842,6 +847,15 @@ mod tests {
     fn known_constraint_preserves_unrecognized_fields() {
         let json = r#"{"type":"payment.amount","currency":"USD","max":40000,"acme_tier":"gold"}"#;
         let parsed: Constraint = serde_json::from_str(json).unwrap();
+
+        // Pinned to the recognized arm. An unrecognized constraint round-trips
+        // just as faithfully, so the equality below would still hold if this
+        // tag ever stopped being recognized, and the case this test exists for
+        // would go unexercised.
+        let Constraint::Known { known, .. } = &parsed else {
+            panic!("`payment.amount` must parse as a recognized constraint, got {parsed:?}");
+        };
+        assert!(matches!(known, KnownConstraint::PaymentAmount { .. }));
 
         let before: serde_json::Value = serde_json::from_str(json).unwrap();
         let after: serde_json::Value =
@@ -1080,16 +1094,32 @@ mod tests {
     /// checker says no and the signed mandate says yes.
     #[test]
     fn a_hand_built_unknown_may_not_become_a_recognized_constraint() {
-        let mut fields = serde_json::Map::new();
-        fields.insert("currency".to_owned(), serde_json::json!("USD"));
-        let disguised = Constraint::Unknown {
-            constraint_type: "payment.amount".to_owned(),
-            fields,
-        };
-        assert!(
-            signed_form_matches_the_evaluated_value(&disguised),
-            "an unrecognized constraint must not be signed as a recognized one"
-        );
+        // The disguise needs a tag this build recognizes and the fields that
+        // make it parse back as that variant. Both are taken from the enum, so
+        // renaming a tag cannot turn the disguise into a genuinely
+        // unrecognized constraint and leave this case silently unexercised.
+        // Walking every variant also covers the seven the hand-written case
+        // never reached.
+        for variant in every_known_variant() {
+            let serde_json::Value::Object(mut object) = serde_json::to_value(&variant).unwrap()
+            else {
+                panic!("a recognized constraint must serialize to an object");
+            };
+            let constraint_type = object
+                .remove("type")
+                .and_then(|tag| tag.as_str().map(str::to_owned))
+                .expect("a recognized constraint must carry a string `type`");
+
+            let disguised = Constraint::Unknown {
+                constraint_type: constraint_type.clone(),
+                fields: object,
+            };
+            assert!(
+                signed_form_matches_the_evaluated_value(&disguised),
+                "an unrecognized constraint carrying the recognized tag \
+                 `{constraint_type}` must not be signed as a recognized one"
+            );
+        }
 
         // Control: a genuinely unrecognized tag round-trips as itself.
         let mut fields = serde_json::Map::new();

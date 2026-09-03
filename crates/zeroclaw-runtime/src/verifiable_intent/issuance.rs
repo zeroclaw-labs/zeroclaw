@@ -276,11 +276,12 @@ pub fn create_layer3_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verifiable_intent::crypto::{generate_ec_p256, load_key_pair};
+    use crate::verifiable_intent::crypto::{decode_disclosure, generate_ec_p256, load_key_pair};
     use crate::verifiable_intent::types::{
-        Cnf, DisclosableEntry, Entity, FulfillmentLineItem, KnownConstraint, PaymentAmount,
-        PaymentInstrument,
+        Cnf, DisclosableEntry, Entity, FulfillmentLineItem, KnownConstraint, MandateMode,
+        PaymentAmount, PaymentInstrument,
     };
+    use crate::verifiable_intent::verification::infer_mode_from_vct;
 
     fn test_issuer_l1() -> String {
         // Minimal L1 SD-JWT for testing (not cryptographically valid, just structural)
@@ -499,5 +500,90 @@ mod tests {
         )
         .unwrap();
         assert!(!l3b.serialized.is_empty());
+    }
+
+    /// Issuance passes a mandate's `vct` through into the disclosure it signs,
+    /// and until now nothing read the emitted value back: every assertion in
+    /// this module checks that a serialized form exists, never what VCT it
+    /// carries. The registry could therefore move on the verification side
+    /// while issuance kept emitting the old string, with the whole suite still
+    /// green.
+    ///
+    /// Asserting both halves together is what stops that. The first assertion
+    /// pins what issuance emits; the second requires verification to recognize
+    /// that exact string, so the two cannot drift apart.
+    #[test]
+    fn issuance_emits_mandate_vcts_that_verification_recognizes() {
+        const CHECKOUT_VCT: &str = "mandate.checkout.open";
+        const PAYMENT_VCT: &str = "mandate.payment.open";
+
+        let (user_pkcs8, _user_jwk) = generate_ec_p256().unwrap();
+        let user_key = load_key_pair(&user_pkcs8).unwrap();
+        let (_agent_pkcs8, agent_jwk) = generate_ec_p256().unwrap();
+        let cnf = Cnf {
+            jwk: agent_jwk,
+            kid: Some("agent-key-1".into()),
+        };
+
+        let checkout = OpenCheckoutMandate {
+            vct: CHECKOUT_VCT.into(),
+            cnf: cnf.clone(),
+            constraints: vec![],
+            prompt_summary: None,
+        };
+        let payment = OpenPaymentMandate {
+            vct: PAYMENT_VCT.into(),
+            cnf,
+            payment_instrument: PaymentInstrument {
+                instrument_type: "card".into(),
+                id: "tok-1".into(),
+                description: None,
+            },
+            constraints: vec![],
+        };
+
+        let result = create_layer2_autonomous(
+            &test_issuer_l1(),
+            &checkout,
+            &payment,
+            "https://network.example.com",
+            "nonce-vct",
+            &user_key,
+            1_700_000_000,
+            1_700_086_400,
+        )
+        .unwrap();
+
+        // Read the VCTs back out of the disclosures issuance actually produced.
+        // The segments are split by hand because the serialized L1 this helper
+        // supplies already ends in `~`, which `parse_sd_jwt` refuses. That
+        // defect is stage 3's to fix and is deliberately not worked around
+        // here beyond reaching the disclosures.
+        let emitted: Vec<String> = result
+            .serialized
+            .split('~')
+            .filter_map(|segment| decode_disclosure(segment).ok())
+            .filter_map(|disclosure| {
+                disclosure
+                    .claim_value()
+                    .get("vct")?
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+
+        assert_eq!(
+            emitted,
+            vec![CHECKOUT_VCT.to_owned(), PAYMENT_VCT.to_owned()],
+            "issuance must emit the mandate VCTs it was given, in order"
+        );
+
+        for vct in &emitted {
+            assert_eq!(
+                infer_mode_from_vct(vct).expect("verification must recognize an emitted VCT"),
+                MandateMode::Autonomous,
+                "verification must read `{vct}` as an open mandate"
+            );
+        }
     }
 }
