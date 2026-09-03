@@ -13246,6 +13246,43 @@ pub async fn start_channels(
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": m.channel_id.as_deref().unwrap_or(""), "session_key": m.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
             }
 
+            // The drain above can remove a leading synthetic breadcrumb
+            // marker from the in-memory transcript without touching the
+            // durable `trim_breadcrumb` flag. Recompute ownership from the
+            // ACTUAL post-drain/closure/pruning transcript — the same
+            // ground truth `conversation_histories` is about to store — and
+            // seed `history_crumb_flags` with it directly, so a cold-cache
+            // lookup never falls back to a stale durable `true` for a
+            // marker that hydration just dropped.
+            let crumb_present = msgs.first().is_some_and(|first| {
+                first.role == "user"
+                    && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(
+                        &first.content,
+                    )
+            });
+            target_ctx
+                .history_crumb_flags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(m.key.clone(), crumb_present);
+            if store
+                .get_session_trim_breadcrumb(&m.key)
+                .ok()
+                .flatten()
+                .is_some_and(|durable| durable != crumb_present)
+                && let Err(e) = store.set_session_trim_breadcrumb(&m.key, crumb_present)
+            {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    &format!(
+                        "Failed to reconcile stale trim breadcrumb flag for {}",
+                        m.key
+                    )
+                );
+            }
+
             let mut histories = target_ctx
                 .conversation_histories
                 .lock()
