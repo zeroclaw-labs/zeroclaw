@@ -4764,6 +4764,16 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// After a clean listener return (no error), decide whether the supervisor
+/// should restart. Cancellation means the operator asked for shutdown — the
+/// exit is expected and must not restart. Any other clean return is
+/// unexpected and must restart.
+fn should_restart_listener_after_clean_return(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    !cancel.is_cancelled()
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4818,18 +4828,37 @@ fn spawn_supervised_listener_with_health_interval(
                     tokio::pin!(listen_future);
 
                     loop {
+                        let mut shutdown = false;
                         tokio::select! {
-                            () = cancel.cancelled() => return,
+                            () = cancel.cancelled() => {
+                                shutdown = true;
+                            }
                             _ = health.tick() => {
                                 zeroclaw_runtime::health::mark_component_ok(&component);
                             }
                             result = &mut listen_future => break result,
                         }
+                        if shutdown {
+                            if ch.uses_cancel_token() {
+                                // Wait for the listener to finish cleanup
+                                // so session teardown runs before exit.
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    listen_future,
+                                )
+                                .await;
+                            }
+                            return;
+                        }
+                        // Health tick fired; loop back.
                     }
                 };
 
                 match result {
                     Ok(()) => {
+                        if !should_restart_listener_after_clean_return(&cancel) {
+                            return;
+                        }
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -12712,6 +12741,12 @@ pub async fn start_channels(
                 .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
             let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+
+            // Inject the lifecycle token so channels that internally wait
+            // for shutdown subscribe to the single SIGINT consumer.
+            for cc in &configured_channels {
+                cc.channel.set_cancel_token(cancel.clone());
+            }
 
             for cc in &configured_channels {
                 listener_handles.push(spawn_supervised_listener(
@@ -30394,6 +30429,67 @@ This is an example JSON object for profile settings."#;
         err: Mutex<Option<anyhow::Error>>,
     }
 
+    /// A test channel that opts into the cooperative cancellation contract:
+    /// `uses_cancel_token()` returns `true`, `set_cancel_token` stores the
+    /// token, and `listen()` awaits cancellation before running a bounded,
+    /// probe-able cleanup phase. Used to prove the supervisor waits for
+    /// participating listeners to finish cleanup before exiting.
+    struct ParticipatingCancelChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+        cleanups: Arc<AtomicUsize>,
+        token: Mutex<Option<CancellationToken>>,
+        cleanup_started: Arc<tokio::sync::Notify>,
+        cleanup_finish_allowed: Arc<tokio::sync::Notify>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ParticipatingCancelChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ParticipatingCancelChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn set_cancel_token(&self, token: CancellationToken) {
+            *self.token.lock().unwrap() = Some(token);
+        }
+
+        fn uses_cancel_token(&self) -> bool {
+            true
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = self.token.lock().unwrap().clone();
+            if let Some(token) = token {
+                token.cancelled().await;
+            }
+            // Cleanup phase: signal start, then wait for the test to
+            // release it so the supervisor's grace period is observable.
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            self.cleanup_started.notify_one();
+            self.cleanup_finish_allowed.notified().await;
+            Ok(())
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -30653,6 +30749,119 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn should_restart_listener_after_clean_return_respects_cancellation() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(
+            should_restart_listener_after_clean_return(&cancel),
+            "must restart when cancellation has not been triggered"
+        );
+        cancel.cancel();
+        assert!(
+            !should_restart_listener_after_clean_return(&cancel),
+            "must not restart after cancellation was triggered"
+        );
+    }
+
+    /// A participating listener (via `PacedChannel`) must be allowed to
+    /// finish cleanup before the supervisor exits: cancellation while the
+    /// listener is mid-cleanup keeps the supervisor alive, then a clean
+    /// return yields one call, one cleanup, zero restarts, no error.
+    #[tokio::test]
+    async fn supervised_listener_waits_for_participating_cleanup_on_cancel() {
+        struct Pacing {
+            interval: u64,
+            depth: u16,
+        }
+        impl zeroclaw_config::schema::HasReplyPacing for Pacing {
+            fn reply_min_interval_secs(&self) -> u64 {
+                self.interval
+            }
+            fn reply_queue_depth_max(&self) -> u16 {
+                self.depth
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cleanups = Arc::new(AtomicUsize::new(0));
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let cleanup_finish_allowed = Arc::new(tokio::sync::Notify::new());
+        let channel_name = format!("test-cancel-participating-{}", uuid::Uuid::new_v4());
+        let component = format!("channel:{channel_name}");
+        let inner: Arc<dyn Channel> = Arc::new(ParticipatingCancelChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            cleanups: Arc::clone(&cleanups),
+            token: Mutex::new(None),
+            cleanup_started: Arc::clone(&cleanup_started),
+            cleanup_finish_allowed: Arc::clone(&cleanup_finish_allowed),
+        });
+
+        // Wrap through the real PacedChannel with pacing enabled so the
+        // token forwards through the production wrapper boundary.
+        let channel = crate::paced_channel::PacedChannel::wrap(
+            inner,
+            &Pacing {
+                interval: 1,
+                depth: 16,
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // The supervisor itself injects the token into every channel before
+        // spawning listeners; here we reproduce that injection manually.
+        channel.set_cancel_token(cancel.clone());
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        // Give the listener time to enter listen() and park on cancellation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        cleanup_started.notified().await;
+
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            1,
+            "listener should enter cleanup exactly once"
+        );
+        assert!(
+            !handle.is_finished(),
+            "supervisor must wait for participating cleanup, not exit immediately"
+        );
+
+        // Release cleanup; the supervisor should then exit cleanly.
+        cleanup_finish_allowed.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "supervisor must exit cleanly after cleanup completes"
+        );
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "listener ran more than once"
+        );
+        assert_eq!(
+            cleanups.load(Ordering::SeqCst),
+            1,
+            "cleanup ran more than once"
+        );
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let c = &snapshot["components"][&component];
+        assert_eq!(
+            c["restart_count"].as_u64().unwrap_or(0),
+            0,
+            "must not restart on intentional shutdown"
+        );
+        assert!(
+            c["status"].is_null() || c["status"].as_str() != Some("error"),
+            "must not record component error on intentional shutdown"
+        );
     }
 
     #[tokio::test]
