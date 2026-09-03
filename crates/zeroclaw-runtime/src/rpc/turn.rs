@@ -127,12 +127,20 @@ where
             outcome_from_task_result(joined, accumulated_text)
         }
         DrainOutcome::ExplicitCancel => {
-            match tokio::time::timeout(CANCEL_GRACE, &mut turn_handle).await {
-                Ok(joined) => outcome_from_task_result(
+            match join_with_draining_grace(
+                &mut turn_handle,
+                &mut event_rx,
+                &mut accumulated_text,
+                &on_event,
+                CANCEL_GRACE,
+            )
+            .await
+            {
+                Some(joined) => outcome_from_task_result(
                     joined.map_err(|e| TurnError::Panicked(format!("cancelled turn join: {e}")))?,
                     accumulated_text,
                 ),
-                Err(_) => {
+                None => {
                     turn_handle.abort();
                     Ok(TurnOutcome::Cancelled {
                         partial_text: accumulated_text,
@@ -140,6 +148,65 @@ where
                     })
                 }
             }
+        }
+    }
+}
+
+/// After `drain_until_done_or_cancelled` returns `ExplicitCancel`, keep
+/// draining `event_rx` for up to `grace` while racing the turn task instead
+/// of only awaiting it: the cooperative unwind can synthesize one event per
+/// still-pending tool call, and a batch larger than the channel capacity
+/// blocks the task's send once nobody is reading. An un-drained queue
+/// therefore starves the task of the very grace period meant to let it
+/// commit its trimmed history, and every grace window times out into a hard
+/// abort that loses the writeback this repair depends on.
+///
+/// Returns the joined task result if it finishes within `grace`, or `None`
+/// if the grace period elapsed (the caller must abort the handle).
+async fn join_with_draining_grace<T, F, Fut>(
+    turn_handle: &mut tokio::task::JoinHandle<T>,
+    event_rx: &mut mpsc::Receiver<TurnEvent>,
+    accumulated: &mut String,
+    on_event: &F,
+    grace: std::time::Duration,
+) -> Option<Result<T, tokio::task::JoinError>>
+where
+    F: Fn(TurnEvent) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let sleep = tokio::time::sleep(grace);
+    tokio::pin!(sleep);
+    let mut event_rx_closed = false;
+    loop {
+        tokio::select! {
+            biased;
+            joined = &mut *turn_handle => {
+                // The task can finish while events it already sent are
+                // still sitting in the channel buffer (a bounded send only
+                // needs buffer space, not a live reader). `biased` gives the
+                // join priority over drain on a tied poll, so without this
+                // the last few buffered events would never reach `on_event`
+                // even though the task committed successfully.
+                while let Ok(event) = event_rx.try_recv() {
+                    if let TurnEvent::Chunk { ref delta } = event {
+                        accumulated.push_str(delta);
+                    }
+                    on_event(event).await;
+                }
+                return Some(joined);
+            }
+            maybe_event = event_rx.recv(), if !event_rx_closed => {
+                match maybe_event {
+                    Some(event) => {
+                        if let TurnEvent::Chunk { ref delta } = event {
+                            accumulated.push_str(delta);
+                        }
+                        on_event(event).await;
+                    }
+                    None => event_rx_closed = true,
+                }
+            }
+            () = &mut sleep => return None,
         }
     }
 }
@@ -337,6 +404,62 @@ mod tests {
              window must sit comfortably between the inter-chunk gap of a \
              healthy stream (~hundreds of ms) and the user-perceptible hang \
              threshold (~seconds)."
+        );
+    }
+
+    #[tokio::test]
+    async fn grace_drain_lets_a_backlog_larger_than_the_channel_finish_within_grace() {
+        // A cooperative unwind synthesizing more events than the channel
+        // capacity blocks on the (capacity+1)th send once nobody is
+        // draining. If the grace window only awaits the task without also
+        // draining, the task can never finish and always times out into a
+        // hard abort. This reproduces that backlog against an 8-slot
+        // channel with 20 events and asserts the task still completes well
+        // inside a generous grace window.
+        const CAPACITY: usize = 8;
+        const EVENTS: usize = CAPACITY * 3;
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(CAPACITY);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            for i in 0..EVENTS {
+                // Blocks once the channel fills, exactly like a real
+                // cooperative unwind synthesizing one event per pending
+                // tool call after cancellation is observed.
+                let _ = tx
+                    .send(TurnEvent::Chunk {
+                        delta: i.to_string(),
+                    })
+                    .await;
+            }
+            "task-finished"
+        });
+
+        let mut acc = String::new();
+        let joined = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            join_with_draining_grace(
+                &mut handle,
+                &mut rx,
+                &mut acc,
+                &noop,
+                std::time::Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the grace drain itself must not hang");
+
+        assert_eq!(
+            joined
+                .expect("the task must finish within the grace window")
+                .unwrap(),
+            "task-finished",
+            "an un-drained backlog must not starve the task of the grace \
+             period meant to let it commit its cooperative unwind"
+        );
+        assert_eq!(
+            acc.len(),
+            (0..EVENTS).map(|i| i.to_string().len()).sum::<usize>(),
+            "every backlogged event must still be drained and accumulated"
         );
     }
 
