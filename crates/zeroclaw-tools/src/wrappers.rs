@@ -60,6 +60,14 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.invocation_triggers()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(args)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let reservation = match self.security.reserve_action() {
             Some(reservation) => reservation,
@@ -161,6 +169,14 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
         self.inner.invocation_triggers()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(args)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(arg) = self.extract_path_string(&args) {
             // For shell command arguments, use the full token-aware scanner.
@@ -250,6 +266,9 @@ mod tests {
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({})
         }
+        fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+            Some(format!("host summary for {args}"))
+        }
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult {
@@ -258,6 +277,21 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    /// The approval gate sees tools through the full wrapper stack. A wrapper
+    /// that fails to forward `approval_summary` silently downgrades the
+    /// operator's prompt to the generic argument dump, so the forwarding is
+    /// pinned here through both wrappers at once.
+    #[test]
+    fn wrappers_forward_the_host_approval_summary() {
+        let sec = policy(AutonomyLevel::Full);
+        let (inner, _) = CountingTool::new();
+        let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
+
+        let summary = tool.approval_summary(&serde_json::json!({"x": 1}));
+
+        assert_eq!(summary.as_deref(), Some("host summary for {\"x\":1}"));
     }
 
     // ── RateLimitedTool tests ─────────────────────────────────────────────────

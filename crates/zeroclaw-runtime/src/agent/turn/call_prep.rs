@@ -401,6 +401,7 @@ mod tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         }
     }
 

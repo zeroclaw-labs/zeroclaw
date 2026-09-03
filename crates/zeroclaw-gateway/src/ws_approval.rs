@@ -64,6 +64,14 @@ impl Channel for WsApprovalChannel {
         "ws"
     }
 
+    /// The gateway websocket only exists behind `require_auth` pairing, so
+    /// the party answering these frames proved operator identity to connect.
+    /// That is what entitles this channel to approve operator-only tools
+    /// (`Tool::approval_requires_operator`) that chat channels may not.
+    fn is_operator_approval_surface(&self) -> bool {
+        true
+    }
+
     async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
         // The gateway WS path streams agent output via TurnEvent::Chunk /
         // ::Thinking / ::ToolCall / ::ToolResult; it does not deliver
