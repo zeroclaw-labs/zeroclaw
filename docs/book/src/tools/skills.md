@@ -85,6 +85,8 @@ Never exfiltrate secrets, never disable audit logging, and always ask for approv
 
 A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, `prompts`, and `always` are optional (`always` defaults to `false`; see above). Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
+HTTP skill tools use only `http` and `https` URLs. Arguments are percent-encoded before insertion, redirects and ambient proxies are disabled, and the resolved destination must pass ZeroClaw's public-network egress policy. Private or metadata destinations are rejected, and response bodies larger than one megabyte are truncated before they can expand runtime memory.
+
 ### Slash command options and localizations
 
 A skill tagged `slash` is surfaced as a chat-channel slash command (e.g. Discord `/search`). It may declare typed `[[skill.slash_options]]`; a skill that declares none falls back to a single required free-text input. Both the command description and each option description accept an optional `description_localizations` map keyed by locale code. Unknown or unsupported locale codes are dropped with a warning rather than failing registration, so a typo never wedges command registration.

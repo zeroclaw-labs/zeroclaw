@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
-use crate::attachment::PendingAttachment;
+use crate::attachment::{CleanupReport, PendingAttachment, remove_clipboard_temp};
 use crate::clipboard;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::mouse;
@@ -676,6 +676,7 @@ pub(crate) struct InputBarState {
     last_attachment_manager_area: Option<Rect>,
     file_explorer: Option<FileExplorerState>,
     clipboard_temps: Vec<PathBuf>,
+    cleanup_report: CleanupReport,
 
     // Phase 1: Soft-wrap / dynamic height
     /// Vertical scroll offset within the input bar (0-based row index of first visible line).
@@ -746,6 +747,7 @@ impl InputBarState {
             last_attachment_manager_area: None,
             file_explorer: None,
             clipboard_temps: Vec::new(),
+            cleanup_report: CleanupReport::default(),
             scroll_offset: 0,
             last_input_area: Rect::default(),
             last_inner_width: 0,
@@ -1137,7 +1139,8 @@ impl InputBarState {
         let removed = self.pending_attachments.remove(index);
         if removed.source == crate::attachment::AttachmentSource::Clipboard {
             self.clipboard_temps.retain(|path| path != &removed.path);
-            let _ = std::fs::remove_file(removed.path);
+            self.cleanup_report
+                .merge(remove_clipboard_temp(&removed.path));
         }
 
         if self.pending_attachments.is_empty() {
@@ -1200,8 +1203,14 @@ impl InputBarState {
     /// Remove clipboard temp files (called after turn completes).
     pub fn cleanup_temps(&mut self) {
         for path in self.clipboard_temps.drain(..) {
-            let _ = std::fs::remove_file(path);
+            self.cleanup_report.merge(remove_clipboard_temp(&path));
         }
+    }
+
+    /// Take cleanup failures accumulated by attachment removal or lifecycle
+    /// cleanup. The caller surfaces the bounded report through the info bar.
+    pub(crate) fn take_cleanup_report(&mut self) -> CleanupReport {
+        std::mem::take(&mut self.cleanup_report)
     }
 
     // ── Key handling ─────────────────────────────────────────
@@ -1682,7 +1691,7 @@ impl InputBarState {
                         ))
                     }
                     Err(e) => {
-                        let _ = std::fs::remove_file(&tmp_path);
+                        self.cleanup_report.merge(remove_clipboard_temp(&tmp_path));
                         InputBarAction::StatusMessage(crate::i18n::t_args(
                             "zc-input-clipboard-error",
                             &[("error", &e.to_string())],
@@ -2642,6 +2651,30 @@ mod tests {
         assert!(bar.pending_attachments().is_empty());
         assert!(bar.clipboard_temps().is_empty());
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn removing_clipboard_attachment_surfaces_failed_cleanup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut bar = input_bar_with_shared_commands();
+        bar.clipboard_temps.push(dir.path().to_path_buf());
+        bar.add_attachment(PendingAttachment {
+            path: dir.path().to_path_buf(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 0,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(bar.clipboard_temps().is_empty());
+        assert_eq!(bar.take_cleanup_report().failed_count(), 1);
+        assert!(
+            dir.path().exists(),
+            "failed cleanup must leave the path visible"
+        );
     }
 
     #[test]

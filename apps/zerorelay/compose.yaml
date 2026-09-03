@@ -1,0 +1,39 @@
+# Run the ZeroClaw nominated relay (blind forwarder).
+#
+#   cd apps/zerorelay && podman compose up --build      # (or `docker compose`)
+#
+# Build context is the repository root because zerorelay is a workspace member.
+services:
+  zerorelay:
+    build:
+      context: ../..
+      dockerfile: apps/zerorelay/Dockerfile
+    image: zeroclaw/zerorelay:latest
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    # The image runs `zerorelay --config /etc/zerorelay/relay.toml` (a baked copy
+    # of relay.example.toml). The relay SELF-PROVISIONS its outer TLS cert into
+    # /data/tls on first run (no openssl); the volume persists it so the CA
+    # daemons/clients trust survives restarts (CA at /data/tls/ca.crt). Set the
+    # relay's public hostname in [tls].sans for a reachable relay.
+    volumes:
+      - relay-data:/data
+      # Mount your own relay.toml to override the baked default, then
+      # `podman kill --signal HUP zerorelay` to hot-reload [admission]
+      # (allow/deny/mode) without dropping live connections:
+      #   - ./relay.toml:/etc/zerorelay/relay.toml:ro
+    # Admission defaults to `open` (any signed daemon may register). For an
+    # approved-only relay set [admission].mode = "allowlist" + allow = ["<daemon
+    # pubkey FINGERPRINT sha256 hex>"] in the mounted relay.toml. CLI flags still
+    # override the file:
+    #   command: ["--config", "/etc/zerorelay/relay.toml", "--tls-san", "relay.example.com"]
+    healthcheck:
+      # distroless has no shell; probe via the binary's own subcommand.
+      test: ["CMD", "/usr/local/bin/zerorelay", "healthcheck", "--addr", "127.0.0.1:8443"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  relay-data:

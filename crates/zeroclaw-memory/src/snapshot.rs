@@ -2,9 +2,11 @@
 
 use anyhow::Result;
 use chrono::Local;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::sqlite::SqliteMemory;
 
 /// Filename for the snapshot (lives at workspace root for Git visibility).
 pub const SNAPSHOT_FILENAME: &str = "MEMORY_SNAPSHOT.md";
@@ -32,24 +34,17 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
     let mut stmt = conn.prepare(
-        "SELECT key, content, category, created_at, updated_at
+        "SELECT key, content, created_at, updated_at
          FROM memories
          WHERE category = 'core'
          ORDER BY updated_at DESC",
     )?;
 
-    let rows: Vec<(String, String, String, String, String)> = stmt
+    let rows: Vec<(String, String, String, String)> = stmt
         .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     if rows.is_empty() {
         ::zeroclaw_log::record!(
@@ -70,7 +65,7 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
         rows.len()
     ));
 
-    for (key, content, _category, created_at, updated_at) in &rows {
+    for (key, content, created_at, updated_at) in &rows {
         output.push_str(&format!("### 🔑 `{key}`\n\n"));
         output.push_str(content);
         output.push_str("\n\n");
@@ -111,78 +106,32 @@ pub fn hydrate_from_snapshot(workspace_dir: &Path) -> Result<usize> {
         return Ok(0);
     }
 
-    // Ensure the memory directory exists
-    let db_dir = workspace_dir.join("memory");
-    fs::create_dir_all(&db_dir)?;
-
-    let db_path = db_dir.join("brain.db");
-    let conn = Connection::open(&db_path)?;
-    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-
-    // Initialize schema (same as SqliteMemory::init_schema)
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS memories (
-            id         TEXT PRIMARY KEY,
-            key        TEXT NOT NULL UNIQUE,
-            content    TEXT NOT NULL,
-            category   TEXT NOT NULL DEFAULT 'core',
-            embedding  BLOB,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_mem_key ON memories(key);
-        CREATE INDEX IF NOT EXISTS idx_mem_cat ON memories(category);
-        CREATE INDEX IF NOT EXISTS idx_mem_updated ON memories(updated_at);
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-            USING fts5(key, content, content='memories', content_rowid='rowid');
-
-        CREATE TABLE IF NOT EXISTS embedding_cache (
-            content_hash TEXT PRIMARY KEY,
-            embedding    BLOB NOT NULL,
-            created_at   TEXT NOT NULL
-        );",
-    )?;
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    let mut conn = SqliteMemory::open_and_initialize(&db_path, None)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing_count: i64 =
+        tx.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+    if existing_count != 0 {
+        return Ok(0);
+    }
+    let default_agent_id = zeroclaw_config::schema::v2::sqlite_ensure_default_agent_uuid(&tx)?;
 
     let now = Local::now().to_rfc3339();
-    let mut hydrated = 0;
+    let mut hydrated = 0usize;
 
     for (key, content) in &entries {
         let id = uuid::Uuid::new_v4().to_string();
-        let result = conn.execute(
-            "INSERT OR IGNORE INTO memories (id, key, content, category, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'core', ?4, ?5)",
-            params![id, key, content, now, now],
-        );
-
-        match result {
-            Ok(changed) if changed > 0 => {
-                // Populate FTS5
-                let _ = conn.execute(
-                    "INSERT INTO memories_fts(key, content) VALUES (?1, ?2)",
-                    params![key, content],
-                );
-                hydrated += 1;
-            }
-            Ok(_) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"key": key})),
-                    "hydrate: key '' already exists, skipping"
-                );
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "key": key})),
-                    "hydrate: failed to insert key ''"
-                );
-            }
-        }
+        let changed = tx.execute(
+            "INSERT INTO memories (
+                id, key, content, category, created_at, updated_at, agent_id
+             ) VALUES (?1, ?2, ?3, 'core', ?4, ?5, ?6)
+             ON CONFLICT(agent_id, key) DO NOTHING",
+            params![id, key, content, now, now, default_agent_id],
+        )?;
+        hydrated += changed;
     }
+
+    tx.commit()?;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -201,16 +150,59 @@ pub fn should_hydrate(workspace_dir: &Path) -> bool {
     let db_path = workspace_dir.join("memory").join("brain.db");
     let snapshot = snapshot_path(workspace_dir);
 
-    let db_missing_or_empty = if db_path.exists() {
-        // DB exists but might be empty (freshly created)
-        fs::metadata(&db_path)
-            .map(|m| m.len() < 4096) // SQLite header is ~4096 bytes minimum
-            .unwrap_or(true)
-    } else {
-        true
+    if !snapshot.exists() {
+        return false;
+    }
+    if !db_path.exists() {
+        return true;
+    }
+
+    let conn = match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .or_else(|_| Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE))
+    {
+        Ok(conn) => conn,
+        Err(_) => {
+            log_hydration_admission_failure();
+            return false;
+        }
     };
 
-    db_missing_or_empty && snapshot.exists()
+    let has_memories: rusqlite::Result<bool> = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memories'
+         )",
+        [],
+        |row| row.get(0),
+    );
+    let has_memories = match has_memories {
+        Ok(has_memories) => has_memories,
+        Err(_) => {
+            log_hydration_admission_failure();
+            return false;
+        }
+    };
+    if !has_memories {
+        return true;
+    }
+
+    match conn.query_row("SELECT COUNT(*) FROM memories", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(count) => count == 0,
+        Err(_) => {
+            log_hydration_admission_failure();
+            false
+        }
+    }
+}
+
+fn log_hydration_admission_failure() {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "snapshot hydration admission inspection failed; skipping hydration"
+    );
 }
 
 /// Path to the snapshot file.
@@ -347,6 +339,279 @@ Rule 3: Protect the user.
         let tmp = TempDir::new().unwrap();
         let count = export_snapshot(tmp.path()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn export_decode_failure_does_not_replace_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let db_dir = workspace.join("memory");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("brain.db");
+        let snapshot = workspace.join(SNAPSHOT_FILENAME);
+        fs::write(&snapshot, "existing snapshot").unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                category TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO memories VALUES ('id', 'broken', X'00', 'core', 'created', 'updated');",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(export_snapshot(workspace).is_err());
+        assert_eq!(fs::read_to_string(snapshot).unwrap(), "existing snapshot");
+    }
+
+    #[test]
+    fn hydrate_uses_canonical_schema_default_agent_and_fts() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `identity`\n\nI am a test agent\n",
+        )
+        .unwrap();
+
+        assert_eq!(hydrate_from_snapshot(workspace).unwrap(), 1);
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let agent_alias: String = conn
+            .query_row(
+                "SELECT a.alias FROM memories m JOIN agents a ON a.id = m.agent_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_alias, "default");
+
+        let agent_id_not_null: i64 = conn
+            .query_row(
+                "SELECT [notnull] FROM pragma_table_info('memories') WHERE name = 'agent_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_id_not_null, 1);
+
+        let unique_agent_key = {
+            let indexes: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA index_list(memories)").unwrap();
+                stmt.query_map([], |row| {
+                    let unique: i64 = row.get(2)?;
+                    let name: String = row.get(1)?;
+                    Ok((unique != 0, name))
+                })
+                .unwrap()
+                .filter_map(|result| result.ok())
+                .filter(|(unique, _)| *unique)
+                .map(|(_, name)| name)
+                .collect()
+            };
+            indexes.into_iter().any(|index_name| {
+                let mut info = conn
+                    .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                    .unwrap();
+                let columns: Vec<String> = info
+                    .query_map([index_name], |row| row.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                columns.len() == 2
+                    && columns.iter().any(|column| column == "agent_id")
+                    && columns.iter().any(|column| column == "key")
+            })
+        };
+        assert!(unique_agent_key);
+
+        let (memory_rowid, fts_rowid): (i64, i64) = conn
+            .query_row(
+                "SELECT m.rowid, f.rowid FROM memories m JOIN memories_fts f ON f.rowid = m.rowid",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(memory_rowid, fts_rowid);
+        let found: String = conn
+            .query_row(
+                "SELECT key FROM memories_fts WHERE memories_fts MATCH 'agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, "identity");
+    }
+
+    #[test]
+    fn hydrate_keeps_first_duplicate_key() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `first`\n\nfirst value\n\n### 🔑 `first`\n\nduplicate value\n",
+        )
+        .unwrap();
+
+        assert_eq!(hydrate_from_snapshot(workspace).unwrap(), 1);
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = 'first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "first value");
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 1);
+    }
+
+    #[test]
+    fn hydrate_rolls_back_entire_batch_on_insert_failure() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `first`\n\nfirst value\n\n### 🔑 `second`\n\nsecond value\n",
+        )
+        .unwrap();
+
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = SqliteMemory::open_and_initialize(&db_path, None).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_second_snapshot_entry
+             BEFORE INSERT ON memories
+             WHEN NEW.key = 'second'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected snapshot insert failure');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(hydrate_from_snapshot(workspace).is_err());
+        let conn = Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let fts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 0);
+    }
+
+    #[test]
+    fn should_hydrate_inspects_schema_and_wal_rows() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let snapshot = workspace.join(SNAPSHOT_FILENAME);
+        fs::write(&snapshot, "### 🔑 `test`\n\nHello\n").unwrap();
+        let db_dir = workspace.join("memory");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("brain.db");
+
+        // A valid database without memories is eligible.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute("CREATE TABLE unrelated (value TEXT)", [])
+            .unwrap();
+        assert!(should_hydrate(workspace));
+
+        // An empty memories table is eligible.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE memories (key TEXT)", [])
+            .unwrap();
+        drop(conn);
+        assert!(should_hydrate(workspace));
+
+        // A committed WAL row is visible to read-only admission.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .unwrap();
+        conn.execute("INSERT INTO memories VALUES ('populated')", [])
+            .unwrap();
+        assert!(!should_hydrate(workspace));
+        drop(conn);
+
+        // A corrupt existing database fails closed rather than hydrating.
+        fs::remove_file(&db_path).unwrap();
+        fs::write(&db_path, "not a sqlite database").unwrap();
+        assert!(!should_hydrate(workspace));
+    }
+
+    #[test]
+    fn should_hydrate_opens_closed_empty_wal_without_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `test`\n\nHello\n",
+        )
+        .unwrap();
+        let db_path = workspace.join("memory").join("brain.db");
+
+        let conn = SqliteMemory::open_and_initialize(&db_path, None).unwrap();
+        drop(conn);
+        for sidecar in [
+            db_path.with_extension("db-wal"),
+            db_path.with_extension("db-shm"),
+        ] {
+            if sidecar.exists() {
+                fs::remove_file(&sidecar).unwrap();
+            }
+            assert!(!sidecar.exists());
+        }
+
+        assert!(should_hydrate(workspace));
+    }
+
+    #[test]
+    fn hydrate_skips_snapshot_when_live_row_arrives_after_admission() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::write(
+            workspace.join(SNAPSHOT_FILENAME),
+            "### 🔑 `snapshot`\n\nsnapshot value\n",
+        )
+        .unwrap();
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = SqliteMemory::open_and_initialize(&db_path, None).unwrap();
+        drop(conn);
+
+        assert!(should_hydrate(workspace));
+
+        let conn = SqliteMemory::open_and_initialize(&db_path, None).unwrap();
+        let default_agent_id =
+            zeroclaw_config::schema::v2::sqlite_ensure_default_agent_uuid(&conn).unwrap();
+        let now = Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO memories (
+                id, key, content, category, created_at, updated_at, agent_id
+             ) VALUES (?1, 'live', 'live value', 'core', ?2, ?2, ?3)",
+            params![uuid::Uuid::new_v4().to_string(), now, default_agent_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(hydrate_from_snapshot(workspace).unwrap(), 0);
+        let conn = Connection::open(&db_path).unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT key, content FROM memories ORDER BY key")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![("live".to_string(), "live value".to_string())]);
     }
 
     #[test]

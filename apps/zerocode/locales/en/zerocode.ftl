@@ -138,6 +138,7 @@ zc-input-attachment-manager-hint = { $navigate } select · { $remove } remove ·
 zc-input-help-attachment-remove = Remove attachment
 zc-input-help-attachment-detach = Remove by index
 zc-input-clipboard-error = Clipboard error: { $error }
+zc-input-clipboard-cleanup-error = Clipboard cleanup warning: { $count } temporary file(s) could not be removed and remain on disk.
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.
