@@ -11,6 +11,8 @@ zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-tls.workspace = true
+zeroclaw-relay-proto.workspace = true
 zeroclaw-commands.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
@@ -24,6 +26,7 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 cap-std = "4"
+cap-fs-ext = "4"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
@@ -49,9 +52,6 @@ regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
-rustls-pki-types = "1.14.0"
 schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
@@ -80,6 +80,7 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
 which = "8.0"
+zeroize = { version = "1.8", features = ["alloc"] }
 zeroclaw-macros.workspace = true
 
 # Optional deps
@@ -129,8 +130,16 @@ test-util = []
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 encoding_rs = "0.8"
 rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Enable the shared cert/CSR test fixtures for the enrollment + relay tests.
+zeroclaw-tls = { workspace = true, features = ["testing"] }
+zerorelay = { workspace = true }
+futures-util = "0.3"
 tempfile = "3.26"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+# `test-util` enables tokio's paused-clock test runtime, which is what the relay
+# bridge's setup-deadline and keepalive-liveness regressions need to reach a
+# minute-scale budget without waiting a minute.
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
 scopeguard = "1.2"
 filetime = "0.2"
 wiremock = "0.6"

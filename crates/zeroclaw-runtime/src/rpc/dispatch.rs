@@ -24,7 +24,7 @@ use zeroclaw_api::jsonrpc::{
     JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
     SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
@@ -171,6 +171,9 @@ pub enum Method {
     QuickstartApply,
     QuickstartDismiss,
 
+    // Certificates (mTLS client-cert lifecycle)
+    CertRenew,
+
     SopsList,
     SopsGet,
     SopsGraph,
@@ -280,6 +283,7 @@ impl Method {
         (Method::QuickstartValidate, "quickstart/validate"),
         (Method::QuickstartApply, "quickstart/apply"),
         (Method::QuickstartDismiss, "quickstart/dismiss"),
+        (Method::CertRenew, "cert/renew"),
         (Method::SopsList, "sops/list"),
         (Method::SopsGet, "sops/get"),
         (Method::SopsGraph, "sops/graph"),
@@ -486,9 +490,20 @@ pub struct RpcDispatcher {
     /// TUI session UID assigned during `initialize`. Used for registry
     /// cleanup on disconnect.
     tui_id: Option<String>,
+    /// Which registration of `tui_id` this connection owns. Created here: the
+    /// id alone cannot tell this connection's registration from a successor's
+    /// after a reconnect adopts the same id, and teardown must only remove its
+    /// own. `None` until `initialize` registers.
+    tui_epoch: Option<super::tui_identity::TuiEpoch>,
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
+    /// SHA-256 fingerprint of the client certificate presented on the mTLS
+    /// handshake (remote WSS plane only; `None` on the local socket). This is the
+    /// transport identity: it keys the issued-cert ledger, so the renew RPC gates
+    /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
+    /// resolves from the registry.
+    peer_cert_fingerprint: Option<String>,
 }
 
 impl RpcDispatcher {
@@ -498,14 +513,37 @@ impl RpcDispatcher {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             authenticated: false,
             tui_id: None,
+            tui_epoch: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            peer_cert_fingerprint: None,
         }
+    }
+
+    /// Bind the client certificate fingerprint from the mTLS handshake (WSS).
+    /// Additive builder so the socket transport and tests need no change.
+    #[must_use]
+    pub fn with_peer_cert_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.peer_cert_fingerprint = fingerprint;
+        self
+    }
+
+    /// The presenting client certificate fingerprint, if this is an mTLS peer.
+    pub fn peer_cert_fingerprint(&self) -> Option<&str> {
+        self.peer_cert_fingerprint.as_deref()
     }
 
     /// TUI ID assigned during initialize, if any.
     pub fn tui_id(&self) -> Option<&str> {
         self.tui_id.as_deref()
+    }
+
+    /// This connection's registry registration: the TUI id and the epoch it was
+    /// registered under. Teardown must quote both, so that a connection whose
+    /// cleanup runs after a reconnect has already adopted the same id cannot
+    /// evict the live entry.
+    pub fn tui_registration(&self) -> Option<(&str, super::tui_identity::TuiEpoch)> {
+        Some((self.tui_id.as_deref()?, self.tui_epoch?))
     }
 
     #[cfg(test)]
@@ -527,8 +565,13 @@ impl RpcDispatcher {
             rpc: Arc::clone(&self.rpc),
             authenticated: true,
             tui_id: self.tui_id.clone(),
+            // Same connection, so the same registration: this handle shares the
+            // parent's epoch rather than claiming one of its own. It never runs
+            // teardown; only the owning transport loop does.
+            tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+            peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
     }
 
@@ -874,6 +917,7 @@ impl RpcDispatcher {
             Method::QuickstartValidate => self.handle_quickstart_validate(&req.params),
             Method::QuickstartApply => self.handle_quickstart_apply(&req.params).await,
             Method::QuickstartDismiss => self.handle_quickstart_dismiss(&req.params),
+            Method::CertRenew => self.handle_renew_cert(&req.params).await,
 
             Method::SopsList => self.handle_sops_list(),
             Method::SopsGet => self.handle_sops_get(&req.params),
@@ -932,15 +976,15 @@ impl RpcDispatcher {
             if !self.ctx.tui_registry.verify(claimed_id, sig) {
                 return Err(rpc_err(AUTH_REQUIRED, "Invalid TUI signature"));
             }
-            // Remove stale entry from previous connection before re-registering
-            self.ctx.tui_registry.unregister(claimed_id);
+            // No explicit removal of the previous connection's entry: the
+            // registration below replaces it under a fresh epoch, which is what
+            // marks that predecessor superseded.
             claimed_id.to_string()
         } else if let Some(claimed_id) = req.tui_id.as_deref() {
             // Client claims ID but no signature — accept only if signing disabled
             if self.ctx.tui_registry.signing_is_enabled() {
                 return Err(rpc_err(AUTH_REQUIRED, "TUI signature required"));
             }
-            self.ctx.tui_registry.unregister(claimed_id);
             claimed_id.to_string()
         } else {
             // Fresh connection — generate new ID
@@ -948,7 +992,8 @@ impl RpcDispatcher {
         };
 
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
-        self.ctx
+        let tui_epoch = self
+            .ctx
             .tui_registry
             .register(super::tui_identity::TuiEntry {
                 tui_id: tui_id.clone(),
@@ -962,6 +1007,23 @@ impl RpcDispatcher {
                 env: req.env,
             });
         self.tui_id = Some(tui_id.clone());
+        self.tui_epoch = Some(tui_epoch);
+
+        // Bind the session's tui_id to the presenting client cert fingerprint
+        // (mTLS peers only). The cert is the transport identity; the renew RPC
+        // gates on its ledger status. Authorization still resolves from the
+        // registry - the cert is not a parallel permission store.
+        if let Some(fp) = self.peer_cert_fingerprint.as_deref() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "tui_id": tui_id,
+                        "cert_fingerprint": fp,
+                    })),
+                "WSS session bound to client certificate"
+            );
+        }
 
         self.authenticated = true;
 
@@ -990,6 +1052,191 @@ impl RpcDispatcher {
             capabilities,
             commands,
         })
+    }
+
+    /// Renew the presenting client's certificate over its authenticated mTLS
+    /// session (no second bootstrap). Renewal is REFUSED when the presenting
+    /// cert is revoked in the ledger, so a stolen-but-unexpired cert cannot
+    /// self-renew forever (threat A5). The device identity comes from the
+    /// ledger (the cert's binding), never from the client/CSR.
+    async fn handle_renew_cert(&self, params: &Value) -> RpcResult {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+
+        let fingerprint = self.peer_cert_fingerprint.as_deref().ok_or_else(|| {
+            rpc_err(
+                INVALID_PARAMS,
+                "certificate renewal requires the mutually authenticated WSS plane",
+            )
+        })?;
+        let csr_pem = params
+            .get("csr_pem")
+            .and_then(Value::as_str)
+            .ok_or_else(|| rpc_err(INVALID_PARAMS, "missing csr_pem"))?;
+
+        let (data_dir, relay_cfg, static_client_pins_configured, crl_path) = {
+            let cfg = self.ctx.config.read();
+            (
+                cfg.data_dir.clone(),
+                cfg.relay.clone(),
+                cfg.wss
+                    .client_auth
+                    .as_ref()
+                    .map(|auth| !auth.pinned_certs.is_empty())
+                    .unwrap_or(false),
+                // The file the WSS verifier ACTUALLY reads, resolved from the
+                // same `[wss.client_auth].crl_path` the startup acceptor
+                // resolves. A ledger opened on the default path instead would
+                // revoke in SQLite and rewrite `<data_dir>/tls/revoked` while
+                // the verifier kept reading an unchanged operator-managed file
+                // - a revocation reported and never enforced.
+                //
+                // Resolved HERE, from the config this handler already reads,
+                // rather than snapshotted into `RpcContext` at startup: an
+                // operator who changes `crl_path` and reloads must not have
+                // renewals keep materializing to the old file. Deriving live
+                // policy at use time is the rule this repo works by.
+                crate::security::cert_ledger::effective_revoked_list_path(
+                    &cfg.data_dir,
+                    cfg.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                ),
+            )
+        };
+
+        if static_client_pins_configured {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "certificate renewal is disabled because [wss.client_auth].pinned_certs is configured; provision pinned client certificates out of band",
+            ));
+        }
+
+        // The daemon-wide audit logger, NOT a fresh one per renewal. Each
+        // logger holds the Merkle chain's sequence and prev_hash in its own
+        // mutex, so per-request loggers recover the same tip and append
+        // conflicting entries; concurrent renewals then leave an audit file
+        // that `verify_chain` rejects. Cloning the shared `Arc` puts every
+        // renewal behind the one lock that enrollment and the ledger use.
+        let audit = Arc::clone(self.ctx.cert_audit.as_ref().ok_or_else(|| {
+            rpc_err(
+                INTERNAL_ERROR,
+                "certificate audit logger unavailable; refusing to renew without an audit trail",
+            )
+        })?);
+        let ledger = CertLedger::open_at(&data_dir, Some(audit), crl_path)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("cert ledger: {e}")))?;
+
+        // Gate on ledger status (A5): revoked cannot self-renew; an unknown cert
+        // must re-enroll rather than renew.
+        match ledger
+            .status_of(fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger status: {e}")))?
+        {
+            Some(CertStatus::Active) => {}
+            Some(CertStatus::Revoked) => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "this certificate is revoked; re-enroll for a new one",
+                ));
+            }
+            None => {
+                return Err(rpc_err(
+                    INVALID_PARAMS,
+                    "this certificate is not in the issued-cert ledger; re-enroll",
+                ));
+            }
+        }
+
+        // Device identity is the presenting cert's ledger binding, not the CSR.
+        let device_id = ledger
+            .device_of(fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger lookup: {e}")))?
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ledger row missing device id"))?;
+
+        // Sign the renewal CSR with the daemon CA (reads only the CSR public key).
+        let tls_dir = data_dir.join("tls");
+        let ca_cert_pem = std::fs::read_to_string(tls_dir.join("ca.crt"))
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("read CA cert: {e}")))?;
+        let ca_key_pem = zeroclaw_tls::load_ca_key_pem(
+            &tls_dir.join("ca.key"),
+            &zeroclaw_tls::CaKeyProtection::from_env(),
+        )
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("read CA key: {e}")))?;
+        let issued = zeroclaw_tls::sign_csr(&ca_cert_pem, &ca_key_pem, &device_id, csr_pem)
+            .map_err(|e| rpc_err(INVALID_PARAMS, format!("CSR rejected: {e}")))?;
+
+        // Record the renewal (new fingerprint, same device id) -> CertRenewed
+        // audit. The old cert stays active until it expires; revocation is a
+        // separate, explicit action.
+        //
+        // The presenting fingerprint rides along as a PRECONDITION of the
+        // publish. The status gate above ran several steps ago - a CA signature
+        // ago - on a connection the operator's `revoke-client-cert` does not
+        // share, so an operator revoking this device in the meantime would
+        // otherwise see their revocation succeed and this renewal hand the same
+        // device a fresh active certificate. Re-testing it inside the
+        // publishing transaction makes revocation the guaranteed winner.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        ledger
+            .record_issued_requiring(
+                &LedgerEntry {
+                    device_id: device_id.clone(),
+                    fingerprint: issued.fingerprint.clone(),
+                    not_before: issued.not_before,
+                    not_after: issued.not_after,
+                    status: CertStatus::Active,
+                    token_hash: String::new(),
+                    actor: "renew".to_string(),
+                    issued_at: now,
+                },
+                true,
+                Some(fingerprint),
+            )
+            .map_err(|e| {
+                let message = format!("{e:#}");
+                // A revocation that beat this renewal is the client's business,
+                // not an internal fault: it must re-enroll, and retrying the
+                // renewal will only fail again.
+                if message.contains(crate::security::cert_ledger::ISSUANCE_PRECONDITION_FAILED) {
+                    rpc_err(INVALID_PARAMS, message)
+                } else {
+                    rpc_err(INTERNAL_ERROR, format!("ledger record: {e}"))
+                }
+            })?;
+
+        // Hand back the current relay profile so an in-band node-id rotation
+        // reaches the client without a second bootstrap (rotation push consumer).
+        let relay_profile = crate::enroll::relay_profile(&data_dir, &relay_cfg);
+
+        let response = serde_json::json!({
+            "cert_pem": issued.cert_pem,
+            "ca_chain_pem": ca_cert_pem,
+            "device_id": device_id,
+            "not_after": issued.not_after,
+            "relay_profile": relay_profile,
+        });
+
+        // Delivery boundary for renewal - and an honest one about its limits.
+        // This layer returns a value to the JSON-RPC framing; it never sees the
+        // transport write, so "delivered" here means the response payload was
+        // built successfully, not that the client received it. That residual
+        // window is benign in a way the enrollment one is not: the client's
+        // PREVIOUS certificate is still active and unrevoked, so a renewal that
+        // is recorded but never arrives costs the client nothing - it keeps
+        // using the old cert and renews again - while the unmarked new row is
+        // swept and revoked. Marking after the ledger write (rather than
+        // inside it) is what keeps the sweep able to see the failure at all.
+        //
+        // A ledger that cannot record the delivery fails the renewal outright:
+        // nothing has been sent yet, so refusing is free, and it spares the
+        // client a certificate that would be revoked out from under it an hour
+        // later.
+        ledger
+            .mark_delivered(&issued.fingerprint)
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("ledger delivery record: {e}")))?;
+
+        Ok(response)
     }
 
     async fn handle_status(&self) -> RpcResult {
@@ -1111,6 +1358,17 @@ impl RpcDispatcher {
         let session_id = req
             .session_id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // Session replacement and prompt execution share one admission
+        // permit. Resolve and install the new incarnation only after the
+        // previous same-ID turn has fully finalized its durable state.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let config = self.ctx.config.read().clone();
         let chat_mode = req
@@ -1437,6 +1695,17 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // Cancellation must be signalled before waiting: the admitted prompt
+        // owns this permit until its terminal state and transcript writes are
+        // complete. Removal then happens under the same incarnation fence.
+        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1505,6 +1774,18 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        // Preserve kill semantics by signalling the admitted prompt first,
+        // then wait for its finalization before reading mode or tombstoning
+        // and removing this exact session incarnation.
+        self.ctx.sessions.signal_session_kill(sid);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let chat_mode = self
             .ctx
@@ -1730,6 +2011,32 @@ impl RpcDispatcher {
             ));
         }
 
+        // Admission fences the complete session incarnation: agent, mode,
+        // attachments, durable writes, and terminal state are all resolved
+        // while same-ID replacement is excluded.
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
+        // Registration is the first operation after admission and the RAII
+        // handle removes this exact generation on every exit path. Removal
+        // handlers signal before waiting on the same queue, so they cannot
+        // lose cancellation while setup awaits agent lookup, attachments, or
+        // persistence.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_registration = self
+            .ctx
+            .sessions
+            .register_cancel_token_guard(sid, cancel.clone());
+        self.ctx
+            .sessions
+            .wait_test_prompt_registration_pause()
+            .await;
+
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
             None => match self.rehydrate_reaped_session(sid).await {
@@ -1787,16 +2094,35 @@ impl RpcDispatcher {
             }
         }
 
-        let _guard = self
+        let chat_mode = self
             .ctx
             .sessions
-            .session_queue
-            .acquire(sid)
+            .chat_mode(sid)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
+        // Mirror the gateway WS path so `session/state` and stuck-session
+        // detection see RPC-driven turns too. The durable row lives under the
+        // same `rpc_{sid}` key the Chat-mode message persistence below and
+        // `session/state` both use. The HTTP running-sessions listing stays
+        // blind to these rows: it derives its caller-facing id by stripping a
+        // `gw_` prefix, and the sibling lookup and abort paths resolve only
+        // gateway keys, so surfacing a row here would hand callers an id those
+        // endpoints cannot act on.
+        //
+        // Scoped to Chat sessions only. Session IDs are caller-supplied and
+        // the two persistence modes share that namespace, so an ACP prompt
+        // reusing the ID of a closed Chat session would otherwise mutate that
+        // session's retained `rpc_{sid}` row — making a stale Chat record
+        // report `running`/`idle`/`error` from an ACP turn, and surfacing it
+        // in stuck-session queries. ACP state belongs to `AcpSessionStore`.
+        let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
+        let session_key = format!("rpc_{sid}");
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
+        }
+
         self.ctx.sessions.touch(sid).await;
         ::zeroclaw_log::record!(
             INFO,
@@ -1806,12 +2132,6 @@ impl RpcDispatcher {
             "turn dispatch: registered cancel token, starting turn"
         );
 
-        let chat_mode = self
-            .ctx
-            .sessions
-            .chat_mode(sid)
-            .await
-            .unwrap_or(crate::rpc::types::ChatMode::Chat);
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1910,10 +2230,7 @@ impl RpcDispatcher {
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
-        let cancel_cause = self.ctx.sessions.take_cancel_cause(sid);
-        self.ctx
-            .sessions
-            .remove_cancel_token(sid, cancel_generation);
+        let cancel_cause = cancel_registration.finish();
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -2019,6 +2336,9 @@ impl RpcDispatcher {
 
         match outcome {
             Ok(TurnOutcome::Completed { text, .. }) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
@@ -2032,6 +2352,9 @@ impl RpcDispatcher {
                 })
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
                 let cancel_message = match cancel_cause {
                     Some(cause) => {
                         format!(
@@ -2075,6 +2398,9 @@ impl RpcDispatcher {
                 })
             }
             Err(e) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "error", Some(&turn_id));
+                }
                 let user_message = e.user_message().map(str::to_owned);
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -2419,54 +2745,14 @@ impl RpcDispatcher {
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+        let mut messages = Vec::new();
+        let mut acp_session_found = false;
 
-        // Try the raw id first (channel sessions store as-is), then
-        // prefixed variants for RPC/gateway-originated sessions.
-        let candidates = [
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ];
-        let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
-        for key in &candidates {
-            let loaded = backend.load(key);
-            if !loaded.is_empty() {
-                raw = loaded;
-                break;
-            }
-        }
-
-        if raw.is_empty()
-            && let Some(store) = self.ctx.acp_session_store.as_ref()
-        {
+        if let Some(store) = self.ctx.acp_session_store.as_ref() {
             match store.load_session(&req.session_id) {
                 Ok(Some(data)) => {
-                    raw = data
-                        .messages
-                        .into_iter()
-                        .filter_map(|m| {
-                            match m {
-                            zeroclaw_api::model_provider::ConversationMessage::Chat(c) => Some(c),
-                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                                text: Some(t),
-                                ..
-                            } if !t.is_empty() => {
-                                Some(zeroclaw_api::model_provider::ChatMessage::assistant(t))
-                            }
-                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                                ..
-                            }
-                            | zeroclaw_api::model_provider::ConversationMessage::ToolResults(_) => {
-                                None
-                            }
-                        }
-                        })
-                        .collect();
+                    acp_session_found = true;
+                    messages = conversation_message_entries(&data.messages);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -2478,17 +2764,45 @@ impl RpcDispatcher {
             }
         }
 
-        let total = raw.len();
+        if !acp_session_found {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+
+            // Try the raw id first (channel sessions store as-is), then
+            // prefixed variants for RPC/gateway-originated sessions.
+            let candidates = [
+                req.session_id.clone(),
+                format!("rpc_{}", req.session_id),
+                format!("gw_{}", req.session_id),
+            ];
+            for key in &candidates {
+                let loaded = backend.load(key);
+                if !loaded.is_empty() {
+                    messages = loaded
+                        .into_iter()
+                        .map(|message| MessageEntry {
+                            role: message.role,
+                            content: message.content,
+                            kind: MessageEntryKind::Message,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                        })
+                        .collect();
+                    break;
+                }
+            }
+        }
+
+        let total = messages.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
         let start = end.saturating_sub(limit);
-        let messages: Vec<MessageEntry> = raw[start..end]
-            .iter()
-            .map(|m| MessageEntry {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
+        let messages = messages[start..end].to_vec();
 
         to_result(SessionMessagesResult {
             session_id: req.session_id,
@@ -2534,6 +2848,14 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -4740,6 +5062,101 @@ impl RpcDispatcher {
     }
 }
 
+fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
+    let mut entries = Vec::new();
+    let mut tool_entries_by_id =
+        std::collections::HashMap::<String, std::collections::VecDeque<usize>>::new();
+
+    for message in messages {
+        match message {
+            ConversationMessage::Chat(chat) => entries.push(MessageEntry {
+                role: chat.role.clone(),
+                content: chat.content.clone(),
+                kind: MessageEntryKind::Message,
+                tool_call_id: None,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+            }),
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: text.clone(),
+                        kind: MessageEntryKind::Message,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                    });
+                }
+
+                for call in tool_calls {
+                    let index = entries.len();
+                    tool_entries_by_id
+                        .entry(call.id.clone())
+                        .or_default()
+                        .push_back(index);
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: format!("Tool call: {}\n{}", call.name, call.arguments),
+                        kind: MessageEntryKind::ToolCall,
+                        tool_call_id: Some(call.id.clone()),
+                        tool_name: Some(call.name.clone()),
+                        tool_input: Some(
+                            serde_json::from_str(&call.arguments)
+                                .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+                        ),
+                        tool_output: None,
+                    });
+                }
+            }
+            ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    let output = result.content.clone();
+                    let entry_index = tool_entries_by_id
+                        .get_mut(&result.tool_call_id)
+                        .and_then(std::collections::VecDeque::pop_front);
+                    if tool_entries_by_id
+                        .get(&result.tool_call_id)
+                        .is_some_and(std::collections::VecDeque::is_empty)
+                    {
+                        tool_entries_by_id.remove(&result.tool_call_id);
+                    }
+                    if let Some(entry) = entry_index.and_then(|index| entries.get_mut(index)) {
+                        entry.tool_output = Some(output.clone());
+                        entry.content.push_str("\nResult:\n");
+                        entry.content.push_str(&output);
+                    } else {
+                        entries.push(MessageEntry {
+                            role: "tool".to_string(),
+                            content: format!(
+                                "Tool result: {}\n{}",
+                                if result.tool_name.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &result.tool_name
+                                },
+                                output
+                            ),
+                            kind: MessageEntryKind::ToolResult,
+                            tool_call_id: Some(result.tool_call_id.clone()),
+                            tool_name: (!result.tool_name.is_empty())
+                                .then(|| result.tool_name.clone()),
+                            tool_input: None,
+                            tool_output: Some(output),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    entries
+}
+
 fn response_id_key(id: &Value) -> Option<String> {
     match id {
         Value::String(id) => Some(id.clone()),
@@ -6319,6 +6736,741 @@ mod tests {
         RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
     }
 
+    /// A5: the renew RPC gates on ledger status. An active cert renews; a revoked
+    /// (but unexpired) cert cannot self-renew; a connection with no client cert
+    /// (e.g. the local socket) cannot renew at all.
+    #[tokio::test]
+    async fn cert_renew_gates_on_ledger_status() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let mk = |id: &str| {
+            let (csr, _) = zeroclaw_tls::testing::gen_client_csr(id);
+            zeroclaw_tls::sign_csr(&ca_cert, &ca_key, id, &csr).unwrap()
+        };
+        let active = mk("dev-active");
+        let revoked = mk("dev-revoked");
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            for (issued, id) in [(&active, "dev-active"), (&revoked, "dev-revoked")] {
+                ledger
+                    .record_issued(
+                        &LedgerEntry {
+                            device_id: id.to_string(),
+                            fingerprint: issued.fingerprint.clone(),
+                            not_before: issued.not_before,
+                            not_after: issued.not_after,
+                            status: CertStatus::Active,
+                            token_hash: String::new(),
+                            actor: "enroll:test".to_string(),
+                            issued_at: 0,
+                        },
+                        false,
+                    )
+                    .unwrap();
+                // These stand for certificates their clients actually hold. An
+                // unmarked row is an UNDELIVERED one, and the ledger's sweep
+                // revokes those at open - so without this the renewal below
+                // would be refused for the wrong reason entirely.
+                ledger.mark_delivered(&issued.fingerprint).unwrap();
+            }
+            ledger.mark_revoked(&revoked.fingerprint, "test").unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        // Active cert renews.
+        let active_disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        assert!(
+            active_disp.handle_renew_cert(&params).await.is_ok(),
+            "an active cert should renew"
+        );
+
+        // Revoked-but-unexpired cert is refused (A5).
+        let revoked_disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(revoked.fingerprint.clone()));
+        assert!(
+            revoked_disp.handle_renew_cert(&params).await.is_err(),
+            "a revoked cert must not self-renew"
+        );
+
+        // No client cert (local socket) cannot renew.
+        let nocert_disp = RpcDispatcher::new(ctx, tx, "unix:test".into());
+        assert!(
+            nocert_disp.handle_renew_cert(&params).await.is_err(),
+            "renewal requires the mutually authenticated WSS plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_refuses_static_pinned_wss_policy() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-static-pin");
+        let active =
+            zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-static-pin", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-static-pin".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // A certificate its client holds; an unmarked row would be swept as
+            // undelivered and the assertion below would read Revoked.
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.wss.client_auth = Some(zeroclaw_config::schema::WssClientAuthConfig {
+            pinned_certs: vec![active.fingerprint.clone()],
+            ..Default::default()
+        });
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        let err = disp
+            .handle_renew_cert(&params)
+            .await
+            .expect_err("static WSS pins must disable in-band renewal");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(
+            err.message.contains("[wss.client_auth].pinned_certs"),
+            "got: {}",
+            err.message
+        );
+
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            ledger.status_of(&active.fingerprint).unwrap(),
+            Some(CertStatus::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_refuses_once_the_operator_has_revoked_the_device() {
+        // End-to-end at the RPC boundary: an operator revocation that wins the
+        // race must leave the device with no usable certificate, and the client
+        // must be told to re-enroll rather than retry. INVALID_PARAMS, not
+        // INTERNAL_ERROR - this is the client's situation, not a server fault.
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-revoked-mid");
+        let presenting =
+            zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-revoked-mid", &csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-revoked-mid".to_string(),
+                        fingerprint: presenting.fingerprint.clone(),
+                        not_before: presenting.not_before,
+                        not_after: presenting.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&presenting.fingerprint).unwrap();
+            // The operator revokes the whole device, exactly as
+            // `security revoke-client-cert --device` does, on its own handle.
+            assert_eq!(
+                ledger.revoke_device("dev-revoked-mid", "operator").unwrap(),
+                1
+            );
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(presenting.fingerprint.clone()));
+
+        let err = disp
+            .handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect_err("a revoked device must not renew");
+        assert_eq!(err.code, INVALID_PARAMS, "got: {err:?}");
+
+        // No new active certificate exists for the revoked device.
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        assert!(
+            ledger.list_active().unwrap().is_empty(),
+            "a revoked device must hold no active certificate, got: {:?}",
+            ledger.list_active().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_revokes_into_the_configured_crl_not_the_default() {
+        // The renewal RPC opens its own ledger per call. Opening it on the
+        // ledger DEFAULT path while `[wss.client_auth].crl_path` is configured
+        // meant every revocation it performs - including the undelivered sweep
+        // that runs at every open - rewrote `<data_dir>/tls/revoked`, a file
+        // the verifier never reads, and left the operator's real CRL untouched.
+        // Revoked in SQLite, still accepted at the handshake.
+        use crate::security::cert_ledger::{
+            CertLedger, CertStatus, LedgerEntry, effective_revoked_list_path, revoked_list_path,
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let custom_crl = dir.path().join("operator-managed.crl");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.wss.client_auth = Some(zeroclaw_config::schema::WssClientAuthConfig {
+            crl_path: custom_crl.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-crl");
+        let presenting = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-crl", &csr).unwrap();
+
+        // Seed through a ledger opened on the SAME configured path, so the
+        // fixture cannot be what puts the revocation in the right file.
+        let effective = effective_revoked_list_path(
+            dir.path(),
+            config.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+        );
+        assert_eq!(effective, custom_crl);
+        {
+            let ledger = CertLedger::open_at(dir.path(), None, effective.clone()).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-crl".to_string(),
+                        fingerprint: presenting.fingerprint.clone(),
+                        not_before: presenting.not_before,
+                        not_after: presenting.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&presenting.fingerprint).unwrap();
+            // A stranded undelivered certificate, already past the TTL. The
+            // renewal's ledger open must sweep it.
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-ghost".to_string(),
+                        fingerprint: "ab".repeat(32),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(presenting.fingerprint.clone()));
+
+        disp.handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect("renewal must succeed");
+
+        // The sweep's revocation landed in the file the verifier reads...
+        let set = zeroclaw_tls::load_revoked_fingerprints(&custom_crl)
+            .expect("the configured CRL must exist");
+        assert!(
+            set.contains(&"ab".repeat(32)),
+            "the renewal path must revoke into the CONFIGURED CRL, got: {set:?}"
+        );
+        // ...and not only into the default path the verifier ignores.
+        let default_body =
+            std::fs::read_to_string(revoked_list_path(dir.path())).unwrap_or_default();
+        assert!(
+            !default_body.contains(&"ab".repeat(32)),
+            "revocation must not be written to the unused default path: {default_body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_marks_delivery_and_reconciles_one_that_never_landed() {
+        // Renewal's half of the delivery contract, both directions.
+        //
+        // A renewal records a SECOND active row (new fingerprint, same device)
+        // while the old certificate stays valid - that is what makes renewal
+        // safe. So an undelivered renewal has to be reconciled without
+        // disturbing the certificate the client is still using, or the sweep
+        // would lock out the very client it is protecting.
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-renew");
+        let prior = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-renew", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-renew".to_string(),
+                        fingerprint: prior.fingerprint.clone(),
+                        not_before: prior.not_before,
+                        not_after: prior.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // The client holds this one - it is what it presents to renew.
+            ledger.mark_delivered(&prior.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(prior.fingerprint.clone()));
+
+        let renewed = disp
+            .handle_renew_cert(&serde_json::json!({ "csr_pem": renew_csr }))
+            .await
+            .expect("an active, delivered cert must renew");
+        let renewed_fp = zeroclaw_tls::single_cert_pem_sha256_fingerprint(
+            renewed["cert_pem"].as_str().expect("cert_pem is a string"),
+        )
+        .unwrap();
+        assert_ne!(
+            renewed_fp, prior.fingerprint,
+            "a renewal produces a new fingerprint, so it is a second row"
+        );
+
+        // Direction 1: the handler marked the renewal delivered, so it survives
+        // the sweep. Without the call site this assertion is what fails.
+        let marks = |fp: &str| -> Option<i64> {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.query_row(
+                "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+                rusqlite::params![fp],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            marks(&renewed_fp).is_some(),
+            "the renewal handler must record delivery of the certificate it returns"
+        );
+
+        // Direction 2: the crash window the handler cannot close itself - the
+        // process dies between the ledger write and the delivery mark. Clearing
+        // the mark reproduces exactly the durable state that leaves behind,
+        // the same way `stage_pending_row` reproduces a mid-issuance crash.
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute(
+                "UPDATE issued_certs SET delivered_at = NULL, issued_at = issued_at - 7200
+                     WHERE fingerprint = ?1",
+                rusqlite::params![renewed_fp],
+            )
+            .unwrap();
+        }
+
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(
+            reopened.status_of(&renewed_fp).unwrap(),
+            Some(CertStatus::Revoked),
+            "an undelivered renewal must be reconciled to revoked"
+        );
+        assert_eq!(
+            reopened.status_of(&prior.fingerprint).unwrap(),
+            Some(CertStatus::Active),
+            "the certificate the client still holds must be untouched by the sweep"
+        );
+        assert_eq!(
+            reopened.revoked_fingerprints().unwrap(),
+            vec![renewed_fp],
+            "only the undelivered renewal is revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_renew_propagates_certificate_audit_write_failure() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.security.audit.log_path = "missing/audit.log".to_string();
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-active");
+        let active = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-active", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-active".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            // Delivered, so the failing audit logger below is exercised by the
+            // RENEWAL write - not by the undelivered sweep trying to revoke
+            // this row at open, which fails the open for a different reason.
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint));
+        let err = disp
+            .handle_renew_cert(&params)
+            .await
+            .expect_err("audit write failure must fail renewal");
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message.contains("certificate audit event"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// Renewal must append through the daemon's SHARED audit logger, not one
+    /// it builds itself. Proven by injecting a write failure into
+    /// `ctx.cert_audit` and requiring the renewal to see it: a handler that
+    /// constructed its own `AuditLogger` would be writing to a different
+    /// instance, the injected fault would not reach it, and the renewal would
+    /// succeed. Deterministic — no concurrency needed to tell the two wirings
+    /// apart.
+    #[tokio::test]
+    async fn cert_renew_writes_through_the_shared_audit_logger() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let (initial_csr, _) = zeroclaw_tls::testing::gen_client_csr("dev-shared");
+        let active = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, "dev-shared", &initial_csr).unwrap();
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev-shared".to_string(),
+                        fingerprint: active.fingerprint.clone(),
+                        not_before: active.not_before,
+                        not_after: active.not_after,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: "enroll:test".to_string(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .unwrap();
+            ledger.mark_delivered(&active.fingerprint).unwrap();
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let shared = ctx
+            .cert_audit
+            .clone()
+            .expect("the daemon context must carry a certificate audit logger");
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        // Fault the SHARED instance. Only a renewal that writes through it
+        // can observe this.
+        shared.fail_writes_after_for_test(0);
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+        let disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint.clone()));
+        let err = disp.handle_renew_cert(&params).await.expect_err(
+            "renewal must write through the shared audit logger, so a fault injected \
+             into it must fail the renewal",
+        );
+        assert_eq!(err.code, INTERNAL_ERROR);
+
+        // Clearing the fault on the same instance lets renewal proceed, which
+        // confirms the failure came from the injection and not from setup.
+        shared.clear_write_failure_for_test();
+        let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+        let params = serde_json::json!({ "csr_pem": renew_csr });
+        let disp = RpcDispatcher::new(ctx, tx, "wss:test".into())
+            .with_peer_cert_fingerprint(Some(active.fingerprint));
+        disp.handle_renew_cert(&params)
+            .await
+            .expect("renewal must succeed once the injected fault is cleared");
+
+        let log_path = dir.path().join("audit.log");
+        crate::security::audit::verify_chain(&log_path)
+            .expect("a failed then retried renewal must leave a verifiable audit chain");
+    }
+
+    /// Renewal is a normal operational path with audit logging on by default,
+    /// so several clients renewing at once is ordinary traffic - not an edge
+    /// case. Every one of them appends to the Merkle-chained audit file, and
+    /// the chain has exactly one writer per file: the shared
+    /// `RpcContext::cert_audit`.
+    ///
+    /// When each renewal built its own `AuditLogger`, each instance recovered
+    /// the same chain tip and then advanced its own private copy of the
+    /// sequence and `prev_hash`. Concurrent renewals appended entries that
+    /// duplicated sequence numbers and linked to hashes their neighbours had
+    /// overwritten, and `verify_chain` rejected the whole file even though
+    /// every request had used its own correctly locked logger.
+    ///
+    /// NOTE: some renewals in this test are expected to fail, for a reason
+    /// that has nothing to do with the audit chain. `CertLedger::open` runs
+    /// `materialize_revocations`, which stages the revocation list through a
+    /// FIXED temp filename (`cert_ledger.rs`, `materialize_on`: `let tmp =
+    /// path.with_extension("tmp")`) and renames it into place. Concurrent
+    /// opens — and renewal opens the ledger per request — collide on that one
+    /// temp path, and the loser's rename fails with ENOENT. This test
+    /// therefore accepts that specific failure and rejects every other error,
+    /// so it still fails loudly if renewal breaks for any new reason. The
+    /// ledger race is tracked separately; fixing it should let this test
+    /// require all renewals to succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_renewals_keep_the_audit_chain_verifiable() {
+        use crate::security::cert_ledger::{CertLedger, CertStatus, LedgerEntry};
+        const RENEWALS: usize = 8;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: dir.path().to_path_buf(),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let mats = zeroclaw_tls::ensure_server_materials(&dir.path().join("tls"), &[]).unwrap();
+        let ca_cert = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+
+        // One active certificate per concurrent client.
+        let mut fingerprints = Vec::with_capacity(RENEWALS);
+        {
+            let ledger = CertLedger::open(dir.path(), None).unwrap();
+            for i in 0..RENEWALS {
+                let device = format!("dev-concurrent-{i}");
+                let (csr, _) = zeroclaw_tls::testing::gen_client_csr(&device);
+                let issued = zeroclaw_tls::sign_csr(&ca_cert, &ca_key, &device, &csr).unwrap();
+                ledger
+                    .record_issued(
+                        &LedgerEntry {
+                            device_id: device,
+                            fingerprint: issued.fingerprint.clone(),
+                            not_before: issued.not_before,
+                            not_after: issued.not_after,
+                            status: CertStatus::Active,
+                            token_hash: String::new(),
+                            actor: "enroll:test".to_string(),
+                            issued_at: 0,
+                        },
+                        false,
+                    )
+                    .unwrap();
+                // A real client cert reached its owner, so the row is
+                // delivered; without this the undelivered sweep at ledger open
+                // revokes it and renewal is refused for the wrong reason.
+                ledger.mark_delivered(&issued.fingerprint).unwrap();
+                fingerprints.push(issued.fingerprint);
+            }
+        }
+
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        // ONE context, so one shared audit logger - exactly the daemon's shape.
+        let ctx = RpcContext::minimal_with_cert_audit(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+
+        // Every renewal is in flight before any of them finishes.
+        let gate = Arc::new(tokio::sync::Barrier::new(RENEWALS));
+        let mut tasks = Vec::with_capacity(RENEWALS);
+        for fingerprint in fingerprints {
+            let disp = RpcDispatcher::new(ctx.clone(), tx.clone(), "wss:test".into())
+                .with_peer_cert_fingerprint(Some(fingerprint));
+            let gate = Arc::clone(&gate);
+            let (renew_csr, _) = zeroclaw_tls::testing::gen_client_csr("ignored-by-daemon");
+            tasks.push(::zeroclaw_spawn::spawn!(async move {
+                let params = serde_json::json!({ "csr_pem": renew_csr });
+                gate.wait().await;
+                disp.handle_renew_cert(&params).await
+            }));
+        }
+        // EVERY concurrent renewal must succeed. This assertion used to tolerate
+        // failures whose message contained "initialize cert ledger DB", because
+        // each ledger open materializes the revocation list through a FIXED
+        // temp path and concurrent opens raced the rename - three of eight
+        // failed. That race is fixed in `CertLedger::materialize_on` (unique
+        // per-call temp name), so tolerating it here would only hide its
+        // return.
+        let mut succeeded = 0usize;
+        for task in tasks {
+            match task.await.expect("renewal task panicked") {
+                Ok(_) => succeeded += 1,
+                Err(e) => panic!("a concurrent renewal must not fail: {e:?}"),
+            }
+        }
+        assert_eq!(
+            succeeded, RENEWALS,
+            "all {RENEWALS} concurrent renewals must complete"
+        );
+
+        // The trail must still verify end to end.
+        let log_path = dir.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path).expect("audit log must exist");
+        let entries: Vec<crate::security::audit::AuditEvent> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("every audit line must be complete JSON"))
+            .collect();
+
+        let verified = crate::security::audit::verify_chain(&log_path)
+            .expect("concurrent renewals must leave a verifiable audit chain");
+        assert_eq!(
+            verified as usize,
+            entries.len(),
+            "verify_chain must cover every appended entry"
+        );
+        assert_eq!(
+            entries.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            (0..entries.len() as u64).collect::<Vec<_>>(),
+            "sequences must be strictly consecutive: no duplicates, no gaps"
+        );
+
+        let renewed = entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_type,
+                    crate::security::audit::AuditEventType::CertRenewed
+                )
+            })
+            .count();
+        assert_eq!(
+            renewed, succeeded,
+            "every renewal that completed must be recorded exactly once"
+        );
+    }
+
     #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
@@ -7080,6 +8232,61 @@ mod tests {
     /// `RpcApprovalChannel` can route `request_choice` over
     /// `elicitation/create`. Source-of-truth check: the dispatcher
     /// is the canonical owner; the test reads the field directly.
+    /// Wiring check for the registry's epoch guard: `initialize` must record the
+    /// epoch it registered under, so a displaced connection's teardown removes
+    /// its own registration and not the reconnect that adopted the same TUI id.
+    /// The registry enforces the rule; this proves the dispatcher supplies it.
+    #[tokio::test]
+    async fn a_reconnect_survives_the_displaced_connections_teardown() {
+        let (mut first, _sessions) =
+            make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let ctx = Arc::clone(&first.ctx);
+
+        first
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+            }))
+            .await
+            .expect("first initialize");
+        let (id, epoch_first) = first.tui_registration().expect("first registered");
+        let id = id.to_string();
+
+        // The client reconnects on a NEW connection, claiming the same id.
+        // Test registries are unsigned, so the claim is accepted as it would be
+        // with a valid signature.
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
+        let mut second =
+            RpcDispatcher::new(Arc::clone(&ctx), writer_tx, "wss:reconnect".to_string());
+        second
+            .handle_initialize(&serde_json::json!({
+                "protocol_version": RPC_PROTOCOL_VERSION,
+                "tui_id": id,
+            }))
+            .await
+            .expect("reconnect initialize");
+        let (_, epoch_second) = second.tui_registration().expect("reconnect registered");
+        assert_ne!(
+            epoch_first, epoch_second,
+            "a reconnect must register under its own epoch"
+        );
+
+        // The displaced connection's transport loop finally tears down.
+        ctx.tui_registry.unregister(&id, epoch_first);
+        assert_eq!(
+            ctx.tui_registry.list().len(),
+            1,
+            "the reconnect must survive the displaced connection's cleanup"
+        );
+        assert!(
+            ctx.tui_registry.get_env(&id).is_some(),
+            "the live TUI must still resolve its captured environment"
+        );
+
+        // The live connection's own teardown still works.
+        ctx.tui_registry.unregister(&id, epoch_second);
+        assert!(ctx.tui_registry.list().is_empty());
+    }
+
     #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =
@@ -8134,6 +9341,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conversation_message_entries_projects_typed_tool_exchange() {
+        use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::Chat(ChatMessage::user("question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("I will inspect both files".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call-1".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "call-2".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"a.txt"}"#.into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "call-2".into(),
+                    content: "contents".into(),
+                    tool_name: "read".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    content: "/tmp".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "orphan".into(),
+                    content: "late result".into(),
+                    tool_name: "shell".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].kind, MessageEntryKind::Message);
+        assert_eq!(entries[1].content, "I will inspect both files");
+        assert_eq!(entries[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(entries[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(entries[2].tool_output.as_deref(), Some("/tmp"));
+        assert_eq!(entries[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(entries[3].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(entries[3].tool_output.as_deref(), Some("contents"));
+        assert_eq!(entries[4].kind, MessageEntryKind::ToolResult);
+        assert_eq!(entries[4].tool_call_id.as_deref(), Some("orphan"));
+        assert_eq!(entries[4].tool_output.as_deref(), Some("late result"));
+    }
+
+    #[test]
+    fn conversation_message_entries_pairs_duplicate_tool_ids_in_order() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let entries = conversation_message_entries(&[
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "first".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "duplicate".into(),
+                        name: "second".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "first result".into(),
+                    tool_name: "first".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "duplicate".into(),
+                    content: "second result".into(),
+                    tool_name: "second".into(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].tool_name.as_deref(), Some("first"));
+        assert_eq!(entries[0].tool_output.as_deref(), Some("first result"));
+        assert_eq!(entries[1].tool_name.as_deref(), Some("second"));
+        assert_eq!(entries[1].tool_output.as_deref(), Some("second result"));
+    }
+
+    #[test]
+    fn persisted_transcript_projection_survives_active_history_trim() {
+        use zeroclaw_api::model_provider::{ChatMessage, ToolCall, ToolResultMessage};
+
+        let durable = vec![
+            ConversationMessage::Chat(ChatMessage::user("old question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("checking".into()),
+                tool_calls: vec![ToolCall {
+                    id: "old-call".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"pwd"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "old-call".into(),
+                content: "/tmp".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("old answer")),
+            ConversationMessage::Chat(ChatMessage::user("new question")),
+            ConversationMessage::Chat(ChatMessage::assistant("new answer")),
+        ];
+
+        let active = crate::agent::history_trim::trim_conversation_to_recent_turns(
+            durable.clone(),
+            2,
+            false,
+        );
+        assert!(active.trimmed);
+        assert!(!active.history.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.content == "old question"
+        )));
+
+        let transcript = conversation_message_entries(&durable);
+        assert!(
+            transcript
+                .iter()
+                .any(|entry| entry.content == "old question")
+        );
+        assert!(transcript.iter().any(|entry| {
+            entry.tool_call_id.as_deref() == Some("old-call")
+                && entry.tool_output.as_deref() == Some("/tmp")
+        }));
+    }
+
     #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
@@ -8196,14 +9553,13 @@ mod tests {
             )
             .expect("append turn");
 
-        // Sanity: the unified backend really is empty for this id under any
-        // candidate key. If this ever changes the test below stops being a
-        // regression for the ACP-store fallback.
-        for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
-            assert!(
-                chat_backend.load(&key).is_empty(),
-                "precondition: unified backend has no rows for {key}"
-            );
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .expect("seed colliding unified backend row");
+
+        assert_eq!(chat_backend.load(sid).len(), 1);
+        for key in [format!("rpc_{sid}"), format!("gw_{sid}")] {
+            assert!(chat_backend.load(&key).is_empty());
         }
 
         let result = dispatcher
@@ -8215,12 +9571,12 @@ mod tests {
 
         assert_eq!(parsed.session_id, sid);
         assert_eq!(
-            parsed.total, 3,
+            parsed.total, 5,
             "ACP-backed sessions must report their full replayable message count"
         );
         assert_eq!(
             parsed.messages.len(),
-            3,
+            5,
             "ACP-backed sessions must replay their persisted messages, not a blank transcript"
         );
         assert_eq!(parsed.messages[0].role, "user");
@@ -8233,8 +9589,122 @@ mod tests {
              on that row, so dropping it would lose visible turns from the \
              replayed transcript"
         );
-        assert_eq!(parsed.messages[2].role, "assistant");
-        assert_eq!(parsed.messages[2].content, "ack from prior turn");
+        assert_eq!(parsed.messages[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(
+            parsed.messages[2].tool_output.as_deref(),
+            Some("log contents")
+        );
+        assert_eq!(parsed.messages[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[3].tool_call_id.as_deref(), Some("tc-2"));
+        assert_eq!(parsed.messages[3].tool_output.as_deref(), Some("no errors"));
+        assert_eq!(parsed.messages[4].role, "assistant");
+        assert_eq!(parsed.messages[4].content, "ack from prior turn");
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .all(|entry| !entry.content.contains("stale backend collision")),
+            "a colliding generic backend row must not override canonical ACP history"
+        );
+
+        let page = dispatcher
+            .handle_session_messages_for_test(&json!({
+                "session_id": sid,
+                "limit": 2,
+                "before_index": 3
+            }))
+            .await
+            .expect("paginated session/messages should succeed");
+        let page: SessionMessagesResult = from_value(page).expect("paginated result shape");
+        assert_eq!(page.total, 5);
+        assert_eq!(page.start, 1);
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[0].content, "let me check the logs");
+        assert_eq!(page.messages[1].tool_call_id.as_deref(), Some("tc-1"));
+    }
+
+    #[tokio::test]
+    async fn session_messages_keeps_plain_backend_projection() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        chat_backend
+            .append("rpc-plain", &ChatMessage::user("hello"))
+            .unwrap();
+        chat_backend
+            .append("rpc-plain", &ChatMessage::assistant("world"))
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": "rpc-plain" }))
+            .await
+            .expect("plain session/messages should succeed");
+        let parsed: SessionMessagesResult = from_value(result).unwrap();
+        assert_eq!(parsed.total, 2);
+        assert!(parsed.messages.iter().all(|entry| {
+            entry.kind == MessageEntryKind::Message
+                && entry.tool_call_id.is_none()
+                && entry.tool_output.is_none()
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_messages_does_not_mask_malformed_acp_history_with_backend_fallback() {
+        use rusqlite::{Connection, params};
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-malformed-history";
+
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[ConversationMessage::AssistantToolCalls {
+                    text: Some("checking".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "bad-call".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    }],
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .unwrap();
+
+        let conn = Connection::open(data_dir.join("sessions/acp-sessions.db")).unwrap();
+        conn.execute(
+            "UPDATE acp_tool_calls SET event_kind = 'malformed' WHERE tool_call_id = ?1",
+            params!["bad-call"],
+        )
+        .unwrap();
+
+        let error = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect_err("malformed ACP history must fail closed");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(
+            error
+                .message
+                .contains("Failed to load ACP session messages")
+        );
     }
 
     #[tokio::test]
@@ -10378,6 +11848,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            cert_audit: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-close:pid=1".into());
@@ -10421,6 +11892,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            cert_audit: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-delete:pid=1".into());
@@ -10523,6 +11995,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             hooks: Some(Arc::new(runner)),
+            cert_audit: None,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-real-close:pid=1".into());
@@ -11076,6 +12549,1004 @@ mod tests {
             !on_disk.contains("[agents.alpha]"),
             "old alias must not survive on disk:\n{on_disk}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // session/prompt must mirror the durable running/idle/error state the
+    // gateway WS path already writes, so session/state and stuck-session
+    // detection see RPC-driven turns.
+    // -----------------------------------------------------------------------
+
+    /// A provider whose `chat` call reports back on `started` the moment it
+    /// is invoked, then blocks until the test releases it on `release`. Lets
+    /// a test observe state that is only true while a turn is in flight,
+    /// without racing a sleep against the agent loop.
+    struct GatedProvider {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for GatedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let _ = self.started.send(());
+            let rx = self
+                .release
+                .lock()
+                .await
+                .take()
+                .expect("chat must be invoked at most once in this harness");
+            let _ = rx.await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("turn finished".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GatedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "gated-provider"
+        }
+    }
+
+    /// A provider whose `chat` call always fails, driving `execute_turn` down
+    /// the `Err` path so the session-state write on failure can be observed.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            Err(anyhow::Error::msg("provider unavailable"))
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FailingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "failing-provider"
+        }
+    }
+
+    /// Build an `Agent` around the given provider and register it directly in
+    /// `sessions` as a Chat-mode RPC session, bypassing `session/new` so the
+    /// provider can be a test double. Also stamps the durable metadata row
+    /// under the same `rpc_{sid}` key `session/new` would, since
+    /// `set_session_state` only ever `UPDATE`s an existing row.
+    async fn install_state_test_session(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+    ) -> String {
+        install_state_test_session_with_owner(sessions, chat_backend, sid, provider, None).await
+    }
+
+    async fn install_state_test_session_with_owner(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+        owner_tui_id: Option<&str>,
+    ) -> String {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        )
+        .with_owner(owner_tui_id.map(str::to_string));
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let session_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+        session_key
+    }
+
+    #[tokio::test]
+    async fn owner_cancelled_rpc_prompt_returns_durable_chat_state_to_idle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let sid = "rpc-state-owner-cancel";
+        let owner = "cancel-owner";
+        let session_key = install_state_test_session_with_owner(
+            &sessions,
+            &chat_backend,
+            sid,
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            Some(owner),
+        )
+        .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-owner-cancel:pid=1".into());
+        dispatcher.set_tui_id_for_test(Some(owner.to_string()));
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "wait for owner cancellation",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the real Chat prompt must reach its gated provider");
+
+        let running = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the admitted Chat turn must have durable state");
+        assert_eq!(running.state, "running");
+        assert!(running.turn_id.is_some());
+
+        let cancelled = dispatcher
+            .handle_session_cancel(&json!({"session_id": sid}))
+            .await
+            .expect("the owning dispatcher must be allowed to cancel its turn");
+        assert_eq!(cancelled["cancelled"], true);
+
+        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+            .await
+            .expect("owner cancellation must release the blocked prompt")
+            .expect("prompt task must not panic")
+            .expect("cancelled prompt must settle normally");
+        assert_eq!(prompt_result["stop_reason"], "cancelled");
+        assert!(
+            release_tx.send(()).is_err(),
+            "cancellation must drop the gated provider future"
+        );
+
+        let idle = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the cancelled Chat turn must retain its durable row");
+        assert_eq!(idle.state, "idle");
+        assert!(
+            idle.turn_id.is_none(),
+            "a cancelled terminal turn must clear its durable turn id"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_reports_running_during_turn_and_idle_after() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let provider = GatedProvider {
+            started: started_tx,
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+
+        let sid = "rpc-state-turn";
+        let session_key = install_state_test_session(&sessions, &chat_backend, sid, provider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-state:pid=1".into());
+
+        let before = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.state, "idle",
+            "session must start idle before any turn runs"
+        );
+
+        let handle = dispatcher.spawn_handle();
+        let sid_owned = sid.to_string();
+        let turn_task = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_owned,
+                    "prompt": "hello",
+                }))
+                .await
+        });
+
+        started_rx
+            .recv()
+            .await
+            .expect("provider must be invoked once the turn starts");
+
+        let mid_turn = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("state row must exist once the turn has started");
+        assert_eq!(
+            mid_turn.state, "running",
+            "session state must be running while the RPC turn is in flight"
+        );
+        assert!(
+            mid_turn.turn_id.is_some(),
+            "a running state must carry a turn id"
+        );
+
+        release_tx
+            .send(())
+            .expect("test harness must still hold the release channel");
+
+        let result = turn_task.await.expect("turn task must not panic");
+        assert!(result.is_ok(), "turn should complete: {result:?}");
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state, "idle",
+            "session state must return to idle once the turn completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_reports_error_state_on_provider_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-state-error";
+        let session_key =
+            install_state_test_session(&sessions, &chat_backend, sid, FailingProvider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-error:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a failing provider must surface as an RPC error"
+        );
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state, "error",
+            "session state must record error after a failed turn"
+        );
+        assert!(
+            after.turn_id.is_some(),
+            "the error state must still carry the turn id it failed under"
+        );
+    }
+
+    /// `session/new` with `chat_mode: "acp"` never creates a `session_backend`
+    /// row — ACP sessions live entirely in `acp_session_store` — and
+    /// `set_session_state` only `UPDATE`s an existing row. So the
+    /// running/idle/error write in `handle_session_prompt` is a silent no-op
+    /// for ACP-mode turns, and `session/state` (which probes `session_backend`
+    /// under the bare id, `rpc_{id}`, and `gw_{id}`) reports session-not-found
+    /// rather than idle or running, both before and after the turn.
+    #[tokio::test]
+    async fn acp_mode_session_prompt_leaves_session_backend_state_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "acp-state-gap";
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Acp,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let candidates = [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")];
+        for key in &candidates {
+            assert!(
+                chat_backend.get_session_state(key).unwrap().is_none(),
+                "an ACP session must have no session_backend row under {key} before a turn"
+            );
+        }
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-acp-gap:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "the failing provider still surfaces as an RPC error under ACP mode"
+        );
+
+        for key in &candidates {
+            assert!(
+                chat_backend.get_session_state(key).unwrap().is_none(),
+                "an ACP session must still have no session_backend row under {key} after a \
+                 turn — the running/idle/error write is a no-op for chat_mode: acp"
+            );
+        }
+
+        let state_result = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await;
+        assert!(
+            state_result.is_err(),
+            "session/state must report the ACP session as not found rather than idle or \
+             running, since chat_mode: acp never populates session_backend"
+        );
+    }
+
+    /// Session IDs are caller-supplied and the Chat and ACP persistence modes
+    /// share that namespace, so a closed or replaced Chat session can leave a
+    /// durable `rpc_{sid}` row behind that an ACP session later reuses the ID
+    /// of. The lifecycle writes must be scoped by `chat_mode`, or the ACP turn
+    /// mutates the retained Chat row — making a stale Chat record report
+    /// `running`/`idle`/`error` from an ACP turn and surfacing it in
+    /// stuck-session queries.
+    ///
+    /// Unlike `acp_mode_session_prompt_leaves_session_backend_state_absent`,
+    /// this starts *with* a Chat row present, which is the only way to observe
+    /// the cross-store mutation: `set_session_state` only `UPDATE`s an
+    /// existing row, so the no-row case cannot catch the collision.
+    #[tokio::test]
+    async fn acp_prompt_does_not_mutate_a_retained_chat_row_with_the_same_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "shared-id-collision";
+        let session_key = format!("rpc_{sid}");
+
+        // A Chat session existed under this id and left its durable row
+        // behind, carrying a terminal state from its own last turn.
+        chat_backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .set_session_state(&session_key, "error", Some("chat-era-turn"))
+            .unwrap();
+        let retained = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the retained Chat row must exist before the ACP turn");
+        assert_eq!(retained.state, "error");
+        assert_eq!(retained.turn_id.as_deref(), Some("chat-era-turn"));
+
+        // An ACP session now reuses the same caller-supplied id.
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Acp,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-collision:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "the failing provider still surfaces as an RPC error under ACP mode"
+        );
+
+        // The ACP turn ran start-to-error. Had the lifecycle writes not been
+        // mode-scoped, this row would now read "error" under a fresh uuid
+        // turn id — an ACP turn overwriting Chat-owned durable state.
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the retained Chat row must still exist");
+        assert_eq!(
+            after.state, "error",
+            "an ACP turn must not rewrite the retained Chat row's state"
+        );
+        assert_eq!(
+            after.turn_id.as_deref(),
+            Some("chat-era-turn"),
+            "an ACP turn must not stamp its own turn id onto the retained Chat row"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_id_chat_replacement_waits_for_blocked_acp_prompt_finalization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-replaced-by-chat";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let sid_for_prompt = sid.to_string();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_for_prompt,
+                    "prompt": "blocked ACP turn",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("ACP provider must block after prompt admission");
+
+        let replacement_handle = dispatcher.spawn_handle();
+        let sid_for_replacement = sid.to_string();
+        let replacement_task = zeroclaw_spawn::spawn!(async move {
+            replacement_handle
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid_for_replacement,
+                    "chat_mode": "chat",
+                }))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if sessions.session_queue.queue_depth(sid).await == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-ID replacement must register behind the admitted ACP prompt");
+        assert!(
+            !replacement_task.is_finished(),
+            "session/new must not replace a same-ID session while its prompt owns admission"
+        );
+        assert!(
+            chat_backend
+                .get_session_state(&format!("rpc_{sid}"))
+                .unwrap()
+                .is_none(),
+            "the blocked ACP incarnation must not create Chat durable state"
+        );
+
+        release_tx.send(()).unwrap();
+        let prompt_result = prompt_task.await.expect("prompt task must not panic");
+        assert!(
+            prompt_result.is_ok(),
+            "ACP prompt should finish: {prompt_result:?}"
+        );
+        let replacement_result = replacement_task
+            .await
+            .expect("replacement task must not panic");
+        assert!(
+            replacement_result.is_ok(),
+            "Chat replacement should succeed after ACP finalization: {replacement_result:?}"
+        );
+
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        let key = format!("rpc_{sid}");
+        let replacement_state = chat_backend
+            .get_session_state(&key)
+            .unwrap()
+            .expect("Chat replacement must create its durable row");
+        assert_eq!(replacement_state.state, "idle");
+        assert!(replacement_state.turn_id.is_none());
+        assert!(
+            chat_backend.load(&key).is_empty(),
+            "the finalized ACP prompt must not append into the replacement Chat transcript"
+        );
+    }
+
+    #[tokio::test]
+    async fn removals_cancel_after_prompt_admission_before_fallible_setup() {
+        #[derive(Clone, Copy, Debug)]
+        enum Removal {
+            Close,
+            Kill,
+            Delete,
+        }
+
+        for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let chat_backend = Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+            );
+            let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 2, 60,
+            ));
+            let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+            let (provider_started_tx, mut provider_started_rx) =
+                tokio::sync::mpsc::unbounded_channel();
+            let (_provider_release_tx, provider_release_rx) = tokio::sync::oneshot::channel();
+            let sid = format!("pre-setup-removal-{removal:?}").to_ascii_lowercase();
+            install_state_test_session(
+                &sessions,
+                &chat_backend,
+                &sid,
+                GatedProvider {
+                    started: provider_started_tx,
+                    release: tokio::sync::Mutex::new(Some(provider_release_rx)),
+                },
+            )
+            .await;
+
+            let ctx = RpcContext::for_persistence_tests(
+                zeroclaw_config::schema::Config::default(),
+                Arc::clone(&sessions),
+                Some(chat_backend.clone()
+                    as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-pre-setup-removal".into());
+            let (prompt_admitted, release_prompt) = sessions.set_test_prompt_registration_pause();
+
+            let prompt_handle = dispatcher.spawn_handle();
+            let sid_for_prompt = sid.clone();
+            let prompt_task = zeroclaw_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": sid_for_prompt,
+                        "prompt": "must be cancelled",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                prompt_admitted.notified(),
+            )
+            .await
+            .expect("prompt must own admission with its cancel token registered");
+            assert!(sessions.has_inflight_turn(&sid));
+
+            let removal_handle = dispatcher.spawn_handle();
+            let sid_for_removal = sid.clone();
+            let removal_task = zeroclaw_spawn::spawn!(async move {
+                match removal {
+                    Removal::Close => {
+                        removal_handle
+                            .handle_session_close(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Kill => {
+                        removal_handle
+                            .handle_session_kill(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Delete => {
+                        removal_handle
+                            .handle_session_delete(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must signal cancellation before waiting on prompt admission");
+
+            release_prompt.notify_one();
+            let prompt_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+                    .await
+                    .expect("the pre-setup removal signal must cancel the admitted prompt")
+                    .expect("prompt task must not panic");
+            let prompt_result = prompt_result.expect("prompt should settle as cancelled");
+            assert_eq!(prompt_result["stop_reason"], "cancelled");
+            let removal_result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), removal_task)
+                    .await
+                    .expect("removal must complete instead of timing out behind the prompt")
+                    .expect("removal task must not panic");
+            assert!(
+                removal_result.is_ok(),
+                "{removal:?} should complete after cancelling setup: {removal_result:?}"
+            );
+            assert!(sessions.chat_mode(&sid).await.is_none());
+            assert!(
+                provider_started_rx.try_recv().is_err(),
+                "{removal:?} must cancel before provider execution begins"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_setup_failure_unregisters_its_cancel_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 2, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let sid = "prompt-setup-failure";
+        install_state_test_session(&sessions, &chat_backend, sid, FailingProvider).await;
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-setup-failure".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "attachment should fail before provider execution",
+                "attachments": [{
+                    "data_b64": "not-valid-base64!!!",
+                    "filename": "bad.txt",
+                    "source": "file",
+                }],
+            }))
+            .await;
+        assert!(result.is_err(), "malformed attachment must fail setup");
+        assert!(
+            !sessions.has_inflight_turn(sid),
+            "RAII cleanup must remove the admitted prompt token on setup errors"
+        );
+        assert_eq!(sessions.take_cancel_cause(sid), None);
+    }
+
+    #[tokio::test]
+    async fn session_removals_wait_for_prompt_finalization_before_same_id_reuse() {
+        #[derive(Clone, Copy, Debug)]
+        enum Removal {
+            Close,
+            Kill,
+            Delete,
+        }
+
+        for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+
+            let sid = format!("acp-removal-{removal:?}").to_ascii_lowercase();
+            acp_store
+                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap())
+                .unwrap();
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(GatedProvider {
+                    started: started_tx,
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .agent_alias("test-agent".to_string())
+                .build()
+                .expect("test agent should build");
+            sessions
+                .insert(
+                    sid.clone(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "test-agent",
+                        tmp.path().to_str().unwrap(),
+                        crate::rpc::types::ChatMode::Acp,
+                    ),
+                )
+                .await
+                .unwrap();
+
+            // Hold admission so both operations queue deterministically. The
+            // prompt registers first; the removal must remain behind it until
+            // that ACP incarnation has finalized all durable work.
+            let admission_guard = sessions.session_queue.acquire(&sid).await.unwrap();
+            let prompt_handle = dispatcher.spawn_handle();
+            let sid_for_prompt = sid.clone();
+            let prompt_task = zeroclaw_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": sid_for_prompt,
+                        "prompt": "blocked ACP turn",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("prompt must register behind the test admission guard");
+
+            let removal_handle = dispatcher.spawn_handle();
+            let sid_for_removal = sid.clone();
+            let removal_task = zeroclaw_spawn::spawn!(async move {
+                match removal {
+                    Removal::Close => {
+                        removal_handle
+                            .handle_session_close(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Kill => {
+                        removal_handle
+                            .handle_session_kill(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Delete => {
+                        removal_handle
+                            .handle_session_delete(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must register behind the admitted prompt");
+            assert!(
+                !removal_task.is_finished(),
+                "{removal:?} must not remove an incarnation that still owns admission"
+            );
+            assert_eq!(
+                sessions.chat_mode(&sid).await,
+                Some(crate::rpc::types::ChatMode::Acp)
+            );
+
+            drop(admission_guard);
+            started_rx
+                .recv()
+                .await
+                .expect("the queued ACP prompt must run before removal");
+            assert!(
+                !removal_task.is_finished(),
+                "{removal:?} must wait while the ACP provider is blocked"
+            );
+            release_tx.send(()).unwrap();
+
+            let prompt_result = prompt_task.await.expect("prompt task must not panic");
+            assert!(
+                prompt_result.is_ok(),
+                "ACP prompt should finalize before {removal:?}: {prompt_result:?}"
+            );
+            let removal_result = removal_task.await.expect("removal task must not panic");
+            assert!(
+                removal_result.is_ok(),
+                "{removal:?} should succeed after prompt finalization: {removal_result:?}"
+            );
+            assert!(sessions.chat_mode(&sid).await.is_none());
+
+            let replacement = dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                    "chat_mode": "chat",
+                }))
+                .await;
+            assert!(
+                replacement.is_ok(),
+                "same-ID Chat replacement should succeed after {removal:?}: {replacement:?}"
+            );
+            let key = format!("rpc_{sid}");
+            let replacement_state = chat_backend
+                .get_session_state(&key)
+                .unwrap()
+                .expect("Chat replacement must own a fresh durable row");
+            assert_eq!(replacement_state.state, "idle");
+            assert!(replacement_state.turn_id.is_none());
+            assert!(
+                chat_backend.load(&key).is_empty(),
+                "old ACP turn must not contaminate Chat transcript after {removal:?}"
+            );
+        }
     }
 
     // ── generation-gated stale-refresh in-flight race tests ──

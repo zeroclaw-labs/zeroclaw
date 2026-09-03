@@ -68,6 +68,19 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        // When this decorator patches `vision` itself, that patch - not
+        // whatever the wrapped provider reports - is authoritative for the
+        // capability seen above, so the inner offender (if any) no longer
+        // applies. There is no dotted entry name for the override itself,
+        // so the honest answer is `None` rather than a stale one. Only a
+        // pass-through (`None` override) forwards to the inner lookup.
+        match self.supports_vision {
+            Some(_) => None,
+            None => self.inner.vision_limited_by(model),
+        }
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
         self.inner.has_mixed_native_tool_support_for_model(model)
     }
@@ -302,6 +315,10 @@ mod tests {
                 context_window: None,
             }])
         }
+
+        fn vision_limited_by(&self, _model: &str) -> Option<String> {
+            Some("inner-fallback".to_string())
+        }
     }
 
     #[tokio::test]
@@ -399,6 +416,23 @@ mod tests {
         let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
         let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
         assert!(stable.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn vision_limited_by_hides_inner_offender_when_overridden_but_forwards_on_pass_through() {
+        // An active override (force-on or force-off) is itself authoritative
+        // for the capability it patches, so the inner offender must not leak
+        // through and mislead a caller about what actually limits vision here.
+        let overridden = VisionOverrideProvider::new(Box::new(PricedVisionFake), false);
+        assert_eq!(overridden.vision_limited_by("model"), None);
+
+        // With no override set, the wrapper is a transparent pass-through and
+        // must forward the inner provider's answer unchanged.
+        let pass_through = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
+        assert_eq!(
+            pass_through.vision_limited_by("model"),
+            Some("inner-fallback".to_string())
+        );
     }
 
     struct AccountedVisionLeaf;
