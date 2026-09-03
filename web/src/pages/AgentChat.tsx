@@ -1,9 +1,10 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, Paperclip, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
+import { ApiError, uploadChatFile } from '@/lib/api';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import {
@@ -285,6 +286,66 @@ export function AgentChatInner({
     }
   };
 
+  // ── File upload (picker + drag-and-drop) ───────────────────────────────
+  // Both gestures funnel into one helper: upload each file, then append the
+  // returned marker ([IMAGE:…] for provider-loadable images, [Document: …]
+  // otherwise) to the draft so the user can add context before sending. The
+  // gateway decides the kind from filename and payload bytes. Failures
+  // surface as chat-local messages (same channel as unknown slash commands),
+  // never as sent messages.
+  const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // dragenter/dragleave fire per child element; a depth counter keeps the
+  // overlay stable while the pointer crosses inner boundaries.
+  const dragDepthRef = useRef(0);
+
+  const uploadFiles = useCallback(async (files: Iterable<File>) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    setUploading(true);
+    try {
+      for (const file of list) {
+        try {
+          const res = await uploadChatFile(agentAlias, file);
+          setInput((prev) => `${prev && !prev.endsWith(' ') ? `${prev} ` : prev}${res.marker} `);
+        } catch (err) {
+          const message = err instanceof ApiError
+            ? err.envelope.message
+            : err instanceof Error ? err.message : String(err);
+          addLocalMessage(t('agent.upload_failed').replace('{error}', message));
+        }
+      }
+    } finally {
+      setUploading(false);
+      inputRef.current?.focus();
+    }
+  }, [agentAlias, addLocalMessage]);
+
+  const dragHasFiles = (e: React.DragEvent) => e.dataTransfer.types.includes('Files');
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  };
+  const handleDragOver = (e: React.DragEvent) => {
+    if (dragHasFiles(e)) e.preventDefault();
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    if (!dragHasFiles(e)) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    void uploadFiles(e.dataTransfer.files);
+  };
+
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
     setInput(value);
@@ -406,7 +467,30 @@ export function AgentChatInner({
        Hoisting the opt-out to the outermost container covers all of them
        with a single ancestor. Static UI chrome here localizes through
        t() i18n, so losing browser translation on it is intentional. */
-    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
+    <div
+      translate="no"
+      className="notranslate relative flex flex-col h-full min-h-0"
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {dragActive && (
+        <div
+          className="absolute inset-2 z-50 flex items-center justify-center pointer-events-none rounded-[var(--radius-md)]"
+          style={{
+            border: '2px dashed var(--pc-accent)',
+            background: 'color-mix(in srgb, var(--pc-accent) 10%, transparent)',
+          }}
+        >
+          <span
+            className="px-3 py-1.5 text-sm font-medium rounded-[var(--radius-md)]"
+            style={{ background: 'var(--pc-bg-surface)', color: 'var(--pc-accent)' }}
+          >
+            {t('agent.drop_to_attach')}
+          </span>
+        </div>
+      )}
       {/* Header with model selector */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-pc-border bg-pc-surface">
         <div className="flex items-center gap-2">
@@ -597,6 +681,30 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files) void uploadFiles(e.target.files);
+              // Reset so picking the same file again re-fires onChange.
+              e.target.value = '';
+            }}
+          />
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="flex-shrink-0 w-10 px-0"
+            aria-label={t('agent.attach_file')}
+            title={t('agent.attach_file')}
+          >
+            {uploading
+              ? <Loader2 className="h-4 w-4 animate-spin" />
+              : <Paperclip className="h-4 w-4" />}
+          </Button>
           <textarea
             ref={inputRef}
             rows={1}
