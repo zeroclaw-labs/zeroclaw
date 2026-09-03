@@ -152,10 +152,6 @@ struct NativeThinkingConfig {
     budget_tokens: u32,
 }
 
-fn anthropic_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
-}
-
 /// Characters legal between `data:` and `;base64,` in a data URI header: the
 /// media type plus any parameters. Whitespace, commas and brackets are excluded
 /// so a stray `data:` in prose cannot claim a `;base64,` further down the string.
@@ -1873,7 +1869,10 @@ impl AnthropicModelProvider {
         model: &str,
     ) -> (Option<f64>, Option<NativeThinkingConfig>, u32) {
         match thinking {
-            Some(params) if anthropic_model_supports_native_thinking(model) => {
+            Some(params)
+                if crate::claude_models::claude_thinking_shape(model)
+                    == crate::claude_models::ClaudeThinkingShape::FixedBudget =>
+            {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3725,24 +3724,6 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn anthropic_model_supports_native_thinking_excludes_opus_4_7() {
-        // Opus 4.7 only supports adaptive thinking; fixed-budget returns 400.
-        assert!(!anthropic_model_supports_native_thinking("claude-opus-4-7"));
-        assert!(!anthropic_model_supports_native_thinking(
-            "claude-opus-4-7-20260101"
-        ));
-    }
-
-    #[test]
-    fn anthropic_model_supports_native_thinking_allows_other_models() {
-        assert!(anthropic_model_supports_native_thinking("claude-opus-4-6"));
-        assert!(anthropic_model_supports_native_thinking(
-            "claude-sonnet-4-6"
-        ));
-        assert!(anthropic_model_supports_native_thinking("claude-haiku-4-5"));
-    }
-
-    #[test]
     fn resolve_thinking_drops_native_for_opus_4_7() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
@@ -3771,7 +3752,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: 10_000,
         };
         let (temp, config, _) =
-            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-6");
+            provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
         assert!(
             config.is_some(),
             "native thinking should activate on supported models"

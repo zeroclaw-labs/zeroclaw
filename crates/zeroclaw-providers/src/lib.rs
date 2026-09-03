@@ -6,6 +6,7 @@ pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
 pub mod catalog;
+pub mod claude_models;
 pub mod compatible;
 pub mod copilot;
 pub mod dispatch;

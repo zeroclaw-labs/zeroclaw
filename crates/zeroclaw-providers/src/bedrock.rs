@@ -610,10 +610,6 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-fn bedrock_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
-}
-
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     if model.contains("claude") {
@@ -1674,7 +1670,10 @@ impl ModelProvider for BedrockModelProvider {
         let (effective_temperature, additional_fields, effective_max_tokens) = match request
             .thinking
         {
-            Some(params) if bedrock_model_supports_native_thinking(model) => {
+            Some(params)
+                if crate::claude_models::claude_thinking_shape(model)
+                    == crate::claude_models::ClaudeThinkingShape::FixedBudget =>
+            {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2256,31 +2255,6 @@ mod tests {
         assert!(!json.contains("system"));
         assert!(json.contains("Hello"));
         assert!(json.contains("maxTokens"));
-    }
-
-    #[test]
-    fn bedrock_model_supports_native_thinking_excludes_opus_4_7() {
-        // Per AWS Bedrock model card, Opus 4.7 only supports adaptive thinking;
-        // fixed-budget native thinking returns a 400.
-        assert!(!bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-opus-4-7"
-        ));
-        assert!(!bedrock_model_supports_native_thinking(
-            "anthropic.claude-opus-4-7-v1:0"
-        ));
-    }
-
-    #[test]
-    fn bedrock_model_supports_native_thinking_allows_other_models() {
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-opus-4-6-v1"
-        ));
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-haiku-4-5-v1"
-        ));
     }
 
     #[test]
