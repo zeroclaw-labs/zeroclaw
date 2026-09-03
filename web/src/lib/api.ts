@@ -2260,3 +2260,30 @@ export function getCliTools(): Promise<CliTool[]> {
     },
   );
 }
+
+// ---------------------------------------------------------------------------
+// Chat image upload
+// ---------------------------------------------------------------------------
+
+export interface UploadImageResult {
+  /** Absolute path of the saved file inside the agent workspace. */
+  path: string;
+  /** `[IMAGE:<path>]` marker ready to embed in a chat message. */
+  marker: string;
+}
+
+/**
+ * Upload an image for the given agent's chat. The body is the raw file — the
+ * gateway types it by magic bytes (client MIME and filename are never
+ * trusted), saves it under the agent workspace, and returns the
+ * `[IMAGE:<path>]` marker to embed in the next message.
+ */
+export function uploadChatImage(
+  agent: string,
+  file: Blob,
+): Promise<UploadImageResult> {
+  return apiFetch<UploadImageResult>(
+    `/api/upload?agent=${encodeURIComponent(agent)}`,
+    { method: "POST", body: file },
+  );
+}

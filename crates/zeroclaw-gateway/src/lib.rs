@@ -22,6 +22,7 @@ pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
 mod api_sop_webhook;
+pub mod api_upload;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -1621,6 +1622,12 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route(
+            "/api/upload",
+            post(api_upload::handle_upload).layer(axum::extract::DefaultBodyLimit::max(
+                api_upload::UPLOAD_BODY_CEILING_BYTES,
+            )),
+        )
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(
