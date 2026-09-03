@@ -84,7 +84,7 @@ pub fn mark_component_ok(component: &str) {
 /// works.
 ///
 /// Two things make this more than a no-op, because the registry only creates an
-/// entry when a mutation reaches [`upsert_component`]:
+/// entry when a mutation reaches it:
 ///
 /// - On first call the entry is created, so the component appears in
 ///   [`snapshot`] as `starting` instead of being absent from `/health`
