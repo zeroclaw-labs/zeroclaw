@@ -4782,11 +4782,17 @@ fn spawn_supervised_listener(
 /// A channel with no signal to give (`None`, the default) is recorded exactly as
 /// it was before this existed.
 ///
-/// `Pending` records *nothing*. Stamping `ok` for a listener that has not yet
-/// completed an exchange is the original bug in slower form: the component
-/// would read healthy before the channel had ever reached the service. Leaving
-/// it alone keeps it at whatever it already was — `starting`, with no `last_ok`,
-/// for a listener that has just come up.
+/// `Pending` records *no success*, but it does not leave the entry alone
+/// either. Stamping `ok` for a listener that has not yet completed an exchange
+/// is the original bug in slower form. Doing nothing at all is a quieter
+/// version of the same thing, for two reasons: the registry only creates a
+/// component when a mutation reaches it, so a listener that never completes an
+/// exchange would be *absent* from `/health` rather than visibly `starting`;
+/// and the registry outlives a daemon reload in a process-wide `OnceLock`, so a
+/// replacement listener on the same alias would inherit its predecessor's `ok`
+/// and `last_ok` and keep reporting healthy while it has never connected. So
+/// `Pending` marks the component `starting` and clears `last_ok`, which
+/// publishes the component without claiming a success it has not observed.
 fn mark_listener_health(ch: &dyn Channel, component: &str) {
     match ch.listener_health() {
         None | Some(ListenerHealth::Healthy) => {
@@ -4795,7 +4801,9 @@ fn mark_listener_health(ch: &dyn Channel, component: &str) {
         Some(ListenerHealth::Unhealthy) => {
             zeroclaw_runtime::health::mark_component_error(component, "channel reported unhealthy");
         }
-        Some(ListenerHealth::Pending) => {}
+        Some(ListenerHealth::Pending) => {
+            zeroclaw_runtime::health::mark_component_starting(component);
+        }
     }
 }
 
@@ -30529,9 +30537,12 @@ This is an example JSON object for profile settings."#;
 
         let snapshot = zeroclaw_runtime::health::snapshot_json();
         let component = &snapshot["components"][&component_name];
-        assert_ne!(
-            component["status"], "ok",
-            "a channel that has not completed an exchange must not read ok; got {component}"
+        // Assert on the *present* entry, not on the absence of one. Indexing a
+        // missing key yields JSON null, which would satisfy both assertions
+        // below while `/health` showed the channel nowhere at all.
+        assert_eq!(
+            component["status"], "starting",
+            "a pending listener must be published as starting, not omitted; got {component}"
         );
         assert!(
             component["last_ok"].is_null(),
@@ -30541,6 +30552,101 @@ This is an example JSON object for profile settings."#;
         cancel.cancel();
         let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
         assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_listener_does_not_inherit_the_previous_ok_on_the_same_alias() {
+        // A daemon reload rebuilds the channel subsystem inside the same
+        // process, but the health registry lives in a process-wide `OnceLock`
+        // and survives it. So a replacement listener registers under the alias
+        // its predecessor was using, and whatever that predecessor last wrote
+        // is still sitting there.
+        //
+        // That is the reported bug with an extra step: if `Pending` left the
+        // entry untouched, the new listener would inherit `ok` and a fresh
+        // `last_ok` from the old one, and every subsequent heartbeat would
+        // leave it alone. An operator would read a healthy channel whose
+        // current listener has never once reached the service, and the
+        // staleness rule could not save them — the new channel has no recorded
+        // poll result to expire.
+        let channel_name = format!("test-alias-reuse-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+
+        // First incarnation: healthy, so it stamps `ok` and a `last_ok`.
+        let healthy = Arc::new(ObservedChannel::reporting(
+            channel_name.clone(),
+            Some(ListenerHealth::Healthy),
+        ));
+        let first: Arc<dyn Channel> = healthy;
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_handle = spawn_supervised_listener_with_health_interval(
+            first,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            first_cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let before = zeroclaw_runtime::health::snapshot_json();
+        let before = &before["components"][&component_name];
+        assert_eq!(
+            before["status"], "ok",
+            "the first listener should be recorded healthy; got {before}"
+        );
+        let inherited_last_ok = before["last_ok"].clone();
+        assert!(
+            !inherited_last_ok.is_null(),
+            "the first listener should have stamped a last_ok; got {before}"
+        );
+
+        first_cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), first_handle).await;
+        assert!(join.is_ok(), "the first listener should stop on cancel");
+        drop(rx);
+
+        // Second incarnation: same alias, brand new channel that has not
+        // completed an exchange. Its first request never returns.
+        let pending = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Pending),
+        ));
+        let second: Arc<dyn Channel> = pending;
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_handle = spawn_supervised_listener_with_health_interval(
+            second,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            second_cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let after = zeroclaw_runtime::health::snapshot_json();
+        let after = &after["components"][&component_name];
+        assert_eq!(
+            after["status"], "starting",
+            "the replacement listener must not inherit the old ok; got {after}"
+        );
+        assert!(
+            after["last_ok"].is_null(),
+            "the predecessor's last_ok must be invalidated, not carried forward \
+             (was {inherited_last_ok}); got {after}"
+        );
+
+        second_cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), second_handle).await;
+        assert!(
+            join.is_ok(),
+            "the replacement listener should stop on cancel"
+        );
         drop(rx);
     }
 
@@ -30591,9 +30697,11 @@ This is an example JSON object for profile settings."#;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let pending = zeroclaw_runtime::health::snapshot_json();
         let pending = &pending["components"][&component_name];
-        assert_ne!(
-            pending["status"], "ok",
-            "Pending must survive the wrapper; got {pending}"
+        // As above: require the entry to exist, since a missing key would index
+        // to null and pass a bare `assert_ne!(.., "ok")`.
+        assert_eq!(
+            pending["status"], "starting",
+            "Pending must survive the wrapper and publish the component; got {pending}"
         );
         assert!(
             pending["last_ok"].is_null(),
