@@ -782,6 +782,7 @@ mod tests {
         let r = SopRun {
             run_id: id.to_string(),
             sop_name: "deploy".to_string(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

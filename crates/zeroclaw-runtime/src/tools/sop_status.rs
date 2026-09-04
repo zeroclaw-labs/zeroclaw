@@ -413,6 +413,7 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Completed,
@@ -455,6 +456,7 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
             frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Failed,

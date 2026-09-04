@@ -17,7 +17,7 @@ use lapin::{
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::SopDispatch;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{dispatch_untrusted_fan_in, results_need_redelivery};
+use zeroclaw_runtime::sop::dispatch::{dispatch_untrusted_fan_in_driven, results_need_redelivery};
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::SopTriggerSource;
 
@@ -38,6 +38,7 @@ pub struct AmqpChannel {
     dispatch: SopDispatch,
     engine: Option<Arc<Mutex<SopEngine>>>,
     audit: Option<Arc<SopAuditLogger>>,
+    driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
@@ -58,6 +59,7 @@ pub struct AmqpChannelConfig {
     pub dispatch: SopDispatch,
     pub engine: Option<Arc<Mutex<SopEngine>>>,
     pub audit: Option<Arc<SopAuditLogger>>,
+    pub driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
     pub alias: String,
     pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
@@ -107,6 +109,7 @@ impl AmqpChannel {
             durable_ack: cfg.durable_ack,
             dispatch: cfg.dispatch,
             engine: cfg.engine,
+            driver_sink: cfg.driver_sink,
             audit: cfg.audit,
             alias: cfg.alias,
             peer_resolver: cfg.peer_resolver,
@@ -206,9 +209,10 @@ impl AmqpChannel {
             let dedup = message_id
                 .filter(|id| !id.is_empty())
                 .map(|id| (format!("amqp:{}:{id}", self.alias), redelivered));
-            let results = dispatch_untrusted_fan_in(
+            let results = dispatch_untrusted_fan_in_driven(
                 engine,
                 audit,
+                self.driver_sink.as_ref(),
                 SopTriggerSource::Amqp,
                 Some(routing_key),
                 Some(&String::from_utf8_lossy(data)),
@@ -583,6 +587,7 @@ mod tests {
         audit: Option<Arc<SopAuditLogger>>,
     ) -> anyhow::Result<AmqpChannel> {
         AmqpChannel::new(AmqpChannelConfig {
+            driver_sink: None,
             amqp_url: "amqp://localhost:5672".into(),
             exchange: "amq.topic".into(),
             routing_keys: vec!["org.release-monitoring.prod.anitya.project.version.update".into()],
