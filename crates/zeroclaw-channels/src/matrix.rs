@@ -5678,6 +5678,9 @@ mod tests {
         async fn synthesis_failure_still_delivers_the_text_reply() {
             let room_id = owned_room_id!("!room:server");
             let homeserver = homeserver_with_room(room_id.as_str()).await;
+            // The member list has to answer, or the voice gate fails closed
+            // before synthesis is ever reached and this asserts nothing.
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
             // No /v1/audio/speech route mounted: synthesis fails.
             let tts = MockServer::start().await;
 
@@ -5692,12 +5695,21 @@ mod tests {
                 .expect(1)
                 .mount(&homeserver)
                 .await;
+            // Nothing to upload when there is no audio.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/never"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
 
             let state_dir = TempDir::new().expect("temp state dir");
             let channel = channel_for(
                 &homeserver,
                 config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
-                vec![room_id.to_string()],
+                vec!["@alice:server".to_string()],
                 &state_dir,
             )
             .await;
@@ -5711,6 +5723,79 @@ mod tests {
                 .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
                 .await
                 .expect("a TTS failure must not fail the text reply");
+
+            assert!(
+                !tts.received_requests()
+                    .await
+                    .expect("wiremock records requests")
+                    .is_empty(),
+                "synthesis has to be attempted for its failure to be the thing under test"
+            );
+        }
+
+        /// The voice gate asks the homeserver who is in the room. When that
+        /// question cannot be answered, the room is not voiced: a shared room
+        /// is the wrong place to guess, and the text reply carries the answer
+        /// either way.
+        #[tokio::test]
+        async fn an_unanswerable_member_list_never_voices_the_room() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/members$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&homeserver)
+                .await;
+            // Synthesis would succeed if it were reached, so a voice note here
+            // would mean the gate opened on an unverified room.
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/never"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("an unreachable member list must not fail the text reply");
+
+            assert!(
+                tts.received_requests()
+                    .await
+                    .expect("wiremock records requests")
+                    .is_empty(),
+                "a room whose membership could not be read must not be synthesized for"
+            );
         }
     }
 

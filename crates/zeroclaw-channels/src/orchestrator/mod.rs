@@ -2121,11 +2121,19 @@ fn normalize_peer_username(raw: &str) -> String {
 /// Only replies pass through here. Proactive delivery (cron announces) has no
 /// inbound sender to consult and is decided by the channel from the target
 /// room instead.
+///
+/// Scoped to Matrix. Telegram and WhatsApp Web already decide reply modality
+/// from channel-local session state, so answering here as well would give one
+/// peer group two competing owners. Unifying the two mechanisms is separate
+/// work.
 fn sender_prefers_voice(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
 ) -> bool {
     let channel_type = msg.channel.as_str();
+    if !channel_type.starts_with("matrix") {
+        return false;
+    }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
     let voice_peers: Vec<String> = ctx
         .prompt_config
@@ -26755,13 +26763,13 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Telegram addresses replies by chat id and names peers by username, so
-    /// it has the same recipient-versus-identity mismatch Matrix had. Resolving
-    /// modality in the runtime fixes both at once, which is a behaviour change
-    /// for Telegram: a voice group that was inert now matches, and Telegram's
-    /// `send` treats `force_voice` as voice-*only*, dropping the text reply.
-    /// Matrix instead posts the voice note alongside its text. That divergence
-    /// is Telegram's existing contract, not something this resolution invents.
+    /// Telegram addresses replies by chat id and names peers by username, so it
+    /// has the same recipient-versus-identity mismatch Matrix had, and resolving
+    /// modality here would fix both at once. It is deliberately not done:
+    /// Telegram's `send` treats `force_voice` as voice-*only* and drops the text
+    /// reply, where Matrix posts the voice note alongside its text. Turning a
+    /// Telegram user's replies voice-only is a behaviour change that belongs to
+    /// Telegram, so `sender_prefers_voice` stays scoped to Matrix.
     fn telegram_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
         zeroclaw_api::channel::ChannelMessage {
             sender: sender.into(),
@@ -26774,7 +26782,11 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn telegram_voice_group_is_resolved_by_username_not_chat_id() {
+    fn sender_prefers_voice_is_matrix_only() {
+        // A voice group whose member matches by every rule this function applies,
+        // on a channel it does not serve. Telegram decides modality for itself
+        // from session state; answering here too would give the group a second
+        // owner and silently turn the user's replies voice-only.
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
@@ -26784,14 +26796,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
         assert!(
-            sender_prefers_voice(&ctx, &telegram_msg("@alice")),
-            "the sender's username decides, and it is what the group names"
+            !sender_prefers_voice(&ctx, &telegram_msg("@alice")),
+            "a matching Telegram voice group must not be answered here"
         );
-        assert!(
-            !sender_prefers_voice(&ctx, &telegram_msg("123456789")),
-            "the chat id the reply is addressed to is not a peer identity"
-        );
-        assert!(!sender_prefers_voice(&ctx, &telegram_msg("@mallory")));
     }
 
     #[test]
@@ -26873,6 +26880,39 @@ BTC is currently around $65,000 based on latest tool output."#
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
         assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+    }
+
+    #[test]
+    fn telegram_voice_group_accidentally_silences_text() {
+        // This test documents the current (broken) behavior and will need updating when
+        // Telegram's sender-side voice-group resolution is implemented as a follow-up.
+        // Today: `sender_prefers_voice` is gated to Matrix only, so Telegram voice groups
+        // are ignored at the routing layer (the function returns false). This is correct
+        // by accident — the real bug is Telegram's own `is_voice_chat` path, which compares
+        // chat IDs against user-peer lists. When fixed, both Telegram and Matrix will use
+        // the same sender-side resolution, and this test should then assert `true`.
+        // For now it confirms the gate works: Telegram voice groups do not leak into
+        // `sender_prefers_voice` output.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "telegram_voice".into(),
+            voice_peer_group("telegram.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            sender: "@alice:server".into(),
+            reply_target: "123456789".into(),
+            channel: "telegram.default".into(),
+            channel_alias: Some("default".into()),
+            content: "hello".into(),
+            ..Default::default()
+        };
+        assert!(
+            !sender_prefers_voice(&ctx, &msg),
+            "Telegram is gated out; the voice-group config is ignored (safe, but not the intended design)"
+        );
     }
 
     #[test]
