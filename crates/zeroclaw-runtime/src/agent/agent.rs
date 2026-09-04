@@ -9333,6 +9333,7 @@ mod tests {
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: Some(1_024),
                     effort: None,
+                    display: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -9343,6 +9344,7 @@ mod tests {
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: Some(2_048),
                     effort: None,
+                    display: None,
                 }),
                 agent_b.turn("same request"),
             )

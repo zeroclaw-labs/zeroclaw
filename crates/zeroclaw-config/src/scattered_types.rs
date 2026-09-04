@@ -74,7 +74,7 @@ impl ThinkingLevel {
 }
 
 pub use zeroclaw_api::model_provider::{
-    MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams, ThinkingEffort,
+    MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams, ThinkingDisplay, ThinkingEffort,
 };
 
 /// Configuration for thinking/reasoning level control.

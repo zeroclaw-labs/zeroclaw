@@ -2307,6 +2307,7 @@ mod tests {
         let params = NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: Some(ThinkingEffort::High),
+            display: None,
         };
         let (temperature, fields, max_tokens) = provider.resolve_thinking(
             Some(params),
@@ -2334,6 +2335,7 @@ mod tests {
         let params = NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
+            display: None,
         };
         let (temperature, fields, max_tokens) = provider.resolve_thinking(
             Some(params),
@@ -2348,6 +2350,27 @@ mod tests {
             }))
         );
         assert_eq!(max_tokens, 10_001);
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_ignores_the_display() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "anthropic.claude-fable-5-1");
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            })),
+            "this adapter has no display field to carry the choice"
+        );
     }
 
     #[test]

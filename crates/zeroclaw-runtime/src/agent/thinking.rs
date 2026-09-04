@@ -136,10 +136,13 @@ pub fn apply_thinking_level_with_config(
     // does not: a level the operator chose should reach the families that read
     // it, and the default level asks for nothing.
     let effort = level.native_effort();
+    // A level says how deep to think, not how much of it to show; the display
+    // is a separate choice the caller makes per request.
     params.native_thinking = (budget_tokens.is_some() || effort.is_some()).then_some(
         zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens,
             effort,
+            display: None,
         },
     );
     params
@@ -629,10 +632,11 @@ mod tests {
 
     #[tokio::test]
     async fn native_thinking_override_round_trips_through_scope() {
-        use zeroclaw_config::scattered_types::NativeThinkingParams;
+        use zeroclaw_config::scattered_types::{NativeThinkingParams, ThinkingDisplay};
         let installed = Some(NativeThinkingParams {
             budget_tokens: Some(32_000),
             effort: None,
+            display: Some(ThinkingDisplay::Summarized),
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {

@@ -6063,6 +6063,7 @@ mod tests {
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
+            display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -6112,6 +6113,7 @@ mod tests {
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
+            display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -6168,6 +6170,7 @@ mod tests {
         let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
+            display: None,
         });
 
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
