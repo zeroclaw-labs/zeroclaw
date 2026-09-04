@@ -5576,8 +5576,12 @@ mod tests {
             wav
         }
 
-        fn handler_ctx(
-            stt_url: &str,
+        /// The handler context every route test drives, with the
+        /// transcription resolver left to the caller so a test can supply the
+        /// one a *configured* channel installed instead of the legacy
+        /// single-endpoint resolver.
+        fn handler_ctx_with_resolver(
+            transcription: Option<super::super::TranscriptionResolver>,
             workspace: &std::path::Path,
             tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
         ) -> HandlerCtx {
@@ -5585,7 +5589,27 @@ mod tests {
                 config: Arc::new(MatrixConfig::default()),
                 alias: "test".to_string(),
                 peer_resolver: Arc::new(|| vec!["*".to_string()]),
-                transcription: Some(super::super::legacy_transcription_resolver(
+                transcription,
+                workspace_dir: Some(Arc::new(workspace.to_path_buf())),
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        /// Legacy-resolver context: the single `[transcription]` endpoint at
+        /// `stt_url`, which is what most route tests want.
+        fn handler_ctx(
+            stt_url: &str,
+            workspace: &std::path::Path,
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            handler_ctx_with_resolver(
+                Some(super::super::legacy_transcription_resolver(
                     TranscriptionConfig {
                         enabled: true,
                         local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
@@ -5597,15 +5621,9 @@ mod tests {
                         ..TranscriptionConfig::default()
                     },
                 )),
-                workspace_dir: Some(Arc::new(workspace.to_path_buf())),
+                workspace,
                 tx,
-                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
-                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
-                bot_user_id: user_id!("@bot:localhost").to_owned(),
-                bot_display_name: Arc::new(TokioRwLock::new(None)),
-                initial_sync_done: Arc::new(AtomicBool::new(true)),
-                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
-            }
+            )
         }
 
         fn voice_event_json(event_id: &str) -> serde_json::Value {
@@ -5730,6 +5748,141 @@ mod tests {
             assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
 
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        /// A voice note arriving on a *really configured* Matrix channel must
+        /// reach the STT server the owning agent's `transcription_provider`
+        /// names — not merely "some" registered provider.
+        ///
+        /// The channel is built by the production factory
+        /// [`crate::orchestrator::build_configured_matrix_channel`], and only
+        /// the resolver it installed is handed to the route, so nothing here
+        /// short-circuits provider selection.
+        ///
+        /// Two providers are registered on purpose:
+        /// [`super::super::build_transcription_manager`] binds a *sole*
+        /// registered provider when the agent states no preference, so a
+        /// one-provider fixture passes even with routing completely broken.
+        /// The decoy is what makes the assertion mean something.
+        #[tokio::test]
+        async fn configured_route_transcribes_via_the_agents_provider() {
+            use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let wanted = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": TRANSCRIPT })),
+                )
+                .expect(1)
+                .mount(&wanted)
+                .await;
+
+            let decoy = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": "decoy transcript" })),
+                )
+                .expect(0)
+                .mount(&decoy)
+                .await;
+
+            // Provider aliases share no name with the channel alias or the
+            // agent alias, so nothing can route correctly by coincidence.
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.transcription.enabled = true;
+            config.channels.matrix.insert(
+                "home".to_string(),
+                MatrixConfig {
+                    enabled: true,
+                    homeserver: "https://matrix.invalid".to_string(),
+                    access_token: Some("test-token".to_string()),
+                    ..MatrixConfig::default()
+                },
+            );
+            config.agents.insert(
+                "listener".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec!["matrix.home".into()],
+                    transcription_provider: "local_whisper.wanted".into(),
+                    ..Default::default()
+                },
+            );
+            config.providers.transcription.local_whisper.insert(
+                "wanted".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: format!("{}/v1/transcribe", wanted.uri()),
+                    ..Default::default()
+                },
+            );
+            config.providers.transcription.local_whisper.insert(
+                "decoy".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: format!("{}/v1/transcribe", decoy.uri()),
+                    ..Default::default()
+                },
+            );
+
+            let config_arc = Arc::new(parking_lot::RwLock::new(config));
+            let channel = {
+                let config = config_arc.read();
+                crate::orchestrator::build_configured_matrix_channel(
+                    &config_arc,
+                    &config,
+                    "home",
+                    config
+                        .channels
+                        .matrix
+                        .get("home")
+                        .expect("configured Matrix alias"),
+                )
+                .expect("configured Matrix channel builds")
+            };
+
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx =
+                handler_ctx_with_resolver(channel.transcription.clone(), workspace.path(), tx);
+            assert!(
+                ctx.transcription.is_some(),
+                "the configured channel must install a transcription resolver"
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$configured1:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript from the routed provider must land in the inbound content: {}",
+                msg.content
+            );
+
+            assert_stt_received_the_wav(&wanted.received_requests().await.unwrap(), &wav);
+            assert!(
+                decoy.received_requests().await.unwrap().is_empty(),
+                "the provider the agent did not name must never be called"
+            );
+            wanted.verify().await;
+            decoy.verify().await;
         }
 
         #[tokio::test]
