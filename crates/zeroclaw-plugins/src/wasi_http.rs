@@ -159,6 +159,40 @@ fn build_trust_anchors() -> TrustAnchors {
 /// host says what it trusted and where those roots came from. The event names
 /// counts and sources; it never carries certificate material, subjects, or
 /// issuer names, so it cannot become a channel for the store's contents.
+/// What the platform store actually contributed, as the operator-facing record
+/// has to state it.
+///
+/// The middle case is the reason this is not a boolean. A machine can hand back
+/// valid roots and a read error in the same pass — a readable `SSL_CERT_FILE`
+/// beside an unreadable `SSL_CERT_DIR`, or one malformed file in a directory of
+/// hundreds — and calling that "the platform store added nothing" sends an
+/// operator hunting for a store whose roots are already in the verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustVerdict {
+    /// Nothing from this machine reached the verifier: the store was empty, or
+    /// nothing on it could be read.
+    BundledOnly,
+    /// Roots from this machine reached the verifier, and something on the store
+    /// could not be read.
+    Partial,
+    /// The store was read whole.
+    Complete,
+}
+
+/// Classify an assembly for the record.
+///
+/// Split from the logging call so the classification can be asserted directly:
+/// the branch it decides is otherwise reachable only through a global log
+/// subscriber, and the state it exists for — roots added *and* errors seen — is
+/// exactly the one a live machine produces least predictably.
+fn trust_verdict(anchors: &TrustAnchors) -> TrustVerdict {
+    match (anchors.native_added, anchors.read_errors) {
+        (0, _) => TrustVerdict::BundledOnly,
+        (_, 0) => TrustVerdict::Complete,
+        _ => TrustVerdict::Partial,
+    }
+}
+
 fn record_trust_anchors(anchors: &TrustAnchors) {
     let attrs = ::serde_json::json!({
         "bundled_roots": webpki_roots::TLS_SERVER_ROOTS.len(),
@@ -167,26 +201,42 @@ fn record_trust_anchors(anchors: &TrustAnchors) {
         "native_store_read_errors": anchors.read_errors,
         "error_key": "plugin_egress_trust_anchors",
     });
-    if anchors.read_errors > 0 || anchors.native_added == 0 {
-        // Worth a warning on its own: plugin HTTPS still works against the
-        // public web, but any endpoint whose certificate chains only to a
-        // locally installed CA will fail, and this line is the only place that
-        // says why before the failure looks like a broken plugin.
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(attrs),
-            "Plugin HTTPS trusts the bundled roots only; the platform trust store added nothing"
-        );
-    } else {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(attrs),
-            "Plugin HTTPS trusts the bundled roots plus the platform trust store"
-        );
+    match trust_verdict(anchors) {
+        TrustVerdict::BundledOnly => {
+            // Worth a warning on its own: plugin HTTPS still works against the
+            // public web, but any endpoint whose certificate chains only to a
+            // locally installed CA will fail, and this line is the only place that
+            // says why before the failure looks like a broken plugin.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "Plugin HTTPS trusts the bundled roots only; the platform trust store added nothing"
+            );
+        }
+        TrustVerdict::Partial => {
+            // Still a warning, and a different one: the roots that were read
+            // are in force, so an operator chasing a failing endpoint needs to
+            // know their store was consulted and came back short, not that it
+            // was ignored.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(attrs),
+                "Plugin HTTPS trusts the bundled roots plus part of the platform trust store; some of that store could not be read"
+            );
+        }
+        TrustVerdict::Complete => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(attrs),
+                "Plugin HTTPS trusts the bundled roots plus the platform trust store"
+            );
+        }
     }
 }
 
@@ -206,6 +256,31 @@ fn trust_environment() -> TrustEnvironment {
     )
 }
 
+/// One trust environment's client configuration, and the assembly that fills it.
+///
+/// The assembly runs as its own blocking task and this slot keeps its handle,
+/// so the read outlives every request waiting on it. That is the whole point of
+/// the type: `connect_timeout` is the guest's number, and a guest that sets a
+/// short one must not be able to cancel the store read that the *next* request
+/// needs. What a timeout cancels here is the waiter, never the work.
+struct TrustSlot {
+    ready: tokio::sync::watch::Receiver<Option<Arc<rustls::ClientConfig>>>,
+    /// Held for its `Drop` alone. [`wasmtime_wasi::runtime::spawn_blocking`]
+    /// hands back a handle that aborts its task when dropped, so letting this
+    /// fall at the end of the miss branch would abort the very assembly the
+    /// waiters are about to await.
+    _assembly: wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
+}
+
+/// Test-only delay injected ahead of the store read.
+///
+/// Production compiles this away entirely. Under test it makes the read
+/// arbitrarily slow without touching the machine's real trust store, which is
+/// what lets a case prove the deadline is answered by the waiter rather than by
+/// the read finishing.
+#[cfg(test)]
+static ASSEMBLY_DELAY: std::sync::Mutex<Option<std::time::Duration>> = std::sync::Mutex::new(None);
+
 /// The TLS client configuration for plugin egress, assembled once per trust
 /// environment.
 ///
@@ -218,30 +293,112 @@ fn trust_environment() -> TrustEnvironment {
 /// an input: in a normal process it never changes and this map holds exactly
 /// one entry, while a process that does change it gets the roots it asked for
 /// instead of whichever set happened to be assembled first.
-fn plugin_tls_config() -> Arc<rustls::ClientConfig> {
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<TrustEnvironment, Arc<rustls::ClientConfig>>>> =
+///
+/// # Where the blocking work runs, and why the caller only waits
+///
+/// The read is a blocking walk of the filesystem or the platform store, and
+/// this function is called from a task on the runtime. Running it inline would
+/// hold a runtime worker, and — because the caller reaches here with a
+/// connection lease in hand — would hold a scarce connection slot past the
+/// deadline that was supposed to bound it, with no await point at which
+/// cancelling the guest's request could interrupt it.
+///
+/// So the read goes to the blocking pool, the lock is dropped before any await,
+/// and the caller waits on a watch channel under its own deadline. A caller
+/// that times out leaves; the assembly finishes and populates the slot
+/// regardless, because the slot holds both the receiver and the task handle.
+/// The next request finds the work done instead of starting it over.
+///
+/// # Refresh boundary
+///
+/// The cache is keyed on the trust *environment*, not on the store's contents.
+/// Rewriting the certificate file at the same path, or changing the operating
+/// system's own store, does not change that key, so a process keeps the roots
+/// it assembled until it restarts. The same holds for an unlucky first read: a
+/// machine whose store was briefly unreadable serves bundled-only trust for the
+/// life of the process. An operator changing machine trust under a running
+/// daemon has to restart it before plugin HTTPS sees the change, and the
+/// warning from [`record_trust_anchors`] is what says the assembly they are
+/// living with came back short.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ConnectionTimeout`] when the deadline expires before
+/// the assembly lands, and [`ErrorCode::TlsProtocolError`] when the assembly
+/// task itself died without producing a configuration.
+async fn plugin_tls_config(deadline: Instant) -> Result<Arc<rustls::ClientConfig>, ErrorCode> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<TrustEnvironment, TrustSlot>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let key = trust_environment();
-    // A poisoned lock here means another thread panicked mid-assembly. The
-    // cached configurations are plain values with no invariant to violate, so
-    // the map is still sound to use and a plugin request must not inherit an
-    // unrelated panic.
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(config) = guard.get(&key) {
-        return Arc::clone(config);
+
+    // The lock covers a map lookup and, at most, spawning the assembly. It is
+    // released at the end of this block, before the await below: holding a
+    // `std::sync::Mutex` across an await point is what would let one guest's
+    // slow store read stall every other request that wants the same slot.
+    let mut ready = {
+        let mut guard = cache
+            .lock()
+            // A poisoned lock here means another thread panicked mid-assembly.
+            // The cached configurations are plain values with no invariant to
+            // violate, so the map is still sound to use and a plugin request
+            // must not inherit an unrelated panic.
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = guard.get(&key) {
+            if let Some(config) = slot.ready.borrow().clone() {
+                return Ok(config);
+            }
+            slot.ready.clone()
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            let assembly = wasmtime_wasi::runtime::spawn_blocking(move || {
+                #[cfg(test)]
+                {
+                    let delay = *ASSEMBLY_DELAY
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(delay) = delay {
+                        std::thread::sleep(delay);
+                    }
+                }
+                let anchors = build_trust_anchors();
+                record_trust_anchors(&anchors);
+                let config = Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(anchors.store)
+                        .with_no_client_auth(),
+                );
+                // The slot keeps a receiver alive for the life of the process,
+                // so this send lands whether or not anyone is still waiting.
+                let _ = sender.send(Some(config));
+            });
+            guard.insert(
+                key.clone(),
+                TrustSlot {
+                    ready: receiver.clone(),
+                    _assembly: assembly,
+                },
+            );
+            receiver
+        }
+    };
+
+    match timeout_at(deadline, ready.wait_for(Option::is_some)).await {
+        Ok(Ok(value)) => Ok(value
+            .clone()
+            .expect("wait_for returns only once the slot holds a configuration")),
+        // The sender is gone and nothing was published: the assembly task died.
+        // Drop the slot so the next request assembles again rather than
+        // inheriting a permanently empty one.
+        Ok(Err(_)) => {
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+            Err(ErrorCode::TlsProtocolError)
+        }
+        Err(_) => Err(ErrorCode::ConnectionTimeout),
     }
-    let anchors = build_trust_anchors();
-    record_trust_anchors(&anchors);
-    let config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(anchors.store)
-            .with_no_client_auth(),
-    );
-    guard.insert(key, Arc::clone(&config));
-    config
 }
 
 /// Split a request authority into the one endpoint that must be authorized,
@@ -485,16 +642,31 @@ async fn send(
     // Canonical host from the pin, used for SNI and certificate verification —
     // never for a second resolution.
     let server_name = authorized.destination().host().to_string();
+
+    // Trust is assembled before the socket, not after it. On a cold process the
+    // assembly is a read of this machine's store, and the lease is already held
+    // by this point: paying for that read with a socket open and a scarce
+    // connection slot booked is what would put both past the deadline meant to
+    // bound them. Expiring here returns before anything is dialed, and dropping
+    // `authorized` on the way out releases the slot at once. The read itself
+    // runs on the blocking pool and outlives this wait, so a guest that gives up
+    // does not cancel the work the next request needs.
+    //
+    // See `plugin_tls_config` for why both root sets, and for what stays
+    // unchanged about verification itself.
+    let tls_config = if config.use_tls {
+        Some(plugin_tls_config(deadline).await?)
+    } else {
+        None
+    };
+
     let tcp_stream = dial_pinned(authorized.destination().addresses(), deadline).await?;
 
-    let (mut sender, worker) = if config.use_tls {
+    let (mut sender, worker) = if let Some(tls_config) = tls_config {
         use rustls::pki_types::ServerName;
         use wasmtime_wasi_http::io::TokioIo;
 
-        // Trust is the bundled webpki root program plus whatever this machine
-        // trusts; see `build_trust_anchors` for why both sets, and for what
-        // stays unchanged about verification itself.
-        let connector = tokio_rustls::TlsConnector::from(plugin_tls_config());
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
         let domain = ServerName::try_from(server_name).map_err(|_| ErrorCode::TlsProtocolError)?;
         // The stage that most needs the deadline: the TCP connect has already
         // succeeded, so a peer that never sends a `ServerHello` is indistinguishable
@@ -896,8 +1068,16 @@ mod tests {
     /// able to hang the guest's request, and must not keep the instance's
     /// connection slot while it does. The TLS stage carried no timeout of its
     /// own, so this request had no bound at all before the shared deadline.
-    #[tokio::test]
-    async fn a_stalled_tls_peer_times_out_within_one_connect_budget() {
+    ///
+    /// Driven on a local runtime rather than `#[tokio::test]` so it can hold the
+    /// process-wide environment lock: since plugin HTTPS started reading the
+    /// machine store, this request reaches the loader and therefore reads
+    /// `SSL_CERT_FILE` and `SSL_CERT_DIR`, which the trust tests replace while
+    /// they run. Green CI does not establish that a lock covers a reader that
+    /// never takes it.
+    #[test]
+    fn a_stalled_tls_peer_times_out_within_one_connect_budget() {
+        let _lock = env_lock();
         let port = stalled_peer();
         let service = loopback_service();
         let mut hooks = hooks(Some(service.clone()));
@@ -910,14 +1090,20 @@ mod tests {
             between_bytes_timeout: Duration::from_secs(1),
         };
 
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
         let started = std::time::Instant::now();
-        let response = hooks
-            .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
-            .expect("a stalled peer is a guest-visible error, never a trap");
-        let HostFutureIncomingResponse::Pending(handle) = response else {
-            panic!("an authorized destination is dialed asynchronously");
-        };
-        let outcome = handle.await.expect("the send task must not trap");
+        let outcome = runtime.block_on(async {
+            let response = hooks
+                .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
+                .expect("a stalled peer is a guest-visible error, never a trap");
+            let HostFutureIncomingResponse::Pending(handle) = response else {
+                panic!("an authorized destination is dialed asynchronously");
+            };
+            handle.await.expect("the send task must not trap")
+        });
         let elapsed = started.elapsed();
 
         assert!(
@@ -1557,6 +1743,203 @@ ok",
             handshakes.load(Ordering::SeqCst),
             1,
             "the peer must have completed one handshake and answered it"
+        );
+    }
+
+    /// Installs a delay ahead of the trust-store read and removes it on drop.
+    ///
+    /// The injected loader the review asked for: it makes the read slow without
+    /// touching the machine's real store, so a case can time a waiter against a
+    /// read that has not finished.
+    struct AssemblyDelay;
+
+    impl AssemblyDelay {
+        fn set(delay: Duration) -> Self {
+            *ASSEMBLY_DELAY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(delay);
+            Self
+        }
+    }
+
+    impl Drop for AssemblyDelay {
+        fn drop(&mut self) {
+            *ASSEMBLY_DELAY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    /// A loopback peer that counts the connections it accepts and then holds
+    /// them open.
+    ///
+    /// The counter is the evidence: a request that never dials leaves it at
+    /// zero, which is what distinguishes "gave up before opening a socket" from
+    /// "opened one and gave up afterwards".
+    fn counting_peer() -> (u16, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let port = listener.local_addr().expect("loopback port").port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Held open and silent, so an accepted connection stays
+                // countable for the length of the test.
+                std::thread::sleep(Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A cold trust-store read must not be paid for with a socket and a leased
+    /// connection slot.
+    ///
+    /// The assembly used to run inline, after the dial, with the lease already
+    /// held and no await point between: a slow machine store held a runtime
+    /// worker, kept the socket, and kept the instance's slot past the deadline
+    /// that was supposed to bound them. This is that regression. The peer counts
+    /// what it accepts, so moving the assembly back after `dial_pinned` fails
+    /// this case on the connection count rather than only on timing.
+    #[test]
+    fn a_slow_trust_store_read_expires_before_a_socket_is_opened() {
+        let _lock = env_lock();
+        let fixture = tls_fixture("127.0.0.1");
+        // A store nobody has assembled yet: the temporary path is unique per
+        // run, so this request takes the cache's miss branch.
+        let (_file, _path, _dir) = machine_store(&fixture.ca_pem);
+        let _delay = AssemblyDelay::set(Duration::from_millis(1_500));
+        let (port, accepted) = counting_peer();
+
+        let service = loopback_service();
+        let mut hooks = hooks(Some(service.clone()));
+        let instance = hooks.scope.id().clone();
+        let budget = Duration::from_millis(150);
+        let config = OutgoingRequestConfig {
+            use_tls: true,
+            connect_timeout: budget,
+            first_byte_timeout: Duration::from_secs(1),
+            between_bytes_timeout: Duration::from_secs(1),
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        let (outcome, elapsed) = runtime.block_on(async move {
+            let started = std::time::Instant::now();
+            let response = hooks
+                .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
+                .expect("an authorized destination is dialed asynchronously");
+            let HostFutureIncomingResponse::Pending(handle) = response else {
+                panic!("an authorized destination is dialed asynchronously");
+            };
+            let outcome = handle.await.expect("the send task must not trap");
+            (outcome, started.elapsed())
+        });
+
+        assert!(
+            matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
+            "a trust store slower than the budget must fail closed as a connect timeout, got: {outcome:?}"
+        );
+        assert!(
+            elapsed < 4 * budget,
+            "the guest must be released on its own deadline, not on the store read; took {elapsed:?} against a {budget:?} budget"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "the deadline expired before the trust store landed, so nothing may have been dialed"
+        );
+        assert_eq!(
+            service.live_connections(&instance),
+            0,
+            "a request that gives up while assembling trust must return its slot"
+        );
+    }
+
+    /// A waiter that gives up must not take the read with it.
+    ///
+    /// `connect_timeout` is the guest's own number. If the assembly were driven
+    /// by whoever happens to be waiting, a guest with a short timeout would
+    /// cancel it every time and every request on the process would re-read the
+    /// machine store, which is a worse outcome than the blocking call this
+    /// change replaced. The assembly therefore runs as its own task and the slot
+    /// keeps its handle; this proves the value lands anyway.
+    #[test]
+    fn a_timed_out_waiter_leaves_the_assembly_running() {
+        let _lock = env_lock();
+        let fixture = tls_fixture("127.0.0.1");
+        let (_file, _path, _dir) = machine_store(&fixture.ca_pem);
+        let delay = Duration::from_millis(600);
+        let _delay = AssemblyDelay::set(delay);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime");
+        runtime.block_on(async move {
+            let gave_up = plugin_tls_config(Instant::now() + Duration::from_millis(50)).await;
+            assert!(
+                matches!(gave_up, Err(ErrorCode::ConnectionTimeout)),
+                "the first waiter must be released on its deadline, got: {gave_up:?}"
+            );
+
+            // Well past the injected delay: the abandoned read has had time to
+            // finish and publish into the slot.
+            tokio::time::sleep(delay * 3).await;
+
+            let started = std::time::Instant::now();
+            let config = plugin_tls_config(Instant::now() + Duration::from_millis(50)).await;
+            assert!(
+                config.is_ok(),
+                "the abandoned assembly must have populated the slot, got: {config:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "the second request must be served from the slot, not by reading the store again; took {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
+    /// A store that was read in part is not a store that added nothing.
+    ///
+    /// A readable `SSL_CERT_FILE` beside an unreadable `SSL_CERT_DIR` produces
+    /// roots and errors in the same pass, and the operator-facing line used to
+    /// call that "the platform trust store added nothing", sending whoever read
+    /// it to look for roots that are already in the verifier. Asserted on the
+    /// classifier directly because the branch is otherwise reachable only
+    /// through a global log subscriber.
+    #[test]
+    fn a_partly_read_platform_store_is_not_reported_as_bundled_only() {
+        let anchors = |native_added, read_errors| TrustAnchors {
+            store: rustls::RootCertStore::empty(),
+            native_added,
+            native_rejected: 0,
+            read_errors,
+        };
+
+        assert_eq!(
+            trust_verdict(&anchors(7, 1)),
+            TrustVerdict::Partial,
+            "roots added alongside a read error is a partial read, not an empty one"
+        );
+        assert_eq!(
+            trust_verdict(&anchors(0, 1)),
+            TrustVerdict::BundledOnly,
+            "nothing readable means the bundled program is all that is trusted"
+        );
+        assert_eq!(
+            trust_verdict(&anchors(0, 0)),
+            TrustVerdict::BundledOnly,
+            "an empty store contributes nothing, however cleanly it was read"
+        );
+        assert_eq!(
+            trust_verdict(&anchors(3, 0)),
+            TrustVerdict::Complete,
+            "roots with no read errors is a whole store"
         );
     }
 }
