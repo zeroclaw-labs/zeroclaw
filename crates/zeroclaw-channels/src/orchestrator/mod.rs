@@ -77,7 +77,9 @@ pub use crate::wecom_ws::WeComWsChannel;
 use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub use zeroclaw_api::channel::{
+    Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, SendMessage,
+};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
@@ -123,6 +125,7 @@ use zeroclaw_runtime::agent::loop_::{
     build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
+use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer};
@@ -242,7 +245,7 @@ const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group messa
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
     BOOTSTRAP_MAX_CHARS, build_system_prompt, build_system_prompt_with_mode,
-    build_system_prompt_with_mode_and_autonomy,
+    build_system_prompt_with_mode_and_autonomy, build_system_prompt_with_mode_and_effective_tools,
 };
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
@@ -2185,14 +2188,23 @@ fn rendered_skills_prompt_mode(
 fn refreshed_skills_system_prompt(
     ctx: &ChannelRuntimeContext,
     base_prompt: &str,
-    read_skill_available: bool,
+    callable_protocol_exposed: bool,
+    excluded_tools: &[String],
 ) -> String {
+    let is_tool_available = |name: &str| {
+        channel_tool_available_for_turn(
+            callable_protocol_exposed,
+            ctx.tools_registry.as_ref(),
+            excluded_tools,
+            name,
+        )
+    };
     let skills_prompt_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
         ctx.prompt_config
             .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
-        read_skill_available,
+        is_tool_available("read_skill"),
     );
-    let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
+    let refreshed_skills = build_skills_prompt_with_effective_tools(
         &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
             ctx.prompt_config.as_ref(),
@@ -2200,6 +2212,7 @@ fn refreshed_skills_system_prompt(
         ),
         ctx.workspace_dir.as_ref(),
         skills_prompt_mode,
+        is_tool_available,
     );
     replace_available_skills_section(base_prompt, &refreshed_skills)
 }
@@ -2208,8 +2221,15 @@ fn system_prompt_for_channel_turn(
     ctx: &ChannelRuntimeContext,
     base_prompt: &str,
     refresh_skills: bool,
-    read_skill_available: bool,
+    callable_protocol_exposed: bool,
+    excluded_tools: &[String],
 ) -> String {
+    let read_skill_available = channel_tool_available_for_turn(
+        callable_protocol_exposed,
+        ctx.tools_registry.as_ref(),
+        excluded_tools,
+        "read_skill",
+    );
     let desired_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
         ctx.prompt_config
             .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
@@ -2219,32 +2239,33 @@ fn system_prompt_for_channel_turn(
         .is_some_and(|cached_mode| cached_mode != desired_mode);
 
     if refresh_skills || cached_mode_changed {
-        refreshed_skills_system_prompt(ctx, base_prompt, read_skill_available)
+        refreshed_skills_system_prompt(ctx, base_prompt, callable_protocol_exposed, excluded_tools)
     } else {
         base_prompt.to_string()
     }
 }
 
-fn read_skill_available_for_channel_turn(
-    model_provider: &dyn ModelProvider,
+fn callable_protocol_exposed_for_channel_turn(
+    native_tool_specs_present: bool,
     strict_tool_parsing: bool,
-    tools_registry: &[Box<dyn Tool>],
-    excluded_tools: &[String],
     system_prompt: &str,
 ) -> bool {
-    let callable_protocol = model_provider.supports_native_tools()
-        || (!strict_tool_parsing && text_tool_prompt_advertises(system_prompt, "read_skill"));
-
-    callable_protocol
-        && tools_registry
-            .iter()
-            .any(|tool| tool.name() == "read_skill")
-        && !excluded_tools
-            .iter()
-            .any(|excluded| excluded == "read_skill")
+    native_tool_specs_present
+        || (!strict_tool_parsing && text_tool_protocol_advertised(system_prompt))
 }
 
-fn text_tool_prompt_advertises(system_prompt: &str, tool_name: &str) -> bool {
+fn channel_tool_available_for_turn(
+    callable_protocol_exposed: bool,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    tool_name: &str,
+) -> bool {
+    callable_protocol_exposed
+        && tools_registry.iter().any(|tool| tool.name() == tool_name)
+        && !excluded_tools.iter().any(|excluded| excluded == tool_name)
+}
+
+fn text_tool_protocol_advertised(system_prompt: &str) -> bool {
     const PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
     const TOOLS_HEADER: &str = "### Available Tools\n\n";
 
@@ -2255,19 +2276,17 @@ fn text_tool_prompt_advertises(system_prompt: &str, tool_name: &str) -> bool {
     let Some(tools_start) = protocol.find(TOOLS_HEADER) else {
         return false;
     };
-    let tools = &protocol[tools_start + TOOLS_HEADER.len()..];
-    let tools = tools
-        .split_once("\n## ")
-        .map_or(tools, |(tools, _next_section)| tools);
-    let expected_prefix = format!("**{tool_name}**:");
-
-    tools.lines().any(|line| line.starts_with(&expected_prefix))
+    protocol[tools_start + TOOLS_HEADER.len()..]
+        .lines()
+        .any(|line| line.starts_with("**") && line.contains("**:"))
 }
 
 fn refresh_channel_history_skills(
     ctx: &ChannelRuntimeContext,
     history: &mut [ChatMessage],
-    read_skill_available: bool,
+    force_refresh: bool,
+    callable_protocol_exposed: bool,
+    excluded_tools: &[String],
 ) {
     let Some(system_message) = history
         .first_mut()
@@ -2278,8 +2297,9 @@ fn refresh_channel_history_skills(
     system_message.content = system_prompt_for_channel_turn(
         ctx,
         system_message.content.as_str(),
-        false,
-        read_skill_available,
+        force_refresh,
+        callable_protocol_exposed,
+        excluded_tools,
     );
 }
 
@@ -4763,6 +4783,50 @@ fn spawn_supervised_listener(
     )
 }
 
+/// Record one health observation for a supervised listener.
+///
+/// The supervisor cannot see whether a channel's API calls are succeeding — it
+/// only knows that `listen()` has not returned. A channel that polls a broken
+/// endpoint forever keeps the listener future alive, so treating "still
+/// listening" as "healthy" reports `ok` for a channel that has never connected,
+/// and re-clearing `last_error` on every tick erases a real failure within one
+/// heartbeat interval.
+///
+/// So ask the channel for what it already recorded. `Channel::listener_health`
+/// is synchronous and reads observed state, so this runs no I/O: it cannot send
+/// a message, dial a broker, or delay listener startup and cancellation. The
+/// active `Channel::health_check` probe is deliberately not used here — several
+/// implementations post a real message or open a connection to answer it, which
+/// is fine on demand and not fine on a 30-second timer.
+///
+/// A channel with no signal to give (`None`, the default) is recorded exactly as
+/// it was before this existed.
+///
+/// `Pending` records *no success*, but it does not leave the entry alone
+/// either. Stamping `ok` for a listener that has not yet completed an exchange
+/// is the original bug in slower form. Doing nothing at all is a quieter
+/// version of the same thing, for two reasons: the registry only creates a
+/// component when a mutation reaches it, so a listener that never completes an
+/// exchange would be *absent* from `/health` rather than visibly `starting`;
+/// and the registry outlives a daemon reload in a process-wide `OnceLock`, so a
+/// replacement listener on the same alias would inherit its predecessor's `ok`
+/// and `last_ok` and keep reporting healthy while it has never connected. So
+/// `Pending` marks the component `starting` and clears `last_ok`, which
+/// publishes the component without claiming a success it has not observed.
+fn mark_listener_health(ch: &dyn Channel, component: &str) {
+    match ch.listener_health() {
+        None | Some(ListenerHealth::Healthy) => {
+            zeroclaw_runtime::health::mark_component_ok(component);
+        }
+        Some(ListenerHealth::Unhealthy) => {
+            zeroclaw_runtime::health::mark_component_error(component, "channel reported unhealthy");
+        }
+        Some(ListenerHealth::Pending) => {
+            zeroclaw_runtime::health::mark_component_starting(component);
+        }
+    }
+}
+
 fn spawn_supervised_listener_with_health_interval(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4790,8 +4854,13 @@ fn spawn_supervised_listener_with_health_interval(
             let max_backoff = max_backoff_secs.max(backoff);
 
             loop {
-                zeroclaw_runtime::health::mark_component_ok(&component);
-                let mut health = tokio::time::interval(health_interval);
+                mark_listener_health(&*ch, &component);
+                // First tick one interval out, not immediately: the observation
+                // above already covers this instant.
+                let mut health = tokio::time::interval_at(
+                    tokio::time::Instant::now() + health_interval,
+                    health_interval,
+                );
                 health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let result = {
                     let listen_future = ch.listen(tx.clone());
@@ -4801,7 +4870,7 @@ fn spawn_supervised_listener_with_health_interval(
                         tokio::select! {
                             () = cancel.cancelled() => return,
                             _ = health.tick() => {
-                                zeroclaw_runtime::health::mark_component_ok(&component);
+                                mark_listener_health(&*ch, &component);
                             }
                             result = &mut listen_future => break result,
                         }
@@ -5174,6 +5243,14 @@ impl Channel for ApprovalTypingChannel {
         self.inner.listen(tx).await
     }
 
+    /// Forward the inner channel's passive observation; see the note on
+    /// `PacedChannel::listener_health`. Pausing typing around approvals says
+    /// nothing about listener health, and the trait default would hide the
+    /// inner channel's signal from the supervisor.
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        self.inner.listener_health()
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -5326,22 +5403,29 @@ fn single_message_pending_has_prefix(text: &str, prefix: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty())
 }
 
-fn single_message_pending_thinking_round(text: &str) -> Option<usize> {
-    zeroclaw_runtime::agent::loop_::thinking_status_round(text)
+fn single_message_pending_thinking_round(progress: &DraftProgress) -> Option<usize> {
+    matches!(progress.kind, DraftProgressKind::Status)
+        .then(|| zeroclaw_runtime::agent::loop_::thinking_status_round(&progress.text))
+        .flatten()
 }
 
-fn single_message_pending_is_thinking_status(text: &str) -> bool {
-    single_message_pending_thinking_round(text).is_some()
+fn single_message_pending_is_thinking_status(progress: &DraftProgress) -> bool {
+    single_message_pending_thinking_round(progress).is_some()
 }
 
-fn single_message_pending_is_reasoning(text: &str) -> bool {
-    single_message_pending_has_prefix(text, zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
-        && !single_message_pending_is_thinking_status(text)
+fn single_message_pending_is_reasoning(progress: &DraftProgress) -> bool {
+    matches!(progress.kind, DraftProgressKind::Reasoning)
+        && single_message_pending_has_prefix(
+            &progress.text,
+            zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX,
+        )
 }
 
-fn single_message_pending_visible_lines(text: &str) -> usize {
-    if single_message_pending_is_reasoning(text) {
-        text.trim_end_matches(&['\r', '\n'][..])
+fn single_message_pending_visible_lines(progress: &DraftProgress) -> usize {
+    if single_message_pending_is_reasoning(progress) {
+        progress
+            .text
+            .trim_end_matches(&['\r', '\n'][..])
             .split('\n')
             .count()
             .max(1)
@@ -5350,15 +5434,20 @@ fn single_message_pending_visible_lines(text: &str) -> usize {
     }
 }
 
-fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+fn trim_pending_visible_lines_from_front(
+    progress: &DraftProgress,
+    remove_lines: usize,
+) -> DraftProgress {
     if remove_lines == 0 {
-        return text.to_string();
+        return progress.clone();
     }
 
-    let rendered = text.trim_end_matches(&['\r', '\n'][..]);
-    let total = single_message_pending_visible_lines(rendered);
+    let rendered = progress.text.trim_end_matches(&['\r', '\n'][..]);
+    let total = single_message_pending_visible_lines(progress);
     if remove_lines >= total {
-        return String::new();
+        let mut empty = progress.clone();
+        empty.text.clear();
+        return empty;
     }
 
     let retained = rendered
@@ -5366,7 +5455,7 @@ fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> Str
         .skip(remove_lines)
         .collect::<Vec<_>>()
         .join("\n");
-    if single_message_pending_is_reasoning(text)
+    let text = if single_message_pending_is_reasoning(progress)
         && !retained.starts_with(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
     {
         format!(
@@ -5375,16 +5464,20 @@ fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> Str
         )
     } else {
         retained
+    };
+    DraftProgress {
+        kind: progress.kind,
+        text,
     }
 }
 
-fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usize) {
+fn trim_matrix_single_message_pending(pending: &mut Vec<DraftProgress>, max_lines: usize) {
     if max_lines == 0 {
         return;
     }
     let mut total_lines = pending
         .iter()
-        .map(|line| single_message_pending_visible_lines(line))
+        .map(single_message_pending_visible_lines)
         .sum::<usize>();
     while total_lines > max_lines {
         let remove_lines = total_lines - max_lines;
@@ -5399,31 +5492,37 @@ fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usiz
     }
 }
 
-fn push_matrix_single_message_pending(pending: &mut Vec<String>, text: String, max_lines: usize) {
-    if text.is_empty() {
+fn push_matrix_single_message_pending(
+    pending: &mut Vec<DraftProgress>,
+    progress: DraftProgress,
+    max_lines: usize,
+) {
+    if progress.text.is_empty() {
         return;
     }
-    if let Some(incoming_round) = single_message_pending_thinking_round(&text)
+    if let Some(incoming_round) = single_message_pending_thinking_round(&progress)
         && let Some(existing) = pending.last_mut()
         && single_message_pending_is_thinking_status(existing)
     {
         if incoming_round >= single_message_pending_thinking_round(existing).unwrap_or(0) {
-            *existing = text;
+            *existing = progress;
         }
         trim_matrix_single_message_pending(pending, max_lines);
         return;
     }
 
-    if let Some(fragment) = text.strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+    if let Some(fragment) = progress
+        .text
+        .strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
         && let Some(existing) = pending.last_mut()
         && single_message_pending_is_reasoning(existing)
     {
-        existing.push_str(fragment);
+        existing.text.push_str(fragment);
         trim_matrix_single_message_pending(pending, max_lines);
         return;
     }
 
-    pending.push(text);
+    pending.push(progress);
     trim_matrix_single_message_pending(pending, max_lines);
 }
 
@@ -5818,16 +5917,16 @@ fn matrix_progress_text(
     event: &zeroclaw_runtime::agent::loop_::StreamDelta,
     config: &Config,
     matrix_alias: &str,
-) -> Option<String> {
+) -> Option<DraftProgress> {
     use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
 
-    let text = match event {
-        StreamDelta::Status(text) => Some(matrix_scrub_progress_text(text)),
+    let progress = match event {
+        StreamDelta::Status(text) => Some(DraftProgress::status(matrix_scrub_progress_text(text))),
         StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
-            matrix_tool_progress(event, config, matrix_alias)
+            matrix_tool_progress(event, config, matrix_alias).map(DraftProgress::status)
         }
-        StreamDelta::Reasoning(text) => Some(matrix_scrub_progress_text(&format!(
-            "{REASONING_FULL_PREFIX}{text}"
+        StreamDelta::Reasoning(text) => Some(DraftProgress::reasoning(matrix_scrub_progress_text(
+            &format!("{REASONING_FULL_PREFIX}{text}"),
         ))),
         StreamDelta::Text(_) | StreamDelta::Lifecycle(_) => None,
     }?;
@@ -5838,7 +5937,10 @@ fn matrix_progress_text(
     // transport encoding, so a future dynamic field cannot bypass the guard.
     // Do not apply `scrub_credentials` again: structured-value redaction is
     // the shared authority for serialized tool arguments.
-    Some(zeroclaw_runtime::security::scrub(&text))
+    Some(DraftProgress {
+        kind: progress.kind,
+        text: zeroclaw_runtime::security::scrub(&progress.text),
+    })
 }
 
 async fn run_matrix_single_message_draft_updater(
@@ -5857,7 +5959,7 @@ async fn run_matrix_single_message_draft_updater(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
-    let mut pending = Vec::<String>::new();
+    let mut pending = Vec::<DraftProgress>::new();
     let mut rx_open = true;
     let mut flush_in_flight = false;
 
@@ -5895,7 +5997,7 @@ async fn run_matrix_single_message_draft_updater(
                 flush_in_flight = true;
                 zeroclaw_spawn::spawn!(async move {
                     let result = channel
-                        .update_draft_progress_batch(&reply_target, &draft_id, &batch)
+                        .update_typed_draft_progress_batch(&reply_target, &draft_id, &batch)
                         .await
                         .map_err(|e| e.to_string());
                     let _ = flush_tx.send(result.err()).await;
@@ -6456,19 +6558,6 @@ async fn process_channel_message_body(
         } else {
             ctx.non_cli_excluded_tools.as_ref()
         };
-    let read_skill_available = read_skill_available_for_channel_turn(
-        active_model_provider.as_ref(),
-        ctx.agent_cfg.resolved.strict_tool_parsing,
-        ctx.tools_registry.as_ref(),
-        per_turn_excluded_tools,
-        ctx.system_prompt.as_str(),
-    );
-    let base_system_prompt = system_prompt_for_channel_turn(
-        ctx.as_ref(),
-        ctx.system_prompt.as_str(),
-        !had_prior_history,
-        read_skill_available,
-    );
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
@@ -6478,6 +6567,21 @@ async fn process_channel_message_body(
             ctx.activated_tools.as_ref(),
         )
         .unwrap_or(false);
+    let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
+        per_turn_native_tool_specs_present,
+        ctx.agent_cfg.resolved.strict_tool_parsing,
+        ctx.system_prompt.as_str(),
+    );
+    let route_differs_from_startup = route.model_provider.as_str()
+        != ctx.model_provider_ref.as_str()
+        || route.model.as_str() != ctx.model.as_str();
+    let base_system_prompt = system_prompt_for_channel_turn(
+        ctx.as_ref(),
+        ctx.system_prompt.as_str(),
+        !had_prior_history || route_differs_from_startup,
+        callable_protocol_exposed,
+        per_turn_excluded_tools,
+    );
     let mut system_prompt = build_channel_system_prompt_for_message_with_signal(
         &base_system_prompt,
         &msg,
@@ -7203,11 +7307,18 @@ async fn process_channel_message_body(
                             &runtime_defaults,
                         );
 
-                        let read_skill_available = read_skill_available_for_channel_turn(
-                            active_model_provider.as_ref(),
+                        let switched_native_tool_specs_present =
+                            ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+                                active_model_provider.as_ref(),
+                                route.model.as_str(),
+                                ctx.tools_registry.as_ref(),
+                                excluded_tools,
+                                ctx.activated_tools.as_ref(),
+                            )
+                            .unwrap_or(false);
+                        let callable_protocol_exposed = callable_protocol_exposed_for_channel_turn(
+                            switched_native_tool_specs_present,
                             ctx.agent_cfg.resolved.strict_tool_parsing,
-                            ctx.tools_registry.as_ref(),
-                            excluded_tools,
                             history
                                 .first()
                                 .map_or("", |message| message.content.as_str()),
@@ -7215,7 +7326,9 @@ async fn process_channel_message_body(
                         refresh_channel_history_skills(
                             ctx.as_ref(),
                             &mut history,
-                            read_skill_available,
+                            true,
+                            callable_protocol_exposed,
+                            excluded_tools,
                         );
 
                         continue;
@@ -9176,9 +9289,23 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
+                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_channel_key = format!("matrix.{alias}");
                 Ok(Arc::new(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
-                        .with_transcription(config.transcription.clone())
+                        .with_transcription_manager_factory(move || {
+                            let config = transcription_config_arc.read();
+                            if !config.transcription.enabled {
+                                return None;
+                            }
+                            let provider = resolve_agent_transcription_provider(
+                                &config,
+                                &transcription_channel_key,
+                            );
+                            Some(crate::matrix::build_transcription_manager(
+                                &config, &provider,
+                            ))
+                        })
                         .with_workspace_dir(workspace_dir)
                         .with_ack_reactions(ack),
                 ))
@@ -10093,16 +10220,21 @@ pub fn register_channels_for_tools(
 }
 
 /// Resolve the `transcription_provider` configured on the enabled agent that
-/// owns `channel_key` (for example `"telegram.support"` or
-/// `"voice_wake.frontdoor"`). Returns an empty string when no owning agent
+/// owns `channel_key` (for example `"telegram.support"`, `"discord.community"`,
+/// or `"voice_wake.frontdoor"`). Returns an empty string when no owning agent
 /// declares a preference. `channel_key` only selects which agent to consult
 /// — it is never itself treated as a provider identity, and the returned
 /// value must not be confused with the channel alias embedded in the key.
 ///
-/// Gated to match its callers: with both transcribing channels compiled out
+/// Gated to match its callers: with all transcribing channels compiled out
 /// this has no call sites, and an ungated definition trips the dead-code lint
 /// under a no-default-features build.
-#[cfg(any(feature = "channel-telegram", feature = "voice-wake"))]
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-discord",
+    feature = "voice-wake",
+    feature = "channel-matrix"
+))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     let enabled_agents = enabled_agent_aliases(config);
     build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
@@ -10110,6 +10242,71 @@ fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> S
         .and_then(|owner| config.agents.get(owner))
         .map(|agent| agent.transcription_provider.as_str().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(feature = "channel-discord")]
+fn configure_discord_transcription(
+    channel: DiscordChannel,
+    config: &Config,
+    channel_key: &str,
+) -> DiscordChannel {
+    if !config.transcription.enabled {
+        return channel;
+    }
+
+    let provider = resolve_agent_transcription_provider(config, channel_key);
+    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
+        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            channel
+        }
+    }
+}
+
+#[cfg(feature = "channel-discord")]
+fn build_configured_discord_channel(
+    config_arc: &Arc<RwLock<Config>>,
+    config: &Config,
+    alias: &str,
+    dc: &zeroclaw_config::schema::DiscordConfig,
+) -> DiscordChannel {
+    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let cfg_arc = config_arc.clone();
+        let alias = alias.to_string();
+        Arc::new(move || cfg_arc.read().channel_external_peers("discord", &alias))
+    };
+    let channel_key = format!("discord.{alias}");
+    let channel = DiscordChannel::new(
+        dc.bot_token.clone(),
+        dc.guild_ids.clone(),
+        alias,
+        peer_resolver,
+        dc.listen_to_bots,
+        dc.mention_only,
+    )
+    .with_channel_ids(dc.channel_ids.clone())
+    .with_workspace_dir(config.channel_workspace_dir(&channel_key))
+    .with_streaming(
+        dc.stream_mode,
+        dc.draft_update_interval_ms,
+        dc.multi_message_delay_ms,
+    )
+    .with_proxy_url(dc.proxy_url.clone())
+    .with_stall_timeout(dc.stall_timeout_secs)
+    .with_approval_timeout_secs(dc.approval_timeout_secs)
+    .with_slash_commands(dc.slash_commands)
+    .with_slash_command_scope(dc.slash_command_scope)
+    .with_intents_mask(dc.intents_mask)
+    .with_reaction_notifications(dc.reaction_notifications);
+
+    configure_discord_transcription(channel, config, &channel_key)
 }
 
 /// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
@@ -10227,40 +10424,14 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-discord")]
     for (alias, dc) in &config.channels.discord {
-        if !active_channel_aliases.contains(&format!("discord.{alias}")) {
+        let channel_key = format!("discord.{alias}");
+        if !active_channel_aliases.contains(&channel_key) {
             continue;
         }
         if !dc.enabled {
             continue;
         }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("discord", &alias))
-        };
-        let mut discord_ch = DiscordChannel::new(
-            dc.bot_token.clone(),
-            dc.guild_ids.clone(),
-            alias.clone(),
-            peer_resolver,
-            dc.listen_to_bots,
-            dc.mention_only,
-        )
-        .with_channel_ids(dc.channel_ids.clone())
-        .with_workspace_dir(config.channel_workspace_dir(&format!("discord.{alias}")))
-        .with_streaming(
-            dc.stream_mode,
-            dc.draft_update_interval_ms,
-            dc.multi_message_delay_ms,
-        )
-        .with_proxy_url(dc.proxy_url.clone())
-        .with_transcription(config.transcription.clone())
-        .with_stall_timeout(dc.stall_timeout_secs)
-        .with_approval_timeout_secs(dc.approval_timeout_secs)
-        .with_slash_commands(dc.slash_commands)
-        .with_slash_command_scope(dc.slash_command_scope)
-        .with_intents_mask(dc.intents_mask)
-        .with_reaction_notifications(dc.reaction_notifications);
+        let mut discord_ch = build_configured_discord_channel(config_arc, &config, alias, dc);
         if dc.slash_commands {
             let cfg_arc_for_slash = config_arc.clone();
             let channel_ref = format!("discord.{alias}");
@@ -10482,10 +10653,24 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
         };
         let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_channel_key = format!("matrix.{alias}");
         match MatrixChannel::new(mx.clone(), alias.clone(), peer_resolver, state_dir) {
             Ok(channel) => {
                 let channel = channel
-                    .with_transcription(config.transcription.clone())
+                    .with_transcription_manager_factory(move || {
+                        let config = transcription_config_arc.read();
+                        if !config.transcription.enabled {
+                            return None;
+                        }
+                        let provider = resolve_agent_transcription_provider(
+                            &config,
+                            &transcription_channel_key,
+                        );
+                        Some(crate::matrix::build_transcription_manager(
+                            &config, &provider,
+                        ))
+                    })
                     .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
                     .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
@@ -12458,7 +12643,18 @@ pub async fn start_channels(
         } else {
             None
         };
-        let native_tools = model_provider.supports_native_tools();
+        let startup_excluded_tools: &[String] = if risk_profile.level == AutonomyLevel::Full {
+            &[]
+        } else {
+            &risk_profile.excluded_tools
+        };
+        let native_tools = ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+            model_provider.as_ref(),
+            model.as_str(),
+            tools_registry.as_ref(),
+            startup_excluded_tools,
+            ch_activated_handle.as_ref(),
+        )?;
         let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -12466,10 +12662,12 @@ pub async fn start_channels(
             &mut deferred_section,
             &pinned_section,
         );
-        let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
+        let callable_protocol_exposed = native_tools || expose_text_tool_protocol;
+        let mut system_prompt = build_system_prompt_with_mode_and_effective_tools(
             &workspace,
             &model,
             &tool_descs,
+            |name| callable_protocol_exposed && effective_tool_names.contains(name),
             &skills,
             Some(&agent.identity),
             bootstrap_max_chars,
@@ -14104,8 +14302,8 @@ pub(crate) mod tests {
         )
         .expect("status renders");
 
-        assert!(!progress.contains(token));
-        assert!(progress.contains("[REDACTED"));
+        assert!(!progress.text.contains(token));
+        assert!(progress.text.contains("[REDACTED"));
     }
 
     #[test]
@@ -14128,9 +14326,9 @@ pub(crate) mod tests {
         )
         .expect("tool completion renders");
 
-        assert!(!progress.contains("-----BEGIN PRIVATE KEY-----"));
-        assert!(!progress.contains("-----END PRIVATE KEY-----"));
-        assert!(progress.contains("[REDACTED"));
+        assert!(!progress.text.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!progress.text.contains("-----END PRIVATE KEY-----"));
+        assert!(progress.text.contains("[REDACTED"));
     }
 
     #[test]
@@ -14144,8 +14342,12 @@ pub(crate) mod tests {
             } else {
                 format!("{REASONING_FULL_PREFIX} r{idx}")
             };
-            push_matrix_single_message_pending(&mut pending, fragment, 3);
-            push_matrix_single_message_pending(&mut pending, format!("tool-{idx}\n"), 3);
+            push_matrix_single_message_pending(&mut pending, DraftProgress::reasoning(fragment), 3);
+            push_matrix_single_message_pending(
+                &mut pending,
+                DraftProgress::status(format!("tool-{idx}\n")),
+                3,
+            );
         }
 
         assert!(
@@ -14153,11 +14355,11 @@ pub(crate) mod tests {
             "bounded pending buffer should honor stream_draft_lines, got {pending:?}"
         );
         assert!(
-            pending.iter().all(|line| !line.contains("r7 r8")),
+            pending.iter().all(|line| !line.text.contains("r7 r8")),
             "reasoning after tool progress must start a new entry, got {pending:?}"
         );
         assert!(
-            !pending.iter().any(|line| line == "tool-0\n"),
+            !pending.iter().any(|line| line.text == "tool-0\n"),
             "old non-reasoning progress should be trimmed first: {pending:?}"
         );
     }
@@ -14169,21 +14371,21 @@ pub(crate) mod tests {
         let mut pending = Vec::new();
         push_matrix_single_message_pending(
             &mut pending,
-            format!("{REASONING_FULL_PREFIX}before tool"),
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}before tool")),
             2,
         );
-        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2);
+        push_matrix_single_message_pending(&mut pending, DraftProgress::status("tool call"), 2);
         push_matrix_single_message_pending(
             &mut pending,
-            format!("{REASONING_FULL_PREFIX}after tool"),
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}after tool")),
             2,
         );
 
         assert_eq!(
             pending,
             vec![
-                "tool call".to_string(),
-                format!("{REASONING_FULL_PREFIX}after tool")
+                DraftProgress::status("tool call"),
+                DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}after tool"))
             ]
         );
     }
@@ -14194,11 +14396,24 @@ pub(crate) mod tests {
 
         let mut pending = Vec::new();
         let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
-        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}abcd"), 3);
-        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}efgh"), 3);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}abcd")),
+            3,
+        );
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}efgh")),
+            3,
+        );
 
-        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcdefgh")]);
-        assert!(pending.iter().any(|line| line.len() > max_bytes));
+        assert_eq!(
+            pending,
+            vec![DraftProgress::reasoning(format!(
+                "{REASONING_FULL_PREFIX}abcdefgh"
+            ))]
+        );
+        assert!(pending.iter().any(|line| line.text.len() > max_bytes));
     }
 
     #[test]
@@ -14208,19 +14423,28 @@ pub(crate) mod tests {
         let mut pending = Vec::new();
         push_matrix_single_message_pending(
             &mut pending,
-            format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+            DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}one\ntwo\nthree")),
             2,
         );
 
-        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}two\nthree")]);
+        assert_eq!(
+            pending,
+            vec![DraftProgress::reasoning(format!(
+                "{REASONING_FULL_PREFIX}two\nthree"
+            ))]
+        );
 
-        push_matrix_single_message_pending(&mut pending, "tool line\nwith detail\n".to_string(), 2);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status("tool line\nwith detail\n"),
+            2,
+        );
 
         assert_eq!(
             pending,
             vec![
-                format!("{REASONING_FULL_PREFIX}three"),
-                "tool line\nwith detail\n".to_string()
+                DraftProgress::reasoning(format!("{REASONING_FULL_PREFIX}three")),
+                DraftProgress::status("tool line\nwith detail\n")
             ]
         );
     }
@@ -14230,23 +14454,69 @@ pub(crate) mod tests {
         use zeroclaw_runtime::agent::loop_::thinking_status_text;
 
         let mut pending = Vec::new();
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3);
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status(thinking_status_text(1)),
+            3,
+        );
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status(thinking_status_text(0)),
+            3,
+        );
 
-        assert_eq!(pending, vec![thinking_status_text(1)]);
+        assert_eq!(
+            pending,
+            vec![DraftProgress::status(thinking_status_text(1))]
+        );
 
-        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3);
+        push_matrix_single_message_pending(&mut pending, DraftProgress::status("tool\n"), 3);
 
-        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3);
+        push_matrix_single_message_pending(
+            &mut pending,
+            DraftProgress::status(thinking_status_text(2)),
+            3,
+        );
 
         assert_eq!(
             pending,
             vec![
-                thinking_status_text(1),
-                "tool\n".to_string(),
-                thinking_status_text(2)
+                DraftProgress::status(thinking_status_text(1)),
+                DraftProgress::status("tool\n"),
+                DraftProgress::status(thinking_status_text(2))
             ]
         );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_preserves_reasoning_matching_thinking_status() {
+        use zeroclaw_runtime::agent::loop_::{StreamDelta, thinking_status_text};
+
+        let config = Config::default();
+        let status = matrix_progress_text(
+            &StreamDelta::Status(thinking_status_text(0)),
+            &config,
+            "missing",
+        )
+        .expect("thinking status renders");
+        let reasoning = matrix_progress_text(
+            &StreamDelta::Reasoning("Thinking...\n".to_string()),
+            &config,
+            "missing",
+        )
+        .expect("reasoning renders");
+        let mut pending = Vec::new();
+
+        // Equal display text must remain two source-distinct progress entries.
+        push_matrix_single_message_pending(&mut pending, status.clone(), 3);
+        push_matrix_single_message_pending(&mut pending, reasoning.clone(), 3);
+
+        assert_eq!(
+            status.text, reasoning.text,
+            "the regression requires an exact display-text collision"
+        );
+        assert_ne!(status.kind, reasoning.kind);
+        assert_eq!(pending, vec![status, reasoning]);
     }
 
     struct SlowBatchChannel {
@@ -18922,6 +19192,49 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    struct ModelAwareToolProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ModelAwareToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn capabilities_for_model(
+            &self,
+            model: &str,
+        ) -> zeroclaw_providers::traits::ProviderCapabilities {
+            zeroclaw_providers::traits::ProviderCapabilities {
+                native_tool_calling: model != "text-only",
+                ..Default::default()
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ModelAwareToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ModelAwareToolProvider"
+        }
+    }
+
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
@@ -19969,6 +20282,96 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             failed_with_fingerprint,
             "skill tool must execute via the INJECTED runtime, not a default one; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_prompt_callable_names_follow_assembled_registry() {
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.security.nat64_prefixes = vec!["not-a-prefix".into()];
+        let security = Arc::new(SecurityPolicy::default());
+        let skills = vec![zeroclaw_runtime::skills::Skill {
+            name: "ops".into(),
+            description: "Operations helpers".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                zeroclaw_runtime::skills::SkillTool {
+                    name: "run".into(),
+                    description: "Run an operation".into(),
+                    kind: "shell".into(),
+                    command: "echo ok".into(),
+                    args: Default::default(),
+                    target: None,
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                },
+                zeroclaw_runtime::skills::SkillTool {
+                    name: "fetch".into(),
+                    description: "Fetch operation status".into(),
+                    kind: "http".into(),
+                    command: "https://example.com/status".into(),
+                    args: Default::default(),
+                    target: None,
+                    locked_args: Default::default(),
+                    timeout_secs: None,
+                },
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+        let assembled = assemble_channel_agent_tools(
+            &config,
+            "test-agent",
+            "test-provider",
+            "test-model",
+            &security,
+            channel_all_tools_result(vec![Box::new(NamedMockTool("shell"))]),
+            &skills,
+            Arc::new(platform::NativeRuntime::new()),
+        )
+        .await;
+        let effective_tool_names: HashSet<&str> =
+            assembled.tools.iter().map(|tool| tool.name()).collect();
+        assert!(effective_tool_names.contains("ops__run"));
+        assert!(!effective_tool_names.contains("ops__fetch"));
+
+        let prompt = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |name| effective_tool_names.contains(name),
+            &skills,
+            None,
+            None,
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            true,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            None,
+        );
+        let callable = prompt
+            .split_once("<callable_tools")
+            .and_then(|(_, rest)| rest.split_once("</callable_tools>"))
+            .map(|(block, _)| block)
+            .expect("surviving shell skill should create callable block");
+
+        assert!(callable.contains("<name>ops__run</name>"));
+        assert!(!callable.contains("<name>ops__fetch</name>"));
+        assert!(
+            prompt.contains("<name>fetch</name>"),
+            "omitted HTTP tool should remain descriptive"
         );
     }
 
@@ -24938,47 +25341,122 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn channel_read_skill_availability_requires_callable_tool_protocol() {
-        let provider = HistoryCaptureModelProvider::default();
+    fn channel_strict_non_native_prompt_keeps_skill_tools_non_callable() {
+        let ws = make_workspace();
+        let skills = vec![zeroclaw_runtime::skills::Skill {
+            name: "ops".into(),
+            description: "Operations helpers".into(),
+            description_localizations: Default::default(),
+            version: "1".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![zeroclaw_runtime::skills::SkillTool {
+                name: "run".into(),
+                description: "Run an operation".into(),
+                kind: "shell".into(),
+                command: "echo ok".into(),
+                args: Default::default(),
+                target: None,
+                locked_args: Default::default(),
+                timeout_secs: None,
+            }],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_effective_tools(
+            ws.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            false,
+            false,
+            None,
+        );
+
+        assert!(!prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>run</name>"));
+    }
+
+    #[test]
+    fn channel_skill_availability_requires_callable_tool_protocol() {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let text_tool_prompt = "## Tool Use Protocol\n\n\
+            <tool_call></tool_call>\n\n\
+            ### Available Tools\n\n\
+            **read_skill**: Read a skill";
+        let read_skill_available = |native_tool_specs_present: bool,
+                                    strict_tool_parsing: bool,
+                                    excluded_tools: &[String],
+                                    system_prompt: &str| {
+            channel_tool_available_for_turn(
+                callable_protocol_exposed_for_channel_turn(
+                    native_tool_specs_present,
+                    strict_tool_parsing,
+                    system_prompt,
+                ),
+                &tools_registry,
+                excluded_tools,
+                "read_skill",
+            )
+        };
+
+        assert!(read_skill_available(false, false, &[], text_tool_prompt));
+        assert!(!read_skill_available(false, false, &[], ""));
+        assert!(!read_skill_available(
+            false,
+            false,
+            &[],
+            "## Workspace\n\nMentions ## Tool Use Protocol and **read_skill** in ordinary prose.",
+        ));
+        assert!(!read_skill_available(
+            false,
+            false,
+            &["read_skill".to_string()],
+            text_tool_prompt,
+        ));
+        assert!(!read_skill_available(false, true, &[], text_tool_prompt));
+        assert!(read_skill_available(true, true, &[], ""));
+    }
+
+    #[test]
+    fn channel_skill_availability_uses_selected_model_capability() {
+        let provider = ModelAwareToolProvider;
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
         let text_tool_prompt = "## Tool Use Protocol\n\n\
             <tool_call></tool_call>\n\n\
             ### Available Tools\n\n\
             **read_skill**: Read a skill";
 
-        assert!(read_skill_available_for_channel_turn(
-            &provider,
-            false,
-            &tools_registry,
-            &[],
-            text_tool_prompt,
-        ));
-        assert!(!read_skill_available_for_channel_turn(
-            &provider,
-            false,
-            &tools_registry,
-            &[],
-            "",
-        ));
-        assert!(!read_skill_available_for_channel_turn(
-            &provider,
-            false,
-            &tools_registry,
-            &[],
-            "## Workspace\n\nMentions ## Tool Use Protocol and **read_skill** in ordinary prose.",
-        ));
-        assert!(!read_skill_available_for_channel_turn(
-            &provider,
-            false,
-            &tools_registry,
-            &["read_skill".to_string()],
-            text_tool_prompt,
-        ));
-        assert!(!read_skill_available_for_channel_turn(
-            &provider,
+        assert!(provider.supports_native_tools());
+        let selected_model_native =
+            ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
+                &provider,
+                "text-only",
+                &tools_registry,
+                &[],
+                None,
+            )
+            .unwrap();
+        assert!(!selected_model_native);
+        assert!(!callable_protocol_exposed_for_channel_turn(
+            selected_model_native,
             true,
-            &tools_registry,
-            &[],
+            text_tool_prompt,
+        ));
+        assert!(callable_protocol_exposed_for_channel_turn(
+            selected_model_native,
+            false,
             text_tool_prompt,
         ));
     }
@@ -25036,16 +25514,31 @@ BTC is currently around $65,000 based on latest tool output."#
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
-        assert!(prompt.contains("### SOUL.md"), "missing SOUL.md header");
-        assert!(prompt.contains("Be helpful"), "missing SOUL content");
-        assert!(prompt.contains("### IDENTITY.md"), "missing IDENTITY.md");
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
+        const SOUL_CONTENT: &str = "# Soul\nBe helpful.";
+        assert!(prompt.contains(SOUL_CONTENT), "missing SOUL content");
+        assert_eq!(
+            prompt.matches(SOUL_CONTENT).count(),
+            1,
+            "SOUL content should be injected exactly once"
+        );
+        assert!(
+            !prompt.contains("### IDENTITY.md"),
+            "heading removed: IDENTITY.md"
+        );
         assert!(
             prompt.contains("Name: ZeroClaw"),
             "missing IDENTITY content"
         );
-        assert!(prompt.contains("### USER.md"), "missing USER.md");
-        assert!(prompt.contains("### AGENTS.md"), "missing AGENTS.md");
-        assert!(prompt.contains("### TOOLS.md"), "missing TOOLS.md");
+        assert!(!prompt.contains("### USER.md"), "heading removed: USER.md");
+        assert!(
+            !prompt.contains("### AGENTS.md"),
+            "heading removed: AGENTS.md"
+        );
+        assert!(
+            !prompt.contains("### TOOLS.md"),
+            "heading removed: TOOLS.md"
+        );
         // HEARTBEAT.md is intentionally excluded from channel prompts — it's only
         // relevant to the heartbeat worker and causes LLMs to emit spurious
         // "HEARTBEAT_OK" acknowledgments in channel conversations.
@@ -25053,7 +25546,10 @@ BTC is currently around $65,000 based on latest tool output."#
             !prompt.contains("### HEARTBEAT.md"),
             "HEARTBEAT.md should not be in channel prompt"
         );
-        assert!(prompt.contains("### MEMORY.md"), "missing MEMORY.md");
+        assert!(
+            !prompt.contains("### MEMORY.md"),
+            "heading removed: MEMORY.md"
+        );
         assert!(prompt.contains("User likes Rust"), "missing MEMORY content");
     }
 
@@ -25078,12 +25574,16 @@ BTC is currently around $65,000 based on latest tool output."#
             "BOOTSTRAP.md should not appear when missing"
         );
 
-        // Create BOOTSTRAP.md — should appear
+        // Create BOOTSTRAP.md — content should appear, heading should not
         std::fs::write(ws.path().join("BOOTSTRAP.md"), "# Bootstrap\nFirst run.").unwrap();
         let prompt2 = build_system_prompt(ws.path(), "model", &[], &[], None, None);
         assert!(
-            prompt2.contains("### BOOTSTRAP.md"),
-            "BOOTSTRAP.md should appear when present"
+            !prompt2.contains("### BOOTSTRAP.md"),
+            "BOOTSTRAP heading removed: {prompt2}"
+        );
+        assert!(
+            prompt2.contains("First run."),
+            "BOOTSTRAP content should appear: {prompt2}"
         );
         assert!(prompt2.contains("First run"));
     }
@@ -27488,6 +27988,7 @@ BTC is currently around $65,000 based on latest tool output."#
             tools_registry: Arc::new(
                 zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
                     Box::new(NamedMockTool("read_skill")),
+                    Box::new(NamedMockTool("refresh-test__shell")),
                 ]),
             ),
             observer: Arc::new(NoopObserver),
@@ -27576,8 +28077,22 @@ BTC is currently around $65,000 based on latest tool output."#
         let skill_dir = workspace.path().join("skills").join("refresh-test");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: refresh-test\ndescription: Refresh the available skills section\n---\n# Refresh Test\nExpose this skill on fresh sessions.\n",
+            skill_dir.join("SKILL.toml"),
+            "prompts = [\"Expose this skill on fresh sessions.\"]\n\
+             [skill]\n\
+             name = \"refresh-test\"\n\
+             description = \"Refresh the available skills section\"\n\
+             version = \"1\"\n\
+             [[tools]]\n\
+             name = \"shell\"\n\
+             description = \"Run the refresh check\"\n\
+             kind = \"shell\"\n\
+             command = \"echo ok\"\n\
+             [[tools]]\n\
+             name = \"fetch\"\n\
+             description = \"Fetch refresh status\"\n\
+             kind = \"http\"\n\
+             command = \"https://example.com/status\"\n",
         )
         .unwrap();
         let refreshed_skills =
@@ -27589,6 +28104,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 runtime_ctx.as_ref(),
                 runtime_ctx.system_prompt.as_str(),
                 false,
+                &[],
             )
             .contains("<name>refresh-test</name>"),
             "fresh-session prompt should pick up skills added after startup"
@@ -27598,6 +28114,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 runtime_ctx.as_ref(),
                 runtime_ctx.system_prompt.as_str(),
                 false,
+                &[],
             )
             .contains("Expose this skill on fresh sessions."),
             "fresh-session prompt should inline instructions when read_skill is unavailable"
@@ -27607,14 +28124,25 @@ BTC is currently around $65,000 based on latest tool output."#
             runtime_ctx.as_ref(),
             runtime_ctx.system_prompt.as_str(),
             true,
+            &[],
         );
         assert!(cached_compact_prompt.contains("read_skill(name)"));
         assert!(!cached_compact_prompt.contains("Expose this skill on fresh sessions."));
+        let callable = cached_compact_prompt
+            .split_once("<callable_tools")
+            .and_then(|(_, rest)| rest.split_once("</callable_tools>"))
+            .map(|(block, _)| block)
+            .expect("registered shell skill should remain callable after refresh");
+        assert!(callable.contains("<name>refresh-test__shell</name>"));
+        assert!(!callable.contains("<name>refresh-test__fetch</name>"));
+        assert!(cached_compact_prompt.contains("<name>fetch</name>"));
         let mut provider_transition_history = vec![ChatMessage::system(cached_compact_prompt)];
         refresh_channel_history_skills(
             runtime_ctx.as_ref(),
             &mut provider_transition_history,
+            true,
             false,
+            &[],
         );
         let provider_transition_prompt = &provider_transition_history[0].content;
         assert!(
@@ -27622,6 +28150,28 @@ BTC is currently around $65,000 based on latest tool output."#
             "an established session must inline instructions when its active provider loses the loader protocol"
         );
         assert!(!provider_transition_prompt.contains("read_skill(name)"));
+
+        let full_callable_skills = build_skills_prompt_with_effective_tools(
+            &refreshed_skills,
+            workspace.path(),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            |name| name == "refresh-test__shell",
+        );
+        assert!(full_callable_skills.contains("<callable_tools"));
+        let mut same_mode_provider_transition = vec![ChatMessage::system(full_callable_skills)];
+        refresh_channel_history_skills(
+            runtime_ctx.as_ref(),
+            &mut same_mode_provider_transition,
+            true,
+            false,
+            &[],
+        );
+        let same_mode_prompt = &same_mode_provider_transition[0].content;
+        assert!(
+            !same_mode_prompt.contains("<callable_tools"),
+            "a provider switch must remove stale callable skills even when Full mode is unchanged"
+        );
+        assert!(same_mode_prompt.contains("Expose this skill on fresh sessions."));
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -29065,18 +29615,24 @@ This is an example JSON object for profile settings."#;
     fn aieos_fallback_to_openclaw_on_parse_error() {
         use zeroclaw_config::schema::IdentityConfig;
 
+        let ws = make_workspace();
+        std::fs::write(ws.path().join("identity.json"), "{not valid json").unwrap();
+
         let config = IdentityConfig {
             format: "aieos".into(),
-            aieos_path: Some("nonexistent.json".into()),
+            aieos_path: Some("identity.json".into()),
             aieos_inline: None,
         };
 
-        let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
-        // Should fall back to OpenClaw format when AIEOS file is not found
-        // (Error is logged to stderr with filename, not included in prompt)
-        assert!(prompt.contains("### SOUL.md"));
+        // Should fall back to OpenClaw format when AIEOS JSON cannot be parsed.
+        // The parse error is logged to stderr, not included in the prompt.
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
+        assert!(
+            prompt.contains("Be helpful"),
+            "OpenClaw fallback should inject workspace content"
+        );
     }
 
     #[test]
@@ -29094,7 +29650,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format (not configured for AIEOS)
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"));
     }
 
@@ -29112,7 +29668,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], Some(&config), None);
 
         // Should use OpenClaw format even if aieos_path is set
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"));
         assert!(!prompt.contains("## Identity"));
     }
@@ -29124,7 +29680,7 @@ This is an example JSON object for profile settings."#;
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         // Should use OpenClaw format
-        assert!(prompt.contains("### SOUL.md"));
+        assert!(!prompt.contains("### SOUL.md"), "heading removed: SOUL.md");
         assert!(prompt.contains("Be helpful"));
     }
 
@@ -29790,6 +30346,91 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn configured_discord_transcription_dispatches_to_routed_agent_provider() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "routed transcript"})),
+            )
+            .expect(1)
+            .mount(&whisper_server)
+            .await;
+
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.channels.discord.insert(
+            "community".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".into(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "listener".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.community".into()],
+                transcription_provider: "local_whisper.routed".into(),
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.local_whisper.insert(
+            "routed".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", whisper_server.uri()),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channel = {
+            let config = config_arc.read();
+            build_configured_discord_channel(
+                &config_arc,
+                &config,
+                "community",
+                config
+                    .channels
+                    .discord
+                    .get("community")
+                    .expect("configured Discord alias"),
+            )
+        };
+
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": format!("{}/voice.ogg", media_server.uri()),
+        })];
+        let (text, media) = channel
+            .process_attachments_for_test(&attachments, &reqwest::Client::new())
+            .await;
+
+        assert_eq!(text, "[Voice] routed transcript");
+        assert!(
+            media.is_empty(),
+            "successful direct-channel transcription must not fall back to media"
+        );
+        media_server.verify().await;
+        whisper_server.verify().await;
+    }
+
     // Regression: Voice Wake bound its transcription manager to its own
     // channel alias instead of the owning agent's `transcription_provider`,
     // so any config whose alias wasn't coincidentally also a provider key
@@ -29965,6 +30606,82 @@ This is an example JSON object for profile settings."#;
         name: String,
         calls: Arc<AtomicUsize>,
         err: Mutex<Option<anyhow::Error>>,
+    }
+
+    /// A channel whose listener stays alive for as long as the supervisor
+    /// watches it — the reported shape where Telegram long-polls a bad bot
+    /// token and absorbs the 404 without ever returning from `listen`.
+    ///
+    /// It counts both ways the supervisor could ask about health, so a test can
+    /// assert on which one it actually used: `observations` counts passive
+    /// `listener_health` reads, and `probes` counts active `health_check` calls
+    /// — the ones that, on real channels, post a message or open a connection.
+    struct ObservedChannel {
+        name: String,
+        /// Mutable so a test can model a channel whose answer *changes* — a
+        /// constant report cannot express "succeeded once, then stopped
+        /// completing exchanges", which is the staleness case that matters.
+        report: parking_lot::Mutex<Option<ListenerHealth>>,
+        observations: Arc<AtomicUsize>,
+        probes: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ObservedChannel {
+        fn reporting(name: String, report: Option<ListenerHealth>) -> Self {
+            Self {
+                name,
+                report: parking_lot::Mutex::new(report),
+                observations: Arc::new(AtomicUsize::new(0)),
+                probes: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn set_report(&self, report: Option<ListenerHealth>) {
+            *self.report.lock() = report;
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ObservedChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ObservedChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+
+        fn listener_health(&self) -> Option<ListenerHealth> {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            *self.report.lock()
+        }
+
+        async fn health_check(&self) -> bool {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            true
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
@@ -30226,6 +30943,426 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_report_ok_for_a_channel_that_never_connected() {
+        // A live listener is not evidence of a working channel. A bad bot
+        // token leaves Telegram long-polling and swallowing 404s forever, and
+        // the supervisor used to keep stamping `ok` on every heartbeat.
+        let channel_name = format!("test-never-connects-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Unhealthy),
+        ));
+        let calls = Arc::clone(&inner.calls);
+        let probes = Arc::clone(&inner.probes);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+
+        assert_eq!(
+            component["status"], "error",
+            "a channel that has never connected must not report ok; got {component}"
+        );
+        assert!(
+            component["last_ok"].is_null(),
+            "last_ok must not advance while every API call fails; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "an unhealthy report must come from recorded state, not a probe"
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_health_observation_never_probes_the_channel() {
+        // `health_check` is an on-demand diagnostic, and implementations answer
+        // it by talking to the service: WeCom posts a real webhook message,
+        // Slack runs `auth.test` and opens a socket-mode URL, AMQP dials the
+        // broker. None of that may run on a 30-second heartbeat, so the
+        // supervisor must never reach it.
+        let channel_name = format!("test-passive-observation-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Healthy),
+        ));
+        let probes = Arc::clone(&inner.probes);
+        let observations = Arc::clone(&inner.observations);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "the heartbeat must not call health_check"
+        );
+        assert!(
+            observations.load(Ordering::SeqCst) >= 2,
+            "the heartbeat should have observed passively at least twice by now; got {}",
+            observations.load(Ordering::SeqCst)
+        );
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(
+            component["status"], "ok",
+            "a channel reporting itself healthy stays ok; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    // Paused time so the assertion is on the deadline itself rather than on a
+    // real sleep racing a real tick.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_listener_waits_one_interval_before_its_second_observation() {
+        // `tokio::time::interval` fires its first tick immediately, which would
+        // double up on the pre-listen observation. The heartbeat's first tick
+        // belongs one interval out.
+        let channel_name = format!("test-observation-cadence-{}", uuid::Uuid::new_v4());
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Healthy),
+        ));
+        let observations = Arc::clone(&inner.observations);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(500),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            observations.load(Ordering::SeqCst),
+            1,
+            "only the pre-listen observation should have run inside one interval"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_report_ok_before_the_first_exchange() {
+        // A listener that has only just started has not reached the service
+        // yet. Recording `ok` for it is the original "never connected" bug in
+        // slower form: if the first request never completes, `/health` reports
+        // a healthy channel forever.
+        let channel_name = format!("test-pending-observation-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Pending),
+        ));
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        // Assert on the *present* entry, not on the absence of one. Indexing a
+        // missing key yields JSON null, which would satisfy both assertions
+        // below while `/health` showed the channel nowhere at all.
+        assert_eq!(
+            component["status"], "starting",
+            "a pending listener must be published as starting, not omitted; got {component}"
+        );
+        assert!(
+            component["last_ok"].is_null(),
+            "nothing has succeeded, so last_ok must be unset; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_listener_does_not_inherit_the_previous_ok_on_the_same_alias() {
+        // A daemon reload rebuilds the channel subsystem inside the same
+        // process, but the health registry lives in a process-wide `OnceLock`
+        // and survives it. So a replacement listener registers under the alias
+        // its predecessor was using, and whatever that predecessor last wrote
+        // is still sitting there.
+        //
+        // That is the reported bug with an extra step: if `Pending` left the
+        // entry untouched, the new listener would inherit `ok` and a fresh
+        // `last_ok` from the old one, and every subsequent heartbeat would
+        // leave it alone. An operator would read a healthy channel whose
+        // current listener has never once reached the service, and the
+        // staleness rule could not save them — the new channel has no recorded
+        // poll result to expire.
+        let channel_name = format!("test-alias-reuse-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+
+        // First incarnation: healthy, so it stamps `ok` and a `last_ok`.
+        let healthy = Arc::new(ObservedChannel::reporting(
+            channel_name.clone(),
+            Some(ListenerHealth::Healthy),
+        ));
+        let first: Arc<dyn Channel> = healthy;
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_handle = spawn_supervised_listener_with_health_interval(
+            first,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            first_cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let before = zeroclaw_runtime::health::snapshot_json();
+        let before = &before["components"][&component_name];
+        assert_eq!(
+            before["status"], "ok",
+            "the first listener should be recorded healthy; got {before}"
+        );
+        let inherited_last_ok = before["last_ok"].clone();
+        assert!(
+            !inherited_last_ok.is_null(),
+            "the first listener should have stamped a last_ok; got {before}"
+        );
+
+        first_cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), first_handle).await;
+        assert!(join.is_ok(), "the first listener should stop on cancel");
+        drop(rx);
+
+        // Second incarnation: same alias, brand new channel that has not
+        // completed an exchange. Its first request never returns.
+        let pending = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Pending),
+        ));
+        let second: Arc<dyn Channel> = pending;
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_handle = spawn_supervised_listener_with_health_interval(
+            second,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            second_cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let after = zeroclaw_runtime::health::snapshot_json();
+        let after = &after["components"][&component_name];
+        assert_eq!(
+            after["status"], "starting",
+            "the replacement listener must not inherit the old ok; got {after}"
+        );
+        assert!(
+            after["last_ok"].is_null(),
+            "the predecessor's last_ok must be invalidated, not carried forward \
+             (was {inherited_last_ok}); got {after}"
+        );
+
+        second_cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), second_handle).await;
+        assert!(
+            join.is_ok(),
+            "the replacement listener should stop on cancel"
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn paced_wrapper_preserves_listener_health_through_to_the_registry() {
+        // Telegram is registered through `PacedChannel::wrap`, which returns a
+        // wrapper whenever `reply_min_interval_secs > 0`. If the wrapper does
+        // not forward `listener_health`, dynamic dispatch hits the trait
+        // default `None`, the supervisor maps that to `ok`, and the false-health
+        // bug survives for anyone with reply pacing configured. This drives the
+        // real production wrapper rather than the bare channel.
+        struct Pacing;
+        impl zeroclaw_config::schema::HasReplyPacing for Pacing {
+            fn reply_min_interval_secs(&self) -> u64 {
+                1
+            }
+            fn reply_queue_depth_max(&self) -> u16 {
+                8
+            }
+        }
+
+        let channel_name = format!("test-paced-health-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Pending),
+        ));
+        let reporter = Arc::clone(&inner);
+        let bare: Arc<dyn Channel> = inner;
+        let paced = crate::paced_channel::PacedChannel::wrap(bare, &Pacing);
+        assert!(
+            !Arc::ptr_eq(&paced, &(Arc::clone(&reporter) as Arc<dyn Channel>)),
+            "non-zero pacing must actually produce the wrapper"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            paced,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending = zeroclaw_runtime::health::snapshot_json();
+        let pending = &pending["components"][&component_name];
+        // As above: require the entry to exist, since a missing key would index
+        // to null and pass a bare `assert_ne!(.., "ok")`.
+        assert_eq!(
+            pending["status"], "starting",
+            "Pending must survive the wrapper and publish the component; got {pending}"
+        );
+        assert!(
+            pending["last_ok"].is_null(),
+            "nothing has succeeded, so last_ok must be unset; got {pending}"
+        );
+
+        reporter.set_report(Some(ListenerHealth::Unhealthy));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let unhealthy = zeroclaw_runtime::health::snapshot_json();
+        let unhealthy = &unhealthy["components"][&component_name];
+        assert_eq!(
+            unhealthy["status"], "error",
+            "Unhealthy must survive the wrapper; got {unhealthy}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_stops_refreshing_ok_once_a_success_goes_stale() {
+        // One successful exchange, then the next one never completes. The old
+        // success must stop counting: otherwise every heartbeat re-stamps a
+        // current `last_ok` for a channel that has not talked to the service
+        // since, which reads as freshly healthy indefinitely.
+        let channel_name = format!("test-stale-observation-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Healthy),
+        ));
+        let reporter = Arc::clone(&inner);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let healthy = zeroclaw_runtime::health::snapshot_json();
+        let healthy = &healthy["components"][&component_name];
+        assert_eq!(
+            healthy["status"], "ok",
+            "a fresh success is recorded as ok; got {healthy}"
+        );
+        let stamped_while_healthy = healthy["last_ok"].clone();
+        assert!(!stamped_while_healthy.is_null(), "expected a last_ok stamp");
+
+        // The channel's own freshness rule has now expired its last success.
+        reporter.set_report(Some(ListenerHealth::Unhealthy));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let stale = zeroclaw_runtime::health::snapshot_json();
+        let stale = &stale["components"][&component_name];
+        assert_eq!(
+            stale["status"], "error",
+            "a stale success must not keep reading healthy; got {stale}"
+        );
+        assert_eq!(
+            stale["last_ok"], stamped_while_healthy,
+            "last_ok must stop advancing once the success went stale; got {stale}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
     }
 
     #[tokio::test]
@@ -31202,13 +32339,8 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1, "expected exactly one reply message");
         assert!(
-            sent[0].contains("does not support vision"),
-            "reply must mention vision capability error, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[0].contains("⚠️ Error"),
-            "reply must start with error prefix, got: {}",
+            sent[0].contains("⚠️ Error: "),
+            "reply must contain the error prefix, got: {}",
             sent[0]
         );
     }
@@ -31344,8 +32476,8 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2, "expected one error and one successful reply");
         assert!(
-            sent[0].contains("does not support vision"),
-            "first reply must mention vision capability error, got: {}",
+            sent[0].contains("⚠️ Error: "),
+            "first reply must be the localized error response, got: {}",
             sent[0]
         );
         assert!(

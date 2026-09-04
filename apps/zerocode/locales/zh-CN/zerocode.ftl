@@ -138,6 +138,7 @@ zc-logs-section-trace = 追踪
 zc-logs-section-attribution = 归属
 zc-logs-section-attributes = 属性
 zc-logs-preview-only = 无法获取完整负载 — 仅显示预览字段。
+zc-logs-persisted-path = 持久化日志：{ $path }
 zc-logs-no-event-selected = 未选择事件
 zc-logs-loading = 加载中…
 zc-logs-search-action-apply = 应用

@@ -42,7 +42,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     );
     prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
-    let preprocessor_env = peer_groups_preprocessor_env();
+    let preprocessor_env = mdbook_xtask_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
@@ -54,8 +54,8 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
         if Some(&entry.code) != primary_locale.as_ref() {
             cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
         }
-        if let Some((key, value)) = &preprocessor_env {
-            cmd.env(key, value);
+        if let Some(env) = &preprocessor_env {
+            cmd.envs(env.iter().map(|(key, value)| (key, value)));
         }
         run_cmd(&mut cmd)?;
     }

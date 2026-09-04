@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod cert_ledger;
 pub mod detect;
 pub mod docker;
 

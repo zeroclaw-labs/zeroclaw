@@ -1150,23 +1150,6 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
-                // Option<T> nested fields delegate with the UNSTRIPPED name
-                // (T carries its own configurable_prefix), so the namespace is
-                // shared with sibling fields: an inner "Unknown property"
-                // falls through so siblings still get their chance, while
-                // real value errors propagate — see
-                // `build_set_prop_delegation_gate` /
-                // `crate::config::is_unknown_property_error`.
-                let option_set_gate = build_set_prop_delegation_gate(
-                    quote! { inner.set_prop(name, value_str) },
-                    quote! { name },
-                    quote! {},
-                );
-                nested_set_prop.push(quote! {
-                    if let Some(inner) = &mut self.#field_ident {
-                        #option_set_gate
-                    }
-                });
                 nested_prop_is_secret.push(quote! {
                     // Extract inner type from Option for static dispatch
                     // We need to know the inner type at compile time
@@ -1175,6 +1158,29 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 // For Option<T> nested, extract inner type for Default::default
                 if let Some(inner_ty) = extract_option_inner(&field.ty) {
                     let inner_ty_tokens = quote! { #inner_ty };
+                    // Option<T> fields share the unstripped dotted namespace
+                    // with their siblings. A missing child must therefore be
+                    // probed transactionally: commit the default only when the
+                    // child accepts the property, preserve None for unrelated
+                    // paths or invalid values, and propagate real value errors.
+                    nested_set_prop.push(quote! {
+                        if let Some(inner) = &mut self.#field_ident {
+                            match inner.set_prop(name, value_str) {
+                                Err(e) if crate::config::is_unknown_property_error(&e, name) => {}
+                                other => return other,
+                            }
+                        } else {
+                            let mut probe = <#inner_ty_tokens as Default>::default();
+                            match probe.set_prop(name, value_str) {
+                                Ok(()) => {
+                                    self.#field_ident = Some(probe);
+                                    return Ok(());
+                                }
+                                Err(e) if crate::config::is_unknown_property_error(&e, name) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    });
                     init_defaults_ops.push(quote! {
                         if self.#field_ident.is_none() {
                             let child_prefix = <#inner_ty_tokens>::configurable_prefix();
@@ -2681,8 +2687,8 @@ fn extract_credential_class(attrs: &[syn::Attribute]) -> syn::Result<proc_macro2
 }
 
 /// Shared `set_prop` delegation gate for nested sites whose dotted namespace
-/// is (or may be) shared with sibling candidates: serde-flatten fields,
-/// `Option<T>` nested fields, and the two-level dotted-key candidate loop.
+/// is (or may be) shared with sibling candidates: serde-flatten fields and
+/// the two-level dotted-key candidate loop.
 /// `Ok` and real value errors return immediately — the path is
 /// confirmed, so a failure is a value problem that must reach the caller.
 /// The generated "Unknown property" marker

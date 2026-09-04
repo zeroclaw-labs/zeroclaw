@@ -87,7 +87,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -270,7 +270,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
       # Cache every target, including Windows. CI's Windows Clippy job caches the
       # same x86_64-pc-windows-msvc target with this exact action, so there is no
@@ -328,11 +328,20 @@ jobs:
           else
             BUILD_CMD="cargo build"
           fi
+          # Always build --no-default-features against the generator's explicit
+          # per-target list: FEATURES already carries the default leaves for the
+          # target, so this applies the canonical per-target exclusions with no
+          # implicit feature drift. Unioning the root crate's defaults back in
+          # (by omitting --no-default-features) would silently re-enable a
+          # feature the generator excludes for this target (e.g. the Prometheus
+          # exporter on ARM).
           $BUILD_CMD --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
-          # Build the zerocode TUI alongside the main binary so it ships in the
-          # release archive. Skipped on Android, which lacks the terminal deps.
+          # Build the zerocode TUI and the zerorelay nominated relay alongside the
+          # main binary so they ship in the release archive. Skipped on Android,
+          # which lacks the terminal deps.
           if [ "${{ matrix.target }}" != "aarch64-linux-android" ]; then
             $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}
+            $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}
           fi
 
       - name: Check binary size
@@ -347,10 +356,12 @@ jobs:
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           extra=""
-          if [ -f target/${{ matrix.target }}/release/zerocode ]; then
-            cp target/${{ matrix.target }}/release/zerocode staging/
-            extra="zerocode"
-          fi
+          for b in zerocode zerorelay; do
+            if [ -f target/${{ matrix.target }}/release/$b ]; then
+              cp target/${{ matrix.target }}/release/$b staging/
+              extra="$extra $b"
+            fi
+          done
           cp -r web/dist staging/web/dist
           cd staging
           tar czf ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
@@ -362,10 +373,12 @@ jobs:
           mkdir -p staging/web
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           extra=""
-          if [ -f target/${{ matrix.target }}/release/zerocode.exe ]; then
-            cp target/${{ matrix.target }}/release/zerocode.exe staging/
-            extra="zerocode.exe"
-          fi
+          for b in zerocode.exe zerorelay.exe; do
+            if [ -f target/${{ matrix.target }}/release/$b ]; then
+              cp target/${{ matrix.target }}/release/$b staging/
+              extra="$extra $b"
+            fi
+          done
           cp -r web/dist staging/web/dist
           cd staging
           7z a ../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }} $extra web/dist
@@ -395,7 +408,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -597,7 +610,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -646,7 +659,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -697,7 +710,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Generate SBOM — SPDX
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: spdx-json
@@ -705,7 +718,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate SBOM — CycloneDX
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           format: cyclonedx-json
