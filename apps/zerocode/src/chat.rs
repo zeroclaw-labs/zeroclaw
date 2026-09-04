@@ -3455,20 +3455,37 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
         state.model_picker.modal_rows(),
     ) {
         let title = crate::i18n::t(title_key);
-        // The Loading placeholder has no cursor: an out-of-range index keeps
-        // its single row unhighlighted.
-        let cursor = state.model_picker.picker().map_or(usize::MAX, |p| p.cursor);
-        crate::widgets::PickerModal::new(&title, rows, cursor).render(f, area);
+        let current_label = crate::i18n::t("zc-picker-current");
+        picker_modal(&state.model_picker, &title, rows, &current_label).render(f, area);
     }
 
     state.input_bar.render_explorer_overlay(f, area);
 }
 
-/// Screen rect of the open picker modal, computed from the same title and rows
-/// the draw path uses so mouse hit-testing lands on the rows the user sees.
+/// The modal widget for an open picker overlay. Both the draw path and the
+/// hit-test geometry build it here so they agree on rows and widths.
+fn picker_modal<'a>(
+    overlay: &ModelPickerOverlay,
+    title: &'a str,
+    rows: &'a [String],
+    current_label: &'a str,
+) -> crate::widgets::PickerModal<'a> {
+    // The Loading placeholder has no picker: an out-of-range cursor keeps its
+    // single row unhighlighted and nothing is marked current.
+    let (cursor, current) = overlay
+        .picker()
+        .map_or((usize::MAX, None), |p| (p.cursor, p.current));
+    crate::widgets::PickerModal::new(title, rows, cursor).with_current(current, current_label)
+}
+
+/// Screen rect of the open picker modal, computed from the same title, rows
+/// and current marker the draw path uses so mouse hit-testing lands on the
+/// rows the user sees.
 fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> Option<Rect> {
     let title = crate::i18n::t(model_picker.title_key()?);
-    crate::widgets::PickerModal::area_for(&title, model_picker.modal_rows()?, area)
+    let rows = model_picker.modal_rows()?;
+    let current_label = crate::i18n::t("zc-picker-current");
+    picker_modal(model_picker, &title, rows, &current_label).area(area)
 }
 
 fn resume_queue_chord_label() -> String {
@@ -9185,6 +9202,38 @@ mod tests {
         ));
         assert_eq!(stage1.title_key(), Some("zc-model-provider-picker-title"));
         assert_eq!(stage1.modal_rows(), Some(providers.as_slice()));
+    }
+
+    #[test]
+    fn picker_rows_stay_hit_testable_with_the_current_marker() {
+        let mut s = state();
+        s.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
+            vec!["claude-opus-4-8".into(), "claude-sonnet-4-6".into()],
+            Some("claude-sonnet-4-6"),
+        ));
+        let area = Rect::new(0, 0, 80, 20);
+
+        let modal = model_picker_overlay_area(&s.model_picker, area).unwrap();
+        let plain = crate::widgets::PickerModal::area_for(
+            &crate::i18n::t("zc-model-picker-title"),
+            s.model_picker.modal_rows().unwrap(),
+            area,
+        )
+        .unwrap();
+
+        assert!(
+            modal.width > plain.width,
+            "the current suffix widens the modal the mouse is tested against"
+        );
+        assert_eq!(s.model_picker.picker().and_then(|p| p.current), Some(1));
+        assert_eq!(
+            mouse::list_click_index(modal.y + 1, modal, 0, s.model_picker.item_count()),
+            Some(0)
+        );
+        assert_eq!(
+            mouse::list_click_index(modal.y + 2, modal, 0, s.model_picker.item_count()),
+            Some(1)
+        );
     }
 
     #[test]

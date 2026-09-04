@@ -377,6 +377,7 @@ zc-model-catalog-no-provider = 設定からこのエージェントの model_pro
 zc-model-catalog-empty = アクティブな model_provider に利用可能なモデルがありません。
 zc-model-catalog-loading = モデルを読み込み中…
 zc-model-provider-catalog-failed = model_providers を読み込めませんでした: { $error }
+zc-picker-current = 現在
 zc-chat-label-you = あなた:
 zc-chat-label-agent = エージェント:
 zc-chat-loading-agents = エージェントを読み込み中…

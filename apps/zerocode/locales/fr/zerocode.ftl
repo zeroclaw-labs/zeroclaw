@@ -377,6 +377,7 @@ zc-model-catalog-no-provider = Impossible de résoudre le model_provider de cet 
 zc-model-catalog-empty = Aucun modèle disponible pour le model_provider actif.
 zc-model-catalog-loading = Chargement des modèles…
 zc-model-provider-catalog-failed = Impossible de charger les model_providers : { $error }
+zc-picker-current = actuel
 zc-chat-label-you = Vous :
 zc-chat-label-agent = Agent :
 zc-chat-loading-agents = Chargement des agents…

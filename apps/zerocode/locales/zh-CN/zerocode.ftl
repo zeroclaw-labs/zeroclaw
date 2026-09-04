@@ -377,6 +377,7 @@ zc-model-catalog-no-provider = 无法从配置中解析此代理的 model_provid
 zc-model-catalog-empty = 当前激活的 model_provider 没有可用模型。
 zc-model-catalog-loading = 正在加载模型…
 zc-model-provider-catalog-failed = 无法加载 model_providers：{ $error }
+zc-picker-current = 当前
 zc-chat-label-you = 你：
 zc-chat-label-agent = 代理：
 zc-chat-loading-agents = 正在加载代理…

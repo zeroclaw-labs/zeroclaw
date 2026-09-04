@@ -451,6 +451,9 @@ zc-model-catalog-empty = No models available for the active model_provider.
 zc-model-catalog-loading = Loading models…
 zc-model-provider-catalog-failed = Could not load model_providers: { $error }
 
+# Picker modals: dim suffix on the row whose value is currently in force
+zc-picker-current = current
+
 zc-chat-label-you = You:
 zc-chat-label-agent = Agent:
 
