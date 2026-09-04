@@ -524,6 +524,7 @@ impl Chat {
                 );
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
+                Self::refresh_thinking_options(&self.rpc, &mut state).await;
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
                 // empty history. Fresh sessions have nothing to load.
@@ -615,6 +616,7 @@ impl Chat {
                 state.reset_for_session(s.session_id, None, Self::resolve_todo_settings(current));
                 state.cwd = s.workspace_dir;
                 Self::refresh_model_identity(rpc, state).await;
+                Self::refresh_thinking_options(rpc, state).await;
                 state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
             }
             Err(e) => {
@@ -2067,6 +2069,7 @@ impl Chat {
         state.cwd = rehydrated.workspace_dir;
 
         Self::refresh_model_identity(rpc, state).await;
+        Self::refresh_thinking_options(rpc, state).await;
         state.load_history(history.messages, pane_kind == PaneKind::Acp);
     }
 
@@ -2112,6 +2115,13 @@ impl Chat {
                 if provider_ref.is_some() {
                     state.input_bar.set_model_catalog(String::new(), Vec::new());
                 }
+                // A model or provider change can change what thinking the
+                // session offers: take the options the daemon echoed and
+                // re-read only when it left them out.
+                match result.thinking_options {
+                    Some(options) => state.set_thinking_identity(options),
+                    None => Self::refresh_thinking_options(rpc, state).await,
+                }
             }
             Err(e) => {
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
@@ -2129,6 +2139,29 @@ impl Chat {
             let model = Self::configured_model(rpc, &provider_ref).await;
             state.set_model_identity(Some(&provider_ref), model.as_deref());
         }
+    }
+
+    /// Re-read the thinking options the session's model offers and render
+    /// exactly those. Quiet on the info bar: an older daemon answers
+    /// METHOD_NOT_FOUND and simply shows no effort/display title segments,
+    /// and a fault must not spam the bar at every session boundary (it is
+    /// logged so it can be diagnosed). Either way the previous options are
+    /// dropped rather than shown stale.
+    async fn refresh_thinking_options(rpc: &RpcClient, state: &mut ChatState) {
+        let options = match rpc.session_thinking_options(&state.session_id).await {
+            Ok(result) => result.thinking_options.unwrap_or_default(),
+            Err(error) => {
+                let older_daemon = crate::client::DaemonRpcError::from_anyhow(&error)
+                    .is_some_and(crate::client::DaemonRpcError::is_method_not_found);
+                if !older_daemon {
+                    eprintln!(
+                        "zerocode: reading thinking options failed ({error:#}); showing none"
+                    );
+                }
+                crate::client::ThinkingOptionsResult::default()
+            }
+        };
+        state.set_thinking_identity(options);
     }
 
     /// Resolve the agent's configured model_provider reference (`<type>.<alias>`)
@@ -2573,6 +2606,7 @@ impl Chat {
                         let tx = self.model_fetch_tx.clone();
                         Self::open_model_picker(&rpc, &tx, state).await;
                     }
+                    TitleHitTarget::ThinkingLevel | TitleHitTarget::ThinkingDisplay => {}
                 }
                 return;
             }
@@ -5352,6 +5386,27 @@ enum TitleHitTarget {
     Agent,
     ModelProvider,
     Model,
+    ThinkingLevel,
+    ThinkingDisplay,
+}
+
+/// Title segment for a thinking control (`effort:high`, `display:summarized`):
+/// present only while the model offers choices for it, labeled with the value
+/// in force. The prefix is the slash command's own name rather than localized
+/// copy, like the provider ref and model segments beside it.
+fn thinking_title_segment(
+    options: &crate::client::ThinkingOptionsResult,
+    control: crate::client::ThinkingControl,
+) -> Option<String> {
+    let (offered, current, _) = options.control(control);
+    if offered.is_empty() {
+        return None;
+    }
+    let prefix = match control {
+        crate::client::ThinkingControl::Level => "effort",
+        crate::client::ThinkingControl::Display => "display",
+    };
+    Some(format!("{prefix}:{}", current?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5628,6 +5683,11 @@ pub struct ChatState {
     pub info_message: Option<crate::widgets::InfoMessage>,
     /// Active model / model_provider picker overlay.
     model_picker: ModelPickerOverlay,
+    /// The thinking controls the session's model offers (levels, displays,
+    /// the values in force and their sources), exactly as the daemon last
+    /// described them. Empty lists mean nothing is adjustable, or a daemon
+    /// that predates the controls.
+    thinking: crate::client::ThinkingOptionsResult,
     /// Live TodoWrite tracker panel for this session. Read-only; fed by
     /// `SessionUpdate::Plan`, toggled by the user, laid out per config.
     todo_tracker: crate::todo_tracker::TodoTracker,
@@ -5716,6 +5776,7 @@ impl ChatState {
             queue_scroll: 0,
             info_message: None,
             model_picker: ModelPickerOverlay::None,
+            thinking: crate::client::ThinkingOptionsResult::default(),
             todo_tracker: crate::todo_tracker::TodoTracker::from_settings(todo_settings),
         }
     }
@@ -6589,7 +6650,7 @@ impl ChatState {
 
     fn title_parts(&self) -> Vec<(Option<TitleHitTarget>, String)> {
         let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
-        let mut parts: Vec<(Option<TitleHitTarget>, String)> = Vec::with_capacity(5);
+        let mut parts: Vec<(Option<TitleHitTarget>, String)> = Vec::with_capacity(7);
         parts.push((Some(TitleHitTarget::Agent), self.agent_alias.clone()));
         if let Some(ref name) = self.session_name {
             parts.push((None, format!("— {name}")));
@@ -6600,6 +6661,16 @@ impl ChatState {
         }
         if let Some(ref model) = self.model {
             parts.push((Some(TitleHitTarget::Model), model.clone()));
+        }
+        if let Some(segment) =
+            thinking_title_segment(&self.thinking, crate::client::ThinkingControl::Level)
+        {
+            parts.push((Some(TitleHitTarget::ThinkingLevel), segment));
+        }
+        if let Some(segment) =
+            thinking_title_segment(&self.thinking, crate::client::ThinkingControl::Display)
+        {
+            parts.push((Some(TitleHitTarget::ThinkingDisplay), segment));
         }
         parts
     }
@@ -6640,6 +6711,13 @@ impl ChatState {
         if let Some(m) = model {
             self.model = Some(m.to_string());
         }
+    }
+
+    /// Replace the session's thinking identity with the options block the
+    /// daemon returned, from `session/thinking-options` or echoed by
+    /// `session/configure`.
+    pub fn set_thinking_identity(&mut self, options: crate::client::ThinkingOptionsResult) {
+        self.thinking = options;
     }
 
     #[cfg(test)]
@@ -7484,6 +7562,7 @@ impl ChatState {
         self.session_name = name;
         self.model_provider_ref = None;
         self.model = None;
+        self.thinking = crate::client::ThinkingOptionsResult::default();
         self.input_bar.reset();
         let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.entries.clear();
@@ -9120,6 +9199,128 @@ mod tests {
         assert_eq!(s.title_hit_target_at(35, 4), None);
     }
 
+    /// Options as a Claude model with native thinking offers them, with a
+    /// session-scoped level and an alias-scoped display.
+    fn offered_thinking() -> crate::client::ThinkingOptionsResult {
+        crate::client::ThinkingOptionsResult {
+            levels: vec!["low".into(), "high".into()],
+            displays: vec!["omitted".into(), "summarized".into()],
+            current_level: Some("high".into()),
+            level_source: crate::client::ThinkingSource::Session,
+            current_display: Some("summarized".into()),
+            display_source: crate::client::ThinkingSource::Alias,
+        }
+    }
+
+    #[test]
+    fn title_shows_effort_and_display_only_when_offered() {
+        let mut s = ChatState::new(
+            "abcdef1234".to_string(),
+            "ag".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.set_model_identity(Some("anthropic.default"), Some("claude-fable-5-1"));
+        assert_eq!(
+            s.title(),
+            "ag  abcdef1  anthropic.default  claude-fable-5-1"
+        );
+
+        s.set_thinking_identity(offered_thinking());
+        assert_eq!(
+            s.title(),
+            "ag  abcdef1  anthropic.default  claude-fable-5-1  effort:high  display:summarized"
+        );
+
+        // Levels without displays (Opus 4.6): only the effort segment.
+        s.set_thinking_identity(crate::client::ThinkingOptionsResult {
+            levels: vec!["low".into(), "medium".into(), "high".into(), "max".into()],
+            current_level: Some("medium".into()),
+            level_source: crate::client::ThinkingSource::ModelDefault,
+            ..Default::default()
+        });
+        assert_eq!(
+            s.title(),
+            "ag  abcdef1  anthropic.default  claude-fable-5-1  effort:medium"
+        );
+
+        // Nothing adjustable (a non-Claude provider, or an older daemon).
+        s.set_thinking_identity(crate::client::ThinkingOptionsResult::default());
+        assert_eq!(
+            s.title(),
+            "ag  abcdef1  anthropic.default  claude-fable-5-1"
+        );
+
+        // A list without a value in force cannot label a segment.
+        s.set_thinking_identity(crate::client::ThinkingOptionsResult {
+            levels: vec!["low".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            s.title(),
+            "ag  abcdef1  anthropic.default  claude-fable-5-1"
+        );
+    }
+
+    #[test]
+    fn title_hit_rects_target_thinking_segments_after_the_model() {
+        let mut s = ChatState::new(
+            "abcdef1234".to_string(),
+            "ag".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.set_model_identity(Some("openai.work"), Some("gpt-5"));
+        s.set_thinking_identity(offered_thinking());
+
+        s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
+
+        // The existing segments keep their columns.
+        assert_eq!(s.title_hit_target_at(12, 4), Some(TitleHitTarget::Agent));
+        assert_eq!(
+            s.title_hit_target_at(25, 4),
+            Some(TitleHitTarget::ModelProvider)
+        );
+        assert_eq!(s.title_hit_target_at(38, 4), Some(TitleHitTarget::Model));
+        // "effort:high" follows "gpt-5" (cols 38..42) after the two-cell gap.
+        assert_eq!(s.title_hit_target_at(44, 4), None);
+        assert_eq!(
+            s.title_hit_target_at(45, 4),
+            Some(TitleHitTarget::ThinkingLevel)
+        );
+        assert_eq!(
+            s.title_hit_target_at(55, 4),
+            Some(TitleHitTarget::ThinkingLevel)
+        );
+        assert_eq!(s.title_hit_target_at(56, 4), None);
+        // "display:summarized" starts at col 58 and spans 18 cells.
+        assert_eq!(
+            s.title_hit_target_at(58, 4),
+            Some(TitleHitTarget::ThinkingDisplay)
+        );
+        assert_eq!(
+            s.title_hit_target_at(75, 4),
+            Some(TitleHitTarget::ThinkingDisplay)
+        );
+        assert_eq!(s.title_hit_target_at(76, 4), None);
+        assert_eq!(s.title_hit_target_at(58, 5), None);
+    }
+
+    #[test]
+    fn reset_for_session_clears_thinking_identity() {
+        let mut s = state();
+        s.set_model_identity(Some("anthropic.default"), Some("claude-fable-5-1"));
+        s.set_thinking_identity(offered_thinking());
+        assert!(s.title().contains("effort:high"));
+
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        assert_eq!(s.thinking, crate::client::ThinkingOptionsResult::default());
+        assert_eq!(s.title(), "myagent  sess-2");
+    }
+
     #[test]
     fn model_provider_picker_overlay_rows_are_hit_testable() {
         let mut s = state();
@@ -9909,6 +10110,26 @@ mod tests {
         assert_eq!(request["params"]["prefix"], "agents.beta.model_provider");
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        let request = next_rpc_request(&mut rx, "resume should read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-beta");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-beta",
+                "overrides": {},
+                "thinking_options": {
+                    "levels": ["low", "medium", "high", "xhigh", "max"],
+                    "displays": ["omitted", "summarized", "updates"],
+                    "current_level": "high",
+                    "level_source": "profile",
+                    "current_display": "summarized",
+                    "display_source": "model_default"
+                }
+            }),
+        );
+
         let request = next_rpc_request(&mut rx, "resume should load history").await;
         assert_eq!(request["method"], method::SESSION_MESSAGES);
         assert_eq!(request["params"]["session_id"], "sess-beta");
@@ -9934,6 +10155,12 @@ mod tests {
         assert_eq!(state.session_id, "sess-beta");
         assert_eq!(state.agent_alias, "beta");
         assert_eq!(state.cwd.as_deref(), Some("/tmp/beta"));
+        assert_eq!(state.thinking.current_level.as_deref(), Some("high"));
+        assert!(
+            state.title().ends_with("effort:high  display:summarized"),
+            "title: {}",
+            state.title()
+        );
     }
 
     #[tokio::test]
@@ -10017,6 +10244,17 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        // An older daemon without the thinking controls: the session still
+        // opens and the title simply carries no effort/display segments.
+        let request = next_rpc_request(&mut rx, "fresh session should read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            "method not found: session/thinking-options",
+        );
+
         let chat = tokio::time::timeout(Duration::from_secs(2), fresh)
             .await
             .expect("fresh start should finish")
@@ -10025,6 +10263,15 @@ mod tests {
             panic!("Esc should enter a fresh ACP session");
         };
         assert_eq!(state.session_id, "sess-fresh");
+        assert_eq!(
+            state.thinking,
+            crate::client::ThinkingOptionsResult::default()
+        );
+        assert!(
+            !state.title().contains("effort:"),
+            "title: {}",
+            state.title()
+        );
     }
 
     #[tokio::test]
@@ -10080,6 +10327,17 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         assert_eq!(request["params"]["prefix"], "agents.alpha.model_provider");
         respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let request =
+            next_rpc_request(&mut rx, "fresh fallback should read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-fresh");
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "provider unavailable",
+        );
 
         let chat = tokio::time::timeout(Duration::from_secs(2), init)
             .await
@@ -10208,11 +10466,211 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        let request = next_rpc_request(&mut rx, "restart should read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-fresh");
+        // A daemon that answers without the block offers nothing adjustable.
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "overrides": {} }),
+        );
+
         let phase = tokio::time::timeout(Duration::from_secs(2), restart)
             .await
             .expect("restart should finish")
             .unwrap();
         assert!(phase.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_switch_takes_thinking_options_from_the_configure_echo() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = state();
+
+        let switch = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::apply_session_override(
+                    &client,
+                    &mut state,
+                    crate::client::SessionOverrides {
+                        model: Some("claude-fable-5-1".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                state
+            })
+        };
+
+        let request = next_rpc_request(&mut rx, "model switch should configure the session").await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        assert_eq!(request["params"]["session_id"], "sess-1");
+        assert_eq!(
+            request["params"]["overrides"],
+            serde_json::json!({ "model": "claude-fable-5-1" })
+        );
+        assert!(request["params"].get("reset").is_none());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "model": "claude-fable-5-1" },
+                "thinking_options": {
+                    "levels": ["low", "medium", "high", "xhigh", "max"],
+                    "displays": ["omitted", "summarized", "updates"],
+                    "current_level": "high",
+                    "level_source": "profile",
+                    "current_display": "summarized",
+                    "display_source": "alias"
+                }
+            }),
+        );
+
+        let state = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("model switch should finish")
+            .unwrap();
+        assert_eq!(state.model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(state.thinking.current_level.as_deref(), Some("high"));
+        assert_eq!(
+            state.thinking.displays,
+            ["omitted", "summarized", "updates"]
+        );
+        assert_eq!(
+            state.title(),
+            "myagent  sess-1  claude-fable-5-1  effort:high  display:summarized"
+        );
+        // The echoed block is authoritative: no separate options read follows.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a configure echo carrying thinking_options must not trigger a re-read"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_switch_reads_thinking_options_when_configure_omits_them() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = state();
+        state.set_thinking_identity(offered_thinking());
+
+        let switch = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::apply_session_override(
+                    &client,
+                    &mut state,
+                    crate::client::SessionOverrides {
+                        model: Some("claude-opus-4-6".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                state
+            })
+        };
+
+        let request = next_rpc_request(&mut rx, "model switch should configure the session").await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "model": "claude-opus-4-6" }
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "model switch should re-read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-1");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "model": "claude-opus-4-6" },
+                "thinking_options": {
+                    "levels": ["low", "medium", "high", "max"],
+                    "displays": [],
+                    "current_level": "medium",
+                    "level_source": "model_default"
+                }
+            }),
+        );
+
+        let state = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("model switch should finish")
+            .unwrap();
+        assert_eq!(state.thinking.levels, ["low", "medium", "high", "max"]);
+        assert!(state.thinking.displays.is_empty());
+        assert_eq!(
+            state.title(),
+            "myagent  sess-1  claude-opus-4-6  effort:medium"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_switch_drops_stale_thinking_options_when_the_re_read_fails() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = state();
+        state.set_thinking_identity(offered_thinking());
+
+        let switch = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::apply_session_override(
+                    &client,
+                    &mut state,
+                    crate::client::SessionOverrides {
+                        model: Some("gpt-5".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+                state
+            })
+        };
+
+        let request = next_rpc_request(&mut rx, "model switch should configure the session").await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-1", "overrides": { "model": "gpt-5" } }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "model switch should re-read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        respond_err(
+            &rpc,
+            &request,
+            crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            "method not found: session/thinking-options",
+        );
+
+        let state = tokio::time::timeout(Duration::from_secs(2), switch)
+            .await
+            .expect("model switch should finish")
+            .unwrap();
+        assert_eq!(
+            state.thinking,
+            crate::client::ThinkingOptionsResult::default()
+        );
+        assert_eq!(state.title(), "myagent  sess-1  gpt-5");
     }
 
     #[tokio::test]
@@ -10335,6 +10793,24 @@ mod tests {
         assert_eq!(request["method"], method::CONFIG_LIST);
         respond_ok(&rpc, &request, serde_json::json!([]));
 
+        let request = next_rpc_request(&mut rx, "double-click should read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(request["params"]["session_id"], "sess-new");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-new",
+                "overrides": {},
+                "thinking_options": {
+                    "levels": ["low", "medium", "high", "max"],
+                    "displays": [],
+                    "current_level": "low",
+                    "level_source": "session"
+                }
+            }),
+        );
+
         let chat = tokio::time::timeout(Duration::from_secs(2), switch)
             .await
             .expect("double-click switch should finish")
@@ -10346,6 +10822,12 @@ mod tests {
         assert_eq!(state.agent_alias, "beta");
         assert_eq!(state.cwd.as_deref(), Some("/tmp/new"));
         assert!(matches!(state.session_overlay, SessionOverlay::None));
+        assert_eq!(state.thinking.current_level.as_deref(), Some("low"));
+        assert!(
+            state.title().ends_with("effort:low"),
+            "title: {}",
+            state.title()
+        );
     }
 
     #[tokio::test]
