@@ -9,6 +9,7 @@ use serde_json::Value;
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::{SessionOverrideField, SessionOverrides};
+pub use crate::rpc::thinking_options::ThinkingOptions;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
 pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -274,6 +275,19 @@ rpc_type! {
     pub struct SessionConfigureResult {
         pub session_id: String,
         pub overrides: SessionOverrides,
+        /// What the session can adjust about the reasoning after this call,
+        /// computed for the merged model.
+        pub thinking_options: ThinkingOptions,
+    }
+}
+
+rpc_type! {
+    /// `session/thinking-options`: the block `session/configure` returns,
+    /// without changing anything.
+    pub struct SessionThinkingOptionsResult {
+        pub session_id: String,
+        pub overrides: SessionOverrides,
+        pub thinking_options: ThinkingOptions,
     }
 }
 

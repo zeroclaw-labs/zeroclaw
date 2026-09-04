@@ -8,7 +8,7 @@
 //! within a tool round. A session is therefore offered a level only where the
 //! model reads it natively.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_providers::claude_models::{
@@ -73,7 +73,7 @@ pub fn accepted_levels(
 }
 
 /// Where the level a turn will use comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LevelSource {
     /// A `session/configure` override.
@@ -85,7 +85,7 @@ pub enum LevelSource {
 }
 
 /// Where the display a turn will use comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplaySource {
     /// A `session/configure` override.
@@ -97,19 +97,19 @@ pub enum DisplaySource {
 }
 
 /// What a session can adjust, and what it currently has.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingOptions {
     pub model_provider: String,
     pub model: String,
     pub levels: Vec<ThinkingLevel>,
     pub displays: Vec<ThinkingDisplay>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_level: Option<ThinkingLevel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level_source: Option<LevelSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_display: Option<ThinkingDisplay>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_source: Option<DisplaySource>,
 }
 
