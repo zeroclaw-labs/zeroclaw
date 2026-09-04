@@ -4,6 +4,7 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
@@ -1153,6 +1154,7 @@ impl WhatsAppWebChannel {
     }
 
     /// Render a WhatsApp pairing QR payload into terminal-friendly text.
+    /// Uses compact Unicode blocks (Dense1x2) and adapts to terminal width.
     #[cfg(feature = "whatsapp-web")]
     fn render_pairing_qr(code: &str) -> Result<String> {
         let payload = code.trim();
@@ -1171,10 +1173,51 @@ impl WhatsAppWebChannel {
             anyhow::Error::msg(format!("Failed to encode WhatsApp Web QR payload: {err}"))
         })?;
 
-        Ok(qr
+        // Detect terminal width to choose appropriate rendering
+        let term_width = Self::detect_terminal_width();
+        
+        // Render with Dense1x2 (compact Unicode blocks, 2 pixels per char)
+        let rendered = qr
             .render::<qrcode::render::unicode::Dense1x2>()
-            .quiet_zone(true)
-            .build())
+            .quiet_zone(false)  // Disable quiet zone to save space
+            .build();
+        
+        // If terminal is too narrow, try reducing module dimensions
+        if term_width > 0 && Self::estimate_qr_width(&rendered) > term_width {
+            // Reduce module dimensions to fit
+            return Ok(qr
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(false)
+                .module_dimensions(1, 1)  // Smaller modules
+                .build());
+        }
+        
+        Ok(rendered)
+    }
+
+    /// Detect terminal width, returns 0 if unknown
+    #[cfg(feature = "whatsapp-web")]
+    fn detect_terminal_width() -> usize {
+        // Try standard approach first
+        if let Some(size) = terminal_size::terminal_size() {
+            return size.0.0 as usize;
+        }
+        // Fallback to environment variable
+        if let Ok(cols) = std::env::var("COLUMNS") {
+            if let Ok(width) = cols.parse::<usize>() {
+                return width;
+            }
+        }
+        0
+    }
+
+    /// Estimate the rendered QR code width in characters
+    #[cfg(feature = "whatsapp-web")]
+    fn estimate_qr_width(rendered: &str) -> usize {
+        rendered.lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -2939,18 +2982,27 @@ impl Channel for WhatsAppWebChannel {
                                 );
                                 match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
+                                        // Print to stderr with explicit flush
                                         eprintln!();
                                         eprintln!(
                                             "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
                                         );
                                         eprintln!("{rendered}");
                                         eprintln!();
+                                        // Also save to file for reliable access
+                                        let qr_path = std::env::temp_dir().join(format!("zeroclaw_whatsapp_qr_{}.txt", alias));
+                                        let _ = tokio::fs::write(&qr_path, &rendered).await;
+                                        eprintln!("QR code also saved to: {}", qr_path.display());
+                                        eprintln!();
+                                        // Explicit flush to ensure output appears
+                                        let _ = std::io::stderr().flush();
                                     }
                                     Err(err) => {
                                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to render pairing QR in terminal: {}", err));
                                         eprintln!();
                                         eprintln!("WhatsApp Web QR payload: {code}");
                                         eprintln!();
+                                        let _ = std::io::stderr().flush();
                                     }
                                 }
                             }
