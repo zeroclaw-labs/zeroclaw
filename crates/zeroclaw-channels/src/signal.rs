@@ -913,6 +913,7 @@ impl Channel for SignalChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
 
         let (tx, rx) = oneshot::channel();

@@ -4978,8 +4978,14 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
+        // Back-to-back cards from one message are otherwise indistinguishable
+        // before the operator taps, so say which call this is.
+        let position = Self::escape_html(&crate::util::approval_position_line(
+            request.position_counter(),
+        ));
         let text = format!(
             "\u{1f527} <b>{heading}</b>\n\n\
+             {position}\
              {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
              {tap_instruction}",
@@ -5037,9 +5043,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                     "Telegram sendMessage (approval) with HTML failed; retrying without parse_mode"
                 );
 
-                // Fallback: plain text, no parse_mode, keep the buttons
+                // Fallback: plain text, no parse_mode, keep the buttons.
+                // Unescaped position line: this send has no parse_mode, so the
+                // HTML-escaped one above would show its entities literally.
+                let plain_position =
+                    crate::util::approval_position_line(request.position_counter());
                 let plain_text = format!(
-                    "🔧 {heading}\n\n{tool_label}: {}\n{}\n\n{tap_instruction}",
+                    "🔧 {heading}\n\n{plain_position}{tool_label}: {}\n{}\n\n{tap_instruction}",
                     request.tool_name, request.arguments_summary
                 );
                 let mut plain_body = serde_json::json!({
@@ -12530,6 +12540,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -12622,6 +12633,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -12762,6 +12774,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -12803,6 +12816,153 @@ mod tests {
         }
         assert_eq!(ids.len(), 1, "all three buttons share one approval id");
         assert_eq!(actions, vec!["approve", "deny", "always"]);
+    }
+
+    #[tokio::test]
+    async fn approval_card_shows_the_batch_position_in_html_and_in_the_plain_fallback() {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // When the HTML send is rejected, the card is rebuilt from scratch
+        // without `parse_mode` and resent with the same buttons. That rebuild
+        // is a second renderer, and it has to carry the position too — the
+        // operator sees the fallback card, not the one that failed.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("parse_mode"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+        };
+
+        // Nothing resolves the pending oneshot; the short timeout returns a
+        // Deny instead of hanging the test.
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "HTML send then plain-text retry");
+
+        let raw = crate::util::approval_position_line(Some((2, 3)));
+        let raw = raw.trim_end();
+        assert!(!raw.is_empty(), "helper should render a 2-of-3 line");
+        // The two sends escape differently, so the expectations differ. Several
+        // locales put an apostrophe in this line (fr: `Appel d'outil 2 sur 3`),
+        // which the HTML send escapes and the fallback must not; comparing both
+        // against the raw string passes only in locales with nothing to escape.
+        let escaped = TelegramChannel::escape_html(raw);
+
+        let html: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            html["parse_mode"], "HTML",
+            "the first send is the HTML card"
+        );
+        let html_text = html["text"].as_str().unwrap();
+        assert!(
+            html_text.contains(escaped.as_str()),
+            "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
+        );
+        if escaped != raw {
+            assert!(
+                !html_text.contains(raw),
+                "the HTML position line must be escaped, not raw; got {html_text}"
+            );
+        }
+
+        let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            plain.get("parse_mode").is_none(),
+            "the retry is the plain-text fallback"
+        );
+        let plain_text = plain["text"].as_str().unwrap();
+        assert!(
+            plain_text.contains(raw),
+            "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"
+        );
+        // With no parse_mode, an escaped line would show its entities literally.
+        // Only meaningful in a locale where the two forms actually differ.
+        if escaped != raw {
+            assert!(
+                !plain_text.contains(escaped.as_str()),
+                "the fallback position line must not be HTML-escaped; got {plain_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_card_omits_the_position_for_a_single_call() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+        };
+
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        assert_eq!(
+            body["text"],
+            format!(
+                "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
+            ),
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     #[test]

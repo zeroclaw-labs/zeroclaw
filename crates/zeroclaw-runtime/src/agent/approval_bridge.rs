@@ -305,6 +305,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         }
     }
 

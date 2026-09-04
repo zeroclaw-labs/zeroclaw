@@ -253,7 +253,15 @@ fn build_approval_card(
     approval_id: &str,
     tool_name: &str,
     arguments_summary: &str,
+    position: Option<(u32, u32)>,
 ) -> serde_json::Value {
+    // Two pending cards from one turn are otherwise identical until tapped.
+    // The shared line is newline-terminated; Lark's markdown needs the blank
+    // line to render it as its own paragraph, and an empty line stays empty.
+    let position_line = match crate::util::approval_position_line(position).as_str() {
+        "" => String::new(),
+        line => format!("{line}\n"),
+    };
     let make_button = |label: &str, button_type: &str, decision: &str| {
         serde_json::json!({
             "tag": "button",
@@ -283,7 +291,7 @@ fn build_approval_card(
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": format!("**Tool:** `{tool_name}`\n\n{arguments_summary}")
+                    "content": format!("{position_line}**Tool:** `{tool_name}`\n\n{arguments_summary}")
                 },
                 {
                     "tag": "column_set",
@@ -3177,8 +3185,12 @@ impl Channel for LarkChannel {
         request: &zeroclaw_api::channel::ChannelApprovalRequest,
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let approval_id = Uuid::new_v4().to_string();
-        let card =
-            build_approval_card(&approval_id, &request.tool_name, &request.arguments_summary);
+        let card = build_approval_card(
+            &approval_id,
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
+        );
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
@@ -6106,7 +6118,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_contains_all_three_buttons() {
-        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo");
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", None);
 
         // Card 2.0 schema lock — guard against future regressions where the
         // send-side schema drifts back to 1.0 (which Feishu's PATCH endpoint
@@ -6139,7 +6151,7 @@ mod tests {
 
     #[test]
     fn build_approval_card_round_trips_approval_id_in_all_buttons() {
-        let card = build_approval_card("approval-abc-123", "tool", "args");
+        let card = build_approval_card("approval-abc-123", "tool", "args", None);
         let columns = card["body"]["elements"][1]["columns"]
             .as_array()
             .expect("columns array");
@@ -6152,10 +6164,34 @@ mod tests {
     }
 
     #[test]
+    fn build_approval_card_shows_the_batch_position() {
+        let card = build_approval_card("test-id", "shell", "rm -rf /tmp/foo", Some((2, 3)));
+        let content = card["body"]["elements"][0]["content"]
+            .as_str()
+            .expect("markdown content");
+        let expected = crate::util::approval_position_line(Some((2, 3)));
+        assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
+        assert!(
+            content.starts_with(expected.trim_end()),
+            "the position leads the card body; got {content}"
+        );
+    }
+
+    #[test]
+    fn build_approval_card_omits_the_position_for_a_single_call() {
+        let single = build_approval_card("test-id", "shell", "args", Some((1, 1)));
+        let none = build_approval_card("test-id", "shell", "args", None);
+        assert_eq!(
+            single, none,
+            "a one-call batch renders exactly as an unpositioned card"
+        );
+    }
+
+    #[test]
     fn build_approval_card_and_resolved_card_share_schema_version() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let send_card = build_approval_card("id", "shell", "args");
+        let send_card = build_approval_card("id", "shell", "args", None);
         let patch_card =
             build_resolved_approval_card("shell", "args", ChannelApprovalResponse::Approve);
 
@@ -6943,6 +6979,7 @@ mod tests {
                         tool_name: "demo_tool".to_string(),
                         arguments_summary: "demo args".to_string(),
                         raw_arguments: None,
+                        position: None,
                     },
                 )
                 .await

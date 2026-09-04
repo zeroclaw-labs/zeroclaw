@@ -64,6 +64,19 @@ interface channel {
         in-reply-to: option<string>,
     }
 
+    /// Where a tool call sits in the batch the model issued for one turn.
+    ///
+    /// This is the raw batch position, not an approval count: `index` counts
+    /// every call the model asked for, including calls that never reach an
+    /// approval prompt.
+    @unstable(feature = plugins-wit-v0)
+    record approval-position {
+        /// 1-based position of this call within the batch.
+        index: u32,
+        /// Number of calls in the batch.
+        total: u32,
+    }
+
     /// A compact description of a tool call presented to the operator for
     /// approval.
     @unstable(feature = plugins-wit-v0)
@@ -72,6 +85,9 @@ interface channel {
         arguments-summary: string,
         /// JSON-encoded raw arguments; `none` when not available.
         raw-arguments: option<json-string>,
+        /// Batch position, when the runtime knows it; `none` on paths that
+        /// approve a single call with no batch to count.
+        position: option<approval-position>,
     }
 
     /// The operator's response to a channel-presented approval prompt.
