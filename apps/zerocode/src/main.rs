@@ -49,6 +49,7 @@ mod test_support;
 mod text_navigation;
 mod text_selection;
 mod theme;
+mod thought_layout;
 mod todo_tracker;
 mod turn_status;
 mod widgets;
