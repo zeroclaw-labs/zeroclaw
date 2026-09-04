@@ -282,6 +282,7 @@ impl PostgresMemory {
         let timestamp: DateTime<Utc> = row.get("created_at");
 
         Ok(MemoryEntry {
+            principal_id: None,
             id: row.get("id"),
             key: row.get("key"),
             content: row.get("content"),

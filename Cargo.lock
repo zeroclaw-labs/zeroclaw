@@ -13680,6 +13680,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "parking_lot",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "strum 0.28.0",
@@ -14386,6 +14387,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "rcgen",
+ "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -14403,6 +14405,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "url",
  "webpki-roots 0.26.11",
+ "wiremock",
  "zeroize",
 ]
 

@@ -904,6 +904,13 @@ Examples:
         auth_command: AuthCommands,
     },
 
+    /// Enroll with an inbound OIDC identity provider to obtain an RPC auth token
+    #[cfg(feature = "agent-runtime")]
+    Oidc {
+        #[command(subcommand)]
+        oidc_command: OidcCommands,
+    },
+
     /// Discover and introspect USB hardware
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
@@ -3707,6 +3714,27 @@ enum AuthCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum OidcCommands {
+    /// Sign in interactively: shows a verification code (device grant) or
+    /// opens your browser (--browser), then prints the access token on stdout
+    Login {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+        /// Sign in with the system browser via Authorization Code + PKCE
+        /// (RFC 8252 loopback) instead of the device grant
+        #[arg(long)]
+        browser: bool,
+    },
+    /// Obtain a service token via the client_credentials grant (requires the
+    /// entry's client_secret); prints the access token on stdout
+    Token {
+        /// Alias of the [oidc.<alias>] config entry to enroll against
+        alias: String,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// Refresh and cache model_provider models
@@ -5401,7 +5429,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
+                    move |host,
+                          port,
+                          config,
+                          tx,
+                          reload_controls,
+                          tui_registry,
+                          pairing,
+                          ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -5416,6 +5451,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                pairing,
                                 ready_tx,
                             ))
                             .await
@@ -6692,6 +6728,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Oidc { oidc_command } => handle_oidc_command(oidc_command, &config).await,
 
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
@@ -9065,6 +9104,154 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
     Ok(())
 }
 
+#[cfg(feature = "agent-runtime")]
+async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
+    use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
+
+    enum OidcFlow {
+        Device,
+        Browser,
+        ClientCredentials,
+    }
+    let (alias, flow) = match &oidc_command {
+        OidcCommands::Login {
+            alias,
+            browser: false,
+        } => (alias.clone(), OidcFlow::Device),
+        OidcCommands::Login {
+            alias,
+            browser: true,
+        } => (alias.clone(), OidcFlow::Browser),
+        OidcCommands::Token { alias } => (alias.clone(), OidcFlow::ClientCredentials),
+    };
+    let Some(entry) = config.oidc.get(&alias) else {
+        let mut known: Vec<&str> = config.oidc.keys().map(String::as_str).collect();
+        known.sort_unstable();
+        let known = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        bail!(ta(
+            "cli-oidc-unknown-alias",
+            &[("alias", &alias), ("known", &known)],
+            &format!("No [oidc.{alias}] entry in the config. Configured entries: {known}"),
+        ));
+    };
+    let enrollment = Enrollment::new(entry.clone())?;
+
+    let token = match flow {
+        OidcFlow::ClientCredentials => enrollment.client_credentials().await?,
+        OidcFlow::Browser => {
+            use zeroclaw_runtime::security::auth_provider::LoopbackListener;
+            let listener = LoopbackListener::bind().await?;
+            let pkce = enrollment.pkce_start(&listener.redirect_uri()).await?;
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-browser-open",
+                    &[("uri", &pkce.authorize_url)],
+                    &format!(
+                        "Opening your browser to sign in. If nothing opens, visit:\n{}",
+                        pkce.authorize_url
+                    ),
+                )
+            );
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg(&pkce.authorize_url)
+                    .spawn();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&pkce.authorize_url)
+                    .spawn();
+            }
+            eprintln!(
+                "{}",
+                t(
+                    "cli-oidc-browser-waiting",
+                    "Waiting for the browser sign-in to complete...",
+                )
+            );
+            let code = listener
+                .wait_for_code(&pkce.state, std::time::Duration::from_mins(5))
+                .await?;
+            enrollment.pkce_exchange(&pkce, &code).await?
+        }
+        OidcFlow::Device => {
+            let start = enrollment.device_grant_start().await?;
+            let uri = start
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| start.verification_uri.clone());
+            let expires = start.expires_in.to_string();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-visit",
+                    &[("uri", &uri), ("code", &start.user_code)],
+                    &format!("To sign in, visit {uri} and enter code {}", start.user_code),
+                )
+            );
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-waiting",
+                    &[("seconds", &expires)],
+                    &format!(
+                        "Waiting for identity-provider approval (the code expires in {expires} seconds)..."
+                    ),
+                )
+            );
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in);
+            let mut interval = start.interval.max(1);
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    bail!(t(
+                        "cli-oidc-device-expired",
+                        "The device code expired before approval; run the command again.",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match enrollment.device_grant_poll(&start.device_code).await? {
+                    DevicePollOutcome::Pending => {}
+                    DevicePollOutcome::SlowDown => interval += 5,
+                    DevicePollOutcome::Token(token) => break *token,
+                }
+            }
+        }
+    };
+
+    eprintln!(
+        "{}",
+        ta(
+            "cli-oidc-enrolled",
+            &[("alias", &alias)],
+            &format!(
+                "Enrolled with [oidc.{alias}]. The access token is on stdout; present it as \
+                 auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN."
+            ),
+        )
+    );
+    if let Some(secs) = token.expires_in {
+        let secs = secs.to_string();
+        eprintln!(
+            "{}",
+            ta(
+                "cli-oidc-token-expiry",
+                &[("seconds", &secs)],
+                &format!("The token expires in {secs} seconds."),
+            )
+        );
+    }
+    println!("{}", token.access_token);
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
@@ -9763,7 +9950,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade

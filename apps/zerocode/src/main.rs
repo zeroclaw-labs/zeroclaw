@@ -40,6 +40,7 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod oidc_enroll;
 mod quickstart_pane;
 mod relay_proto;
 mod sop_pane;
@@ -221,6 +222,13 @@ pub(crate) struct WssRoute {
     pub(crate) relay: Option<client::RelayDial>,
     /// TLS verification + mutual-TLS client identity, shared by both legs.
     pub(crate) tls: client::ClientTls,
+    /// Bearer presented as `auth_token` in the initialize handshake (a gateway
+    /// pairing token, or an OIDC access token with `auth_provider`), shared by
+    /// both legs. The mTLS cert is transport/device admission; this is
+    /// principal authentication.
+    pub(crate) auth_token: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`); `native` default.
+    pub(crate) auth_provider: Option<String>,
     /// How many direct attempts before falling back to the relay (min 1).
     pub(crate) direct_attempts: u32,
     /// Per-attempt direct-connect timeout, in seconds (min 1).
@@ -249,7 +257,14 @@ impl WssRoute {
         if let Some(url) = &self.direct_url {
             let mut last_err: Option<anyhow::Error> = None;
             for _ in 0..self.direct_attempts.max(1) {
-                let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+                let fut = client::RpcClient::connect_wss_direct(
+                    url,
+                    prev_id,
+                    prev_sig,
+                    &self.tls,
+                    self.auth_token.as_deref(),
+                    self.auth_provider.as_deref(),
+                );
                 match tokio::time::timeout(
                     Duration::from_secs(self.direct_timeout_secs.max(1)),
                     fut,
@@ -274,6 +289,8 @@ impl WssRoute {
                     prev_sig,
                     &self.tls,
                     relay,
+                    self.auth_token.as_deref(),
+                    self.auth_provider.as_deref(),
                 )
                 .await?;
                 return Ok((client, ActiveLeg::WssRelay));
@@ -292,6 +309,8 @@ impl WssRoute {
             prev_sig,
             &self.tls,
             relay,
+            self.auth_token.as_deref(),
+            self.auth_provider.as_deref(),
         )
         .await?;
         Ok((client, ActiveLeg::WssRelay))
@@ -309,7 +328,14 @@ impl WssRoute {
             .direct_url
             .as_ref()
             .ok_or_else(|| anyhow::Error::msg("no direct address to re-probe"))?;
-        let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+        let fut = client::RpcClient::connect_wss_direct(
+            url,
+            prev_id,
+            prev_sig,
+            &self.tls,
+            self.auth_token.as_deref(),
+            self.auth_provider.as_deref(),
+        );
         match tokio::time::timeout(Duration::from_secs(self.direct_timeout_secs.max(1)), fut).await
         {
             Ok(r) => r,
@@ -386,6 +412,27 @@ fn resolve_direct_url(cli_connect: Option<String>, cfg_wss: &config::WssSection)
 /// Server verification is skipped when either the flag or the config asks.
 fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> bool {
     cli_skip_verify || cfg_wss.tls.skip_verify
+}
+
+/// The credential presented in the initialize handshake: `ZEROCLAW_AUTH_TOKEN`
+/// overrides `[wss].auth_token`; the provider selection comes from config.
+/// The mTLS client cert is transport/device admission; this is the principal.
+fn resolve_auth(cfg_wss: &config::WssSection) -> (Option<String>, Option<String>) {
+    let env_token = std::env::var("ZEROCLAW_AUTH_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    auth_from(cfg_wss, env_token)
+}
+
+/// Testable core of [`resolve_auth`]: env token overrides config; provider from
+/// config. Split so unit tests inject the env value rather than mutate process
+/// environment.
+fn auth_from(
+    cfg_wss: &config::WssSection,
+    env_token: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let auth_token = env_token.or_else(|| cfg_wss.auth_token.clone());
+    (auth_token, cfg_wss.auth_provider.clone())
 }
 
 fn should_enroll_via_relay(cli: &Cli, cfg_wss: &config::WssSection, relay_available: bool) -> bool {
@@ -907,6 +954,45 @@ async fn run() -> anyhow::Result<()> {
                     .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
                     .or_else(|| default_tls_path(&config_dir, "client.key")),
             };
+            let (mut auth_token, auth_provider) = resolve_auth(cfg_wss);
+            // An OIDC provider with no token means "enroll first": run the
+            // device grant through the gateway enrollment API and hold the
+            // token for this session only.
+            if auth_token.is_none()
+                && let Some(alias) = auth_provider
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix("oidc."))
+            {
+                let Some(enroll_url) = cfg_wss.enroll_url.as_deref() else {
+                    anyhow::bail!(i18n::t_args(
+                        "zc-oidc-enroll-missing-url",
+                        &[("provider", auth_provider.as_deref().unwrap_or(""))],
+                    ));
+                };
+                let token = oidc_enroll::run_device_flow(enroll_url, skip_verify, alias, |start| {
+                    let uri = start
+                        .verification_uri_complete
+                        .as_deref()
+                        .unwrap_or(&start.verification_uri);
+                    eprintln!(
+                        "{}",
+                        i18n::t_args(
+                            "zc-oidc-enroll-visit",
+                            &[("uri", uri), ("code", &start.user_code)],
+                        )
+                    );
+                    eprintln!(
+                        "{}",
+                        i18n::t_args(
+                            "zc-oidc-enroll-waiting",
+                            &[("seconds", &start.expires_in.to_string())],
+                        )
+                    );
+                })
+                .await?;
+                eprintln!("{}", i18n::t("zc-oidc-enroll-done"));
+                auth_token = Some(token);
+            }
             ConnectTarget::Wss(Box::new(WssRoute {
                 direct_url,
                 relay_inner_url: DEFAULT_RELAY_INNER_URL.to_string(),
@@ -917,6 +1003,8 @@ async fn run() -> anyhow::Result<()> {
                     .direct_timeout_secs
                     .unwrap_or(DEFAULT_DIRECT_TIMEOUT_SECS),
                 reprobe_secs: cfg_wss.reprobe_secs.unwrap_or(DEFAULT_REPROBE_SECS),
+                auth_token,
+                auth_provider,
             }))
         } else {
             let socket = client::resolve_socket_path(&config_dir)?;
@@ -2138,6 +2226,27 @@ mod connection_tests {
         cfg.tls.skip_verify = false;
         assert!(resolve_skip_verify(true, &cfg)); // flag wins
         assert!(!resolve_skip_verify(false, &cfg)); // neither
+    }
+
+    #[test]
+    fn auth_env_token_overrides_config() {
+        let cfg = WssSection {
+            auth_token: Some("cfg_token".to_string()),
+            auth_provider: Some("oidc.corp".to_string()),
+            ..Default::default()
+        };
+        // Env wins over config.
+        assert_eq!(
+            auth_from(&cfg, Some("env_token".to_string())),
+            (Some("env_token".to_string()), Some("oidc.corp".to_string()))
+        );
+        // No env falls back to config.
+        assert_eq!(
+            auth_from(&cfg, None),
+            (Some("cfg_token".to_string()), Some("oidc.corp".to_string()))
+        );
+        // Neither: no token, provider still passes through if set.
+        assert_eq!(auth_from(&WssSection::default(), None), (None, None));
     }
 
     #[test]

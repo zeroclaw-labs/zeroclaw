@@ -141,6 +141,26 @@ impl ConnectionSection {
 pub(crate) struct WssSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Bearer presented as `auth_token` in the initialize handshake (a
+    /// gateway pairing token, or an OIDC access token together with
+    /// `auth_provider`). Remote daemons require it since the RFC 7141
+    /// enforcement boundary. The `ZEROCLAW_AUTH_TOKEN` environment
+    /// variable overrides this value, so the token can stay out of the
+    /// config file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`). Defaults
+    /// to the daemon's `native` pairing provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
+    /// Gateway HTTP origin for interactive OIDC enrollment (e.g.
+    /// `https://gateway.example.com:9090`). Used only when
+    /// `auth_provider` names an `oidc.<alias>` provider and no
+    /// `auth_token` is available: zerocode then runs the device grant
+    /// through the gateway's enrollment API before connecting. The
+    /// token is held for the session only, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_url: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
     /// Reach the daemon through a nominated relay at this `host:port` instead of
@@ -173,6 +193,9 @@ impl WssSection {
             && self.direct_attempts.is_none()
             && self.direct_timeout_secs.is_none()
             && self.reprobe_secs.is_none()
+            && self.auth_token.is_none()
+            && self.auth_provider.is_none()
+            && self.enroll_url.is_none()
     }
 }
 
