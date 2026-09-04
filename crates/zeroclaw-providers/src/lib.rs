@@ -2064,6 +2064,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("groq", "Groq", false),
             ("mistral", "Mistral", false),
             ("xai", "xAI (Grok)", false),
+            ("crusoe", "Crusoe Managed Inference", false),
             ("deepseek", "DeepSeek", false),
             ("together", "Together AI", false),
             ("fireworks", "Fireworks AI", false),
@@ -3387,6 +3388,10 @@ mod tests {
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
         );
+        assert_eq!(
+            default_model_provider_url("crusoe"),
+            Some("https://api.inference.crusoecloud.com/v1")
+        );
     }
 
     #[test]
@@ -3412,6 +3417,22 @@ mod tests {
         assert_eq!(
             openrouter_context_window_url(&config),
             "https://proxy.example.test/openrouter/models"
+        );
+    }
+
+    #[test]
+    fn crusoe_default_url_matches_endpoint_enum() {
+        use crate::factory::CompatFamilySpec;
+        use zeroclaw_config::schema::CrusoeModelProviderConfig;
+        // Cross-surface drift guard: the factory default URL must equal the
+        // config-owned `CrusoeEndpoint` URI. Both reference
+        // `CrusoeEndpoint::DEFAULT_URI`, so this asserts the single-source-of-
+        // truth wiring stays intact if either surface is edited independently.
+        assert_eq!(
+            <CrusoeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            <zeroclaw_config::schema::CrusoeEndpoint as zeroclaw_config::schema::ModelEndpoint>::uri(
+                &zeroclaw_config::schema::CrusoeEndpoint::Default,
+            ),
         );
     }
 
@@ -5127,6 +5148,238 @@ mod tests {
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
+
+    // ── Crusoe catalog / context-window boundary regression ────
+    //
+    // The bot review identified a missing boundary regression for the
+    // Crusoe catalog and context-window discovery paths. Crusoe has
+    // `MODELS_DEV_KEY = None`, so a configured credential forces the shared
+    // native `/models` path. This test pins the response contract (id-shaped
+    // entries, bearer auth, context_length field) so the three user-visible
+    // paths — `list_models`, `list_models_with_pricing`, and
+    // `fetch_context_window` — cannot silently drift.
+
+    /// Redacted Crusoe-shaped `/v1/models` response fixture.
+    /// Crusoe's Serverless Inference API returns OpenAI-compatible entries
+    /// with an `id` field (not `name`) and a `context_length` field.
+    const CRUSOE_MODELS_FIXTURE: &str = r#"{
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-ai/DeepSeek-V4-Flash",
+                "object": "model",
+                "context_length": 1000000
+            },
+            {
+                "id": "zai/GLM-5.2",
+                "object": "model",
+                "context_length": 256000
+            },
+            {
+                "id": "nvidia/Nemotron-3-Super-120B-A12B",
+                "object": "model",
+                "context_length": 262000
+            }
+        ]
+    }"#;
+
+    /// Spawn a mock server that serves the Crusoe `/models` fixture and
+    /// captures the Authorization header. Returns `(base_url, captured_auth)`.
+    async fn spawn_crusoe_models_mock(
+        fixture: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let captured_auth = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_for_route = std::sync::Arc::clone(&captured_auth);
+
+        let app = Router::new().route(
+            "/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let captured = std::sync::Arc::clone(&captured_for_route);
+                let body = fixture;
+                async move {
+                    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                        captured.lock().unwrap().replace(auth.to_string());
+                    }
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}"), captured_auth, server)
+    }
+
+    /// `list_models` must parse the `id` field from Crusoe's `/models`
+    /// response and return sorted, deduplicated model IDs.
+    #[tokio::test]
+    async fn crusoe_list_models_parses_id_field_from_models_endpoint() {
+        let (base_url, captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let provider =
+            create_model_provider_with_url("crusoe", Some("cr_test-key"), Some(&base_url))
+                .expect("crusoe provider builds with mock URL");
+
+        let models = provider
+            .list_models()
+            .await
+            .expect("list_models succeeds against the mock /models endpoint");
+
+        assert_eq!(
+            models,
+            vec![
+                "deepseek-ai/DeepSeek-V4-Flash",
+                "nvidia/Nemotron-3-Super-120B-A12B",
+                "zai/GLM-5.2",
+            ],
+            "list_models must return the id-shaped entries sorted alphabetically"
+        );
+
+        // The credential must be sent as a bearer token.
+        let auth = captured_auth.lock().unwrap().clone();
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer cr_test-key"),
+            "Crusoe /models request must include the bearer auth header"
+        );
+    }
+
+    /// `list_models_with_pricing` must parse the same `id` field and return
+    /// `ModelInfo` entries. Crusoe's `/models` endpoint does not include
+    /// pricing, so the `pricing` field should be `None`.
+    #[tokio::test]
+    async fn crusoe_list_models_with_parsing_parses_id_field() {
+        let (base_url, _captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let provider =
+            create_model_provider_with_url("crusoe", Some("cr_test-key"), Some(&base_url))
+                .expect("crusoe provider builds with mock URL");
+
+        let models = provider
+            .list_models_with_pricing()
+            .await
+            .expect("list_models_with_pricing succeeds against the mock /models endpoint");
+
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "deepseek-ai/DeepSeek-V4-Flash",
+                "nvidia/Nemotron-3-Super-120B-A12B",
+                "zai/GLM-5.2",
+            ],
+            "list_models_with_pricing must return the same id-shaped entries"
+        );
+        // Crusoe's /models endpoint does not expose pricing data.
+        assert!(
+            models.iter().all(|m| m.pricing.is_none()),
+            "pricing should be None when the /models response has no pricing field"
+        );
+    }
+
+    /// `fetch_context_window` must match the configured model by `id` and
+    /// extract the `context_length` field from the Crusoe `/models` response.
+    #[tokio::test]
+    async fn crusoe_fetch_context_window_extracts_context_length_by_id() {
+        let (base_url, captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("deepseek-ai/DeepSeek-V4-Flash".to_string()),
+            api_key: Some("cr_test-key".to_string()),
+            uri: Some(base_url),
+            ..Default::default()
+        };
+
+        let ctx = fetch_context_window("crusoe", &config)
+            .await
+            .expect("context window must be discovered from the mock /models response");
+
+        assert_eq!(
+            ctx, 1_000_000,
+            "fetch_context_window must return the context_length for the matched model"
+        );
+
+        // The credential must be sent as a bearer token.
+        let auth = captured_auth.lock().unwrap().clone();
+        assert_eq!(
+            auth.as_deref(),
+            Some("Bearer cr_test-key"),
+            "Crusoe context-window request must include the bearer auth header"
+        );
+    }
+
+    /// `fetch_context_window` must return `None` when the configured model
+    /// is not present in the `/models` response — the operator retains the
+    /// fallback context window.
+    #[tokio::test]
+    async fn crusoe_fetch_context_window_returns_none_for_unknown_model() {
+        let (base_url, _captured_auth, _server) =
+            spawn_crusoe_models_mock(CRUSOE_MODELS_FIXTURE).await;
+
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("nonexistent/model".to_string()),
+            api_key: Some("cr_test-key".to_string()),
+            uri: Some(base_url),
+            ..Default::default()
+        };
+
+        let ctx = fetch_context_window("crusoe", &config).await;
+        assert!(
+            ctx.is_none(),
+            "fetch_context_window must return None when the model is not in the /models response"
+        );
+    }
+
+    /// `fetch_context_window` must also accept the `context_window` field
+    /// name (some OpenAI-compatible providers use it instead of
+    /// `context_length`).
+    #[tokio::test]
+    async fn crusoe_fetch_context_window_accepts_context_window_field_name() {
+        let fixture = r#"{
+            "object": "list",
+            "data": [
+                {
+                    "id": "deepseek-ai/DeepSeek-V4-Flash",
+                    "object": "model",
+                    "context_window": 1000000
+                }
+            ]
+        }"#;
+        let (base_url, _captured_auth, _server) = spawn_crusoe_models_mock(fixture).await;
+
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("deepseek-ai/DeepSeek-V4-Flash".to_string()),
+            api_key: Some("cr_test-key".to_string()),
+            uri: Some(base_url),
+            ..Default::default()
+        };
+
+        let ctx = fetch_context_window("crusoe", &config)
+            .await
+            .expect("context window must be discovered via the context_window field");
+
+        assert_eq!(
+            ctx, 1_000_000,
+            "fetch_context_window must accept the context_window field name"
+        );
+    }
 }
 
 /// Attempt to fetch context window from provider's /models endpoint.
@@ -5138,7 +5391,9 @@ pub async fn fetch_context_window(
     match provider_type {
         "openrouter" => fetch_openrouter_context_window(config).await,
         "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
-        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
+        | "nebius" | "crusoe" => {
+            fetch_openai_compatible_context_window(provider_type, config).await
+        }
         _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
     }
 }

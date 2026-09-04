@@ -480,26 +480,26 @@ use zeroclaw_config::schema::{
     AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
-    FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
-    GeminiModelProviderConfig, GithubModelsModelProviderConfig, GlmModelProviderConfig,
-    GrokCliModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
+    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
+    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
+    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
+    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
     ZerorouterModelProviderConfig,
 };
 
@@ -591,6 +591,12 @@ impl CompatFamilySpec for TogetherModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.together.xyz";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("togetherai");
+}
+impl CompatFamilySpec for CrusoeModelProviderConfig {
+    const DISPLAY: &'static str = "Crusoe Managed Inference";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::CrusoeEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = None;
 }
 impl CompatFamilySpec for FireworksModelProviderConfig {
     const DISPLAY: &'static str = "Fireworks AI";
