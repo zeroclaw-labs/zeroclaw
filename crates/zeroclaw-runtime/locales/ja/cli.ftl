@@ -634,6 +634,18 @@ cli-pairing-use-code = {"  "}このワンタイムコードを使って新しい
 cli-pairing-post = {"    "}POST /pair にヘッダー X-Pairing-Code: {$code} を付けて送信
 cli-pairing-restart = {"   "}新しいペアリングコードを生成するにはゲートウェイを再起動してください。
 cli-pairing-disabled = ⚠️  ゲートウェイのペアリングは設定で無効になっています。
+cli-pairing-fetch-failed = ❌ ゲートウェイからペアリングコードを取得できませんでした: {$endpoint}
+cli-pairing-no-code = 🔐 ゲートウェイのペアリングは有効ですが、利用可能なアクティブなペアリングコードがありません。
+cli-pairing-requests-accepted = すべてのリクエストが認証なしで受け付けられます。
+cli-pairing-enable-config = ペアリングを有効にするには、[gateway] require_pairing = true を設定してください。
+cli-pairing-show-only = `zeroclaw gateway get-paircode` は既存のアクティブなコードを表示するだけで、新しいコードは発行しません。
+cli-pairing-pair-another = 別のデバイスをペアリングするには、次を実行してください:
+cli-pairing-revoke-replace = 既存のペアリングを取り消して置き換えコードを発行するには、次を実行してください:
+cli-pairing-new-code-unavailable = ゲートウェイは新しいペアリングコードを発行しませんでした。コードがすでに保留中か、ペアリングのリセットが必要な可能性があります。
+cli-pairing-retry-or-rotate = しばらくしてから再試行するか、既存のペアリングを取り消して置き換えコードを発行してください:
+cli-pairing-rotate-no-code = ローテーション要求は置き換えコードを返さずに完了しました。
+cli-pairing-check-enabled = ペアリングが有効か確認してから、新しいデバイスコードを要求してください:
+cli-pairing-inspect = 実行中のゲートウェイを確認するには:
 cli-gateway-running-q = {"   "}ゲートウェイは実行中ですか？次のコマンドで起動してください:
 cli-status-title = 🦀 ZeroClaw ステータス
 cli-security-status-title = ZeroClaw セキュリティステータス
@@ -1002,6 +1014,7 @@ channel-approval-group-visibility-warning =
 channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました
+channel-telegram-approval-ack-not-accepted = 承認は受け付けられませんでした
 channel-telegram-approval-ack-unknown = 不明な操作です
 channel-telegram-approval-ack-already-resolved = 承認はすでに処理済みです
 channel-discord-approval-btn-allow-once = 今回のみ許可
@@ -1012,6 +1025,9 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = {$marker_count} 個の画像マーカーを受信しましたが、フォールバック model_provider={$fallback_name} は画像入力をサポートしていません
+cli-agent-vision-unsupported-by-provider = {$marker_count} 個の画像マーカーを受信しましたが、この model_provider は画像入力をサポートしていません
 cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。
 cli-agent-error-provider-credentials-missing = 選択したモデルプロバイダーの認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
 cli-agent-error-provider-credentials-missing-named = モデルプロバイダー {$provider} の認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。

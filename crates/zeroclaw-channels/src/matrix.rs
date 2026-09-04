@@ -32,7 +32,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
     DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
 };
-use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode, TranscriptionConfig};
+use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
 use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
 
 // ─── markers ───────────────────────────────────────────────────────────────
@@ -2055,15 +2055,11 @@ mod inbound {
         },
     };
     use serde_json::Value as JsonValue;
-    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
-    use crate::transcription::TranscriptionManager;
-    use zeroclaw_api::{
-        channel::{ChannelApprovalResponse, ChannelMessage},
-        media::MediaAttachment,
-    };
-    use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+    use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
+    use zeroclaw_config::schema::MatrixConfig;
 
     pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -2076,11 +2072,10 @@ mod inbound {
         /// Resolves inbound external peers from canonical state at message-time.
         /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
         pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-        pub transcription: Option<Arc<TranscriptionConfig>>,
+        pub transcription: Option<super::TranscriptionResolver>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals:
-            Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -2238,19 +2233,25 @@ mod inbound {
         let body = ctx_mod::body_for(&ev.content.msgtype);
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
+        let allowed_peers = (ctx.peer_resolver)();
+        let sender_allowed = allowlist::user_allowed(&allowed_peers, sender);
+        let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
 
-        // Approval reply has highest priority — operator answer must work even
-        // if the room/user filters would otherwise drop the message.
-        if let Some((token, response)) = approval::parse_reply(&body) {
-            let waiter = ctx.pending_approvals.lock().await.remove(&token);
-            if let Some(tx) = waiter {
-                let _ = tx.send(response);
-                return Ok(());
-            }
+        if let Some((token, response)) = approval::parse_reply(&body)
+            && crate::util::resolve_pending_approval(
+                &ctx.pending_approvals,
+                &token,
+                response,
+                sender_allowed && room_allowed,
+                room_id,
+            )
+            .await
+            .suppresses_message()
+        {
+            return Ok(());
         }
 
-        let allowed_peers = (ctx.peer_resolver)();
-        if !allowlist::user_allowed(&allowed_peers, sender) {
+        if !sender_allowed {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2259,7 +2260,7 @@ mod inbound {
             );
             return Ok(());
         }
-        if !allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id) {
+        if !room_allowed {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2398,7 +2399,7 @@ mod inbound {
                 ctx.workspace_dir.as_deref(),
                 &body,
                 content,
-                ctx.transcription.as_deref(),
+                ctx.transcription.as_ref(),
             )
             .await;
         } else if let Some(reply_id) = reply_target.as_ref() {
@@ -2416,7 +2417,7 @@ mod inbound {
                             ctx.workspace_dir.as_deref(),
                             "",
                             content,
-                            ctx.transcription.as_deref(),
+                            ctx.transcription.as_ref(),
                         )
                         .await;
                     }
@@ -2570,11 +2571,11 @@ mod inbound {
         File,
     }
 
-    pub(super) fn should_transcribe(
-        kind: &MediaCategory,
-        transcription: Option<&TranscriptionConfig>,
-    ) -> bool {
-        matches!(kind, MediaCategory::Voice) && matches!(transcription, Some(t) if t.enabled)
+    /// Voice notes (MSC3245) are the only inbound media ZeroClaw transcribes.
+    /// Whether transcription is enabled at all is owned by the channel's
+    /// transcription resolver, which reads it from live config.
+    pub(super) fn should_transcribe(kind: &MediaCategory) -> bool {
+        matches!(kind, MediaCategory::Voice)
     }
 
     async fn attach_media(
@@ -2583,7 +2584,7 @@ mod inbound {
         workspace_dir: Option<&std::path::PathBuf>,
         body_hint: &str,
         content: String,
-        transcription: Option<&TranscriptionConfig>,
+        transcription: Option<&super::TranscriptionResolver>,
     ) -> String {
         let mut content = content;
         match save_media_to_workspace(room, info, workspace_dir).await {
@@ -2602,12 +2603,13 @@ mod inbound {
                     format!("{content}\n\n{marker}")
                 };
 
-                if should_transcribe(&info.kind, transcription) {
-                    let t = transcription.expect("should_transcribe guarantees Some");
+                if should_transcribe(&info.kind)
+                    && let Some(resolver) = transcription
+                {
                     let transcribe_name =
                         transcription_safe_filename(&info.file_name, info.mime.as_deref());
-                    match transcribe_from_disk(t, &path, &transcribe_name).await {
-                        Ok(text) if !text.trim().is_empty() => {
+                    match transcribe_from_disk(resolver, &path, &transcribe_name).await {
+                        Ok(Some(text)) if !text.trim().is_empty() => {
                             content = format!("[voice transcript]: {text}\n\n{content}");
                         }
                         Ok(_) => {}
@@ -2875,11 +2877,17 @@ mod inbound {
         }
     }
 
+    /// Resolves the manager from live config before touching the filesystem.
+    /// `Ok(None)` means transcription is currently disabled.
     async fn transcribe_from_disk(
-        config: &TranscriptionConfig,
+        resolver: &super::TranscriptionResolver,
         path: &std::path::Path,
         file_name: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Option<String>> {
+        let Some(manager) = resolver() else {
+            return Ok(None);
+        };
+        let manager = manager?;
         let bytes = std::fs::read(path).map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2894,25 +2902,67 @@ mod inbound {
             );
             anyhow::Error::msg(format!("read {}: {e}", path.display()))
         })?;
-        let manager = build_transcription_manager(config)?;
-        manager.transcribe(&bytes, file_name).await
+        manager.transcribe(&bytes, file_name).await.map(Some)
     }
+}
 
-    /// Binds the sole registered provider as the agent alias when exactly one
-    /// is configured; multi-provider setups keep the alias empty (unsupported).
-    pub(super) fn build_transcription_manager(
-        config: &TranscriptionConfig,
-    ) -> anyhow::Result<TranscriptionManager> {
-        let manager = TranscriptionManager::new(config)?;
-        let sole_provider = match manager.available_providers().as_slice() {
-            [only] => Some((*only).to_string()),
-            _ => None,
-        };
-        Ok(match sole_provider {
-            Some(alias) => manager.with_agent_transcription_provider(alias),
-            None => manager,
-        })
+/// Registers every configured provider — legacy `[transcription]` and typed
+/// `[providers.transcription.<type>.<alias>]` alike — and binds
+/// `agent_provider`.
+///
+/// When the owning agent states no preference, a lone registered provider is
+/// bound so single-provider deployments keep working without an explicit
+/// `transcription_provider`.
+pub(crate) fn build_transcription_manager(
+    config: &zeroclaw_config::schema::Config,
+    agent_provider: &str,
+) -> anyhow::Result<crate::transcription::TranscriptionManager> {
+    let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
+        config,
+        agent_provider.to_string(),
+    )?;
+    if !agent_provider.is_empty() {
+        return Ok(manager);
     }
+    let sole_provider = match manager.available_providers().as_slice() {
+        [only] => Some((*only).to_string()),
+        _ => None,
+    };
+    Ok(match sole_provider {
+        Some(alias) => manager.with_agent_transcription_provider(alias),
+        None => manager,
+    })
+}
+
+/// Resolves transcription state from live config at message time. `None` means
+/// transcription is currently disabled; the inner `Result` carries provider
+/// registration failures.
+///
+/// Held as a closure rather than a config snapshot so reloadable provider
+/// policy is never copied into this long-lived channel handle
+/// (see AGENTS.md "Single Source Of Truth").
+pub(crate) type TranscriptionResolver = Arc<
+    dyn Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>> + Send + Sync,
+>;
+
+/// Resolver over a legacy `[transcription]` section alone. Typed
+/// `[providers.transcription.<type>.<alias>]` entries are unreachable this way,
+/// so production always goes through the channel runtime's live-config
+/// resolver; this exists to drive the inbound tests from a bare section.
+#[cfg(test)]
+pub(crate) fn legacy_transcription_resolver(
+    transcription: zeroclaw_config::schema::TranscriptionConfig,
+) -> TranscriptionResolver {
+    let config = Arc::new(zeroclaw_config::schema::Config {
+        transcription,
+        ..Default::default()
+    });
+    Arc::new(move || {
+        if !config.transcription.enabled {
+            return None;
+        }
+        Some(build_transcription_manager(&config, ""))
+    })
 }
 
 // ─── outbound ──────────────────────────────────────────────────────────────
@@ -4011,9 +4061,9 @@ pub struct MatrixChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     state_dir: PathBuf,
     workspace_dir: Option<Arc<PathBuf>>,
-    transcription: Option<Arc<TranscriptionConfig>>,
+    transcription: Option<TranscriptionResolver>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -4085,8 +4135,17 @@ impl MatrixChannel {
         self
     }
 
-    pub fn with_transcription(mut self, transcription: TranscriptionConfig) -> Self {
-        self.transcription = Some(Arc::new(transcription));
+    /// Replace the compatibility resolver with the channel runtime's
+    /// live-config resolver, so typed provider entries and the owning agent's
+    /// `transcription_provider` are honoured.
+    pub(crate) fn with_transcription_manager_factory(
+        mut self,
+        factory: impl Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.transcription = Some(Arc::new(factory));
         self
     }
 
@@ -4964,6 +5023,10 @@ impl Channel for MatrixChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        let client = self.ensure_client().await?;
+        let destination = client::resolve_room(client, &self.alias_cache, recipient)
+            .await?
+            .to_string();
         let token = approval::generate_token_default();
         let prompt = crate::util::build_approve_deny_approval_prompt(
             &token,
@@ -4972,10 +5035,14 @@ impl Channel for MatrixChannel {
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination,
+                tool_name: request.tool_name.clone(),
+            },
+        );
 
         let send_msg = SendMessage::new(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
@@ -5024,11 +5091,14 @@ fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKe
 #[cfg(test)]
 mod tests {
     mod transcription_provider_resolution {
-        use super::super::inbound::build_transcription_manager;
-        use zeroclaw_config::schema::TranscriptionConfig;
+        use super::super::build_transcription_manager;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, LocalWhisperConfig,
+            LocalWhisperTranscriptionProviderConfig, TranscriptionConfig,
+        };
 
-        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
-            zeroclaw_config::schema::LocalWhisperConfig {
+        fn local_whisper_config(url: &str) -> LocalWhisperConfig {
+            LocalWhisperConfig {
                 url: url.to_string(),
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
@@ -5036,15 +5106,105 @@ mod tests {
             }
         }
 
+        fn with_transcription(transcription: TranscriptionConfig) -> Config {
+            Config {
+                transcription,
+                ..Config::default()
+            }
+        }
+
+        /// A typed `[providers.transcription.local_whisper.stoa]` entry plus the
+        /// owning agent's `transcription_provider`, and no legacy provider.
+        fn typed_config() -> Config {
+            let mut config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            });
+            config.providers.transcription.local_whisper.insert(
+                "stoa".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+                    ..LocalWhisperTranscriptionProviderConfig::default()
+                },
+            );
+            config.agents.insert(
+                "local".to_string(),
+                AliasedAgentConfig {
+                    transcription_provider: "local_whisper.stoa".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config
+        }
+
+        #[tokio::test]
+        async fn registers_typed_provider_and_binds_the_agent_alias() {
+            // Regression: the channel built its manager from the legacy
+            // `[transcription]` section alone, so typed entries never
+            // registered and the agent's provider was never read — voice
+            // ingest failed with "no transcription provider registered".
+            let config = typed_config();
+
+            let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
+
+            assert!(
+                manager
+                    .available_providers()
+                    .contains(&"local_whisper.stoa"),
+                "typed provider must register, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the bound alias, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn agent_alias_wins_over_the_sole_provider_heuristic() {
+            // Two providers register, so the sole-provider fallback cannot
+            // fire; only the agent's explicit alias can bind here.
+            let mut config = typed_config();
+            config.transcription.local_whisper =
+                Some(local_whisper_config("http://127.0.0.1:9998/v1/transcribe"));
+
+            let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "the explicit agent alias must be bound, got: {err}"
+            );
+        }
+
         #[tokio::test]
         async fn binds_alias_when_exactly_one_provider_is_configured() {
-            let config = TranscriptionConfig {
+            let config = with_transcription(TranscriptionConfig {
                 enabled: true,
                 local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
                 ..TranscriptionConfig::default()
-            };
+            });
 
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config, "").unwrap();
             assert_eq!(
                 manager.available_providers(),
                 vec!["local_whisper"],
@@ -5068,14 +5228,14 @@ mod tests {
 
         #[tokio::test]
         async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
-            let config = TranscriptionConfig {
+            let config = with_transcription(TranscriptionConfig {
                 enabled: true,
                 api_key: Some("test-groq-key".to_string()),
                 local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
                 ..TranscriptionConfig::default()
-            };
+            });
 
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config, "").unwrap();
             assert!(
                 manager.available_providers().len() > 1,
                 "fixture must register more than one provider, got {:?}",
@@ -5095,7 +5255,8 @@ mod tests {
     }
 
     mod media_filename_resolution {
-        use super::super::inbound::{build_transcription_manager, transcription_safe_filename};
+        use super::super::build_transcription_manager;
+        use super::super::inbound::transcription_safe_filename;
         use zeroclaw_config::schema::TranscriptionConfig;
 
         fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
@@ -5104,6 +5265,13 @@ mod tests {
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
                 timeout_secs: 30,
+            }
+        }
+
+        fn config_with(transcription: TranscriptionConfig) -> zeroclaw_config::schema::Config {
+            zeroclaw_config::schema::Config {
+                transcription,
+                ..zeroclaw_config::schema::Config::default()
             }
         }
 
@@ -5174,7 +5342,7 @@ mod tests {
                 local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
                 ..TranscriptionConfig::default()
             };
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
 
             let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
 
@@ -5200,7 +5368,7 @@ mod tests {
                 local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
                 ..TranscriptionConfig::default()
             };
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
 
             let file_name = transcription_safe_filename("recording.bin", Some("audio/ogg"));
 
@@ -5242,7 +5410,7 @@ mod tests {
                 ))),
                 ..TranscriptionConfig::default()
             };
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
 
             let file_name = transcription_safe_filename("recording.aac", Some("audio/aac"));
             assert_eq!(file_name, "recording.aac");
@@ -5279,7 +5447,7 @@ mod tests {
                 ))),
                 ..TranscriptionConfig::default()
             };
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
 
             let file_name = transcription_safe_filename("Voice message", None);
             assert_eq!(file_name, "Voice message");
@@ -5319,7 +5487,7 @@ mod tests {
                 ))),
                 ..TranscriptionConfig::default()
             };
-            let manager = build_transcription_manager(&config).unwrap();
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
 
             let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
 
@@ -5351,9 +5519,10 @@ mod tests {
         use matrix_sdk::ruma::{RoomId, room_id, user_id};
         use matrix_sdk::test_utils::mocks::MatrixMockServer;
         use matrix_sdk_test::JoinedRoomBuilder;
-        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalResponse;
         use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
         use super::super::inbound::{HandlerCtx, register_event_handlers};
@@ -5416,16 +5585,18 @@ mod tests {
                 config: Arc::new(MatrixConfig::default()),
                 alias: "test".to_string(),
                 peer_resolver: Arc::new(|| vec!["*".to_string()]),
-                transcription: Some(Arc::new(TranscriptionConfig {
-                    enabled: true,
-                    local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
-                        url: stt_url.to_string(),
-                        bearer_token: Some("test-token".to_string()),
-                        max_audio_bytes: 10 * 1024 * 1024,
-                        timeout_secs: 30,
-                    }),
-                    ..TranscriptionConfig::default()
-                })),
+                transcription: Some(super::super::legacy_transcription_resolver(
+                    TranscriptionConfig {
+                        enabled: true,
+                        local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                            url: stt_url.to_string(),
+                            bearer_token: Some("test-token".to_string()),
+                            max_audio_bytes: 10 * 1024 * 1024,
+                            timeout_secs: 30,
+                        }),
+                        ..TranscriptionConfig::default()
+                    },
+                )),
                 workspace_dir: Some(Arc::new(workspace.to_path_buf())),
                 tx,
                 pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
@@ -5900,6 +6071,109 @@ mod tests {
             );
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
+        #[tokio::test]
+        async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            };
+            let (approved_tx, approved_rx) = oneshot::channel();
+            let (wrong_tx, _wrong_rx) = oneshot::channel();
+            let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+            {
+                let mut approvals = ctx.pending_approvals.lock().await;
+                approvals.insert(
+                    "AUTH0001".into(),
+                    crate::util::PendingApproval {
+                        sender: approved_tx,
+                        destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+                approvals.insert(
+                    "WRONG001".into(),
+                    crate::util::PendingApproval {
+                        sender: wrong_tx,
+                        destination: "!other:localhost".into(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+                approvals.insert(
+                    "OTHER001".into(),
+                    crate::util::PendingApproval {
+                        sender: unauthorized_tx,
+                        destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+            }
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let approved = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$approved:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": { "msgtype": "m.text", "body": "AUTH0001 approve" }
+            });
+            let wrong_destination = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$wrong-destination:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": { "msgtype": "m.text", "body": "WRONG001 deny" }
+            });
+            let unauthorized = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$unauthorized:localhost",
+                "sender": "@other:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": { "msgtype": "m.text", "body": "OTHER001 deny" }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room())
+                        .add_timeline_event(timeline_raw(&approved))
+                        .add_timeline_event(timeline_raw(&wrong_destination))
+                        .add_timeline_event(timeline_raw(&unauthorized)),
+                )
+                .await;
+
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), approved_rx)
+                    .await
+                    .expect("sync ingress should resolve the authorized approval")
+                    .expect("sync ingress should resolve the authorized approval"),
+                ChannelApprovalResponse::Approve
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "approval-shaped events must not reach agent dispatch"
+            );
+            let approvals = ctx.pending_approvals.lock().await;
+            assert!(approvals.contains_key("WRONG001"));
+            assert!(approvals.contains_key("OTHER001"));
+        }
     }
 
     mod markers {
@@ -5983,6 +6257,99 @@ mod tests {
         use rand::rngs::StdRng;
         use std::collections::HashSet;
         use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        #[tokio::test]
+        async fn pending_approval_requires_allowed_user_and_origin_room() {
+            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVAL".to_string(),
+                crate::util::PendingApproval {
+                    sender: tx,
+                    destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+
+            for response in [
+                ChannelApprovalResponse::Approve,
+                ChannelApprovalResponse::Deny,
+                ChannelApprovalResponse::AlwaysApprove,
+            ] {
+                assert_eq!(
+                    crate::util::resolve_pending_approval(
+                        &pending,
+                        "APPROVAL",
+                        response,
+                        super::super::allowlist::user_allowed(
+                            &["@operator:example.invalid".to_string()],
+                            "@other:example.invalid",
+                        ),
+                        "!origin:example.invalid",
+                    )
+                    .await,
+                    crate::util::PendingApprovalResolution::Rejected,
+                );
+                assert!(pending.lock().await.contains_key("APPROVAL"));
+            }
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!other:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(pending.lock().await.contains_key("APPROVAL"));
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::AlwaysApprove,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+            let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVE2".to_string(),
+                crate::util::PendingApproval {
+                    sender: approve_tx,
+                    destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVE2",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        }
 
         #[test]
         fn token_length_and_alphabet() {
@@ -9632,6 +9999,7 @@ mod tests {
     mod transcription_gate {
 
         use super::super::inbound::{MediaCategory, should_transcribe};
+        use super::super::legacy_transcription_resolver;
         use zeroclaw_config::schema::TranscriptionConfig;
 
         fn enabled_cfg() -> TranscriptionConfig {
@@ -9648,50 +10016,42 @@ mod tests {
         }
 
         #[test]
-        fn voice_with_enabled_cfg_transcribes() {
-            assert!(should_transcribe(
-                &MediaCategory::Voice,
-                Some(&enabled_cfg())
-            ));
+        fn voice_transcribes() {
+            assert!(should_transcribe(&MediaCategory::Voice));
         }
 
         #[test]
-        fn voice_with_disabled_cfg_does_not_transcribe() {
-            assert!(!should_transcribe(
-                &MediaCategory::Voice,
-                Some(&disabled_cfg())
-            ));
-        }
-
-        #[test]
-        fn voice_without_cfg_does_not_transcribe() {
-            assert!(!should_transcribe(&MediaCategory::Voice, None));
-        }
-
-        #[test]
-        fn audio_with_enabled_cfg_does_not_transcribe() {
+        fn audio_does_not_transcribe() {
             // Plain m.audio (no MSC3245 voice flag) is left as a regular
             // audio file — only voice notes get transcribed.
-            assert!(!should_transcribe(
-                &MediaCategory::Audio,
-                Some(&enabled_cfg())
-            ));
+            assert!(!should_transcribe(&MediaCategory::Audio));
         }
 
         #[test]
-        fn image_with_enabled_cfg_does_not_transcribe() {
-            assert!(!should_transcribe(
-                &MediaCategory::Image,
-                Some(&enabled_cfg())
-            ));
+        fn image_does_not_transcribe() {
+            assert!(!should_transcribe(&MediaCategory::Image));
         }
 
         #[test]
-        fn voice_kind_alone_is_sufficient() {
-            assert!(should_transcribe(
-                &MediaCategory::Voice,
-                Some(&enabled_cfg())
-            ));
+        fn resolver_yields_nothing_when_disabled() {
+            // The enabled gate moved from `should_transcribe` onto the
+            // resolver, which reads it from live config on every message.
+            let resolver = legacy_transcription_resolver(disabled_cfg());
+            assert!(resolver().is_none());
+        }
+
+        #[test]
+        fn resolver_yields_a_manager_when_enabled() {
+            let resolver = legacy_transcription_resolver(TranscriptionConfig {
+                local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+                    bearer_token: None,
+                    max_audio_bytes: 10 * 1024 * 1024,
+                    timeout_secs: 30,
+                }),
+                ..enabled_cfg()
+            });
+            assert!(resolver().is_some_and(|manager| manager.is_ok()));
         }
     }
 

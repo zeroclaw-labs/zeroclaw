@@ -1,6 +1,7 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
+use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -56,34 +57,6 @@ impl Drop for ChildGroupGuard {
         }
     }
 }
-
-/// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-/// Environment variables safe to pass to shell commands on Windows.
-/// Includes Windows-specific variables needed for cmd.exe and program resolution.
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
@@ -218,7 +191,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for key in SAFE_ENV_VARS
+    for key in SAFE_SHELL_ENV_VARS
         .iter()
         .copied()
         .chain(security.shell_env_passthrough.iter().map(|s| s.as_str()))
@@ -1835,33 +1808,6 @@ mod tests {
         assert!(!decoded.contains('\u{FFFD}'));
     }
 
-    #[test]
-    fn shell_safe_env_vars_excludes_secrets() {
-        for var in SAFE_ENV_VARS {
-            let lower = var.to_lowercase();
-            assert!(
-                !lower.contains("key") && !lower.contains("secret") && !lower.contains("token"),
-                "SAFE_ENV_VARS must not include sensitive variable: {var}"
-            );
-        }
-    }
-
-    #[test]
-    fn shell_safe_env_vars_includes_essentials() {
-        assert!(
-            SAFE_ENV_VARS.contains(&"PATH"),
-            "PATH must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"HOME") || SAFE_ENV_VARS.contains(&"USERPROFILE"),
-            "HOME or USERPROFILE must be in safe env vars"
-        );
-        assert!(
-            SAFE_ENV_VARS.contains(&"TERM"),
-            "TERM must be in safe env vars"
-        );
-    }
-
     #[tokio::test]
     async fn shell_blocks_rate_limited() {
         let security = Arc::new(SecurityPolicy {
@@ -1990,7 +1936,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_is_passed_to_subprocess() {
-        // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
+        // A var that is NOT in SAFE_SHELL_ENV_VARS and NOT in passthrough —
         // it should only appear if tui_env injects it.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
@@ -2031,7 +1977,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_overrides_safe_var() {
-        // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
+        // tui_env wins over the process-level value for a var that is also in SAFE_SHELL_ENV_VARS.
         // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
         let home_key = home_env_key();
         let _guard = EnvGuard::set(home_key, "daemon-home");
@@ -2068,7 +2014,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shell_tui_env_none_behaves_like_existing() {
         // with_tui_env(None) must be identical to no tui_env at all —
-        // only SAFE_ENV_VARS + passthrough reach the subprocess.
+        // only SAFE_SHELL_ENV_VARS + passthrough reach the subprocess.
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
 
         let result = tool
@@ -2087,7 +2033,7 @@ mod tests {
     async fn shell_tui_env_secrets_reach_subprocess_but_not_safe_list() {
         // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
         // DO reach the subprocess via tui_env even though they are not
-        // in SAFE_ENV_VARS.
+        // in SAFE_SHELL_ENV_VARS.
         let tool =
             ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
                 let mut m = std::collections::HashMap::new();
@@ -2097,8 +2043,8 @@ mod tests {
 
         // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
         assert!(
-            !SAFE_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
-            "SSH_AUTH_SOCK must not be in SAFE_ENV_VARS"
+            !SAFE_SHELL_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
+            "SSH_AUTH_SOCK must not be in SAFE_SHELL_ENV_VARS"
         );
 
         let result = tool

@@ -2307,6 +2307,7 @@ mod tests {
         let params = NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: Some(ThinkingEffort::High),
+            display: None,
         };
         let (temperature, fields, max_tokens) = provider.resolve_thinking(
             Some(params),
@@ -2334,6 +2335,7 @@ mod tests {
         let params = NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
+            display: None,
         };
         let (temperature, fields, max_tokens) = provider.resolve_thinking(
             Some(params),

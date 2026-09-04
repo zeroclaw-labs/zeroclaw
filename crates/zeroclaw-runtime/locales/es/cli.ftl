@@ -634,6 +634,18 @@ cli-pairing-use-code = {"  "}Usa este código de un solo uso para emparejar un n
 cli-pairing-post = {"    "}POST /pair con encabezado X-Pairing-Code: {$code}
 cli-pairing-restart = {"   "}Reinicia el gateway para generar un nuevo código de emparejamiento.
 cli-pairing-disabled = ⚠️  El emparejamiento del gateway está deshabilitado en la configuración.
+cli-pairing-fetch-failed = ❌ No se pudo obtener el código de emparejamiento del gateway en {$endpoint}
+cli-pairing-no-code = 🔐 El emparejamiento del gateway está habilitado, pero no hay ningún código de emparejamiento activo disponible.
+cli-pairing-requests-accepted = Todas las solicitudes se aceptarán sin autenticación.
+cli-pairing-enable-config = Para habilitar el emparejamiento, establece [gateway] require_pairing = true.
+cli-pairing-show-only = `zeroclaw gateway get-paircode` solo muestra un código activo existente; no genera uno nuevo.
+cli-pairing-pair-another = Para emparejar otro dispositivo, ejecuta:
+cli-pairing-revoke-replace = Para revocar los emparejamientos existentes y generar un código de reemplazo, ejecuta:
+cli-pairing-new-code-unavailable = El gateway no generó un código de emparejamiento nuevo. Puede que ya haya un código pendiente o que sea necesario restablecer el emparejamiento.
+cli-pairing-retry-or-rotate = Vuelve a intentarlo pronto o revoca los emparejamientos existentes y genera un código de reemplazo:
+cli-pairing-rotate-no-code = La solicitud de rotación terminó sin devolver un código de reemplazo.
+cli-pairing-check-enabled = Comprueba si el emparejamiento está habilitado y solicita un código para el nuevo dispositivo:
+cli-pairing-inspect = Para inspeccionar el gateway en ejecución:
 cli-gateway-running-q = {"   "}¿Está el gateway en ejecución? Inícialo con:
 cli-status-title = 🦀 Estado de ZeroClaw
 cli-security-status-title = Estado de seguridad de ZeroClaw
@@ -1002,6 +1014,7 @@ channel-approval-group-visibility-warning =
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
+channel-telegram-approval-ack-not-accepted = Aprobación no aceptada
 channel-telegram-approval-ack-unknown = Acción desconocida
 channel-telegram-approval-ack-already-resolved = Aprobación ya resuelta
 channel-discord-approval-btn-allow-once = Permitir una vez
@@ -1012,6 +1025,9 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = Se recibieron {$marker_count} marcadores de imagen, pero el model_provider alternativo={$fallback_name} no admite entrada de visión
+cli-agent-vision-unsupported-by-provider = Se recibieron {$marker_count} marcadores de imagen, pero este model_provider no admite entrada de visión
 cli-agent-error-provider-context-window = La solicitud es demasiado grande para el modelo seleccionado. Reduce la conversación o elige un modelo con una ventana de contexto mayor.
 cli-agent-error-provider-credentials-missing = El proveedor de modelo seleccionado no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
 cli-agent-error-provider-credentials-missing-named = El proveedor de modelo {$provider} no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
