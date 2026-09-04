@@ -163,6 +163,12 @@ where
 ///
 /// Returns the joined task result if it finishes within `grace`, or `None`
 /// if the grace period elapsed (the caller must abort the handle).
+///
+/// `on_event` delivery is bounded by the *remaining* grace, not left to run
+/// unbounded: `select!` only polls its `sleep` branch between chosen-branch
+/// polls, so an `on_event` call that itself awaits (e.g. an RPC callback
+/// blocked on a full outbound queue with no reader) would otherwise keep the
+/// timer from ever firing and defeat the grace deadline entirely.
 async fn join_with_draining_grace<T, F, Fut>(
     turn_handle: &mut tokio::task::JoinHandle<T>,
     event_rx: &mut mpsc::Receiver<TurnEvent>,
@@ -174,7 +180,8 @@ where
     F: Fn(TurnEvent) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let sleep = tokio::time::sleep(grace);
+    let deadline = tokio::time::Instant::now() + grace;
+    let sleep = tokio::time::sleep_until(deadline);
     tokio::pin!(sleep);
     let mut event_rx_closed = false;
     loop {
@@ -186,12 +193,18 @@ where
                 // needs buffer space, not a live reader). `biased` gives the
                 // join priority over drain on a tied poll, so without this
                 // the last few buffered events would never reach `on_event`
-                // even though the task committed successfully.
+                // even though the task committed successfully. The task has
+                // already finished here, so a stuck callback must not block
+                // this return: bound each delivery and stop draining (but
+                // still report the join) once the deadline is reached.
                 while let Ok(event) = event_rx.try_recv() {
                     if let TurnEvent::Chunk { ref delta } = event {
                         accumulated.push_str(delta);
                     }
-                    on_event(event).await;
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                        break;
+                    }
                 }
                 return Some(joined);
             }
@@ -201,7 +214,10 @@ where
                         if let TurnEvent::Chunk { ref delta } = event {
                             accumulated.push_str(delta);
                         }
-                        on_event(event).await;
+                        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if tokio::time::timeout(remaining, on_event(event)).await.is_err() {
+                            return None;
+                        }
                     }
                     None => event_rx_closed = true,
                 }
@@ -461,6 +477,56 @@ mod tests {
             (0..EVENTS).map(|i| i.to_string().len()).sum::<usize>(),
             "every backlogged event must still be drained and accumulated"
         );
+    }
+
+    #[tokio::test]
+    async fn grace_drain_returns_within_grace_despite_a_callback_that_never_resolves() {
+        // A callback that permanently blocks (e.g. the outbound RPC queue
+        // is full and nobody is reading) must not be able to keep
+        // join_with_draining_grace parked past its deadline: without a
+        // per-delivery timeout, select! never gets to re-poll the sleep
+        // branch while the chosen branch's on_event().await is still
+        // running, so the grace bound would be defeated entirely.
+        let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
+
+        let mut handle = zeroclaw_spawn::spawn!(async move {
+            let _ = tx
+                .send(TurnEvent::Chunk {
+                    delta: "x".to_string(),
+                })
+                .await;
+            // Task itself never finishes on its own within the grace
+            // window; only the deadline should end this test.
+            std::future::pending::<()>().await;
+            "unreachable"
+        });
+
+        fn never_resolves(_e: TurnEvent) -> std::future::Pending<()> {
+            std::future::pending()
+        }
+
+        let mut acc = String::new();
+        let grace = std::time::Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let joined = tokio::time::timeout(
+            grace + std::time::Duration::from_secs(5),
+            join_with_draining_grace(&mut handle, &mut rx, &mut acc, &never_resolves, grace),
+        )
+        .await
+        .expect("a stuck callback must not hang join_with_draining_grace past its own timeout");
+
+        assert!(
+            joined.is_none(),
+            "the task never finishes on its own here, so the grace window \
+             elapsing must report timeout, not a spurious join"
+        );
+        assert!(
+            started.elapsed() < grace + std::time::Duration::from_secs(2),
+            "a callback stuck in on_event().await must not extend the grace \
+             deadline; the caller (execute_turn) depends on this bound to \
+             reach its persistence path"
+        );
+        handle.abort();
     }
 
     #[test]
