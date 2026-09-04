@@ -554,42 +554,30 @@ impl Chat {
     }
 
     async fn confirm_model_picker_selection(rpc: &Arc<RpcClient>, state: &mut ChatState) {
-        // Resolve the selection, then act. The final switch needs async + `rpc`,
-        // so extract owned values before replacing the overlay.
-        match &state.model_picker {
+        // Resolve the selection into an owned request, close the overlay, then
+        // act: the switch needs async + `rpc` after the overlay is gone.
+        let overrides = match &state.model_picker {
             ModelPickerOverlay::Model(p) => {
-                let choice = p.selected().map(str::to_string);
-                state.model_picker = ModelPickerOverlay::None;
-                if let Some(model) = choice {
-                    Self::apply_session_override(
-                        rpc,
-                        state,
-                        crate::client::SessionOverrides {
-                            model: Some(model),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                }
+                p.selected().map(|model| crate::client::SessionOverrides {
+                    model: Some(model.to_string()),
+                    ..Default::default()
+                })
             }
             ModelPickerOverlay::ConfiguredProviderStage(p) => {
-                let choice = p.selected().map(str::to_string);
-                state.model_picker = ModelPickerOverlay::None;
-                if let Some(model_provider) = choice {
-                    Self::apply_session_override(
-                        rpc,
-                        state,
-                        crate::client::SessionOverrides {
-                            model_provider: Some(model_provider),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                } else {
-                    state.mark_dirty_full();
-                }
+                p.selected()
+                    .map(|model_provider| crate::client::SessionOverrides {
+                        model_provider: Some(model_provider.to_string()),
+                        ..Default::default()
+                    })
             }
-            ModelPickerOverlay::Loading | ModelPickerOverlay::None => {}
+            // Loading has nothing to confirm and stays up until the fetch
+            // lands; a closed overlay has nothing to do.
+            ModelPickerOverlay::Loading | ModelPickerOverlay::None => return,
+        };
+        state.model_picker = ModelPickerOverlay::None;
+        match overrides {
+            Some(overrides) => Self::apply_session_override(rpc, state, overrides).await,
+            None => state.mark_dirty_full(),
         }
     }
 
@@ -1329,16 +1317,12 @@ impl Chat {
 
             // Movement first.
             if up || down {
-                match &mut state.model_picker {
-                    ModelPickerOverlay::Model(p)
-                    | ModelPickerOverlay::ConfiguredProviderStage(p) => {
-                        if up {
-                            p.move_up();
-                        } else {
-                            p.move_down();
-                        }
+                if let Some(picker) = state.model_picker.picker_mut() {
+                    if up {
+                        picker.move_up();
+                    } else {
+                        picker.move_down();
                     }
-                    ModelPickerOverlay::Loading | ModelPickerOverlay::None => {}
                 }
                 state.mark_dirty_full();
                 return false;
@@ -3466,58 +3450,25 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
     }
 
     // Model / model_provider picker overlay (drawn on top of content).
-    match &state.model_picker {
-        ModelPickerOverlay::Loading => {
-            // The "Loading models…" status shows in the info bar; the overlay
-            // exists only to block input until the catalog arrives. A modal box
-            // with no rows would render nothing, so draw a titled placeholder.
-            let title = crate::i18n::t("zc-model-catalog-loading");
-            let placeholder = [String::new()];
-            crate::widgets::PickerModal::new(&title, &placeholder, usize::MAX).render(f, area);
-        }
-        ModelPickerOverlay::Model(picker) => {
-            crate::widgets::PickerModal::new(
-                &crate::i18n::t("zc-model-picker-title"),
-                &picker.items,
-                picker.cursor,
-            )
-            .render(f, area);
-        }
-        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
-            crate::widgets::PickerModal::new(
-                &crate::i18n::t("zc-model-provider-picker-title"),
-                &picker.items,
-                picker.cursor,
-            )
-            .render(f, area);
-        }
-        ModelPickerOverlay::None => {}
+    if let (Some(title_key), Some(rows)) = (
+        state.model_picker.title_key(),
+        state.model_picker.modal_rows(),
+    ) {
+        let title = crate::i18n::t(title_key);
+        // The Loading placeholder has no cursor: an out-of-range index keeps
+        // its single row unhighlighted.
+        let cursor = state.model_picker.picker().map_or(usize::MAX, |p| p.cursor);
+        crate::widgets::PickerModal::new(&title, rows, cursor).render(f, area);
     }
 
     state.input_bar.render_explorer_overlay(f, area);
 }
 
+/// Screen rect of the open picker modal, computed from the same title and rows
+/// the draw path uses so mouse hit-testing lands on the rows the user sees.
 fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> Option<Rect> {
-    match model_picker {
-        ModelPickerOverlay::Loading => {
-            let title = crate::i18n::t("zc-model-catalog-loading");
-            let placeholder = [String::new()];
-            crate::widgets::PickerModal::area_for(&title, &placeholder, area)
-        }
-        ModelPickerOverlay::Model(picker) => crate::widgets::PickerModal::area_for(
-            &crate::i18n::t("zc-model-picker-title"),
-            &picker.items,
-            area,
-        ),
-        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
-            crate::widgets::PickerModal::area_for(
-                &crate::i18n::t("zc-model-provider-picker-title"),
-                &picker.items,
-                area,
-            )
-        }
-        ModelPickerOverlay::None => None,
-    }
+    let title = crate::i18n::t(model_picker.title_key()?);
+    crate::widgets::PickerModal::area_for(&title, model_picker.modal_rows()?, area)
 }
 
 fn resume_queue_chord_label() -> String {
@@ -5304,16 +5255,44 @@ enum ModelPickerOverlay {
     ConfiguredProviderStage(crate::widgets::PickerState),
 }
 
+/// The single blank row the Loading overlay draws. The "Loading models…"
+/// status lives in the info bar; the overlay exists only to block input until
+/// the catalog arrives, and a modal with no rows would render nothing.
+static LOADING_PLACEHOLDER_ROWS: [String; 1] = [String::new()];
+
 impl ModelPickerOverlay {
     fn is_open(&self) -> bool {
         !matches!(self, Self::None)
     }
 
-    fn item_count(&self) -> usize {
+    /// Fluent key of the modal title, `None` while no overlay is open.
+    fn title_key(&self) -> Option<&'static str> {
         match self {
-            Self::Model(p) | Self::ConfiguredProviderStage(p) => p.items.len(),
-            Self::Loading => 1,
-            Self::None => 0,
+            Self::Loading => Some("zc-model-catalog-loading"),
+            Self::Model(_) => Some("zc-model-picker-title"),
+            Self::ConfiguredProviderStage(_) => Some("zc-model-provider-picker-title"),
+            Self::None => None,
+        }
+    }
+
+    /// The rows the modal draws: the picker's items, or the Loading
+    /// placeholder. Drawing and hit-testing both read this so they agree.
+    fn modal_rows(&self) -> Option<&[String]> {
+        match self {
+            Self::Loading => Some(&LOADING_PLACEHOLDER_ROWS),
+            Self::None => None,
+            _ => self.picker().map(|p| p.items.as_slice()),
+        }
+    }
+
+    fn item_count(&self) -> usize {
+        self.modal_rows().map_or(0, <[String]>::len)
+    }
+
+    fn picker(&self) -> Option<&crate::widgets::PickerState> {
+        match self {
+            Self::Model(p) | Self::ConfiguredProviderStage(p) => Some(p),
+            Self::Loading | Self::None => None,
         }
     }
 
@@ -9163,6 +9142,64 @@ mod tests {
             None,
         ));
         assert!(stage1.is_open());
+    }
+
+    #[test]
+    fn closed_overlay_exposes_no_title_rows_or_area() {
+        let closed = ModelPickerOverlay::None;
+        assert_eq!(closed.title_key(), None);
+        assert!(closed.modal_rows().is_none());
+        assert_eq!(closed.item_count(), 0);
+        assert!(closed.picker().is_none());
+        assert!(model_picker_overlay_area(&closed, Rect::new(0, 0, 80, 20)).is_none());
+    }
+
+    #[test]
+    fn loading_overlay_draws_one_placeholder_row_without_a_picker() {
+        let loading = ModelPickerOverlay::Loading;
+        assert_eq!(loading.title_key(), Some("zc-model-catalog-loading"));
+        assert_eq!(loading.modal_rows(), Some(&[String::new()][..]));
+        assert_eq!(loading.item_count(), 1);
+        assert!(loading.picker().is_none());
+        assert!(model_picker_overlay_area(&loading, Rect::new(0, 0, 80, 20)).is_some());
+    }
+
+    #[test]
+    fn overlay_title_keys_and_rows_follow_the_open_picker() {
+        let items = vec![
+            "claude-opus-4-8".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ];
+        let model = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
+            items.clone(),
+            Some("claude-sonnet-4-6"),
+        ));
+        assert_eq!(model.title_key(), Some("zc-model-picker-title"));
+        assert_eq!(model.modal_rows(), Some(items.as_slice()));
+        assert_eq!(model.picker().map(|p| p.cursor), Some(1));
+
+        let providers = vec!["anthropic.default".to_string()];
+        let stage1 = ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
+            providers.clone(),
+            None,
+        ));
+        assert_eq!(stage1.title_key(), Some("zc-model-provider-picker-title"));
+        assert_eq!(stage1.modal_rows(), Some(providers.as_slice()));
+    }
+
+    #[test]
+    fn overlay_area_matches_the_widget_geometry_of_its_rows() {
+        let items = vec!["openai.default".to_string(), "deepseek.default".to_string()];
+        let overlay = ModelPickerOverlay::ConfiguredProviderStage(
+            crate::widgets::PickerState::new(items.clone(), None),
+        );
+        let area = Rect::new(0, 0, 80, 20);
+        let expected = crate::widgets::PickerModal::area_for(
+            &crate::i18n::t("zc-model-provider-picker-title"),
+            &items,
+            area,
+        );
+        assert_eq!(model_picker_overlay_area(&overlay, area), expected);
     }
 
     // ── Session-transition settings reload ──────────────────────────────────
