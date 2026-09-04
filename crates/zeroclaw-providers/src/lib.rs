@@ -6631,6 +6631,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn openai_codex_default_oauth_is_not_rotation_eligible() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "codex-oauth".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    api_key: None,
+                    ..Default::default()
+                },
+            },
+        );
+        config.reliability.api_keys = vec!["sk-codex-extra".to_string()];
+
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "openai",
+            "codex-oauth",
+            &PrimaryCredentialSource::Alias,
+            true,
+        );
+        assert!(
+            attempts.is_empty(),
+            "default codex oauth profile must not offer key rotation attempts"
+        );
+
+        let rotation = credential_rotation_for_alias(
+            &config,
+            "openai",
+            "codex-oauth",
+            None,
+            &config.reliability.clone(),
+            None,
+            &CredentialRotationScope::primary(),
+        );
+        assert!(
+            rotation.is_none(),
+            "default codex oauth profile must not build credential rotation"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_codex_custom_gateway_rotates_on_rate_limit() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            routing::post,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn codex_gateway_handler(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> (StatusCode, Json<Value>) {
+            let auth = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push(auth.clone());
+
+            if auth == "Bearer sk-codex-primary" {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({"error": {"message": "rate limited"}})),
+                );
+            }
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "output_text": "ok",
+                    "output": []
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/responses", post(codex_gateway_handler))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "codex-gateway".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    api_key: Some("sk-codex-primary".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    ..Default::default()
+                },
+            },
+        );
+        config.reliability.provider_retries = 1;
+        config.reliability.provider_backoff_ms = 1;
+        config.reliability.api_keys = vec!["sk-codex-alternate".to_string()];
+
+        let attempts = credential_attempts_for_alias(
+            config.clone(),
+            "openai",
+            "codex-gateway",
+            &PrimaryCredentialSource::Alias,
+            true,
+        );
+        assert_eq!(
+            attempts.len(),
+            2,
+            "configured codex gateway must yield primary and alternate key attempts"
+        );
+
+        let live_config = Arc::new(parking_lot::RwLock::new(config));
+        let provider = create_routed_model_provider_with_live_config_options(
+            Arc::clone(&live_config),
+            "openai.codex-gateway",
+            "gpt-5-codex",
+        )
+        .expect("routed codex gateway provider should build");
+
+        let response = provider
+            .simple_chat("hello", "gpt-5-codex", None)
+            .await
+            .expect("gateway request should succeed on rotated alternate key");
+        assert_eq!(response, "ok");
+
+        server.abort();
+
+        assert_eq!(
+            &*capture.lock().expect("capture lock poisoned"),
+            &[
+                "Bearer sk-codex-primary".to_string(),
+                "Bearer sk-codex-alternate".to_string(),
+            ],
+            "first attempt with rate-limited primary key must rotate to alternate gateway key"
+        );
+    }
+
     #[tokio::test]
     async fn qwen_api_key_profile_without_oauth_still_rotates() {
         use axum::{

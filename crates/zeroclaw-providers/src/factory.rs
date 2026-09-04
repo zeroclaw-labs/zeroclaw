@@ -505,14 +505,26 @@ pub(crate) fn rotation_credential_eligible(
     key: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> bool {
+    let mut resolved_opts = opts.clone();
     if let Some(config) = config {
         let Some(entry) = config.providers.models.find(family, alias) else {
             return false;
         };
-        if entry.requires_openai_auth {
+        if resolved_opts.provider_api_url.is_none()
+            && let Some(uri) = entry
+                .uri
+                .as_deref()
+                .or_else(|| config.providers.models.resolved_endpoint_uri(family, alias))
+        {
+            resolved_opts.provider_api_url = Some(uri.to_string());
+        }
+        if entry.requires_openai_auth
+            && !crate::openai_codex::api_key_is_outbound_credential(&resolved_opts, key)
+        {
             return false;
         }
     }
+    let opts = &resolved_opts;
 
     let provider_kind = opts
         .provider_kind
@@ -1280,9 +1292,17 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
     fn api_key_is_outbound_credential(
         &self,
         key: Option<&str>,
-        _opts: &ModelProviderRuntimeOptions,
+        opts: &ModelProviderRuntimeOptions,
     ) -> bool {
-        has_api_key(key) && !self.base.requires_openai_auth
+        if self.base.requires_openai_auth {
+            let mut resolved_opts = opts.clone();
+            if resolved_opts.provider_api_url.is_none() {
+                resolved_opts.provider_api_url = self.base.uri.clone();
+            }
+            crate::openai_codex::api_key_is_outbound_credential(&resolved_opts, key)
+        } else {
+            has_api_key(key)
+        }
     }
 }
 
@@ -2042,6 +2062,66 @@ mod tests {
             "default",
             Some("gateway-api-key"),
             &custom_endpoint,
+        ));
+    }
+
+    #[test]
+    fn configured_codex_alias_with_custom_gateway_is_rotation_eligible() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "gateway_alias".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    uri: Some("https://gateway.example.com/v1".to_string()),
+                    api_key: Some("gateway-primary-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://gateway.example.com/v1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(rotation_credential_eligible(
+            Some(&config),
+            "openai",
+            "gateway_alias",
+            Some("gateway-primary-key"),
+            &options,
+        ));
+        assert!(rotation_credential_eligible(
+            Some(&config),
+            "openai",
+            "gateway_alias",
+            Some("gateway-alternate-key"),
+            &options,
+        ));
+    }
+
+    #[test]
+    fn configured_codex_alias_with_default_oauth_is_not_rotation_eligible() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "oauth_alias".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let options = ModelProviderRuntimeOptions::default();
+
+        assert!(!rotation_credential_eligible(
+            Some(&config),
+            "openai",
+            "oauth_alias",
+            Some("oauth-token"),
+            &options,
         ));
     }
 

@@ -41,7 +41,7 @@ A streaming call selects the first eligible, non-cooling entry that supports the
 
 `reliability.api_keys` supplies additional API keys for the primary provider profile. After a retryable rate limit, ZeroClaw cools the failed key, rebuilds the same provider candidate with the next healthy key, and retries within the configured `provider_retries` bound. Live config replacement and removal are observed before the next credential selection.
 
-Rotation is available only when the provider factory confirms that `api_key` is the credential sent on the wire. OAuth refresh-token modes, Anthropic setup tokens, ambient or CLI authentication, `requires_openai_auth`, and providers that ignore `api_key` are excluded. A route-level key stays with that exact route, fallback profiles use their own keys, and neither receives the primary profile's additional-key pool.
+Rotation is available only when the provider factory confirms that `api_key` is the credential sent on the wire. OAuth refresh-token modes, Anthropic setup tokens, ambient or CLI authentication, default `requires_openai_auth` subscription OAuth (custom gateways that send the supplied API key remain eligible), and providers that ignore `api_key` are excluded. A route-level key stays with that exact route, fallback profiles use their own keys, and neither receives the primary profile's additional-key pool.
 
 Cooldowns are keyed to the failed credential without storing or logging the key itself. Entries that resolve the same provider alias share the cooldown, including sibling routes. Removing a key does not clear its cooldown, so reintroducing it before expiry does not immediately retry it.
 
