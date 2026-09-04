@@ -130,11 +130,15 @@ impl Drop for AgentTurnGuard<'_> {
     }
 }
 
-/// Process-wide broadcast hook installed by long-running subsystems (today: the
-/// gateway) so that events emitted by observers built in *other* subsystems —
-/// notably the agent loop's `process_message` — also fan out to the SSE
-/// broadcast channel. Without this, observers created per call site stay
-/// isolated and `/api/events` only sees the gateway's own direct emissions.
+/// Process-wide broadcast hooks installed by long-running subsystems (today:
+/// the gateway's SSE layer) so that events emitted by observers built in
+/// *other* subsystems — notably the agent loop's `process_message` — also fan
+/// out to them. Without this, observers created per call site stay isolated
+/// and `/api/events` only sees the gateway's own direct emissions.
+///
+/// Every live hook receives every event: concurrently installed hooks fan out
+/// rather than shadowing each other, so a process-level consumer (e.g. a
+/// lifecycle projection worker) can coexist with the gateway's SSE layer.
 ///
 /// Uses `parking_lot::RwLock` so the event-recording path never has to handle
 /// lock poisoning: a panic inside a hook would not silently disable the entire
@@ -150,11 +154,24 @@ struct BroadcastHookEntry {
 struct BroadcastHookState {
     next_scoped_id: u64,
     entries: Vec<BroadcastHookEntry>,
+    /// Precomputed fan-out over `entries`, rebuilt on every install/remove so
+    /// the per-event path stays a single `Arc` clone under the read lock.
+    composite: Option<Arc<dyn Observer>>,
 }
 
 impl BroadcastHookState {
     fn current(&self) -> Option<Arc<dyn Observer>> {
-        self.entries.last().map(|entry| entry.observer.clone())
+        self.composite.clone()
+    }
+
+    fn rebuild_composite(&mut self) {
+        self.composite = match self.entries.as_slice() {
+            [] => None,
+            [single] => Some(single.observer.clone()),
+            many => Some(Arc::new(MultiObserver::from_shared(
+                many.iter().map(|entry| entry.observer.clone()).collect(),
+            ))),
+        };
     }
 }
 
@@ -164,7 +181,8 @@ fn broadcast_hook_slot() -> &'static RwLock<BroadcastHookState> {
 
 /// Install a process-wide observer that will receive every event recorded
 /// through observers built by [`create_observer`]. Calling this again replaces
-/// the previous hook.
+/// every previously installed hook, scoped ones included; prefer
+/// [`set_scoped_broadcast_hook`] when other hooks must keep receiving events.
 pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
     let mut slot = broadcast_hook_slot().write();
     slot.entries.clear();
@@ -172,6 +190,7 @@ pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
         scoped_id: None,
         observer,
     });
+    slot.rebuild_composite();
 }
 
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
@@ -184,10 +203,14 @@ impl Drop for BroadcastHookGuard {
         let mut slot = broadcast_hook_slot().write();
         slot.entries
             .retain(|entry| entry.scoped_id != Some(self.scoped_id));
+        slot.rebuild_composite();
     }
 }
 
-/// Install a process-wide observer and return a guard that clears it on drop.
+/// Install a process-wide observer and return a guard that removes it on drop.
+/// Multiple scoped hooks may be live at once; every live hook receives every
+/// event, so independent subsystems can install their own without shadowing
+/// each other.
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
 pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGuard {
     let mut slot = broadcast_hook_slot().write();
@@ -197,12 +220,15 @@ pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGu
         scoped_id: Some(scoped_id),
         observer,
     });
+    slot.rebuild_composite();
     BroadcastHookGuard { scoped_id }
 }
 
-/// Remove the broadcast hook, if any. Intended for tests and orderly shutdown.
+/// Remove all broadcast hooks, if any. Intended for tests and orderly shutdown.
 pub fn clear_broadcast_hook() {
-    broadcast_hook_slot().write().entries.clear();
+    let mut slot = broadcast_hook_slot().write();
+    slot.entries.clear();
+    slot.rebuild_composite();
 }
 
 fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
@@ -258,7 +284,10 @@ impl Drop for FlushGuard {
 }
 
 /// Wrapper that forwards every event to a primary observer plus the
-/// process-wide broadcast hook (when set). Metrics flow only to the primary.
+/// process-wide broadcast hooks (when installed). Metrics flow only to the
+/// primary. Flush reaches the hooks too, so background consumers attached at
+/// the hook get a drain signal from the same [`FlushGuard`]/shutdown paths
+/// that flush the primary.
 struct TeeObserver {
     primary: Box<dyn Observer>,
 }
@@ -277,6 +306,9 @@ impl Observer for TeeObserver {
 
     fn flush(&self) {
         self.primary.flush();
+        if let Some(hook) = current_broadcast_hook() {
+            hook.flush();
+        }
     }
 
     fn name(&self) -> &str {
@@ -690,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
+    fn concurrent_scoped_broadcast_hooks_all_receive_events() {
         let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
@@ -706,19 +738,47 @@ mod tests {
         };
         let observer = create_observer(&cfg);
         observer.record_event(&ObserverEvent::HeartbeatTick);
-        assert_eq!(old_hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
         assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
 
         drop(new_guard);
         observer.record_event(&ObserverEvent::HeartbeatTick);
-        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 2);
         assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
 
         drop(old_guard);
         observer.record_event(&ObserverEvent::HeartbeatTick);
-        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 2);
         assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
 
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn tee_flush_reaches_every_live_broadcast_hook() {
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
+        clear_broadcast_hook();
+
+        let hook_a = Arc::new(CountingObserver::default());
+        let guard_a = set_scoped_broadcast_hook(hook_a.clone());
+        let hook_b = Arc::new(CountingObserver::default());
+        let guard_b = set_scoped_broadcast_hook(hook_b.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.flush();
+        assert_eq!(hook_a.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(hook_b.flushes.load(Ordering::SeqCst), 1);
+
+        drop(guard_b);
+        observer.flush();
+        assert_eq!(hook_a.flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(hook_b.flushes.load(Ordering::SeqCst), 1);
+
+        drop(guard_a);
         clear_broadcast_hook();
     }
 
