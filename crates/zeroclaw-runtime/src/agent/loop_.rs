@@ -539,8 +539,9 @@ pub fn native_tool_specs_present_for_turn(
     Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
 }
 
-static IMAGE_DATA_URI_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[IMAGE:data:[^\]]*\]").unwrap());
+static IMAGE_DATA_URI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[IMAGE:data:[^\]]*\]").expect("static image data URI regex must compile")
+});
 
 fn elide_image_data(content: &str) -> String {
     IMAGE_DATA_URI_REGEX
