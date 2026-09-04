@@ -742,6 +742,47 @@ pub(crate) enum FileLookupFailure {
     Permanent,
 }
 
+/// Why a voice message was dropped for good, and what its sender is told.
+///
+/// A voice note that disappears without a word is indistinguishable, from the
+/// sender's side, from a bot that never heard them: the message was delivered,
+/// no answer came, and no reason was given. Every permanent drop therefore
+/// carries a short human sentence. Transient failures are deliberately absent:
+/// the update is retried from the same offset, so a notice would be sent again
+/// on every attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceDropReason {
+    /// The recording is longer than `transcription.max_duration_secs`.
+    TooLong { limit_secs: u64 },
+    /// Telegram will never hand us this file: expired id, too big, forbidden.
+    FileUnavailable,
+    /// Transcription succeeded but produced nothing usable — silence, noise.
+    EmptyTranscript,
+}
+
+impl VoiceDropReason {
+    /// The sentence the sender sees. Vendor and engine diagnostics stay in the
+    /// log: the sender gets the reason, never the internals.
+    pub(crate) fn notice(self) -> String {
+        match self {
+            Self::TooLong { limit_secs } => format!(
+                "⚠️ Voice message skipped: it is longer than the {limit_secs}s limit. \
+                 Send a shorter recording or split it up."
+            ),
+            Self::FileUnavailable => {
+                "⚠️ Voice message skipped: the recording could not be retrieved from Telegram. \
+                 Please send it again."
+                    .to_string()
+            }
+            Self::EmptyTranscript => {
+                "⚠️ Voice message skipped: nothing could be recognised in the recording. \
+                 Please try again, closer to the microphone."
+                    .to_string()
+            }
+        }
+    }
+}
+
 /// A `getFile` failure with the vendor diagnostics preserved.
 ///
 /// The previous code mapped every failure to a single generic
@@ -2532,10 +2573,43 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }))
     }
 
+    /// Tell the sender why their voice message will not be answered.
+    ///
+    /// Best effort by design: if the notice itself cannot be delivered the
+    /// drop is still permanent, so the failure is logged and swallowed rather
+    /// than turned into a retry of the original update.
+    async fn notify_voice_drop(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        reason: VoiceDropReason,
+    ) {
+        if let Err(e) = self
+            .send_text_chunks(&reason.notice(), chat_id, thread_id)
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                        "reason": format!("{reason:?}"),
+                    })),
+                "Failed to notify sender about skipped voice message"
+            );
+        }
+    }
+
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
     /// disabled, or the message exceeds duration limits; `RetryTransient` if download or
     /// transcription I/O fails.
+    ///
+    /// Every permanent drop that reaches an allowed sender is announced to them
+    /// (see [`VoiceDropReason`]): silence is indistinguishable from a bot that
+    /// never received the recording. Transient failures stay silent — the same
+    /// update is retried, and a notice per attempt would be spam.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> UpdateDisposition {
         let Some(config) = self.transcription.as_ref() else {
             return UpdateDisposition::SkipPermanent;
@@ -2551,18 +2625,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         };
 
-        if duration > config.max_duration_secs {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Skipping voice message: duration {duration}s exceeds limit {}s",
-                    config.max_duration_secs
-                )
-            );
-            return UpdateDisposition::SkipPermanent;
-        }
-
+        // The duration check used to run here, before the sender was known.
+        // It now runs once the chat is resolved and the sender has passed the
+        // allowlist and mention gate, so the skip can be explained to them —
+        // and so a stranger's oversized recording still costs nothing: the
+        // check stays ahead of every download.
         let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let mut identities = vec![username.as_str()];
@@ -2604,6 +2671,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
+        if duration > config.max_duration_secs {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping voice message: duration {duration}s exceeds limit {}s",
+                    config.max_duration_secs
+                )
+            );
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::TooLong {
+                    limit_secs: config.max_duration_secs,
+                },
+            )
+            .await;
+            return UpdateDisposition::SkipPermanent;
+        }
+
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
             Ok(p) => p,
@@ -2621,7 +2708,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // See the attachment path: a permanent vendor rejection must
                 // not hold the offset, or the batch never drains.
                 return match e.kind {
-                    FileLookupFailure::Permanent => UpdateDisposition::SkipPermanent,
+                    FileLookupFailure::Permanent => {
+                        self.notify_voice_drop(
+                            &chat_id,
+                            thread_id.as_deref(),
+                            VoiceDropReason::FileUnavailable,
+                        )
+                        .await;
+                        UpdateDisposition::SkipPermanent
+                    }
                     FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
                 };
             }
@@ -2667,6 +2762,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "Voice transcription returned empty text, skipping"
             );
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::EmptyTranscript,
+            )
+            .await;
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -8163,6 +8264,22 @@ mod tests {
 
     #[tokio::test]
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The skip is announced to the sender: silence would look like the bot
+        // never heard the recording at all.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
             api_key: Some("test_key".to_string()),
@@ -8177,7 +8294,8 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_transcription(tc);
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
         let update = serde_json::json!({
             "message": {
                 "message_id": 2,
@@ -8189,6 +8307,143 @@ mod tests {
 
         let parsed = ch.try_parse_voice_message(&update).await;
         assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1, "the sender is told exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["chat_id"], "456");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("5s limit"), "notice names the limit: {text}");
+    }
+
+    #[tokio::test]
+    async fn oversized_voice_notice_goes_to_the_forum_topic_it_came_from() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 8 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 3,
+                "message_thread_id": 42,
+                "is_topic_message": true,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -1004389982480_i64, "type": "supergroup" }
+            }
+        });
+
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            UpdateDisposition::SkipPermanent
+        ));
+
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["chat_id"], "-1004389982480");
+        assert_eq!(
+            body["message_thread_id"], "42",
+            "a notice in the wrong topic is as good as no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_voice_from_stranger_is_dropped_without_a_word() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // No `expect`: any outgoing call at all is the failure this guards.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 9 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        )
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 4,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            UpdateDisposition::SkipPermanent
+        ));
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "an unauthorized sender learns nothing — not even that a limit exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_drop_notices_name_the_reason_without_internals() {
+        let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
+        assert!(too_long.contains("900s limit"));
+
+        for notice in [
+            too_long,
+            VoiceDropReason::FileUnavailable.notice(),
+            VoiceDropReason::EmptyTranscript.notice(),
+        ] {
+            assert!(
+                notice.starts_with("⚠️ Voice message skipped:"),
+                "every notice says what happened up front: {notice}"
+            );
+            assert!(
+                !notice.to_lowercase().contains("error")
+                    && !notice.contains("http")
+                    && !notice.contains("api"),
+                "diagnostics belong in the log, not in the chat: {notice}"
+            );
+        }
     }
 
     #[tokio::test]
