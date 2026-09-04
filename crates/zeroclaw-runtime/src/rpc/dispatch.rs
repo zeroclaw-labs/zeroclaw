@@ -1970,7 +1970,15 @@ impl RpcDispatcher {
         let req: SessionPromptParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        if req.prompt.trim().is_empty() && req.attachments.is_empty() {
+        // A leading `/effort:<level>` (or the older `/think:<level>`) names
+        // the depth for this turn only and never reaches the model.
+        let (inline_level, prompt_body) =
+            match crate::agent::thinking::parse_thinking_directive(&req.prompt) {
+                Some((level, remaining)) => (Some(level), remaining),
+                None => (None, req.prompt.clone()),
+            };
+
+        if prompt_body.trim().is_empty() && req.attachments.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
                 "session/prompt requires a non-empty `prompt` or at least one attachment",
@@ -2001,8 +2009,58 @@ impl RpcDispatcher {
             },
         };
 
+        // Resolve the turn's thinking request before any side effect. An
+        // inline level the model does not take fails here, with the same
+        // completion notice the absent-session branch sends so the client
+        // leaves its working state.
+        let thinking = {
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(sid)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            let overrides = self
+                .ctx
+                .sessions
+                .get_overrides(sid)
+                .await
+                .unwrap_or_default();
+            let resolved = {
+                let config = self.ctx.config.read();
+                resolve_turn_thinking(&config, &agent_alias, &overrides, inline_level)
+            };
+            match resolved {
+                Ok(thinking) => thinking,
+                Err(err) => {
+                    self.emit_turn_complete(
+                        sid,
+                        crate::rpc::types::TurnCompletionOutcome::Failed,
+                        "turn cancelled by daemon: thinking_level_unsupported".to_string(),
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+        };
+        if let Some(params) = thinking {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "inline": inline_level.is_some(),
+                        "effort": params.effort.map(|effort| effort.as_str()),
+                        "budget_tokens": params.budget_tokens,
+                        "display": params.display.map(|display| display.as_str()),
+                    })),
+                "thinking request resolved for the turn"
+            );
+        }
+
         // Process inline attachments: upload each, append markers to prompt.
-        let mut prompt = req.prompt.clone();
+        let mut prompt = prompt_body;
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
@@ -2123,6 +2181,7 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
+            thinking,
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -5182,6 +5241,50 @@ fn validate_thinking_overrides(
         ));
     }
     Ok(())
+}
+
+/// The thinking request for one RPC turn. An inline level the model does not
+/// take is rejected, naming what it does take; the session override was
+/// checked when it was set.
+fn resolve_turn_thinking(
+    config: &Config,
+    agent_alias: &str,
+    overrides: &SessionOverrides,
+    inline_level: Option<zeroclaw_config::scattered_types::ThinkingLevel>,
+) -> Result<Option<zeroclaw_api::model_provider::NativeThinkingParams>, JsonRpcError> {
+    use super::thinking_options::{
+        accepted_levels, capabilities_for, join_levels, resolve_session_thinking,
+    };
+
+    let profile = session_thinking_profile(config, agent_alias);
+    if let Some(level) = inline_level {
+        let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+            config,
+            agent_alias,
+            overrides.model_provider.as_deref(),
+            overrides.model.as_deref(),
+        )
+        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        let accepted = accepted_levels(&capabilities_for(&model_provider, &model), &profile);
+        if !accepted.contains(&level) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                unsupported_thinking_message(
+                    "thinking_level",
+                    level.as_str(),
+                    &model,
+                    &model_provider,
+                    &join_levels(&accepted),
+                ),
+            ));
+        }
+    }
+    Ok(resolve_session_thinking(
+        inline_level,
+        overrides.thinking_level,
+        overrides.thinking_display,
+        &profile,
+    ))
 }
 
 fn unsupported_thinking_message(
@@ -11453,6 +11556,7 @@ mod tests {
                 enabled: true,
                 model_provider: "anthropic.default".into(),
                 risk_profile: "test-profile".into(),
+                runtime_profile: "default".into(),
                 ..Default::default()
             },
         )]);
@@ -11695,6 +11799,277 @@ mod tests {
         identity_matches(
             thinking_overrides_for_session(&dispatcher, &session_id).await,
             attribution,
+        );
+    }
+
+    /// Records the thinking request and the newest user message of each call.
+    #[derive(Default)]
+    struct TurnRecordingProvider {
+        calls: std::sync::Mutex<
+            Vec<(
+                Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+                Option<String>,
+            )>,
+        >,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for TurnRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let user = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone());
+            self.calls.lock().unwrap().push((request.thinking, user));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnRecordingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "recording"
+        }
+    }
+
+    /// A shared handle so the test keeps reading what the agent's box saw.
+    struct SharedRecordingProvider(Arc<TurnRecordingProvider>);
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SharedRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.0
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.0.chat(request, model, temperature).await
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SharedRecordingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            self.0.role()
+        }
+        fn alias(&self) -> &str {
+            self.0.alias()
+        }
+    }
+
+    /// A dispatcher on the thinking test config whose one session runs a
+    /// recording provider instead of a real one.
+    async fn recording_thinking_session(
+        tmp: &tempfile::TempDir,
+    ) -> (RpcDispatcher, Arc<TurnRecordingProvider>, String) {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let provider = Arc::new(TurnRecordingProvider::default());
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(SharedRecordingProvider(Arc::clone(&provider))))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("claude-fable-5-1".into())
+            .model_provider_name("anthropic.default".into())
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("minimal Agent should build");
+        let session_id = "thinking-session".to_string();
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            tmp.path().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions
+            .insert(session_id.clone(), rpc_session)
+            .await
+            .unwrap();
+        let dispatcher = make_shared_sessions_dispatcher(make_thinking_test_config(tmp), sessions);
+        (dispatcher, provider, session_id)
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_an_inline_level_the_model_lacks_before_the_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, mut rx, _sessions) =
+            make_dispatcher_with_capture(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model": "claude-opus-4-6"}
+            }))
+            .await
+            .expect("the model switch succeeds");
+
+        let err = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "/effort:xhigh explain the classifier",
+            }))
+            .await
+            .expect_err("xhigh is not a depth this generation takes");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "thinking_level `xhigh` is not supported by `claude-opus-4-6` (anthropic.default); accepted: low, medium, high, max"
+        );
+
+        let raw = rx
+            .try_recv()
+            .expect("a rejected turn still tells the client the turn is over");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("notification must be JSON");
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["session_id"], session_id);
+        assert_eq!(v["params"]["outcome"], "failed");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing else is emitted: the turn never started"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_applies_the_session_level_and_strips_the_inline_prefix() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, provider, session_id) = recording_thinking_session(&tmp).await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "high", "thinking_display": "summarized"}
+            }))
+            .await
+            .expect("both choices are ones this model takes");
+
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "/effort:max hello",
+            }))
+            .await
+            .expect("the turn runs on the recording provider");
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "/think:low again",
+            }))
+            .await
+            .expect("the older spelling is still accepted");
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "and once more",
+            }))
+            .await
+            .expect("a plain prompt uses the session level");
+
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "one provider call per turn");
+        let thinking: Vec<_> = calls.iter().map(|(thinking, _)| *thinking).collect();
+        assert_eq!(
+            thinking,
+            vec![
+                Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::Max),
+                    display: Some(ThinkingDisplay::Summarized),
+                }),
+                Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::Low),
+                    display: Some(ThinkingDisplay::Summarized),
+                }),
+                Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::High),
+                    display: Some(ThinkingDisplay::Summarized),
+                }),
+            ],
+            "the inline level applies to its own turn only; the session level and display carry over"
+        );
+        // The runtime prepends its own preamble to the user message, so only
+        // the last line is the prompt as the client sent it.
+        let prompts: Vec<_> = calls
+            .iter()
+            .map(|(_, user)| user.as_deref().and_then(|user| user.lines().last()))
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![Some("hello"), Some("again"), Some("and once more")],
+            "the prefix never reaches the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_uses_the_profile_default_without_overrides() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, provider, session_id) = recording_thinking_session(&tmp).await;
+
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "hello",
+            }))
+            .await
+            .expect("the turn runs on the recording provider");
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls[0].0,
+            Some(NativeThinkingParams {
+                budget_tokens: None,
+                effort: Some(ThinkingEffort::High),
+                display: None,
+            }),
+            "the profile's default level reaches RPC turns natively"
         );
     }
 

@@ -17,14 +17,19 @@ pub struct ThinkingParams {
     pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
 }
 
+/// Prefixes that name a reasoning depth for one message. `/effort:` matches
+/// the shared `/effort` command; `/think:` is the older spelling and stays
+/// accepted.
+const THINKING_DIRECTIVE_PREFIXES: &[&str] = &["/effort:", "/think:"];
+
 pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)> {
     let trimmed = message.trim_start();
-    if !trimmed.starts_with("/think:") {
-        return None;
-    }
+    let prefix = THINKING_DIRECTIVE_PREFIXES
+        .iter()
+        .find(|prefix| trimmed.starts_with(*prefix))?;
 
-    // Extract the level token (everything between `/think:` and the next whitespace or end).
-    let after_prefix = &trimmed["/think:".len()..];
+    // Extract the level token (everything between the prefix and the next whitespace or end).
+    let after_prefix = &trimmed[prefix.len()..];
     let level_end = after_prefix
         .find(|c: char| c.is_whitespace())
         .unwrap_or(after_prefix.len());
@@ -295,6 +300,21 @@ mod tests {
         let (level, remaining) = result.unwrap();
         assert_eq!(level, ThinkingLevel::High);
         assert_eq!(remaining, "What is Rust?");
+    }
+
+    #[test]
+    fn parse_directive_accepts_the_effort_spelling() {
+        let (level, remaining) =
+            parse_thinking_directive("/effort:xhigh plan the migration").expect("directive");
+        assert_eq!(level, ThinkingLevel::XHigh);
+        assert_eq!(remaining, "plan the migration");
+        assert_eq!(
+            strip_thinking_directive("  /effort:low  body"),
+            "body",
+            "the older and newer spellings strip the same way"
+        );
+        assert!(parse_thinking_directive("/effort high").is_none());
+        assert!(parse_thinking_directive("/effort:turbo hi").is_none());
     }
 
     #[test]
