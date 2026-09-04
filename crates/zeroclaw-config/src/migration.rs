@@ -236,7 +236,14 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
 /// a malformed one to its `Default` may grant a broader posture than intended.
 /// Salvage still drops them (so the daemon boots) but logs ERROR and reports
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
-pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
+pub const SECURITY_CRITICAL_KEYS: &[&str] = &[
+    "security",
+    "risk_profiles",
+    "peer_groups",
+    "users",
+    "oidc",
+    "permission_profiles",
+];
 
 pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
 
@@ -3039,6 +3046,27 @@ from_address = "a@example.com"
         assert!(
             migrate_to_current(raw).is_err(),
             "strict path must surface the defect for repair tooling"
+        );
+    }
+
+    #[test]
+    fn broken_users_roster_is_reported_as_security_degraded() {
+        // A malformed [users] roster salvaged to an empty roster is
+        // indistinguishable from an intentional no-roster config, which
+        // re-opens the shared-operator fallback. It must surface as a
+        // security-critical drop so exposure gating can react.
+        let raw = r#"
+schema_version = 3
+
+[users.alice]
+uid = "not-an-integer"
+permission_profiles = ["operator"]
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.dropped_security.iter().any(|p| p == "users"),
+            "malformed [users] must be a security-critical drop, got: {:?}",
+            load.dropped_security
         );
     }
 
