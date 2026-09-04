@@ -189,11 +189,16 @@ impl RpcOutbound {
         }
     }
 
-    pub async fn notify(&self, method: &'static str, params: Value) {
+    /// Queue one JSON-RPC notification for the transport writer.
+    ///
+    /// Returns `false` when serialization fails or the writer task has already
+    /// stopped, allowing callers that own temporary resources to clean them up.
+    pub async fn notify(&self, method: &'static str, params: Value) -> bool {
         let n = JsonRpcNotification::new(method, params);
-        if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.writer_tx.send(s).await;
-        }
+        let Ok(serialized) = serde_json::to_string(&n) else {
+            return false;
+        };
+        self.writer_tx.send(serialized).await.is_ok()
     }
 
     pub async fn request(

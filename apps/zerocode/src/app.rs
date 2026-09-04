@@ -629,6 +629,7 @@ pub async fn run(
     let mut mode_bar_layout = ModeBarLayout::default();
     let mut content_area = Rect::default();
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
+    let mut reconnect_cleanup_report = crate::attachment::CleanupReport::default();
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
 
@@ -915,6 +916,12 @@ pub async fn run(
         // episode an owned ephemeral daemon is respawned at most once, attached daemons
         // are never spawned, and both modes keep polling for manual recovery.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
+            // Transport loss terminates ownership of active-turn clipboard
+            // temporaries even when reconnect cannot complete immediately.
+            // Retain the bounded report so a replacement pane can surface it.
+            let cleanup_report = chat_pane.cleanup_for_teardown();
+            reconnect_cleanup_report.merge(cleanup_report);
+            chat_pane.surface_teardown_cleanup_report(cleanup_report);
             if owns_ephemeral && !ephemeral_respawn_done {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(socket) = target {
@@ -946,6 +953,10 @@ pub async fn run(
                         let adopted = adopt_client!(new_client);
                         active_leg = leg_after_adoption(adopted, active_leg, leg);
                         if adopted {
+                            // Carry the disconnected pane's bounded cleanup
+                            // failure count into the resumed pane.
+                            let cleanup_report = std::mem::take(&mut reconnect_cleanup_report);
+                            chat_pane.surface_teardown_cleanup_report(cleanup_report);
                             chrome_status.clear();
                             chrome_status.tick(&rpc);
                             reconnect_last_attempt = None;

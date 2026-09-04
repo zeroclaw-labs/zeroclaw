@@ -125,6 +125,9 @@ pub(crate) struct Chat {
     /// from leaving the matching local turn stuck in flight.
     prompt_completion_tx: mpsc::Sender<PromptCompletion>,
     prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
+    /// Cleanup failures inherited while this pane is not yet active. Reconnect
+    /// can rebuild into a picker/error phase before the resumed session opens.
+    pending_cleanup_report: CleanupReport,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
@@ -225,6 +228,7 @@ impl Chat {
             model_fetch_rx,
             prompt_completion_tx,
             prompt_completion_rx,
+            pending_cleanup_report: CleanupReport::default(),
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -270,6 +274,29 @@ impl Chat {
         match &self.phase {
             ChatPhase::Active(state) => Some(state.agent_alias.as_str()),
             _ => None,
+        }
+    }
+
+    /// Release clipboard temporaries owned by this pane before reconnect
+    /// replacement, returning bounded failures for the new pane to surface.
+    pub(crate) fn cleanup_for_teardown(&mut self) -> CleanupReport {
+        match &mut self.phase {
+            ChatPhase::Active(state) => state.cleanup_for_teardown(),
+            _ => CleanupReport::default(),
+        }
+    }
+
+    /// Surface cleanup failures inherited from a pane replaced on reconnect.
+    pub(crate) fn surface_teardown_cleanup_report(&mut self, report: CleanupReport) {
+        self.pending_cleanup_report.merge(report);
+        self.surface_pending_cleanup_report();
+    }
+
+    /// Apply an inherited cleanup report once the resumed session is active.
+    fn surface_pending_cleanup_report(&mut self) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            let report = std::mem::take(&mut self.pending_cleanup_report);
+            state.surface_cleanup_report(report);
         }
     }
 
@@ -1145,6 +1172,7 @@ impl Chat {
     // ── Drawing ──────────────────────────────────────────────────
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        self.surface_pending_cleanup_report();
         self.drain_notifications();
         self.drain_prompt_completions();
         self.drain_inbound_requests();
@@ -6969,6 +6997,17 @@ impl ChatState {
         cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
     }
 
+    /// Release every clipboard temporary owned by this pane during teardown.
+    /// User-selected files remain untouched because each cleanup helper checks
+    /// the attachment source before removing a path.
+    fn cleanup_for_teardown(&mut self) -> CleanupReport {
+        self.input_bar.reset();
+        let mut report = self.input_bar.take_cleanup_report();
+        report.merge(self.cleanup_active_turn_attachments());
+        report.merge(self.clear_queue());
+        report
+    }
+
     const QUEUE_CAP: usize = 32;
     const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
     const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
@@ -7531,6 +7570,14 @@ impl ChatState {
         cleanup_report.merge(self.cleanup_active_turn_attachments());
         cleanup_report.merge(self.clear_queue());
         self.surface_cleanup_report(cleanup_report);
+    }
+}
+
+impl Drop for ChatState {
+    fn drop(&mut self) {
+        // Drop is the final safety net for normal exit, reconnect replacement,
+        // and early-return paths that cannot surface UI feedback anymore.
+        let _ = self.cleanup_for_teardown();
     }
 }
 
@@ -12381,6 +12428,100 @@ mod tests {
         );
         assert!(user_path.exists(), "user-selected file must be preserved");
         assert!(state.active_turn_attachments.is_empty());
+    }
+
+    #[test]
+    fn dropping_chat_state_cleans_all_owned_clipboard_temps_without_touching_user_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let active_path = dir.path().join("active.png");
+        std::fs::write(&active_path, b"active").expect("write active clipboard temp");
+        let queued_path = dir.path().join("queued.png");
+        std::fs::write(&queued_path, b"queued").expect("write queued clipboard temp");
+        let composer_path = dir.path().join("composer.png");
+        std::fs::write(&composer_path, b"composer").expect("write composer clipboard temp");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let mut active = state();
+        active.own_active_turn_attachments(vec![
+            clipboard_att(&active_path, "active.png"),
+            PendingAttachment {
+                path: user_path.clone(),
+                mime_type: "image/png".to_string(),
+                filename: "user.png".to_string(),
+                size_bytes: 4,
+                source: crate::attachment::AttachmentSource::File,
+            },
+        ]);
+        active
+            .enqueue_message(
+                "queued".to_string(),
+                vec![clipboard_att(&queued_path, "queued.png")],
+            )
+            .expect("queue clipboard attachment");
+        active.input_bar.load_for_edit(
+            String::new(),
+            vec![clipboard_att(&composer_path, "composer.png")],
+        );
+
+        drop(active);
+
+        assert!(
+            !active_path.exists(),
+            "active clipboard temp must be removed"
+        );
+        assert!(
+            !queued_path.exists(),
+            "queued clipboard temp must be removed"
+        );
+        assert!(
+            !composer_path.exists(),
+            "composer clipboard temp must be removed"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+    }
+
+    #[tokio::test]
+    async fn reconnect_teardown_surfaces_bounded_cleanup_failure_on_rebuilt_pane() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let failed_path = dir.path().join("failed-cleanup");
+        std::fs::create_dir(&failed_path).expect("create forced-failure path");
+
+        let (old_rpc_tx, _old_rpc_rx) = mpsc::channel::<String>(16);
+        let old_client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(old_rpc_tx))));
+        let mut old_chat = Chat::new(old_client, PaneKind::Chat);
+        let mut old_state = state();
+        old_state.own_active_turn_attachments(vec![clipboard_att(&failed_path, "failed.png")]);
+        old_chat.phase = ChatPhase::Active(Box::new(old_state));
+
+        let cleanup_report = old_chat.cleanup_for_teardown();
+        assert_eq!(cleanup_report.failed_count(), 1);
+
+        let (new_rpc_tx, _new_rpc_rx) = mpsc::channel::<String>(16);
+        let new_client = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(new_rpc_tx))));
+        let mut rebuilt_chat = Chat::new(new_client, PaneKind::Chat);
+        rebuilt_chat.surface_teardown_cleanup_report(cleanup_report);
+        assert_eq!(rebuilt_chat.pending_cleanup_report.failed_count(), 1);
+
+        // Reconnect can briefly rebuild into a non-active phase. The bounded
+        // report must survive until the resumed session becomes active.
+        rebuilt_chat.phase = ChatPhase::Active(Box::new(state()));
+        rebuilt_chat.surface_pending_cleanup_report();
+
+        let ChatPhase::Active(state) = &rebuilt_chat.phase else {
+            panic!("expected active rebuilt chat");
+        };
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| { message.text.contains("1 temporary file") })
+        );
+        let failed_path = failed_path.to_string_lossy();
+        assert!(state.entries.iter().all(|entry| match entry {
+            ChatEntry::SystemMessage(text) => !text.contains(failed_path.as_ref()),
+            _ => true,
+        }));
     }
 
     #[tokio::test]
