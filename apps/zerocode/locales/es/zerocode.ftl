@@ -386,6 +386,7 @@ zc-thinking-switch-failed = Error al cambiar el razonamiento: { $error }
 zc-effort-none-for-model = Este modelo no ofrece niveles de esfuerzo.
 zc-display-none-for-model = Este modelo no ofrece opciones de visualización del razonamiento.
 zc-thinking-options-failed = No se pudieron cargar las opciones de razonamiento: { $error }
+zc-thinking-remembered-skipped = El ajuste de razonamiento recordado { $value } no está disponible para este modelo; omitido.
 zc-picker-current = actual
 zc-chat-label-you = Tú:
 zc-chat-label-agent = Agente:

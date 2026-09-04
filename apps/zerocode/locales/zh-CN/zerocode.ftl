@@ -386,6 +386,7 @@ zc-thinking-switch-failed = 思考设置更改失败：{ $error }
 zc-effort-none-for-model = 此模型不提供思考强度选项。
 zc-display-none-for-model = 此模型不提供思考显示选项。
 zc-thinking-options-failed = 无法加载思考选项：{ $error }
+zc-thinking-remembered-skipped = 记住的思考设置 { $value } 不适用于此模型，已跳过。
 zc-picker-current = 当前
 zc-chat-label-you = 你：
 zc-chat-label-agent = 代理：

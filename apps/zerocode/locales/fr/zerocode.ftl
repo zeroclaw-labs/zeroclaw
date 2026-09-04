@@ -386,6 +386,7 @@ zc-thinking-switch-failed = Échec du changement de réflexion : { $error }
 zc-effort-none-for-model = Ce modèle ne propose aucun niveau d'effort.
 zc-display-none-for-model = Ce modèle ne propose aucun choix d'affichage de la réflexion.
 zc-thinking-options-failed = Impossible de charger les options de réflexion : { $error }
+zc-thinking-remembered-skipped = Le réglage de réflexion mémorisé { $value } n'est pas proposé par ce modèle ; ignoré.
 zc-picker-current = actuel
 zc-chat-label-you = Vous :
 zc-chat-label-agent = Agent :

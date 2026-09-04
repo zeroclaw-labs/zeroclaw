@@ -525,6 +525,7 @@ impl Chat {
                 state.cwd = session.workspace_dir;
                 Self::refresh_model_identity(&self.rpc, &mut state).await;
                 Self::refresh_thinking_options(&self.rpc, &mut state).await;
+                Self::apply_remembered_thinking(&self.rpc, &mut state).await;
                 // On a resume, replay the daemon-retained transcript so the
                 // reattached pane shows the prior conversation rather than an
                 // empty history. Fresh sessions have nothing to load.
@@ -621,6 +622,9 @@ impl Chat {
                 Self::refresh_model_identity(rpc, state).await;
                 Self::refresh_thinking_options(rpc, state).await;
                 state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
+                // After the restart note, so a skipped or failed memory
+                // re-application (the more actionable message) is what stays.
+                Self::apply_remembered_thinking(rpc, state).await;
             }
             Err(e) => {
                 state.set_info_notice(crate::i18n::t_args(
@@ -2087,6 +2091,7 @@ impl Chat {
 
         Self::refresh_model_identity(rpc, state).await;
         Self::refresh_thinking_options(rpc, state).await;
+        Self::apply_remembered_thinking(rpc, state).await;
         state.load_history(history.messages, pane_kind == PaneKind::Acp);
     }
 
@@ -2174,10 +2179,111 @@ impl Chat {
                     }
                 };
                 state.info_message = Some(crate::widgets::InfoMessage::note(summary));
+                Self::remember_thinking_override(&state.agent_alias, &request);
             }
             Err(error) => {
                 state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
                     request.failed_key(),
+                    &[("error", &daemon_error_text(&error))],
+                )));
+            }
+        }
+        state.mark_dirty_full();
+    }
+
+    /// Record an accepted thinking change in the agent's memory
+    /// (`[thinking.agent_override.<alias>]` in `zerocode-config.toml`) so the
+    /// agent's next session starts from it; a reset forgets the value. Model
+    /// changes are not remembered. A write failure is logged: the session
+    /// already runs with the new value.
+    fn remember_thinking_override(agent_alias: &str, request: &SessionOverride) {
+        use crate::config::AgentThinkingKey;
+        let (key, value) = match request {
+            SessionOverride::ThinkingLevel(level) => {
+                (AgentThinkingKey::Level, Some(level.as_str()))
+            }
+            SessionOverride::ResetThinkingLevel => (AgentThinkingKey::Level, None),
+            SessionOverride::ThinkingDisplay(display) => {
+                (AgentThinkingKey::Display, Some(display.as_str()))
+            }
+            SessionOverride::ResetThinkingDisplay => (AgentThinkingKey::Display, None),
+            SessionOverride::Model(_) | SessionOverride::ModelProvider(_) => return,
+        };
+        if let Err(error) = crate::config::persist_agent_thinking(
+            &crate::i18n::config_dir(),
+            agent_alias,
+            key,
+            value,
+        ) {
+            eprintln!(
+                "zerocode: remembering the thinking setting for {agent_alias} failed ({error:#})"
+            );
+        }
+    }
+
+    /// Re-apply the agent's remembered effort and display to a session that
+    /// just started: each only when the model offers the value and the
+    /// session carries no override of its own (a resumed session keeps what
+    /// it had). A remembered value the model does not offer is skipped with a
+    /// note. The memory is read fresh from `zerocode-config.toml` at every
+    /// boundary; the file is its single source of truth.
+    async fn apply_remembered_thinking(rpc: &RpcClient, state: &mut ChatState) {
+        use crate::client::{SessionOverrides, ThinkingControl, ThinkingSource};
+        let memory = match crate::config::remembered_agent_thinking(
+            &crate::i18n::config_dir(),
+            &state.agent_alias,
+        ) {
+            Ok(memory) => memory,
+            Err(error) => {
+                eprintln!(
+                    "zerocode: reading the remembered thinking settings failed ({error:#}); skipping"
+                );
+                return;
+            }
+        };
+        let mut overrides = SessionOverrides::default();
+        let mut skipped = Vec::new();
+        for (control, remembered) in [
+            (ThinkingControl::Level, memory.level),
+            (ThinkingControl::Display, memory.display),
+        ] {
+            let Some(value) = remembered else {
+                continue;
+            };
+            let (offered, _, source) = state.thinking.control(control);
+            if source == ThinkingSource::Session {
+                continue;
+            }
+            if offered.contains(&value) {
+                match control {
+                    ThinkingControl::Level => overrides.thinking_level = Some(value),
+                    ThinkingControl::Display => overrides.thinking_display = Some(value),
+                }
+            } else {
+                skipped.push(value);
+            }
+        }
+        if !skipped.is_empty() {
+            state.set_info_notice(crate::i18n::t_args(
+                "zc-thinking-remembered-skipped",
+                &[("value", &skipped.join(", "))],
+            ));
+            state.mark_dirty_full();
+        }
+        if overrides == SessionOverrides::default() {
+            return;
+        }
+        match rpc
+            .session_configure(&state.session_id, overrides, &[])
+            .await
+        {
+            Ok(result) => match result.thinking_options {
+                Some(options) => state.set_thinking_identity(options),
+                None => Self::refresh_thinking_options(rpc, state).await,
+            },
+            Err(error) => {
+                state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                    "zc-thinking-switch-failed",
                     &[("error", &daemon_error_text(&error))],
                 )));
             }
@@ -11726,6 +11832,311 @@ mod tests {
         };
         assert_eq!(picker.items, ["omitted", "summarized"]);
         assert_eq!(picker.current, Some(1));
+    }
+
+    #[tokio::test]
+    async fn remembered_thinking_is_applied_only_when_the_model_offers_it() {
+        use crate::config::AgentThinkingKey;
+
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        crate::config::persist_agent_thinking(
+            dir.path(),
+            "alpha",
+            AgentThinkingKey::Level,
+            Some("high"),
+        )
+        .unwrap();
+        crate::config::persist_agent_thinking(
+            dir.path(),
+            "alpha",
+            AgentThinkingKey::Display,
+            Some("updates"),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::restart_session_for_state(&client, PaneKind::Chat, &mut state).await;
+                state
+            })
+        };
+
+        let request = next_rpc_request(&mut rx, "restart should start a fresh session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": null }),
+        );
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        respond_ok(&rpc, &request, serde_json::json!({}));
+        let request = next_rpc_request(&mut rx, "restart should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+        let request = next_rpc_request(&mut rx, "restart should read thinking options").await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        // The model offers the remembered level but not the remembered display.
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "overrides": {},
+                "thinking_options": {
+                    "levels": ["low", "medium", "high", "max"],
+                    "displays": ["omitted", "summarized"],
+                    "current_level": "medium",
+                    "level_source": "model_default",
+                    "current_display": "summarized",
+                    "display_source": "model_default"
+                }
+            }),
+        );
+
+        let request = next_rpc_request(&mut rx, "the remembered level should be re-applied").await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        assert_eq!(request["params"]["session_id"], "sess-fresh");
+        assert_eq!(
+            request["params"]["overrides"],
+            serde_json::json!({ "thinking_level": "high" })
+        );
+        assert!(request["params"].get("reset").is_none());
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-fresh",
+                "overrides": { "thinking_level": "high" },
+                "thinking_options": {
+                    "levels": ["low", "medium", "high", "max"],
+                    "displays": ["omitted", "summarized"],
+                    "current_level": "high",
+                    "level_source": "session",
+                    "current_display": "summarized",
+                    "display_source": "model_default"
+                }
+            }),
+        );
+
+        let state = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+        assert_eq!(state.thinking.current_level.as_deref(), Some("high"));
+        assert_eq!(
+            state.thinking.level_source,
+            crate::client::ThinkingSource::Session
+        );
+        assert_eq!(
+            state.thinking.current_display.as_deref(),
+            Some("summarized")
+        );
+        assert_eq!(
+            info_text(&state),
+            Some(crate::i18n::t_args(
+                "zc-thinking-remembered-skipped",
+                &[("value", "updates")]
+            ))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "the skipped display must not be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn remembered_thinking_defers_to_a_sessions_own_override() {
+        use crate::config::AgentThinkingKey;
+
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        crate::config::persist_agent_thinking(
+            dir.path(),
+            "myagent",
+            AgentThinkingKey::Level,
+            Some("high"),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        // A resumed session already carrying its own session-scoped level.
+        let mut state = state();
+        let resumed = crate::client::ThinkingOptionsResult {
+            levels: vec!["low".into(), "high".into()],
+            current_level: Some("low".into()),
+            level_source: crate::client::ThinkingSource::Session,
+            ..Default::default()
+        };
+        state.set_thinking_identity(resumed.clone());
+
+        let apply = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::apply_remembered_thinking(&client, &mut state).await;
+                state
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "a session override must not be overwritten by the memory"
+        );
+        let state = tokio::time::timeout(Duration::from_secs(2), apply)
+            .await
+            .expect("apply should finish")
+            .unwrap();
+        assert_eq!(state.thinking, resumed);
+        assert_eq!(info_text(&state), None);
+    }
+
+    /// Drive one `apply_session_override` against a daemon that accepts it
+    /// and echoes `options`, handing the state back.
+    async fn apply_accepted(
+        client: &Arc<RpcClient>,
+        rpc: &RpcOutbound,
+        rx: &mut mpsc::Receiver<String>,
+        state: ChatState,
+        request: SessionOverride,
+        options: serde_json::Value,
+    ) -> ChatState {
+        let task = {
+            let client = Arc::clone(client);
+            tokio::spawn(async move {
+                let mut state = state;
+                Chat::apply_session_override(&client, &mut state, request).await;
+                state
+            })
+        };
+        let request = next_rpc_request(rx, "the override should configure the session").await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        respond_ok(
+            rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {},
+                "thinking_options": options
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the override should finish")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn thinking_overrides_are_remembered_per_agent_and_forgotten_on_reset() {
+        use crate::config::{AgentThinkingMemory, remembered_agent_thinking};
+
+        let _lock = env_test_lock_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let options = serde_json::json!({
+            "levels": ["low", "high"],
+            "displays": ["omitted", "updates"],
+            "current_level": "high",
+            "level_source": "session",
+            "current_display": "updates",
+            "display_source": "session"
+        });
+
+        let state = apply_accepted(
+            &client,
+            &rpc,
+            &mut rx,
+            state(),
+            SessionOverride::ThinkingLevel("high".into()),
+            options.clone(),
+        )
+        .await;
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "myagent").unwrap(),
+            AgentThinkingMemory {
+                level: Some("high".into()),
+                display: None,
+            }
+        );
+
+        let state = apply_accepted(
+            &client,
+            &rpc,
+            &mut rx,
+            state,
+            SessionOverride::ThinkingDisplay("updates".into()),
+            options.clone(),
+        )
+        .await;
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "myagent").unwrap(),
+            AgentThinkingMemory {
+                level: Some("high".into()),
+                display: Some("updates".into()),
+            }
+        );
+
+        let state = apply_accepted(
+            &client,
+            &rpc,
+            &mut rx,
+            state,
+            SessionOverride::ResetThinkingLevel,
+            options.clone(),
+        )
+        .await;
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "myagent").unwrap(),
+            AgentThinkingMemory {
+                level: None,
+                display: Some("updates".into()),
+            }
+        );
+
+        // Model changes are not part of the memory.
+        let _state = apply_accepted(
+            &client,
+            &rpc,
+            &mut rx,
+            state,
+            SessionOverride::Model("gpt-5".into()),
+            options,
+        )
+        .await;
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "myagent").unwrap(),
+            AgentThinkingMemory {
+                level: None,
+                display: Some("updates".into()),
+            }
+        );
+        assert_eq!(
+            remembered_agent_thinking(dir.path(), "other").unwrap(),
+            AgentThinkingMemory::default(),
+            "the memory is per agent"
+        );
     }
 
     #[tokio::test]

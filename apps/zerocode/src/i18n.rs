@@ -397,6 +397,7 @@ mod tests {
             ("zc-display-reset", "display"),
             ("zc-thinking-switch-failed", "error"),
             ("zc-thinking-options-failed", "error"),
+            ("zc-thinking-remembered-skipped", "value"),
         ];
 
         for (locale, source) in catalogues {

@@ -461,6 +461,7 @@ zc-thinking-switch-failed = Thinking change failed: { $error }
 zc-effort-none-for-model = This model offers no effort levels.
 zc-display-none-for-model = This model offers no thinking display choices.
 zc-thinking-options-failed = Could not load thinking options: { $error }
+zc-thinking-remembered-skipped = Remembered thinking setting { $value } is not offered by this model; skipped.
 
 # Picker modals: dim suffix on the row whose value is currently in force
 zc-picker-current = current

@@ -386,6 +386,7 @@ zc-thinking-switch-failed = 思考設定の変更に失敗しました: { $error
 zc-effort-none-for-model = このモデルには思考レベルの選択肢がありません。
 zc-display-none-for-model = このモデルには思考表示の選択肢がありません。
 zc-thinking-options-failed = 思考オプションを読み込めませんでした: { $error }
+zc-thinking-remembered-skipped = 記憶された思考設定 { $value } はこのモデルでは利用できないため、スキップしました。
 zc-picker-current = 現在
 zc-chat-label-you = あなた:
 zc-chat-label-agent = エージェント:
