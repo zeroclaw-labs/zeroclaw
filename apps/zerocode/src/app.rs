@@ -57,6 +57,21 @@ enum QuickstartChatDrain {
     AfterReconnect,
 }
 
+/// Project cached pane state only while the daemon connection is authoritative.
+/// A disconnect keeps session state available for reconnection, but externally
+/// visible terminal state must become neutral instead of advertising a cached
+/// working or blocked turn indefinitely.
+fn terminal_status_for_connection<'a>(
+    connection: &ConnectionState,
+    panes: impl IntoIterator<Item = (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>)>,
+) -> (Option<&'a crate::turn_status::TurnStatus>, Option<&'a str>) {
+    if matches!(connection, ConnectionState::Disconnected { .. }) {
+        (None, None)
+    } else {
+        crate::osc_status::most_urgent(panes)
+    }
+}
+
 /// How often the UI redraws when no input arrives (for live panes).
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -651,14 +666,19 @@ pub async fn run(
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
                 let doctor_pane = doctor::Doctor::new(rpc.clone());
-                let mut acp_pane = acp::Acp::new(rpc.clone());
+                let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+                let mut acp_pane = acp::Acp::new(rpc.clone(), inbound_request_claims.clone());
                 // Carry the pre-disconnect session across a reconnect rebuild so
                 // the rebuilt pane resumes the daemon-retained session
                 // instead of minting a fresh one. None on first build.
                 acp_pane.set_resume_session_id($resume_acp.0);
                 acp_pane.set_resume_agent_alias($resume_acp.1);
                 acp_pane.init().await?;
-                let mut chat_pane = chat::Chat::new(rpc.clone(), chat::PaneKind::Chat);
+                let mut chat_pane = chat::Chat::new_with_claims(
+                    rpc.clone(),
+                    chat::PaneKind::Chat,
+                    inbound_request_claims,
+                );
                 chat_pane.set_resume_session_id($resume_chat.0);
                 chat_pane.set_resume_agent_alias($resume_chat.1);
                 chat_pane.init().await?;
@@ -787,6 +807,30 @@ pub async fn run(
             theme::set_active(t);
         }
 
+        // Both panes host an agent and either may be mid-turn, so keep both
+        // current regardless of which one is on screen — a hidden pane's agent
+        // goes on working and its approvals still arrive.
+        chat_pane.poll();
+        acp_pane.poll();
+        match mode {
+            Mode::Chat => chat_pane.refresh_visible_metadata(),
+            Mode::Acp => acp_pane.refresh_visible_metadata(),
+            _ => {}
+        }
+
+        // Report whichever pane most wants the operator, not whichever is
+        // visible: the terminal status exists to be read from outside this
+        // window, so it has to answer "does anything here need me?". Emitted
+        // before `term.draw` so the OSC write never lands inside a frame.
+        let (status, agent) = terminal_status_for_connection(
+            &conn_state,
+            [
+                (chat_pane.turn_status(), chat_pane.selected_agent()),
+                (acp_pane.turn_status(), acp_pane.selected_agent()),
+            ],
+        );
+        crate::osc_status::sync(status, agent);
+
         term.draw(|frame| {
             // Theme backdrop: paint the whole screen with the active
             // theme's background first so every pane inherits it. The
@@ -802,6 +846,7 @@ pub async fn run(
             // the status bar, only while the active pane has a message to show.
             let info_message = match mode {
                 Mode::Chat => chat_pane.info_message().cloned(),
+                Mode::Acp => acp_pane.info_message().cloned(),
                 _ => None,
             };
             let has_info = info_message.is_some();
@@ -2216,6 +2261,46 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_terminal_projection_is_neutral() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+        let disconnected = ConnectionState::Disconnected {
+            reason: "test disconnect".to_string(),
+        };
+
+        let (status, agent) = terminal_status_for_connection(
+            &disconnected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(status.is_none());
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn connected_terminal_projection_keeps_urgent_pane() {
+        let working = crate::turn_status::TurnStatus::Working;
+        let blocked = crate::turn_status::TurnStatus::WaitingForApproval;
+
+        let (status, agent) = terminal_status_for_connection(
+            &ConnectionState::Connected,
+            [
+                (Some(&working), Some("chat")),
+                (Some(&blocked), Some("code")),
+            ],
+        );
+
+        assert!(matches!(
+            status,
+            Some(crate::turn_status::TurnStatus::WaitingForApproval)
+        ));
+        assert_eq!(agent, Some("code"));
+    }
+
+    #[test]
     fn coalesces_contiguous_mouse_drags_to_latest_position() {
         let first = mouse_event(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
@@ -2620,8 +2705,13 @@ mod tests {
         let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
         let mut quickstart =
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
-        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
-        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc), Arc::clone(&inbound_request_claims));
+        let mut chat_pane = chat::Chat::new_with_claims(
+            Arc::clone(&rpc),
+            chat::PaneKind::Chat,
+            inbound_request_claims,
+        );
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         tokio::time::timeout(
@@ -2660,8 +2750,13 @@ mod tests {
         let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
         let mut quickstart =
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
-        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
-        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc), Arc::clone(&inbound_request_claims));
+        let mut chat_pane = chat::Chat::new_with_claims(
+            Arc::clone(&rpc),
+            chat::PaneKind::Chat,
+            inbound_request_claims,
+        );
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         switch_mode(
@@ -2767,8 +2862,13 @@ mod tests {
         let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
         let mut quickstart =
             quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
-        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
-        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let inbound_request_claims = Arc::new(chat::InboundRequestClaims::default());
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc), Arc::clone(&inbound_request_claims));
+        let mut chat_pane = chat::Chat::new_with_claims(
+            Arc::clone(&rpc),
+            chat::PaneKind::Chat,
+            inbound_request_claims,
+        );
         let mut sop_pane = sop_pane::SopPane::new(rpc);
 
         tokio::time::timeout(

@@ -6,7 +6,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -216,6 +216,9 @@ pub fn resolve_config_dir(cli_override: Option<&Path>) -> Result<PathBuf> {
 pub struct RpcNotification {
     pub method: String,
     pub params: Value,
+    /// Monotonic receipt time at the transport boundary. The UI may be paused
+    /// while the reader keeps running, so dequeue time is not equivalent.
+    pub received_at: Instant,
 }
 
 /// A server-initiated JSON-RPC request (has both `id` and `method`)
@@ -273,6 +276,7 @@ pub enum SessionUpdate {
         tool_name: String,
         arguments_summary: String,
         timeout_secs: u64,
+        received_at: Instant,
     },
     /// Emitted once per LLM call with current context size and configured limit.
     ContextUsage {
@@ -324,7 +328,10 @@ impl TurnEndOutcome {
     }
 }
 
-pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate> {
+pub fn parse_session_update(
+    params: &serde_json::Value,
+    received_at: Instant,
+) -> Option<SessionUpdate> {
     let kind = params.get("type")?.as_str()?;
     let sid = params.get("session_id")?.as_str()?.to_string();
     match kind {
@@ -353,6 +360,7 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             tool_name: params.get("tool_name")?.as_str()?.to_string(),
             arguments_summary: params.get("arguments_summary")?.as_str()?.to_string(),
             timeout_secs: params.get("timeout_secs")?.as_u64().unwrap_or(30),
+            received_at,
         }),
         "context_usage" => Some(SessionUpdate::ContextUsage {
             session_id: sid,
@@ -397,7 +405,7 @@ pub fn spawn_notification_router(
                     if notif.method != "session/update" {
                         continue;
                     }
-                    if let Some(update) = parse_session_update(&notif.params)
+                    if let Some(update) = parse_session_update(&notif.params, notif.received_at)
                         && update_tx.send(update).await.is_err()
                     {
                         break;
@@ -652,7 +660,11 @@ fn route_inbound_frame(
         // Notification: method present, no id (or null id).
         (None, Some(method)) => {
             let params = frame.get("params").cloned().unwrap_or(Value::Null);
-            let _ = notif_tx.send(RpcNotification { method, params });
+            let _ = notif_tx.send(RpcNotification {
+                method,
+                params,
+                received_at: Instant::now(),
+            });
         }
         _ => {}
     }
@@ -1883,11 +1895,23 @@ impl RpcClient {
         id: Value,
         result: std::result::Result<Value, JsonRpcError>,
     ) -> Result<()> {
-        let sent = self.rpc.respond(id, result).await;
-        if !sent {
-            anyhow::bail!("writer task closed before response could be sent");
-        }
-        Ok(())
+        self.rpc
+            .respond(id, result)
+            .await
+            .map_err(|error| anyhow::Error::msg(format!("response could not be sent: {error}")))
+    }
+
+    /// Fail-fast variant for the interactive event loop. A full writer queue
+    /// leaves the modal intact so the operator can retry without freezing the
+    /// TUI behind transport backpressure.
+    pub fn try_respond_to_inbound_request(
+        &self,
+        id: Value,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> Result<()> {
+        self.rpc
+            .try_respond(id, result)
+            .map_err(|error| anyhow::Error::msg(format!("response could not be sent: {error}")))
     }
 
     /// Ask the daemon to start streaming log events as notifications.
@@ -2687,6 +2711,11 @@ impl RpcClient {
     #[cfg(test)]
     pub fn relay_pump_finished(&self) -> Option<bool> {
         self.relay_pump.as_ref().map(|p| p.is_finished())
+    }
+
+    #[cfg(test)]
+    pub fn publish_inbound_request_for_test(&self, req: RpcInboundRequest) {
+        let _ = self.inbound_requests_bcast.send(req);
     }
 
     /// Transport protocol of this connection.
@@ -5118,6 +5147,7 @@ mod notification_tests {
         RpcNotification {
             method: method.to_string(),
             params,
+            received_at: Instant::now(),
         }
     }
 
@@ -5128,7 +5158,7 @@ mod notification_tests {
             "session_id": "s1",
             "text": "hello"
         });
-        let update = parse_session_update(&params).unwrap();
+        let update = parse_session_update(&params, Instant::now()).unwrap();
         match update {
             SessionUpdate::AgentMessageChunk { session_id, text } => {
                 assert_eq!(session_id, "s1");
@@ -5140,6 +5170,7 @@ mod notification_tests {
 
     #[tokio::test]
     async fn parse_approval_request() {
+        let received_at = Instant::now() - Duration::from_secs(5);
         let params = serde_json::json!({
             "type": "approval_request",
             "session_id": "s2",
@@ -5148,8 +5179,14 @@ mod notification_tests {
             "arguments_summary": "ls /tmp",
             "timeout_secs": 60
         });
-        let update = parse_session_update(&params).unwrap();
-        assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+        let update = parse_session_update(&params, received_at).unwrap();
+        assert!(matches!(
+            update,
+            SessionUpdate::ApprovalRequest {
+                received_at: parsed,
+                ..
+            } if parsed == received_at
+        ));
     }
 
     #[tokio::test]
@@ -5309,7 +5346,7 @@ mod plan_parse_tests {
                 { "content": "B", "status": "in_progress", "activeForm": "Doing B" }
             ]
         });
-        let update = parse_session_update(&params).expect("plan parses");
+        let update = parse_session_update(&params, Instant::now()).expect("plan parses");
         match update {
             SessionUpdate::Plan {
                 session_id,
@@ -5331,7 +5368,7 @@ mod plan_parse_tests {
             "session_id": "sess-2",
             "entries": []
         });
-        match parse_session_update(&params).expect("empty plan parses") {
+        match parse_session_update(&params, Instant::now()).expect("empty plan parses") {
             SessionUpdate::Plan { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected SessionUpdate::Plan"),
         }
@@ -5348,7 +5385,7 @@ mod plan_parse_tests {
         });
 
         assert!(matches!(
-            parse_session_update(&params),
+            parse_session_update(&params, Instant::now()),
             Some(SessionUpdate::HistoryTrimmed {
                 session_id,
                 dropped_messages: 12,
@@ -5361,7 +5398,7 @@ mod plan_parse_tests {
     #[test]
     fn plan_update_missing_entries_is_none() {
         let params = serde_json::json!({ "type": "plan", "session_id": "s" });
-        assert!(parse_session_update(&params).is_none());
+        assert!(parse_session_update(&params, Instant::now()).is_none());
     }
 }
 

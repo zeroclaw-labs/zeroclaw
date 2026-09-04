@@ -71,6 +71,10 @@ pub(crate) fn init_terminal() -> Result<Term> {
 }
 
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
+    // Terminal status is not screen content: leaving the alternate screen does
+    // not clear it, so hand it back explicitly. First, because every step below
+    // can fail and return, and a tab left reading as busy outlives the process.
+    crate::osc_status::release();
     disable_raw_mode()?;
     // Pop the enhancement flags best-effort — if they were never pushed (or the
     // terminal doesn't support them), popping is a harmless no-op we ignore.

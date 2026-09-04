@@ -9,7 +9,7 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
-    multi_select_schema, single_select_schema,
+    multi_select_schema, scoped_tool_call_id, single_select_schema,
 };
 use zeroclaw_runtime::i18n;
 
@@ -133,6 +133,7 @@ impl AcpChannel {
     ) -> anyhow::Result<Option<String>> {
         let req = ElicitationRequest {
             session_id: self.session_id.clone(),
+            tool_call_id: scoped_tool_call_id(),
             mode: ElicitationMode::Form,
             message: question.to_string(),
             requested_schema: single_select_schema(choices),
@@ -377,6 +378,7 @@ impl Channel for AcpChannel {
 
         let req = ElicitationRequest {
             session_id: self.session_id.clone(),
+            tool_call_id: scoped_tool_call_id(),
             mode: ElicitationMode::Form,
             message: question.to_string(),
             requested_schema: multi_select_schema(choices, min_items, max_items),

@@ -518,6 +518,8 @@ pub enum ElicitationMode {
 pub struct ElicitationRequestParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: Option<String>,
     pub mode: ElicitationMode,
     pub message: String,
     #[serde(rename = "requestedSchema")]
@@ -670,6 +672,7 @@ mod elicitation_wire_tests {
     fn request_params_round_trips_canonical_shape() {
         let raw = serde_json::json!({
             "sessionId": "sess-1",
+            "toolCallId": "call-1",
             "mode": "form",
             "message": "Pick one",
             "requestedSchema": {
@@ -688,6 +691,7 @@ mod elicitation_wire_tests {
         });
         let params: ElicitationRequestParams = serde_json::from_value(raw).unwrap();
         assert_eq!(params.session_id, "sess-1");
+        assert_eq!(params.tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(params.mode, ElicitationMode::Form);
         assert_eq!(params.message, "Pick one");
     }

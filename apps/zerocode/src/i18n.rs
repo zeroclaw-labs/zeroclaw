@@ -343,6 +343,28 @@ mod tests {
             assert!(controls.contains('↑'));
             assert!(controls.contains('↓'));
             assert!(controls.contains("Esc"));
+
+            for key in [
+                "zc-chat-status-working",
+                "zc-chat-status-thinking",
+                "zc-chat-status-responding",
+                "zc-chat-status-awaiting-approval",
+                "zc-chat-status-awaiting-input",
+                "zc-chat-status-cancelling",
+            ] {
+                assert!(
+                    format_ftl_message(source, locale, key, &[]).is_some(),
+                    "{key} must format for {locale}"
+                );
+            }
+            let calling_tool = format_ftl_message(
+                source,
+                locale,
+                "zc-chat-status-calling-tool",
+                &[("tool", "git_diff")],
+            )
+            .unwrap_or_else(|| panic!("calling-tool status must format for {locale}"));
+            assert!(calling_tool.contains("git_diff"));
         }
     }
 

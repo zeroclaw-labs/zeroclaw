@@ -40,6 +40,7 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod osc_status;
 mod quickstart_pane;
 mod relay_proto;
 mod sop_pane;
@@ -64,24 +65,31 @@ const DAEMON_STDERR_LIMIT: usize = 8 * 1024;
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
-struct ShutdownSignals {
-    interrupt: tokio::signal::unix::Signal,
+struct TerminationSignals {
     terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
-impl ShutdownSignals {
+impl TerminationSignals {
     fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
         })
     }
 
     async fn recv(&mut self) {
         tokio::select! {
-            _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+            _ = self.hangup.recv() => {}
+            _ = self.quit.recv() => {}
         }
     }
 }
@@ -582,6 +590,9 @@ fn install_panic_hook() {
 /// handlers. Errors are intentionally ignored — we're already crashing.
 fn force_restore_terminal() {
     if TERMINAL_ACTIVE.load(Ordering::Relaxed) {
+        // Terminal status outlives the process, so it has to be handed back
+        // here too — otherwise a crash leaves the tab reading as busy.
+        crate::osc_status::release();
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -731,18 +742,18 @@ async fn resolve_relay_trust(
 }
 
 #[cfg(unix)]
-fn prepare_wss_shutdown_signals(
+fn prepare_wss_termination_signals(
     requires_confirmation: bool,
     config_dir: &std::path::Path,
     url: &str,
-) -> anyhow::Result<ShutdownSignals> {
+) -> anyhow::Result<TerminationSignals> {
     // Keep the default signal disposition while this synchronous prompt waits
     // for input. Installing Tokio's handler first would consume Ctrl+C without
     // giving the blocked read a chance to observe it.
     if requires_confirmation {
         apply_insecure_tls_choice(confirm_insecure_tls(url)?, config_dir, url)?;
     }
-    Ok(ShutdownSignals::new()?)
+    Ok(TerminationSignals::new()?)
 }
 
 /// Apply the operator's [`InsecureTlsChoice`] for `url`: a no-op for
@@ -925,7 +936,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     #[cfg(unix)]
-    let mut shutdown_signals = None;
+    let mut termination_signals = None;
 
     // Initial connection (before the terminal is initialized).
     // `owns_ephemeral` records whether THIS process spawned the daemon
@@ -935,11 +946,11 @@ async fn run() -> anyhow::Result<()> {
     let (rpc, initial_leg) = match &target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
-            let shutdown_signals = shutdown_signals.insert(ShutdownSignals::new()?);
+            let termination_signals = termination_signals.insert(TerminationSignals::new()?);
             #[cfg(unix)]
             let initial_connection = tokio::select! {
                 result = client::RpcClient::connect(socket, None, None) => result,
-                _ = shutdown_signals.recv() => return Ok(()),
+                _ = termination_signals.recv() => return Ok(()),
             };
             #[cfg(not(unix))]
             let initial_connection = client::RpcClient::connect(socket, None, None).await;
@@ -953,7 +964,7 @@ async fn run() -> anyhow::Result<()> {
                     #[cfg(unix)]
                     let readiness = tokio::select! {
                         result = await_spawned_daemon_ready(socket, &mut daemon) => result,
-                        _ = shutdown_signals.recv() => {
+                        _ = termination_signals.recv() => {
                             return cleanup_spawned_daemon_after_signal(&mut daemon);
                         }
                     };
@@ -990,7 +1001,7 @@ async fn run() -> anyhow::Result<()> {
                 )?;
             }
             #[cfg(unix)]
-            let shutdown_signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
+            let termination_signals = termination_signals.insert(prepare_wss_termination_signals(
                 requires_confirmation,
                 &local_config_dir,
                 &ack_key,
@@ -1001,7 +1012,7 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(unix)]
             let connect_result = tokio::select! {
                 result = route.connect_preferred(None, None) => result,
-                _ = shutdown_signals.recv() => return Ok(()),
+                _ = termination_signals.recv() => return Ok(()),
             };
             #[cfg(not(unix))]
             let connect_result = route.connect_preferred(None, None).await;
@@ -1042,9 +1053,9 @@ async fn run() -> anyhow::Result<()> {
         owns_ephemeral,
         initial_leg,
         #[cfg(unix)]
-        shutdown_signals
+        termination_signals
             .as_mut()
-            .expect("Unix connection path installs shutdown signal handlers"),
+            .expect("Unix connection path installs termination signal handlers"),
     )
     .await;
 
@@ -1053,8 +1064,8 @@ async fn run() -> anyhow::Result<()> {
     result
 }
 
-/// Runs the TUI under Unix shutdown handlers so the terminal is restored on
-/// SIGINT or SIGTERM instead of dying mid-draw. `app::run` owns the full session
+/// Runs the TUI under Unix termination handlers so the terminal is restored
+/// instead of dying mid-draw. `app::run` owns the full session
 /// lifecycle — including in-loop reconnection and recovery — and returns
 /// only when the user quits.
 async fn run_until_exit(
@@ -1064,7 +1075,7 @@ async fn run_until_exit(
     config_dir: &std::path::Path,
     owns_ephemeral: bool,
     initial_leg: ActiveLeg,
-    #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
+    #[cfg(unix)] termination_signals: &mut TerminationSignals,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
@@ -1079,7 +1090,7 @@ async fn run_until_exit(
     {
         tokio::select! {
             r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral, initial_leg) => r.map(|_| ()),
-            _ = shutdown_signals.recv() => Ok(()),
+            _ = termination_signals.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -1663,7 +1674,10 @@ mod connection_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let daemon_pid = loop {
             if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                break pid.trim().parse::<u32>().expect("parse daemon pid");
+                let pid = pid.trim();
+                if !pid.is_empty() {
+                    break pid.parse::<u32>().expect("parse daemon pid");
+                }
             }
             assert!(
                 owner.try_wait().expect("poll signal owner").is_none(),
@@ -1699,14 +1713,10 @@ mod connection_tests {
 
     #[cfg(unix)]
     #[test]
-    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
-        assert_parent_signal_cleans_up_child(libc::SIGTERM);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn spawned_daemon_parent_only_sigint_cleans_up_child() {
-        assert_parent_signal_cleans_up_child(libc::SIGINT);
+    fn spawned_daemon_parent_termination_signals_clean_up_child() {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            assert_parent_signal_cleans_up_child(signal);
+        }
     }
 
     #[cfg(unix)]
@@ -2017,15 +2027,15 @@ mod connection_tests {
                     .build()
                     .expect("build signal runtime");
                 runtime.block_on(async {
-                    let mut shutdown_signals =
-                        ShutdownSignals::new().expect("install Unix shutdown handlers");
+                    let mut termination_signals =
+                        TerminationSignals::new().expect("install termination handlers");
                     let mut daemon = SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep"))
                         .expect("spawn owned daemon helper");
                     let pid_path = std::env::var_os("ZEROCODE_SIGNAL_OWNER_PID_PATH")
                         .expect("signal owner pid path");
                     std::fs::write(pid_path, daemon.id().to_string())
                         .expect("publish owned daemon pid");
-                    shutdown_signals.recv().await;
+                    termination_signals.recv().await;
                     cleanup_spawned_daemon_after_signal(&mut daemon)
                         .expect("clean up signalled daemon");
                 });
@@ -2039,12 +2049,12 @@ mod connection_tests {
                     .build()
                     .expect("build insecure prompt runtime");
                 let _runtime_guard = runtime.enter();
-                prepare_wss_shutdown_signals(
+                prepare_wss_termination_signals(
                     true,
                     std::path::Path::new(&config_dir),
                     "wss://insecure.example",
                 )
-                .expect("prepare WSS shutdown signals");
+                .expect("prepare WSS termination signals");
             }
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             Ok("terminal-owner") => {
@@ -2053,15 +2063,15 @@ mod connection_tests {
                     .build()
                     .expect("build terminal-owner runtime");
                 runtime.block_on(async {
-                    let mut shutdown_signals =
-                        ShutdownSignals::new().expect("install Unix shutdown handlers");
+                    let mut termination_signals =
+                        TerminationSignals::new().expect("install termination handlers");
                     let mut terminal =
                         config_manager::init_terminal().expect("initialize terminal");
                     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
                     let ready_path = std::env::var_os("ZEROCODE_TERMINAL_OWNER_READY_PATH")
                         .expect("terminal owner ready path");
                     std::fs::write(ready_path, b"ready").expect("publish terminal readiness");
-                    shutdown_signals.recv().await;
+                    termination_signals.recv().await;
                     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
                     config_manager::restore_terminal(&mut terminal).expect("restore terminal");
                     let restored_path = std::env::var_os("ZEROCODE_TERMINAL_OWNER_RESTORED_PATH")
