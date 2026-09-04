@@ -16,6 +16,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `temperature`: optional sampling temperature.
 - `timeout_secs`: HTTP request timeout in seconds.
 - `max_tokens`: optional response length cap.
+- `context_window`: the model's input limit in tokens. Drives history trimming and the doctor context checks. Set it for families whose model listing does not publish it.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
@@ -24,7 +25,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
-Family-specific entries add their own typed fields on top of these shared fields.
+Family-specific entries add their own typed fields on top of these shared fields, for example `thinking_display` on the `anthropic` slot (see [Anthropic](#anthropic)).
 
 ## Field resolution order
 
@@ -139,6 +140,33 @@ request. Set `display = "off"` (or remove the field) to return to the
 previous wire behavior.
 
 ## Per-family knobs: worked examples
+
+### Anthropic
+
+Current Claude models think adaptively: the model decides how much to reason per request, and the API rejects both the older fixed thinking budget and every sampling parameter. Earlier models keep the fixed budget. ZeroClaw reads the generation from the alias `model`, so one alias entry works for either.
+
+```toml
+[providers.models.anthropic.fable]
+api_key = "sk-ant-..."
+model = "claude-fable-5-1"
+max_tokens = 32000
+timeout_secs = 900
+context_window = 1000000
+thinking_display = "summarized"
+fallback_models = ["claude-opus-5"]
+```
+
+- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary, and `updates` returns the short progress notes the model writes between tool calls. Leave it unset for the API default, which returns reasoning blocks with their text withheld. ZeroClaw adds the beta header `updates` needs. Older models ignore the field.
+- `max_tokens`: reasoning counts toward this cap on the current models, so the 4096 default is low. ZeroClaw warns when an adaptive model runs at or below it. Use 16000 or more, and 32000 for agentic work.
+- `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
+- `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.
+- `temperature`: current models reject sampling parameters. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
+
+Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or a `/think:<level>` prefix on one message, maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high` and `max` ask for those. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones.
+
+Signed reasoning is replayed only within the tool round that produced it, because these models reject reasoning whose conversation prefix has since changed.
+
+When Anthropic's safety classifiers decline a request, ZeroClaw does not retry that model and moves on to `fallback_models` and then `fallback`. See [Fallback on failure](#fallback-on-failure).
 
 ### Ollama
 

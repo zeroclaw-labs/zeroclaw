@@ -610,10 +610,6 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-fn bedrock_model_supports_native_thinking(model: &str) -> bool {
-    !model.contains("claude-opus-4-7")
-}
-
 fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     if model.contains("claude") {
@@ -947,13 +943,79 @@ impl BedrockModelProvider {
 
     // ── Message conversion ──────────────────────────────────────
 
+    /// Resolve the reasoning request fields, the sampling temperature and the
+    /// output cap, which the model generation constrains together.
+    ///
+    /// Older generations name a token budget and must pin the temperature.
+    /// Newer ones think adaptively, take a depth setting instead, and reject
+    /// both a budget and any sampling parameter.
+    fn resolve_thinking(
+        &self,
+        thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        temperature: Option<f64>,
+        model: &str,
+    ) -> (Option<f64>, Option<serde_json::Value>, u32) {
+        use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
+
+        if claude_thinking_shape(model) == ClaudeThinkingShape::FixedBudget {
+            let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
+                return (temperature, None, self.max_tokens);
+            };
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"budget_tokens": budget})),
+                "Bedrock native extended thinking enabled; forcing temperature=1.0"
+            );
+            let fields = serde_json::json!({
+                "thinking": { "type": "enabled", "budget_tokens": budget }
+            });
+            return (Some(1.0), Some(fields), self.max_tokens.max(budget + 1));
+        }
+
+        if let Some(temperature) = temperature {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "temperature": temperature,
+                    })),
+                "temperature dropped: this model generation rejects sampling parameters"
+            );
+        }
+        if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "max_tokens": self.max_tokens,
+                    })),
+                "max_tokens is at the baseline; reasoning counts toward it on this model generation, so raise it on the provider entry"
+            );
+        }
+        let fields = thinking.and_then(|params| params.effort).map(|effort| {
+            serde_json::json!({
+                "thinking": { "type": "adaptive" },
+                "output_config": { "effort": effort.as_str() }
+            })
+        });
+        (None, fields, self.max_tokens)
+    }
+
     fn convert_messages(
         messages: &[ChatMessage],
     ) -> (Option<Vec<SystemBlock>>, Vec<ConverseMessage>) {
         let mut system_blocks = Vec::new();
         let mut converse_messages = Vec::new();
+        // Same boundary rule as the Anthropic adapter: only the round still in
+        // flight replays its signed reasoning.
+        let last_exchange_start = messages.iter().enumerate().rev().find_map(|(index, msg)| {
+            (!matches!(msg.role.as_str(), "system" | "assistant" | "tool")).then_some(index)
+        });
 
-        for msg in messages {
+        for (index, msg) in messages.iter().enumerate() {
             match msg.role.as_str() {
                 "system" => {
                     if system_blocks.is_empty() {
@@ -963,7 +1025,10 @@ impl BedrockModelProvider {
                     }
                 }
                 "assistant" => {
-                    if let Some(blocks) = Self::parse_assistant_tool_call_message(&msg.content) {
+                    let replay_thinking = last_exchange_start.is_some_and(|start| index > start);
+                    if let Some(blocks) =
+                        Self::parse_assistant_tool_call_message(&msg.content, replay_thinking)
+                    {
                         converse_messages.push(ConverseMessage {
                             role: "assistant".to_string(),
                             content: blocks,
@@ -1238,7 +1303,13 @@ impl BedrockModelProvider {
     }
 
     /// Parse assistant message containing structured tool calls.
-    fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<ContentBlock>> {
+    /// Rebuild an assistant turn's blocks from the stored envelope.
+    /// `replay_thinking` gates the signed reasoning, which only the round
+    /// still in flight may resend.
+    fn parse_assistant_tool_call_message(
+        content: &str,
+        replay_thinking: bool,
+    ) -> Option<Vec<ContentBlock>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
         let tool_calls = value
             .get("tool_calls")
@@ -1250,10 +1321,11 @@ impl BedrockModelProvider {
         // with reasoning content blocks (including signatures) before any
         // tool_use blocks. The reasoning_content field stores JSON-encoded
         // thinking blocks from the original response.
-        if let Some(reasoning) = value
-            .get("reasoning_content")
-            .and_then(serde_json::Value::as_str)
-            .filter(|r| !r.is_empty())
+        if replay_thinking
+            && let Some(reasoning) = value
+                .get("reasoning_content")
+                .and_then(serde_json::Value::as_str)
+                .filter(|r| !r.is_empty())
         {
             // reasoning_content may contain multiple JSON blocks joined by \n
             for part in reasoning.split('\n') {
@@ -1668,40 +1740,8 @@ impl ModelProvider for BedrockModelProvider {
 
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
-        // Native thinking forces temperature=1.0 (Anthropic API requirement).
-        // Otherwise the caller's Option<f64> flows through verbatim; None
-        // omits the field via skip_serializing_if.
-        let (effective_temperature, additional_fields, effective_max_tokens) = match request
-            .thinking
-        {
-            Some(params) if bedrock_model_supports_native_thinking(model) => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
-                    "Bedrock native extended thinking enabled; forcing temperature=1.0"
-                );
-                let fields = serde_json::json!({
-                    "thinking": {
-                        "type": "enabled",
-                        "budget_tokens": params.budget_tokens
-                    }
-                });
-                let min_required = params.budget_tokens + 1;
-                let max_tokens = self.max_tokens.max(min_required);
-                (Some(1.0), Some(fields), max_tokens)
-            }
-            Some(_) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"model": model})),
-                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
-                );
-                (temperature, None, self.max_tokens)
-            }
-            None => (temperature, None, self.max_tokens),
-        };
+        let (effective_temperature, additional_fields, effective_max_tokens) =
+            self.resolve_thinking(request.thinking, temperature, model);
 
         let converse_request = ConverseRequest {
             system,
@@ -2259,28 +2299,66 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_model_supports_native_thinking_excludes_opus_4_7() {
-        // Per AWS Bedrock model card, Opus 4.7 only supports adaptive thinking;
-        // fixed-budget native thinking returns a 400.
-        assert!(!bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-opus-4-7"
-        ));
-        assert!(!bedrock_model_supports_native_thinking(
-            "anthropic.claude-opus-4-7-v1:0"
-        ));
+    fn bedrock_resolve_thinking_sends_adaptive_depth_without_a_budget() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test")
+            .max_tokens(32_000)
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: Some(ThinkingEffort::High),
+            display: None,
+        };
+        let (temperature, fields, max_tokens) = provider.resolve_thinking(
+            Some(params),
+            Some(0.5_f64),
+            "us.anthropic.claude-opus-4-8-v1",
+        );
+        assert!(
+            temperature.is_none(),
+            "this generation rejects sampling parameters"
+        );
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "high"}
+            }))
+        );
+        assert_eq!(max_tokens, 32_000);
     }
 
     #[test]
-    fn bedrock_model_supports_native_thinking_allows_other_models() {
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-opus-4-6-v1"
-        ));
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-sonnet-4-6-v1"
-        ));
-        assert!(bedrock_model_supports_native_thinking(
-            "us.anthropic.claude-haiku-4-5-v1"
-        ));
+    fn bedrock_resolve_thinking_keeps_the_budget_shape_on_older_generations() {
+        use zeroclaw_api::model_provider::NativeThinkingParams;
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: Some(10_000),
+            effort: None,
+            display: None,
+        };
+        let (temperature, fields, max_tokens) = provider.resolve_thinking(
+            Some(params),
+            Some(0.5_f64),
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+        );
+        assert!((temperature.unwrap() - 1.0_f64).abs() < f64::EPSILON);
+        assert_eq!(
+            fields,
+            Some(serde_json::json!({
+                "thinking": {"type": "enabled", "budget_tokens": 10_000}
+            }))
+        );
+        assert_eq!(max_tokens, 10_001);
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_sends_nothing_without_a_chosen_depth() {
+        let provider = BedrockModelProvider::builder("test").build();
+        let (temperature, fields, _) =
+            provider.resolve_thinking(None, Some(0.5_f64), "anthropic.claude-fable-5-1");
+        assert!(temperature.is_none());
+        assert!(fields.is_none());
     }
 
     #[test]

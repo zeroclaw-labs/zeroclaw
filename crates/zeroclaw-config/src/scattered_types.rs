@@ -58,10 +58,23 @@ impl ThinkingLevel {
             Self::Max => Some(50_000),
         }
     }
+
+    /// Reasoning depth for model families that take a depth setting instead of
+    /// a token budget. `None` on the default level leaves the choice to the
+    /// provider, which is what an operator who set no level asked for.
+    #[must_use]
+    pub fn native_effort(&self) -> Option<ThinkingEffort> {
+        match self {
+            Self::Off | Self::Minimal | Self::Low => Some(ThinkingEffort::Low),
+            Self::Medium => None,
+            Self::High => Some(ThinkingEffort::High),
+            Self::Max => Some(ThinkingEffort::Max),
+        }
+    }
 }
 
 pub use zeroclaw_api::model_provider::{
-    MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams,
+    MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams, ThinkingEffort,
 };
 
 /// User-facing control for Anthropic's `thinking.display` beta
@@ -948,6 +961,31 @@ mod tests {
         assert_eq!(ThinkingLevel::Medium.default_budget_tokens(), None);
         assert_eq!(ThinkingLevel::High.default_budget_tokens(), Some(10_000));
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
+    }
+
+    #[test]
+    fn thinking_level_effort_leaves_the_default_level_unset() {
+        assert_eq!(
+            ThinkingLevel::Off.native_effort(),
+            Some(ThinkingEffort::Low)
+        );
+        assert_eq!(
+            ThinkingLevel::Minimal.native_effort(),
+            Some(ThinkingEffort::Low)
+        );
+        assert_eq!(
+            ThinkingLevel::Low.native_effort(),
+            Some(ThinkingEffort::Low)
+        );
+        assert_eq!(ThinkingLevel::Medium.native_effort(), None);
+        assert_eq!(
+            ThinkingLevel::High.native_effort(),
+            Some(ThinkingEffort::High)
+        );
+        assert_eq!(
+            ThinkingLevel::Max.native_effort(),
+            Some(ThinkingEffort::Max)
+        );
     }
 
     // The runtime context compressor was removed; nothing reads
