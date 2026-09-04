@@ -183,11 +183,13 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         id: BuiltinCommandId::Thinking,
-        name: "thinking",
-        aliases: &["think"],
-        usage: "/thinking [off|low|medium|high|xhigh|max|reset]",
+        name: "effort",
+        // The older spellings stay as aliases so existing channel users lose
+        // nothing; the id is unchanged for the same reason.
+        aliases: &["thinking", "think"],
+        usage: "/effort [off|low|medium|high|xhigh|max|reset]",
         description_key: "command-thinking-description",
-        surfaces: CHANNEL_ONLY,
+        surfaces: CHANNEL_AND_TUI,
         execution: CommandExecution::RuntimeCommand,
     },
     CommandSpec {
@@ -264,6 +266,14 @@ mod tests {
             command_by_name("/think").map(|spec| spec.id),
             Some(BuiltinCommandId::Thinking)
         );
+        assert_eq!(
+            command_by_name("/thinking").map(|spec| spec.id),
+            Some(BuiltinCommandId::Thinking)
+        );
+        assert_eq!(
+            command_by_name("/effort").map(|spec| spec.name),
+            Some("effort")
+        );
     }
 
     #[test]
@@ -313,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_surface_advertises_help_model_and_new_only() {
+    fn tui_surface_advertises_help_new_model_and_effort_only() {
         let tui_ids: Vec<BuiltinCommandId> = commands_for_surface(CommandSurface::Tui)
             .map(|spec| spec.id)
             .collect();
@@ -323,12 +333,20 @@ mod tests {
                 BuiltinCommandId::Help,
                 BuiltinCommandId::New,
                 BuiltinCommandId::Model,
+                BuiltinCommandId::Thinking,
             ]
         );
         assert!(parse_command_token("/help", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/model", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new", CommandSurface::Tui).is_some());
         assert!(parse_command_token("/new-session", CommandSurface::Tui).is_some());
+        for spelling in ["/effort", "/thinking", "/think"] {
+            assert_eq!(
+                parse_command_token(spelling, CommandSurface::Tui).map(|parsed| parsed.command.id),
+                Some(BuiltinCommandId::Thinking),
+                "{spelling} parses on the TUI"
+            );
+        }
         assert!(parse_command_token("/clear", CommandSurface::Tui).is_none());
     }
 

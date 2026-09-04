@@ -8518,7 +8518,8 @@ mod tests {
             serde_json::json!([
                 {"id": "help", "name": "help"},
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
-                {"id": "model", "name": "model"}
+                {"id": "model", "name": "model"},
+                {"id": "thinking", "name": "effort", "aliases": ["thinking", "think"]}
             ])
         );
     }

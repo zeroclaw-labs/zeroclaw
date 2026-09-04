@@ -878,7 +878,7 @@ channel-runtime-thinking-cleared = thinking 覆盖已清除。此发送者会话
 channel-runtime-thinking-default =
     thinking 已经在此发送者会话中使用 agent 默认值 `{ $default }`。
     使用 `/thinking high`、`/thinking max` 或 `/thinking off` 覆盖。
-channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/thinking off|minimal|low|medium|high|xhigh|max`、`/thinking on` 或 `/thinking reset`。
+channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/effort off|minimal|low|medium|high|xhigh|max`、`/effort on` 或 `/effort reset`。
 channel-runtime-provider-turn-init-failed =
     ⚠️ 初始化 model_provider `{ $provider }` 失败。请运行 `/models` 选择另一个 model_provider。
     详情：{ $error }
