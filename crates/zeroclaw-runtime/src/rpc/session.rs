@@ -72,6 +72,10 @@ pub struct RpcSession {
     /// and pass it to `SessionStore::apply_model_provider` so stale work
     /// cannot mutate a successor installed under the same session ID.
     pub generation: u64,
+    /// Owning principal for session isolation. `None` for sessions created
+    /// by unscoped connections (shared operator, admin): such sessions are
+    /// visible to unscoped connections and invisible to scoped principals.
+    pub owner_principal_id: Option<String>,
 }
 
 impl RpcSession {
@@ -94,12 +98,20 @@ impl RpcSession {
             chat_mode,
             owner_tui_id: None,
             generation: 0,
+            owner_principal_id: None,
         }
     }
 
     /// Bind this session to a TUI owner.
     pub fn with_owner(mut self, tui_id: Option<String>) -> Self {
         self.owner_tui_id = tui_id;
+        self
+    }
+
+    /// Bind this session to its owning principal (scoped principals only;
+    /// unscoped connections pass `None`).
+    pub fn with_owner_principal(mut self, principal_id: Option<String>) -> Self {
+        self.owner_principal_id = principal_id;
         self
     }
 }
@@ -201,6 +213,25 @@ impl SessionStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
         session.generation = generation;
+        sessions.insert(id, session);
+        Ok(())
+    }
+
+    /// Atomically reserve a NEW session id: fails if the id is already
+    /// live, so `session/new` can never replace (and thereby hijack) an
+    /// existing session's agent, whoever owns it.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return Err("session id already in use");
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
         sessions.insert(id, session);
         Ok(())
     }
@@ -633,6 +664,15 @@ impl SessionStore {
     pub async fn session_owner_tui_id(&self, session_id: &str) -> Option<Option<String>> {
         let sessions = self.sessions.lock().await;
         sessions.get(session_id).map(|s| s.owner_tui_id.clone())
+    }
+
+    /// Read the owning-principal stamp from a LIVE session. Same tri-state
+    /// contract as [`Self::session_owner_tui_id`].
+    pub async fn session_owner_principal(&self, session_id: &str) -> Option<Option<String>> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|s| s.owner_principal_id.clone())
     }
 
     pub async fn list_ids(&self) -> Vec<String> {

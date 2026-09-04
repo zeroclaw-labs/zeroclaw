@@ -489,6 +489,29 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
+    /// issuer whose identities this daemon accepts and how their verified
+    /// claims map to permission profiles. Any standards-compliant IdP
+    /// works; there is no per-vendor configuration.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub oidc: HashMap<String, OidcConfig>,
+
+    /// Local user roster (`[users.<name>]`) for credential-to-principal
+    /// mapping of local auth providers (peer credentials today). OIDC
+    /// identities are NOT listed here; they are keyed by issuer + subject.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub users: HashMap<String, UserConfig>,
+
+    /// Named permission profiles (`[permission_profiles.<alias>]`): the
+    /// single runtime authorization vocabulary. OIDC claim mappings and
+    /// user roster entries resolve here; deny-by-default: anything a
+    /// profile does not grant is refused.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12819,6 +12842,412 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+// ── Inbound authentication & principals (RFC 7141) ──────────────
+
+/// Validates the operator-chosen names used by the auth sections: OIDC
+/// aliases (which become the `oidc.<alias>` provider selection key) and
+/// roster entry names / durable principal ids. Conservative charset so the
+/// composed keys stay unambiguous in logs, TOML paths, and principal ids.
+fn is_valid_auth_section_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    name.len() <= 64 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// One OIDC trust relationship (`[oidc.<alias>]`): the identity-mapping
+/// half consumed by the shared principal resolver, plus the
+/// token-verification settings the `oidc.<alias>` auth provider enforces.
+///
+/// The alias is an operator-chosen handle (it appears in logs and audit
+/// attribution as `oidc.<alias>` and selects the provider during the
+/// handshake), never part of principal identity: canonical identity is
+/// keyed by the validated issuer plus token subject, so renaming an alias
+/// cannot re-key principals or link accounts across issuers.
+#[derive(Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "oidc"]
+#[serde(default)]
+pub struct OidcConfig {
+    /// Issuer URL exactly as it appears in validated token `iss` claims
+    /// (e.g. `https://sso.example.com/realms/main`). Discovery is fetched
+    /// from `<issuer>/.well-known/openid-configuration` and its `issuer`
+    /// field must match this value exactly.
+    pub issuer: String,
+    /// Audience the token must carry in its `aud` claim for this daemon
+    /// (typically the client ID or resource identifier registered at the
+    /// IdP). Required for token verification.
+    pub audience: String,
+    /// Client ID this daemon authenticates AS for confidential flows
+    /// (token introspection; enrollment in a later slice). Defaults to
+    /// `audience` when empty.
+    pub client_id: String,
+    /// Client secret for confidential-client flows (token introspection).
+    /// Not required for JWKS validation. Encrypted at rest.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: Option<String>,
+    /// How presented tokens are validated.
+    pub validation: OidcValidation,
+    /// Dotted path to the verified claim holding this deployment's
+    /// role/group values (e.g. `realm_access.roles`, `groups`). Must be
+    /// set explicitly: the daemon refuses to guess where grants live in a
+    /// token.
+    pub claim_path: String,
+    /// Maps a claim value found at `claim_path` to a
+    /// `[permission_profiles.<alias>]` name. Claim values with no mapping
+    /// grant nothing; an identity mapping to no profile at all is denied.
+    pub profile_map: HashMap<String, String>,
+    /// Maps a SERVICE client's verified `client_id` to a
+    /// `[permission_profiles.<alias>]` name. Service principals resolve ONLY
+    /// through this map, never `profile_map`, so a machine credential cannot
+    /// inherit a human profile from similarly-named claims. A service
+    /// `client_id` with no entry here is authenticated but entitled to nothing
+    /// (fail closed).
+    #[serde(default)]
+    pub service_profile_map: HashMap<String, String>,
+    /// Require the token to attest MFA (`amr` containing `mfa`, `otp`, or
+    /// `hwk`) before authentication succeeds.
+    pub require_mfa: bool,
+    /// Acceptable `acr` (authentication context class) values. Empty = no
+    /// requirement; non-empty = the token's `acr` claim must be one of
+    /// these values or authentication fails closed.
+    pub required_acr: Vec<String>,
+    /// Allowed `azp` (authorized party) values, meaning the client the
+    /// token was issued TO. Empty = no restriction; non-empty = the token must carry
+    /// an `azp` claim listed here or authentication fails closed.
+    pub allowed_authorized_parties: Vec<String>,
+    /// Client identities that resolve to SERVICE principals
+    /// (`client_credentials` callers), matched against the token's
+    /// verified `client_id`/`azp` claim. Service principals are keyed by
+    /// issuer + client identity and never inherit human-user assumptions.
+    /// A caller not listed here needs a human `sub` to authenticate.
+    pub service_clients: Vec<String>,
+    /// Require the RFC 9068 `typ: at+jwt` header on presented JWTs. Off
+    /// by default because not every IdP mints typed access tokens; ID
+    /// tokens are rejected regardless via their `nonce` marker.
+    pub require_at_jwt: bool,
+    /// Maximum authentication lifetime (seconds) for offline-validated
+    /// (JWKS) tokens. Offline validation cannot see revocation, so the
+    /// identity expires at the EARLIER of the token `exp` and now + this
+    /// cap. Must be > 0.
+    pub max_auth_lifetime_secs: u64,
+    /// Revalidation interval (seconds) for introspection mode: the
+    /// deadline stamped on each identity after which the next privileged
+    /// operation must re-introspect or fail closed. `0` = revalidate at
+    /// every privileged operation.
+    pub revalidation_secs: u64,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("validation", &self.validation)
+            .field("claim_path", &self.claim_path)
+            .field("profile_map", &self.profile_map)
+            .field("service_profile_map", &self.service_profile_map)
+            .field("require_mfa", &self.require_mfa)
+            .field("required_acr", &self.required_acr)
+            .field(
+                "allowed_authorized_parties",
+                &self.allowed_authorized_parties,
+            )
+            .field("service_clients", &self.service_clients)
+            .field("require_at_jwt", &self.require_at_jwt)
+            .field("max_auth_lifetime_secs", &self.max_auth_lifetime_secs)
+            .field("revalidation_secs", &self.revalidation_secs)
+            .finish()
+    }
+}
+
+fn default_oidc_max_auth_lifetime_secs() -> u64 {
+    86_400
+}
+
+fn default_oidc_revalidation_secs() -> u64 {
+    60
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audience: String::new(),
+            client_id: String::new(),
+            client_secret: None,
+            validation: OidcValidation::default(),
+            claim_path: String::new(),
+            profile_map: HashMap::new(),
+            service_profile_map: HashMap::new(),
+            require_mfa: false,
+            required_acr: Vec::new(),
+            allowed_authorized_parties: Vec::new(),
+            service_clients: Vec::new(),
+            require_at_jwt: false,
+            max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
+            revalidation_secs: default_oidc_revalidation_secs(),
+        }
+    }
+}
+
+/// Token validation strategy for an OIDC trust relationship.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OidcValidation {
+    /// Validate token signatures offline against the issuer's published
+    /// JWKS (fetched via discovery, refreshed on key rotation with a
+    /// bounded cooldown). No per-request IdP round-trip; revocation is
+    /// bounded by `max_auth_lifetime_secs` and token expiry.
+    #[default]
+    Jwks,
+    /// Validate every token online via the issuer's RFC 7662 introspection
+    /// endpoint. Live revocation within `revalidation_secs`; requires
+    /// `client_secret`.
+    Introspection,
+}
+
+impl OidcConfig {
+    pub fn validate(&self, alias: &str) -> Result<()> {
+        if !is_valid_auth_section_name(alias) {
+            anyhow::bail!(
+                "oidc alias {alias:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if self.issuer.trim().is_empty() {
+            anyhow::bail!("oidc.{alias}.issuer is required");
+        }
+        // Require TLS for the issuer: the OIDC discovery, JWKS, and
+        // introspection documents fetched from it are trusted to verify
+        // tokens, so a plaintext issuer lets an on-path attacker forge
+        // them (and, for enrollment, capture the client secret). Loopback
+        // is the sole exception, for local IdP development and the test
+        // harness where there is no network to intercept.
+        {
+            // Parse structurally: a prefix check accepts lookalike hosts like
+            // `http://localhost.attacker.example`. Require https, or http only
+            // when the host is EXACTLY a loopback name (local IdP dev / tests).
+            let issuer = self.issuer.trim();
+            let url = match url::Url::parse(issuer) {
+                Ok(url) => url,
+                Err(e) => anyhow::bail!("oidc.{alias}.issuer is not a valid URL: {e}"),
+            };
+            match url.scheme() {
+                "https" => {}
+                "http" => {
+                    let host = url.host_str().unwrap_or_default();
+                    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+                    if !is_loopback {
+                        anyhow::bail!(
+                            "oidc.{alias}.issuer must be an https URL (http is allowed only for \
+                             an exact loopback host: localhost, 127.0.0.1, or ::1)"
+                        );
+                    }
+                }
+                other => anyhow::bail!(
+                    "oidc.{alias}.issuer must be an http(s) URL, got scheme '{other}'"
+                ),
+            }
+        }
+        if self.audience.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.audience is required: tokens must be minted for this \
+                 daemon's audience, or any token from the issuer would be accepted"
+            );
+        }
+        if self.claim_path.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.claim_path is required: set the dotted path to the \
+                 claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
+            );
+        }
+        if self.profile_map.is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.profile_map is required: map at least one claim value to a \
+                 permission profile or every identity from this issuer will be denied"
+            );
+        }
+        if self.validation == OidcValidation::Introspection && self.client_secret.is_none() {
+            anyhow::bail!(
+                "oidc.{alias}.client_secret is required when validation is `introspection`"
+            );
+        }
+        if self.max_auth_lifetime_secs == 0 {
+            anyhow::bail!(
+                "oidc.{alias}.max_auth_lifetime_secs must be > 0: offline-validated \
+                 tokens need a bounded authentication lifetime"
+            );
+        }
+        Ok(())
+    }
+
+    /// The client ID used for confidential-client calls (introspection);
+    /// falls back to `audience` when unset.
+    #[must_use]
+    pub fn effective_client_id(&self) -> &str {
+        if self.client_id.trim().is_empty() {
+            &self.audience
+        } else {
+            &self.client_id
+        }
+    }
+}
+
+/// One local roster identity (`[users.<name>]`) for the local auth
+/// providers (peer credentials today; SSH keys and passwords are
+/// separately tracked extensions).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "user"]
+#[serde(default)]
+pub struct UserConfig {
+    /// Durable principal identifier for this entry; defaults to the entry
+    /// name. Ownership of sessions, memory, approvals, and audit trails
+    /// keys on this id, NOT on the entry name. To rename the entry
+    /// without orphaning its data, set `principal_id` to the original id
+    /// in the same edit. Changing an entry's effective principal id
+    /// creates a new principal that owns nothing.
+    pub principal_id: Option<String>,
+    /// Unix uid accepted for this user over the local socket (peer
+    /// credential). Required today: it is the only roster credential the
+    /// accepted provider set supports.
+    pub uid: Option<u32>,
+    /// The `[permission_profiles.<alias>]` entries granting this user's
+    /// permissions, merged by deterministic union. Required; a user with
+    /// no profile cannot authenticate.
+    pub permission_profiles: Vec<String>,
+}
+
+impl UserConfig {
+    /// The durable principal id this entry resolves to (explicit
+    /// `principal_id`, else the entry name).
+    #[must_use]
+    pub fn effective_principal_id<'a>(&'a self, name: &'a str) -> &'a str {
+        self.principal_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(name)
+    }
+
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if !is_valid_auth_section_name(name) {
+            anyhow::bail!(
+                "users entry name {name:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if let Some(id) = self.principal_id.as_deref().map(str::trim)
+            && !id.is_empty()
+            && !is_valid_auth_section_name(id)
+        {
+            anyhow::bail!(
+                "users.{name}.principal_id {id:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if self.uid.is_none() {
+            anyhow::bail!(
+                "users.{name}.uid is required: the peer-credential provider is the only \
+                 supported roster credential today, and an entry with no credential can \
+                 never authenticate"
+            );
+        }
+        if self.permission_profiles.iter().all(|p| p.trim().is_empty()) {
+            anyhow::bail!(
+                "users.{name}.permission_profiles is required: a user with no permission \
+                 profile holds no grants and cannot authenticate"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One named grant set (`[permission_profiles.<alias>]`).
+///
+/// Profiles are the single authorization vocabulary: OIDC `profile_map`
+/// values and `[users.<name>].permission_profiles` both resolve here. A
+/// profile grants exactly what it lists; everything else is denied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "permission_profile"]
+#[serde(default)]
+pub struct PermissionProfileConfig {
+    /// Grant everything. When true all other fields are irrelevant.
+    pub admin: bool,
+    /// Agent aliases holders of this profile may bind or address. Empty
+    /// grants NO agents; grant every agent with the explicit `"*"` entry.
+    pub allowed_agents: Vec<String>,
+    /// Dotted config path prefixes holders may write. A trailing `.*`
+    /// grants the subtree (e.g. `channels.*`); a bare path grants that
+    /// exact prop; `"*"` grants every path. Empty grants NO paths.
+    pub config_write_paths: Vec<String>,
+    /// Tool names holders may cause an agent to run. Empty grants NO
+    /// tools; broad access requires the explicit `"*"` entry. (Note this
+    /// differs from risk-profile `allowed_tools`, where empty means
+    /// unconstrained: permission profiles are deny-by-default. The
+    /// agent's own risk-profile policy still applies on top.)
+    pub allowed_tools: Vec<String>,
+    /// Resource-class grants: for each resource kind, the verbs
+    /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,
+    /// `config`, `agents`, `cost`, `skills`, `personality`, `logs`,
+    /// `tui`, `files`, `locales`, `quickstart`, `channels`, `providers`,
+    /// `models`, `peer_groups`, `plugins`, `tools`, `sops`. Verbs:
+    /// `create`, `read`, `update`, `delete`, `execute`. An unlisted
+    /// resource is denied.
+    pub grants: HashMap<zeroclaw_api::grants::Resource, Vec<zeroclaw_api::grants::Verb>>,
+}
+
+impl PermissionProfileConfig {
+    /// Compile this profile into the runtime grant shape.
+    #[must_use]
+    pub fn resolve(&self) -> zeroclaw_api::grants::ResolvedGrants {
+        use zeroclaw_api::principal::AgentAlias;
+        let mut resolved = zeroclaw_api::grants::ResolvedGrants::none();
+        resolved.admin = self.admin;
+        // Normalize selectors: trim surrounding whitespace and drop empties.
+        // Validation trims when checking existence, but the compiled selector
+        // must match too, so `" main "` cannot validate and then never match.
+        resolved.allowed_agents = self
+            .allowed_agents
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|a| AgentAlias(a.to_string()))
+            .collect();
+        resolved.config_write_paths = self
+            .config_write_paths
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        resolved.allowed_tools = self
+            .allowed_tools
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        for (resource, verbs) in &self.grants {
+            resolved
+                .resources
+                .insert(*resource, verbs.iter().copied().collect());
+        }
+        resolved
+    }
+}
+
 // ── Profiles & Bundles ───────────────────────────────────────────
 
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
@@ -17419,7 +17848,7 @@ impl ChannelConfig for LineConfig {
 /// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
 /// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
@@ -17470,6 +17899,15 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub nat64_prefixes: Vec<String>,
 
+    /// Whether the daemon's OWN uid keeps the trusted shared-operator path
+    /// on the local socket even when a `[users]` roster is configured.
+    /// Default `true`: the operator who runs the daemon (and owns its
+    /// config file) retains local authority, which is also what makes
+    /// local-only lockout recovery possible. Set `false` to require every
+    /// local peer — including the daemon's own uid — to map through
+    /// `[users.<name>].uid` or present a credential.
+    #[serde(default = "default_true")]
+    pub trust_daemon_uid: bool,
     /// Audit logging configuration
     #[serde(default)]
     #[nested]
@@ -17491,15 +17929,35 @@ pub struct SecurityConfig {
     #[nested]
     pub estop: EstopConfig,
 
-    /// Nevis IAM integration for SSO/MFA authentication and role-based access.
-    #[serde(default)]
-    #[nested]
-    pub nevis: NevisConfig,
+    /// DEPRECATED and ignored: the Nevis IAM integration was removed in
+    /// favor of the shared authentication stack (`[oidc.<alias>]`
+    /// verification, the `[users]` roster, and `[permission_profiles]`
+    /// grants). A legacy `[security.nevis]` table still parses so existing
+    /// configs keep loading, but enabling it does nothing and config
+    /// validation logs a warning naming the replacement. The table is
+    /// dropped on the next config save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nevis: Option<serde_json::Value>,
 
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            trust_daemon_uid: default_true(),
+            audit: AuditConfig::default(),
+            leak_detection: LeakDetectionConfig::default(),
+            otp: OtpConfig::default(),
+            estop: EstopConfig::default(),
+            nevis: None,
+            webauthn: WebAuthnConfig::default(),
+            nat64_prefixes: Vec::new(),
+        }
+    }
 }
 
 /// Outbound credential leak detection configuration.
@@ -17718,169 +18176,6 @@ impl Default for EstopConfig {
             require_otp_to_resume: true,
         }
     }
-}
-
-/// Nevis IAM integration configuration.
-///
-/// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
-/// Security Suite instance and maps Nevis roles to tool/workspace permissions.
-#[derive(Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "security.nevis"]
-#[serde(deny_unknown_fields)]
-pub struct NevisConfig {
-    /// Enable Nevis IAM integration. Defaults to false for backward compatibility.
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// Base URL of the Nevis instance (e.g. `https://nevis.example.com`).
-    #[serde(default)]
-    pub instance_url: String,
-
-    /// Nevis realm to authenticate against.
-    #[serde(default = "default_nevis_realm")]
-    pub realm: String,
-
-    /// OAuth2 client ID registered in Nevis.
-    #[serde(default)]
-    pub client_id: String,
-
-    /// OAuth2 client secret. Encrypted via SecretStore when stored on disk.
-    #[serde(default)]
-    #[secret]
-    #[credential_class = "encrypted_secret"]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub client_secret: Option<String>,
-
-    /// Token validation strategy: `"local"` (JWKS) or `"remote"` (introspection).
-    #[serde(default = "default_nevis_token_validation")]
-    pub token_validation: String,
-
-    /// JWKS endpoint URL for local token validation.
-    #[serde(default)]
-    pub jwks_url: Option<String>,
-
-    /// Nevis role to ZeroClaw permission mappings.
-    #[serde(default)]
-    pub role_mapping: Vec<NevisRoleMappingConfig>,
-
-    /// Require MFA verification for all Nevis-authenticated requests.
-    #[serde(default)]
-    pub require_mfa: bool,
-
-    /// Session timeout in seconds.
-    #[serde(default = "default_nevis_session_timeout_secs")]
-    pub session_timeout_secs: u64,
-}
-
-impl std::fmt::Debug for NevisConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NevisConfig")
-            .field("enabled", &self.enabled)
-            .field("instance_url", &self.instance_url)
-            .field("realm", &self.realm)
-            .field("client_id", &self.client_id)
-            .field(
-                "client_secret",
-                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
-            )
-            .field("token_validation", &self.token_validation)
-            .field("jwks_url", &self.jwks_url)
-            .field("role_mapping", &self.role_mapping)
-            .field("require_mfa", &self.require_mfa)
-            .field("session_timeout_secs", &self.session_timeout_secs)
-            .finish()
-    }
-}
-
-impl NevisConfig {
-    /// Validate that required fields are present when Nevis is enabled.
-    ///
-    /// Call at config load time to fail fast on invalid configuration rather
-    /// than deferring errors to the first authentication request.
-    pub fn validate(&self) -> Result<(), String> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        if self.instance_url.trim().is_empty() {
-            return Err("nevis.instance_url is required when Nevis IAM is enabled".into());
-        }
-
-        if self.client_id.trim().is_empty() {
-            return Err("nevis.client_id is required when Nevis IAM is enabled".into());
-        }
-
-        if self.realm.trim().is_empty() {
-            return Err("nevis.realm is required when Nevis IAM is enabled".into());
-        }
-
-        match self.token_validation.as_str() {
-            "local" | "remote" => {}
-            other => {
-                return Err(format!(
-                    "nevis.token_validation has invalid value '{other}': \
-                     expected 'local' or 'remote'"
-                ));
-            }
-        }
-
-        if self.token_validation == "local" && self.jwks_url.is_none() {
-            return Err("nevis.jwks_url is required when token_validation is 'local'".into());
-        }
-
-        if self.session_timeout_secs == 0 {
-            return Err("nevis.session_timeout_secs must be greater than 0".into());
-        }
-
-        Ok(())
-    }
-}
-
-fn default_nevis_realm() -> String {
-    "master".into()
-}
-
-fn default_nevis_token_validation() -> String {
-    "local".into()
-}
-
-fn default_nevis_session_timeout_secs() -> u64 {
-    3600
-}
-
-impl Default for NevisConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            instance_url: String::new(),
-            realm: default_nevis_realm(),
-            client_id: String::new(),
-            client_secret: None,
-            token_validation: default_nevis_token_validation(),
-            jwks_url: None,
-            role_mapping: Vec::new(),
-            require_mfa: false,
-            session_timeout_secs: default_nevis_session_timeout_secs(),
-        }
-    }
-}
-
-/// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
-pub struct NevisRoleMappingConfig {
-    /// Nevis role name (case-insensitive).
-    pub nevis_role: String,
-
-    /// Tool names this role can access. Use `"all"` for unrestricted tool access.
-    #[serde(default)]
-    pub zeroclaw_permissions: Vec<String>,
-
-    /// Workspace names this role can access. Use `"all"` for unrestricted.
-    #[serde(default)]
-    pub workspace_access: Vec<String>,
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -19232,6 +19527,9 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -21823,6 +22121,112 @@ impl Config {
             }
         }
 
+        // Inbound authentication & principals (RFC 7141): each auth section
+        // must be internally valid, reference only configured entries, and
+        // map credentials and principal ids unambiguously. Keys are sorted
+        // so the first error reported is deterministic.
+        {
+            let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
+            oidc_aliases.sort();
+            for alias in oidc_aliases {
+                let oidc = &self.oidc[alias];
+                oidc.validate(alias)?;
+                let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
+                claim_values.sort();
+                for claim_value in claim_values {
+                    let profile = &oidc.profile_map[claim_value];
+                    if !self.permission_profiles.contains_key(profile) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("oidc.{alias}.profile_map"),
+                            "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                        );
+                    }
+                }
+            }
+
+            let mut user_names: Vec<&String> = self.users.keys().collect();
+            user_names.sort();
+            let mut uid_owners: HashMap<u32, &str> = HashMap::new();
+            let mut principal_owners: HashMap<&str, &str> = HashMap::new();
+            for name in user_names {
+                let user = &self.users[name];
+                user.validate(name)?;
+                for profile in &user.permission_profiles {
+                    let trimmed = profile.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !self.permission_profiles.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("users.{name}.permission_profiles"),
+                            "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
+                        );
+                    }
+                }
+                // A uid maps a kernel-reported peer to exactly one
+                // principal; two entries claiming one uid would make
+                // authentication ambiguous.
+                if let Some(uid) = user.uid
+                    && let Some(other) = uid_owners.insert(uid, name.as_str())
+                {
+                    validation_bail!(
+                        ValidationFailed,
+                        format!("users.{name}.uid"),
+                        "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
+                    );
+                }
+                // Two entries resolving to one durable principal id would
+                // silently link accounts and merge their owned data.
+                let principal_id = user.effective_principal_id(name);
+                if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
+                    validation_bail!(
+                        ValidationFailed,
+                        format!("users.{name}.principal_id"),
+                        "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
+                    );
+                }
+            }
+
+            let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
+            profile_aliases.sort();
+            for alias in profile_aliases {
+                let profile = &self.permission_profiles[alias];
+                for agent in &profile.allowed_agents {
+                    let trimmed = agent.trim();
+                    if trimmed.is_empty() || trimmed == "*" {
+                        continue;
+                    }
+                    if !self.agents.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("permission_profiles.{alias}.allowed_agents"),
+                            "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                        );
+                    }
+                }
+            }
+        }
+
+        // A remote WSS listener with no possible credential path must fail
+        // validation rather than start: before enforcement that meant
+        // silently accepting unauthenticated clients, after it an
+        // enforced-but-unusable listener. gateway.require_pairing keeps a
+        // recoverable path (pair, then authenticate) even with no tokens
+        // yet.
+        if self.wss.enabled
+            && self.oidc.is_empty()
+            && self.gateway.paired_tokens.is_empty()
+            && !self.gateway.require_pairing
+        {
+            validation_bail!(
+                ValidationFailed,
+                "wss.enabled",
+                "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
+            );
+        }
+
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
             validation_bail!(
@@ -22565,9 +22969,16 @@ impl Config {
             }
         }
 
-        // Nevis IAM — delegate to NevisConfig::validate() for field-level checks
-        if let Err(msg) = self.security.nevis.validate() {
-            anyhow::bail!("security.nevis: {msg}");
+        // Nevis IAM was removed; the table is tolerated but inert.
+        if self.security.nevis.is_some() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "[security.nevis] is deprecated and ignored: the Nevis integration was \
+                 removed. Configure [oidc.<alias>] with [users] / [permission_profiles] \
+                 instead; the table will be dropped on the next config save."
+            );
         }
 
         // Delegate tool global defaults
@@ -25581,6 +25992,389 @@ mod tests {
         assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
+    // ── Inbound auth config sections (RFC 7141 stage 2) ─────────────
+
+    fn auth_operator_profile() -> PermissionProfileConfig {
+        PermissionProfileConfig {
+            allowed_agents: vec!["*".to_string()],
+            allowed_tools: vec!["calculator".to_string()],
+            grants: HashMap::from([(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                ],
+            )]),
+            ..PermissionProfileConfig::default()
+        }
+    }
+
+    fn auth_config() -> Config {
+        let mut config = Config::default();
+        config
+            .permission_profiles
+            .insert("operator".to_string(), auth_operator_profile());
+        config.users.insert(
+            "alice".to_string(),
+            UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+                ..UserConfig::default()
+            },
+        );
+        config.oidc.insert(
+            "corp".to_string(),
+            OidcConfig {
+                issuer: "https://sso.example.com/realms/main".to_string(),
+                audience: "zeroclaw".to_string(),
+                claim_path: "realm_access.roles".to_string(),
+                profile_map: HashMap::from([(
+                    "zeroclaw-operators".to_string(),
+                    "operator".to_string(),
+                )]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_sections_valid_config_passes_validation() {
+        auth_config().validate().expect("valid auth config");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_dangling_profile_map_reference_fails() {
+        let mut config = auth_config();
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .profile_map
+            .insert("admins".to_string(), "missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("oidc.corp.profile_map"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_requires_issuer_claim_path_and_profile_map() {
+        for strip in ["issuer", "audience", "claim_path", "profile_map"] {
+            let mut config = auth_config();
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            match strip {
+                "issuer" => oidc.issuer.clear(),
+                "audience" => oidc.audience.clear(),
+                "claim_path" => oidc.claim_path.clear(),
+                _ => oidc.profile_map.clear(),
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(strip),
+                "stripping {strip} must fail, got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_issuer_must_be_https_except_loopback() {
+        // Plaintext issuer over the network is rejected: discovery/JWKS/
+        // introspection are the token-verification root of trust.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().issuer = "http://sso.corp".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("https"),
+            "http issuer must be refused, got: {err}"
+        );
+
+        // Loopback stays allowed for local IdP dev and the test harness.
+        for loopback in [
+            "http://127.0.0.1:8080/realms/main",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            let mut ok = auth_config();
+            ok.oidc.get_mut("corp").unwrap().issuer = loopback.to_string();
+            assert!(
+                ok.validate().is_ok(),
+                "loopback issuer {loopback} must be accepted"
+            );
+        }
+
+        // Lookalike hosts must NOT count as loopback: the url::Url parse
+        // (vs a string prefix) rejects these cleartext issuers.
+        for lookalike in [
+            "http://localhost.attacker.example/realms/main",
+            "http://127.0.0.1.attacker.example",
+            "http://not-localhost:8080",
+            "ftp://sso.corp",
+        ] {
+            let mut bad = auth_config();
+            bad.oidc.get_mut("corp").unwrap().issuer = lookalike.to_string();
+            assert!(
+                bad.validate().is_err(),
+                "lookalike/invalid issuer {lookalike} must be rejected"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolve_normalizes_agent_selectors() {
+        // A whitespace-padded selector must normalize so it actually matches
+        // (`" main "` validated but never matched before); empties are dropped.
+        let profile = PermissionProfileConfig {
+            allowed_agents: vec![" main ".to_string(), "   ".to_string()],
+            ..PermissionProfileConfig::default()
+        };
+        let resolved = profile.resolve();
+        assert!(
+            resolved.may_use_agent("main"),
+            "trimmed selector must match"
+        );
+        assert_eq!(resolved.allowed_agents.len(), 1, "whitespace-only dropped");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_alias_charset_is_enforced() {
+        let mut config = auth_config();
+        let entry = config.oidc.remove("corp").unwrap();
+        config.oidc.insert("bad.alias".to_string(), entry);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("bad.alias"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_dangling_profile_reference_fails() {
+        let mut config = auth_config();
+        config
+            .users
+            .get_mut("alice")
+            .unwrap()
+            .permission_profiles
+            .push("missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("users.alice.permission_profiles"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_without_uid_fail_closed_at_load() {
+        let mut config = auth_config();
+        config.users.get_mut("alice").unwrap().uid = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("users.alice.uid"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_duplicate_uid_is_ambiguous_and_fails() {
+        let mut config = auth_config();
+        config.users.insert(
+            "bob".to_string(),
+            UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+                ..UserConfig::default()
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("uid must resolve to exactly one principal")
+                || err.contains("already mapped"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_duplicate_principal_id_fails() {
+        // An explicit principal_id colliding with another entry's effective
+        // id would silently link two accounts and merge their owned data.
+        let mut config = auth_config();
+        config.users.insert(
+            "bob".to_string(),
+            UserConfig {
+                principal_id: Some("alice".to_string()),
+                uid: Some(2000),
+                permission_profiles: vec!["operator".to_string()],
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("principal ids must be unique"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_rename_with_pinned_principal_id_is_stable() {
+        let mut config = auth_config();
+        let mut entry = config.users.remove("alice").unwrap();
+        entry.principal_id = Some("alice".to_string());
+        config.users.insert("alice-renamed".to_string(), entry);
+        config.validate().expect("rename with pinned id is valid");
+        assert_eq!(
+            config.users["alice-renamed"].effective_principal_id("alice-renamed"),
+            "alice",
+            "the durable principal id survives the display rename"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_allowed_agents_must_exist_or_be_wildcard() {
+        let mut config = auth_config();
+        config
+            .permission_profiles
+            .get_mut("operator")
+            .unwrap()
+            .allowed_agents = vec!["ghost".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("permission_profiles.operator.allowed_agents"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolves_to_deny_by_default_grants() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let resolved = auth_operator_profile().resolve();
+        assert!(!resolved.admin);
+        assert!(resolved.permits(Resource::Sessions, Verb::Read));
+        assert!(!resolved.permits(Resource::Sessions, Verb::Delete));
+        assert!(!resolved.permits(Resource::Config, Verb::Update));
+        assert!(resolved.may_use_agent("anything"), "wildcard entry");
+        assert!(resolved.may_use_tool("calculator"));
+        assert!(!resolved.may_use_tool("shell"), "selector is an allowlist");
+        assert!(
+            !resolved.may_write_config("channels.discord"),
+            "empty config paths grant nothing"
+        );
+
+        let empty = PermissionProfileConfig::default().resolve();
+        assert!(
+            !empty.may_use_tool("calculator"),
+            "empty profile grants nothing"
+        );
+        assert!(!empty.permits(Resource::System, Verb::Read));
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_sections_roundtrip_from_toml() {
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+allowed_tools = ["calculator"]
+
+[permission_profiles.operator.grants]
+sessions = ["create", "read"]
+tools = ["execute"]
+
+[users.alice]
+uid = 1000
+permission_profiles = ["operator"]
+
+[oidc.corp]
+issuer = "https://sso.example.com/realms/main"
+audience = "zeroclaw"
+claim_path = "realm_access.roles"
+
+[oidc.corp.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("auth sections parse");
+        config.validate().expect("parsed auth config validates");
+        let resolved = config.permission_profiles["operator"].resolve();
+        assert!(resolved.permits(
+            zeroclaw_api::grants::Resource::Tools,
+            zeroclaw_api::grants::Verb::Execute
+        ));
+        assert_eq!(
+            config.oidc["corp"].profile_map["zeroclaw-operators"],
+            "operator"
+        );
+        assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
+    #[::core::prelude::v1::test]
+    fn wss_without_any_credential_path_fails_validation() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("remote credential path"), "got: {err}");
+
+        config.gateway.require_pairing = true;
+        config
+            .validate()
+            .expect("pairing-capable wss config is startable");
+
+        config.gateway.require_pairing = false;
+        config.gateway.paired_tokens = vec!["zc_tok".into()];
+        config
+            .validate()
+            .expect("an existing paired token is a path");
+    }
+
+    #[::core::prelude::v1::test]
+    fn security_trust_daemon_uid_defaults_true_via_both_paths() {
+        assert!(SecurityConfig::default().trust_daemon_uid);
+        let parsed: Config = toml::from_str("[security]\n").unwrap();
+        assert!(parsed.security.trust_daemon_uid);
+        let parsed: Config = toml::from_str("[security]\ntrust_daemon_uid = false\n").unwrap();
+        assert!(!parsed.security.trust_daemon_uid);
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_introspection_requires_client_secret() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().validation = OidcValidation::Introspection;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("client_secret"), "got: {err}");
+
+        config.oidc.get_mut("corp").unwrap().client_secret = Some("s3cret".to_string());
+        config
+            .validate()
+            .expect("introspection with secret is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_max_auth_lifetime_must_be_positive() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().max_auth_lifetime_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_auth_lifetime_secs"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_verification_defaults_are_bounded() {
+        let defaults = OidcConfig::default();
+        assert_eq!(defaults.validation, OidcValidation::Jwks);
+        assert_eq!(defaults.max_auth_lifetime_secs, 86_400);
+        assert_eq!(defaults.revalidation_secs, 60);
+        assert!(!defaults.require_at_jwt);
+        assert!(defaults.required_acr.is_empty());
+        assert!(defaults.service_clients.is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_debug_redacts_client_secret() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().client_secret = Some("super-secret-value".to_string());
+        let dbg = format!("{:?}", config.oidc["corp"]);
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("super-secret-value"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_effective_client_id_falls_back_to_audience() {
+        let mut entry = OidcConfig {
+            audience: "zeroclaw".to_string(),
+            ..OidcConfig::default()
+        };
+        assert_eq!(entry.effective_client_id(), "zeroclaw");
+        entry.client_id = "zeroclaw-daemon".to_string();
+        assert_eq!(entry.effective_client_id(), "zeroclaw-daemon");
+    }
+
     #[test]
     async fn filesystem_validate_requires_path() {
         let cfg = FilesystemConfig {
@@ -28146,6 +28940,9 @@ auto_save = true
                 backend: ObservabilityBackend::Log,
                 ..ObservabilityConfig::default()
             },
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             risk_profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -29246,6 +30043,9 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -35733,183 +36533,30 @@ url = "http://localhost:8080/mcp"
         }
     }
 
-    #[tokio::test]
-    async fn nevis_client_secret_encrypt_decrypt_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "zeroclaw_test_nevis_secret_{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&dir).await.unwrap();
-
-        let plaintext_secret = "nevis-test-client-secret-value";
-
-        let mut config = Config {
-            data_dir: dir.join("workspace"),
-            config_path: dir.join("config.toml"),
-            ..Default::default()
-        };
-        config.security.nevis.client_secret = Some(plaintext_secret.into());
-
-        // Save (triggers encryption)
-        config.save().await.unwrap();
-
-        // Read raw TOML and verify plaintext secret is NOT present
-        let raw_toml = tokio::fs::read_to_string(&config.config_path)
-            .await
-            .unwrap();
+    #[test]
+    async fn legacy_nevis_table_parses_and_is_ignored() {
+        // Compat shim: a config carrying the removed [security.nevis]
+        // table must keep loading (enabled or not, with its old nested
+        // shapes intact), while a default config never serializes the
+        // dead table again.
+        let raw = r#"
+[security.nevis]
+enabled = true
+instance_url = "https://nevis.example.com"
+realm = "corp"
+client_secret = "enc:v1:abc"
+role_mapping = [{ nevis_role = "admin", zeroclaw_permissions = ["all"] }]
+"#;
+        let config: Config = toml::from_str(raw).expect("legacy nevis table still parses");
         assert!(
-            !raw_toml.contains(plaintext_secret),
-            "Saved TOML must not contain the plaintext client_secret"
+            config.security.nevis.is_some(),
+            "the shim retains the raw table"
         );
 
-        // Parse stored TOML and verify the value is encrypted
-        let stored: Config = toml::from_str(&raw_toml).unwrap();
-        let stored_secret = stored.security.nevis.client_secret.as_ref().unwrap();
+        let serialized = toml::to_string(&Config::default()).unwrap();
         assert!(
-            crate::secrets::SecretStore::is_encrypted(stored_secret),
-            "Stored client_secret must be marked as encrypted"
-        );
-
-        // Decrypt and verify it matches the original plaintext
-        let store = crate::secrets::SecretStore::new(&dir, true);
-        assert_eq!(store.decrypt(stored_secret).unwrap(), plaintext_secret);
-
-        // Simulate a full load: deserialize then decrypt (mirrors load_or_init logic)
-        let mut loaded: Config = toml::from_str(&raw_toml).unwrap();
-        loaded.config_path = dir.join("config.toml");
-        let load_store = crate::secrets::SecretStore::new(&dir, loaded.secrets.encrypt);
-        loaded.decrypt_secrets(&load_store).unwrap();
-        assert_eq!(
-            loaded.security.nevis.client_secret.as_deref().unwrap(),
-            plaintext_secret,
-            "Loaded client_secret must match the original plaintext after decryption"
-        );
-
-        let _ = fs::remove_dir_all(&dir).await;
-    }
-
-    // ══════════════════════════════════════════════════════════
-    // Nevis config validation tests
-    // ══════════════════════════════════════════════════════════
-
-    #[test]
-    async fn nevis_config_validate_disabled_accepts_empty_fields() {
-        let cfg = NevisConfig::default();
-        assert!(!cfg.enabled);
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_instance_url() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: String::new(),
-            client_id: "test-client".into(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("instance_url"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_client_id() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: String::new(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("client_id"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_empty_realm() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            realm: String::new(),
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("realm"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_local_without_jwks() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            token_validation: "local".into(),
-            jwks_url: None,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("jwks_url"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_zero_session_timeout() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            client_id: "test-client".into(),
-            token_validation: "remote".into(),
-            session_timeout_secs: 0,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(err.contains("session_timeout_secs"));
-    }
-
-    #[test]
-    async fn nevis_config_validate_accepts_valid_enabled_config() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            realm: "master".into(),
-            client_id: "test-client".into(),
-            token_validation: "remote".into(),
-            session_timeout_secs: 3600,
-            ..NevisConfig::default()
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    async fn nevis_config_validate_rejects_invalid_token_validation() {
-        let cfg = NevisConfig {
-            enabled: true,
-            instance_url: "https://nevis.example.com".into(),
-            realm: "master".into(),
-            client_id: "test-client".into(),
-            token_validation: "invalid_mode".into(),
-            session_timeout_secs: 3600,
-            ..NevisConfig::default()
-        };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.contains("invalid value 'invalid_mode'"),
-            "Expected invalid token_validation error, got: {err}"
-        );
-    }
-
-    #[test]
-    async fn nevis_config_debug_redacts_client_secret() {
-        let cfg = NevisConfig {
-            client_secret: Some("super-secret".into()),
-            ..NevisConfig::default()
-        };
-        let debug_output = format!("{:?}", cfg);
-        assert!(
-            !debug_output.contains("super-secret"),
-            "Debug output must not contain the raw client_secret"
-        );
-        assert!(
-            debug_output.contains("[REDACTED]"),
-            "Debug output must show [REDACTED] for client_secret"
+            !serialized.contains("nevis"),
+            "default configs must not emit the removed table"
         );
     }
 

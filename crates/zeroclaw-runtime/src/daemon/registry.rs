@@ -28,6 +28,10 @@ pub type GatewayStarter = Box<
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
+            // The daemon's canonical live pairing authority. Shared with
+            // the RPC native auth provider so /pair and revocation act on
+            // both surfaces at once; `None` only for standalone gateways.
+            Option<zeroclaw_config::pairing::PairingGuard>,
             Option<GatewayReadinessReporter>,
         ) -> StarterFuture
         + Send
@@ -202,7 +206,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {

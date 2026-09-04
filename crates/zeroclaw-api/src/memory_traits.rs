@@ -41,6 +41,14 @@ pub struct MemoryEntry {
     /// Tenant or end-user scope for multi-user memory isolation.
     #[serde(default)]
     pub tenant_id: Option<String>,
+    /// Owning principal for PRIVATE principal memory (RFC 7141). `None`
+    /// marks the shared/legacy plane: rows visible to unscoped
+    /// connections and agent-loop recall. A private row is visible only
+    /// through the principal-scoped operations, and the owner is an
+    /// additional dimension composed WITH (never replacing) the agent,
+    /// session, namespace, and tenant dimensions.
+    #[serde(default)]
+    pub principal_id: Option<String>,
     /// Resolved, human-readable agent alias for this row (the HashMap key
     /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
     /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
@@ -313,6 +321,66 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// that can hold more than one row per `key` — the unscoped `forget`
     /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
+
+    // ── Private principal memory (RFC 7141) ─────────────────────────
+    //
+    // One principal's private plane: every operation carries the owner in
+    // the storage statement itself (atomic predicate), and the legacy
+    // operations above never see private rows. The defaults FAIL CLOSED:
+    // a backend that has not implemented principal scoping refuses
+    // private-memory operations rather than silently un-scoping them.
+
+    /// Store into `principal_id`'s private memory. The owner is written in
+    /// the same statement that stores the row.
+    async fn store_for_principal(
+        &self,
+        _principal_id: &str,
+        _key: &str,
+        _content: &str,
+        _category: MemoryCategory,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Recall within `principal_id`'s private memory only.
+    async fn recall_for_principal(
+        &self,
+        _principal_id: &str,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// List within `principal_id`'s private memory only.
+    async fn list_for_principal(
+        &self,
+        _principal_id: &str,
+        _category: Option<&MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Get one row from `principal_id`'s private memory; other principals'
+    /// rows and shared-plane rows are invisible.
+    async fn get_for_principal(
+        &self,
+        _principal_id: &str,
+        _key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
+
+    /// Remove one row from `principal_id`'s private memory: the ownership
+    /// predicate and the delete are one statement.
+    async fn forget_for_principal(&self, _principal_id: &str, _key: &str) -> anyhow::Result<bool> {
+        anyhow::bail!("this memory backend does not support principal-scoped memory")
+    }
 
     /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
@@ -727,6 +795,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),
             content: "Rust".into(),
@@ -783,6 +852,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_new_memory_plane_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-2".into(),
             key: "deployment_decision".into(),
             content: "Use staged rollout".into(),
