@@ -2224,7 +2224,7 @@ pub async fn run(
                         println!("  /clear /new       Clear conversation history");
                         println!("  /quit /exit       Exit interactive mode");
                         println!(
-                            "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n"
+                            "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|xhigh|max)\n"
                         );
                         continue;
                     }

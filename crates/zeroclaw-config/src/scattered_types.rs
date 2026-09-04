@@ -20,6 +20,9 @@ pub enum ThinkingLevel {
     #[default]
     Medium,
     High,
+    /// Between `high` and `max`. Only the model generations that take a
+    /// depth setting read it; the budget generations have no budget for it.
+    XHigh,
     Max,
 }
 
@@ -35,6 +38,7 @@ impl ThinkingLevel {
             "low" => Some(Self::Low),
             "medium" | "med" | "default" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" | "x-high" | "extra" => Some(Self::XHigh),
             "max" | "maximum" => Some(Self::Max),
             _ => None,
         }
@@ -47,13 +51,15 @@ impl ThinkingLevel {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
             Self::Max => "max",
         }
     }
 
     pub fn default_budget_tokens(&self) -> Option<u32> {
         match self {
-            Self::Off | Self::Minimal | Self::Low | Self::Medium => None,
+            // `xhigh` is a depth setting only, so it never selects a budget.
+            Self::Off | Self::Minimal | Self::Low | Self::Medium | Self::XHigh => None,
             Self::High => Some(10_000),
             Self::Max => Some(50_000),
         }
@@ -68,6 +74,7 @@ impl ThinkingLevel {
             Self::Off | Self::Minimal | Self::Low => Some(ThinkingEffort::Low),
             Self::Medium => None,
             Self::High => Some(ThinkingEffort::High),
+            Self::XHigh => Some(ThinkingEffort::XHigh),
             Self::Max => Some(ThinkingEffort::Max),
         }
     }
@@ -114,8 +121,8 @@ impl ThinkingConfig {
     }
 
     pub fn warn_unknown_budget_keys(&self) {
-        use ThinkingLevel::{High, Low, Max, Medium, Minimal, Off};
-        const ALL_LEVELS: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High, Max];
+        use ThinkingLevel::{High, Low, Max, Medium, Minimal, Off, XHigh};
+        const ALL_LEVELS: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High, XHigh, Max];
         for key in self.budget_tokens.keys() {
             if !ALL_LEVELS.iter().any(|l| l.as_str() == key) {
                 ::zeroclaw_log::record!(
@@ -123,7 +130,7 @@ impl ThinkingConfig {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"key": key})),
                     "Unknown thinking level in budget_tokens config; \
-                     valid levels are: off, minimal, low, medium, high, max"
+                     valid levels are: off, minimal, low, medium, high, xhigh, max"
                 );
             }
         }
@@ -946,8 +953,33 @@ mod tests {
             Some(ThinkingEffort::High)
         );
         assert_eq!(
+            ThinkingLevel::XHigh.native_effort(),
+            Some(ThinkingEffort::XHigh)
+        );
+        assert_eq!(
             ThinkingLevel::Max.native_effort(),
             Some(ThinkingEffort::Max)
+        );
+    }
+
+    #[test]
+    fn xhigh_is_a_depth_only_level() {
+        for spelling in ["xhigh", "XHigh", "x-high", "extra"] {
+            assert_eq!(
+                ThinkingLevel::from_str_insensitive(spelling),
+                Some(ThinkingLevel::XHigh),
+                "{spelling}"
+            );
+        }
+        assert_eq!(ThinkingLevel::XHigh.as_str(), "xhigh");
+        assert_eq!(
+            ThinkingLevel::XHigh.default_budget_tokens(),
+            None,
+            "the budget generations have no budget for it"
+        );
+        assert_eq!(
+            serde_json::to_string(&ThinkingLevel::XHigh).unwrap(),
+            "\"xhigh\""
         );
     }
 

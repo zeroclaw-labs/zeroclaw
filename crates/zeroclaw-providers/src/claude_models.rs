@@ -115,6 +115,7 @@ const EFFORTS_4_6: &[ThinkingEffort] = &[
 const EFFORTS_CURRENT: &[ThinkingEffort] = &[
     ThinkingEffort::Low,
     ThinkingEffort::High,
+    ThinkingEffort::XHigh,
     ThinkingEffort::Max,
 ];
 
@@ -241,7 +242,7 @@ mod tests {
     use super::*;
     use ClaudeProviderSlot::{Anthropic, Bedrock};
     use ThinkingDisplay::{Omitted, Summarized, Updates};
-    use ThinkingEffort::{High, Low, Max};
+    use ThinkingEffort::{High, Low, Max, XHigh};
 
     const ADAPTIVE_IDS: &[&str] = &[
         "claude-fable-5-1",
@@ -396,7 +397,7 @@ mod tests {
                 "claude-opus-4-7",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 &[Omitted, Summarized],
             ),
             (
@@ -404,7 +405,7 @@ mod tests {
                 "claude-sonnet-5",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 &[Omitted, Summarized],
             ),
             (
@@ -412,7 +413,7 @@ mod tests {
                 "claude-next",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 &[Omitted, Summarized],
             ),
             (
@@ -420,7 +421,7 @@ mod tests {
                 "claude-fable-5-1",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 &[Omitted, Summarized, Updates],
             ),
             (
@@ -428,7 +429,7 @@ mod tests {
                 "claude-mythos-5-1",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 &[Omitted, Summarized, Updates],
             ),
             (
@@ -436,7 +437,7 @@ mod tests {
                 "us.anthropic.claude-opus-4-8-v1",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 none,
             ),
             (
@@ -444,7 +445,7 @@ mod tests {
                 "anthropic.claude-fable-5-1",
                 ClaudeThinkingShape::Adaptive,
                 false,
-                &[Low, High, Max],
+                &[Low, High, XHigh, Max],
                 none,
             ),
         ];
@@ -490,6 +491,16 @@ mod tests {
         assert!(current.supports_effort(Max));
         assert!(current.supports_display(Summarized));
         assert!(!current.supports_display(Updates));
+
+        assert_eq!(current.fit_effort(XHigh), Some(XHigh));
+
+        let previous = thinking_capabilities(Anthropic, "claude-opus-4-6");
+        assert_eq!(
+            previous.fit_effort(XHigh),
+            Some(High),
+            "the 4.6 generation has no xhigh, so it takes the depth just below"
+        );
+        assert!(!previous.supports_effort(XHigh));
 
         let older = thinking_capabilities(Anthropic, "claude-haiku-4-5");
         assert_eq!(older.fit_effort(High), None);

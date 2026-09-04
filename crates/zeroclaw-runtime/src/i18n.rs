@@ -1136,7 +1136,7 @@ mod tests {
                 &[("raw", "banana")][..],
                 [
                     "banana",
-                    "/thinking off|minimal|low|medium|high|max",
+                    "/thinking off|minimal|low|medium|high|xhigh|max",
                     "/thinking on",
                     "/thinking reset",
                 ]

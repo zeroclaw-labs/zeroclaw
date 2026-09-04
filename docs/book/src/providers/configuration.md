@@ -132,7 +132,7 @@ fallback_models = ["claude-opus-5"]
 - `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.
 - `temperature`: current models reject sampling parameters. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
 
-Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or a `/think:<level>` prefix on one message, maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high` and `max` ask for those. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones.
+Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or a `/think:<level>` prefix on one message, maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high`, `xhigh` and `max` ask for those. `xhigh` arrived with the 4.7 generation, so on 4.6 it is sent as `high`. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones.
 
 Signed reasoning is replayed only within the tool round that produced it, because these models reject reasoning whose conversation prefix has since changed.
 

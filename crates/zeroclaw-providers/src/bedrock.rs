@@ -2389,6 +2389,33 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_resolve_thinking_fits_xhigh_to_high_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::XHigh),
+            display: None,
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-sonnet-4-6-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("high")
+        );
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-8-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
     fn bedrock_resolve_thinking_ignores_the_display() {
         use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
         let provider = BedrockModelProvider::builder("test").build();

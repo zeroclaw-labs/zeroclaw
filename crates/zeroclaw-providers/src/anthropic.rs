@@ -4626,6 +4626,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         for (effort, expected) in [
             (ThinkingEffort::Low, "low"),
             (ThinkingEffort::High, "high"),
+            (ThinkingEffort::XHigh, "xhigh"),
             (ThinkingEffort::Max, "max"),
         ] {
             let params = NativeThinkingParams {
@@ -4640,6 +4641,30 @@ data: {\"type\":\"message_stop\"}\n\n";
                 "wire value for {effort:?}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_thinking_fits_xhigh_to_high_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::XHigh),
+            display: None,
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high"),
+            "the depth just below stands in for one the generation lacks"
+        );
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("xhigh")
+        );
     }
 
     #[test]

@@ -1011,7 +1011,7 @@ channel-runtime-thinking-cleared = Thinking override cleared. Using agent defaul
 channel-runtime-thinking-default =
     Thinking is already using agent default `{ $default }` for this sender session.
     Use `/thinking high`, `/thinking max`, or `/thinking off` to override it.
-channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/thinking off|minimal|low|medium|high|max`, `/thinking on`, or `/thinking reset`.
+channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/thinking off|minimal|low|medium|high|xhigh|max`, `/thinking on`, or `/thinking reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Failed to initialize model_provider `{ $provider }`. Please run `/models` to choose another model_provider.
     Details: { $error }

@@ -18,6 +18,8 @@ pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 pub enum ThinkingEffort {
     Low,
     High,
+    /// Between `high` and `max`; the 4.7 generation and later take it.
+    XHigh,
     Max,
 }
 
@@ -28,6 +30,7 @@ impl ThinkingEffort {
         match self {
             Self::Low => "low",
             Self::High => "high",
+            Self::XHigh => "xhigh",
             Self::Max => "max",
         }
     }

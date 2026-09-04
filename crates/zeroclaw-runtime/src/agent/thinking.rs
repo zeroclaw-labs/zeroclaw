@@ -78,7 +78,9 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
             system_prompt_prefix: None,
             native_thinking: None,
         },
-        ThinkingLevel::High => ThinkingParams {
+        // `xhigh` is a native depth setting; where only the prompt can carry
+        // the level it reads as `high`.
+        ThinkingLevel::High | ThinkingLevel::XHigh => ThinkingParams {
             temperature_adjustment: 0.05,
             max_tokens_adjustment: 1000,
             system_prompt_prefix: Some(
@@ -428,6 +430,13 @@ mod tests {
     }
 
     #[test]
+    fn apply_thinking_level_xhigh_reads_as_high_outside_native_depth() {
+        let xhigh = apply_thinking_level(ThinkingLevel::XHigh);
+        let high = apply_thinking_level(ThinkingLevel::High);
+        assert_eq!(xhigh, high);
+    }
+
+    #[test]
     fn apply_thinking_level_max_is_most_thorough() {
         let params = apply_thinking_level(ThinkingLevel::Max);
         assert!(params.temperature_adjustment > 0.0);
@@ -528,6 +537,7 @@ mod tests {
             (ThinkingLevel::Minimal, Some(ThinkingEffort::Low)),
             (ThinkingLevel::Low, Some(ThinkingEffort::Low)),
             (ThinkingLevel::High, Some(ThinkingEffort::High)),
+            (ThinkingLevel::XHigh, Some(ThinkingEffort::XHigh)),
             (ThinkingLevel::Max, Some(ThinkingEffort::Max)),
         ] {
             let params = apply_thinking_level_with_config(level, &config);
@@ -679,7 +689,7 @@ mod tests {
         validate_thinking_config(&cfg_default);
 
         let mut cfg_all_valid = ThinkingConfig::default();
-        for level in ["off", "minimal", "low", "medium", "high", "max"] {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             cfg_all_valid
                 .budget_tokens
                 .insert(level.to_string(), 10_000);

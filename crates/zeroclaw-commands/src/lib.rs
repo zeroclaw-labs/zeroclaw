@@ -185,7 +185,7 @@ static BUILTIN_COMMANDS: &[CommandSpec] = &[
         id: BuiltinCommandId::Thinking,
         name: "thinking",
         aliases: &["think"],
-        usage: "/thinking [off|low|medium|high|max|reset]",
+        usage: "/thinking [off|low|medium|high|xhigh|max|reset]",
         description_key: "command-thinking-description",
         surfaces: CHANNEL_ONLY,
         execution: CommandExecution::RuntimeCommand,
