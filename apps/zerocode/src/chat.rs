@@ -2161,9 +2161,15 @@ impl Chat {
                             .unwrap_or_else(|| requested.clone());
                         crate::i18n::t_args("zc-effort-ok", &[("level", &level)])
                     }
+                    // A model that offers no levels has nothing to fall back
+                    // to, so say that rather than naming an empty level.
                     SessionOverride::ResetThinkingLevel => {
-                        let level = state.thinking.current_level.clone().unwrap_or_default();
-                        crate::i18n::t_args("zc-effort-reset", &[("level", &level)])
+                        match state.thinking.current_level.clone() {
+                            Some(level) => {
+                                crate::i18n::t_args("zc-effort-reset", &[("level", &level)])
+                            }
+                            None => crate::i18n::t("zc-effort-none-for-model"),
+                        }
                     }
                     SessionOverride::ThinkingDisplay(requested) => {
                         let display = state
@@ -2174,8 +2180,12 @@ impl Chat {
                         crate::i18n::t_args("zc-display-ok", &[("display", &display)])
                     }
                     SessionOverride::ResetThinkingDisplay => {
-                        let display = state.thinking.current_display.clone().unwrap_or_default();
-                        crate::i18n::t_args("zc-display-reset", &[("display", &display)])
+                        match state.thinking.current_display.clone() {
+                            Some(display) => {
+                                crate::i18n::t_args("zc-display-reset", &[("display", &display)])
+                            }
+                            None => crate::i18n::t("zc-display-none-for-model"),
+                        }
                     }
                 };
                 state.info_message = Some(crate::widgets::InfoMessage::note(summary));
@@ -11348,6 +11358,56 @@ mod tests {
             "{}",
             state.title()
         );
+    }
+
+    #[tokio::test]
+    async fn effort_reset_on_a_model_without_levels_says_nothing_is_adjustable() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut state = state();
+        state.set_thinking_identity(crate::client::ThinkingOptionsResult::default());
+
+        let apply = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                Chat::apply_session_override(
+                    &client,
+                    &mut state,
+                    SessionOverride::ResetThinkingLevel,
+                )
+                .await;
+                state
+            })
+        };
+
+        let request = next_rpc_request(&mut rx, "a typed reset still configures the session").await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        assert_eq!(
+            request["params"]["reset"],
+            serde_json::json!(["thinking_level"])
+        );
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {},
+                "thinking_options": { "levels": [], "displays": [] }
+            }),
+        );
+
+        let state = tokio::time::timeout(Duration::from_secs(2), apply)
+            .await
+            .expect("reset should finish")
+            .unwrap();
+        assert_eq!(state.thinking.current_level, None);
+        assert_eq!(
+            info_text(&state),
+            Some(crate::i18n::t("zc-effort-none-for-model")),
+            "no level to fall back to means no level is named"
+        );
+        assert!(!state.title().contains("effort:"), "{}", state.title());
     }
 
     #[tokio::test]
