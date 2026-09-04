@@ -529,6 +529,18 @@ pub struct SopSaveRequest {
     pub original_name: Option<String>,
 }
 
+/// Request payload for `sops/rename`: move the SOP stored under `from` to
+/// `to`. Rename is its own operation rather than a side effect of `sops/save`
+/// because saving persists under the submitted SOP's name, so a name change
+/// smuggled through a save would fork the SOP or overwrite a different one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRenameRequest {
+    /// Name the SOP is stored under today.
+    pub from: String,
+    /// Name to move it to. Must not already be taken.
+    pub to: String,
+}
+
 /// Request payload for `fs.list_dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsListDirRequest {
