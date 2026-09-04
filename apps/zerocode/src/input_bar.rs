@@ -44,7 +44,17 @@ enum SlashCommandId {
     ModelProvider,
     RestartSession,
     ToggleThinking,
+    /// The shared `effort` command (catalogue id `thinking`, aliases
+    /// `thinking` and `think`): the session's thinking level.
+    Effort,
+    /// The local `display` command: the session's thinking display.
+    Display,
 }
+
+/// The argument that clears a session thinking override (`/effort reset`)
+/// and the trailing row of the effort and display pickers. `default` is
+/// accepted as a spelling of the same request.
+pub(crate) const THINKING_RESET_ARGUMENT: &str = "reset";
 
 #[derive(Debug, Clone, Copy)]
 struct LocalCommandDescriptor {
@@ -83,6 +93,11 @@ const LOCAL_COMMANDS: &[LocalCommandDescriptor] = &[
         aliases: &[],
     },
     LocalCommandDescriptor {
+        id: SlashCommandId::Display,
+        name: "display",
+        aliases: &[],
+    },
+    LocalCommandDescriptor {
         id: SlashCommandId::ModelProvider,
         name: "model-provider",
         aliases: &[],
@@ -108,16 +123,21 @@ struct CommandToken {
 #[derive(Debug, Clone)]
 struct SlashCommandRegistry {
     tokens: Vec<CommandToken>,
+    /// Each command's primary token (its `name`), so an alias the user typed
+    /// can be rewritten to the canonical form on argument completion.
+    canonical: Vec<(SlashCommandId, String)>,
 }
 
 impl SlashCommandRegistry {
     fn new(shared: &[crate::wire::CommandDescriptor]) -> Self {
         let mut tokens = std::collections::BTreeMap::new();
+        let mut canonical = Vec::new();
 
         for descriptor in shared {
             let Some(id) = shared_command_id(&descriptor.id) else {
                 continue;
             };
+            canonical.push((id, format!("/{}", descriptor.name)));
             for name in std::iter::once(descriptor.name.as_str())
                 .chain(descriptor.aliases.iter().map(String::as_str))
             {
@@ -128,6 +148,7 @@ impl SlashCommandRegistry {
         // Local commands own their tokens if a future shared descriptor
         // collides with one of them.
         for descriptor in LOCAL_COMMANDS {
+            canonical.push((descriptor.id, format!("/{}", descriptor.name)));
             for name in std::iter::once(descriptor.name).chain(descriptor.aliases.iter().copied()) {
                 tokens.insert(format!("/{name}"), descriptor.id);
             }
@@ -138,6 +159,7 @@ impl SlashCommandRegistry {
                 .into_iter()
                 .map(|(token, id)| CommandToken { id, token })
                 .collect(),
+            canonical,
         }
     }
 
@@ -145,17 +167,41 @@ impl SlashCommandRegistry {
         self.tokens.iter().map(|entry| entry.token.as_str())
     }
 
+    /// The command a typed token (`/model`, `/think`) names, if any.
+    fn id_of(&self, token: &str) -> Option<SlashCommandId> {
+        self.tokens
+            .iter()
+            .find(|entry| entry.token == token)
+            .map(|entry| entry.id)
+    }
+
+    /// Commands that take an argument: a completed name gets a trailing
+    /// space so argument completion starts right away, and Enter on the
+    /// completed name fills the line instead of submitting it.
+    fn takes_argument(id: SlashCommandId) -> bool {
+        matches!(
+            id,
+            SlashCommandId::Model
+                | SlashCommandId::ModelProvider
+                | SlashCommandId::Effort
+                | SlashCommandId::Display
+        )
+    }
+
+    /// The primary token of `id` (`/effort` for a typed `/think`).
+    fn canonical_token(&self, id: SlashCommandId) -> Option<&str> {
+        self.canonical
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, token)| token.as_str())
+    }
+
     fn parse<'a>(&self, input: &'a str) -> SlashCommand<'a> {
         let trimmed = input.trim();
         let (head, argument) = trimmed
             .split_once(' ')
             .map_or((trimmed, None), |(head, rest)| (head, Some(rest.trim())));
-        let Some(id) = self
-            .tokens
-            .iter()
-            .find(|entry| entry.token == head)
-            .map(|entry| entry.id)
-        else {
+        let Some(id) = self.id_of(head) else {
             return SlashCommand::NotACommand;
         };
 
@@ -180,6 +226,12 @@ impl SlashCommandRegistry {
             (SlashCommandId::ModelProvider, Some(name)) => SlashCommand::ModelProvider(name),
             (SlashCommandId::Model, None | Some("")) => SlashCommand::ModelPicker,
             (SlashCommandId::Model, Some(name)) => SlashCommand::Model(name),
+            (SlashCommandId::Effort, argument) => {
+                SlashCommand::Effort(ThinkingArg::parse(argument))
+            }
+            (SlashCommandId::Display, argument) => {
+                SlashCommand::Display(ThinkingArg::parse(argument))
+            }
             _ => SlashCommand::NotACommand,
         }
     }
@@ -190,8 +242,48 @@ fn shared_command_id(id: &str) -> Option<SlashCommandId> {
         "help" => Some(SlashCommandId::Help),
         "model" => Some(SlashCommandId::Model),
         "new" => Some(SlashCommandId::RestartSession),
+        "thinking" => Some(SlashCommandId::Effort),
         _ => None,
     }
+}
+
+/// The argument of `/effort` or `/display`: none opens the picker, `reset`
+/// (or `default`) clears the session override, anything else is a value the
+/// daemon validates against the session's model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingArg<'a> {
+    Picker,
+    Reset,
+    Set(&'a str),
+}
+
+impl<'a> ThinkingArg<'a> {
+    fn parse(argument: Option<&'a str>) -> Self {
+        match argument {
+            None | Some("") => Self::Picker,
+            Some(value) if value == THINKING_RESET_ARGUMENT || value == "default" => Self::Reset,
+            Some(value) => Self::Set(value),
+        }
+    }
+
+    fn action(self) -> ThinkingAction {
+        match self {
+            Self::Picker => ThinkingAction::OpenPicker,
+            Self::Reset => ThinkingAction::Reset,
+            Self::Set(value) => ThinkingAction::Set(value.to_string()),
+        }
+    }
+}
+
+/// What a `/effort` or `/display` command asks the parent to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThinkingAction {
+    /// Open the picker over the values the session's model offers.
+    OpenPicker,
+    /// Apply this value through `session/configure`.
+    Set(String),
+    /// Drop the session override so the profile or model default applies.
+    Reset,
 }
 
 // ── Action type ──────────────────────────────────────────────────
@@ -241,6 +333,10 @@ pub(crate) enum InputBarAction {
     /// User typed `/model-provider` with no argument — parent opens the
     /// two-stage model_provider picker modal.
     OpenModelProviderPicker,
+    /// User typed `/effort` or `/display` (or an alias): the parent opens the
+    /// picker, applies the value through `session/configure`, or clears the
+    /// session override.
+    Thinking(crate::client::ThinkingControl, ThinkingAction),
     /// Key was not handled by the input bar — parent should handle it.
     NotHandled,
 }
@@ -264,6 +360,10 @@ enum SlashCommand<'a> {
     ModelProvider(&'a str),
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
+    /// `/effort [...]`, the shared `thinking` command and its aliases.
+    Effort(ThinkingArg<'a>),
+    /// `/display [...]`.
+    Display(ThinkingArg<'a>),
     RestartSession,
     EnterBrowseMode,
     OpenHelp,
@@ -715,6 +815,12 @@ pub(crate) struct InputBarState {
     model_catalog_provider: Option<String>,
     /// Cached model_provider names for `/model-provider <partial>` autocomplete.
     provider_catalog: Vec<String>,
+    /// Thinking levels the session's model offers, for `/effort <partial>`
+    /// autocomplete. Pushed in by the app layer from the daemon's options;
+    /// empty when nothing is adjustable.
+    effort_catalog: Vec<String>,
+    /// Thinking displays the session's model offers, for `/display <partial>`.
+    display_catalog: Vec<String>,
 }
 
 /// What the autocomplete popup is currently offering, so Tab-completion knows
@@ -727,6 +833,34 @@ enum AutocompleteTarget {
     ModelArg,
     /// Completing the `/model-provider <arg>` value (replaces only the argument).
     ModelProviderArg,
+    /// Completing the `/effort <arg>` value (replaces only the argument).
+    EffortArg,
+    /// Completing the `/display <arg>` value (replaces only the argument).
+    DisplayArg,
+}
+
+impl AutocompleteTarget {
+    /// The argument target of a command, for commands that complete one.
+    fn for_command(id: SlashCommandId) -> Option<Self> {
+        match id {
+            SlashCommandId::Model => Some(Self::ModelArg),
+            SlashCommandId::ModelProvider => Some(Self::ModelProviderArg),
+            SlashCommandId::Effort => Some(Self::EffortArg),
+            SlashCommandId::Display => Some(Self::DisplayArg),
+            _ => None,
+        }
+    }
+
+    /// The command an argument target completes for.
+    fn command(self) -> Option<SlashCommandId> {
+        match self {
+            Self::Command => None,
+            Self::ModelArg => Some(SlashCommandId::Model),
+            Self::ModelProviderArg => Some(SlashCommandId::ModelProvider),
+            Self::EffortArg => Some(SlashCommandId::Effort),
+            Self::DisplayArg => Some(SlashCommandId::Display),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -760,6 +894,8 @@ impl InputBarState {
             model_catalog: Vec::new(),
             model_catalog_provider: None,
             provider_catalog: Vec::new(),
+            effort_catalog: Vec::new(),
+            display_catalog: Vec::new(),
         }
     }
 
@@ -862,38 +998,42 @@ impl InputBarState {
             return;
         }
 
-        // Argument completion: `/model <partial>` or `/model-provider <partial>`.
-        // model_provider is checked first — its prefix is longer and `/model `
-        // would otherwise swallow it.
-        if let Some(partial) = text.strip_prefix("/model-provider ") {
-            let partial = partial.trim_start().to_string();
-            self.set_arg_matches(AutocompleteTarget::ModelProviderArg, &partial);
-            return;
+        // Argument completion: an exact head token (`/model`, `/think`, ...)
+        // followed by the partial value. Matching the whole token rather than
+        // a prefix keeps `/model-provider` from reading as `/model`, lets
+        // every alias resolve, and leaves `/effort:high text` (a one-message
+        // prefix the daemon handles) alone.
+        let argument = text.split_once(' ').and_then(|(head, rest)| {
+            let target = AutocompleteTarget::for_command(self.command_registry.id_of(head)?)?;
+            Some((target, rest.trim_start().to_string()))
+        });
+        match argument {
+            Some((target, partial)) => self.set_arg_matches(target, &partial),
+            None => self.dismiss_autocomplete(),
         }
-        if let Some(partial) = text.strip_prefix("/model ") {
-            let partial = partial.trim_start().to_string();
-            self.set_arg_matches(AutocompleteTarget::ModelArg, &partial);
-            return;
-        }
-
-        self.autocomplete_active = false;
-        self.autocomplete_matches.clear();
-        self.autocomplete_index = None;
     }
 
     /// Filter the relevant cached catalog by `partial` (case-insensitive
     /// substring) and populate the popup. Empty `partial` lists the whole
-    /// catalog so the user sees options immediately after the space.
+    /// catalog so the user sees options immediately after the space. The
+    /// thinking catalogs also offer the reset argument, but only while the
+    /// model offers values at all.
     fn set_arg_matches(&mut self, target: AutocompleteTarget, partial: &str) {
-        let catalog = match target {
-            AutocompleteTarget::ModelArg => &self.model_catalog,
-            AutocompleteTarget::ModelProviderArg => &self.provider_catalog,
+        let reset = [THINKING_RESET_ARGUMENT.to_string()];
+        let (catalog, extra): (&[String], &[String]) = match target {
+            AutocompleteTarget::ModelArg => (&self.model_catalog, &[]),
+            AutocompleteTarget::ModelProviderArg => (&self.provider_catalog, &[]),
+            AutocompleteTarget::EffortArg if self.effort_catalog.is_empty() => (&[], &[]),
+            AutocompleteTarget::EffortArg => (&self.effort_catalog, &reset),
+            AutocompleteTarget::DisplayArg if self.display_catalog.is_empty() => (&[], &[]),
+            AutocompleteTarget::DisplayArg => (&self.display_catalog, &reset),
             AutocompleteTarget::Command => return,
         };
         let needle = partial.to_ascii_lowercase();
         self.autocomplete_target = target;
         self.autocomplete_matches = catalog
             .iter()
+            .chain(extra)
             .filter(|c| needle.is_empty() || c.to_ascii_lowercase().contains(&needle))
             .filter(|c| c.as_str() != partial)
             .cloned()
@@ -938,6 +1078,20 @@ impl InputBarState {
         self.provider_catalog = providers;
     }
 
+    /// Replace the thinking levels and displays offered for `/effort` and
+    /// `/display` argument autocomplete. Called by the app layer whenever the
+    /// daemon describes the session's thinking options; empty lists mean
+    /// nothing is adjustable and nothing (reset included) is offered.
+    pub fn set_thinking_catalogs(&mut self, levels: Vec<String>, displays: Vec<String>) {
+        self.effort_catalog = levels;
+        self.display_catalog = displays;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn autocomplete_matches_for_test(&self) -> &[String] {
+        &self.autocomplete_matches
+    }
+
     fn dismiss_autocomplete(&mut self) {
         self.autocomplete_active = false;
         self.autocomplete_matches.clear();
@@ -945,26 +1099,31 @@ impl InputBarState {
     }
 
     /// Apply a chosen popup entry to the input. A command choice replaces the
-    /// whole line (and, for the model commands, appends a space so argument
-    /// autocomplete kicks in immediately). An argument choice rewrites only the
-    /// value after the command prefix.
+    /// whole line (and, for commands that take an argument, appends a space so
+    /// argument autocomplete kicks in immediately). An argument choice
+    /// rewrites only the value after the command, and spells the command in
+    /// its canonical form so `/think hi` completes to `/effort high`.
     fn apply_autocomplete_choice(&mut self, choice: &str) {
-        match self.autocomplete_target {
-            AutocompleteTarget::Command => {
-                let takes_arg = choice == "/model" || choice == "/model-provider";
-                self.input = if takes_arg {
-                    format!("{choice} ")
-                } else {
-                    choice.to_string()
-                };
+        self.input = match self.autocomplete_target.command() {
+            None => match self.command_registry.id_of(choice) {
+                Some(id) if SlashCommandRegistry::takes_argument(id) => format!("{choice} "),
+                _ => choice.to_string(),
+            },
+            Some(id) => {
+                let typed_head = self
+                    .input
+                    .trim_start()
+                    .split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let head = self
+                    .command_registry
+                    .canonical_token(id)
+                    .map_or(typed_head, str::to_string);
+                format!("{head} {choice}")
             }
-            AutocompleteTarget::ModelArg => {
-                self.input = format!("/model {choice}");
-            }
-            AutocompleteTarget::ModelProviderArg => {
-                self.input = format!("/model-provider {choice}");
-            }
-        }
+        };
         self.cursor = self.input.len();
     }
 
@@ -979,7 +1138,10 @@ impl InputBarState {
         self.apply_autocomplete_choice(&choice);
         self.dismiss_autocomplete();
         let fills_only = target == AutocompleteTarget::Command
-            && (choice == "/model" || choice == "/model-provider");
+            && self
+                .command_registry
+                .id_of(&choice)
+                .is_some_and(SlashCommandRegistry::takes_argument);
         if fills_only {
             return InputBarAction::Consumed;
         }
@@ -1619,6 +1781,12 @@ impl InputBarState {
                     InputBarAction::SetModelProvider(name.to_string())
                 }
                 SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
+                SlashCommand::Effort(arg) => {
+                    InputBarAction::Thinking(crate::client::ThinkingControl::Level, arg.action())
+                }
+                SlashCommand::Display(arg) => {
+                    InputBarAction::Thinking(crate::client::ThinkingControl::Display, arg.action())
+                }
                 SlashCommand::NotACommand => {
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
@@ -2263,6 +2431,14 @@ mod tests {
                 id: "model".into(),
                 name: "model".into(),
                 aliases: vec![],
+            },
+            // The shared effort command keeps its catalogue id `thinking`;
+            // the daemon advertises `effort` with the legacy spellings as
+            // aliases.
+            crate::wire::CommandDescriptor {
+                id: "thinking".into(),
+                name: "effort".into(),
+                aliases: vec!["thinking".into(), "think".into()],
             },
         ]
     }
@@ -2982,24 +3158,269 @@ mod tests {
     }
 
     #[test]
-    fn derived_slash_command_set_matches_expected_twelve_entries() {
+    fn derived_slash_command_set_matches_expected_sixteen_entries() {
         let expected: Vec<&str> = vec![
             "/attach",
             "/attachments",
             "/browse",
             "/clear-queue",
             "/detach",
+            "/display",
+            "/effort",
             "/help",
             "/model",
             "/model-provider",
             "/new",
             "/new-session",
             "/restart-session",
+            "/think",
+            "/thinking",
             "/toggle-thinking",
         ];
         let registry = command_registry();
         let derived: Vec<&str> = registry.command_names().collect();
         assert_eq!(derived, expected);
+    }
+
+    #[test]
+    fn parse_thinking_commands_and_aliases() {
+        assert!(matches!(
+            parse_slash_command("/effort"),
+            SlashCommand::Effort(ThinkingArg::Picker)
+        ));
+        assert!(matches!(
+            parse_slash_command("/effort "),
+            SlashCommand::Effort(ThinkingArg::Picker)
+        ));
+        assert!(matches!(
+            parse_slash_command("/effort high"),
+            SlashCommand::Effort(ThinkingArg::Set("high"))
+        ));
+        assert!(matches!(
+            parse_slash_command("/thinking max"),
+            SlashCommand::Effort(ThinkingArg::Set("max"))
+        ));
+        assert!(matches!(
+            parse_slash_command("/think hi"),
+            SlashCommand::Effort(ThinkingArg::Set("hi"))
+        ));
+        assert!(matches!(
+            parse_slash_command("/effort reset"),
+            SlashCommand::Effort(ThinkingArg::Reset)
+        ));
+        assert!(matches!(
+            parse_slash_command("/think default"),
+            SlashCommand::Effort(ThinkingArg::Reset)
+        ));
+        assert!(matches!(
+            parse_slash_command("/display"),
+            SlashCommand::Display(ThinkingArg::Picker)
+        ));
+        assert!(matches!(
+            parse_slash_command("/display summarized"),
+            SlashCommand::Display(ThinkingArg::Set("summarized"))
+        ));
+        assert!(matches!(
+            parse_slash_command("/display default"),
+            SlashCommand::Display(ThinkingArg::Reset)
+        ));
+        // One-message prefixes are the daemon's to interpret: not commands.
+        assert!(matches!(
+            parse_slash_command("/effort:high hello"),
+            SlashCommand::NotACommand
+        ));
+        assert!(matches!(
+            parse_slash_command("/think:high hello"),
+            SlashCommand::NotACommand
+        ));
+    }
+
+    #[test]
+    fn registry_resolves_aliases_and_canonical_tokens() {
+        let registry = command_registry();
+        assert_eq!(registry.id_of("/effort"), Some(SlashCommandId::Effort));
+        assert_eq!(registry.id_of("/thinking"), Some(SlashCommandId::Effort));
+        assert_eq!(registry.id_of("/think"), Some(SlashCommandId::Effort));
+        assert_eq!(registry.id_of("/display"), Some(SlashCommandId::Display));
+        assert_eq!(registry.id_of("/effort:high"), None);
+        assert_eq!(
+            registry.canonical_token(SlashCommandId::Effort),
+            Some("/effort")
+        );
+        assert_eq!(
+            registry.canonical_token(SlashCommandId::RestartSession),
+            Some("/new")
+        );
+        assert!(SlashCommandRegistry::takes_argument(SlashCommandId::Effort));
+        assert!(SlashCommandRegistry::takes_argument(
+            SlashCommandId::Display
+        ));
+        assert!(SlashCommandRegistry::takes_argument(SlashCommandId::Model));
+        assert!(!SlashCommandRegistry::takes_argument(
+            SlashCommandId::ToggleThinking
+        ));
+    }
+
+    #[test]
+    fn effort_arg_autocomplete_offers_levels_and_reset() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.set_thinking_catalogs(
+            vec!["low".into(), "medium".into(), "high".into()],
+            vec!["omitted".into(), "summarized".into()],
+        );
+
+        bar.insert_text("/effort ");
+        assert!(bar.autocomplete_active);
+        assert_eq!(bar.autocomplete_target, AutocompleteTarget::EffortArg);
+        assert_eq!(
+            bar.autocomplete_matches,
+            vec!["low", "medium", "high", THINKING_RESET_ARGUMENT]
+        );
+
+        bar.clear_input();
+        bar.insert_text("/thinking hi");
+        assert!(bar.autocomplete_active);
+        assert_eq!(bar.autocomplete_target, AutocompleteTarget::EffortArg);
+        assert_eq!(bar.autocomplete_matches, vec!["high"]);
+
+        bar.clear_input();
+        bar.insert_text("/display ");
+        assert_eq!(bar.autocomplete_target, AutocompleteTarget::DisplayArg);
+        assert_eq!(
+            bar.autocomplete_matches,
+            vec!["omitted", "summarized", THINKING_RESET_ARGUMENT]
+        );
+    }
+
+    #[test]
+    fn effort_arg_autocomplete_offers_nothing_without_offered_levels() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.set_thinking_catalogs(Vec::new(), vec!["omitted".into()]);
+
+        bar.insert_text("/effort ");
+        assert!(!bar.autocomplete_active, "no levels, so not even reset");
+        assert!(bar.autocomplete_matches.is_empty());
+
+        bar.clear_input();
+        bar.insert_text("/display ");
+        assert!(bar.autocomplete_active);
+        assert_eq!(
+            bar.autocomplete_matches,
+            vec!["omitted", THINKING_RESET_ARGUMENT]
+        );
+    }
+
+    #[test]
+    fn alias_arg_autocomplete_canonicalizes_the_command() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.set_thinking_catalogs(vec!["low".into(), "high".into()], Vec::new());
+
+        bar.insert_text("/think hi");
+        assert_eq!(bar.autocomplete_target, AutocompleteTarget::EffortArg);
+        bar.apply_autocomplete_choice("high");
+        assert_eq!(bar.input(), "/effort high");
+
+        bar.clear_input();
+        bar.insert_text("/model-provider open");
+        bar.set_provider_catalog(vec!["openai".into()]);
+        bar.insert_text("a");
+        assert_eq!(
+            bar.autocomplete_target,
+            AutocompleteTarget::ModelProviderArg
+        );
+        bar.apply_autocomplete_choice("openai");
+        assert_eq!(bar.input(), "/model-provider openai");
+    }
+
+    #[test]
+    fn thinking_command_autocomplete_appends_space() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.apply_autocomplete_choice("/effort");
+        assert_eq!(bar.input(), "/effort ");
+        bar.apply_autocomplete_choice("/display");
+        assert_eq!(bar.input(), "/display ");
+        bar.apply_autocomplete_choice("/toggle-thinking");
+        assert_eq!(bar.input(), "/toggle-thinking");
+    }
+
+    #[test]
+    fn enter_on_effort_command_completion_fills_without_submitting() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/eff");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "/effort ");
+    }
+
+    #[test]
+    fn enter_accepts_highlighted_effort_arg_and_submits() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.set_thinking_catalogs(vec!["low".into(), "high".into()], Vec::new());
+        bar.insert_text("/effort hi");
+        assert!(bar.autocomplete_active);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            action,
+            InputBarAction::Thinking(crate::client::ThinkingControl::Level, ThinkingAction::Set(level))
+                if level == "high"
+        ));
+        assert!(!bar.autocomplete_active);
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_thinking_commands_return_thinking_actions() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("/effort");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::Thinking(
+                crate::client::ThinkingControl::Level,
+                ThinkingAction::OpenPicker
+            )
+        ));
+        bar.insert_text("/display reset");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::Thinking(
+                crate::client::ThinkingControl::Display,
+                ThinkingAction::Reset
+            )
+        ));
+        bar.insert_text("/thinking max");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::Thinking(crate::client::ThinkingControl::Level, ThinkingAction::Set(level))
+                if level == "max"
+        ));
+        bar.insert_text("/display summarized");
+        assert!(matches!(
+            bar.handle_enter(),
+            InputBarAction::Thinking(crate::client::ThinkingControl::Display, ThinkingAction::Set(display))
+                if display == "summarized"
+        ));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn inline_thinking_prefix_submits_as_prompt_text() {
+        for prefixed in ["/effort:high hello", "/think:high hello"] {
+            let mut bar = input_bar_with_shared_commands();
+            bar.set_thinking_catalogs(vec!["high".into()], Vec::new());
+            bar.insert_text(prefixed);
+            assert!(
+                !bar.autocomplete_active,
+                "{prefixed} is not a command, so nothing completes"
+            );
+            match bar.handle_enter() {
+                InputBarAction::Submit { text, attachments } => {
+                    assert_eq!(text.as_deref(), Some(prefixed));
+                    assert!(attachments.is_empty());
+                }
+                _ => panic!("{prefixed} must submit as plain prompt text"),
+            }
+        }
     }
 
     /// Parity guard: every command the derived descriptor set advertises
@@ -3076,6 +3497,19 @@ mod tests {
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
         ));
+        assert!(matches!(
+            parse_slash_command("/display"),
+            SlashCommand::Display(ThinkingArg::Picker)
+        ));
+        for token in ["/effort", "/thinking", "/think"] {
+            assert!(
+                matches!(
+                    parse_slash_command(token),
+                    SlashCommand::Effort(ThinkingArg::Picker)
+                ),
+                "{token} must open the effort picker"
+            );
+        }
     }
 
     #[test]

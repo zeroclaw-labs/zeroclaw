@@ -1721,6 +1721,31 @@ impl Chat {
                     Self::open_provider_picker(&rpc, state).await;
                     return false;
                 }
+                InputBarAction::Thinking(control, action) => {
+                    use crate::client::ThinkingControl;
+                    use crate::input_bar::ThinkingAction;
+                    let rpc = self.rpc.clone();
+                    let request = match (control, action) {
+                        (_, ThinkingAction::OpenPicker) => {
+                            Self::open_thinking_picker(&rpc, state, control).await;
+                            return false;
+                        }
+                        (ThinkingControl::Level, ThinkingAction::Set(level)) => {
+                            SessionOverride::ThinkingLevel(level)
+                        }
+                        (ThinkingControl::Display, ThinkingAction::Set(display)) => {
+                            SessionOverride::ThinkingDisplay(display)
+                        }
+                        (ThinkingControl::Level, ThinkingAction::Reset) => {
+                            SessionOverride::ResetThinkingLevel
+                        }
+                        (ThinkingControl::Display, ThinkingAction::Reset) => {
+                            SessionOverride::ResetThinkingDisplay
+                        }
+                    };
+                    Self::apply_session_override(&rpc, state, request).await;
+                    return false;
+                }
                 InputBarAction::Consumed => {
                     if let Some(message) = state.input_bar.take_cleanup_report().notice() {
                         state.set_info_notice(message);
@@ -5412,7 +5437,7 @@ enum ModelPickerOverlay {
 /// Row appended to an effort or display picker while a session override is in
 /// force: the same token the user types as `/effort reset`, kept literal like
 /// the level and display tokens above it.
-const RESET_ROW: &str = "reset";
+const RESET_ROW: &str = crate::input_bar::THINKING_RESET_ARGUMENT;
 
 /// One session-scoped change requested through `session/configure`. The
 /// info-bar copy, the identity update and the cache invalidation key off this
@@ -6938,8 +6963,12 @@ impl ChatState {
 
     /// Replace the session's thinking identity with the options block the
     /// daemon returned, from `session/thinking-options` or echoed by
-    /// `session/configure`.
+    /// `session/configure`. The offered values also feed `/effort` and
+    /// `/display` argument autocomplete, so the popup never suggests a value
+    /// the model would reject.
     pub fn set_thinking_identity(&mut self, options: crate::client::ThinkingOptionsResult) {
+        self.input_bar
+            .set_thinking_catalogs(options.levels.clone(), options.displays.clone());
         self.thinking = options;
     }
 
@@ -7785,7 +7814,9 @@ impl ChatState {
         self.session_name = name;
         self.model_provider_ref = None;
         self.model = None;
-        self.thinking = crate::client::ThinkingOptionsResult::default();
+        // Also drops the `/effort` and `/display` argument catalogs; the next
+        // session's options are read fresh at the boundary.
+        self.set_thinking_identity(crate::client::ThinkingOptionsResult::default());
         self.input_bar.reset();
         let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.entries.clear();
@@ -8033,6 +8064,86 @@ mod tests {
                 _ => panic!("present empty catalogue must submit {command} as ordinary input"),
             }
         }
+    }
+
+    #[test]
+    fn daemon_effort_descriptor_maps_the_shared_thinking_command_and_aliases() {
+        use crate::client::ThinkingControl;
+        use crate::input_bar::ThinkingAction;
+
+        let response = serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": [
+                { "id": "thinking", "name": "effort", "aliases": ["thinking", "think"] }
+            ]
+        });
+
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/effort"),
+            InputBarAction::Thinking(ThinkingControl::Level, ThinkingAction::OpenPicker)
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/think high"),
+            InputBarAction::Thinking(ThinkingControl::Level, ThinkingAction::Set(level))
+                if level == "high"
+        ));
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/thinking reset"),
+            InputBarAction::Thinking(ThinkingControl::Level, ThinkingAction::Reset)
+        ));
+        // `display` is local: it works whatever the catalogue says.
+        assert!(matches!(
+            command_action_from_initialize(response.clone(), "/display summarized"),
+            InputBarAction::Thinking(ThinkingControl::Display, ThinkingAction::Set(display))
+                if display == "summarized"
+        ));
+        // A one-message prefix is the daemon's to interpret.
+        match command_action_from_initialize(response, "/effort:high hello") {
+            InputBarAction::Submit { text, .. } => {
+                assert_eq!(text.as_deref(), Some("/effort:high hello"));
+            }
+            _ => panic!("an inline effort prefix must submit as prompt text"),
+        }
+    }
+
+    #[test]
+    fn daemon_without_the_effort_command_submits_it_as_prompt_text() {
+        // A pre-catalogue daemon (legacy fallback) and a daemon whose
+        // catalogue predates the effort command never advertised it, so the
+        // token stays ordinary input rather than becoming a phantom command.
+        for response in [
+            serde_json::json!({ "server_version": env!("CARGO_PKG_VERSION") }),
+            serde_json::json!({ "server_version": env!("CARGO_PKG_VERSION"), "commands": [] }),
+        ] {
+            match command_action_from_initialize(response, "/effort high") {
+                InputBarAction::Submit { text, .. } => {
+                    assert_eq!(text.as_deref(), Some("/effort high"));
+                }
+                _ => panic!("an unadvertised effort command must submit as ordinary input"),
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_identity_feeds_argument_autocomplete_until_the_session_resets() {
+        let mut s = state();
+        s.set_thinking_identity(offered_thinking());
+        s.input_bar.insert_text("/display ");
+        assert_eq!(
+            s.input_bar.autocomplete_matches_for_test(),
+            ["omitted", "summarized", RESET_ROW]
+        );
+
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        s.input_bar.insert_text("/display ");
+        assert!(
+            s.input_bar.autocomplete_matches_for_test().is_empty(),
+            "a new session offers nothing until its options are read"
+        );
     }
 
     fn transcript_snapshot(area: Rect, rows: &[&str]) -> TranscriptSnapshot {
