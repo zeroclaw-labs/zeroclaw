@@ -13,6 +13,8 @@ pub struct WeComChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// API host, overridable for tests (mirrors `LineChannel`).
+    api_base_url: String,
 }
 
 impl WeComChannel {
@@ -25,7 +27,14 @@ impl WeComChannel {
             webhook_key,
             alias: alias.into(),
             peer_resolver,
+            api_base_url: "https://qyapi.weixin.qq.com".into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_api_base_url(mut self, url: &str) -> Self {
+        self.api_base_url = url.trim_end_matches('/').to_string();
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -34,8 +43,8 @@ impl WeComChannel {
 
     fn webhook_url(&self) -> String {
         format!(
-            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={}",
-            self.webhook_key
+            "{}/cgi-bin/webhook/send?key={}",
+            self.api_base_url, self.webhook_key
         )
     }
 
@@ -119,23 +128,19 @@ impl Channel for WeComChannel {
     }
 
     async fn health_check(&self) -> bool {
-        // Verify we can reach the WeCom API endpoint.
-        let resp = self
-            .http_client()
-            .post(self.webhook_url())
-            .json(&serde_json::json!({
-                "msgtype": "text",
-                "text": {
-                    "content": "health_check"
-                }
-            }))
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) => r.status().is_success(),
-            Err(_) => false,
-        }
+        // WeCom's Bot Webhook API has no side-effect-free validation surface:
+        // every documented webhook operation posts a visible message to the
+        // group. Routine health and doctor checks must not create user-visible
+        // traffic, so this validates configuration only. Delivery — including
+        // WeCom's application-level `errcode` — is validated on real sends.
+        let configured = !self.webhook_key.trim().is_empty();
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"alias": self.alias, "configured": configured})),
+            "wecom health: configuration-only validation (the webhook API has no message-free probe)"
+        );
+        configured
     }
 }
 
@@ -183,6 +188,82 @@ mod tests {
     fn test_user_denied_empty() {
         let ch = WeComChannel::new("key".into(), "wecom_test_alias", Arc::new(Vec::new));
         assert!(!ch.is_user_allowed("anyone"));
+    }
+
+    #[tokio::test]
+    async fn health_check_is_side_effect_free_and_reflects_configuration() {
+        use wiremock::MockServer;
+
+        // No mock is mounted: any request would fail the test via the
+        // received-requests assertion below.
+        let server = MockServer::start().await;
+
+        let ch = WeComChannel::new("key-abc".into(), "wecom_test_alias", Arc::new(Vec::new))
+            .with_api_base_url(&server.uri());
+        assert!(ch.health_check().await, "configured key reads healthy");
+
+        let empty = WeComChannel::new(String::new(), "wecom_test_alias", Arc::new(Vec::new))
+            .with_api_base_url(&server.uri());
+        assert!(!empty.health_check().await, "missing key reads unhealthy");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(
+            received.is_empty(),
+            "health_check must not call the WeCom API (would post a visible message); saw {} request(s)",
+            received.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_reports_api_level_failure_despite_http_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cgi-bin/webhook/send"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errcode": 93000,
+                "errmsg": "invalid webhook url"
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = WeComChannel::new("bad-key".into(), "wecom_test_alias", Arc::new(Vec::new))
+            .with_api_base_url(&server.uri());
+
+        let error = ch
+            .send(&SendMessage::new("hello", "group"))
+            .await
+            .expect_err("HTTP 200 with nonzero errcode must not read as delivered");
+        let message = error.to_string();
+        assert!(
+            message.contains("errcode=93000"),
+            "error should surface the WeCom errcode: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_succeeds_on_errcode_zero() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/cgi-bin/webhook/send"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errcode": 0,
+                "errmsg": "ok"
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = WeComChannel::new("good-key".into(), "wecom_test_alias", Arc::new(Vec::new))
+            .with_api_base_url(&server.uri());
+
+        ch.send(&SendMessage::new("hello", "group"))
+            .await
+            .expect("errcode 0 delivers");
     }
 
     #[test]
