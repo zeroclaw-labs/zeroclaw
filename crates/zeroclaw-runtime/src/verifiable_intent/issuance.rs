@@ -118,6 +118,36 @@ pub fn create_layer2_autonomous(
         ));
     }
 
+    // An autonomous mandate must name the key it delegates to. §4.6 requires
+    // `cnf.jwk` to carry a `kid`, and §5.7 rule 1 is what makes it load-bearing:
+    // an L3 verifier resolves the agent's key by matching the L3 header's `kid`
+    // against this one, so an L2 without it delegates to a key nothing can
+    // resolve.
+    //
+    // `Jwk.kid` stays optional, because a bare public key and an L1 credential
+    // both have legitimate use for one without an identifier. The requirement
+    // belongs to this construction boundary, which is where the delegation is
+    // actually declared.
+    //
+    // Checking the checkout side alone is sufficient because the parity check
+    // above has already established that the two `cnf` values are equal. An
+    // all-whitespace identifier is refused on the same reasoning as an empty
+    // constraint currency in `verify_fulfillment_currency`: it is present
+    // without naming anything.
+    let names_a_key = checkout
+        .cnf
+        .jwk
+        .kid
+        .as_deref()
+        .is_some_and(|kid| !kid.trim().is_empty());
+    if !names_a_key {
+        return Err(ViError::new(
+            ViErrorKind::IssuanceInputInvalid,
+            "an autonomous mandate must bind the agent key by identifier: \
+             cnf.jwk.kid is required and must not be blank",
+        ));
+    }
+
     let l1_hash = sd_hash(serialized_l1);
 
     let checkout_value = serde_json::to_value(checkout).map_err(|e| {
@@ -454,6 +484,79 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind, ViErrorKind::ModeMismatch);
+    }
+
+    /// An autonomous L2 must not issue without `cnf.jwk.kid`.
+    ///
+    /// `credential-format.md` §4.6 requires every autonomous mandate to carry
+    /// `cnf.jwk` with a `kid` member, and §5.7 rule 1 is what makes it
+    /// load-bearing: an L3 verifier resolves the delegated key by matching the
+    /// L3 header's `kid` against this value. An L2 issued without one leaves the
+    /// L3 credentials no conformant key-binding path.
+    ///
+    /// Parity alone does not catch this. Two mandates whose nested JWK is
+    /// missing the identifier are equal to each other, so the pair check passes
+    /// and a structurally invalid credential gets signed. `generate_ec_p256`
+    /// returns `kid: None`, so that is the state a caller starts from.
+    #[test]
+    fn autonomous_issuance_requires_a_nested_kid() {
+        let (user_pkcs8, _user_jwk) = generate_ec_p256().unwrap();
+        let user_key = load_key_pair(&user_pkcs8).unwrap();
+        let (_agent_pkcs8, agent_jwk) = generate_ec_p256().unwrap();
+
+        let instrument = || PaymentInstrument {
+            instrument_type: "card".into(),
+            id: "tok-1".into(),
+            description: None,
+        };
+        let issue = |cnf: Cnf| {
+            create_layer2_autonomous(
+                &test_issuer_l1(),
+                &OpenCheckoutMandate {
+                    vct: "mandate.checkout.open".into(),
+                    cnf: cnf.clone(),
+                    constraints: vec![],
+                    prompt_summary: None,
+                },
+                &OpenPaymentMandate {
+                    vct: "mandate.payment.open".into(),
+                    cnf,
+                    payment_instrument: instrument(),
+                    constraints: vec![],
+                },
+                "https://network.example.com",
+                "nonce-kid",
+                &user_key,
+                1_700_000_000,
+                1_700_086_400,
+            )
+        };
+
+        // The pair matches, and the shared JWK carries no identifier.
+        let err = issue(Cnf {
+            jwk: Jwk {
+                kid: None,
+                ..agent_jwk.clone()
+            },
+        })
+        .expect_err("an autonomous mandate pair without `cnf.jwk.kid` must be refused");
+        assert_eq!(err.kind, ViErrorKind::IssuanceInputInvalid);
+        assert!(
+            err.message.contains("kid"),
+            "the refusal must name the missing member: {}",
+            err.message
+        );
+
+        // Control: the same pair issues once the identifier is present, so the
+        // refusal above is attributable to the missing `kid` and not to the
+        // empty constraint lists or anything else in the fixture.
+        issue(Cnf {
+            jwk: Jwk {
+                kid: Some("agent-key-1".into()),
+                ..agent_jwk
+            },
+        })
+        .expect("a pair carrying `cnf.jwk.kid` must still issue");
     }
 
     #[test]
