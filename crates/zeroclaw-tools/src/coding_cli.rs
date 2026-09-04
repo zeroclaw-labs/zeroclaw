@@ -328,6 +328,25 @@ mod tests {
     #[tokio::test]
     async fn every_adapter_applies_the_canonical_environment_boundary() {
         let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/zeroclaw-runtime"))
+            .expect("runtime marker directory");
+        std::fs::create_dir_all(workspace.path().join("crates/zeroclaw-tools"))
+            .expect("tools marker directory");
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/zeroclaw-runtime\", \"crates/zeroclaw-tools\"]\n\n[package]\nname = \"zeroclaw\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("root source manifest");
+        std::fs::write(
+            workspace.path().join("crates/zeroclaw-runtime/Cargo.toml"),
+            "[package]\nname = \"zeroclaw-runtime\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("runtime source manifest");
+        std::fs::write(
+            workspace.path().join("crates/zeroclaw-tools/Cargo.toml"),
+            "[package]\nname = \"zeroclaw-tools\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("tools source manifest");
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: workspace.path().to_path_buf(),
@@ -356,6 +375,10 @@ mod tests {
             Box::new(CodexCliTool::new_with_executor(
                 security.clone(),
                 CodexCliConfig {
+                    executable_path: Some(
+                        std::env::current_exe().expect("test executable path should be available"),
+                    ),
+                    recovery_source_workspace: Some(workspace.path().to_path_buf()),
                     env_passthrough: passthrough.clone(),
                     ..CodexCliConfig::default()
                 },
@@ -379,9 +402,17 @@ mod tests {
             )),
         ];
         for tool in tools {
-            tool.execute(serde_json::json!({"prompt": "environment probe"}))
+            let invocation = tool.execute(serde_json::json!({"prompt": "environment probe"}));
+            let result = if tool.name() == "codex_cli" {
+                crate::codex_cli::scope_zeroclaw_recovery(
+                    "ZeroClaw environment repair probe".to_string(),
+                    invocation,
+                )
                 .await
-                .unwrap_or_else(|error| panic!("{} adapter failed: {error}", tool.name()));
+            } else {
+                invocation.await
+            };
+            result.unwrap_or_else(|error| panic!("{} adapter failed: {error}", tool.name()));
         }
 
         let commands = std::mem::take(
@@ -390,15 +421,15 @@ mod tests {
                 .lock()
                 .expect("recorded command lock should not be poisoned"),
         );
+        assert_eq!(commands[0].program, OsString::from("claude"));
         assert_eq!(
-            commands
-                .iter()
-                .map(|command| command.program.clone())
-                .collect::<Vec<_>>(),
-            ["claude", "codex", "gemini", "opencode"]
-                .map(OsString::from)
-                .to_vec()
+            commands[1].program,
+            std::fs::canonicalize(std::env::current_exe().expect("test executable path"))
+                .expect("canonical test executable path")
+                .into_os_string()
         );
+        assert_eq!(commands[2].program, OsString::from("gemini"));
+        assert_eq!(commands[3].program, OsString::from("opencode"));
 
         // Compare names only so assertion failures cannot expose host paths.
         let mut expected_env_keys = SAFE_ENV_VARS

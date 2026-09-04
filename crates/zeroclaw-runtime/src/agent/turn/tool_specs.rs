@@ -36,7 +36,10 @@ pub(crate) fn build_iteration_tool_specs(
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+        .filter(|tool| {
+            crate::tools::model_may_invoke_tool(tool.name())
+                && !excluded_tools.iter().any(|ex| ex == tool.name())
+        })
         .map(|tool| tool.spec())
         .collect();
     if let Some(at) = activated_tools {
@@ -54,7 +57,9 @@ pub(crate) fn build_iteration_tool_specs(
             }
         };
         for spec in activated_tools.tool_specs() {
-            if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+            if crate::tools::model_may_invoke_tool(&spec.name)
+                && !excluded_tools.iter().any(|ex| ex == &spec.name)
+            {
                 tool_specs.push(spec);
             }
         }
@@ -240,6 +245,23 @@ mod tests {
                 .any(|spec| spec.name == "docker-mcp__extract_text"),
             "recovered poisoned lock should still expose activated tool specs"
         );
+    }
+
+    #[test]
+    fn codex_recovery_tool_is_not_exposed_to_the_task_model() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new("codex_cli", Arc::clone(&invocations))),
+            Box::new(CountingTool::new("shell", invocations)),
+        ];
+
+        let specs =
+            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &tools, &[], None)
+                .expect("tool specs should build");
+
+        assert!(specs.tool_specs.iter().any(|spec| spec.name == "shell"));
+        assert!(!specs.tool_specs.iter().any(|spec| spec.name == "codex_cli"));
+        assert!(!specs.known_tool_names.contains("codex_cli"));
     }
 
     #[test]

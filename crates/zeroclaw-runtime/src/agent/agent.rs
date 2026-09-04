@@ -2062,7 +2062,14 @@ impl Agent {
         } else {
             &no_tools
         };
-        let instructions = dispatcher.prompt_instructions(prompt_tools);
+        let has_model_tools = prompt_tools
+            .iter()
+            .any(|tool| crate::tools::model_may_invoke_tool(tool.name()));
+        let instructions = if has_model_tools {
+            dispatcher.prompt_instructions(prompt_tools)
+        } else {
+            String::new()
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -2072,8 +2079,7 @@ impl Agent {
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: dispatcher.should_send_tool_specs()
-                && !prompt_tools.is_empty(),
+            sends_native_tool_specs: dispatcher.should_send_tool_specs() && has_model_tools,
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
             shell_profile: self.shell_profile.clone(),

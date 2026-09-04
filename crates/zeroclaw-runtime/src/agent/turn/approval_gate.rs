@@ -4,7 +4,7 @@
 use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{ToolExecutionOutcome, ToolFailureKind};
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
 
@@ -184,6 +184,11 @@ pub(crate) async fn gate_tool_approval(
                 output: denied.clone(),
                 success: false,
                 error_reason: Some(denied),
+                failure_kind: Some(if unanswerable {
+                    ToolFailureKind::PolicyDenied
+                } else {
+                    ToolFailureKind::OperatorDenied
+                }),
                 duration: Duration::ZERO,
                 receipt: None,
                 output_data: None,
@@ -219,6 +224,7 @@ pub(crate) async fn gate_tool_approval(
                 output: crate::approval::sanitize_tool_replacement(replacement),
                 success: true,
                 error_reason: None,
+                failure_kind: None,
                 duration: Duration::ZERO,
                 receipt: None,
                 output_data: None,

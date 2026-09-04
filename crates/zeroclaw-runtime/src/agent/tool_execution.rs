@@ -102,6 +102,7 @@ fn unavailable_tool_outcome(
         output: reason.clone(),
         success: false,
         error_reason: Some(reason),
+        failure_kind: Some(ToolFailureKind::PolicyDenied),
         duration,
         receipt: None,
         output_data: None,
@@ -121,10 +122,32 @@ pub struct ToolExecutionOutcome {
     /// concern applied at each human-facing surface (observer events,
     /// post-execution log line, CLI progress), never stored pre-scrubbed here.
     pub error_reason: Option<String>,
+    /// Machine-readable failure provenance for turn-local recovery decisions.
+    /// The execution boundary creates this fact; downstream code must not
+    /// re-derive operator decisions or policy denials from display text.
+    pub failure_kind: Option<ToolFailureKind>,
     pub duration: Duration,
     /// Cryptographic HMAC receipt proving this tool actually executed.
     /// Present only when tool receipts are enabled in config.
     pub receipt: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFailureKind {
+    /// The tool ran (or failed to run) for a reason that is not a policy gate.
+    Ordinary,
+    /// ZeroClaw's runtime policy denied the operation without an operator
+    /// choosing to reject it.
+    PolicyDenied,
+    /// A real operator declined an approval request. This must never be
+    /// treated as a runtime defect to repair.
+    OperatorDenied,
+    /// The runtime skipped a duplicate call within the turn.
+    Duplicate,
+    /// A hook cancelled the call intentionally.
+    HookCancelled,
+    /// The turn was cancelled before a tool result completed.
+    Interrupted,
 }
 
 // ── Single tool execution ────────────────────────────────────────────────
@@ -214,6 +237,7 @@ pub(crate) async fn execute_one_tool(
             output: reason.clone(),
             success: false,
             error_reason: Some(reason),
+            failure_kind: Some(ToolFailureKind::Ordinary),
             duration,
             receipt: None,
             output_data: None,
@@ -358,11 +382,17 @@ pub(crate) async fn execute_one_tool(
                         output_data: r.output.into_data(),
                         success: true,
                         error_reason: None,
+                        failure_kind: None,
                         duration,
                         receipt,
                     })
                 } else {
                     let reason = r.error.unwrap_or_else(|| r.output.into_string());
+                    let failure_kind = if is_security_policy_failure(&reason) {
+                        ToolFailureKind::PolicyDenied
+                    } else {
+                        ToolFailureKind::Ordinary
+                    };
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
@@ -379,6 +409,7 @@ pub(crate) async fn execute_one_tool(
                         output: format!("Error: {reason}"),
                         success: false,
                         error_reason: Some(reason),
+                        failure_kind: Some(failure_kind),
                         duration,
                         receipt: None,
                         output_data: None,
@@ -402,6 +433,11 @@ pub(crate) async fn execute_one_tool(
                     format!("tool error: {call_name}")
                 );
                 let reason = format!("Error executing {call_name}: {e}");
+                let failure_kind = if is_security_policy_failure(&reason) {
+                    ToolFailureKind::PolicyDenied
+                } else {
+                    ToolFailureKind::Ordinary
+                };
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
                     tool_call_id: tool_call_id_owned.clone(),
@@ -418,6 +454,7 @@ pub(crate) async fn execute_one_tool(
                     output: reason.clone(),
                     success: false,
                     error_reason: Some(reason),
+                    failure_kind: Some(failure_kind),
                     duration,
                     receipt: None,
                     output_data: None,
@@ -453,6 +490,16 @@ pub(crate) async fn execute_one_tool(
     }
 
     outcome
+}
+
+fn is_security_policy_failure(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("security policy")
+        || reason.contains("denied by policy")
+        || reason.contains("workspace allowlist")
+        || reason.contains("rate limit exceeded")
+        || reason.contains("action budget exhausted")
+        || reason.contains("requires approval and no operator decision was available")
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -567,13 +614,30 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDispatchContext, execute_one_tool, resolved_tool_provenance};
+    use super::{
+        ToolDispatchContext, execute_one_tool, is_security_policy_failure, resolved_tool_provenance,
+    };
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use zeroclaw_api::tool::Tool;
+
+    #[test]
+    fn policy_failure_classifier_covers_runtime_gate_messages_only() {
+        for reason in [
+            "Command not allowed by security policy: destructive command",
+            "memory write denied by policy",
+            "Resolved path escapes workspace allowlist",
+            "Rate limit exceeded: action budget exhausted",
+            "tool requires approval and no operator decision was available",
+        ] {
+            assert!(is_security_policy_failure(reason), "missed: {reason}");
+        }
+        assert!(!is_security_policy_failure("network connection timed out"));
+        assert!(!is_security_policy_failure("operator explicitly declined"));
+    }
 
     /// Minimal tool that records invocations. Used to verify that the
     /// poisoned-lock recovery path still resolves an activated tool and

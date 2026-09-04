@@ -2256,6 +2256,9 @@ mod tests {
         let mut config = test_config(&tmp).await;
         config.memory.backend = "none".to_string();
         config.memory.auto_save = false;
+        // Enable the capability globally, then prove this cron job's explicit
+        // allowlist still removes it on every retry and concurrent run.
+        config.codex_cli.enabled = true;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
         config.providers.models.ollama.insert(
@@ -2318,6 +2321,16 @@ mod tests {
         }
 
         let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().all(|request| {
+                request["tools"].as_array().is_none_or(|tools| {
+                    tools
+                        .iter()
+                        .all(|tool| tool["function"]["name"].as_str() != Some("codex_cli"))
+                })
+            }),
+            "cron retries must not manufacture a codex_cli grant outside job.allowed_tools"
+        );
         let tool_results: Vec<&str> = requests
             .iter()
             .filter_map(|request| {

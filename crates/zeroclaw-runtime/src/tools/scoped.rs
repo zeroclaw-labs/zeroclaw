@@ -1521,11 +1521,17 @@ mod tests {
     #[tokio::test]
     async fn assemble_threads_caller_allowed_narrowing() {
         // The documented per-run caller allowlist (run() path) narrows further, and is
-        // honored through the seam like every other path that narrows.
+        // honored through the seam like every other path that narrows. This is
+        // also the scheduler/cron contract: recovery must not manufacture a
+        // missing codex_cli grant.
         let allow = vec!["shell".to_string()];
         let names = assemble_names(
             Arc::new(SecurityPolicy::default()),
-            vec![Box::new(MockTool("shell")), Box::new(MockTool("file_read"))],
+            vec![
+                Box::new(MockTool("shell")),
+                Box::new(MockTool("file_read")),
+                Box::new(MockTool("codex_cli")),
+            ],
             Some(&allow),
         )
         .await;

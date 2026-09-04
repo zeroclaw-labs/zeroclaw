@@ -78,6 +78,14 @@ pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
+
+/// Whether a scoped tool may be advertised to, or invoked directly by, the
+/// task model. `codex_cli` remains in the sealed registry solely so the Rust
+/// turn engine can use it for bounded ZeroClaw recovery after a typed trigger.
+/// Its own implementation also rejects calls outside that recovery scope.
+pub(crate) fn model_may_invoke_tool(name: &str) -> bool {
+    name != "codex_cli"
+}
 pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
 pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
@@ -1397,7 +1405,10 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Codex CLI delegation tool
+    // Repair-only Codex CLI. The tool resolves its sole working directory
+    // from root_config.codex_cli.recovery_source_workspace and fails closed
+    // when that operator-controlled source is absent or invalid; it never
+    // falls back to the application workspace in SecurityPolicy.
     if register_coding_cli_tools && root_config.codex_cli.enabled {
         tool_arcs.push(Arc::new(RateLimitedTool::new(
             CodexCliTool::new_with_executor(

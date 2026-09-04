@@ -165,6 +165,15 @@ impl LoopDetector {
         }
     }
 
+    /// Clear observations made before a bounded runtime-recovery attempt.
+    ///
+    /// Recovery does not change the configured thresholds; it only creates a
+    /// fresh observation window so ZeroClaw can make one real retry without
+    /// immediately inheriting the circuit-breaker state that triggered repair.
+    pub fn reset(&mut self) {
+        self.window.clear();
+    }
+
     pub fn record(
         &mut self,
         name: &str,

@@ -421,6 +421,38 @@ pub enum ProgressEvent {
     FinalizingResponse,
 }
 
+/// Coarse, non-sensitive description of a tool's purpose for progress UI.
+///
+/// The runtime deliberately sends this closed classification instead of a
+/// model- or extension-supplied tool name. That lets channels explain the work
+/// without exposing commands, paths, queries, arguments, or arbitrary labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolActivity {
+    Codex,
+    Browser,
+    Web,
+    Files,
+    CommandLine,
+    Memory,
+    VersionControl,
+    Other,
+}
+
+/// Stage of a privacy-safe tool progress update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProgressPhase {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// Typed tool progress that is safe for channel chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolProgressEvent {
+    pub activity: ToolActivity,
+    pub phase: ToolProgressPhase,
+}
+
 /// Origin of a rendered draft-progress entry.
 ///
 /// Channels may display both variants identically, but must retain this value
@@ -945,6 +977,22 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _recipient: &str,
         _message_id: &str,
         _event: ProgressEvent,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether the channel renders privacy-safe typed tool progress.
+    fn supports_typed_tool_progress(&self) -> bool {
+        false
+    }
+
+    /// Show privacy-safe tool progress without receiving a tool name,
+    /// arguments, result, error, or other potentially sensitive details.
+    async fn update_draft_tool_progress(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _event: ToolProgressEvent,
     ) -> anyhow::Result<()> {
         Ok(())
     }

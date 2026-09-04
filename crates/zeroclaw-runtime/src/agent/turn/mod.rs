@@ -17,6 +17,7 @@ pub(crate) mod post_exec;
 pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
+pub(crate) mod recovery;
 pub(crate) mod redact;
 pub(crate) mod results_collect;
 pub(crate) mod steering;
@@ -528,6 +529,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             max_repeats: pacing.loop_detection_max_repeats,
         },
     );
+    let mut recovery_tracker = recovery::RecoveryTracker::default();
+    let mut recovery_attempted = false;
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
@@ -1292,6 +1295,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             ),
                             success: false,
                             error_reason: None,
+                            failure_kind: Some(
+                                crate::agent::tool_execution::ToolFailureKind::Interrupted,
+                            ),
                             duration: std::time::Duration::ZERO,
                             receipt: None,
                             output_data: None,
@@ -1317,6 +1323,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         ),
                         success: false,
                         error_reason: None,
+                        failure_kind: Some(
+                            crate::agent::tool_execution::ToolFailureKind::Interrupted,
+                        ),
                         duration: std::time::Duration::ZERO,
                         receipt: None,
                         output_data: None,
@@ -1330,11 +1339,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             individual_results,
             tool_results,
             detection_relevant_output,
+            mut recovery_trigger,
         } = collect_tool_results(
             ordered_results,
             &tool_calls,
             turn_state.history,
             &mut loop_detector,
+            &mut recovery_tracker,
             &loop_ignore_tools,
             max_tool_result_chars,
             collected_receipts,
@@ -1343,8 +1354,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_id,
         )?;
 
-        if !cancelled_mid_batch {
-            check_identical_output_abort(
+        if !cancelled_mid_batch && recovery_trigger.is_none() {
+            recovery_trigger = check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
                 pacing,
@@ -1353,7 +1364,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model,
                 iteration,
                 turn_id,
-            )?;
+            );
         }
 
         turn_state.append_tool_round(
@@ -1427,6 +1438,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 observer,
             )
             .await;
+        }
+
+        if let Some(trigger) = recovery_trigger {
+            if recovery_attempted {
+                anyhow::bail!("Agent loop remained stuck after the bounded Codex recovery attempt");
+            }
+            let recovery_result = recovery::attempt_codex_recovery(
+                trigger,
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback.as_ref(),
+                receipt_generator,
+                &ctx,
+                iteration + 1 < max_iterations,
+            )
+            .await;
+            turn_state.push_dual(recovery_result.history_message());
+            recovery_attempted = true;
+            // The bounded repair attempt is a semantic boundary. Retain the
+            // task history, but discard only stale detector observations so
+            // ZeroClaw gets a genuine retry and remains the task owner.
+            loop_detector.reset();
+            recovery_tracker.reset();
+            consecutive_identical_outputs = 0;
+            last_tool_output_hash = None;
         }
     }
 

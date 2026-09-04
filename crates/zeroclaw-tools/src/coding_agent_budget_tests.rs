@@ -115,7 +115,10 @@ fn coding_agent_cases(
         wrapped_tool(
             CodexCliTool::new_with_executor(
                 security.clone(),
-                CodexCliConfig::default(),
+                CodexCliConfig {
+                    recovery_source_workspace: Some(workspace.to_path_buf()),
+                    ..CodexCliConfig::default()
+                },
                 executor.clone(),
             ),
             security,
@@ -155,6 +158,7 @@ fn coding_agent_cases(
 #[tokio::test]
 async fn coding_agent_wrappers_charge_one_action_each() {
     let workspace = tempfile::TempDir::new().expect("workspace");
+    mark_as_zeroclaw_source(workspace.path());
     let tmux_binary = workspace.path().join("tmux");
     write_successful_tmux(&tmux_binary);
 
@@ -162,10 +166,13 @@ async fn coding_agent_wrappers_charge_one_action_each() {
         coding_agent_cases(AutonomyLevel::Full, 2, workspace.path(), &tmux_binary)
     {
         let tool_name = tool.name().to_string();
-        let result = tool
-            .execute(json!({"prompt": "hello"}))
-            .await
-            .expect("coding-agent invocation");
+        let invocation = tool.execute(json!({"prompt": "hello"}));
+        let result = if tool_name == "codex_cli" {
+            crate::codex_cli::scope_zeroclaw_recovery("repair ZeroClaw".into(), invocation).await
+        } else {
+            invocation.await
+        }
+        .expect("coding-agent invocation");
         assert!(result.success, "{tool_name} should succeed: {result:?}");
         assert!(
             security.record_action(),
@@ -179,6 +186,29 @@ async fn coding_agent_wrappers_charge_one_action_each() {
 }
 
 #[cfg(unix)]
+fn mark_as_zeroclaw_source(workspace: &std::path::Path) {
+    std::fs::create_dir_all(workspace.join("crates/zeroclaw-runtime"))
+        .expect("runtime marker directory");
+    std::fs::create_dir_all(workspace.join("crates/zeroclaw-tools"))
+        .expect("tools marker directory");
+    std::fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/zeroclaw-runtime\", \"crates/zeroclaw-tools\"]\n\n[package]\nname = \"zeroclaw\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("root source manifest");
+    std::fs::write(
+        workspace.join("crates/zeroclaw-runtime/Cargo.toml"),
+        "[package]\nname = \"zeroclaw-runtime\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("runtime source manifest");
+    std::fs::write(
+        workspace.join("crates/zeroclaw-tools/Cargo.toml"),
+        "[package]\nname = \"zeroclaw-tools\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("tools source manifest");
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn coding_agent_readonly_rejection_consumes_no_action() {
     let workspace = tempfile::TempDir::new().expect("workspace");
@@ -188,10 +218,13 @@ async fn coding_agent_readonly_rejection_consumes_no_action() {
         coding_agent_cases(AutonomyLevel::ReadOnly, 1, workspace.path(), &tmux_binary)
     {
         let tool_name = tool.name().to_string();
-        let result = tool
-            .execute(json!({"prompt": "hello"}))
-            .await
-            .expect("read-only rejection");
+        let invocation = tool.execute(json!({"prompt": "hello"}));
+        let result = if tool_name == "codex_cli" {
+            crate::codex_cli::scope_zeroclaw_recovery("repair ZeroClaw".into(), invocation).await
+        } else {
+            invocation.await
+        }
+        .expect("read-only rejection");
         assert!(
             !result.success,
             "{tool_name} must be rejected in read-only mode"

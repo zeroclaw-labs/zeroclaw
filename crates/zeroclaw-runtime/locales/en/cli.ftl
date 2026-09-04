@@ -959,15 +959,40 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
 turn-ingress-dropped = This request was not processed: { $reason }
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
+# Repair-only Codex recovery. The Rust runtime supplies only typed, sanitized
+# ZeroClaw failure metadata; no original task or user content enters this path.
+turn-codex-recovery-failure-repeated-tool = repeated tool failure
+turn-codex-recovery-failure-security-policy = security-policy denial
+turn-codex-recovery-failure-circuit-breaker = circuit breaker
+turn-codex-recovery-triggered = ⚠️ ZeroClaw is stuck: { $failure } in `{ $tool }`.
+turn-codex-recovery-repairing = 🔧 Codex is diagnosing and repairing ZeroClaw source, configuration handling, or runtime behavior. The original task remains owned by ZeroClaw.
+turn-codex-recovery-unavailable = Codex recovery is unavailable under this turn's configured tool policy.
+turn-codex-recovery-applied = ✅ Codex reported that the ZeroClaw repair was applied.
+turn-codex-recovery-restart-required = ⚠️ Codex reported that the ZeroClaw repair requires a restart. ZeroClaw will report that requirement without delegating the original task.
+turn-codex-recovery-not-applied = Codex completed diagnosis but did not report an applied ZeroClaw repair.
+turn-codex-recovery-failed = Codex recovery failed under the existing runtime policy.
+turn-codex-recovery-will-retry = ZeroClaw will retry or continue the original task.
+turn-codex-recovery-will-stop = ZeroClaw will report the stop without delegating the original task.
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
-channel-runtime-progress-received = Received
-channel-runtime-progress-planning = Planning
-channel-runtime-progress-waiting-on-model = Waiting on model
-channel-runtime-progress-running-tool = Running tool
-channel-runtime-progress-compacting-context = Compacting context
-channel-runtime-progress-finalizing-response = Finalizing response
+channel-runtime-progress-received = Got it — checking the request…
+channel-runtime-progress-planning = Reviewing what I know and choosing the next step…
+channel-runtime-progress-waiting-on-model = Thinking through the next action…
+channel-runtime-progress-running-tool = Using a tool to gather the next piece of information…
+channel-runtime-progress-compacting-context = Organizing the working context so I can continue…
+channel-runtime-progress-finalizing-response = Putting the result into a clear answer…
+channel-runtime-progress-tool-activity-codex = Codex
+channel-runtime-progress-tool-activity-browser = the browser
+channel-runtime-progress-tool-activity-web = the web
+channel-runtime-progress-tool-activity-files = files and code
+channel-runtime-progress-tool-activity-command-line = the command line
+channel-runtime-progress-tool-activity-memory = saved context
+channel-runtime-progress-tool-activity-version-control = version control
+channel-runtime-progress-tool-activity-other = another tool
+channel-runtime-progress-tool-running = Working with { $activity } to gather the next piece of information…
+channel-runtime-progress-tool-succeeded = Finished with { $activity }; reviewing what it found…
+channel-runtime-progress-tool-failed = { $activity } hit a problem; checking the error and another safe route…
 channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.

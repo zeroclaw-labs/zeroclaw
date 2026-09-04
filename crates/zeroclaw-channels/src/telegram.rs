@@ -6,7 +6,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage, ToolProgressEvent,
+};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -4327,6 +4329,23 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    fn supports_typed_tool_progress(&self) -> bool {
+        true
+    }
+
+    async fn update_draft_tool_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        event: ToolProgressEvent,
+    ) -> anyhow::Result<()> {
+        if self.stream_mode == StreamMode::Partial {
+            let status_line = crate::util::localized_tool_progress(event);
+            return self.update_draft(recipient, message_id, &status_line).await;
+        }
+        Ok(())
+    }
+
     async fn finalize_draft(
         &self,
         recipient: &str,
@@ -5613,6 +5632,48 @@ mod tests {
                 "tool status detail '{leaked}' leaked to Telegram"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn typed_tool_progress_explains_activity_and_outcome() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::{ToolActivity, ToolProgressPhase};
+
+        let mock_server = MockServer::start().await;
+        let event = ToolProgressEvent {
+            activity: ToolActivity::Codex,
+            phase: ToolProgressPhase::Running,
+        };
+        let expected = crate::util::localized_tool_progress(event);
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .and(body_json(serde_json::json!({
+                "chat_id": "123",
+                "message_id": 42,
+                "text": expected,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_api_base(mock_server.uri());
+
+        channel
+            .update_draft_tool_progress("123", "42", event)
+            .await
+            .unwrap();
     }
 
     #[test]

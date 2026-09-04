@@ -157,6 +157,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     struct FakeRuntime {
         seen_command: Arc<Mutex<Option<String>>>,
+        seen_working_dir: Arc<Mutex<Option<PathBuf>>>,
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -187,6 +188,8 @@ mod tests {
             workspace_dir: &std::path::Path,
         ) -> anyhow::Result<tokio::process::Command> {
             *self.seen_command.lock().expect("fake runtime mutex") = Some(command.to_string());
+            *self.seen_working_dir.lock().expect("fake runtime mutex") =
+                Some(workspace_dir.to_path_buf());
             let mut process = tokio::process::Command::new("/bin/sh");
             process
                 .args([
@@ -352,30 +355,62 @@ mod tests {
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn codex_cli_uses_runtime_and_sandbox_executor() {
-        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let application_workspace = tempfile::TempDir::new().expect("application workspace");
+        let source_workspace = tempfile::TempDir::new().expect("recovery source workspace");
+        std::fs::create_dir_all(source_workspace.path().join("crates/zeroclaw-runtime"))
+            .expect("runtime marker directory");
+        std::fs::create_dir_all(source_workspace.path().join("crates/zeroclaw-tools"))
+            .expect("tools marker directory");
+        std::fs::write(
+            source_workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/zeroclaw-runtime\", \"crates/zeroclaw-tools\"]\n\n[package]\nname = \"zeroclaw\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("root source manifest");
+        std::fs::write(
+            source_workspace
+                .path()
+                .join("crates/zeroclaw-runtime/Cargo.toml"),
+            "[package]\nname = \"zeroclaw-runtime\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("runtime source manifest");
+        std::fs::write(
+            source_workspace
+                .path()
+                .join("crates/zeroclaw-tools/Cargo.toml"),
+            "[package]\nname = \"zeroclaw-tools\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("tools source manifest");
         let seen_command = Arc::new(Mutex::new(None));
+        let seen_working_dir = Arc::new(Mutex::new(None));
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::clone(&seen_command),
+            seen_working_dir: Arc::clone(&seen_working_dir),
         });
         let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), false);
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
-            workspace_dir: workspace.path().to_path_buf(),
+            workspace_dir: application_workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = CodexCliTool::new_with_executor(
             security,
             CodexCliConfig {
+                executable_path: Some(
+                    std::env::current_exe().expect("test executable path should be available"),
+                ),
+                recovery_source_workspace: Some(source_workspace.path().to_path_buf()),
                 timeout_secs: 5,
                 ..CodexCliConfig::default()
             },
             executor,
         );
 
-        let result = tool
-            .execute(json!({"prompt": "prove runtime boundary"}))
-            .await
-            .expect("codex_cli should return a tool result");
+        let result = zeroclaw_tools::codex_cli::scope_zeroclaw_recovery(
+            "prove runtime boundary".to_string(),
+            tool.execute(json!({})),
+        )
+        .await
+        .expect("codex_cli should return a tool result");
 
         assert!(result.success, "unexpected error: {:?}", result.error);
         assert_eq!(result.output.trim(), "runtime:sandbox:sandboxed");
@@ -384,8 +419,25 @@ mod tests {
             .expect("fake runtime mutex")
             .clone()
             .expect("runtime should receive the coding CLI command");
-        assert!(command.contains("codex"), "command was {command:?}");
+        let canonical_executable = std::fs::canonicalize(
+            std::env::current_exe().expect("test executable path should be available"),
+        )
+        .expect("canonical test executable path");
+        assert!(
+            command.contains(canonical_executable.to_string_lossy().as_ref()),
+            "command was {command:?}"
+        );
         assert!(command.contains("exec"), "command was {command:?}");
+        let working_dir = seen_working_dir
+            .lock()
+            .expect("fake runtime mutex")
+            .clone()
+            .expect("runtime should receive the working directory");
+        assert_eq!(
+            working_dir,
+            std::fs::canonicalize(source_workspace.path()).expect("canonical source workspace")
+        );
+        assert_ne!(working_dir, application_workspace.path());
         assert!(
             command.contains("prove runtime boundary"),
             "command was {command:?}"
@@ -398,6 +450,7 @@ mod tests {
         let workspace = tempfile::TempDir::new().expect("temp workspace");
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::new(Mutex::new(None)),
+            seen_working_dir: Arc::new(Mutex::new(None)),
         });
         let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), true);
         let mut command = CodingCliCommand::new("/bin/echo", workspace.path().to_path_buf(), 5);
@@ -422,6 +475,7 @@ mod tests {
         let seen_command = Arc::new(Mutex::new(None));
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::clone(&seen_command),
+            seen_working_dir: Arc::new(Mutex::new(None)),
         });
         let executor =
             RuntimeCodingCliExecutor::shared(runtime, Arc::new(UnsupportedSandbox), false);
@@ -457,6 +511,7 @@ mod tests {
             .expect("canonical workspace");
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::new(Mutex::new(None)),
+            seen_working_dir: Arc::new(Mutex::new(None)),
         });
         let executor =
             RuntimeCodingCliExecutor::shared(runtime, Arc::new(ReplacingPwdSandbox), true);

@@ -524,7 +524,10 @@ pub fn native_tool_specs_present_for_turn(
     // filtering, without assembling any specs tools are present if
     // the registry or the activated deferred set has a non-excluded name.
     let is_excluded = |name: &str| excluded_tools.iter().any(|ex| ex == name);
-    if tools_registry.iter().any(|tool| !is_excluded(tool.name())) {
+    if tools_registry
+        .iter()
+        .any(|tool| crate::tools::model_may_invoke_tool(tool.name()) && !is_excluded(tool.name()))
+    {
         return Ok(true);
     }
     let Some(at) = activated_tools else {
@@ -536,7 +539,10 @@ pub fn native_tool_specs_present_for_turn(
         // still safe for a read-only name scan.
         Err(poisoned) => poisoned.into_inner(),
     };
-    Ok(activated.tool_names().iter().any(|name| !is_excluded(name)))
+    Ok(activated
+        .tool_names()
+        .iter()
+        .any(|name| crate::tools::model_may_invoke_tool(name) && !is_excluded(name)))
 }
 
 static IMAGE_DATA_URI_REGEX: LazyLock<Regex> =
@@ -637,7 +643,9 @@ pub(crate) fn build_system_prompt_for_turn(
     let effective_tool_names: HashSet<&str> = tools_registry
         .iter()
         .map(|tool| tool.name())
-        .filter(|name| !excluded_tool_names.contains(*name))
+        .filter(|name| {
+            crate::tools::model_may_invoke_tool(name) && !excluded_tool_names.contains(*name)
+        })
         .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
     turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
@@ -1026,7 +1034,10 @@ pub fn build_tool_instructions_for_names(
 }
 
 fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> String {
-    let tools: Vec<&dyn Tool> = tools.into_iter().collect();
+    let tools: Vec<&dyn Tool> = tools
+        .into_iter()
+        .filter(|tool| crate::tools::model_may_invoke_tool(tool.name()))
+        .collect();
     if tools.is_empty() {
         return String::new();
     }
@@ -3178,7 +3189,10 @@ pub async fn process_message(
         let effective_tool_names: HashSet<&str> = tools_registry
             .iter()
             .map(|tool| tool.name())
-            .filter(|name| !excluded_tools.iter().any(|ex| ex == *name))
+            .filter(|name| {
+                crate::tools::model_may_invoke_tool(name)
+                    && !excluded_tools.iter().any(|ex| ex == *name)
+            })
             .collect();
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
@@ -5495,6 +5509,175 @@ mod tests {
                 error: Some(self.error_reason.clone()),
             })
         }
+    }
+
+    struct SuccessfulRecoveryExecutor {
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_tools::coding_cli::CodingCliExecutor for SuccessfulRecoveryExecutor {
+        async fn output(
+            &self,
+            command: zeroclaw_tools::coding_cli::CodingCliCommand,
+        ) -> Result<std::process::Output, zeroclaw_tools::coding_cli::CodingCliExecutionError>
+        {
+            self.prompts.lock().unwrap().push(
+                command
+                    .args
+                    .last()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            Ok(std::process::Output {
+                status: successful_test_exit_status(),
+                stdout: b"ZEROCLAW_RECOVERY_STATUS: applied\n".to_vec(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn successful_test_exit_status() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn successful_test_exit_status() -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[tokio::test]
+    async fn recovery_returns_control_to_zeroclaw_tool_loop() {
+        let original_task = "ORIGINAL_TASK_SENTINEL: remain owned by ZeroClaw";
+        let tool_call = |value: usize| {
+            format!(
+                "<tool_call>\n{{\"name\":\"failing\",\"arguments\":{{\"attempt\":{value}}}}}\n</tool_call>"
+            )
+        };
+        let responses = [tool_call(1), tool_call(2), tool_call(3)];
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            &responses[0],
+            &responses[1],
+            &responses[2],
+            "ZeroClaw resumed and finished the original task",
+        ]);
+
+        let workspace = tempfile::TempDir::new().expect("recovery source workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/zeroclaw-runtime"))
+            .expect("runtime marker directory");
+        std::fs::create_dir_all(workspace.path().join("crates/zeroclaw-tools"))
+            .expect("tools marker directory");
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/zeroclaw-runtime\", \"crates/zeroclaw-tools\"]\n\n[package]\nname = \"zeroclaw\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("root source manifest");
+        std::fs::write(
+            workspace.path().join("crates/zeroclaw-runtime/Cargo.toml"),
+            "[package]\nname = \"zeroclaw-runtime\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("runtime source manifest");
+        std::fs::write(
+            workspace.path().join("crates/zeroclaw-tools/Cargo.toml"),
+            "[package]\nname = \"zeroclaw-tools\"\nversion = \"0.0.0\"\n",
+        )
+        .expect("tools source manifest");
+
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy {
+            autonomy: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..zeroclaw_config::policy::SecurityPolicy::default()
+        });
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(FailingTool::new("failing", "stable runtime failure")),
+            Box::new(zeroclaw_tools::codex_cli::CodexCliTool::new_with_executor(
+                security,
+                zeroclaw_config::schema::CodexCliConfig {
+                    executable_path: Some(
+                        std::env::current_exe().expect("test executable path should be available"),
+                    ),
+                    recovery_source_workspace: Some(workspace.path().to_path_buf()),
+                    ..zeroclaw_config::schema::CodexCliConfig::default()
+                },
+                Arc::new(SuccessfulRecoveryExecutor {
+                    prompts: Arc::clone(&prompts),
+                }),
+            )),
+        ]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user(original_task),
+        ];
+        let observer = NoopObserver;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("zeroclaw-test-agent"),
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("ZeroClaw should resume after bounded recovery");
+
+        assert_eq!(result, "ZeroClaw resumed and finished the original task");
+        assert_eq!(history[1].content, original_task);
+        assert!(history.iter().any(|message| {
+            message.role == "system"
+                && message.content.contains("\"task_owner\":\"zeroclaw\"")
+                && message
+                    .content
+                    .contains("zeroclaw_retry_or_continue_original_task")
+        }));
+        let recorded_prompts = prompts.lock().unwrap();
+        assert_eq!(recorded_prompts.len(), 1);
+        assert!(recorded_prompts[0].contains("ZeroClaw Rust runtime"));
+        assert!(!recorded_prompts[0].contains(original_task));
     }
 
     #[tokio::test]

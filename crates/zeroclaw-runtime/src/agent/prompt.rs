@@ -140,7 +140,11 @@ impl PromptSection for ToolHonestySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.tools.is_empty() {
+        if !ctx
+            .tools
+            .iter()
+            .any(|tool| crate::tools::model_may_invoke_tool(tool.name()))
+        {
             return Ok(String::new());
         }
 
@@ -160,7 +164,11 @@ impl PromptSection for ToolsSection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        if ctx.tools.is_empty() {
+        if !ctx
+            .tools
+            .iter()
+            .any(|tool| crate::tools::model_may_invoke_tool(tool.name()))
+        {
             return Ok(String::new());
         }
         if ctx.sends_native_tool_specs {
@@ -168,7 +176,11 @@ impl PromptSection for ToolsSection {
         }
 
         let mut out = String::from("## Tools\n\n");
-        for tool in ctx.tools {
+        for tool in ctx
+            .tools
+            .iter()
+            .filter(|tool| crate::tools::model_may_invoke_tool(tool.name()))
+        {
             let i18n_description = crate::i18n::get_tool_description(tool.name());
             let desc = i18n_description.unwrap_or_else(|| tool.description());
             let _ = writeln!(

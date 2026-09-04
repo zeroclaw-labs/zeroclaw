@@ -8,6 +8,7 @@ use crate::agent::history::{
 };
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::turn::recovery::{RecoveryTracker, RecoveryTrigger};
 use anyhow::Result;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -26,18 +27,22 @@ pub(crate) struct CollectedResults {
     pub(crate) tool_results: String,
     /// Concatenated non-ignored outputs feeding the identical-output hash.
     pub(crate) detection_relevant_output: String,
+    /// A typed stuck condition for the repair-only recovery seam. The prompt
+    /// builder consumes only this metadata, never history or raw tool data.
+    pub(crate) recovery_trigger: Option<RecoveryTrigger>,
 }
 
 /// Collect this round's tool results (upstream loop body, results-collection
 /// section): feed the loop detector (Warning/Block append system messages;
-/// Break bails), canonicalize media markers, truncate, append receipts, and
-/// build the per-call and XML result forms.
+/// Break yields a typed recovery trigger), canonicalize media markers,
+/// truncate, append receipts, and build the per-call and XML result forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
     ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     tool_calls: &[ParsedToolCall],
     history: &mut Vec<ChatMessage>,
     loop_detector: &mut LoopDetector,
+    recovery_tracker: &mut RecoveryTracker,
     loop_ignore_tools: &HashSet<&str>,
     max_tool_result_chars: usize,
     collected_receipts: Option<&Mutex<Vec<String>>>,
@@ -48,6 +53,7 @@ pub(crate) fn collect_tool_results(
     let mut tool_results = String::new();
     let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
     let mut detection_relevant_output = String::new();
+    let mut recovery_trigger = None;
     // Use enumerate *before* filter_map so result_index stays aligned with
     // tool_calls even when some ordered_results entries are None.
     for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
@@ -55,6 +61,9 @@ pub(crate) fn collect_tool_results(
         .enumerate()
         .filter_map(|(i, opt)| opt.map(|v| (i, v)))
     {
+        if recovery_trigger.is_none() {
+            recovery_trigger = recovery_tracker.observe(&tool_name, &outcome, iteration);
+        }
         if !loop_ignore_tools.contains(tool_name.as_str()) {
             if outcome.success {
                 detection_relevant_output.push_str(&outcome.output);
@@ -117,7 +126,9 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    recovery_trigger.get_or_insert_with(|| {
+                        RecoveryTrigger::circuit_breaker(&tool_name, &msg, iteration)
+                    });
                 }
             }
         }
@@ -152,6 +163,7 @@ pub(crate) fn collect_tool_results(
         individual_results,
         tool_results,
         detection_relevant_output,
+        recovery_trigger,
     })
 }
 
@@ -168,7 +180,7 @@ pub(crate) fn check_identical_output_abort(
     model: &str,
     iteration: usize,
     turn_id: &str,
-) -> Result<()> {
+) -> Option<RecoveryTrigger> {
     let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
         Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
         None => false, // disabled when not configured (backwards compatible)
@@ -202,13 +214,13 @@ pub(crate) fn check_identical_output_abort(
                     })),
                 "tool_loop_identical_output_abort"
             );
-            anyhow::bail!(
-                "Agent loop aborted: identical tool output detected {} consecutive times",
-                *consecutive_identical_outputs
-            );
+            return Some(RecoveryTrigger::identical_output(
+                *consecutive_identical_outputs,
+                iteration,
+            ));
         }
     }
-    Ok(())
+    None
 }
 
 #[cfg(test)]
@@ -229,6 +241,8 @@ mod tests {
             } else {
                 Some(output.to_string())
             },
+            failure_kind: (!success)
+                .then_some(crate::agent::tool_execution::ToolFailureKind::Ordinary),
             duration: Duration::from_millis(1),
             receipt: None,
             output_data: None,
@@ -240,6 +254,7 @@ mod tests {
     /// `success` flag.
     fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut recovery_tracker = RecoveryTracker::default();
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
@@ -261,6 +276,7 @@ mod tests {
             &tool_calls,
             &mut history,
             &mut detector,
+            &mut recovery_tracker,
             &ignore,
             10_000,
             None,
@@ -282,12 +298,10 @@ mod tests {
     #[test]
     fn successful_identical_results_still_trip_no_progress_breaker() {
         // Identical *successful* output across different args is the genuine
-        // stuck-loop signaland must still hard-abort the turn.
-        let err = match run(8, "byte-identical successful output", true) {
-            Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("loop detector"), "got: {err}");
+        // stuck-loop signal and must request bounded repair recovery.
+        let collected = run(8, "byte-identical successful output", true)
+            .expect("result collection should return the typed recovery trigger");
+        assert!(collected.recovery_trigger.is_some());
     }
 
     fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {
@@ -300,6 +314,7 @@ mod tests {
         let mut consecutive_identical_outputs = 0usize;
         let mut last_tool_output_hash: Option<u64> = None;
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut recovery_tracker = RecoveryTracker::default();
         let ignore: HashSet<&str> = HashSet::new();
         for iteration in 0..n {
             let mut history: Vec<ChatMessage> = Vec::new();
@@ -318,6 +333,7 @@ mod tests {
                 &tool_calls,
                 &mut history,
                 &mut detector,
+                &mut recovery_tracker,
                 &ignore,
                 10_000,
                 None,
@@ -325,7 +341,7 @@ mod tests {
                 iteration,
                 "turn-test",
             )?;
-            check_identical_output_abort(
+            if check_identical_output_abort(
                 &collected.detection_relevant_output,
                 loop_started_at,
                 &pacing,
@@ -334,7 +350,11 @@ mod tests {
                 "test-model",
                 iteration,
                 "turn-test",
-            )?;
+            )
+            .is_some()
+            {
+                anyhow::bail!("typed identical-output recovery trigger")
+            }
         }
         Ok(())
     }

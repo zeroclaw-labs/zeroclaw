@@ -78,7 +78,8 @@ use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
-    Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, SendMessage,
+    Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, ProgressEvent,
+    SendMessage, ToolActivity, ToolProgressEvent, ToolProgressPhase,
 };
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -3912,6 +3913,43 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
     s.to_string()
 }
 
+/// Reduce a registry tool name to a closed, non-sensitive activity label.
+///
+/// Tool names can originate in extensions, so they never cross the channel
+/// boundary verbatim. Unknown names intentionally collapse to `Other`.
+fn classify_tool_activity(tool: &str) -> ToolActivity {
+    let normalized = tool.to_ascii_lowercase();
+    let leaf = normalized.rsplit("__").next().unwrap_or(&normalized);
+
+    if leaf == "codex_cli" {
+        ToolActivity::Codex
+    } else if normalized.starts_with("safari_browser__")
+        || matches!(
+            leaf,
+            "browser" | "browser_open" | "browser_delegate" | "screenshot"
+        )
+    {
+        ToolActivity::Browser
+    } else if matches!(
+        leaf,
+        "web_search" | "web_fetch" | "http_request" | "content_search" | "weather"
+    ) {
+        ToolActivity::Web
+    } else if leaf.starts_with("file_")
+        || matches!(leaf, "glob_search" | "project_intel" | "image_info")
+    {
+        ToolActivity::Files
+    } else if matches!(leaf, "shell" | "exec" | "exec_command") {
+        ToolActivity::CommandLine
+    } else if leaf.starts_with("memory_") {
+        ToolActivity::Memory
+    } else if leaf.starts_with("git_") || leaf.starts_with("github") {
+        ToolActivity::VersionControl
+    } else {
+        ToolActivity::Other
+    }
+}
+
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
 /// way out.
 ///
@@ -3942,6 +3980,13 @@ async fn run_draft_updater(
             // A lifecycle event is a typed signal, not assistant text, so it
             // carries nothing to sanitize and passes straight through.
             StreamDelta::Lifecycle(event) => {
+                // A structured ToolStart immediately follows RunningTool. Let
+                // capable channels render the more useful closed activity
+                // label instead of consuming their edit budget on a generic
+                // line that would make the typed update disappear.
+                if event == ProgressEvent::RunningTool && channel.supports_typed_tool_progress() {
+                    continue;
+                }
                 if let Err(e) = channel
                     .update_draft_lifecycle(&reply_target, &draft_id, event)
                     .await
@@ -3968,12 +4013,43 @@ async fn run_draft_updater(
                     );
                 }
             }
-            // Structured tool events remain visible to ordinary draft
-            // consumers through the runtime's conservative legacy renderer.
-            // Matrix has its own disclosure policy in
-            // `run_matrix_single_message_draft_updater`.
+            // Structured tool events remain visible to legacy draft consumers
+            // through the runtime's conservative renderer. Typed consumers get
+            // only a closed activity class and outcome; no name, arguments,
+            // result, or error crosses that channel boundary. Matrix has its
+            // own disclosure policy in `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
-                if let Some(text) = event.legacy_status() {
+                if channel.supports_typed_tool_progress() {
+                    let typed = match &event {
+                        StreamDelta::ToolStart { tool, .. } => ToolProgressEvent {
+                            activity: classify_tool_activity(tool),
+                            phase: ToolProgressPhase::Running,
+                        },
+                        StreamDelta::ToolComplete { tool, success, .. } => ToolProgressEvent {
+                            activity: classify_tool_activity(tool),
+                            phase: if *success {
+                                ToolProgressPhase::Succeeded
+                            } else {
+                                ToolProgressPhase::Failed
+                            },
+                        },
+                        _ => unreachable!("match arm accepts only structured tool progress"),
+                    };
+                    if let Err(e) = channel
+                        .update_draft_tool_progress(&reply_target, &draft_id, typed)
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Typed draft tool progress update failed"
+                        );
+                    }
+                } else if let Some(text) = event.legacy_status() {
                     let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
                     if let Err(e) = channel
                         .update_draft_progress(&reply_target, &draft_id, &visible)
@@ -17264,12 +17340,14 @@ api_key = "anthropic-key"
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         progress_messages: tokio::sync::Mutex<Vec<String>>,
+        typed_tool_progress: tokio::sync::Mutex<Vec<ToolProgressEvent>>,
         lifecycle_events: tokio::sync::Mutex<Vec<zeroclaw_runtime::agent::loop_::ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
         cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
         delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
         stall_start_typing: bool,
         stall_stop_typing: bool,
+        supports_typed_tool_progress: bool,
         /// Text handed to `update_draft`, in order, so a test can assert on
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
@@ -17296,14 +17374,21 @@ api_key = "anthropic-key"
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 progress_messages: tokio::sync::Mutex::new(Vec::new()),
+                typed_tool_progress: tokio::sync::Mutex::new(Vec::new()),
                 lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
                 cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
                 delivery_events: tokio::sync::Mutex::new(Vec::new()),
                 stall_start_typing: false,
                 stall_stop_typing: false,
+                supports_typed_tool_progress: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_typed_tool_progress(mut self) -> Self {
+            self.supports_typed_tool_progress = true;
+            self
         }
 
         fn matrix(stream_mode: zeroclaw_config::schema::MatrixStreamMode) -> Self {
@@ -17733,6 +17818,20 @@ api_key = "anthropic-key"
             event: zeroclaw_runtime::agent::loop_::ProgressEvent,
         ) -> anyhow::Result<()> {
             self.lifecycle_events.lock().await.push(event);
+            Ok(())
+        }
+
+        fn supports_typed_tool_progress(&self) -> bool {
+            self.supports_typed_tool_progress
+        }
+
+        async fn update_draft_tool_progress(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            event: ToolProgressEvent,
+        ) -> anyhow::Result<()> {
+            self.typed_tool_progress.lock().await.push(event);
             Ok(())
         }
     }
@@ -34972,6 +35071,80 @@ Done."#;
             channel_impl.progress_messages.lock().await.as_slice(),
             ["⏳ shell: pwd".to_string(), "✅ shell (2s)".to_string()],
             "ordinary draft channels preserve the established structured-tool presentation"
+        );
+    }
+
+    #[test]
+    fn tool_activity_classification_is_closed_and_useful() {
+        assert_eq!(classify_tool_activity("codex_cli"), ToolActivity::Codex);
+        assert_eq!(
+            classify_tool_activity("safari_browser__browse"),
+            ToolActivity::Browser
+        );
+        assert_eq!(classify_tool_activity("file_read"), ToolActivity::Files);
+        assert_eq!(classify_tool_activity("shell"), ToolActivity::CommandLine);
+        assert_eq!(
+            classify_tool_activity("extension__private-token-123"),
+            ToolActivity::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_sends_typed_tool_activity_without_raw_details() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl =
+            Arc::new(DraftRecordingChannel::new(false, false).with_typed_tool_progress());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Lifecycle(ProgressEvent::RunningTool))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::ToolStart {
+            tool: "extension__private-token-123".to_string(),
+            arguments: Arc::new(serde_json::json!({
+                "path": "/home/example/.ssh/id_rsa",
+                "api_key": "placeholder-secret"
+            })),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamDelta::ToolComplete {
+            tool: "extension__private-token-123".to_string(),
+            arguments: Arc::new(serde_json::json!({"api_key": "placeholder-secret"})),
+            tool_provenance: None,
+            secs: 2,
+            success: false,
+            error: Some("placeholder-secret".to_string()),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            rx,
+        )
+        .await;
+
+        assert!(channel_impl.lifecycle_events.lock().await.is_empty());
+        assert!(channel_impl.progress_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.typed_tool_progress.lock().await.as_slice(),
+            [
+                ToolProgressEvent {
+                    activity: ToolActivity::Other,
+                    phase: ToolProgressPhase::Running,
+                },
+                ToolProgressEvent {
+                    activity: ToolActivity::Other,
+                    phase: ToolProgressPhase::Failed,
+                },
+            ]
         );
     }
 

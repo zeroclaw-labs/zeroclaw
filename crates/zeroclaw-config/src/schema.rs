@@ -9617,16 +9617,31 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
+/// Runs bounded, repair-only ZeroClaw recovery through the `codex exec` CLI.
+/// The task model cannot supply its prompt or working directory. Authentication
+/// uses the binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "codex_cli"]
 pub struct CodexCliConfig {
-    /// Enable the `codex_cli` tool
+    /// Enable repair-only `codex_cli` recovery
     #[serde(default)]
     pub enabled: bool,
+    /// Absolute operator-controlled path to an executable regular file; unset or invalid paths fail closed after canonical validation, with no daemon `PATH` fallback.
+    ///
+    /// Before each recovery attempt, ZeroClaw canonicalizes this path and
+    /// verifies that it names an executable regular file. Recovery fails
+    /// closed when the value is absent or invalid; the daemon's `PATH` is not
+    /// used as a fallback.
+    #[serde(default)]
+    pub executable_path: Option<PathBuf>,
+    /// Absolute operator-controlled ZeroClaw source path; unset or invalid paths fail closed after canonical validation, with no application workspace fallback.
+    ///
+    /// Before each use, ZeroClaw canonicalizes this path and validates the
+    /// expected workspace and crate manifests.
+    #[serde(default)]
+    pub recovery_source_workspace: Option<PathBuf>,
     /// Maximum execution time in seconds (coding tasks can be long)
     #[serde(default = "default_codex_cli_timeout_secs")]
     pub timeout_secs: u64,
@@ -9640,11 +9655,13 @@ pub struct CodexCliConfig {
     /// Extra CLI arguments appended to `codex exec` before the prompt.
     ///
     /// Values come from operator-controlled config (same trust level as
-    /// `env_passthrough`) and remain allowed without blocking. Config validation
-    /// warns when a recognized argument can disable Codex's sandbox, alter
-    /// approval or policy loading, expand workspace access, or register a
-    /// locally executable integration. This is a warning inventory, not an
-    /// allowlist; ordinary and unknown arguments remain allowed and silent.
+    /// `env_passthrough`). Working-directory selectors (`--cd` and `-C`) are
+    /// rejected so `recovery_source_workspace` remains the only working-root
+    /// authority. Config validation warns when another recognized argument can
+    /// disable Codex's sandbox, alter approval or policy loading, expand
+    /// workspace access, or register a locally executable integration. This is
+    /// a warning inventory, not an allowlist; ordinary and unknown arguments
+    /// remain allowed and silent.
     ///
     /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
     /// isolation; only use in environments where the container itself provides
@@ -9664,6 +9681,19 @@ impl CodexCliConfig {
     /// sequences. Original indices keep warning paths stable for operators.
     pub fn effective_extra_args(&self) -> impl Iterator<Item = (usize, &str)> {
         effective_codex_cli_extra_args(&self.extra_args)
+    }
+
+    /// Return the first operator argument that would replace the canonical
+    /// recovery working directory.
+    pub fn recovery_workspace_override_arg(&self) -> Option<(usize, &str)> {
+        self.effective_extra_args()
+            .take_while(|(_, arg)| *arg != "--")
+            .find(|(_, arg)| {
+                *arg == "--cd"
+                    || arg.starts_with("--cd=")
+                    || *arg == "-C"
+                    || (arg.starts_with("-C") && arg.len() > 2)
+            })
     }
 }
 
@@ -9746,8 +9776,9 @@ const RISKY_CODEX_CLI_FLAGS: &[RiskyCodexCliFlag] = &[
         value: RiskyCodexCliArgValue::AnyValue,
         effect: "add writable directories alongside the selected workspace",
     },
-    // ZeroClaw validates the tool's working_directory before spawning Codex;
-    // this flag can replace that validated root inside the child process.
+    // The recovery adapter rejects this selector because the dedicated,
+    // canonical recovery source must remain the only Codex working root. Keep
+    // the warning too so operators see the conflict during config diagnosis.
     RiskyCodexCliFlag {
         spellings: &["--cd", "-C"],
         display: "--cd / -C",
@@ -9935,6 +9966,8 @@ impl Default for CodexCliConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            executable_path: None,
+            recovery_source_workspace: None,
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
@@ -42111,6 +42144,66 @@ group_policy = "ignore"
                 (3, "danger-full-access"),
                 (4, "--skip-git-repo-check"),
             ]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_recovery_source_is_optional_and_deserializes_from_operator_config() {
+        let default_config: CodexCliConfig = toml::from_str("").expect("default Codex config");
+        assert!(default_config.recovery_source_workspace.is_none());
+
+        let configured: CodexCliConfig = toml::from_str(
+            r#"recovery_source_workspace = "/srv/zeroclaw/source"
+"#,
+        )
+        .expect("configured Codex recovery source");
+        assert_eq!(
+            configured.recovery_source_workspace,
+            Some(PathBuf::from("/srv/zeroclaw/source"))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_executable_path_is_optional_and_deserializes_from_operator_config() {
+        let default_config: CodexCliConfig = toml::from_str("").expect("default Codex config");
+        assert!(default_config.executable_path.is_none());
+
+        let configured: CodexCliConfig = toml::from_str(
+            r#"executable_path = "/opt/codex/bin/codex"
+"#,
+        )
+        .expect("configured Codex executable path");
+        assert_eq!(
+            configured.executable_path,
+            Some(PathBuf::from("/opt/codex/bin/codex"))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_recovery_workspace_override_detection_stops_at_terminator() {
+        for args in [
+            &["--cd", "/tmp"][..],
+            &["--cd=/tmp"][..],
+            &["-C", "/tmp"][..],
+            &["-C/tmp"][..],
+        ] {
+            let config = CodexCliConfig {
+                extra_args: owned_codex_args(args),
+                ..CodexCliConfig::default()
+            };
+            assert!(
+                config.recovery_workspace_override_arg().is_some(),
+                "working-directory selector should be rejected: {args:?}"
+            );
+        }
+
+        let after_terminator = CodexCliConfig {
+            extra_args: owned_codex_args(&["--", "--cd", "/tmp"]),
+            ..CodexCliConfig::default()
+        };
+        assert!(
+            after_terminator.recovery_workspace_override_arg().is_none(),
+            "arguments after -- are prompt data rather than Codex options"
         );
     }
 

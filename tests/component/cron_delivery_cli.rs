@@ -348,6 +348,7 @@ fn seed_declarative_job(config_dir: &Path) {
         prompt: None,
         enabled: true,
         model: None,
+        timeout_secs: None,
         allowed_tools: None,
         uses_memory: true,
         session_target: None,

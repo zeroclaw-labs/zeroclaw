@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    ProgressEvent, RoomCreationOptions, SendMessage,
+    ProgressEvent, RoomCreationOptions, SendMessage, ToolProgressEvent,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -430,6 +430,21 @@ impl Channel for PacedChannel {
     ) -> Result<()> {
         self.inner
             .update_draft_lifecycle(recipient, message_id, event)
+            .await
+    }
+
+    fn supports_typed_tool_progress(&self) -> bool {
+        self.inner.supports_typed_tool_progress()
+    }
+
+    async fn update_draft_tool_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        event: ToolProgressEvent,
+    ) -> Result<()> {
+        self.inner
+            .update_draft_tool_progress(recipient, message_id, event)
             .await
     }
 

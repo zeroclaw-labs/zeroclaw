@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
+
+static GIT_OPERATIONS_DESCRIPTION: OnceLock<String> = OnceLock::new();
 
 /// Git operations tool for structured repository management.
 /// Provides safe, parsed git operations with JSON output.
@@ -55,7 +57,7 @@ impl GitOperationsTool {
     fn requires_write_access(&self, operation: &str) -> bool {
         matches!(
             operation,
-            "commit" | "add" | "checkout" | "stash" | "reset" | "revert" | "worktree"
+            "commit" | "add" | "checkout" | "push" | "stash" | "reset" | "revert" | "worktree"
         )
     }
 
@@ -618,6 +620,86 @@ impl GitOperationsTool {
         }
     }
 
+    async fn git_push(
+        &self,
+        args: serde_json::Value,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<ToolResult> {
+        let remote = args.get("remote").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                "tool-git-operations-push-missing-remote",
+            ))
+        })?;
+        let branch = args.get("branch").and_then(|v| v.as_str()).ok_or_else(|| {
+            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                "tool-git-operations-push-missing-branch",
+            ))
+        })?;
+
+        let remote_is_safe = !remote.is_empty()
+            && !remote.starts_with('-')
+            && remote
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !remote_is_safe {
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-git-operations-push-invalid-remote"
+            ));
+        }
+
+        let branch_args = self.sanitize_git_args(branch)?;
+        if branch_args.len() != 1 || branch_args[0].starts_with('-') {
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-git-operations-push-invalid-branch"
+            ));
+        }
+        self.run_git_command(&["check-ref-format", "--branch", branch], working_dir)
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                    "tool-git-operations-push-invalid-branch",
+                ))
+            })?;
+
+        // `allowed_commands` remains the canonical operator-controlled source
+        // for network-capable Git execution. This keeps the structured push
+        // closed when shell Git is not explicitly allowed by policy.
+        let policy_command = format!("git push -- {remote} {branch}");
+        if let Err(error) = self
+            .security
+            .validate_command_execution(&policy_command, false)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
+        match self
+            .run_git_command(&["push", "--", remote, branch], working_dir)
+            .await
+        {
+            Ok(_) => Ok(ToolResult {
+                success: true,
+                output: crate::i18n::get_required_tool_string_with_args(
+                    "tool-git-operations-push-success",
+                    &[("branch", branch), ("remote", remote)],
+                )
+                .into(),
+                error: None,
+            }),
+            Err(error) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_tool_string_with_args(
+                    "tool-git-operations-push-error",
+                    &[("error", &error.to_string())],
+                )),
+            }),
+        }
+    }
+
     async fn git_stash(
         &self,
         args: serde_json::Value,
@@ -859,7 +941,9 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        GIT_OPERATIONS_DESCRIPTION
+            .get_or_init(|| crate::i18n::get_required_tool_string("tool-git-operations"))
+            .as_str()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -868,7 +952,7 @@ impl Tool for GitOperationsTool {
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash", "worktree"],
+                    "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "push", "stash", "worktree"],
                     "description": "Git operation to perform"
                 },
                 "subcommand": {
@@ -886,7 +970,11 @@ impl Tool for GitOperationsTool {
                 },
                 "branch": {
                     "type": "string",
-                    "description": "Branch name (for 'checkout' operation or 'worktree add' subcommand)"
+                    "description": "Branch name (for 'checkout' or 'push' operation, or 'worktree add' subcommand)"
+                },
+                "remote": {
+                    "type": "string",
+                    "description": "Configured Git remote name (required for 'push'; URL remotes are rejected)"
                 },
                 "worktree_path": {
                     "type": "string",
@@ -1026,6 +1114,7 @@ impl Tool for GitOperationsTool {
             "commit" => self.git_commit(args, &working_dir).await,
             "add" => self.git_add(args, &working_dir).await,
             "checkout" => self.git_checkout(args, &working_dir).await,
+            "push" => self.git_push(args, &working_dir).await,
             "stash" => self.git_stash(args, &working_dir).await,
             "worktree" => self.git_worktree(args, &working_dir).await,
             _ => Ok(ToolResult {
@@ -1219,6 +1308,7 @@ mod tests {
         assert!(tool.requires_write_access("commit"));
         assert!(tool.requires_write_access("add"));
         assert!(tool.requires_write_access("checkout"));
+        assert!(tool.requires_write_access("push"));
         assert!(tool.requires_write_access("stash"));
         assert!(tool.requires_write_access("worktree"));
 
@@ -1365,7 +1455,7 @@ mod tests {
 
         let tool = test_tool(tmp.path());
 
-        let result = tool.execute(json!({"operation": "push"})).await.unwrap();
+        let result = tool.execute(json!({"operation": "fetch"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result
@@ -1373,6 +1463,114 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Unknown operation")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_is_closed_when_policy_requires_approval() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        let tool = test_tool(tmp.path());
+
+        let result = tool
+            .execute(json!({
+                "operation": "push",
+                "remote": "origin",
+                "branch": "main"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
+    }
+
+    #[tokio::test]
+    async fn push_rejects_url_remote() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        let tool = test_tool(tmp.path());
+
+        let error = tool
+            .execute(json!({
+                "operation": "push",
+                "remote": "https://example.invalid/repo.git",
+                "branch": "main"
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Invalid remote name"));
+    }
+
+    #[tokio::test]
+    async fn push_sends_named_branch_to_configured_remote() {
+        let source = TempDir::new().unwrap();
+        let remote = TempDir::new().unwrap();
+        git_init_no_sign(source.path(), &[]);
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        std::fs::write(source.path().join("README.md"), "hello\n").unwrap();
+        for args in [
+            &["add", "README.md"][..],
+            &["commit", "-m", "initial"][..],
+            &["branch", "-M", "main"][..],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(source.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        let output = std::process::Command::new("git")
+            .args(["remote", "add", "origin", remote.path().to_str().unwrap()])
+            .current_dir(source.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: source.path().to_path_buf(),
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, source.path().to_path_buf());
+        let result = tool
+            .execute(json!({
+                "operation": "push",
+                "remote": "origin",
+                "branch": "main"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let remote_head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let source_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(source.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            remote_head,
+            String::from_utf8_lossy(&source_head.stdout).trim()
         );
     }
 
