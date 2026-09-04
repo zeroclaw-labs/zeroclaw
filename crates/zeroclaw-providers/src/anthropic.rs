@@ -2029,9 +2029,12 @@ impl AnthropicModelProvider {
         temperature: Option<f64>,
         model: &str,
     ) -> ResolvedRequestTuning {
-        use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
+        use crate::claude_models::{
+            ClaudeProviderSlot, ClaudeThinkingShape, thinking_capabilities,
+        };
 
-        if claude_thinking_shape(model) == ClaudeThinkingShape::FixedBudget {
+        let capabilities = thinking_capabilities(ClaudeProviderSlot::Anthropic, model);
+        if capabilities.shape == ClaudeThinkingShape::FixedBudget {
             let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
                 // No budget to spend, so the request carries no thinking at
                 // all and the caller's temperature stands.
@@ -2064,7 +2067,20 @@ impl AnthropicModelProvider {
             };
         }
 
-        let effort = thinking.and_then(|params| params.effort);
+        let requested_effort = thinking.and_then(|params| params.effort);
+        let effort = requested_effort.and_then(|effort| capabilities.fit_effort(effort));
+        if requested_effort != effort {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "requested": requested_effort.map(|effort| effort.as_str()),
+                        "sent": effort.map(|effort| effort.as_str()),
+                    })),
+                "reasoning depth fitted to what this model generation accepts"
+            );
+        }
         if thinking.and_then(|params| params.budget_tokens).is_some() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -2097,11 +2113,24 @@ impl AnthropicModelProvider {
         }
         // The request's own choice wins over the alias setting, so a session
         // control can narrow or widen what the operator configured. A choice
-        // that matches the API default sends nothing.
-        let display = thinking
+        // the generation does not take is dropped, and a choice that matches
+        // the API default sends nothing.
+        let requested_display = thinking
             .and_then(|params| params.display)
-            .or_else(|| self.thinking_display.map(Into::into))
-            .filter(|display| display.wire_value().is_some());
+            .or_else(|| self.thinking_display.map(Into::into));
+        let display = requested_display.filter(|display| capabilities.supports_display(*display));
+        if requested_display.is_some() && display.is_none() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "requested": requested_display.map(|display| display.as_str()),
+                    })),
+                "thinking display dropped; this model generation does not take it"
+            );
+        }
+        let display = display.filter(|display| display.wire_value().is_some());
         // Asking for the object turns thinking on for the generations that
         // default it off, so only send it when a depth was chosen or the
         // caller asked to see the reasoning.
@@ -4463,6 +4492,65 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("a chosen depth sends the object");
         assert_eq!(thinking.display, Some("summarized"));
         assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn resolve_thinking_drops_the_display_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
+        let thinking = tuning
+            .thinking
+            .as_ref()
+            .expect("the chosen depth still sends the object");
+        assert_eq!(thinking.kind, "adaptive");
+        assert_eq!(
+            thinking.display, None,
+            "this generation takes no display, whichever side asked"
+        );
+        assert_eq!(tuning.display, None);
+        assert_eq!(
+            tuning.output_config.as_ref().map(|output| output.effort),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn progress_notes_go_only_to_the_families_that_write_them() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        assert!(
+            tuning.thinking.is_none(),
+            "a dropped display leaves nothing to send"
+        );
+        assert_eq!(tuning.display, None);
+
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        assert_eq!(
+            tuning
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.display),
+            Some("updates")
+        );
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Updates));
     }
 
     #[test]

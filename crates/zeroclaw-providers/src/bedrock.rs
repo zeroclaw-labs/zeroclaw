@@ -955,9 +955,12 @@ impl BedrockModelProvider {
         temperature: Option<f64>,
         model: &str,
     ) -> (Option<f64>, Option<serde_json::Value>, u32) {
-        use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
+        use crate::claude_models::{
+            ClaudeProviderSlot, ClaudeThinkingShape, thinking_capabilities,
+        };
 
-        if claude_thinking_shape(model) == ClaudeThinkingShape::FixedBudget {
+        let capabilities = thinking_capabilities(ClaudeProviderSlot::Bedrock, model);
+        if capabilities.shape == ClaudeThinkingShape::FixedBudget {
             let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
                 return (temperature, None, self.max_tokens);
             };
@@ -995,7 +998,21 @@ impl BedrockModelProvider {
                 "max_tokens is at the baseline; reasoning counts toward it on this model generation, so raise it on the provider entry"
             );
         }
-        let fields = thinking.and_then(|params| params.effort).map(|effort| {
+        let requested_effort = thinking.and_then(|params| params.effort);
+        let effort = requested_effort.and_then(|effort| capabilities.fit_effort(effort));
+        if requested_effort != effort {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "model": model,
+                        "requested": requested_effort.map(|effort| effort.as_str()),
+                        "sent": effort.map(|effort| effort.as_str()),
+                    })),
+                "reasoning depth fitted to what this model generation accepts"
+            );
+        }
+        let fields = effort.map(|effort| {
             serde_json::json!({
                 "thinking": { "type": "adaptive" },
                 "output_config": { "effort": effort.as_str() }
@@ -2350,6 +2367,25 @@ mod tests {
             }))
         );
         assert_eq!(max_tokens, 10_001);
+    }
+
+    #[test]
+    fn bedrock_resolve_thinking_keeps_supported_depths_on_the_4_6_generation() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let provider = BedrockModelProvider::builder("test").build();
+        let params = NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::Max),
+            display: None,
+        };
+        let (_, fields, _) =
+            provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-6-v1");
+        assert_eq!(
+            fields
+                .as_ref()
+                .and_then(|fields| fields["output_config"]["effort"].as_str()),
+            Some("max")
+        );
     }
 
     #[test]

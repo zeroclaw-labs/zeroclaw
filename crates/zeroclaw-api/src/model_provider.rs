@@ -12,8 +12,9 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
 /// How much reasoning a model should spend on a request, for model families
-/// that take a depth setting rather than a token budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// that take a depth setting rather than a token budget. Variants are declared
+/// in ascending depth, so they compare by depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ThinkingEffort {
     Low,
     High,
