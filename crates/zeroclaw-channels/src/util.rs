@@ -1,5 +1,5 @@
 #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
-use zeroclaw_api::channel::ProgressEvent;
+use zeroclaw_api::channel::{ProgressEvent, ToolActivity, ToolProgressEvent, ToolProgressPhase};
 
 #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
@@ -16,6 +16,32 @@ pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static st
 #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string(lifecycle_progress_fluent_key(event))
+}
+
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
+fn tool_activity_fluent_key(activity: ToolActivity) -> &'static str {
+    match activity {
+        ToolActivity::Codex => "channel-runtime-progress-tool-activity-codex",
+        ToolActivity::Browser => "channel-runtime-progress-tool-activity-browser",
+        ToolActivity::Web => "channel-runtime-progress-tool-activity-web",
+        ToolActivity::Files => "channel-runtime-progress-tool-activity-files",
+        ToolActivity::CommandLine => "channel-runtime-progress-tool-activity-command-line",
+        ToolActivity::Memory => "channel-runtime-progress-tool-activity-memory",
+        ToolActivity::VersionControl => "channel-runtime-progress-tool-activity-version-control",
+        ToolActivity::Other => "channel-runtime-progress-tool-activity-other",
+    }
+}
+
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
+pub(crate) fn localized_tool_progress(event: ToolProgressEvent) -> String {
+    let activity =
+        zeroclaw_runtime::i18n::get_required_cli_string(tool_activity_fluent_key(event.activity));
+    let key = match event.phase {
+        ToolProgressPhase::Running => "channel-runtime-progress-tool-running",
+        ToolProgressPhase::Succeeded => "channel-runtime-progress-tool-succeeded",
+        ToolProgressPhase::Failed => "channel-runtime-progress-tool-failed",
+    };
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, &[("activity", &activity)])
 }
 
 /// Truncate a string to `max_chars` Unicode characters, appending "..." if truncated.
