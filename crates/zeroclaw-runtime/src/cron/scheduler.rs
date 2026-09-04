@@ -51,6 +51,9 @@ const CRON_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 // claim, and claim-token fencing prevents a stale write if ownership is later
 // reset during process-startup recovery.
 const CRON_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
+// Bounded admission for background SQLite persistence workers so repeatedly
+// stalled persistence writes or reloads cannot consume unbounded blocking threads.
+const MAX_PERSISTENCE_WORKERS: usize = 16;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -103,6 +106,11 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_BEST_EFFORT_WORKER_POOL: Arc<tokio::sync::Semaphore>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PERSISTENCE_WORKER_POOL: Arc<tokio::sync::Semaphore>;
 }
 
 #[cfg(test)]
@@ -166,6 +174,23 @@ fn best_effort_worker_pool() -> Arc<tokio::sync::Semaphore> {
             POOL.get_or_init(|| {
                 Arc::new(tokio::sync::Semaphore::new(MAX_BEST_EFFORT_PURGE_WORKERS))
             }),
+        )
+    }
+}
+
+fn persistence_worker_pool() -> Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    {
+        TEST_PERSISTENCE_WORKER_POOL
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::new(tokio::sync::Semaphore::new(MAX_PERSISTENCE_WORKERS)))
+    }
+
+    #[cfg(not(test))]
+    {
+        static POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        Arc::clone(
+            POOL.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PERSISTENCE_WORKERS))),
         )
     }
 }
@@ -300,7 +325,10 @@ impl std::fmt::Display for OwnedSupervisionError {
 }
 
 enum OwnedWorkerOutcome<T> {
-    Completed(T),
+    Completed {
+        value: T,
+        completed_at: std::time::Instant,
+    },
     CancellationAcknowledged,
     RuntimeBuild(std::io::Error),
 }
@@ -455,7 +483,10 @@ where
                     () = worker_cancellation.cancelled() => {
                         OwnedWorkerOutcome::CancellationAcknowledged
                     },
-                    value = operation => OwnedWorkerOutcome::Completed(value),
+                    value = operation => OwnedWorkerOutcome::Completed {
+                        value,
+                        completed_at: std::time::Instant::now(),
+                    },
                 }
             });
             // Sending the acknowledgement only after the operation future is
@@ -463,13 +494,37 @@ where
             // the durable caller must not release its claim while runtime-owned
             // provider/tool/delivery work can still make progress.
             drop(runtime);
+            let outcome = match outcome {
+                OwnedWorkerOutcome::Completed { value, .. } => {
+                    // Record completion timestamp after the private runtime is dropped
+                    // so teardown delays cannot disguise post-deadline execution as on-time.
+                    OwnedWorkerOutcome::Completed {
+                        value,
+                        completed_at: std::time::Instant::now(),
+                    }
+                }
+                other => other,
+            };
             let _ = tx.send(outcome);
         })
         .map_err(OwnedSupervisionError::ThreadSpawn)?;
 
+    let deadline_instant = std::time::Instant::now() + deadline;
     let deadline_elapsed = tokio::select! {
         biased;
-        result = &mut rx => return owned_worker_result(result, false),
+        result = &mut rx => {
+            let elapsed = match &result {
+                Ok(OwnedWorkerOutcome::Completed { completed_at, .. }) => {
+                    *completed_at >= deadline_instant
+                }
+                _ => std::time::Instant::now() >= deadline_instant,
+            };
+            if elapsed {
+                cancellation.cancel();
+                return owned_worker_result(result, true);
+            }
+            return owned_worker_result(result, false);
+        }
         () = time::sleep(deadline) => true,
     };
     debug_assert!(deadline_elapsed);
@@ -482,10 +537,10 @@ fn owned_worker_result<T>(
     deadline_elapsed: bool,
 ) -> Result<T, OwnedSupervisionError> {
     match result {
-        Ok(OwnedWorkerOutcome::Completed(_)) if deadline_elapsed => {
+        Ok(OwnedWorkerOutcome::Completed { .. }) if deadline_elapsed => {
             Err(OwnedSupervisionError::DeadlineExceeded)
         }
-        Ok(OwnedWorkerOutcome::Completed(value)) => Ok(value),
+        Ok(OwnedWorkerOutcome::Completed { value, .. }) => Ok(value),
         Ok(OwnedWorkerOutcome::CancellationAcknowledged) if deadline_elapsed => {
             Err(OwnedSupervisionError::DeadlineExceeded)
         }
@@ -1758,7 +1813,24 @@ async fn persist_claimed_job_result(
     let job_state_at = Utc::now();
     #[cfg(test)]
     let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
+    let permit = match persistence_worker_pool().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id})),
+                "Cron persistence pool at capacity; retaining the fenced claim for recovery"
+            );
+            return ClaimedJobResult {
+                success: false,
+                output: crate::i18n::get_required_cli_string("cron-result-persistence-pending"),
+            };
+        }
+    };
     let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         #[cfg(test)]
         if let Some(duration) = persist_block {
             std::thread::sleep(duration);
@@ -4100,6 +4172,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn supervise_owned_rejects_completion_when_caller_resumes_after_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let tracker = OwnedWorkerTracker::for_config(&config);
+
+        // Case 1: The worker completes with a successful value after the deadline
+        // while the caller runtime is stalled by another synchronous task.
+        let supervisor = zeroclaw_spawn::spawn!(async move {
+            supervise_owned(
+                Duration::from_millis(40),
+                tracker,
+                Box::new(|_cancellation| {
+                    Box::pin(async {
+                        // The worker sleeps for 80ms before completing.
+                        // Because deadline is 40ms, completed_at >= deadline_instant.
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        42_u8
+                    })
+                }),
+            )
+            .await
+        });
+
+        // Yield to allow supervisor to spawn its private worker thread and enter select!.
+        tokio::task::yield_now().await;
+        // Stall the caller runtime thread past the deadline while the private worker completes.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let outcome = supervisor.await.expect("join supervisor");
+        assert!(
+            matches!(outcome, Err(OwnedSupervisionError::DeadlineExceeded)),
+            "completion after deadline when caller resumes late must remain DeadlineExceeded: {outcome:?}"
+        );
+
+        // Case 2: The worker completes with an error after the deadline.
+        // It must NOT return Ok(Err(...)), which would enter the retryable ordinary-failure path.
+        let tracker2 = OwnedWorkerTracker::for_config(&config);
+        let supervisor2 = zeroclaw_spawn::spawn!(async move {
+            supervise_owned(
+                Duration::from_millis(40),
+                tracker2,
+                Box::new(|_cancellation| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        Result::<(), String>::Err("ordinary provider failure".into())
+                    })
+                }),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(150));
+
+        let outcome2 = supervisor2.await.expect("join supervisor");
+        assert!(
+            matches!(outcome2, Err(OwnedSupervisionError::DeadlineExceeded)),
+            "error completion after deadline when caller resumes late must not enter ordinary-failure path: {outcome2:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervise_owned_cancels_dropped_callers_and_tracks_worker_until_exit() {
         let tmp = TempDir::new().unwrap();
@@ -4933,6 +5067,69 @@ mod tests {
             crate::cron::store::current_claim_for_test(&config, &job.id).is_err(),
             "the original owner releases atomically when its commit eventually finishes"
         );
+    }
+
+    #[tokio::test]
+    async fn persist_claimed_job_result_bounds_permanently_stalled_worker_admission() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let claim = claim_job_with_token(&config, &job.id, started)
+            .unwrap()
+            .expect("worker claims the job");
+
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        TEST_PERSISTENCE_WORKER_POOL
+            .scope(Arc::clone(&pool), async {
+                let first = TEST_PERSIST_TIMEOUT
+                    .scope(
+                        Duration::from_millis(25),
+                        TEST_PERSIST_BLOCK.scope(
+                            Duration::from_millis(300),
+                            persist_claimed_job_result(
+                                &config,
+                                &job,
+                                true,
+                                "stalled result 1",
+                                started,
+                                started + ChronoDuration::milliseconds(10),
+                                &claim,
+                            ),
+                        ),
+                    )
+                    .await;
+                assert!(!first.success);
+                assert_eq!(
+                    first.output,
+                    crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+                );
+
+                // The first worker is still sleeping inside its blocking task and holds the 1 permit.
+                // A second call must be immediately rejected by admission capacity without starting
+                // an untracked blocking thread.
+                let second = persist_claimed_job_result(
+                    &config,
+                    &job,
+                    true,
+                    "stalled result 2",
+                    started,
+                    started + ChronoDuration::milliseconds(10),
+                    &claim,
+                )
+                .await;
+                assert!(!second.success);
+                assert_eq!(
+                    second.output,
+                    crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+                );
+                assert_eq!(
+                    pool.available_permits(),
+                    0,
+                    "the stalled worker must retain its persistence pool permit until finished"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

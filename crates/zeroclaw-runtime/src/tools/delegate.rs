@@ -1074,11 +1074,19 @@ impl Tool for DelegateTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
-         (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
-         Supports background execution (returns a task_id immediately), batched background waits \
-         (await_sessions), and parallel execution (runs multiple agents concurrently)."
+        if self.cancellation.is_run_owned() {
+            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
+             (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
+             prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
+             Background execution (background=true) is unavailable for supervised cron runs; \
+             use synchronous or parallel delegation instead."
+        } else {
+            "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
+             (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
+             prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
+             Supports background execution (returns a task_id immediately), batched background waits \
+             (await_sessions), and parallel execution (runs multiple agents concurrently)."
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1101,6 +1109,16 @@ impl Tool for DelegateTool {
         };
         agent_names.sort_unstable();
         agent_names.dedup();
+        let background_desc = if self.cancellation.is_run_owned() {
+            "Unavailable for supervised cron runs (must use synchronous or parallel delegation). \
+             In other contexts, when true, the sub-agent runs in a background tokio task and \
+             returns a task_id immediately. Results are stored to \
+             workspace/delegate_results/{task_id}.json."
+        } else {
+            "When true, the sub-agent runs in a background tokio task and \
+             returns a task_id immediately. Results are stored to \
+             workspace/delegate_results/{task_id}.json."
+        };
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -1137,9 +1155,7 @@ impl Tool for DelegateTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "When true, the sub-agent runs in a background tokio task and \
-                                    returns a task_id immediately. Results are stored to \
-                                    workspace/delegate_results/{task_id}.json.",
+                    "description": background_desc,
                     "default": false
                 },
                 "parallel": {
@@ -4427,6 +4443,27 @@ mod tests {
             requests.load(std::sync::atomic::Ordering::SeqCst),
             settled_requests,
             "cancelled parallel delegates must not resume provider work"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_run_cancellation_aligns_description_and_schema() {
+        let (_server, _requests) = start_hanging_chat_server().await;
+        let fixture = factory_cancellation_fixture(_server.uri.clone());
+        let desc = fixture.tool.description();
+        assert!(
+            desc.contains(
+                "Background execution (background=true) is unavailable for supervised cron runs"
+            ),
+            "run-owned tool description must disclose background unavailability: {desc}"
+        );
+        let schema = fixture.tool.parameters_schema();
+        let bg_desc = schema["properties"]["background"]["description"]
+            .as_str()
+            .expect("background description must be present");
+        assert!(
+            bg_desc.contains("Unavailable for supervised cron runs"),
+            "run-owned schema must disclose background unavailability: {bg_desc}"
         );
     }
 
