@@ -12530,10 +12530,26 @@ fn hydrate_session_transcript(
     if msgs.is_empty() {
         return None;
     }
-    let durable_crumb = store
-        .get_session_trim_breadcrumb(session_key)
-        .ok()
-        .flatten();
+    // A transient read failure must not silently collapse into "no record"
+    // and fall through to legacy text inference: that would let a
+    // user-controlled first message that happens to collide with the
+    // breadcrumb text manufacture ownership the backend never recorded.
+    // Fail closed by treating an unreadable flag the same as an explicit
+    // `false`.
+    let durable_crumb = match store.get_session_trim_breadcrumb(session_key) {
+        Ok(v) => v,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                &format!(
+                    "Failed to read trim breadcrumb flag for {session_key}; treating as false"
+                )
+            );
+            Some(false)
+        }
+    };
     // Structural check made BEFORE the cap below can remove it: whether the
     // loaded transcript's leading message is physically the synthetic
     // marker the durable flag says is present.
@@ -12561,12 +12577,31 @@ fn hydrate_session_transcript(
         orphan_closed = true;
     }
 
+    // Legacy inference (no recorded flag) must reflect the transcript
+    // actually returned to the caller, not the pre-cap snapshot: if the cap
+    // drained the marker off the front, the post-cap transcript no longer
+    // carries it and ownership must not be inferred from a message that is
+    // no longer there.
+    let marker_present_post_cap = if truncated {
+        msgs.first().is_some_and(|first| {
+            first.role == "user"
+                && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(&first.content)
+        })
+    } else {
+        marker_present_pre_drain
+    };
+
     let crumb_present = match durable_crumb {
         Some(true) => !(truncated && marker_present_pre_drain),
         Some(false) => false,
-        None => marker_present_pre_drain,
+        None => marker_present_post_cap,
     };
-    if durable_crumb != Some(crumb_present) {
+    // Truncation itself must trigger persistence even when ownership is
+    // unchanged: the in-memory transcript returned to the caller no longer
+    // matches the durable one, and skipping the write here means a later
+    // restart reloads the untruncated transcript and repeats this
+    // reconciliation instead of converging.
+    if truncated || durable_crumb != Some(crumb_present) {
         let persist_result = if truncated {
             store.replace_conversation_state(session_key, &msgs, crumb_present)
         } else {
@@ -17676,6 +17711,146 @@ api_key = "anthropic-key"
             store.get_session_trim_breadcrumb(&sender).unwrap(),
             Some(true),
             "an already-correct flag must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn hydration_persists_the_cap_even_when_the_explicit_flag_is_already_false() {
+        // Durable flag is explicitly false and the transcript exceeds
+        // MAX_CHANNEL_HISTORY. Ownership doesn't change, but the cap must
+        // still be written back: otherwise the durable transcript stays
+        // over the cap and a later restart reloads the untruncated state.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_capped_false".to_string();
+        for i in 0..(MAX_CHANNEL_HISTORY + 4) {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(&sender, &msg).unwrap();
+        }
+        store.set_session_trim_breadcrumb(&sender, false).unwrap();
+
+        let hydrated = hydrate_session_transcript(&store, &sender).expect("session must hydrate");
+
+        assert!(!hydrated.crumb_present, "the flag stays false");
+        assert_eq!(
+            hydrated.messages.len(),
+            MAX_CHANNEL_HISTORY,
+            "the returned transcript must be capped"
+        );
+        assert_eq!(
+            store.load(&sender).len(),
+            MAX_CHANNEL_HISTORY,
+            "the durable transcript must be capped too, even though ownership \
+             didn't change, so a restart doesn't reload the uncapped state"
+        );
+    }
+
+    #[test]
+    fn hydration_drops_legacy_marker_ownership_when_the_cap_removes_it() {
+        // No recorded flag (legacy session) and the leading synthetic
+        // marker is old enough that the cap drains it off. Ownership must
+        // be inferred from the transcript actually returned, not from a
+        // pre-cap snapshot that no longer matches what's kept.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_legacy_capped".to_string();
+        store
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        for i in 0..MAX_CHANNEL_HISTORY {
+            let msg = if i % 2 == 0 {
+                ChatMessage::user(format!("turn {i}"))
+            } else {
+                ChatMessage::assistant(format!("reply {i}"))
+            };
+            store.append(&sender, &msg).unwrap();
+        }
+        // No set_session_trim_breadcrumb call: this session never recorded
+        // a flag, matching a pre-upgrade transcript.
+
+        let hydrated = hydrate_session_transcript(&store, &sender).expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "the marker was drained by the cap, so legacy inference must not claim ownership"
+        );
+        assert_eq!(
+            store.get_session_trim_breadcrumb(&sender).unwrap(),
+            Some(false),
+            "the inferred flag must be persisted"
+        );
+        assert_eq!(
+            store.load(&sender).len(),
+            MAX_CHANNEL_HISTORY,
+            "the durable transcript must be capped together with the flag"
+        );
+    }
+
+    #[test]
+    fn hydration_fails_closed_when_the_breadcrumb_flag_is_unreadable() {
+        // A backend read error must not be treated the same as "no record":
+        // that would fall through to legacy text inference and let a
+        // colliding first user message manufacture ownership the backend
+        // never actually recorded.
+        struct FailingBreadcrumbStore(zeroclaw_infra::session_store::SessionStore);
+
+        impl zeroclaw_infra::session_backend::SessionBackend for FailingBreadcrumbStore {
+            fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+                self.0.load(session_key)
+            }
+            fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+                self.0.append(session_key, message)
+            }
+            fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+                self.0.remove_last(session_key)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                self.0.list_sessions()
+            }
+            fn get_session_trim_breadcrumb(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Option<bool>> {
+                Err(std::io::Error::other("simulated read failure"))
+            }
+            fn set_session_trim_breadcrumb(
+                &self,
+                session_key: &str,
+                present: bool,
+            ) -> std::io::Result<()> {
+                self.0.set_session_trim_breadcrumb(session_key, present)
+            }
+            fn replace_conversation_state(
+                &self,
+                session_key: &str,
+                messages: &[ChatMessage],
+                crumb_present: bool,
+            ) -> std::io::Result<()> {
+                self.0
+                    .replace_conversation_state(session_key, messages, crumb_present)
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+        let sender = "chan_unreadable_flag".to_string();
+        inner
+            .append(&sender, &ChatMessage::user(breadcrumb_text()))
+            .unwrap();
+        inner
+            .append(&sender, &ChatMessage::assistant("ok"))
+            .unwrap();
+        let store = FailingBreadcrumbStore(inner);
+
+        let hydrated = hydrate_session_transcript(&store, &sender).expect("session must hydrate");
+
+        assert!(
+            !hydrated.crumb_present,
+            "an unreadable flag must fail closed instead of falling through to a text guess"
         );
     }
 
