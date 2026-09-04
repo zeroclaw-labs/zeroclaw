@@ -2082,7 +2082,10 @@ impl Chat {
         state.info_message = Some(waiting);
         state.mark_dirty_full();
 
-        match rpc.session_configure(&state.session_id, overrides).await {
+        match rpc
+            .session_configure(&state.session_id, overrides, &[])
+            .await
+        {
             Ok(result) => {
                 let model = result.overrides.model.unwrap_or_default();
                 let model_provider = result.overrides.model_provider.unwrap_or_default();

@@ -112,6 +112,7 @@ pub mod method {
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CONFIGURE: &str = "session/configure";
+    pub const SESSION_THINKING_OPTIONS: &str = "session/thinking-options";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
@@ -519,6 +520,39 @@ impl fmt::Display for DaemonInitializeTimeout {
 }
 
 impl std::error::Error for DaemonInitializeTimeout {}
+
+/// A JSON-RPC error the daemon answered a call with. Carried as the typed
+/// source of the `anyhow` chain (its display text is the same `RPC <method>:
+/// <message> (<code>)` line as before) so callers can branch on the code, such
+/// as an older daemon answering METHOD_NOT_FOUND for a method it lacks, and
+/// quote the daemon's message verbatim instead of the wrapped line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonRpcError {
+    pub method: String,
+    pub code: i32,
+    pub message: String,
+}
+
+impl DaemonRpcError {
+    /// The typed daemon error behind `error`, when the failure was a JSON-RPC
+    /// error rather than a timeout, a transport fault or an undecodable result.
+    pub fn from_anyhow(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+
+    /// The daemon does not implement the method (an older daemon).
+    pub fn is_method_not_found(&self) -> bool {
+        self.code == crate::jsonrpc::error_codes::METHOD_NOT_FOUND
+    }
+}
+
+impl std::fmt::Display for DaemonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RPC {}: {} ({})", self.method, self.message, self.code)
+    }
+}
+
+impl std::error::Error for DaemonRpcError {}
 
 #[derive(Debug)]
 pub(crate) struct InitializeResponse {
@@ -1849,7 +1883,13 @@ impl RpcClient {
                     timeout.as_secs()
                 ))
             })?
-            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+            .map_err(|e| {
+                anyhow::Error::new(DaemonRpcError {
+                    method: method.to_string(),
+                    code: e.code,
+                    message: e.message,
+                })
+            })?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -2366,18 +2406,37 @@ impl RpcClient {
         .await
     }
 
-    /// Apply session-scoped overrides (model, model_provider, temperature) to a
-    /// live session. The daemon applies them immediately and returns the merged
-    /// set. A `model_provider` override triggers a live provider-box rebuild
-    /// daemon-side.
+    /// Apply session-scoped overrides (model, model_provider, temperature,
+    /// thinking level and display) to a live session. The daemon applies them
+    /// immediately and returns the merged set plus the thinking options the
+    /// session offers afterwards. A `model_provider` override triggers a live
+    /// provider-box rebuild daemon-side. `reset` names the thinking overrides
+    /// to drop (`thinking_level` / `thinking_display`); it stays off the wire
+    /// when empty so an older daemon sees exactly the request it knows.
     pub async fn session_configure(
         &self,
         session_id: &str,
         overrides: SessionOverrides,
+        reset: &[&str],
+    ) -> Result<SessionConfigureResult> {
+        let mut params = serde_json::json!({ "session_id": session_id, "overrides": overrides });
+        if !reset.is_empty() {
+            params["reset"] = serde_json::json!(reset);
+        }
+        self.call(method::SESSION_CONFIGURE, params).await
+    }
+
+    /// The thinking levels and displays the session's model offers, with the
+    /// values currently in force and where each comes from. Shares the
+    /// `session/configure` result envelope. An older daemon answers
+    /// METHOD_NOT_FOUND; see [`DaemonRpcError`].
+    pub async fn session_thinking_options(
+        &self,
+        session_id: &str,
     ) -> Result<SessionConfigureResult> {
         self.call(
-            method::SESSION_CONFIGURE,
-            serde_json::json!({ "session_id": session_id, "overrides": overrides }),
+            method::SESSION_THINKING_OPTIONS,
+            serde_json::json!({ "session_id": session_id }),
         )
         .await
     }
@@ -3874,7 +3933,7 @@ pub struct SessionCancelResult {}
 /// Session-scoped overrides mirror of
 /// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
 /// `session/configure`; every field is optional and omitted when `None`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3883,6 +3942,43 @@ pub struct SessionOverrides {
     pub model_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Lowercase thinking level token (`low`, `high`, ...); the daemon
+    /// validates it against the session's model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    /// Lowercase thinking display token (`omitted`, `summarized`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<String>,
+}
+
+impl SessionOverrides {
+    /// An override request carrying only `value` for `control`.
+    pub fn thinking(control: ThinkingControl, value: String) -> Self {
+        let mut overrides = Self::default();
+        match control {
+            ThinkingControl::Level => overrides.thinking_level = Some(value),
+            ThinkingControl::Display => overrides.thinking_display = Some(value),
+        }
+        overrides
+    }
+}
+
+/// Which session thinking override a request targets. The wire token doubles
+/// as the override field name and as the `reset` entry of `session/configure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    Level,
+    Display,
+}
+
+impl ThinkingControl {
+    /// The `reset` token for this control.
+    pub const fn reset_token(self) -> &'static str {
+        match self {
+            Self::Level => "thinking_level",
+            Self::Display => "thinking_display",
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -3894,6 +3990,360 @@ pub struct SessionConfigureResult {
     pub session_id: String,
     #[serde(default)]
     pub overrides: SessionOverrides,
+    /// The thinking options the session offers after the change. Absent from
+    /// daemons that predate the thinking controls, so their result still
+    /// parses.
+    #[serde(default)]
+    pub thinking_options: Option<ThinkingOptionsResult>,
+}
+
+/// Where a thinking value in force comes from. `Unknown` absorbs sources a
+/// newer daemon may add; only `Session` changes TUI behavior (it gates the
+/// picker's reset row).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingSource {
+    Session,
+    Profile,
+    Alias,
+    ModelDefault,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// The `thinking_options` block shared by `session/configure` and
+/// `session/thinking-options`, mirrored down to what the TUI reads (the
+/// daemon also echoes the resolved model_provider and model). Every field
+/// defaults so a partial or older payload parses as "nothing adjustable".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ThinkingOptionsResult {
+    /// Levels the model accepts; empty when nothing is adjustable.
+    #[serde(default)]
+    pub levels: Vec<String>,
+    /// Display choices the model accepts; empty when nothing is adjustable.
+    #[serde(default)]
+    pub displays: Vec<String>,
+    /// Present exactly when `levels` is non-empty.
+    #[serde(default)]
+    pub current_level: Option<String>,
+    #[serde(default)]
+    pub level_source: ThinkingSource,
+    /// Present exactly when `displays` is non-empty.
+    #[serde(default)]
+    pub current_display: Option<String>,
+    #[serde(default)]
+    pub display_source: ThinkingSource,
+}
+
+impl ThinkingOptionsResult {
+    /// The offered values, the value in force and its source for `control`.
+    pub fn control(&self, control: ThinkingControl) -> (&[String], Option<&str>, ThinkingSource) {
+        match control {
+            ThinkingControl::Level => (
+                &self.levels,
+                self.current_level.as_deref(),
+                self.level_source,
+            ),
+            ThinkingControl::Display => (
+                &self.displays,
+                self.current_display.as_deref(),
+                self.display_source,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_thinking_wire_tests {
+    use super::*;
+
+    fn client_with_channel() -> (RpcClient, Arc<RpcOutbound>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        (RpcClient::with_rpc(Arc::clone(&rpc)), rpc, rx)
+    }
+
+    async fn next_request(rx: &mut mpsc::Receiver<String>) -> Value {
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the call should send a request")
+            .expect("the request channel should stay open");
+        serde_json::from_str(&line).expect("the request should be JSON")
+    }
+
+    fn contract_options() -> Value {
+        serde_json::json!({
+            "model_provider": "anthropic.default",
+            "model": "claude-fable-5-1",
+            "levels": ["low", "medium", "high", "xhigh", "max"],
+            "displays": ["omitted", "summarized", "updates"],
+            "current_level": "high",
+            "level_source": "session",
+            "current_display": "summarized",
+            "display_source": "session"
+        })
+    }
+
+    #[test]
+    fn thinking_overrides_serialize_only_when_set() {
+        assert_eq!(
+            serde_json::to_value(SessionOverrides::default()).unwrap(),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(SessionOverrides::thinking(
+                ThinkingControl::Level,
+                "high".into()
+            ))
+            .unwrap(),
+            serde_json::json!({ "thinking_level": "high" })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionOverrides::thinking(
+                ThinkingControl::Display,
+                "summarized".into()
+            ))
+            .unwrap(),
+            serde_json::json!({ "thinking_display": "summarized" })
+        );
+        let combined = SessionOverrides {
+            model: Some("claude-fable-5-1".into()),
+            thinking_level: Some("high".into()),
+            thinking_display: Some("summarized".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(combined).unwrap(),
+            serde_json::json!({
+                "model": "claude-fable-5-1",
+                "thinking_level": "high",
+                "thinking_display": "summarized"
+            })
+        );
+    }
+
+    #[test]
+    fn reset_tokens_match_the_wire_contract() {
+        assert_eq!(ThinkingControl::Level.reset_token(), "thinking_level");
+        assert_eq!(ThinkingControl::Display.reset_token(), "thinking_display");
+    }
+
+    #[tokio::test]
+    async fn session_configure_keeps_reset_off_the_wire_when_empty() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move {
+            client
+                .session_configure(
+                    "sess-1",
+                    SessionOverrides::thinking(ThinkingControl::Level, "high".into()),
+                    &[],
+                )
+                .await
+        });
+
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], method::SESSION_CONFIGURE);
+        assert_eq!(
+            request["params"],
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "thinking_level": "high" }
+            })
+        );
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "thinking_level": "high" }
+            })),
+            None,
+        );
+
+        let result = call.await.unwrap().expect("configure should succeed");
+        assert_eq!(result.overrides.thinking_level.as_deref(), Some("high"));
+        assert!(result.thinking_options.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_configure_sends_the_reset_list_and_parses_echoed_options() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move {
+            client
+                .session_configure(
+                    "sess-1",
+                    SessionOverrides::default(),
+                    &[ThinkingControl::Display.reset_token()],
+                )
+                .await
+        });
+
+        let request = next_request(&mut rx).await;
+        assert_eq!(
+            request["params"],
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {},
+                "reset": ["thinking_display"]
+            })
+        );
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {
+                    "model": "claude-fable-5-1",
+                    "model_provider": "anthropic.default",
+                    "thinking_level": "high"
+                },
+                "thinking_options": contract_options()
+            })),
+            None,
+        );
+
+        let result = call.await.unwrap().expect("configure should succeed");
+        assert_eq!(result.overrides.thinking_display, None);
+        let options = result.thinking_options.expect("options are echoed");
+        assert_eq!(options.current_level.as_deref(), Some("high"));
+        assert_eq!(options.level_source, ThinkingSource::Session);
+    }
+
+    #[tokio::test]
+    async fn session_thinking_options_uses_the_shared_envelope() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move { client.session_thinking_options("sess-1").await });
+
+        let request = next_request(&mut rx).await;
+        assert_eq!(request["method"], method::SESSION_THINKING_OPTIONS);
+        assert_eq!(
+            request["params"],
+            serde_json::json!({ "session_id": "sess-1" })
+        );
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": { "model": "claude-fable-5-1" },
+                "thinking_options": contract_options()
+            })),
+            None,
+        );
+
+        let result = call.await.unwrap().expect("options should load");
+        let options = result.thinking_options.expect("options block present");
+        assert_eq!(options.levels, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(options.displays, ["omitted", "summarized", "updates"]);
+    }
+
+    #[test]
+    fn configure_result_from_an_older_daemon_still_parses() {
+        let result: SessionConfigureResult = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-1",
+            "overrides": { "model": "gpt-5" }
+        }))
+        .expect("pre-thinking result parses");
+
+        assert_eq!(result.overrides.model.as_deref(), Some("gpt-5"));
+        assert_eq!(result.overrides.thinking_level, None);
+        assert_eq!(result.overrides.thinking_display, None);
+        assert!(result.thinking_options.is_none());
+    }
+
+    #[test]
+    fn thinking_options_contract_parses() {
+        let options: ThinkingOptionsResult =
+            serde_json::from_value(contract_options()).expect("contract parses");
+
+        assert_eq!(options.levels, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(options.displays, ["omitted", "summarized", "updates"]);
+        assert_eq!(options.current_level.as_deref(), Some("high"));
+        assert_eq!(options.level_source, ThinkingSource::Session);
+        assert_eq!(options.current_display.as_deref(), Some("summarized"));
+        assert_eq!(options.display_source, ThinkingSource::Session);
+
+        let (levels, current, source) = options.control(ThinkingControl::Level);
+        assert_eq!(levels, options.levels.as_slice());
+        assert_eq!(current, Some("high"));
+        assert_eq!(source, ThinkingSource::Session);
+        let (displays, current, source) = options.control(ThinkingControl::Display);
+        assert_eq!(displays, options.displays.as_slice());
+        assert_eq!(current, Some("summarized"));
+        assert_eq!(source, ThinkingSource::Session);
+    }
+
+    #[test]
+    fn thinking_options_parse_permissively() {
+        let empty: ThinkingOptionsResult =
+            serde_json::from_value(serde_json::json!({})).expect("empty block parses");
+        assert_eq!(empty, ThinkingOptionsResult::default());
+        assert!(empty.levels.is_empty());
+        assert!(empty.displays.is_empty());
+        assert_eq!(empty.level_source, ThinkingSource::Unknown);
+
+        // Opus 4.6: levels without displays.
+        let opus: ThinkingOptionsResult = serde_json::from_value(serde_json::json!({
+            "levels": ["low", "medium", "high", "max"],
+            "displays": [],
+            "current_level": "high",
+            "level_source": "model_default"
+        }))
+        .expect("levels-only block parses");
+        assert_eq!(opus.level_source, ThinkingSource::ModelDefault);
+        assert_eq!(opus.display_source, ThinkingSource::Unknown);
+        assert_eq!(opus.current_display, None);
+
+        // A source token from a newer daemon is absorbed rather than rejected.
+        let newer: ThinkingOptionsResult = serde_json::from_value(serde_json::json!({
+            "levels": ["low"],
+            "current_level": "low",
+            "level_source": "galaxy",
+            "display_source": "alias"
+        }))
+        .expect("unknown source parses");
+        assert_eq!(newer.level_source, ThinkingSource::Unknown);
+        assert_eq!(newer.display_source, ThinkingSource::Alias);
+    }
+
+    #[tokio::test]
+    async fn daemon_errors_keep_their_code_and_verbatim_message() {
+        let (client, rpc, mut rx) = client_with_channel();
+        let call = tokio::spawn(async move { client.session_thinking_options("sess-1").await });
+
+        let request = next_request(&mut rx).await;
+        rpc.dispatch_response(
+            request["id"].as_str().unwrap(),
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+                message: "method not found: session/thinking-options".to_string(),
+                data: None,
+            }),
+        );
+
+        let error = call
+            .await
+            .unwrap()
+            .expect_err("a daemon error should propagate");
+        let daemon = DaemonRpcError::from_anyhow(&error).expect("typed daemon error");
+        assert!(daemon.is_method_not_found());
+        assert_eq!(daemon.message, "method not found: session/thinking-options");
+        assert_eq!(
+            error.to_string(),
+            "RPC session/thinking-options: method not found: session/thinking-options (-32601)"
+        );
+
+        let invalid = DaemonRpcError {
+            method: method::SESSION_CONFIGURE.to_string(),
+            code: crate::jsonrpc::error_codes::INVALID_PARAMS,
+            message: "thinking_level \"xhigh\" is not supported".to_string(),
+        };
+        assert!(!invalid.is_method_not_found());
+        assert_eq!(
+            anyhow::Error::new(invalid.clone()).to_string(),
+            invalid.to_string()
+        );
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
