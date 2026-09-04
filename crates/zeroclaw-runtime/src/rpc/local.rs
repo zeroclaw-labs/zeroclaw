@@ -62,11 +62,16 @@ pub struct LocalTransport {
     reader: BufReader<LocalReadHalf>,
     writer_tx: mpsc::Sender<String>,
     peer_label: String,
+    /// Kernel-reported peer uid (Unix). `None` on Windows named pipes or
+    /// when the kernel query fails — absence of a credential, never a
+    /// credential of its own.
+    peer_uid: Option<u32>,
 }
 
 impl LocalTransport {
     pub fn new(stream: LocalStream) -> Self {
         let peer_label = platform::peer_label_from(&stream);
+        let peer_uid = platform::peer_uid_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
@@ -86,6 +91,7 @@ impl LocalTransport {
             reader: BufReader::new(read_half),
             writer_tx,
             peer_label,
+            peer_uid,
         }
     }
 }
@@ -113,6 +119,17 @@ impl RpcTransport for LocalTransport {
 
     fn peer_label(&self) -> String {
         self.peer_label.clone()
+    }
+
+    fn kind(&self) -> super::transport::TransportKind {
+        super::transport::TransportKind::Local
+    }
+
+    fn credential(&self) -> crate::security::auth_provider::Credential {
+        match self.peer_uid {
+            Some(uid) => crate::security::auth_provider::Credential::Peercred { uid },
+            None => crate::security::auth_provider::Credential::None,
+        }
     }
 }
 
@@ -191,7 +208,8 @@ pub async fn run_local_listener(
                     let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
+                        .with_transport(transport.kind(), transport.credential());
                     dispatcher.run(&mut transport).await;
 
                     // Epoch-checked for the same reason as the WSS teardown: a
@@ -555,14 +573,17 @@ mod platform {
     }
 
     pub fn peer_label_from(stream: &LocalStream) -> String {
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(cred) = stream.peer_cred() {
-                return format!("unix:pid={},uid={}", cred.pid().unwrap_or(0), cred.uid());
-            }
+        if let Ok(cred) = stream.peer_cred() {
+            return format!("unix:pid={},uid={}", cred.pid().unwrap_or(0), cred.uid());
         }
-        let _ = stream;
         "unix:unknown".to_string()
+    }
+
+    /// Kernel-reported peer uid (`SO_PEERCRED` on Linux, `getpeereid`-
+    /// equivalent on macOS/BSD via tokio's `peer_cred`). `None` when the
+    /// query fails — the caller treats that as no credential.
+    pub fn peer_uid_from(stream: &LocalStream) -> Option<u32> {
+        stream.peer_cred().ok().map(|cred| cred.uid())
     }
 }
 
@@ -624,6 +645,13 @@ mod platform {
 
     pub fn peer_label_from(_stream: &LocalStream) -> String {
         "pipe:local".to_string()
+    }
+
+    /// Named pipes carry no portable peer uid; the connection presents no
+    /// transport-intrinsic credential and authenticates explicitly (or
+    /// through the no-roster local compatibility path).
+    pub fn peer_uid_from(_stream: &LocalStream) -> Option<u32> {
+        None
     }
 
     fn path_to_pipe_name(path: &Path) -> String {
@@ -698,6 +726,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
@@ -783,6 +813,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -1241,7 +1273,7 @@ mod tests {
         let (pending_tx, mut pending_rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
         ctx.approval_pending
-            .insert("test-req-1".to_string(), pending_tx);
+            .insert("test-req-1".to_string(), "unused".to_string(), pending_tx);
 
         let approve_params = serde_json::json!({
             "session_id": "unused",
@@ -1337,6 +1369,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         write_half
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())

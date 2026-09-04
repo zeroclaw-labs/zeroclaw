@@ -22822,6 +22822,7 @@ BTC is currently around $65,000 based on latest tool output."#
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
             Ok(vec![zeroclaw_memory::MemoryEntry {
+                principal_id: None,
                 id: "entry-1".to_string(),
                 key: "memory_key_1".to_string(),
                 content: "Age is 45".to_string(),
@@ -28702,6 +28703,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 _until: Option<&str>,
             ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
                 Ok(vec![zeroclaw_memory::MemoryEntry {
+                    principal_id: None,
                     id: "entry-x".to_string(),
                     key: format!("key-for-{}", query),
                     content: format!("memory-for-{}", query),
