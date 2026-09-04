@@ -66,6 +66,8 @@ Streaming deliberately has a narrower retry contract than non-streaming calls:
 
 Draft-update sinks are mutable. A pre-commit fallback may replace a draft without duplicating immutable output, while event sinks define the no-replay boundary.
 
+A stream that completes with no final text or tool calls is a semantic-empty response, not a successful answer. When runtime marks that result replay-safe and `provider_retries` is nonzero, Reliable allows one non-streaming recovery call to the exact provider/model that produced the empty stream. That allowance is consumed once; a failed recovery advances to the remaining configured candidates with their normal retry budgets. With zero retries, the failed stream entry remains skipped. Reasoning already shown stays visible once, but does not count as a final answer. This exception does not authorize replay after cancellation, interrupted visible output, or provider-executed tool work.
+
 This division keeps transport recovery in the runtime, provider-specific framing in the adapter, and retry/fallback policy in the reliability wrapper. A provider implementation should not invent a second turn-level replay policy.
 
 ## Attribution and known gaps

@@ -649,7 +649,7 @@ zeroclaw plugin remove <name>     # remove an installed plugin
 zeroclaw plugin update            # update all installed plugins
 ```
 
-The registry is a JSON index file served from a known URL (e.g., `https://plugins.zeroclawlabs.ai/index.json`). Each entry includes name, version, download URL, SHA-256 checksum, and the publisher's Ed25519 public key. The `PluginHost` signature verification already handles the security model.
+The registry is a JSON index file served from a known URL (e.g., `https://plugins.zeroclaw.com/index.json`). Each entry includes name, version, download URL, SHA-256 checksum, and the publisher's Ed25519 public key. The `PluginHost` signature verification already handles the security model.
 
 ##### D4: Integrate `zeroclaw onboard` with the plugin system
 
