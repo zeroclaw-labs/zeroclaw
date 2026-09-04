@@ -381,7 +381,23 @@ mod tests {
             ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
         ];
 
-        const PLAIN_KEYS: &[&str] = &["zc-picker-current"];
+        const PLAIN_KEYS: &[&str] = &[
+            "zc-picker-current",
+            "zc-effort-picker-title",
+            "zc-display-picker-title",
+            "zc-thinking-switch-applying",
+            "zc-effort-none-for-model",
+            "zc-display-none-for-model",
+        ];
+        // Keys that embed a value: (key, argument name).
+        const ARG_KEYS: &[(&str, &str)] = &[
+            ("zc-effort-ok", "level"),
+            ("zc-effort-reset", "level"),
+            ("zc-display-ok", "display"),
+            ("zc-display-reset", "display"),
+            ("zc-thinking-switch-failed", "error"),
+            ("zc-thinking-options-failed", "error"),
+        ];
 
         for (locale, source) in catalogues {
             for key in PLAIN_KEYS {
@@ -390,6 +406,14 @@ mod tests {
                 assert!(
                     !value.trim().is_empty(),
                     "{key} must not be blank for {locale}"
+                );
+            }
+            for (key, arg) in ARG_KEYS {
+                let value = format_ftl_message(source, locale, key, &[(arg, "xhigh-marker")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(
+                    value.contains("xhigh-marker"),
+                    "{key} must embed ${arg} for {locale}: {value}"
                 );
             }
         }
