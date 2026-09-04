@@ -4,9 +4,15 @@ use std::path::Path;
 use crate::schema::Config;
 use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
+use crate::schema::v3::V3Config;
 
 /// The schema version this binary writes and expects on disk.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+///
+/// V4 is reserved for the breaking schema cut covering channel/tool removals
+/// (the companion PR that removes deprecated channels and SaaS integrations).
+/// This branch's multi-model provider feature occupies V5 so the two cuts can
+/// land independently and in either order.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) struct ConfigLoadAttribution;
 
@@ -786,6 +792,67 @@ pub(crate) fn fold_string_into_array(
     }
 }
 
+/// V4 → V5: regularize each `[providers.<family>.<alias>]` entry's flat
+/// `model` into a `models.default` subtable so one provider profile can host
+/// several named model entries. Entry-level fields are preserved for downgrade
+/// compatibility; this step only mints `models.default.id` from the legacy
+/// entry-level `model` field.
+///
+/// V4 is reserved for the breaking channel/tool-removal cut that removes
+/// deprecated channels and SaaS integrations.
+/// This step sits at V4→V5 so the two cuts can land independently and in
+/// either order without competing for the same version slot.
+fn migrate_v4_to_v5(value: toml::Value) -> Result<toml::Value> {
+    let mut root = match value {
+        toml::Value::Table(t) => t,
+        other => return Ok(other),
+    };
+
+    // Every step stamps its own target version (run_chain does not).
+    root.insert("schema_version".to_string(), toml::Value::Integer(5));
+
+    let Some(toml::Value::Table(providers)) = root.get_mut("providers") else {
+        return Ok(toml::Value::Table(root));
+    };
+    let Some(toml::Value::Table(families)) = providers.get_mut("models") else {
+        return Ok(toml::Value::Table(root));
+    };
+
+    let mut minted = 0usize;
+    for (_family, family_val) in families.iter_mut() {
+        let toml::Value::Table(aliases) = family_val else {
+            continue;
+        };
+        for (_alias, entry_val) in aliases.iter_mut() {
+            let toml::Value::Table(entry) = entry_val else {
+                continue;
+            };
+            // Skip entries that already carry a `models` subtable.
+            if matches!(entry.get("models"), Some(toml::Value::Table(_))) {
+                continue;
+            }
+            let Some(model_id) = entry.get("model").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let mut default_entry = toml::value::Table::new();
+            default_entry.insert("id".to_string(), toml::Value::String(model_id.to_string()));
+            let mut models = toml::value::Table::new();
+            models.insert("default".to_string(), toml::Value::Table(default_entry));
+            entry.insert("models".to_string(), toml::Value::Table(models));
+            minted += 1;
+        }
+    }
+
+    if minted > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "[providers] entry-level model → models.default (V4→V5)"
+        );
+    }
+    Ok(toml::Value::Table(root))
+}
+
 /// One typed migration step: `V_n` TOML → `V_{n+1}` TOML.
 type MigrationStep = fn(toml::Value) -> Result<toml::Value>;
 
@@ -807,6 +874,15 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
+    // V3 → V4: breaking channel/tool-removal migration.
+    |value| {
+        let v3: V3Config = value
+            .try_into()
+            .context("failed to deserialize input as V3 schema")?;
+        v3.migrate().context("failed to migrate V3 → V4")
+    },
+    // V4 → V5: multi-model provider profiles (this branch).
+    |value| migrate_v4_to_v5(value).context("failed to migrate V4 → V5"),
 ];
 
 const _: () = assert!(
@@ -3223,6 +3299,285 @@ enabled = "not-a-bool"
             !backup.exists(),
             "no `.backup` should be created on the no-op path; got {}",
             backup.display()
+        );
+    }
+
+    #[test]
+    fn v4_to_v5_mints_models_default_from_entry_model() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "gpt-4o"
+fallback_models = ["gpt-4o-mini"]
+temperature = 0.5
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migration succeeds")
+            .expect("v4 input migrates to v5");
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let entry = value["providers"]["models"]["custom"]["rag_bot"]
+            .as_table()
+            .unwrap();
+        // Entry-level fields preserved for downgrade compatibility. Profile-level
+        // `fallback_models` stays at the entry level and is NOT copied into the
+        // minted model entry — fallback is a profile-level concept.
+        assert_eq!(entry["model"].as_str(), Some("gpt-4o"));
+        assert!(entry.get("fallback_models").is_some());
+        // models.default minted from the entry-level model id only.
+        let default = entry["models"]["default"].as_table().unwrap();
+        assert_eq!(default["id"].as_str(), Some("gpt-4o"));
+        assert!(default.get("fallback_models").is_none());
+        // Result deserializes as a current Config.
+        let _cfg = migrate_to_current(raw).expect("migrates into a valid Config");
+    }
+
+    #[test]
+    fn v3_to_v5_mints_models_default_via_full_chain() {
+        // V3 runs the typed key-drop migration into V4, then the V4→V5 step
+        // mints models.default. This profile has nothing for the V3→V4 drop
+        // to touch, so it flows through unchanged.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "gpt-4o"
+fallback_models = ["gpt-4o-mini"]
+temperature = 0.5
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migration succeeds")
+            .expect("v3 input migrates to v5");
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(value["schema_version"].as_integer(), Some(5));
+        let entry = value["providers"]["models"]["custom"]["rag_bot"]
+            .as_table()
+            .unwrap();
+        assert_eq!(entry["model"].as_str(), Some("gpt-4o"));
+        let default = entry["models"]["default"].as_table().unwrap();
+        assert_eq!(default["id"].as_str(), Some("gpt-4o"));
+        let _cfg = migrate_to_current(raw).expect("migrates into a valid Config");
+    }
+
+    #[test]
+    fn v3_to_v4_drops_skills_prompt_injection_mode() {
+        let raw = r#"
+schema_version = 3
+
+[skills]
+open_skills_enabled = true
+prompt_injection_mode = "full"
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(cfg.skills.open_skills_enabled);
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        assert!(
+            !migrated.contains("prompt_injection_mode"),
+            "migrated V4 config must not carry the dropped skills key; got:\n{migrated}"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_inert_agent_tunable_keys() {
+        let raw = r#"
+schema_version = 3
+
+[agents.default]
+runtime_profile = "fast"
+max_tool_iterations = 20
+compact_context = true
+tool_dispatcher = "xml"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        for dropped in ["max_tool_iterations", "compact_context", "tool_dispatcher"] {
+            assert!(
+                !migrated.contains(dropped),
+                "migrated V4 config must not carry inert agent key {dropped}; got:\n{migrated}"
+            );
+        }
+        assert!(
+            migrated.contains("runtime_profile"),
+            "surviving agent keys must be preserved; got:\n{migrated}"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_summary_model_swap() {
+        let raw = r#"
+schema_version = 3
+
+[runtime_profiles.default]
+
+[runtime_profiles.default.context_compression]
+enabled = true
+summary_model = "anthropic/claude-3-haiku"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        assert!(
+            !migrated.contains("summary_model"),
+            "migrated V4 config must not carry the deprecated summary_model swap; got:\n{migrated}"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_removed_saas_and_cli_sections() {
+        let raw = r#"
+schema_version = 3
+
+[composio]
+enabled = true
+
+[jira]
+enabled = true
+base_url = "https://jira.example.test"
+
+[notion]
+enabled = true
+
+[google_workspace]
+enabled = true
+
+[claude_code]
+enabled = true
+
+[channels.twitter]
+enabled = true
+
+[channels.reddit]
+enabled = true
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migrate_file succeeds")
+            .expect("V3 input triggers migration");
+        for dropped in [
+            "[composio]",
+            "[jira]",
+            "[notion]",
+            "[google_workspace]",
+            "[claude_code]",
+            "[channels.twitter]",
+            "[channels.reddit]",
+        ] {
+            assert!(
+                !migrated.contains(dropped),
+                "migrated V4 config must not carry removed section {dropped}; got:\n{migrated}"
+            );
+        }
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert!(
+            cfg.channels.telegram.contains_key("main"),
+            "surviving channels must be preserved through the drop"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_is_lossless_for_untouched_config() {
+        let raw = r#"
+schema_version = 3
+
+[heartbeat]
+enabled = false
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(cfg.channels.telegram.contains_key("main"));
+    }
+
+    #[test]
+    fn v3_to_v4_prunes_agent_refs_to_removed_channels() {
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+
+[agents.assistant]
+channels = ["telegram.main", "twitter", "reddit.default", "notion"]
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        let agent = cfg.agents.get("assistant").expect("agent survives");
+        let refs: Vec<&str> = agent.channels.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            refs,
+            vec!["telegram.main"],
+            "refs to removed channel types must be pruned so validate() has no dangling target"
+        );
+    }
+
+    #[test]
+    fn v3_to_v4_drops_peer_groups_bound_to_removed_channels() {
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.main]
+enabled = true
+bot_token = "t"
+
+[peer_groups.ops]
+channel = "telegram.main"
+
+[peer_groups.birdwatch]
+channel = "twitter.default"
+
+[peer_groups.frontpage]
+channel = "reddit"
+"#;
+        let cfg = migrate_to_current(raw).expect("V3 → V4 migration succeeds");
+        assert!(
+            cfg.peer_groups.contains_key("ops"),
+            "peer group on a surviving channel must be kept; got: {:?}",
+            cfg.peer_groups.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !cfg.peer_groups.contains_key("birdwatch")
+                && !cfg.peer_groups.contains_key("frontpage"),
+            "peer groups bound to removed channels must be dropped; got: {:?}",
+            cfg.peer_groups.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn v4_to_v5_leaves_existing_models_subtable_untouched() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "legacy-id"
+
+[providers.models.custom.rag_bot.models.fast]
+id = "gpt-4o-mini"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migration succeeds")
+            .expect("v4 input migrates to v5");
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let models = value["providers"]["models"]["custom"]["rag_bot"]["models"]
+            .as_table()
+            .unwrap();
+        // Pre-existing subtable is preserved; no `default` is synthesized over it.
+        assert!(models.contains_key("fast"));
+        assert!(
+            !models.contains_key("default"),
+            "must not mint default when a models subtable already exists"
         );
     }
 }

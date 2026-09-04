@@ -542,12 +542,49 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
+        // A three-segment reference targets the nested model entry itself;
+        // a bare or two-segment reference keeps the legacy profile-level
+        // behavior. Parsing mirrors `resolve_model_selection` (`splitn(3)`),
+        // so the model alias may itself contain dots.
+        let target_model_alias = match &provider_update {
+            MaybeSet::Set(model_provider) => {
+                let mut parts = model_provider.splitn(3, '.');
+                let family = parts.next().unwrap_or_default();
+                let alias = parts.next();
+                let model_alias = parts.next();
+                match (alias, model_alias) {
+                    (None, _) | (Some(_), None) => None,
+                    (Some(alias), Some(model_alias)) => {
+                        if family.is_empty() || alias.is_empty() || model_alias.is_empty() {
+                            anyhow::bail!(
+                                "model_provider `{model_provider}` must use `<type>.<alias>` or `<type>.<alias>.<model>` form"
+                            );
+                        }
+                        Some(model_alias.to_string())
+                    }
+                }
+            }
+            MaybeSet::Null | MaybeSet::Unset => None,
+        };
+
+        // A three-segment reference carries no meaning on its own — there is
+        // no separate "selected model" pointer, so nothing would be written.
+        if target_model_alias.is_some()
+            && matches!(model_update, MaybeSet::Unset)
+            && matches!(temperature_update, MaybeSet::Unset)
+        {
+            anyhow::bail!(
+                "a `<type>.<alias>.<model>` model_provider requires `model` or `temperature` to set on that model entry"
+            );
+        }
+
         // Determine which models entry to update.
         let (type_k, alias_k) = match &provider_update {
-            MaybeSet::Set(model_provider) => model_provider
-                .split_once('.')
-                .map(|(t, a)| (t.to_string(), a.to_string()))
-                .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
+            MaybeSet::Set(model_provider) => {
+                zeroclaw_config::schema::provider_profile_ref(model_provider)
+                    .map(|(t, a)| (t.to_string(), a.to_string()))
+                    .unwrap_or_else(|| (model_provider.clone(), "default".to_string()))
+            }
             MaybeSet::Null | MaybeSet::Unset => {
                 // Update whichever entry already exists, or create a placeholder.
                 cfg.providers
@@ -581,44 +618,79 @@ impl ModelRoutingConfigTool {
                 ))
             })?;
 
-        match model_update {
-            MaybeSet::Set(model) => entry.model = Some(model),
-            MaybeSet::Null => entry.model = None,
-            MaybeSet::Unset => {}
-        }
+        if let Some(model_alias) = target_model_alias.as_deref() {
+            let model_entry = entry.models.entry(model_alias.to_string()).or_default();
+            match model_update {
+                MaybeSet::Set(model) => model_entry.id = Some(model),
+                MaybeSet::Null => model_entry.id = None,
+                MaybeSet::Unset => {}
+            }
 
-        match temperature_update {
-            MaybeSet::Set(temperature) => {
-                if !(0.0..=2.0).contains(&temperature) {
-                    anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+            match temperature_update {
+                MaybeSet::Set(temperature) => {
+                    if !(0.0..=2.0).contains(&temperature) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    model_entry.temperature = Some(temperature);
                 }
-                entry.temperature = Some(temperature);
+                MaybeSet::Null => model_entry.temperature = None,
+                MaybeSet::Unset => {}
             }
-            MaybeSet::Null => {
-                entry.temperature = None;
+        } else {
+            match model_update {
+                MaybeSet::Set(model) => entry.model = Some(model),
+                MaybeSet::Null => entry.model = None,
+                MaybeSet::Unset => {}
             }
-            MaybeSet::Unset => {}
+
+            match temperature_update {
+                MaybeSet::Set(temperature) => {
+                    if !(0.0..=2.0).contains(&temperature) {
+                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+                    }
+                    entry.temperature = Some(temperature);
+                }
+                MaybeSet::Null => entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
         }
 
         cfg.save().await?;
 
         // Probe the new model with a minimal API call to catch invalid model IDs
-        // before the channel hot-reload picks up the change.
-        let current_model = cfg
-            .providers
-            .models
-            .find(&type_k, &alias_k)
-            .and_then(|e| e.model.clone());
+        // before the channel hot-reload picks up the change. A nested update
+        // probes the targeted model entry's id; the provider itself is still
+        // constructed from the profile ref.
+        let current_model = if let Some(model_alias) = target_model_alias.as_deref() {
+            cfg.providers
+                .models
+                .find(&type_k, &alias_k)
+                .and_then(|e| e.models.get(model_alias).and_then(|m| m.id.clone()))
+        } else {
+            cfg.providers
+                .models
+                .find(&type_k, &alias_k)
+                .and_then(|e| e.model.clone())
+        };
         let provider_name = format!("{type_k}.{alias_k}");
         if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_provider_entry
-                    .as_ref()
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("(none)")
-                    .to_string();
+                let reverted_model = if let Some(model_alias) = target_model_alias.as_deref() {
+                    previous_provider_entry
+                        .as_ref()
+                        .and_then(|e| e.models.get(model_alias))
+                        .and_then(|m| m.id.as_deref())
+                        .unwrap_or("(none)")
+                        .to_string()
+                } else {
+                    previous_provider_entry
+                        .as_ref()
+                        .and_then(|e| e.model.as_deref())
+                        .unwrap_or("(none)")
+                        .to_string()
+                };
 
                 if let Some(prev_entry) = previous_provider_entry
                     && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
@@ -658,8 +730,7 @@ impl ModelRoutingConfigTool {
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
-        let (family, alias) = provider_name
-            .split_once('.')
+        let (family, alias) = zeroclaw_config::schema::provider_profile_ref(provider_name)
             .unwrap_or((provider_name, "default"));
         let entry = self.config.providers.models.find(family, alias);
         let api_key = entry.and_then(|e| e.api_key.as_deref());
@@ -1080,7 +1151,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "model_provider": {
                     "type": "string",
-                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent. For set_default, `<type>.<alias>` targets the profile (legacy `model` field) while `<type>.<alias>.<model>` targets that nested model entry's id/temperature"
                 },
                 "model": {
                     "type": "string",
@@ -1272,6 +1343,61 @@ mod tests {
             .expect("set_default must materialize the moonshot.default slot");
         assert_eq!(entry.model.as_deref(), Some("moonshot-v1-8k"));
         assert_eq!(entry.temperature, Some(0.2));
+    }
+
+    #[tokio::test]
+    async fn set_default_nested_model_ref_updates_model_entry() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.gateway.reasoning",
+                "model": "gpt-5.3-mini",
+                "temperature": 0.1
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway")
+            .expect("set_default must materialize the openai.gateway slot");
+        // The write lands on the nested model entry, not the legacy
+        // profile-level `model` field.
+        assert_eq!(entry.model, None);
+        let nested = entry
+            .models
+            .get("reasoning")
+            .expect("nested reasoning model entry must exist");
+        assert_eq!(nested.id.as_deref(), Some("gpt-5.3-mini"));
+        assert_eq!(nested.temperature, Some(0.1));
+    }
+
+    #[tokio::test]
+    async fn set_default_nested_model_ref_without_updates_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.gateway.reasoning"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a bare three-segment ref has nothing to set"
+        );
+        let entry = read_saved_provider_entry(&cfg_path, "openai", "gateway");
+        assert!(
+            entry.is_none(),
+            "a rejected nested set_default must not materialize the profile slot"
+        );
     }
 
     #[tokio::test]

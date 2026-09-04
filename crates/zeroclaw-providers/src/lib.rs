@@ -753,6 +753,40 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
     }
 }
 
+/// Overlay a selected model entry's model-side tuning onto options already
+/// built from its enclosing provider profile. Only fields the entry sets
+/// override the profile-derived value; connection-side options (URL, headers,
+/// TLS, kind, wire) are left untouched. No-op when `model_entry` is `None`.
+pub fn apply_model_entry_options(
+    options: &mut ModelProviderRuntimeOptions,
+    model_entry: Option<&zeroclaw_config::schema::ModelEntryConfig>,
+) {
+    let Some(m) = model_entry else {
+        return;
+    };
+    if let Some(v) = m.max_tokens {
+        options.provider_max_tokens = Some(v);
+    }
+    if let Some(v) = m.think {
+        options.think = Some(v);
+    }
+    if let Some(v) = m.vision {
+        options.vision = Some(v);
+    }
+    if let Some(v) = m.native_tools {
+        options.native_tools = Some(v);
+    }
+    if let Some(v) = m.replay_assistant_reasoning {
+        options.replay_assistant_reasoning = Some(v);
+    }
+    if m.provider_extra.is_some() {
+        options.provider_extra = m.provider_extra.clone();
+    }
+    if m.chat_template_kwargs.is_some() {
+        options.chat_template_kwargs = m.chat_template_kwargs.clone();
+    }
+}
+
 /// Resolve `ModelProviderRuntimeOptions` from an agent's `model_provider` alias
 /// (`"<type>.<alias>"`). Returns safe defaults when the agent alias doesn't
 /// exist, doesn't have a `model_provider` set, or names a non-existent entry.
@@ -764,7 +798,8 @@ pub fn provider_runtime_options_for_agent(
     let mut options = model_provider_runtime_options_from_model_provider_entry(config, entry);
 
     if let Some(agent) = config.agents.get(agent_alias)
-        && let Some((family, alias)) = agent.model_provider.split_once('.')
+        && let Some((family, alias)) =
+            zeroclaw_config::schema::provider_profile_ref(&agent.model_provider)
     {
         // Multi-endpoint families: pre-resolve the URI via the centralized
         // `resolved_endpoint_uri` dispatch (driven by
@@ -803,7 +838,7 @@ pub fn options_for_provider_ref(
     name: &str,
     fallback: &ModelProviderRuntimeOptions,
 ) -> ModelProviderRuntimeOptions {
-    match name.split_once('.') {
+    match zeroclaw_config::schema::provider_profile_ref(name) {
         Some((family, alias)) => provider_runtime_options_for_alias(config, family, alias),
         None => {
             let mut options = fallback.clone();
@@ -1632,7 +1667,12 @@ fn append_fallback_chain(
             continue;
         }
 
-        let opts = provider_runtime_options_for_alias(config, family, &alias);
+        let mut opts = provider_runtime_options_for_alias(config, family, &alias);
+        // A three-segment fallback ref names a nested model entry; its
+        // per-model tuning applies on top of the profile options. The
+        // selection also yields the named entry's model id below.
+        let selection = config.resolve_model_selection(raw);
+        apply_model_entry_options(&mut opts, selection.as_ref().and_then(|s| s.model_entry));
         if !factory::fallback_auth_ready_for_alias(
             config,
             family,
@@ -1648,6 +1688,13 @@ fn append_fallback_chain(
             );
         }
 
+        // A three-segment ref pins the fallback to the named entry's model id;
+        // a two-segment ref keeps the profile-level pin (push_pinned_entries
+        // falls back to the entry's `model`).
+        let model_override = selection
+            .as_ref()
+            .filter(|s| s.model_alias.is_some())
+            .and_then(|s| s.model_id.clone());
         match create_model_provider_inner(
             Some(config),
             family,
@@ -1656,7 +1703,14 @@ fn append_fallback_chain(
             entry.uri.as_deref(),
             &opts,
         ) {
-            Ok(built) => push_pinned_entries(out, config, family, &alias, built, None),
+            Ok(built) => push_pinned_entries(
+                out,
+                config,
+                family,
+                &alias,
+                built,
+                model_override.as_deref(),
+            ),
             Err(e) => {
                 let profile = format!("[providers.models.{family}.{alias}]");
                 anyhow::bail!(
@@ -1740,11 +1794,15 @@ pub fn create_model_provider_from_ref_with_model(
     // In both cases the intact name reaches `create_model_provider_inner`, which
     // applies family defaults or errors on an unknown provider - keeping a bad ref
     // fail-closed, exactly as the legacy `create_model_provider(vp, None)` did.
-    if let Some((family, alias)) = name.split_once('.')
+    if let Some((family, alias)) = zeroclaw_config::schema::provider_profile_ref(name)
         && !family.contains(':')
         && let Some(entry) = config.providers.models.find(family, alias)
     {
-        let options = provider_runtime_options_for_alias(config, family, alias);
+        let mut options = provider_runtime_options_for_alias(config, family, alias);
+        // Honor a three-segment `<family>.<alias>.<model>` ref: overlay the
+        // selected model entry's tuning and use its `id`.
+        let selection = config.resolve_model_selection(name.trim());
+        apply_model_entry_options(&mut options, selection.as_ref().and_then(|s| s.model_entry));
         let provider = create_model_provider_inner(
             Some(config),
             family,
@@ -1753,12 +1811,12 @@ pub fn create_model_provider_from_ref_with_model(
             entry.uri.as_deref(),
             &options,
         )?;
-        let model = entry
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .map(ToString::to_string);
+        let model = selection
+            .as_ref()
+            .and_then(|s| s.model_id.clone())
+            .or_else(|| entry.model.clone())
+            .map(|m| m.trim().to_string())
+            .filter(|model| !model.is_empty());
         return Ok(ResolvedModelProviderRef { provider, model });
     }
     let provider = create_model_provider_inner(
@@ -1784,7 +1842,7 @@ fn create_resilient_model_provider_from_ref_with_model_override(
     options: &ModelProviderRuntimeOptions,
     primary_model_override: Option<&str>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    match name.split_once('.') {
+    match zeroclaw_config::schema::provider_profile_ref(name) {
         Some((family, alias)) => create_resilient_model_provider_for_alias_with_model_override(
             config,
             family,
@@ -1853,7 +1911,7 @@ pub fn create_routed_model_provider_with_options(
             });
         let key = routed_credential
             .or_else(|| {
-                name.split_once('.')
+                zeroclaw_config::schema::provider_profile_ref(name)
                     .and_then(|(family, alias)| {
                         config
                             .providers
@@ -1868,11 +1926,22 @@ pub fn create_routed_model_provider_with_options(
             })
             .or_else(|| is_primary.then_some(api_key).flatten());
         let url = if is_primary { api_url } else { None };
-        let entry_options = if is_primary {
+        let mut entry_options = if is_primary {
             options.clone()
         } else {
             options_for_provider_ref(config, name, options)
         };
+        // A three-segment route ref (`<family>.<alias>.<model>`) carries its
+        // own per-model tuning on top of the profile options. Overlaying for
+        // the primary too is idempotent — callers that already applied the
+        // nested entry pass the same values.
+        apply_model_entry_options(
+            &mut entry_options,
+            config
+                .resolve_model_selection(name)
+                .as_ref()
+                .and_then(|s| s.model_entry),
+        );
 
         match create_resilient_model_provider_from_ref_with_model_override(
             config,
@@ -1898,7 +1967,10 @@ pub fn create_routed_model_provider_with_options(
                 r.hint.clone(),
                 router::Route {
                     provider_name: r.model_provider.clone(),
-                    model: r.model.clone(),
+                    // An unset route model resolves through the selection
+                    // contract so a three-segment route ref names its nested
+                    // model entry instead of dispatching with an empty model.
+                    model: r.effective_model(config),
                 },
             )
         })

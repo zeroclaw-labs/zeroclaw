@@ -646,8 +646,18 @@ pub async fn run_gateway(
         .next()
         .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
         .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
+    let boot_provider_ref = format!("{boot_family}.{boot_alias}");
     let fallback = boot_entry;
-    let model_provider_name = boot_family.as_str();
+    let model_provider_name = boot_provider_ref.as_str();
+    let mut boot_options =
+        zeroclaw_providers::provider_runtime_options_for_alias(&config, &boot_family, &boot_alias);
+    zeroclaw_providers::apply_model_entry_options(
+        &mut boot_options,
+        config
+            .resolve_model_selection(model_provider_name)
+            .as_ref()
+            .and_then(|selection| selection.model_entry),
+    );
     let (model_provider, boot_provider_failed): (Arc<dyn ModelProvider>, bool) =
         match zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
@@ -655,11 +665,7 @@ pub async fn run_gateway(
             fallback.and_then(|e| e.api_key.as_deref()),
             fallback.and_then(|e| e.uri.as_deref()),
             &config.reliability,
-            &zeroclaw_providers::provider_runtime_options_for_alias(
-                &config,
-                &boot_family,
-                &boot_alias,
-            ),
+            &boot_options,
         ) {
             Ok(p) => (Arc::from(p), false),
             Err(e) => {
@@ -686,12 +692,14 @@ pub async fn run_gateway(
     let model = if boot_provider_failed {
         String::new()
     } else {
-        match fallback
-            .and_then(|e| e.model.as_deref())
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
+        match config
+            .resolve_model_selection(model_provider_name)
+            .and_then(|selection| selection.model_id)
+            .or_else(|| fallback.and_then(|e| e.model.clone()))
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty())
         {
-            Some(m) => m.to_string(),
+            Some(m) => m,
             None => match config.resolve_default_model() {
                 Some(m) => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
@@ -3053,17 +3061,15 @@ async fn handle_webhook(
     let model_label = {
         let cfg = state.config.read();
         let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
-        let resolved_provider = resolved_agent_alias
+        // Label with the agent's selected model — a three-segment ref names the
+        // nested model entry, so resolve through the selection rather than the
+        // profile-level `model` field.
+        resolved_agent_alias
             .as_deref()
-            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
-        resolved_provider
-            .and_then(|(_, _, entry)| {
-                entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(ToString::to_string)
+            .and_then(|alias| cfg.agents.get(alias))
+            .and_then(|agent| {
+                cfg.resolve_model_selection(agent.model_provider.as_str())
+                    .and_then(|selection| selection.model_id)
             })
             .or_else(|| cfg.resolve_default_model())
             .unwrap_or_else(|| "<unresolved>".to_string())

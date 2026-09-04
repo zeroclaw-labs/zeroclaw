@@ -146,15 +146,16 @@ fn quickstart_agent_missing_requirements(
     if model_ref.is_empty() {
         missing.push(format!("Set a model provider for agent `{alias}`."));
     } else if let Some((family, _, provider)) = cfg.resolved_model_provider_for_agent(alias) {
-        let has_model = provider
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|m| !m.is_empty());
-        if !has_model {
+        // Resolve through the selection so a nested-only profile (model ids
+        // under `[providers.models.<family>.<alias>.models.*]`) still counts.
+        let effective_model = cfg
+            .resolve_model_selection(model_ref)
+            .and_then(|selection| selection.model_id);
+        if effective_model.is_none() {
             missing.push(format!("Choose a model for model provider `{model_ref}`."));
         } else if !model_provider_alias_usable(
             provider,
+            effective_model.as_deref(),
             zeroclaw_runtime::quickstart::model_provider_is_local(family),
         ) {
             missing.push(format!(
@@ -531,9 +532,10 @@ fn any_usable_model_provider(cfg: &zeroclaw_config::schema::Config) -> bool {
     cfg.providers
         .models
         .iter_entries()
-        .any(|(family, _, base)| {
+        .any(|(family, alias, base)| {
             model_provider_alias_usable(
                 base,
+                alias_effective_model(cfg, family, alias).as_deref(),
                 zeroclaw_runtime::quickstart::model_provider_is_local(family),
             )
         })
@@ -546,12 +548,16 @@ fn provider_type_badge(
 ) -> Option<String> {
     let mut has_alias = false;
     let mut has_usable_alias = false;
-    for (ty, _, base) in cfg.providers.models.iter_entries() {
+    for (ty, alias, base) in cfg.providers.models.iter_entries() {
         if ty != family {
             continue;
         }
         has_alias = true;
-        if model_provider_alias_usable(base, local) {
+        if model_provider_alias_usable(
+            base,
+            alias_effective_model(cfg, ty, alias).as_deref(),
+            local,
+        ) {
             has_usable_alias = true;
         }
     }
@@ -566,11 +572,10 @@ fn provider_type_badge(
 
 fn model_provider_alias_usable(
     base: &zeroclaw_config::schema::ModelProviderConfig,
+    effective_model: Option<&str>,
     local: bool,
 ) -> bool {
-    let has_model = base
-        .model
-        .as_deref()
+    let has_model = effective_model
         .map(str::trim)
         .is_some_and(|model| !model.is_empty());
     if !has_model {
@@ -582,6 +587,18 @@ fn model_provider_alias_usable(
         .is_some_and(|key| !key.is_empty())
         || base.requires_openai_auth
         || local
+}
+
+/// The model id an alias effectively serves: the nested-model selection for a
+/// `<family>.<alias>` ref (falling back to the legacy profile-level `model`),
+/// so a nested-only profile still counts as having a model.
+fn alias_effective_model(
+    cfg: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+) -> Option<String> {
+    cfg.resolve_model_selection(&format!("{family}.{alias}"))
+        .and_then(|selection| selection.model_id)
 }
 
 fn storage_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {

@@ -264,16 +264,23 @@ fn convert_legacy_to_current(legacy: Value) -> Value {
         }
     }
     if let Some(mp) = get_str("model_provider") {
-        if let Some((ty, alias)) = mp.split_once('.') {
-            zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
-            zeroclaw.insert(type_field("model_provider"), Value::String(ty.to_string()));
-            zeroclaw.insert(
-                alias_field("model_provider"),
-                Value::String(alias.to_string()),
-            );
-        } else {
-            zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
-            zeroclaw.insert(type_field("model_provider"), Value::String(mp));
+        // A model_provider ref may be three-segment (`<type>.<alias>.<model>`);
+        // record the profile alias (second segment) in `_alias`, never
+        // `alias.model`.
+        let mut parts = mp.splitn(3, '.');
+        match (parts.next(), parts.next()) {
+            (Some(ty), Some(alias)) => {
+                zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
+                zeroclaw.insert(type_field("model_provider"), Value::String(ty.to_string()));
+                zeroclaw.insert(
+                    alias_field("model_provider"),
+                    Value::String(alias.to_string()),
+                );
+            }
+            _ => {
+                zeroclaw.insert("model_provider".into(), Value::String(mp.clone()));
+                zeroclaw.insert(type_field("model_provider"), Value::String(mp));
+            }
         }
     }
     if let Some(model) = get_str("model") {

@@ -8,7 +8,6 @@ use zeroclaw_config::presets::{
     SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
 use zeroclaw_config::schema::{Config, WireApi};
-use zeroclaw_config::traits::AliasSource;
 
 /// Which surface invoked the Quickstart. Stamped on every event in
 /// the apply path so SSE/dashboard consumers can filter by origin
@@ -527,7 +526,31 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         default_runtime_profile: recommended_runtime_preset(None)
             .map(|preset| preset.preset_name.to_string())
             .unwrap_or_default(),
-        model_providers: cfg.resolve_alias_source(AliasSource::ModelProviders),
+        // The two-segment profile ref, plus one three-segment ref per model
+        // entry so pickers can target a specific model on the same provider
+        // profile. `resolve_alias_source` (the generic two-tier resolver)
+        // only sees the flat `prop_fields()` view and can't produce these
+        // per-model refs, so this list is built directly from the nested
+        // `providers.models` structure instead.
+        model_providers: {
+            let mut refs: Vec<String> = cfg
+                .providers
+                .models
+                .iter_entries()
+                .flat_map(|(family, alias, cfg)| {
+                    let base = format!("{family}.{alias}");
+                    let mut model_aliases: Vec<String> = cfg.models.keys().cloned().collect();
+                    model_aliases.sort();
+                    std::iter::once(base.clone()).chain(
+                        model_aliases
+                            .into_iter()
+                            .map(move |m| format!("{base}.{m}")),
+                    )
+                })
+                .collect();
+            refs.sort();
+            refs
+        },
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()
@@ -1043,7 +1066,10 @@ fn apply_model_provider(
 ) -> Option<String> {
     match choice {
         SelectorChoice::Existing(reference) => {
-            let (family, alias) = match split_ref(reference) {
+            // A model_provider ref may be three-segment
+            // (`<type>.<alias>.<model>`); key the profile off the first two
+            // segments so a model-selecting ref is not rejected.
+            let (family, alias) = match zeroclaw_config::schema::provider_profile_ref(reference) {
                 Some(parts) => parts,
                 None => {
                     errors.push(QuickstartError::for_surface(

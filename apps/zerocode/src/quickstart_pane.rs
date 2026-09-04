@@ -536,6 +536,11 @@ struct FormState {
     provider_alias: String,
     provider_mode: SelectorMode,
     model: String,
+    /// Set when an existing provider was picked as a three-segment ref
+    /// `<family>.<alias>.<model_alias>`; reassembled into the submitted ref so
+    /// the agent binds to that specific model entry. `None` for plain
+    /// two-segment profile picks.
+    provider_model_alias: Option<String>,
     /// Captured field-form values for the model_provider entry,
     /// keyed by `FieldDescriptor.key` (kebab-case schema identifier).
     /// Submitted verbatim via `ModelProviderChoice.fields`; the
@@ -570,6 +575,7 @@ impl FormState {
             provider_alias: String::new(),
             provider_mode: SelectorMode::Fresh,
             model: String::new(),
+            provider_model_alias: None,
             provider_fields: std::collections::HashMap::new(),
             risk: String::new(),
             risk_mode: SelectorMode::Fresh,
@@ -641,9 +647,16 @@ impl FormState {
                 if self.provider_type.is_empty() {
                     "not yet chosen".to_string()
                 } else {
+                    // Prefer the picked model alias (three-segment existing ref);
+                    // fall back to the free-form model id (fresh provider form).
+                    let model = self
+                        .provider_model_alias
+                        .as_deref()
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or(self.model.as_str());
                     format!(
                         "{} ({}) — {}",
-                        self.provider_type, self.provider_alias, self.model
+                        self.provider_type, self.provider_alias, model
                     )
                 }
             }
@@ -687,7 +700,14 @@ impl FormState {
                 fields: self.provider_fields.clone(),
             }),
             SelectorMode::Existing => {
-                SelectorChoice::Existing(format!("{}.{}", self.provider_type, self.provider_alias))
+                // Reassemble a three-segment ref when a specific model entry
+                // was picked, else the plain two-segment profile ref.
+                let base = format!("{}.{}", self.provider_type, self.provider_alias);
+                let dotted = match &self.provider_model_alias {
+                    Some(m) if !m.is_empty() => format!("{base}.{m}"),
+                    _ => base,
+                };
+                SelectorChoice::Existing(dotted)
             }
         };
         let risk_profile = match self.risk_mode {
@@ -763,11 +783,15 @@ fn apply_existing_provider_choice(
     snapshot: Option<&QuickstartStateResult>,
     dotted_ref: &str,
 ) {
-    let Some((provider_type, alias)) = dotted_ref.split_once('.') else {
+    // Accept both `<family>.<alias>` and `<family>.<alias>.<model_alias>`.
+    let mut parts = dotted_ref.splitn(3, '.');
+    let (Some(provider_type), Some(alias)) = (parts.next(), parts.next()) else {
         return;
     };
+    let model_alias = parts.next();
     form.provider_type = provider_type.to_string();
     form.provider_alias = alias.to_string();
+    form.provider_model_alias = model_alias.map(str::to_string);
     form.provider_mode = SelectorMode::Existing;
     form.model.clear();
     form.provider_fields.clear();

@@ -101,7 +101,7 @@ Frontends and scripts match against the code; UI matches against the path.
 |---|---|---|
 | `path_not_found` | 404 | The requested property does not exist in the schema. |
 | `validation_failed` | 400 | The whole-config validator rejected the proposed state. |
-| `dangling_reference` | 400 | A configured alias reference (e.g. `agents.<x>.model_provider`) names a missing target (e.g. `providers.models.<type>.<alias>`). |
+| `dangling_reference` | 400 | A configured alias reference (e.g. `agents.<x>.model_provider`) names a missing target (e.g. `providers.models.<type>.<alias>`, or a `providers.models.<type>.<alias>.models.<model_alias>` model entry for a three-segment ref). |
 | `value_type_mismatch` | 400 | The submitted JSON value cannot coerce into the target type. |
 | `op_not_supported` | 400 | JSON Patch op is `move` / `copy` / unknown. |
 | `secret_test_forbidden` | 400 | JSON Patch `test` op targeted a secret path. |

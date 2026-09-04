@@ -1026,17 +1026,33 @@ pub fn all_tools_with_runtime(
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
         let llm_task_provider = family.to_string();
-        let llm_task_model = entry
-            .model
-            .clone()
+        // Resolve through the agent's full reference so a nested-model profile
+        // serves the selected model entry's id and temperature rather than the
+        // legacy profile-level `model`.
+        let selection = root_config
+            .agents
+            .get(agent_alias)
+            .and_then(|agent| root_config.resolve_model_selection(agent.model_provider.as_str()));
+        let llm_task_model = selection
+            .as_ref()
+            .and_then(|s| s.model_id.clone())
+            .or_else(|| entry.model.clone())
             .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options =
+        let llm_task_temperature = selection
+            .as_ref()
+            .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+            .or(entry.temperature);
+        let mut llm_task_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
+        zeroclaw_providers::apply_model_entry_options(
+            &mut llm_task_runtime_options,
+            selection.as_ref().and_then(|s| s.model_entry),
+        );
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
             llm_task_provider,
             llm_task_model,
-            entry.temperature,
+            llm_task_temperature,
             entry.api_key.clone(),
             llm_task_runtime_options,
         )));

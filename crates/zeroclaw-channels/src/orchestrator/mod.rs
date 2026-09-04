@@ -1623,7 +1623,7 @@ fn resolve_models_command(
     raw: &str,
 ) -> ModelsCommandResolution {
     let candidate = raw.trim();
-    if let Some((family, alias)) = candidate.split_once('.') {
+    if let Some((family, alias)) = zeroclaw_config::schema::provider_profile_ref(candidate) {
         return match config.providers.models.find(family, alias) {
             Some(_) => ModelsCommandResolution::Resolved(format!("{family}.{alias}")),
             None => ModelsCommandResolution::NoAlias(candidate.to_string()),
@@ -1699,7 +1699,12 @@ fn model_provider_entry_for_ref<'a>(
         anyhow::bail!("model_provider reference must not be empty");
     }
 
-    let Some((provider_type, provider_alias)) = trimmed.split_once('.') else {
+    // Accept both `<type>.<alias>` and `<type>.<alias>.<model>`. The provider
+    // profile is keyed by the first two segments, while the complete reference
+    // remains the identity of the selected model for reload and routing.
+    let Some((provider_type, provider_alias)) =
+        zeroclaw_config::schema::provider_profile_ref(trimmed)
+    else {
         anyhow::bail!("model_provider `{trimmed}` must use `<type>.<alias>` form");
     };
     let Some(entry) = config.providers.models.find(provider_type, provider_alias) else {
@@ -1716,12 +1721,16 @@ fn runtime_defaults_from_config(
     model_provider: &str,
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
     let (default_model_provider, entry) = model_provider_entry_for_ref(config, model_provider)?;
-    let model = entry
-        .model
-        .as_deref()
-        .map(str::trim)
+    // Resolve the (possibly three-segment) selection so a
+    // `<type>.<alias>.<model>` ref picks the model entry's `id` and per-model
+    // temperature; a two-segment ref falls back to the profile's `model`.
+    let selection = config.resolve_model_selection(model_provider.trim());
+    let model = selection
+        .as_ref()
+        .and_then(|s| s.model_id.clone())
+        .or_else(|| entry.model.clone())
+        .map(|m| m.trim().to_string())
         .filter(|model| !model.is_empty())
-        .map(ToString::to_string)
         .ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1739,10 +1748,14 @@ fn runtime_defaults_from_config(
                  fallback entry."
             ))
         })?;
+    let temperature = selection
+        .as_ref()
+        .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+        .or(entry.temperature);
     Ok(ChannelRuntimeDefaults {
         default_model_provider,
         model,
-        temperature: entry.temperature,
+        temperature,
         api_key: entry.api_key.clone(),
         api_url: entry.uri.clone(),
         reliability: config.reliability.clone(),
@@ -1842,10 +1855,22 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
-    let next_options = zeroclaw_providers::options_for_provider_ref(
+    let mut next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,
         &ctx.provider_runtime_options,
+    );
+    // `options_for_provider_ref` resolves profile-level options only; overlay
+    // the per-model tuning for the selected model entry. The reload defaults
+    // keep the agent's complete reference (`<type>.<alias>` or
+    // `<type>.<alias>.<model>`), so resolving from it preserves a non-default
+    // nested model across hot reloads.
+    zeroclaw_providers::apply_model_entry_options(
+        &mut next_options,
+        next_config
+            .resolve_model_selection(&next_defaults.default_model_provider)
+            .as_ref()
+            .and_then(|s| s.model_entry),
     );
     let model_provider_instance = zeroclaw_providers::create_resilient_model_provider_from_ref(
         next_config.as_ref(),
@@ -1980,6 +2005,7 @@ fn set_route_selection(
 
 fn apply_model_ref(
     sel: &mut ChannelRouteSelection,
+    config: &zeroclaw_config::schema::Config,
     model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
     model: &str,
 ) {
@@ -1988,7 +2014,10 @@ fn apply_model_ref(
         .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
     {
         sel.model_provider = route.model_provider.clone();
-        sel.model = route.model.clone();
+        // An unset route model resolves through the selection contract so a
+        // three-segment route ref keeps the named model entry's id instead of
+        // dispatching with an empty model string.
+        sel.model = route.effective_model(config);
         sel.api_key = route.api_key.clone();
     } else {
         sel.model = model.to_string();
@@ -2577,7 +2606,8 @@ fn provider_credentials_for_ref(
     config: &zeroclaw_config::schema::Config,
     provider_ref: &str,
 ) -> (Option<String>, Option<String>) {
-    let Some((type_key, alias_key)) = provider_ref.trim().split_once('.') else {
+    let Some((type_key, alias_key)) = zeroclaw_config::schema::provider_profile_ref(provider_ref)
+    else {
         return (None, None);
     };
     config
@@ -2626,12 +2656,18 @@ async fn get_or_create_provider(
     let effective_api_key = route_api_key.map(ToString::to_string).or(entry_api_key);
 
     let model_provider = create_resilient_model_provider_nonblocking(
-        config,
+        Arc::clone(&config),
         provider_name,
         effective_api_key,
         entry_api_url,
         defaults.reliability,
         ctx.provider_runtime_options.clone(),
+        // Resolve the ref's selected model entry: default-route selections
+        // carry the agent's complete reference, and route refs may name a
+        // nested model directly.
+        config
+            .resolve_model_selection(provider_name)
+            .and_then(|s| s.model_entry.cloned()),
     )
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
@@ -2662,14 +2698,18 @@ async fn create_resilient_model_provider_nonblocking(
     api_url: Option<String>,
     reliability: zeroclaw_config::schema::ReliabilityConfig,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    model_entry: Option<zeroclaw_config::schema::ModelEntryConfig>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
-        let options = zeroclaw_providers::options_for_provider_ref(
+        let mut options = zeroclaw_providers::options_for_provider_ref(
             &config,
             &provider_name,
             &provider_runtime_options,
         );
+        // `options_for_provider_ref` re-derives base options from the profile
+        // for a dotted ref, so overlay the selected model entry's tuning here.
+        zeroclaw_providers::apply_model_entry_options(&mut options, model_entry.as_ref());
         zeroclaw_providers::create_resilient_model_provider_from_ref(
             &config,
             &provider_name,
@@ -3129,7 +3169,12 @@ async fn handle_runtime_command_if_needed(
                 // Resolve provider+model the same way bare `/model` does, then
                 // write it at the requested scope instead of the per-sender route.
                 let mut next = current.clone();
-                apply_model_ref(&mut next, &ctx.model_routes, &model);
+                apply_model_ref(
+                    &mut next,
+                    defaults_snapshot.config.as_ref(),
+                    &ctx.model_routes,
+                    &model,
+                );
                 set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
                 if scope == OverrideScope::Agent {
                     let channel_alias =
@@ -3174,7 +3219,12 @@ async fn handle_runtime_command_if_needed(
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
             } else {
-                apply_model_ref(&mut current, &ctx.model_routes, &model);
+                apply_model_ref(
+                    &mut current,
+                    defaults_snapshot.config.as_ref(),
+                    &ctx.model_routes,
+                    &model,
+                );
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
                 let mut resp = channel_runtime_cli_string_with_args(
@@ -3559,7 +3609,7 @@ async fn resolve_classifier_route(
         return None;
     }
 
-    let (type_key, alias_key) = match provider_str.split_once('.') {
+    let (type_key, alias_key) = match zeroclaw_config::schema::provider_profile_ref(provider_str) {
         Some(parts) => parts,
         None => {
             ::zeroclaw_log::record!(
@@ -3592,8 +3642,20 @@ async fn resolve_classifier_route(
         }
     };
 
-    let model = model_cfg.model.clone().unwrap_or_default();
-    let temperature = model_cfg.temperature;
+    // Resolve the (possibly three-segment) selection so a
+    // `<type>.<alias>.<model>` classifier ref picks the model entry's id/temp.
+    let selection = defaults_snapshot
+        .config
+        .resolve_model_selection(provider_str.trim());
+    let model = selection
+        .as_ref()
+        .and_then(|s| s.model_id.clone())
+        .or_else(|| model_cfg.model.clone())
+        .unwrap_or_default();
+    let temperature = selection
+        .as_ref()
+        .and_then(|s| s.model_entry.and_then(|m| m.temperature))
+        .or(model_cfg.temperature);
     if model.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -3607,6 +3669,9 @@ async fn resolve_classifier_route(
 
     let provider = match get_or_create_provider(
         ctx,
+        // Pass the complete (possibly three-segment) ref so the provider
+        // cache keys on the named model entry and its per-model tuning is
+        // resolved, matching the id/temperature pair derived above.
         provider_str,
         model_cfg.api_key.as_deref(),
         defaults_snapshot,
@@ -6406,10 +6471,14 @@ async fn process_channel_message_body(
             .iter()
             .find(|r| r.hint.eq_ignore_ascii_case(&hint))
     {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_provider": matched_route.model_provider.as_str(), "model": matched_route.model.as_str()})), "Channel message classified — overriding route");
+        // An unset route model resolves through the selection contract so a
+        // three-segment route ref dispatches to the named model entry instead
+        // of carrying an empty model string into the turn.
+        let route_model = matched_route.effective_model(runtime_defaults.config.as_ref());
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hint": hint.as_str(), "model_provider": matched_route.model_provider.as_str(), "model": route_model.as_str()})), "Channel message classified — overriding route");
         route = ChannelRouteSelection {
             model_provider: matched_route.model_provider.clone(),
-            model: matched_route.model.clone(),
+            model: route_model,
             api_key: matched_route.api_key.clone(),
         };
     }
@@ -12446,6 +12515,11 @@ pub async fn start_channels(
         let provider_reliability = runtime_defaults.reliability.clone();
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
+        // Per-model tuning for the agent's selected entry is applied inside the
+        // builder (which re-derives base options from the profile).
+        let model_entry_options = config
+            .resolve_model_selection(agent.model_provider.as_str())
+            .and_then(|s| s.model_entry.cloned());
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
@@ -12454,6 +12528,7 @@ pub async fn start_channels(
                 provider_api_url.clone(),
                 provider_reliability.clone(),
                 provider_runtime_options.clone(),
+                model_entry_options.clone(),
             )
             .await?,
         );
@@ -12973,11 +13048,10 @@ pub async fn start_channels(
                 &config.data_dir,
             )
             .map(|tracker| {
-                let by_type =
-                    zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config);
+                let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
                 ChannelCostTrackingState {
                     tracker,
-                    model_provider_pricing: Arc::new(by_type),
+                    model_provider_pricing: Arc::new(pricing),
                     agent_alias: Arc::new(agent_alias.clone()),
                 }
             }),
@@ -16253,6 +16327,49 @@ api_key = "cold-key"
             Some("https://hot.example.test/v1")
         );
         assert_eq!(defaults.temperature, Some(0.2));
+    }
+
+    #[tokio::test]
+    async fn load_runtime_config_preserves_nested_model_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[agents.agent_a]
+model_provider = "openrouter.hot.reasoning"
+
+[providers.models.openrouter.hot]
+api_key = "hot-key"
+uri = "https://hot.example.test/v1"
+
+[providers.models.openrouter.hot.models.reasoning]
+id = "or-reasoning-model"
+temperature = 0.1
+"#,
+        )
+        .await
+        .unwrap();
+
+        let (config, defaults) = load_runtime_config_and_defaults(&config_path, "agent_a")
+            .await
+            .unwrap();
+
+        // The complete three-segment ref survives the reload — collapsing it
+        // to `openrouter.hot` would fall back to the profile's default/legacy
+        // model on the rebuild path.
+        assert_eq!(defaults.default_model_provider, "openrouter.hot.reasoning");
+        assert_eq!(defaults.model, "or-reasoning-model");
+        assert_eq!(defaults.api_key.as_deref(), Some("hot-key"));
+        assert_eq!(defaults.temperature, Some(0.1));
+        // The selected nested entry resolves for the per-model tuning overlay.
+        let selection = config
+            .resolve_model_selection(&defaults.default_model_provider)
+            .expect("nested model selection resolves after reload");
+        assert_eq!(selection.model_id.as_deref(), Some("or-reasoning-model"));
+        assert!(selection.model_entry.is_some());
     }
 
     #[tokio::test]

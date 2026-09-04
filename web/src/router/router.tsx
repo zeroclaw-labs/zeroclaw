@@ -59,6 +59,7 @@ export const Router = () => (
         <Route path="/config/:section" element={<Config />} />
         <Route path="/config/:section/:type" element={<Config />} />
         <Route path="/config/:section/:type/:alias" element={<Config />} />
+        <Route path="/config/:section/:type/:alias/:sub" element={<Config />} />
         <Route path="/setup/:section" element={<Config />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/doctor" element={<Doctor />} />

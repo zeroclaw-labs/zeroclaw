@@ -31,6 +31,17 @@ export function entityConfigPath(kind: EntityKind, id: string): string {
   const { section, shape } = ENTITY_SECTION[kind];
   if (shape === 'picker') return `/config/${section}`;
   if (shape === 'typed') {
+    // A model-provider ref may be three-segment (`<type>.<alias>.<model>`);
+    // the edit surface is always the profile page keyed by `<type>/<alias>`,
+    // so route on the first two segments and drop any `<model>`. Other typed
+    // sections (channels) are always two-segment `<type>.<alias>`.
+    if (kind === 'model-provider') {
+      const [type, alias] = id.split('.');
+      if (type && alias) {
+        return `/config/${section}/${encodeURIComponent(type)}/${encodeURIComponent(alias)}`;
+      }
+      return `/config/${section}`;
+    }
     const dot = id.indexOf('.');
     if (dot > 0) {
       return `/config/${section}/${encodeURIComponent(id.slice(0, dot))}/${encodeURIComponent(id.slice(dot + 1))}`;

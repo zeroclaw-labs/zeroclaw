@@ -307,8 +307,23 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_get)
     }
 
+    /// Look up a model entry `<family>.<alias>.models.<model_alias>`. Returns
+    /// `None` when the provider profile is missing or has no such model entry.
+    #[must_use]
+    pub fn find_model(
+        &self,
+        family: &str,
+        alias: &str,
+        model_alias: &str,
+    ) -> Option<&super::schema::ModelEntryConfig> {
+        self.find(family, alias)?.models.get(model_alias)
+    }
+
     pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
-        if let Some((kind, alias)) = name.split_once('.') {
+        // A ref may be three-segment (`<type>.<alias>.<model>`); the profile
+        // lookup only needs `<type>.<alias>`, so key off the first two segments
+        // and ignore any model selector.
+        if let Some((kind, alias)) = super::schema::provider_profile_ref(name) {
             macro_rules! emit_dotted {
                 ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                     match kind {

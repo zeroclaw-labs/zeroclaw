@@ -4784,9 +4784,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let final_temperature = temperature
                     .unwrap_or_else(|| agent_entry.and_then(|e| e.temperature).unwrap_or(0.7));
                 if let Some(p) = &model_provider {
-                    // Parse --model-provider as "type.alias" or bare "type" (use agent alias as alias name).
-                    let (type_key, alias_key) =
-                        p.split_once('.').unwrap_or((p.as_str(), &agent_alias));
+                    // Parse --model-provider as "type.alias", bare "type" (use
+                    // the agent alias as the alias), or "type.alias.model" (a
+                    // nested model entry under that profile).
+                    let mut parts = p.splitn(3, '.');
+                    let type_key = parts.next().unwrap_or_default();
+                    let alias_key = parts.next().unwrap_or(agent_alias.as_str());
+                    let model_alias = parts.next();
                     let entry = config
                         .providers
                         .models
@@ -4807,13 +4811,28 @@ async fn async_main(command: clap::Command) -> Result<()> {
                              Configure a provider via `zeroclaw quickstart` or the /config editor."
                             ))
                         })?;
-                    if let Some(m) = &model {
-                        entry.model = Some(m.clone());
+                    // A three-segment override writes the model and temperature
+                    // onto the nested model entry; two-segment keeps the legacy
+                    // profile-level fields.
+                    if let Some(model_alias) = model_alias {
+                        let model_entry = entry.models.entry(model_alias.to_string()).or_default();
+                        if let Some(m) = &model {
+                            model_entry.id = Some(m.clone());
+                        }
+                        model_entry.temperature = Some(final_temperature);
+                    } else {
+                        if let Some(m) = &model {
+                            entry.model = Some(m.clone());
+                        }
+                        entry.temperature = Some(final_temperature);
                     }
-                    entry.temperature = Some(final_temperature);
                     // Update the agent's model_provider to point to the override
                     if let Some(agent_cfg) = config.agents.get_mut(&agent_alias) {
-                        agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+                        agent_cfg.model_provider = match model_alias {
+                            Some(_) => p.clone(),
+                            None => format!("{type_key}.{alias_key}"),
+                        }
+                        .into();
                     }
                 } else if config.model_provider_for_agent(&agent_alias).is_none() {
                     anyhow::bail!(
@@ -4830,14 +4849,21 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     provider_name,
                     resolved_entry.and_then(|e| e.api_key.as_deref()),
                 )?;
-                let model_name = resolved_entry
-                    .and_then(|e| e.model.as_deref())
-                    .unwrap_or("default");
+                // Resolve the model through the agent's (possibly just
+                // overridden) full reference so a nested model entry's `id`
+                // wins over the legacy profile-level `model`.
+                let model_name = config
+                    .agents
+                    .get(&agent_alias)
+                    .and_then(|agent| config.resolve_model_selection(agent.model_provider.as_str()))
+                    .and_then(|selection| selection.model_id)
+                    .or_else(|| resolved_entry.and_then(|e| e.model.clone()))
+                    .unwrap_or_else(|| "default".to_string());
                 match message {
                     Some(msg) => {
                         let response =
                             zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                .simple_chat(&msg, model_name, Some(final_temperature))
+                                .simple_chat(&msg, model_name.as_str(), Some(final_temperature))
                                 .await?;
                         println!("{response}");
                     }
@@ -4866,7 +4892,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             };
                             let response =
                                 zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
-                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
+                                    .simple_chat(
+                                        line.trim(),
+                                        model_name.as_str(),
+                                        Some(final_temperature),
+                                    )
                                     .await?;
                             println!("{response}");
                         }
@@ -9482,10 +9512,21 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 // knobs — without them, OAuth/subscription providers (codex,
                 // opencode) sit unauthenticated and never answer. This mirrors the
                 // delegate tool's provider construction.
-                let options = zeroclaw::providers::provider_runtime_options_for_alias(
+                let mut options = zeroclaw::providers::provider_runtime_options_for_alias(
                     config,
                     provider_type,
                     alias,
+                );
+                let selection = config.resolve_model_selection(
+                    config
+                        .agents
+                        .get("default")
+                        .map(|agent| agent.model_provider.as_str())
+                        .unwrap_or_default(),
+                );
+                zeroclaw::providers::apply_model_entry_options(
+                    &mut options,
+                    selection.as_ref().and_then(|s| s.model_entry),
                 );
                 let provider = match zeroclaw::providers::create_model_provider_for_alias(
                     config,
@@ -9509,7 +9550,17 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                         return None;
                     }
                 };
-                let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
+                let model = config
+                    .resolve_model_selection(
+                        config
+                            .agents
+                            .get("default")
+                            .map(|agent| agent.model_provider.as_str())
+                            .unwrap_or_default(),
+                    )
+                    .and_then(|selection| selection.model_id)
+                    .or_else(|| entry.model.clone())
+                    .unwrap_or_else(|| "default".to_string());
                 Some(std::sync::Arc::new(
                     zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
                         std::sync::Arc::from(provider),
@@ -9909,7 +9960,10 @@ async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
             .providers
             .models
             .iter_entries()
-            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .find(|(_, _, entry)| {
+                entry.model.as_ref().is_some_and(|m| !m.trim().is_empty())
+                    || !entry.models.is_empty()
+            })
             .ok_or_else(|| {
                 anyhow::Error::msg(
                     "No model provider configured. Run `zeroclaw config init` first.",
@@ -9917,7 +9971,14 @@ async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
             })?;
         (entry.0, entry.1.to_string())
     };
-    let prop_path = format!("providers.models.{type_key}.{alias}.model");
+    // When the profile resolves through a nested model entry (`models.default`
+    // or its sole entry), the profile-level `model` is shadowed — the write
+    // must land on that entry's `id` or the command silently does nothing.
+    let prop_path = config
+        .resolve_model_selection(&format!("{type_key}.{alias}"))
+        .and_then(|selection| selection.model_alias)
+        .map(|model_alias| format!("providers.models.{type_key}.{alias}.models.{model_alias}.id"))
+        .unwrap_or_else(|| format!("providers.models.{type_key}.{alias}.model"));
     config.set_prop_persistent(&prop_path, model)?;
     Box::pin(config.save_dirty()).await?;
     println!(
