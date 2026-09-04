@@ -8,7 +8,7 @@ use serde_json::Value;
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
-pub use crate::rpc::session::SessionOverrides;
+pub use crate::rpc::session::{SessionOverrideField, SessionOverrides};
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
 pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -264,6 +264,9 @@ rpc_type! {
         pub session_id: String,
         #[serde(default)]
         pub overrides: SessionOverrides,
+        /// Overrides to clear before `overrides` applies.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub reset: Vec<SessionOverrideField>,
     }
 }
 
