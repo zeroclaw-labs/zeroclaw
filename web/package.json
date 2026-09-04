@@ -9,7 +9,7 @@
   },
   "scripts": {
     "pretest": "npm run pretest:contexts && node --experimental-strip-types --test src/contexts/turnStream.logic.test.ts",
-    "pretest:contexts": "jiti src/lib/chatSessions.test.ts && JITI_JSX=1 JITI_TSCONFIG_PATHS=1 jiti src/contexts/sessionLifecycle.test.ts",
+    "pretest:contexts": "jiti src/lib/chatSessions.test.ts && JITI_TSCONFIG_PATHS=1 jiti src/pages/chatWorkspace.state.test.ts && JITI_JSX=1 JITI_TSCONFIG_PATHS=1 jiti src/contexts/sessionLifecycle.test.ts",
     "check:generated": "node scripts/check-generated-api.mjs",
     "typecheck": "npm run check:generated && tsc -b",
     "build": "npm run check:generated && tsc -b && vite build",

@@ -96,6 +96,8 @@ export interface AgentContextValue {
    * switch back to and session management is withheld.
    */
   sessionPersistence: boolean | null;
+  /** Conversations another pane is showing; not selectable or deletable here. */
+  reservedSessionIds: readonly string[];
   /** Begin an additional conversation without discarding the current one. */
   startNewSession: () => boolean;
   /** Resume a stored conversation; its transcript is rehydrated. */
@@ -153,6 +155,22 @@ export interface AgentProviderProps {
   /** Configured agent alias this provider is bound to. The WebSocket
    * connection, session ID, and chat history are all scoped to this alias. */
   agentAlias: string;
+  /**
+   * Conversation to open. Omit to resume the alias's last one. The workspace
+   * passes it per pane so the same agent can be open twice on two different
+   * conversations, which the per-alias pointer alone cannot express.
+   */
+  initialSessionId?: string;
+  /**
+   * Conversations already claimed by other panes. Those must not be opened or
+   * deleted from here: two sockets on one gateway session produce two Agents
+   * whose histories diverge, and abort/clear address a session by id, so the
+   * panes would cancel and wipe each other's turns.
+   */
+  reservedSessionIds?: readonly string[];
+  /** Called when this pane moves to another conversation, so the owner can
+   * remember where the pane is. */
+  onSessionChange?: (sessionId: string) => void;
   children: React.ReactNode;
   /** Narrow session boundary used by the headless lifecycle regression suite. */
   sessionRuntime?: AgentSessionRuntime;
@@ -186,15 +204,23 @@ const defaultSessionRuntime: AgentSessionRuntime = {
   mintId: newSessionId,
 };
 
+/** Shared empty array so panes with no siblings keep a stable context value. */
+const NO_RESERVED_SESSIONS: readonly string[] = [];
+
 export function AgentProvider({
   agentAlias,
+  initialSessionId,
+  reservedSessionIds,
+  onSessionChange,
   children,
   sessionRuntime = defaultSessionRuntime,
 }: AgentProviderProps) {
   // The conversation this provider is showing. State, not a ref: switching it
   // is what re-runs hydration and rebuilds the socket, which is how one agent
   // serves several independent conversations (issue #7543).
-  const [sessionId, setSessionId] = useState(() => getActiveSessionId(agentAlias));
+  const [sessionId, setSessionId] = useState(
+    () => initialSessionId ?? getActiveSessionId(agentAlias),
+  );
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     const persisted = loadChatHistory(sessionId);
     return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
@@ -1083,10 +1109,16 @@ export function AgentProvider({
     activeSessionIdRef.current = nextSessionId;
     sessionPersistenceRef.current = null;
     typingRef.current = false;
+    // The pointer records the alias's most recently selected conversation, so a
+    // deep link or a fresh workspace resumes there. With the same agent open in
+    // two panes the last switch wins, which is why a pane that has an owner
+    // also reports upward — the owner, not the pointer, is what restores each
+    // pane to its own conversation.
     setActiveSessionId(agentAlias, nextSessionId);
     setSessionId(nextSessionId);
+    onSessionChange?.(nextSessionId);
     return true;
-  }, [agentAlias, resetTranscriptState]);
+  }, [agentAlias, onSessionChange, resetTranscriptState]);
 
   const goToSession = useCallback((nextSessionId: string): boolean => (
     transitionToSession(nextSessionId)
@@ -1172,6 +1204,7 @@ export function AgentProvider({
     sessionId,
     hydrated: hydratedSessionId === sessionId,
     sessionPersistence,
+    reservedSessionIds: reservedSessionIds ?? NO_RESERVED_SESSIONS,
     startNewSession,
     goToSession,
     removeSession,

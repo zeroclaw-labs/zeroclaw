@@ -240,7 +240,11 @@ interface MountedChat {
   drafts: Map<string, string>;
 }
 
-async function mountChat(runtime: FakeSessionRuntime, includeChat = false): Promise<MountedChat> {
+async function mountChat(
+  runtime: FakeSessionRuntime,
+  includeChat = false,
+  reservedSessionIds?: readonly string[],
+): Promise<MountedChat> {
   let currentContext: AgentContextValue | null = null;
   const drafts = new Map<string, string>();
   const draftStore = {
@@ -265,6 +269,7 @@ async function mountChat(runtime: FakeSessionRuntime, includeChat = false): Prom
           {
             agentAlias: 'ops',
             sessionRuntime: runtime,
+            reservedSessionIds,
             children: createElement(
               React.Fragment,
               null,
@@ -434,6 +439,55 @@ test('selecting the active picker row closes the menu', async () => {
       .find((button) => button.props.title === 'Conversations')?.props['aria-expanded'],
     false,
   );
+  await unmount(mounted.renderer);
+});
+
+test('a conversation another pane owns can be neither opened nor deleted here', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  // A sibling pane of the same agent is live on conversation B.
+  const mounted = await mountChat(runtime, true, ['B']);
+  await openSocket(runtime, 0);
+  await settle();
+
+  assert.deepEqual([...mounted.context().reservedSessionIds], ['B']);
+
+  const trigger = mounted.renderer.root.findAllByType('button')
+    .find((button) => button.props.title === 'Conversations');
+  assert.ok(trigger);
+  await act(async () => { trigger.props.onClick(); });
+  await settle();
+
+  const buttons = () => mounted.renderer.root.findAllByType('button');
+  const reservedRow = buttons()
+    .find((button) => button.props.title === 'Open in another tab' && nodeText(button).includes('Second'));
+  assert.ok(reservedRow, 'the sibling-owned row must render');
+  assert.equal(reservedRow.props.disabled, true);
+
+  // Clicking it anyway must not move this pane onto the sibling's conversation:
+  // two sockets on one gateway session diverge and can abort each other.
+  await act(async () => { reservedRow.props.onClick(); });
+  await settle();
+  assert.equal(mounted.context().sessionId, 'A');
+  assert.equal(runtime.sockets.length, 1);
+
+  const reservedDelete = buttons()
+    .find((button) => button.props['aria-label'] === 'Delete conversation: Second');
+  assert.ok(reservedDelete, 'the sibling-owned row must still offer a delete affordance');
+  assert.equal(reservedDelete.props.disabled, true);
+  await act(async () => { reservedDelete.props.onClick(); });
+  await settle();
+  assert.deepEqual(runtime.deleteCalls, []);
+
+  // A conversation no sibling holds stays fully operable from this pane.
+  const freeRow = buttons()
+    .find((button) => button.props.title !== 'Conversations' && nodeText(button).includes('First'));
+  assert.ok(freeRow);
+  assert.equal(freeRow.props.disabled, false);
+  const freeDelete = buttons()
+    .find((button) => button.props['aria-label'] === 'Delete conversation: First');
+  assert.equal(freeDelete?.props.disabled, false);
+
   await unmount(mounted.renderer);
 });
 
