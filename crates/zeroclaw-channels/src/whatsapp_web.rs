@@ -305,6 +305,33 @@ type ApprovalSendHook = Arc<
 >;
 
 #[cfg(feature = "whatsapp-web")]
+#[derive(Clone)]
+struct ReactionTarget {
+    key: waproto::whatsapp::MessageKey,
+    inserted_at: std::time::Instant,
+}
+
+#[cfg(feature = "whatsapp-web")]
+type ReactionTargetRegistry =
+    tokio::sync::Mutex<std::collections::HashMap<(String, String), ReactionTarget>>;
+
+#[cfg(feature = "whatsapp-web")]
+const MAX_REACTION_TARGETS: usize = 1024;
+
+#[cfg(feature = "whatsapp-web")]
+const REACTION_TARGET_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+#[cfg(all(test, feature = "whatsapp-web"))]
+type ReactionSendHook = Arc<
+    dyn Fn(
+            String,
+            waproto::whatsapp::Message,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
     /// Session database path
     session_path: String,
@@ -355,6 +382,8 @@ pub struct WhatsAppWebChannel {
     bot_handle: Arc<Mutex<Option<whatsapp_rust::bot::BotHandle>>>,
     /// Client handle for sending messages and typing indicators
     client: Arc<Mutex<Option<Arc<whatsapp_rust::Client>>>>,
+    /// Recently dispatched inbound 1:1 native message keys eligible for reactions.
+    reaction_targets: Arc<ReactionTargetRegistry>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
@@ -394,6 +423,8 @@ pub struct WhatsAppWebChannel {
     /// between a token's registration and the cleanup that follows it.
     #[cfg(test)]
     approval_send_hook: Option<ApprovalSendHook>,
+    #[cfg(test)]
+    reaction_send_hook: Option<ReactionSendHook>,
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -423,6 +454,7 @@ struct WhatsAppInboundContext {
     transcription_config: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    reaction_targets: Arc<ReactionTargetRegistry>,
 }
 
 impl WhatsAppWebChannel {
@@ -483,6 +515,7 @@ impl WhatsAppWebChannel {
             allowed_groups_resolver,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
+            reaction_targets: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
             transcription_manager: None,
@@ -495,6 +528,8 @@ impl WhatsAppWebChannel {
             persist: None,
             #[cfg(test)]
             approval_send_hook: None,
+            #[cfg(test)]
+            reaction_send_hook: None,
         }
     }
 
@@ -543,6 +578,32 @@ impl WhatsAppWebChannel {
             return hook(message.clone()).await;
         }
         self.send(message).await
+    }
+
+    #[cfg(all(test, feature = "whatsapp-web"))]
+    fn with_reaction_send_hook(mut self, hook: ReactionSendHook) -> Self {
+        self.reaction_send_hook = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_reaction_message(
+        &self,
+        recipient: String,
+        message: waproto::whatsapp::Message,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.reaction_send_hook.clone() {
+            return hook(recipient, message).await;
+        }
+
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        let to = self.recipient_to_jid(&recipient)?;
+        Box::pin(client.send_message(to, message)).await?;
+        Ok(())
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -765,6 +826,20 @@ impl WhatsAppWebChannel {
         let sender_alt = info.source.sender_alt.clone();
         let sender = sender_jid.user().to_string();
         let chat = info.source.chat.to_string();
+
+        // Preserve the native WhatsApp message id for ack_reactions. Missing
+        // ids still get a normal ChannelMessage UUID, but are not eligible
+        // for reactions because that UUID cannot identify a WhatsApp message.
+        let native_msg_id = if info.id.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "WhatsApp message missing native id, falling back to UUID"
+            );
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            info.id.clone()
+        };
 
         let allowed_peers = (context.peer_resolver)();
         let sender_resolution = Self::resolve_sender_allowlist(
@@ -1026,6 +1101,7 @@ impl WhatsAppWebChannel {
                 Vec::new(),
                 true,
                 conversation_scope,
+                native_msg_id,
             )
             .await;
             return;
@@ -1103,6 +1179,12 @@ impl WhatsAppWebChannel {
                 .await;
         }
 
+        if let Some(target) =
+            Self::inbound_reaction_target(&reply_target, is_group, info.source.is_from_me, &info.id)
+        {
+            Self::remember_reaction_target(&context.reaction_targets, target).await;
+        }
+
         Self::send_inbound_channel_message(
             &context.tx,
             context.alias.as_ref(),
@@ -1112,6 +1194,7 @@ impl WhatsAppWebChannel {
             attachments,
             false,
             conversation_scope,
+            native_msg_id,
         )
         .await;
     }
@@ -1120,6 +1203,65 @@ impl WhatsAppWebChannel {
     fn compute_reply_target(chat_jid: &str) -> String {
         // Pass through unchanged - library handles LID resolution internally
         chat_jid.to_string()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_reaction_target(
+        remote_jid: &str,
+        is_group: bool,
+        is_from_me: bool,
+        message_id: &str,
+    ) -> Option<ReactionTarget> {
+        if remote_jid.is_empty() || is_group || is_from_me || message_id.is_empty() {
+            return None;
+        }
+        Some(ReactionTarget {
+            key: waproto::whatsapp::MessageKey {
+                remote_jid: Some(remote_jid.to_string()),
+                from_me: Some(false),
+                id: Some(message_id.to_string()),
+                participant: None,
+            },
+            inserted_at: std::time::Instant::now(),
+        })
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn remember_reaction_target(
+        registry: &Arc<ReactionTargetRegistry>,
+        target: ReactionTarget,
+    ) {
+        let now = std::time::Instant::now();
+        let mut targets = registry.lock().await;
+        targets.retain(|_, target| now.duration_since(target.inserted_at) < REACTION_TARGET_TTL);
+        let key = (
+            target.key.remote_jid.clone().unwrap_or_default(),
+            target.key.id.clone().unwrap_or_default(),
+        );
+        if !targets.contains_key(&key)
+            && targets.len() >= MAX_REACTION_TARGETS
+            && let Some(oldest_key) = targets
+                .iter()
+                .min_by_key(|(_, target)| target.inserted_at)
+                .map(|(key, _)| key.clone())
+        {
+            targets.remove(&oldest_key);
+        }
+        targets.insert(key, target);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn reaction_target(
+        registry: &Arc<ReactionTargetRegistry>,
+        remote_jid: &str,
+        message_id: &str,
+    ) -> Option<ReactionTarget> {
+        let now = std::time::Instant::now();
+        let mut targets = registry.lock().await;
+        targets.retain(|_, target| now.duration_since(target.inserted_at) < REACTION_TARGET_TTL);
+        targets
+            .get(&(remote_jid.to_string(), message_id.to_string()))
+            .cloned()
     }
 
     /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and
@@ -1228,6 +1370,18 @@ impl WhatsAppWebChannel {
     /// Returns `true` only when `Event::LoggedOut` was explicitly observed.
     fn should_purge_session(session_revoked: &std::sync::atomic::AtomicBool) -> bool {
         session_revoked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clear reaction targets only after an explicit logout. Ordinary
+    /// reconnects keep their eligible targets alive across the reconnect.
+    #[cfg(feature = "whatsapp-web")]
+    async fn clear_reaction_targets_if_revoked(
+        registry: &Arc<ReactionTargetRegistry>,
+        session_revoked: &std::sync::atomic::AtomicBool,
+    ) {
+        if Self::should_purge_session(session_revoked) {
+            registry.lock().await.clear();
+        }
     }
 
     /// Record a reconnect attempt and return `(attempt_number, exceeded_max)`.
@@ -1657,10 +1811,11 @@ impl WhatsAppWebChannel {
         attachments: Vec<MediaAttachment>,
         passive_context: bool,
         conversation_scope: ChannelConversationScope,
+        id: String,
     ) {
         if let Err(e) = tx
             .send(ChannelMessage {
-                id: uuid::Uuid::new_v4().to_string(),
+                id,
                 channel: "whatsapp".to_string(),
                 channel_alias: Some(alias.to_string()),
                 sender: sender.to_string(),
@@ -2798,6 +2953,7 @@ impl Channel for WhatsAppWebChannel {
                 transcription_config: self.transcription.clone(),
                 transcription_manager: self.transcription_manager.clone(),
                 voice_chats: self.voice_chats.clone(),
+                reaction_targets: self.reaction_targets.clone(),
             };
             let configured_push_name = self.push_name.clone();
 
@@ -3022,6 +3178,11 @@ impl Channel for WhatsAppWebChannel {
             drop(bot);
             drop(device);
 
+            // The old client and bot are fully stopped above. Invalidate
+            // account-scoped reaction targets before the next loop can build
+            // a newly paired client; transient reconnects preserve them.
+            Self::clear_reaction_targets_if_revoked(&self.reaction_targets, &session_revoked).await;
+
             if should_reconnect {
                 let (attempts, exceeded) = Self::record_retry(&retry_count);
                 if exceeded {
@@ -3165,6 +3326,90 @@ impl Channel for WhatsAppWebChannel {
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!("stop typing for {}", recipient)
+        );
+        Ok(())
+    }
+
+    /// Add an emoji reaction to a message.
+    ///
+    /// ## Current scope (honest documentation)
+    ///
+    /// The generic trait exposes only a channel id and message id, so the
+    /// inbound handler records canonical keys only for supported 1:1 inbound
+    /// targets. Group, own-message, missing-id, expired, and unknown targets
+    /// never enter that bounded registry and therefore fail closed here.
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() || emoji.is_empty() {
+            return Ok(());
+        }
+        let deliverable = Self::resolve_outbound_recipient(channel_id);
+        let Some(target) =
+            Self::reaction_target(&self.reaction_targets, &deliverable, message_id).await
+        else {
+            anyhow::bail!("WhatsApp reaction target is unavailable or expired");
+        };
+        let Some(remote_jid) = target.key.remote_jid.clone() else {
+            return Ok(());
+        };
+        let outgoing = waproto::whatsapp::Message {
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                key: Some(target.key.clone()),
+                text: Some(emoji.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.send_reaction_message(remote_jid, outgoing).await?;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("reaction {emoji} added to {message_id}")
+        );
+        Ok(())
+    }
+
+    /// Remove an emoji reaction from a message.
+    ///
+    /// Scope is the same as [`Self::add_reaction`]: inbound 1:1 messages with
+    /// a live canonical key in the bounded reaction registry.
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+        let deliverable = Self::resolve_outbound_recipient(channel_id);
+        let Some(target) =
+            Self::reaction_target(&self.reaction_targets, &deliverable, message_id).await
+        else {
+            anyhow::bail!("WhatsApp reaction target is unavailable or expired");
+        };
+        let Some(remote_jid) = target.key.remote_jid.clone() else {
+            return Ok(());
+        };
+        let outgoing = waproto::whatsapp::Message {
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                key: Some(target.key.clone()),
+                // Empty text removes the reaction per WhatsApp
+                // protocol.
+                text: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.send_reaction_message(remote_jid, outgoing).await?;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("reaction {emoji} removed from {message_id}")
         );
         Ok(())
     }
@@ -3361,6 +3606,23 @@ impl Channel for WhatsAppWebChannel {
             "channel-whatsapp-web-feature-missing-error"
         ));
     }
+
+    async fn add_reaction(&self, _channel_id: &str, _message_id: &str, _emoji: &str) -> Result<()> {
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> Result<()> {
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -3368,6 +3630,195 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn reactions_use_only_inbound_one_to_one_native_targets() {
+        let chat = "15551234567@s.whatsapp.net";
+        let native_id = "native-reaction-id";
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(4);
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "reaction-target-test",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+        .with_reaction_send_hook(Arc::new(move |recipient, message| {
+            let sent_tx = sent_tx.clone();
+            Box::pin(async move {
+                sent_tx
+                    .send((recipient, message))
+                    .await
+                    .map_err(|e| anyhow::Error::msg(format!("reaction test hook closed: {e}")))
+            })
+        }));
+
+        let target = WhatsAppWebChannel::inbound_reaction_target(chat, false, false, native_id)
+            .expect("an inbound 1:1 native message is reaction eligible");
+        WhatsAppWebChannel::remember_reaction_target(&channel.reaction_targets, target).await;
+
+        channel
+            .add_reaction(chat, native_id, "👍")
+            .await
+            .expect("eligible reaction should send");
+        let (recipient, added) = sent_rx
+            .recv()
+            .await
+            .expect("add reaction should be captured");
+        assert_eq!(recipient, chat);
+        let added = added
+            .reaction_message
+            .expect("captured add should contain a reaction message");
+        let key = added
+            .key
+            .expect("captured add should contain a message key");
+        assert_eq!(key.remote_jid.as_deref(), Some(chat));
+        assert_eq!(key.id.as_deref(), Some(native_id));
+        assert_eq!(key.from_me, Some(false));
+        assert_eq!(key.participant, None);
+        assert_eq!(added.text.as_deref(), Some("👍"));
+
+        channel
+            .remove_reaction(chat, native_id, "👍")
+            .await
+            .expect("eligible removal should send");
+        let (_, removed) = sent_rx
+            .recv()
+            .await
+            .expect("remove reaction should be captured");
+        let removed = removed
+            .reaction_message
+            .expect("captured removal should contain a reaction message");
+        assert_eq!(removed.text.as_deref(), Some(""));
+
+        for (label, is_group, is_from_me, missing_id) in [
+            ("group", true, false, "group-reaction-id"),
+            ("own message", false, true, "own-reaction-id"),
+            ("missing native id", false, false, ""),
+        ] {
+            assert!(
+                WhatsAppWebChannel::inbound_reaction_target(
+                    chat,
+                    is_group,
+                    is_from_me,
+                    missing_id,
+                )
+                .is_none(),
+                "{label} must not enter the reaction registry"
+            );
+            let add_result = channel.add_reaction(chat, missing_id, "👍").await;
+            if missing_id.is_empty() {
+                add_result.expect("empty message id remains a safe no-op");
+            } else {
+                add_result.expect_err("nonempty unsupported reaction must return an error");
+            }
+            let remove_result = channel.remove_reaction(chat, missing_id, "👍").await;
+            if missing_id.is_empty() {
+                remove_result.expect("empty message id remains a safe no-op");
+            } else {
+                remove_result.expect_err("nonempty unsupported removal must return an error");
+            }
+        }
+        assert!(sent_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn nonempty_reaction_miss_errors_without_sending() {
+        let chat = "15551234567@s.whatsapp.net";
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(1);
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "reaction-miss-test",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+        .with_reaction_send_hook(Arc::new(move |recipient, message| {
+            let sent_tx = sent_tx.clone();
+            Box::pin(async move {
+                sent_tx
+                    .send((recipient, message))
+                    .await
+                    .map_err(|e| anyhow::Error::msg(format!("reaction test hook closed: {e}")))
+            })
+        }));
+
+        assert!(
+            channel
+                .add_reaction(chat, "unknown-reaction-id", "👍")
+                .await
+                .is_err()
+        );
+        assert!(
+            channel
+                .remove_reaction(chat, "unknown-reaction-id", "👍")
+                .await
+                .is_err()
+        );
+        assert!(sent_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn duplicate_reaction_target_at_capacity_does_not_evict_another_target() {
+        let registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        for index in 0..MAX_REACTION_TARGETS {
+            let target = WhatsAppWebChannel::inbound_reaction_target(
+                &format!("155500{index}@s.whatsapp.net"),
+                false,
+                false,
+                &format!("native-{index}"),
+            )
+            .expect("synthetic inbound 1:1 target should be eligible");
+            WhatsAppWebChannel::remember_reaction_target(&registry, target).await;
+        }
+
+        let duplicate = WhatsAppWebChannel::inbound_reaction_target(
+            "155500100@s.whatsapp.net",
+            false,
+            false,
+            "native-100",
+        )
+        .expect("existing target should remain eligible");
+        WhatsAppWebChannel::remember_reaction_target(&registry, duplicate).await;
+
+        let targets = registry.lock().await;
+        assert_eq!(targets.len(), MAX_REACTION_TARGETS);
+        assert!(
+            targets.contains_key(&("1555000@s.whatsapp.net".to_string(), "native-0".to_string(),))
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn explicit_logout_clears_reaction_targets_but_reconnect_preserves_them() {
+        use std::sync::atomic::AtomicBool;
+
+        let registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let chat = "15551234567@s.whatsapp.net";
+        let message_id = "reconnect-reaction-id";
+        let target = WhatsAppWebChannel::inbound_reaction_target(chat, false, false, message_id)
+            .expect("synthetic inbound 1:1 target should be eligible");
+        WhatsAppWebChannel::remember_reaction_target(&registry, target).await;
+
+        let ordinary_reconnect = AtomicBool::new(false);
+        WhatsAppWebChannel::clear_reaction_targets_if_revoked(&registry, &ordinary_reconnect).await;
+        assert!(
+            WhatsAppWebChannel::reaction_target(&registry, chat, message_id)
+                .await
+                .is_some(),
+            "ordinary reconnects preserve eligible reaction targets"
+        );
+
+        let explicit_logout = AtomicBool::new(true);
+        WhatsAppWebChannel::clear_reaction_targets_if_revoked(&registry, &explicit_logout).await;
+        assert!(
+            WhatsAppWebChannel::reaction_target(&registry, chat, message_id)
+                .await
+                .is_none(),
+            "explicit logout clears the channel-owned reaction registry"
+        );
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
@@ -4275,6 +4726,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reaction_targets: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
         let message_event = |lid: &str| {
             Event::Message(
@@ -4418,6 +4870,9 @@ mod tests {
                     transcription_config: None,
                     transcription_manager: None,
                     voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                    reaction_targets: Arc::new(tokio::sync::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
                 }
             };
 
@@ -4548,6 +5003,9 @@ mod tests {
                 transcription_config: None,
                 transcription_manager: None,
                 voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                reaction_targets: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
             };
 
         // Personal mode: the operator's own self-chat is admitted even though
@@ -5760,6 +6218,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reaction_targets: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         let reply_event = Event::Message(
@@ -5876,6 +6335,7 @@ mod tests {
             transcription_config: None,
             transcription_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reaction_targets: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         for (word, expected) in [
