@@ -199,8 +199,9 @@ flowchart TD
     I --> M{"Either identity matches<br/>the resolved peer set?"}
     M -->|"yes"| D["Dispatch ChannelMessage to the owning agent"]
     M -->|"no"| B{"Message is /bind code?"}
-    B -->|"no"| H["Reply with the alias-aware operator bind command"]
-    B -->|"yes, pairing active"| V{"One-time code is valid?"}
+    B -->|"no"| H["Reply with the notice for the authorization path in use"]
+    B -->|"yes, startup pairing available"| V{"One-time code is valid?"}
+    B -->|"yes, but pairing is over"| N["Reply that pairing is not active"]
     V -->|"no"| X["Reject; repeated failures can lock out retries"]
     V -->|"yes"| P["Add numeric user ID to peer_groups.telegram_home"]
     P --> W["Save config.toml and accept subsequent messages"]
@@ -212,9 +213,12 @@ The running channel's peer resolver reads that shared config, so the user can
 send the next message immediately without a restart.
 
 The code is one-time. On later restarts the saved peer makes the resolved set
-non-empty, so pairing stays disabled and no replacement code is issued. If the
-bot says it paired only for the current runtime because persistence failed,
-fix the reported config permission or write error before restarting.
+non-empty, so pairing stays disabled and no replacement code is issued. The
+peer set is read live, so a peer that arrives from configuration while the
+channel runs ends pairing at once: an outstanding code stops being redeemable
+without waiting for a restart. If the bot says it paired only for the current
+runtime because persistence failed, fix the reported config permission or
+write error before restarting.
 
 ## 6. Bind another user from the operator CLI
 

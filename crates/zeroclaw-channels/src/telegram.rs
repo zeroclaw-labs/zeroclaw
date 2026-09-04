@@ -1184,8 +1184,9 @@ impl TelegramChannel {
     /// guard outlives the code it issued — `try_pair` clears the code, not
     /// the guard — and peers can start resolving at any time, so a channel
     /// that began empty is not still pairing once either happens. The
-    /// unauthorized notice and the `/bind` hint both read this one predicate
-    /// so they cannot disagree about which path the deployment is on.
+    /// unauthorized notice, the `/bind` hint, and the `/bind` redemption
+    /// branch all read this one predicate, so what the channel says about
+    /// the authorization path and what it accepts cannot disagree.
     fn startup_pairing_available(&self) -> bool {
         self.pairing_code_active() && (self.peer_resolver)().is_empty()
     }
@@ -1931,7 +1932,19 @@ impl TelegramChannel {
         }
 
         if let Some(code) = Self::extract_bind_code(text) {
-            if let Some(pairing) = self.pairing.as_ref() {
+            // Redemption reads the same live predicate the notice and the
+            // `/bind` hint read. The guard's existence is not proof that
+            // startup pairing is still the authorization path: `try_pair`
+            // clears the code and leaves the guard, and a peer set can fill
+            // in while the channel runs. Without this the channel would tell
+            // a sender that pairing is inactive and still accept the
+            // outstanding code from them, writing the peer group that
+            // configuration — possibly a control plane — already owns.
+            if let Some(pairing) = self
+                .pairing
+                .as_ref()
+                .filter(|_| self.startup_pairing_available())
+            {
                 match pairing.try_pair(code, &chat_id).await {
                     Ok(Some(_token)) => {
                         let bind_identity = normalized_sender_id.clone().or_else(|| {
@@ -6072,6 +6085,80 @@ mod tests {
             !texts[2].contains("bind-telegram"),
             "a resolved peer set must not instruct a terminal bind, got: {}",
             texts[2]
+        );
+    }
+
+    /// What the channel says and what it accepts must agree. A channel that
+    /// starts empty issues a one-time code, then gains a configured peer
+    /// while it runs; from that point the notice says pairing is inactive,
+    /// so the outstanding code must stop being redeemable too. Otherwise a
+    /// sender holding the code writes themselves into the peer group that
+    /// configuration — possibly a control plane — already owns.
+    #[tokio::test]
+    async fn bind_code_stops_redeeming_once_peers_resolve() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 1, &[]).await;
+
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let peers = peers.clone();
+            Arc::new(move || peers.lock().clone())
+        };
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            peer_resolver,
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let code = ch
+            .pairing
+            .as_ref()
+            .expect("an empty peer set provisions a pairing guard")
+            .pairing_code()
+            .expect("a fresh guard issues a one-time code");
+
+        // The peer arrives from configuration, not from a redemption: the
+        // code stays outstanding and the guard stays in place.
+        peers.lock().push("zeroclaw_operator".to_string());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_300,
+            71,
+            3_033,
+            "zeroclaw_unauthorized",
+            &format!("/bind {code}"),
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            1,
+            "expected a single reply to the rejected bind, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("pairing is not active"),
+            "a resolved peer set must route the code to the inactive-pairing reply, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[0].contains("bound successfully"),
+            "a valid code must not bind once peers resolve, got: {}",
+            texts[0]
+        );
+        assert_eq!(
+            ch.pairing
+                .as_ref()
+                .expect("guard asserted above")
+                .pairing_code()
+                .as_deref(),
+            Some(code.as_str()),
+            "the rejected attempt must not consume the outstanding code"
         );
     }
 
