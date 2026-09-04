@@ -138,6 +138,7 @@ zc-logs-section-trace = Traza
 zc-logs-section-attribution = Atribución
 zc-logs-section-attributes = Atributos
 zc-logs-preview-only = Carga útil completa no disponible — mostrando solo campos de vista previa.
+zc-logs-persisted-path = Registro persistente: { $path }
 zc-logs-no-event-selected = Ningún evento seleccionado
 zc-logs-loading = Cargando…
 zc-logs-search-action-apply = aplicar

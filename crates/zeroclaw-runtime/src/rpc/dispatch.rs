@@ -841,7 +841,7 @@ impl RpcDispatcher {
             Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
-            Method::SessionNew => self.handle_session_new(&req.params).await,
+            Method::SessionNew => Box::pin(self.handle_session_new(&req.params)).await,
             Method::SessionClose => self.handle_session_close(&req.params).await,
             Method::SessionPrompt => {
                 // Always spawn — turn completion is signaled by a
@@ -1418,14 +1418,20 @@ impl RpcDispatcher {
             .chat_mode
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        if req.interaction_surface.is_some()
+            && !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "interaction_surface is only valid for ACP sessions",
+            ));
+        }
+        let mut resolved_interaction_surface = req.interaction_surface;
 
-        // Resuming an ACP session with no caller cwd: recover the original
-        // working directory from the persisted store so the rehydrated session
-        // keeps its own cwd instead of falling back to the agent workspace dir.
-        // The loaded data is reused below so history is not fetched twice.
+        // Load resumed ACP metadata once, before constructing the live Agent.
+        // The durable row owns the original workspace and interaction surface.
         let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
         if resuming
-            && req.cwd.is_none()
             && matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(ref store) = self.ctx.acp_session_store
         {
@@ -1434,12 +1440,70 @@ impl RpcDispatcher {
             match tokio::task::spawn_blocking(move || store_cloned.load_session_for_restore(&sid))
                 .await
             {
-                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => {
+                Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
+                    mut data,
+                ))) => {
                     if data.agent_alias != req.agent_alias {
                         return Err(rpc_err(
                             INVALID_PARAMS,
                             "ACP session belongs to a different agent",
                         ));
+                    }
+
+                    match data.interaction_surface.as_deref() {
+                        Some(value) => {
+                            if let Some(requested) = req.interaction_surface
+                                && requested.as_str() != value
+                            {
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    "ACP session belongs to a different interaction surface",
+                                ));
+                            }
+                            let stored =
+                                crate::agent::prompt::InteractionSurface::from_persisted(value)
+                                    .ok_or_else(|| {
+                                        rpc_err(
+                                            INVALID_PARAMS,
+                                            "ACP session has an unsupported interaction surface",
+                                        )
+                                    })?;
+                            resolved_interaction_surface = Some(stored);
+                        }
+                        None => {
+                            // Existing databases predate this field. The first
+                            // validated surface declaration claims the NULL slot
+                            // atomically; later mismatches are rejected above.
+                            if let Some(requested) = req.interaction_surface {
+                                let store_cloned = store.clone();
+                                let sid = session_id.clone();
+                                let claimed = requested.as_str().to_string();
+                                let durable = tokio::task::spawn_blocking(move || {
+                                    store_cloned.bind_interaction_surface_if_unset(&sid, &claimed)
+                                })
+                                .await
+                                .map_err(|join| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to bind ACP interaction surface: {join}"),
+                                    )
+                                })?
+                                .map_err(|e| {
+                                    rpc_err(
+                                        INTERNAL_ERROR,
+                                        format!("Failed to bind ACP interaction surface: {e}"),
+                                    )
+                                })?;
+                                if durable != requested.as_str() {
+                                    return Err(rpc_err(
+                                        INVALID_PARAMS,
+                                        "ACP session belongs to a different interaction surface",
+                                    ));
+                                }
+                                data.interaction_surface = Some(durable);
+                                resolved_interaction_surface = Some(requested);
+                            }
+                        }
                     }
                     preloaded_acp = Some(data);
                 }
@@ -1502,6 +1566,9 @@ impl RpcDispatcher {
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+        agent.set_interaction_context(
+            resolved_interaction_surface.map(crate::agent::prompt::InteractionSurface::resolve),
+        );
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -1612,7 +1679,12 @@ impl RpcDispatcher {
                                 data,
                             ) => Ok(AcpSessionNewLoad::Restored(data)),
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
-                                store_cloned.create_session(&sid, &alias, &cwd_owned)?;
+                                store_cloned.create_session_with_interaction_surface(
+                                    &sid,
+                                    &alias,
+                                    &cwd_owned,
+                                    resolved_interaction_surface.map(|surface| surface.as_str()),
+                                )?;
                                 Ok(AcpSessionNewLoad::Created)
                             }
                             zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
@@ -1991,6 +2063,27 @@ impl RpcDispatcher {
         )
         .await
         .ok()?;
+        let interaction_context = match data.interaction_surface.as_deref() {
+            Some(value) => match crate::agent::prompt::InteractionSurface::from_persisted(value) {
+                Some(surface) => Some(surface.resolve()),
+                None => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read,)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": sid,
+                                "interaction_surface": value,
+                            })),
+                        "session/prompt: refusing to rehydrate an unsupported interaction surface"
+                    );
+                    return None;
+                }
+            },
+            None => None,
+        };
+        agent.set_interaction_context(interaction_context);
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -4503,6 +4596,8 @@ impl RpcDispatcher {
 
         to_result(LogsQueryResult {
             events,
+            log_path: zeroclaw_log::active_log_path()
+                .map(|path| path.to_string_lossy().into_owned()),
             next_cursor: page.next_cursor,
             next_cursor_line_offset: page.next_cursor_line_offset,
             at_end: page.at_end,
@@ -8647,6 +8742,24 @@ mod tests {
         (dispatcher, sessions)
     }
 
+    fn make_acp_test_dispatcher_with_receiver(
+        config: zeroclaw_config::schema::Config,
+    ) -> (
+        RpcDispatcher,
+        Arc<crate::rpc::session::SessionStore>,
+        tokio::sync::mpsc::Receiver<String>,
+    ) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stack:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, sessions, rx)
+    }
+
     /// Create a Chat-mode session through the real `session/new` handler,
     /// optionally sending the `keep_siblings` opt-out.
     async fn new_chat_session_for_eviction_test(
@@ -9247,6 +9360,212 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    #[tokio::test]
+    async fn zerocode_code_surface_injects_context_without_changing_authority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": "generic-acp",
+            }))
+            .await
+            .expect("generic ACP session should succeed");
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "zerocode-acp",
+            }))
+            .await
+            .expect("ZeroCode ACP session should succeed");
+
+        let generic = sessions.get_agent("generic-acp").await.unwrap();
+        let surfaced = sessions.get_agent("zerocode-acp").await.unwrap();
+        let mut generic_tools = generic
+            .lock()
+            .await
+            .tool_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let surfaced_guard = surfaced.lock().await;
+        let mut surfaced_tools = surfaced_guard
+            .tool_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        generic_tools.sort();
+        surfaced_tools.sort();
+        assert_eq!(
+            surfaced_tools, generic_tools,
+            "interaction context must not grant or remove tools"
+        );
+
+        let prompt = surfaced_guard.system_prompt_for_test().unwrap();
+        assert!(prompt.contains("## Interaction Context"));
+        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+        assert!(prompt.contains("this description grants no capabilities"));
+        drop(surfaced_guard);
+
+        assert_eq!(
+            acp_store
+                .load_session("zerocode-acp")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_surface_claims_outside_the_closed_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        for params in [
+            json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "interaction_surface": "zerocode_code",
+                "session_id": "wrong-mode",
+            }),
+            json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "caller_defined_surface",
+                "session_id": "unknown-surface",
+            }),
+        ] {
+            let sid = params["session_id"].as_str().unwrap().to_string();
+            let err = dispatcher
+                .handle_session_new_for_test(&params)
+                .await
+                .expect_err("untrusted surface claims must be rejected");
+            assert_eq!(err.code, INVALID_PARAMS);
+            assert!(sessions.get_agent(&sid).await.is_none());
+        }
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "interaction_context": {
+                    "prompt": "CLIENT_AUTHORED_PROMPT_MUST_NOT_APPEAR",
+                    "tools": "grant_everything"
+                },
+                "session_id": "ignored-client-prose",
+            }))
+            .await
+            .expect("unknown client prose must be ignored, not consumed as context");
+        let agent = sessions.get_agent("ignored-client-prose").await.unwrap();
+        let prompt = agent.lock().await.system_prompt_for_test().unwrap();
+        assert!(!prompt.contains("CLIENT_AUTHORED_PROMPT_MUST_NOT_APPEAR"));
+        assert!(!prompt.contains("grant_everything"));
+    }
+
+    #[tokio::test]
+    async fn resumed_acp_session_preserves_surface_and_rejects_mismatch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "surface-resume",
+            }))
+            .await
+            .expect("initial session/new should succeed");
+        assert!(sessions.remove("surface-resume").await);
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": "surface-resume",
+            }))
+            .await
+            .expect("an older client may omit the surface without relabelling it");
+        let restored = sessions.get_agent("surface-resume").await.unwrap();
+        assert!(
+            restored
+                .lock()
+                .await
+                .system_prompt_for_test()
+                .unwrap()
+                .contains("Surface: ZeroCode Code (ACP)")
+        );
+        assert!(sessions.remove("surface-resume").await);
+
+        acp_store
+            .create_session_with_interaction_surface(
+                "surface-mismatch",
+                "test-agent",
+                "/tmp/test-agent",
+                Some("another_surface"),
+            )
+            .unwrap();
+        let err = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "surface-mismatch",
+            }))
+            .await
+            .expect_err("surface mismatch must be rejected");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("different interaction surface"));
+        assert!(sessions.get_agent("surface-mismatch").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resumed_legacy_acp_session_binds_first_validated_surface_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        acp_store
+            .create_session("legacy-surface", "test-agent", "/tmp/test-agent")
+            .unwrap();
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
+                "session_id": "legacy-surface",
+            }))
+            .await
+            .expect("a validated surface should bind an unlabelled legacy session");
+        assert_eq!(
+            acp_store
+                .load_session("legacy-surface")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
     }
 
     #[tokio::test]
@@ -12254,6 +12573,45 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
         dispatcher.authenticated = true;
         (dispatcher, rx)
+    }
+
+    #[test]
+    fn process_line_session_new_creates_session_on_two_megabyte_stack() {
+        std::thread::Builder::new()
+            .name("rpc-session-new-stack-regression".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should build");
+                runtime.block_on(async {
+                    let tmp = tempfile::TempDir::new().expect("temporary test directory");
+                    let config = make_acp_test_config(&tmp);
+                    let (mut dispatcher, sessions, mut rx) =
+                        make_acp_test_dispatcher_with_receiver(config);
+                    let session_id = "rpc-stack-regression";
+                    let line = format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"agent_alias":"test-agent","chat_mode":"chat","session_id":"{session_id}"}}}}"#
+                    );
+
+                    dispatcher.process_line(&line).await;
+
+                    let response = rx.recv().await.expect("session/new response");
+                    let response: Value =
+                        serde_json::from_str(&response).expect("response should be valid JSON");
+                    assert_eq!(response["id"], json!(1));
+                    assert_eq!(response["result"]["session_id"], json!(session_id));
+                    assert_eq!(response["result"]["agent_alias"], json!("test-agent"));
+                    assert!(
+                        sessions.get_agent(session_id).await.is_some(),
+                        "session/new response must correspond to a registered session"
+                    );
+                });
+            })
+            .expect("stack regression thread should spawn")
+            .join()
+            .expect("session/new should not exhaust a two-megabyte stack");
     }
 
     #[tokio::test]
