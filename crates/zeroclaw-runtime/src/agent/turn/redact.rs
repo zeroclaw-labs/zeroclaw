@@ -111,6 +111,41 @@ mod tests {
         assert!(!is_credential_key("status"));
     }
 
+    /// The shape the RPC run-detail response leans on: tool arguments are
+    /// arbitrary JSON, so a secret under a credential-named key is routinely
+    /// carried by a descendant that names nothing sensitive. A key-based walk
+    /// that recursed would leave every one of these intact. Sibling coverage in
+    /// `scrub_credentials_value_replaces_every_credential_value_shape` takes the
+    /// nested-object, numeric, and boolean shapes; this one adds the array and
+    /// `null` cases and asserts no seeded secret reaches the wire.
+    #[test]
+    fn a_credential_key_redacts_its_value_whatever_the_shape() {
+        let value = serde_json::json!({
+            "api_key": {"value": "NESTEDSECRET"},
+            "token": ["ARRAYSECRET"],
+            "password": 12345678,
+            "secret": true,
+            "credential": null,
+        });
+
+        let scrubbed = scrub_credentials_value(value);
+        let wire = serde_json::to_string(&scrubbed).expect("serializable");
+
+        for secret in ["NESTEDSECRET", "ARRAYSECRET", "12345678"] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} must not survive scrubbing"
+            );
+        }
+        for key in ["api_key", "token", "password", "secret"] {
+            assert_eq!(scrubbed[key], "[REDACTED]", "{key} must be replaced whole");
+        }
+        // Even `null` is replaced rather than preserved: the marker is what
+        // tells a reader the key was withheld, and a surviving `null` would
+        // read as a value the run genuinely had.
+        assert_eq!(scrubbed["credential"], "[REDACTED]");
+    }
+
     #[test]
     fn scrub_credentials_value_redacts_nested_secret_and_keeps_key() {
         let input = serde_json::json!({
