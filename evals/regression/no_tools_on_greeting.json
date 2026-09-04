@@ -1,0 +1,17 @@
+{
+  "model_name": "regression-no-tools-on-greeting",
+  "turns": [
+    {
+      "user_input": "Good morning!",
+      "steps": [
+        { "response": { "type": "text", "content": "Good morning! How can I help you today?", "input_tokens": 12, "output_tokens": 11 } }
+      ]
+    }
+  ],
+  "expects": {
+    "response_contains": ["morning"],
+    "response_not_contains": ["error", "tool"],
+    "tools_not_used": ["echo"],
+    "max_tool_calls": 0
+  }
+}

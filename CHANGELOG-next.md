@@ -21,6 +21,7 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 - Add opt-in retrieval caching, a gated rerank stage, typed memory classification and fact extraction, configuration validation, migration reindex hooks, and content scanning at write and recall boundaries (#8897, #8895, #8900, #8899, #8984).
 - Add gated memory audit trails and restore semantic recall of durable global memories across sessions (#8893, #8898).
+- Add isolated per-case SQLite memory seeding and exact-key memory side-effect grading to live evaluations, with memory tools gated by both case and operator allowlists (#9226).
 - Improve Lucid process control with configurable timeouts and more reliable ARM startup handling (#9105).
 
 ### SOP and Automation
