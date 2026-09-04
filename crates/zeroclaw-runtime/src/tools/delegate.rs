@@ -1,4 +1,5 @@
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
+use crate::agent::execution_tree_budget::ExecutionTreeBudget;
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
@@ -925,6 +926,15 @@ impl DelegateTool {
             .unwrap_or(false)
     }
 
+    fn execution_tree_budget_for_agentic_loop(
+        inherited: Option<ExecutionTreeBudget>,
+        target_limit: Option<usize>,
+    ) -> Option<ExecutionTreeBudget> {
+        inherited
+            .map(|budget| budget.child())
+            .or_else(|| ExecutionTreeBudget::from_limit(target_limit))
+    }
+
     fn resolve_loop_runtime(
         &self,
         agent_alias: &str,
@@ -945,6 +955,7 @@ impl DelegateTool {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
+            resolved.max_execution_tree_iterations = profile.max_execution_tree_iterations;
             if let Some(max_context_tokens) = profile.max_context_tokens {
                 resolved.max_context_tokens = max_context_tokens;
             }
@@ -1884,6 +1895,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_budget = ExecutionTreeBudget::current();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1916,6 +1928,7 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let inherited_budget = parent_budget.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1943,14 +1956,17 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
-                            })
-                            .await
-                    })
+                    let result = ExecutionTreeBudget::scope_optional(
+                        inherited_budget,
+                        scope_delegate_session_key(session_key, async move {
+                            crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                .scope(receipt_scope, async move {
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                        .await
+                                })
+                                .await
+                        }),
+                    )
                     .await;
                     (agent_name_for_return, result)
                 }
@@ -2828,6 +2844,10 @@ impl DelegateTool {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
+        let execution_tree_budget = Self::execution_tree_budget_for_agentic_loop(
+            ExecutionTreeBudget::current(),
+            loop_runtime.max_execution_tree_iterations,
+        );
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
@@ -2878,8 +2898,7 @@ impl DelegateTool {
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),
                 on_delta: None,
-                shared_budget: None,
-                // TODO thread from parent in future
+                shared_budget: execution_tree_budget,
                 channel: None,
                 collected_receipts,
                 event_tx: None,
@@ -3737,6 +3756,14 @@ mod tests {
     }
 
     async fn delegate_memory_fixture(model_uri: Option<String>) -> DelegateMemoryFixture {
+        delegate_memory_fixture_with_iteration_caps(model_uri, 5, 5).await
+    }
+
+    async fn delegate_memory_fixture_with_iteration_caps(
+        model_uri: Option<String>,
+        caller_max_tool_iterations: usize,
+        target_max_tool_iterations: usize,
+    ) -> DelegateMemoryFixture {
         use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
 
         let tmp = TempDir::new().unwrap();
@@ -3774,10 +3801,24 @@ mod tests {
             "agentic_test".to_string(),
             RuntimeProfileConfig {
                 agentic: true,
-                max_tool_iterations: 5,
+                max_tool_iterations: target_max_tool_iterations,
                 ..RuntimeProfileConfig::default()
             },
         );
+        root_config.runtime_profiles.insert(
+            "caller_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: caller_max_tool_iterations,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let caller_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "caller_test".into(),
+            ..AliasedAgentConfig::default()
+        };
         let target_config = AliasedAgentConfig {
             model_provider: "custom.local".into(),
             risk_profile: "agentic_test".into(),
@@ -3786,7 +3827,7 @@ mod tests {
         };
         root_config
             .agents
-            .insert("caller".to_string(), target_config.clone());
+            .insert("caller".to_string(), caller_config);
         root_config
             .agents
             .insert("target".to_string(), target_config.clone());
@@ -4253,6 +4294,110 @@ mod tests {
     fn description_not_empty() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn agentic_budget_selects_inherited_child_or_target_root() {
+        use crate::agent::execution_tree_budget::{
+            ExecutionTreeBudgetRole, ExecutionTreeReservation,
+        };
+
+        let inherited_root = ExecutionTreeBudget::root(5);
+        let foreground = DelegateTool::execution_tree_budget_for_agentic_loop(
+            Some(inherited_root.clone()),
+            Some(2),
+        )
+        .expect("foreground delegate should inherit a budget");
+        assert_eq!(foreground.role(), ExecutionTreeBudgetRole::Child);
+        assert_eq!(foreground.remaining(), 5);
+        assert_eq!(
+            foreground.reserve(),
+            Ok(ExecutionTreeReservation::Iteration)
+        );
+        assert_eq!(inherited_root.remaining(), 4);
+
+        let detached = DelegateTool::execution_tree_budget_for_agentic_loop(None, Some(2))
+            .expect("background delegate should mint its target budget");
+        assert_eq!(detached.role(), ExecutionTreeBudgetRole::Root);
+        assert_eq!(detached.reserve(), Ok(ExecutionTreeReservation::Iteration));
+        assert_eq!(
+            detached.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+    }
+
+    #[test]
+    fn delegate_fallback_runtime_projects_execution_tree_budget() {
+        let mut runtime_profiles = agentic_runtime_profiles(5);
+        runtime_profiles
+            .get_mut("agentic_test")
+            .unwrap()
+            .max_execution_tree_iterations = Some(9);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(runtime_profiles);
+
+        let resolved = tool.resolve_loop_runtime("target", &agentic_agent_config());
+        assert_eq!(resolved.max_execution_tree_iterations, Some(9));
+    }
+
+    #[tokio::test]
+    async fn foreground_agentic_delegates_share_tree_budget_and_preserve_root_final_slot() {
+        use crate::agent::execution_tree_budget::{ExecutionTreeBudget, ExecutionTreeReservation};
+
+        let server = start_final_chat_server(vec!["first child", "second child"]).await;
+        let fixture =
+            delegate_memory_fixture_with_iteration_caps(Some(server.uri.clone()), 1, 5).await;
+        let root_budget = ExecutionTreeBudget::root(3);
+        let first = fixture.tool.execute(json!({
+            "agent": "target",
+            "prompt": "first foreground child"
+        }));
+        let second = fixture.tool.execute(json!({
+            "agent": "target",
+            "prompt": "second foreground child"
+        }));
+
+        let (first_result, second_result) =
+            ExecutionTreeBudget::scope(root_budget.clone(), async { tokio::join!(first, second) })
+                .await;
+        let first_result = first_result.expect("first delegate should return a tool result");
+        let second_result = second_result.expect("second delegate should return a tool result");
+
+        assert!(
+            first_result.success,
+            "first delegate failed: {first_result:?}"
+        );
+        assert!(
+            second_result.success,
+            "second delegate failed: {second_result:?}"
+        );
+        assert_eq!(root_budget.remaining(), 1);
+
+        let exhausted = ExecutionTreeBudget::scope(
+            root_budget.clone(),
+            fixture.tool.execute(json!({
+                "agent": "target",
+                "prompt": "child after shared allowance is exhausted"
+            })),
+        )
+        .await
+        .expect("budget exhaustion should return a structured tool result");
+
+        assert!(!exhausted.success);
+        assert!(
+            exhausted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("execution tree iteration budget exhausted")),
+            "delegate should preserve the specific exhaustion cause: {exhausted:?}"
+        );
+        assert!(!fixture.tool.cancellation_token.is_cancelled());
+        assert_eq!(root_budget.remaining(), 1);
+        assert_eq!(
+            root_budget.reserve(),
+            Ok(ExecutionTreeReservation::FinalCompletion)
+        );
+        assert_eq!(root_budget.remaining(), 0);
     }
 
     #[test]

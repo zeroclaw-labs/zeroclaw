@@ -119,6 +119,7 @@ use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
 use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
@@ -7119,6 +7120,10 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
+    let execution_tree_budget = ExecutionTreeBudget::from_limit(
+        ctx.prompt_config
+            .effective_max_execution_tree_iterations(&ctx.agent_alias),
+    );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -7173,7 +7178,7 @@ async fn process_channel_message_body(
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),
                 on_delta: delta_tx.clone(),
-                shared_budget: None,
+                shared_budget: execution_tree_budget.clone(),
                 channel: approval_channel.as_deref(),
                 // Collector is meaningful only when the generator is active.
                 // Pass None when receipts are disabled so the call site

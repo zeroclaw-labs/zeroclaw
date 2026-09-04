@@ -3517,6 +3517,7 @@ impl Default for DelegateToolConfig {
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    pub max_execution_tree_iterations: Option<usize>,
     pub max_history_messages: usize,
     /// Token budget for preemptive context/history trimming (from runtime profile).
     /// NOT the provider `max_tokens` output limit.
@@ -3559,6 +3560,7 @@ impl Default for ResolvedRuntime {
         Self {
             compact_context: true,
             max_tool_iterations: 10,
+            max_execution_tree_iterations: None,
             max_history_messages: 50,
             max_context_tokens: 32_000,
             model_context_window: 32_000,
@@ -4166,6 +4168,12 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_max_execution_tree_iterations(&self, agent_alias: &str) -> Option<usize> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.max_execution_tree_iterations)
+    }
+
+    #[must_use]
     pub fn effective_max_history_messages(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_history_messages)
@@ -4305,6 +4313,8 @@ impl Config {
         let mut out = self.agents.get(agent_alias)?.clone();
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
+            max_execution_tree_iterations: self
+                .effective_max_execution_tree_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
             // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
@@ -12962,6 +12972,8 @@ pub struct RuntimeProfileConfig {
     pub agentic: bool,
     /// Maximum tool-call iterations in agentic mode. `0` inherits the global default.
     pub max_tool_iterations: usize,
+    /// Maximum aggregate loop iterations for one execution tree. Omitted disables it.
+    pub max_execution_tree_iterations: Option<usize>,
     // ── Budget caps (enforced with subagent parent-subset discipline) ──
     /// Maximum actions allowed per hour. `0` is a hard zero budget — the
     /// per-sender rate tracker treats a max of 0 as always exhausted
@@ -13034,6 +13046,7 @@ impl Default for RuntimeProfileConfig {
         Self {
             agentic: false,
             max_tool_iterations: 0,
+            max_execution_tree_iterations: None,
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             shell_timeout_secs: 60,
@@ -21351,6 +21364,16 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
 
+        for (profile_alias, profile) in &self.runtime_profiles {
+            if profile.max_execution_tree_iterations == Some(0) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{profile_alias}.max_execution_tree_iterations"),
+                    "runtime_profiles.{profile_alias}.max_execution_tree_iterations must be greater than 0"
+                );
+            }
+        }
+
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
             let path = "gateway.websocket_ping_interval_secs";
@@ -28743,6 +28766,7 @@ reasoning_effort = "turbo"
         let cfg = AliasedAgentConfig::default();
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
+        assert_eq!(cfg.resolved.max_execution_tree_iterations, None);
         assert_eq!(cfg.resolved.max_history_messages, 50);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
@@ -28846,6 +28870,62 @@ runtime_profile = "fast"
 "#;
         let parsed = parse_test_config(raw);
         assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
+    }
+
+    #[test]
+    async fn runtime_profile_execution_tree_budget_is_disabled_when_omitted() {
+        let raw = r#"
+[runtime_profiles.default]
+
+[agents.default]
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.effective_max_execution_tree_iterations("default"),
+            None
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_execution_tree_iterations, None);
+    }
+
+    #[test]
+    async fn runtime_profile_execution_tree_budget_resolves_positive_value() {
+        let raw = r#"
+[runtime_profiles.default]
+max_execution_tree_iterations = 7
+
+[agents.default]
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.effective_max_execution_tree_iterations("default"),
+            Some(7)
+        );
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.max_execution_tree_iterations, Some(7));
+    }
+
+    #[test]
+    async fn validate_rejects_zero_runtime_profile_execution_tree_budget() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            "default".to_string(),
+            RuntimeProfileConfig {
+                max_execution_tree_iterations: Some(0),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let error = config
+            .validate()
+            .expect_err("zero execution-tree budget must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.default.max_execution_tree_iterations")
+        );
     }
 
     #[test]
