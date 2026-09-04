@@ -80,14 +80,20 @@ fn emacs_rows() -> Vec<(String, Vec<Chord>)> {
         (action.to_string(), chords)
     };
     from_defaults(vec![
-        with(&DashboardTabAction::Up.action_key(), vec![Chord::ctrl('p')]),
+        with(
+            &DashboardTabAction::Up.action_key(),
+            vec![Chord::primary('p')],
+        ),
         with(
             &DashboardTabAction::Down.action_key(),
             vec![Chord::ctrl('n')],
         ),
-        with(&LogsTabAction::Up.action_key(), vec![Chord::ctrl('p')]),
+        with(&LogsTabAction::Up.action_key(), vec![Chord::primary('p')]),
         with(&LogsTabAction::Down.action_key(), vec![Chord::ctrl('n')]),
-        with(&FileExplorerAction::Up.action_key(), vec![Chord::ctrl('p')]),
+        with(
+            &FileExplorerAction::Up.action_key(),
+            vec![Chord::primary('p')],
+        ),
         with(
             &FileExplorerAction::Down.action_key(),
             vec![Chord::ctrl('n')],
@@ -324,6 +330,30 @@ mod tests {
     }
 
     #[test]
+    fn emacs_preset_preserves_primary_p_and_literal_control_n() {
+        let rows: HashMap<_, _> = emacs_rows().into_iter().collect();
+        for (up, down) in [
+            (
+                DashboardTabAction::Up.action_key(),
+                DashboardTabAction::Down.action_key(),
+            ),
+            (
+                LogsTabAction::Up.action_key(),
+                LogsTabAction::Down.action_key(),
+            ),
+            (
+                FileExplorerAction::Up.action_key(),
+                FileExplorerAction::Down.action_key(),
+            ),
+        ] {
+            assert!(rows[&up].contains(&Chord::primary('p')));
+            assert!(!rows[&up].contains(&Chord::ctrl('p')));
+            assert!(rows[&down].contains(&Chord::ctrl('n')));
+            assert!(!rows[&down].contains(&Chord::primary('n')));
+        }
+    }
+
+    #[test]
     fn preset_names_are_snake_case() {
         let ok = |s: &str| {
             !s.is_empty()
@@ -403,28 +433,27 @@ mod tests {
         assert!(build_override_table(rows).is_err());
     }
 
-    /// The darwin arm of the same rule: `normalise_mods` rewrites `CONTROL` to
-    /// `SUPER` for any chord the host has not reserved.
+    /// The darwin arm of the same rule: platform-primary intent resolves to
+    /// `SUPER`, so it collides with a literal `super` spelling.
     #[cfg(target_os = "macos")]
     #[test]
-    fn normalized_ctrl_super_duplicate_is_rejected_on_darwin() {
+    fn primary_super_duplicate_is_rejected_on_darwin() {
         use crossterm::event::{KeyCode, KeyModifiers};
         let mut rows = HashMap::new();
-        rows.insert("dashboard.up".to_string(), vec![Chord::ctrl('a')]);
+        rows.insert("dashboard.up".to_string(), vec![Chord::primary('a')]);
         rows.insert(
             "dashboard.down".to_string(),
             vec![Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER)],
         );
         assert!(build_override_table(rows).is_err());
 
-        // `ctrl+c` is host-reserved, so CONTROL is never rewritten for it and
-        // the two spellings really are different keys. The check must not
-        // over-reject.
+        // Literal Control remains distinct from literal Super for every key.
+        // The check must not over-reject the two explicit spellings.
         let mut ok = HashMap::new();
-        ok.insert("dashboard.up".to_string(), vec![Chord::ctrl('c')]);
+        ok.insert("dashboard.up".to_string(), vec![Chord::ctrl('a')]);
         ok.insert(
             "dashboard.down".to_string(),
-            vec![Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER)],
+            vec![Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER)],
         );
         assert!(build_override_table(ok).is_ok());
     }

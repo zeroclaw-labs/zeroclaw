@@ -138,6 +138,7 @@ zc-logs-section-trace = Trace
 zc-logs-section-attribution = Attribution
 zc-logs-section-attributes = Attributs
 zc-logs-preview-only = Charge utile complète indisponible — affichage des champs d'aperçu uniquement.
+zc-logs-persisted-path = Journal persistant : { $path }
 zc-logs-no-event-selected = Aucun événement sélectionné
 zc-logs-loading = Chargement…
 zc-logs-search-action-apply = appliquer
