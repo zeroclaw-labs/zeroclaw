@@ -1571,6 +1571,7 @@ mod tests {
             agent_id: Option<&str>,
         ) -> MemoryEntry {
             MemoryEntry {
+                principal_id: None,
                 id: key.to_string(),
                 key: key.to_string(),
                 content: content.to_string(),

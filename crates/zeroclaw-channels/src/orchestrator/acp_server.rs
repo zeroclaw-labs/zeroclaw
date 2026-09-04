@@ -881,8 +881,13 @@ impl AcpServer {
             let sid = session_id.clone();
             let alias = agent_alias.clone();
             let wsd = workspace_dir.clone();
+            // The orchestrator ACP transport (CLI/IDE-native) carries no
+            // authenticated gateway principal, so these sessions are stamped
+            // with a NULL owner -- visible only to unscoped connections, never
+            // to a scoped gateway principal (RFC 7141 F2).
             let created =
-                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd)).await;
+                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd, None))
+                    .await;
             let error = match created {
                 Ok(Ok(_)) => None,
                 Ok(Err(e)) => Some(e.to_string()),
@@ -3863,7 +3868,12 @@ mod tests {
 
         let session_id = "sess-restore-ignores-conn-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -3944,7 +3954,12 @@ mod tests {
 
         let session_id = "sess-restore-missing-config-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -3984,7 +3999,12 @@ mod tests {
 
         let session_id = "sess-resume-disabled-owner";
         store
-            .create_session(session_id, "agent-alpha", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "agent-alpha",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -4023,7 +4043,12 @@ mod tests {
 
         let session_id = "sess-resume-ignores-conn-default";
         store
-            .create_session(session_id, "ghost-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "ghost-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5273,7 +5298,12 @@ mod tests {
 
         let session_id = "sess-load-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -5341,7 +5371,12 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-load-trimmed-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -5446,7 +5481,12 @@ mod tests {
         // Create and load the session once to put it in memory
         let session_id = "sess-already-active";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         server
             .handle_session_load(&serde_json::json!({
@@ -5499,7 +5539,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-agent-load";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5542,7 +5582,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let session_id = "sess-cross-agent-resume";
         store
-            .create_session(session_id, "finance", &cwd.path().to_string_lossy())
+            .create_session(session_id, "finance", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -5598,7 +5638,12 @@ mod tests {
 
         let session_id = "sess-resume-test";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         store
             .append_turn(
@@ -5646,7 +5691,12 @@ mod tests {
 
         let session_id = "sess-resume-plan";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
         // A durable plan exists from a prior turn.
         store
@@ -5782,7 +5832,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to load
         let stored_id = "sess-load-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -5826,7 +5876,7 @@ mod tests {
         // Pre-create a stored session that we'll attempt to resume
         let stored_id = "sess-resume-limit-test";
         store
-            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(stored_id, "test-agent", &cwd.path().to_string_lossy(), None)
             .unwrap();
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
@@ -5869,7 +5919,12 @@ mod tests {
 
         let session_id = "sess-load-store-err";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         // Drop the schema via a second connection to force a "no such table"
@@ -5926,7 +5981,12 @@ mod tests {
 
         let session_id = "sess-resume-store-err";
         store
-            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .create_session(
+                session_id,
+                "test-agent",
+                &cwd.path().to_string_lossy(),
+                None,
+            )
             .unwrap();
 
         let db_path = cwd.path().join("sessions/acp-sessions.db");

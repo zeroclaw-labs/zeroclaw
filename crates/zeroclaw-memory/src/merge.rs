@@ -36,6 +36,7 @@ mod tests {
 
     fn survivor(content: &str) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: "id".into(),
             key: "key".into(),
             content: content.into(),

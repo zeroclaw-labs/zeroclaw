@@ -824,6 +824,10 @@ impl RpcTransport for WssTransport {
     fn peer_label(&self) -> String {
         self.peer_label.clone()
     }
+
+    fn kind(&self) -> super::transport::TransportKind {
+        super::transport::TransportKind::Wss
+    }
 }
 
 // ── TLS acceptor ─────────────────────────────────────────────────
@@ -1165,7 +1169,12 @@ pub async fn run_wss_listener(
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
-                        .with_peer_cert_fingerprint(Some(peer_cert_fp));
+                        // mTLS peer cert = transport/device admission (quota, audit);
+                        // transport credential = principal authentication at initialize.
+                        // The two layers compose: the cert admits the connection,
+                        // the token authenticates the principal.
+                        .with_peer_cert_fingerprint(Some(peer_cert_fp))
+                        .with_transport(transport.kind(), transport.credential());
                     dispatcher.run(&mut transport).await;
 
                     // Epoch-checked: a relay flap can leave this session draining
