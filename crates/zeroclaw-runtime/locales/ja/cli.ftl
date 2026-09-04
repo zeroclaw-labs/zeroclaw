@@ -449,6 +449,7 @@ cli-sop-execution-mode = {"  "}実行モード: {$value}
 cli-sop-deterministic = {"  "}決定論的:  {$value}
 cli-sop-cooldown = {"  "}クールダウン:       {$value}秒
 cli-sop-max-concurrent = {"  "}最大同時実行数: {$value}
+cli-sop-global-ceiling = {"  "}全体上限: {$value} (全 SOP で共有)
 cli-sop-admission-policy = {"  "}許可ポリシー:   {$value}
 cli-sop-max-pending-approvals = {"  "}最大保留承認数: {$value}
 cli-sop-location = {"  "}場所:       {$value}

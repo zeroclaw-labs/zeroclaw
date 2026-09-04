@@ -829,6 +829,27 @@ mod tests {
     }
 
     #[test]
+    fn sop_global_pool_contract_appears_in_generated_reference() {
+        // `max_concurrent_total` is a POOL shared by every SOP, not a per-SOP
+        // allowance. In #9902 an operator raised one SOP's `max_concurrent`
+        // twice and measured no change, because the binding ceiling was this
+        // global key. `first_line` truncates a field description to its FIRST
+        // line, so reflowing that doc comment onto a second line would silently
+        // gut the reference again; this pins the whole contract to line one.
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+        let row = md
+            .lines()
+            .find(|line| line.contains("`max_concurrent_total`"))
+            .expect("generated config reference should include the global SOP concurrency pool");
+
+        assert!(row.contains("across ALL SOPs"));
+        assert!(row.contains("one shared pool, not a per-SOP allowance"));
+        assert!(row.contains("smaller of the two"));
+        assert!(row.contains("deferred_at_capacity"));
+    }
+
+    #[test]
     fn cron_section_exposes_uses_memory_field() {
         // Regression test: the generated config reference must expose
         // per-cron-job fields (including `uses_memory`) instead of only the

@@ -449,6 +449,7 @@ cli-sop-execution-mode = {"  "}Modo de ejecución: {$value}
 cli-sop-deterministic = {"  "}Determinista:  {$value}
 cli-sop-cooldown = {"  "}Tiempo de espera: {$value}s
 cli-sop-max-concurrent = {"  "}Máx. concurrentes: {$value}
+cli-sop-global-ceiling = {"  "}Límite global: {$value} (compartido entre todos los SOP)
 cli-sop-admission-policy = {"  "}Admisión:        {$value}
 cli-sop-max-pending-approvals = {"  "}Máx. pendientes: {$value}
 cli-sop-location = {"  "}Ubicación:       {$value}
