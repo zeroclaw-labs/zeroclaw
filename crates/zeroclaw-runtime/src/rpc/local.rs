@@ -144,7 +144,16 @@ impl RpcTransport for LocalTransport {
     }
 }
 
-// ── Listener ─────────────────────────────────────────────────────
+/// RAII decrement guard for the client counter held by an accepted connection
+/// task. The counter drives `--ephemeral` shutdown, so a missed decrement
+/// would keep an idle daemon alive forever.
+struct ClientCountGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Run the local IPC RPC listener as a daemon subsystem.
 /// `client_count` is incremented on connect, decremented on disconnect.
@@ -178,6 +187,8 @@ pub async fn run_local_listener(
         "RPC local IPC listening"
     );
 
+    let mut connection_tasks = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -188,6 +199,7 @@ pub async fn run_local_listener(
                 );
                 break;
             }
+            Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {}
             accept = platform::accept(&mut listener, &path) => {
                 let stream = match accept {
                     Ok(v) => v,
@@ -216,7 +228,8 @@ pub async fn run_local_listener(
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
+                connection_tasks.spawn(async move {
+                    let _count_guard = ClientCountGuard(count);
                     let mut transport = LocalTransport::new(stream, conn_cancel.clone());
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
@@ -260,10 +273,21 @@ pub async fn run_local_listener(
                         .instrument(span)
                         .await;
                     }
-
-                    count.fetch_sub(1, Ordering::Relaxed);
                 });
             }
+        }
+    }
+
+    // Drain accepted connection tasks. Each connection cancels its prompts
+    // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
+    // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
+    // exceeds that window, force-abort remaining connection tasks and join them.
+    tokio::select! {
+        _ = async {
+            while connection_tasks.join_next().await.is_some() {}
+        } => {}
+        _ = tokio::time::sleep(Duration::from_millis(5500)) => {
+            connection_tasks.shutdown().await;
         }
     }
 
@@ -1509,6 +1533,355 @@ mod tests {
     #[tokio::test]
     async fn reload_drains_running_and_queued_prompts_for_local_connection_generation() {
         assert_reload_drains_local_connection_generation().await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_reload_replacement_generation_waits_for_durable_session_prompt_local() {
+        use crate::rpc::dispatch::connection_test_support::insert_session;
+        use async_trait::async_trait;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const DURABLE_SID: &str = "durable-reload-session";
+
+        struct HoldOnDrop {
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        impl Drop for HoldOnDrop {
+            fn drop(&mut self) {
+                self.log.lock().unwrap().push("gen1_unwind_start");
+                let (lock, cvar) = &*self.allow_finish;
+                let mut finished = lock.lock().unwrap();
+                while !*finished {
+                    finished = cvar.wait(finished).unwrap();
+                }
+                self.is_running.store(false, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_ended");
+            }
+        }
+
+        struct BlockingGen1Provider {
+            started: Arc<Notify>,
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for BlockingGen1Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.is_running.store(true, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_started");
+                let _drop_guard = HoldOnDrop {
+                    allow_finish: Arc::clone(&self.allow_finish),
+                    is_running: Arc::clone(&self.is_running),
+                    log: Arc::clone(&self.log),
+                };
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                Ok("gen1 finished".to_string())
+            }
+        }
+
+        impl Attributable for BlockingGen1Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "blocking-gen1"
+            }
+        }
+
+        struct ObservantGen2Provider {
+            gen1_is_running: Arc<AtomicBool>,
+            started: Arc<Notify>,
+            overlap_detected: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ObservantGen2Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if self.gen1_is_running.load(Ordering::SeqCst) {
+                    self.overlap_detected.store(true, Ordering::SeqCst);
+                    self.log.lock().unwrap().push("OVERLAP_DETECTED");
+                }
+                self.log.lock().unwrap().push("gen2_started");
+                self.started.notify_one();
+                self.log.lock().unwrap().push("gen2_ended");
+                Ok("gen2 finished".to_string())
+            }
+        }
+
+        impl Attributable for ObservantGen2Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "observant-gen2"
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+
+        let gen1_started = Arc::new(Notify::new());
+        let allow_gen1_finish = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gen1_is_running = Arc::new(AtomicBool::new(false));
+        let gen2_started = Arc::new(Notify::new());
+        let overlap_detected = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Generation 1 setup
+        let config1 = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
+        let sessions1 = Arc::new(SessionStore::new(64, queue1));
+        let ctx1 = RpcContext::for_persistence_tests(
+            config1,
+            sessions1,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+
+        insert_session(
+            &ctx1,
+            tmp.path(),
+            DURABLE_SID,
+            Box::new(BlockingGen1Provider {
+                started: Arc::clone(&gen1_started),
+                allow_finish: Arc::clone(&allow_gen1_finish),
+                is_running: Arc::clone(&gen1_is_running),
+                log: Arc::clone(&log),
+            }),
+        )
+        .await;
+
+        let cancel1 = CancellationToken::new();
+        let count1 = Arc::new(AtomicUsize::new(0));
+        let cancel1_for_listener = cancel1.clone();
+        let ctx1_for_listener = Arc::clone(&ctx1);
+        let count1_for_listener = Arc::clone(&count1);
+
+        let gen1_listener_handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(
+                ctx1_for_listener,
+                cancel1_for_listener,
+                count1_for_listener,
+                None,
+            )
+            .await
+        });
+
+        wait_for_socket(&sock_path).await;
+        let (_reader1, mut writer1) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count1, 1).await;
+
+        // Send prompt to Generation 1
+        writer1
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 1"}),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), gen1_started.notified())
+            .await
+            .expect("Gen 1 prompt should reach provider");
+
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must be running"
+        );
+
+        // Trigger reload on Generation 1
+        cancel1.cancel();
+
+        // Give any spurious eager exit a moment to trigger (without the fix, listener would return immediately)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !gen1_listener_handle.is_finished(),
+            "Gen 1 listener must NOT finish while prompt is held in cancellation"
+        );
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must remain active while draining"
+        );
+
+        // Spawn replacement generation (Generation 2) task.
+        // It awaits Generation 1 listener exit, exactly like daemon reload / supervisor handoff,
+        // then runs its own listener and attempts to prompt the same durable session.
+        let tmp_path = tmp.path().to_path_buf();
+        let chat_backend2 = chat_backend.clone();
+        let gen1_is_running_for_gen2 = Arc::clone(&gen1_is_running);
+        let gen2_started_clone = Arc::clone(&gen2_started);
+        let overlap_detected_clone = Arc::clone(&overlap_detected);
+        let log_clone = Arc::clone(&log);
+        let sock_path2 = sock_path.clone();
+
+        let gen2_task = zeroclaw_spawn::spawn!(async move {
+            // Gen 2 waits for Gen 1 listener to cleanly shut down
+            gen1_listener_handle
+                .await
+                .unwrap()
+                .expect("Gen 1 listener should exit Ok");
+
+            let config2 = zeroclaw_config::schema::Config {
+                data_dir: tmp_path.clone(),
+                config_path: tmp_path.join("config.toml"),
+                ..Default::default()
+            };
+            let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
+            let sessions2 = Arc::new(SessionStore::new(64, queue2));
+            let ctx2 = RpcContext::for_persistence_tests(
+                config2,
+                sessions2,
+                Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+
+            insert_session(
+                &ctx2,
+                &tmp_path,
+                DURABLE_SID,
+                Box::new(ObservantGen2Provider {
+                    gen1_is_running: gen1_is_running_for_gen2,
+                    started: gen2_started_clone,
+                    overlap_detected: overlap_detected_clone,
+                    log: log_clone,
+                }),
+            )
+            .await;
+
+            let cancel2 = CancellationToken::new();
+            let count2 = Arc::new(AtomicUsize::new(0));
+            let cancel2_for_listener = cancel2.clone();
+            let handle2 = zeroclaw_spawn::spawn!(async move {
+                run_local_listener(ctx2, cancel2_for_listener, count2, None).await
+            });
+
+            wait_for_socket(&sock_path2).await;
+            let (_reader2, mut writer2) = do_initialize(&sock_path2).await;
+
+            writer2
+                .write_all(
+                    rpc_request(
+                        Method::SessionPrompt,
+                        &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 2"}),
+                        3,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            // Wait for Gen 2 prompt to execute
+            let _ = tokio::time::sleep(Duration::from_millis(150)).await;
+
+            cancel2.cancel();
+            handle2
+                .await
+                .unwrap()
+                .expect("Gen 2 listener should exit Ok");
+            drop(writer2);
+        });
+
+        // While Gen 1 is held in cancellation, verify Gen 2 has not started its prompt
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must still be held"
+        );
+        let current_log = log.lock().unwrap().clone();
+        assert_eq!(
+            current_log,
+            vec!["gen1_started", "gen1_unwind_start"],
+            "Prompt 2 must not have started yet"
+        );
+
+        // Now allow Gen 1 prompt to complete its cooperative cancellation unwind
+        {
+            let (lock, cvar) = &*allow_gen1_finish;
+            let mut finished = lock.lock().unwrap();
+            *finished = true;
+            cvar.notify_all();
+        }
+
+        // Gen 2 task should now complete cleanly
+        tokio::time::timeout(Duration::from_secs(5), gen2_task)
+            .await
+            .expect("Gen 2 reload handoff should finish within timeout")
+            .expect("Gen 2 task should not panic");
+
+        assert!(
+            !overlap_detected.load(Ordering::SeqCst),
+            "Prompt 2 must not overlap with Prompt 1 on durable session"
+        );
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log,
+            vec![
+                "gen1_started",
+                "gen1_unwind_start",
+                "gen1_ended",
+                "gen2_started",
+                "gen2_ended"
+            ],
+            "Generations must execute sequentially with Gen 1 fully drained before Gen 2 begins"
+        );
+
+        drop(writer1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_replacement_generation_waits_for_durable_session_prompt_local() {
+        std::thread::Builder::new()
+            .name("local-reload-durable-session".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        assert_reload_replacement_generation_waits_for_durable_session_prompt_local(
+                        ),
+                    );
+            })
+            .unwrap()
+            .join()
+            .expect("local reload durable session test thread should not panic");
     }
 
     #[tokio::test]

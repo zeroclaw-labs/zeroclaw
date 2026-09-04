@@ -951,6 +951,8 @@ pub async fn run_wss_listener(
         "RPC WSS listener started"
     );
 
+    let mut connection_tasks = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -961,6 +963,7 @@ pub async fn run_wss_listener(
                 );
                 break;
             }
+            Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {}
             accept = listener.accept() => {
                 let (tcp_stream, remote_addr) = match accept {
                     Ok(v) => v,
@@ -1024,7 +1027,7 @@ pub async fn run_wss_listener(
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
+                connection_tasks.spawn(async move {
                     // Guarantees the `--ephemeral` counter is decremented on
                     // every exit path below, including the new timeout one.
                     let _count_guard = ClientCountGuard(count);
@@ -1090,7 +1093,12 @@ pub async fn run_wss_listener(
                         Some((ws_stream, scanner))
                     };
 
-                    let (mut ws_stream, scanner) = match tokio::time::timeout_at(deadline, setup).await {
+                    let setup_res = tokio::select! {
+                        _ = conn_cancel.cancelled() => return,
+                        res = tokio::time::timeout_at(deadline, setup) => res,
+                    };
+
+                    let (mut ws_stream, scanner) = match setup_res {
                         Ok(Some(ws)) => ws,
                         Ok(None) => return, // logged above
                         Err(_) => {
@@ -1234,6 +1242,19 @@ pub async fn run_wss_listener(
                     }
                 });
             }
+        }
+    }
+
+    // Drain accepted connection tasks. Each connection cancels its prompts
+    // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
+    // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
+    // exceeds that window, force-abort remaining connection tasks and join them.
+    tokio::select! {
+        _ = async {
+            while connection_tasks.join_next().await.is_some() {}
+        } => {}
+        _ = tokio::time::sleep(Duration::from_millis(5500)) => {
+            connection_tasks.shutdown().await;
         }
     }
 
@@ -1750,6 +1771,532 @@ mod accept_error_tests {
             .unwrap()
             .join()
             .expect("WSS connection generation test thread should not panic");
+    }
+
+    #[derive(Debug)]
+    struct NoServerVerify;
+
+    impl rustls::client::danger::ServerCertVerifier for NoServerVerify {
+        fn verify_server_cert(
+            &self,
+            _e: &rustls::pki_types::CertificateDer<'_>,
+            _i: &[rustls::pki_types::CertificateDer<'_>],
+            _n: &rustls::pki_types::ServerName<'_>,
+            _o: &[u8],
+            _t: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _m: &[u8],
+            _c: &rustls::pki_types::CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _m: &[u8],
+            _c: &rustls::pki_types::CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    fn test_client_connector(
+        client_cert_pem: &str,
+        client_key_pem: &str,
+    ) -> tokio_tungstenite::Connector {
+        use std::io::Write;
+        let mut cf = tempfile::NamedTempFile::new().unwrap();
+        cf.write_all(client_cert_pem.as_bytes()).unwrap();
+        cf.flush().unwrap();
+        let mut kf = tempfile::NamedTempFile::new().unwrap();
+        kf.write_all(client_key_pem.as_bytes()).unwrap();
+        kf.flush().unwrap();
+
+        let chain = zeroclaw_tls::load_certs(cf.path().to_str().unwrap()).unwrap();
+        let key = zeroclaw_tls::load_private_key(kf.path().to_str().unwrap()).unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoServerVerify))
+        .with_client_auth_cert(chain, key)
+        .unwrap();
+        tokio_tungstenite::Connector::Rustls(Arc::new(client_cfg))
+    }
+
+    async fn assert_reload_replacement_generation_waits_for_durable_session_prompt_wss() {
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::dispatch::connection_test_support::insert_session;
+        use crate::rpc::session::SessionStore;
+        use async_trait::async_trait;
+        use tokio::sync::Notify;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const DURABLE_SID: &str = "durable-reload-session-wss";
+
+        struct HoldOnDrop {
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        impl Drop for HoldOnDrop {
+            fn drop(&mut self) {
+                self.log.lock().unwrap().push("gen1_unwind_start");
+                let (lock, cvar) = &*self.allow_finish;
+                let mut finished = lock.lock().unwrap();
+                while !*finished {
+                    finished = cvar.wait(finished).unwrap();
+                }
+                self.is_running.store(false, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_ended");
+            }
+        }
+
+        struct BlockingGen1Provider {
+            started: Arc<Notify>,
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for BlockingGen1Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.is_running.store(true, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_started");
+                let _drop_guard = HoldOnDrop {
+                    allow_finish: Arc::clone(&self.allow_finish),
+                    is_running: Arc::clone(&self.is_running),
+                    log: Arc::clone(&self.log),
+                };
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                Ok("gen1 finished".to_string())
+            }
+        }
+
+        impl Attributable for BlockingGen1Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "blocking-gen1"
+            }
+        }
+
+        struct ObservantGen2Provider {
+            gen1_is_running: Arc<AtomicBool>,
+            started: Arc<Notify>,
+            overlap_detected: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ObservantGen2Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if self.gen1_is_running.load(Ordering::SeqCst) {
+                    self.overlap_detected.store(true, Ordering::SeqCst);
+                    self.log.lock().unwrap().push("OVERLAP_DETECTED");
+                }
+                self.log.lock().unwrap().push("gen2_started");
+                self.started.notify_one();
+                self.log.lock().unwrap().push("gen2_ended");
+                Ok("gen2 finished".to_string())
+            }
+        }
+
+        impl Attributable for ObservantGen2Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "observant-gen2"
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mats = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca_pem = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key_pem = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let client = zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key_pem, "test-client").unwrap();
+
+        let acceptor1 = super::build_tls_acceptor(
+            mats.server_cert_path.to_str().unwrap(),
+            mats.server_key_path.to_str().unwrap(),
+            mats.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+
+        let gen1_started = Arc::new(Notify::new());
+        let allow_gen1_finish = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gen1_is_running = Arc::new(AtomicBool::new(false));
+        let gen2_started = Arc::new(Notify::new());
+        let overlap_detected = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let port1 = free_port().await;
+        let addr1: std::net::SocketAddr = format!("127.0.0.1:{port1}").parse().unwrap();
+
+        let config1 = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
+        let sessions1 = Arc::new(SessionStore::new(64, queue1));
+        let ctx1 = RpcContext::for_persistence_tests(
+            config1,
+            sessions1,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+
+        insert_session(
+            &ctx1,
+            tmp.path(),
+            DURABLE_SID,
+            Box::new(BlockingGen1Provider {
+                started: Arc::clone(&gen1_started),
+                allow_finish: Arc::clone(&allow_gen1_finish),
+                is_running: Arc::clone(&gen1_is_running),
+                log: Arc::clone(&log),
+            }),
+        )
+        .await;
+
+        let cancel1 = CancellationToken::new();
+        let count1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel1_for_listener = cancel1.clone();
+        let ctx1_for_listener = Arc::clone(&ctx1);
+        let count1_for_listener = Arc::clone(&count1);
+
+        let gen1_listener_handle = zeroclaw_spawn::spawn!(async move {
+            super::run_wss_listener(
+                ctx1_for_listener,
+                cancel1_for_listener,
+                count1_for_listener,
+                acceptor1,
+                addr1,
+                super::WssLimits::default(),
+            )
+            .await
+        });
+
+        let connector1 = test_client_connector(&client.cert_pem, &client.key_pem);
+        let url1 = format!("wss://127.0.0.1:{port1}/");
+        let ws1 = async {
+            let started = std::time::Instant::now();
+            loop {
+                match tokio_tungstenite::connect_async_tls_with_config(
+                    &url1,
+                    None,
+                    false,
+                    Some(connector1.clone()),
+                )
+                .await
+                {
+                    Ok((ws, _)) => return ws,
+                    Err(e) => {
+                        if started.elapsed() > Duration::from_secs(5) {
+                            panic!("timed out connecting to Gen 1: {e:?}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+        .await;
+
+        let (mut client_sink1, mut client_stream1) = ws1.split();
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+        };
+        client_sink1
+            .send(Message::Text(
+                rpc_request(Method::Initialize, &init, 1).into(),
+            ))
+            .await
+            .unwrap();
+        let _ = client_stream1.next().await.unwrap().unwrap();
+
+        // Send prompt to Generation 1
+        client_sink1
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 1"}),
+                    2,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), gen1_started.notified())
+            .await
+            .expect("Gen 1 prompt should reach provider");
+
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must be running"
+        );
+
+        // Trigger reload on Generation 1
+        cancel1.cancel();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !gen1_listener_handle.is_finished(),
+            "Gen 1 WSS listener must NOT finish while prompt is held in cancellation"
+        );
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must remain active while draining"
+        );
+
+        let tmp_path = tmp.path().to_path_buf();
+        let chat_backend2 = chat_backend.clone();
+        let gen1_is_running_for_gen2 = Arc::clone(&gen1_is_running);
+        let gen2_started_clone = Arc::clone(&gen2_started);
+        let overlap_detected_clone = Arc::clone(&overlap_detected);
+        let log_clone = Arc::clone(&log);
+        let client_cert_pem = client.cert_pem.clone();
+        let client_key_pem = client.key_pem.clone();
+
+        let gen2_task = zeroclaw_spawn::spawn!(async move {
+            // Gen 2 waits for Gen 1 listener to cleanly shut down
+            gen1_listener_handle
+                .await
+                .unwrap()
+                .expect("Gen 1 WSS listener should exit Ok");
+
+            let port2 = free_port().await;
+            let addr2: std::net::SocketAddr = format!("127.0.0.1:{port2}").parse().unwrap();
+
+            let acceptor2 = super::build_tls_acceptor(
+                mats.server_cert_path.to_str().unwrap(),
+                mats.server_key_path.to_str().unwrap(),
+                mats.ca_cert_path.to_str().unwrap(),
+                &[],
+                "",
+            )
+            .unwrap();
+
+            let config2 = zeroclaw_config::schema::Config {
+                data_dir: tmp_path.clone(),
+                config_path: tmp_path.join("config.toml"),
+                ..Default::default()
+            };
+            let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
+            let sessions2 = Arc::new(SessionStore::new(64, queue2));
+            let ctx2 = RpcContext::for_persistence_tests(
+                config2,
+                sessions2,
+                Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+
+            insert_session(
+                &ctx2,
+                &tmp_path,
+                DURABLE_SID,
+                Box::new(ObservantGen2Provider {
+                    gen1_is_running: gen1_is_running_for_gen2,
+                    started: gen2_started_clone,
+                    overlap_detected: overlap_detected_clone,
+                    log: log_clone,
+                }),
+            )
+            .await;
+
+            let cancel2 = CancellationToken::new();
+            let count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cancel2_for_listener = cancel2.clone();
+            let handle2 = zeroclaw_spawn::spawn!(async move {
+                super::run_wss_listener(
+                    ctx2,
+                    cancel2_for_listener,
+                    count2,
+                    acceptor2,
+                    addr2,
+                    super::WssLimits::default(),
+                )
+                .await
+            });
+
+            let connector2 = test_client_connector(&client_cert_pem, &client_key_pem);
+            let url2 = format!("wss://127.0.0.1:{port2}/");
+            let ws2 = async {
+                let started = std::time::Instant::now();
+                loop {
+                    match tokio_tungstenite::connect_async_tls_with_config(
+                        &url2,
+                        None,
+                        false,
+                        Some(connector2.clone()),
+                    )
+                    .await
+                    {
+                        Ok((ws, _)) => return ws,
+                        Err(e) => {
+                            if started.elapsed() > Duration::from_secs(5) {
+                                panic!("timed out connecting to Gen 2: {e:?}");
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                }
+            }
+            .await;
+
+            let (mut client_sink2, mut client_stream2) = ws2.split();
+            let init = InitializeParams {
+                protocol_version: 1,
+                tui_id: None,
+                tui_sig: None,
+                env: Default::default(),
+                client_capabilities: None,
+            };
+            client_sink2
+                .send(Message::Text(
+                    rpc_request(Method::Initialize, &init, 1).into(),
+                ))
+                .await
+                .unwrap();
+            let _ = client_stream2.next().await.unwrap().unwrap();
+
+            client_sink2
+                .send(Message::Text(
+                    rpc_request(
+                        Method::SessionPrompt,
+                        &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 2"}),
+                        3,
+                    )
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            cancel2.cancel();
+            handle2
+                .await
+                .unwrap()
+                .expect("Gen 2 WSS listener should exit Ok");
+            drop(client_sink2);
+        });
+
+        // While Gen 1 is held in cancellation, verify Gen 2 has not started its prompt
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must still be held"
+        );
+        let current_log = log.lock().unwrap().clone();
+        assert_eq!(
+            current_log,
+            vec!["gen1_started", "gen1_unwind_start"],
+            "Prompt 2 must not have started yet"
+        );
+
+        // Now allow Gen 1 prompt to complete its cooperative cancellation unwind
+        {
+            let (lock, cvar) = &*allow_gen1_finish;
+            let mut finished = lock.lock().unwrap();
+            *finished = true;
+            cvar.notify_all();
+        }
+
+        // Gen 2 task should now complete cleanly
+        tokio::time::timeout(Duration::from_secs(5), gen2_task)
+            .await
+            .expect("Gen 2 reload handoff should finish within timeout")
+            .expect("Gen 2 task should not panic");
+
+        assert!(
+            !overlap_detected.load(Ordering::SeqCst),
+            "Prompt 2 must not overlap with Prompt 1 on durable session"
+        );
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log,
+            vec![
+                "gen1_started",
+                "gen1_unwind_start",
+                "gen1_ended",
+                "gen2_started",
+                "gen2_ended"
+            ],
+            "Generations must execute sequentially with Gen 1 fully drained before Gen 2 begins"
+        );
+
+        drop(client_sink1);
+    }
+
+    #[test]
+    fn reload_replacement_generation_waits_for_durable_session_prompt_wss() {
+        std::thread::Builder::new()
+            .name("wss-reload-durable-session".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        assert_reload_replacement_generation_waits_for_durable_session_prompt_wss(),
+                    );
+            })
+            .unwrap()
+            .join()
+            .expect("WSS reload durable session test thread should not panic");
     }
 
     #[cfg(unix)]

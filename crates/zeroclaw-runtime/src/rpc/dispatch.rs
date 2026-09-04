@@ -5335,6 +5335,15 @@ fn response_id_key(id: &Value) -> Option<String> {
     }
 }
 
+impl Drop for RpcDispatcher {
+    fn drop(&mut self) {
+        self.connection_cancel.cancel();
+        for task in &self.prompt_tasks {
+            task.abort();
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn parse_params<T: DeserializeOwned>(params: &Value) -> Result<T, JsonRpcError> {
@@ -5631,7 +5640,7 @@ pub(crate) mod connection_test_support {
         }
     }
 
-    async fn insert_session(
+    pub(crate) async fn insert_session(
         ctx: &Arc<RpcContext>,
         path: &Path,
         session_id: &str,
