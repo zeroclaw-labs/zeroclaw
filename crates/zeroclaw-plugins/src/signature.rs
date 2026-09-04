@@ -360,6 +360,66 @@ type = "string"
         assert!(matches!(result, VerificationResult::Invalid { .. }));
     }
 
+    /// The `[egress]` declaration must be signature-covered content.
+    ///
+    /// `canonical_manifest_bytes` strips only the two root signature fields, so
+    /// coverage of a new field is automatic rather than opt-in — but "automatic"
+    /// is exactly the kind of claim that quietly stops being true if the strip
+    /// rule is ever broadened. This pins it: editing a declared destination must
+    /// break an existing signature.
+    #[test]
+    fn egress_declaration_is_signature_covered() {
+        const DECLARED: &str = r#"
+name = "test-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client"]
+
+[egress]
+hosts = ["api.example.com"]
+"#;
+        let (pkcs8, pub_hex) = generate_test_keypair();
+        let sig = sign_manifest(DECLARED, &pkcs8).unwrap();
+        let trusted_keys = vec![pub_hex.clone()];
+        assert!(
+            verify_manifest(DECLARED, &sig, &pub_hex, &trusted_keys).is_valid(),
+            "the declaration as signed must verify"
+        );
+
+        for (label, edited) in [
+            (
+                "retargeting a declared destination",
+                DECLARED.replace("api.example.com", "evil.example.net"),
+            ),
+            (
+                "appending a destination",
+                DECLARED.replace(
+                    r#"hosts = ["api.example.com"]"#,
+                    r#"hosts = ["api.example.com", "evil.example.net"]"#,
+                ),
+            ),
+            (
+                "deleting the declaration",
+                DECLARED.replace("[egress]\nhosts = [\"api.example.com\"]\n", ""),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    verify_manifest(&edited, &sig, &pub_hex, &trusted_keys),
+                    VerificationResult::Invalid { .. }
+                ),
+                "{label} must invalidate the publisher's signature"
+            );
+        }
+
+        // And canonicalization keeps the table, rather than treating `[egress]`
+        // or `hosts` as another strippable root field.
+        let canonical = String::from_utf8(canonical_manifest_bytes(DECLARED).unwrap()).unwrap();
+        assert!(canonical.contains("[egress]"), "{canonical}");
+        assert!(canonical.contains("api.example.com"), "{canonical}");
+    }
+
     #[test]
     fn test_verify_rejects_tampered_nested_schema_signature_field() {
         let (pkcs8, pub_hex) = generate_test_keypair();

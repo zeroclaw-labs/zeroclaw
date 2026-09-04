@@ -9,6 +9,90 @@ use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
 
+/// Closed identifier supplied by a trusted interaction client. The identifier
+/// selects host-owned descriptive semantics; it never carries prompt prose or
+/// capability claims from the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionSurface {
+    ZerocodeCode,
+}
+
+impl InteractionSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ZerocodeCode => "zerocode_code",
+        }
+    }
+
+    pub fn from_persisted(value: &str) -> Option<Self> {
+        match value {
+            "zerocode_code" => Some(Self::ZerocodeCode),
+            _ => None,
+        }
+    }
+
+    /// Resolve the client identifier into the canonical host-owned facts that
+    /// may be described to the model.
+    pub fn resolve(self) -> InteractionContext {
+        match self {
+            Self::ZerocodeCode => InteractionContext {
+                surface: self,
+                mode: InteractionMode::InteractiveCoding,
+                response_delivery: ResponseDelivery::CurrentTranscript,
+                workspace: WorkspaceBinding::ActiveSessionWorkingDirectory,
+                tools_and_approvals: ToolAuthority::RuntimeEnforced,
+                memory: MemoryAccess::PersistentMemoryDisabled,
+                persistence: SessionPersistence::HostStoredTranscript,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionMode {
+    InteractiveCoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseDelivery {
+    CurrentTranscript,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceBinding {
+    ActiveSessionWorkingDirectory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAuthority {
+    RuntimeEnforced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryAccess {
+    PersistentMemoryDisabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPersistence {
+    HostStoredTranscript,
+}
+
+/// Product-neutral description of the active user-facing interaction harness.
+/// All fields are resolved by ZeroClaw from a closed surface identifier and
+/// canonical session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractionContext {
+    surface: InteractionSurface,
+    mode: InteractionMode,
+    response_delivery: ResponseDelivery,
+    workspace: WorkspaceBinding,
+    tools_and_approvals: ToolAuthority,
+    memory: MemoryAccess,
+    persistence: SessionPersistence,
+}
+
 pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
@@ -23,6 +107,7 @@ pub struct PromptContext<'a> {
     pub skills: &'a [Skill],
     pub skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
+    pub interaction: Option<&'a InteractionContext>,
     pub dispatcher_instructions: &'a str,
     /// True when the provider request carries native tool specs. In that mode
     /// the prompt must not duplicate the same tool catalog in prose.
@@ -58,6 +143,7 @@ impl SystemPromptBuilder {
         Self {
             sections: vec![
                 Box::new(DateTimeSection),
+                Box::new(InteractionSection),
                 Box::new(IdentitySection),
                 Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
@@ -91,6 +177,7 @@ impl SystemPromptBuilder {
 }
 
 pub struct IdentitySection;
+pub struct InteractionSection;
 pub struct ToolHonestySection;
 pub struct ToolsSection;
 pub struct SafetySection;
@@ -100,6 +187,60 @@ pub struct RuntimeSection;
 pub struct ShellSection;
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
+
+impl PromptSection for InteractionSection {
+    fn name(&self) -> &str {
+        "interaction"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let Some(interaction) = ctx.interaction else {
+            return Ok(String::new());
+        };
+
+        let surface = match interaction.surface {
+            InteractionSurface::ZerocodeCode => "ZeroCode Code (ACP)",
+        };
+        let mode = match interaction.mode {
+            InteractionMode::InteractiveCoding => "interactive coding session",
+        };
+        let response_delivery = match interaction.response_delivery {
+            ResponseDelivery::CurrentTranscript => "shown in the current ZeroCode transcript",
+        };
+        let workspace = match interaction.workspace {
+            WorkspaceBinding::ActiveSessionWorkingDirectory => {
+                "the active session working directory"
+            }
+        };
+        let tools_and_approvals = match interaction.tools_and_approvals {
+            ToolAuthority::RuntimeEnforced => {
+                "provided and enforced by the ZeroClaw runtime; this description grants no capabilities"
+            }
+        };
+        let memory = match interaction.memory {
+            MemoryAccess::PersistentMemoryDisabled => {
+                "persistent memory is unavailable in this session"
+            }
+        };
+        let persistence = match interaction.persistence {
+            SessionPersistence::HostStoredTranscript => {
+                "conversation history is stored by the host for resume"
+            }
+        };
+
+        Ok(format!(
+            "## Interaction Context\n\n\
+             Surface: {surface}\n\
+             Mode: {mode}\n\
+             User messages: direct conversation, not API payloads or log records\n\
+             Response delivery: {response_delivery}\n\
+             Workspace: {workspace}\n\
+             Tools and approvals: {tools_and_approvals}\n\
+             Memory: {memory}\n\
+             Session persistence: {persistence}"
+        ))
+    }
+}
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -250,10 +391,11 @@ impl PromptSection for SkillsSection {
             ctx.skills_prompt_mode,
             ctx.tools.iter().any(|tool| tool.name() == "read_skill"),
         );
-        Ok(crate::skills::skills_to_prompt_with_mode(
+        Ok(crate::skills::skills_to_prompt_with_mode_and_availability(
             ctx.skills,
             ctx.workspace_dir,
             mode,
+            |name| ctx.tools.iter().any(|tool| tool.name() == name),
         ))
     }
 }
@@ -366,6 +508,7 @@ mod tests {
     zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
     zeroclaw_api::mock_tool_attribution!(ShellTestTool);
     zeroclaw_api::mock_tool_attribution!(CronAddTestTool);
+    zeroclaw_api::mock_tool_attribution!(SkillToolTestTool);
 
     struct TestTool;
     struct ReadSkillTestTool;
@@ -373,6 +516,33 @@ mod tests {
     struct ShellTestTool;
     /// Stands in for `cron_add`, which also takes a model-authored command.
     struct CronAddTestTool;
+    struct SkillToolTestTool(&'static str);
+
+    #[async_trait]
+    impl Tool for SkillToolTestTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "registered skill tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
 
     #[async_trait]
     impl Tool for ShellTestTool {
@@ -504,6 +674,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -538,6 +709,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "instr",
             sends_native_tool_specs: false,
 
@@ -552,6 +724,68 @@ mod tests {
     }
 
     #[test]
+    fn interaction_section_renders_only_host_owned_zerocode_code_facts() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let interaction = InteractionSurface::ZerocodeCode.resolve();
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/private/project"),
+            agent_workspace_dir: Path::new("/private/agent"),
+            model_name: "secret-model-name",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            interaction: Some(&interaction),
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
+        };
+
+        let output = InteractionSection.build(&ctx).unwrap();
+        assert_eq!(
+            output,
+            "## Interaction Context\n\n\
+             Surface: ZeroCode Code (ACP)\n\
+             Mode: interactive coding session\n\
+             User messages: direct conversation, not API payloads or log records\n\
+             Response delivery: shown in the current ZeroCode transcript\n\
+             Workspace: the active session working directory\n\
+             Tools and approvals: provided and enforced by the ZeroClaw runtime; this description grants no capabilities\n\
+             Memory: persistent memory is unavailable in this session\n\
+             Session persistence: conversation history is stored by the host for resume"
+        );
+        assert!(!output.contains("/private"));
+        assert!(!output.contains("secret-model-name"));
+    }
+
+    #[test]
+    fn compact_prompt_keeps_interaction_context() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let interaction = InteractionSurface::ZerocodeCode.resolve();
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+            identity_config: None,
+            interaction: Some(&interaction),
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(prompt.contains("## Interaction Context"));
+        assert!(prompt.contains("Surface: ZeroCode Code (ACP)"));
+    }
+
+    #[test]
     fn prompt_builder_skips_tools_section_for_native_tool_specs() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
@@ -562,6 +796,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: true,
 
@@ -586,6 +821,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -607,7 +843,8 @@ mod tests {
 
     #[test]
     fn skills_section_includes_instructions_and_tools_in_full_mode() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
+        let tools: Vec<Box<dyn Tool>> =
+            vec![Box::new(SkillToolTestTool("deploy__release_checklist"))];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -639,6 +876,7 @@ mod tests {
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -658,7 +896,10 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ReadSkillTestTool)];
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadSkillTestTool),
+            Box::new(SkillToolTestTool("deploy__release_checklist")),
+        ];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
             description: "Release safely".into(),
@@ -690,6 +931,7 @@ mod tests {
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -734,6 +976,7 @@ mod tests {
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
             security_summary: None,
@@ -748,7 +991,9 @@ mod tests {
 
     #[test]
     fn skills_section_compact_mode_keeps_instructions_for_always_skill() {
-        let tools: Vec<Box<dyn Tool>> = vec![];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SkillToolTestTool(
+            "security-policy__release_checklist",
+        ))];
         let skills = vec![crate::skills::Skill {
             name: "security-policy".into(),
             description: "Critical safety rules".into(),
@@ -782,6 +1027,7 @@ mod tests {
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
             security_summary: None,
@@ -810,6 +1056,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "instr",
             sends_native_tool_specs: false,
 
@@ -863,6 +1110,7 @@ mod tests {
             skills: &skills,
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -900,6 +1148,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -938,6 +1187,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -968,6 +1218,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -1006,6 +1257,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
 
@@ -1039,6 +1291,7 @@ mod tests {
             skills: &[],
             skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             identity_config: None,
+            interaction: None,
             dispatcher_instructions: "",
             sends_native_tool_specs: false,
             security_summary: None,
