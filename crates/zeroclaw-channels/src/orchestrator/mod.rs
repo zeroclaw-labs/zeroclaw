@@ -26897,6 +26897,57 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// Composes the two halves of the fix the way the reply-delivery arm does,
+    /// so the chain from a real sender to the overrides that reach the channel
+    /// is asserted somewhere, not only link by link. Without this, the negative
+    /// case is covered by two tests that meet at a value neither of them
+    /// derives: `sender_prefers_voice` is asserted to return `Some(false)`, and
+    /// `voice_override_from_sender_verdict` is asserted on a hand-written
+    /// `Some(false)`. Both could stay green while the call site composed them
+    /// wrongly.
+    #[test]
+    fn a_non_member_matrix_sender_composes_to_an_explicit_suppression() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        // Bob shares a room with voice-peer Alice, but is not in the group.
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx,
+                &matrix_msg("@bob:server")
+            )),
+            (Some(true), false),
+            "a non-member sender must reach the channel as an explicit suppression, \
+             or `should_voice` falls back to room membership and voices the reply"
+        );
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx,
+                &matrix_msg("@alice:server")
+            )),
+            (None, true),
+            "a member still voices, with membership fallback left intact"
+        );
+        // No voice groups configured for the channel: still no opinion, so the
+        // proactive/room-membership path keeps working.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let ctx2 =
+            channel_runtime_context_with_peer_groups(tmp2.path(), std::collections::HashMap::new());
+        assert_eq!(
+            voice_override_from_sender_verdict(sender_prefers_voice(
+                &ctx2,
+                &matrix_msg("@bob:server")
+            )),
+            (None, false),
+            "no configured groups must stay 'no opinion', not a suppression"
+        );
+    }
+
     #[test]
     fn matrix_voice_group_wildcard_voices_every_sender() {
         let tmp = tempfile::TempDir::new().unwrap();
