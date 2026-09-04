@@ -21248,7 +21248,7 @@ impl Config {
                     format!("providers.models.anthropic.{alias}.server_fallback_models[{i}]");
                 if model.trim().is_empty() {
                     warnings.push(crate::validation_warnings::ValidationWarning::new(
-                        "empty_server_fallback_model",
+                        crate::validation_warnings::EMPTY_SERVER_FALLBACK_MODEL,
                         format!(
                             "server_fallback_models entry {i} on anthropic.{alias} is empty; \
                              it is dropped before the request is sent"
@@ -21257,7 +21257,7 @@ impl Config {
                     ));
                 } else if primary == Some(model.as_str()) {
                     warnings.push(crate::validation_warnings::ValidationWarning::new(
-                        "server_fallback_model_duplicates_primary",
+                        crate::validation_warnings::SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY,
                         format!(
                             "server_fallback_models entry {model:?} on anthropic.{alias} \
                              duplicates the primary model; it is dropped before the request is sent"

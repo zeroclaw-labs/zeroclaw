@@ -2572,6 +2572,9 @@ impl AnthropicModelProvider {
                         } else {
                             None
                         };
+                        if let Some(usage) = usage.clone() {
+                            let _ = tx.send(Ok(StreamEvent::Usage(usage))).await;
+                        }
                         let _ = tx
                             .send(Err(StreamError::ModelRefusal(Box::new(
                                 AnthropicRefusalError {
@@ -2779,6 +2782,7 @@ impl ModelProvider for AnthropicModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         commit_safeguard_fallback(None);
         if let Some(refusal) = crate::reliable::take_stream_refusal_recovery() {
+            crate::dispatch::accounting::suppress_current_attempt();
             return Err(anyhow::Error::new(refusal));
         }
         let credential = self.credential.as_ref().ok_or_else(|| {
@@ -7937,6 +7941,30 @@ data: {\"type\":\"message_stop\"}\n\n";
         (addr, handle)
     }
 
+    /// Spin up a mock `/v1/messages` server that streams raw SSE events.
+    async fn spawn_messages_sse_server(
+        body: &'static str,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::header, response::Response, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, handle)
+    }
+
     /// Guard against the `E0063` drift class that took this crate's entire
     /// lib-test target down (CI `Lint` + `Test` + `CI Required Gate` all red
     /// at head `59273cd1`): a `#[cfg(test)]` struct literal of
@@ -8919,6 +8947,91 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
         assert_eq!(usage.output_tokens, Some(0), "output tokens");
         assert_eq!(usage.cached_input_tokens, Some(100), "cache_read tokens");
         assert_eq!(refusal.to_string(), ANTHROPIC_REFUSAL_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn unwrapped_anthropic_refusal_recovery_bills_exactly_one_attempt() {
+        use futures_util::StreamExt;
+
+        const SSE: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input_tokens\":412,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":50}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usage\":{\"output_tokens\":0}}\n\n"
+        );
+        let (addr, server) = spawn_messages_sse_server(SSE).await;
+        let provider = refusal_test_provider(addr);
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        let err = scope
+            .scope(async {
+                let dispatcher = crate::dispatch::ProviderDispatch::from_ref(&provider);
+                let mut stream = dispatcher.stream_chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "claude-sonnet-4-6",
+                    None,
+                    StreamOptions::new(true),
+                );
+                let mut refusal = None;
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(_) => {}
+                        Err(StreamError::ModelRefusal(r)) => {
+                            refusal = Some(*r);
+                            break;
+                        }
+                        Err(other) => panic!("unexpected error: {other:?}"),
+                    }
+                }
+                let refusal = refusal.expect("stream refusal event");
+                scope.record_stream_interruption_usage(
+                    refusal.usage.as_deref().expect("refusal usage").clone(),
+                );
+                dispatcher
+                    .chat_after_stream_refusal(
+                        ProviderChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "claude-sonnet-4-6",
+                        None,
+                        refusal,
+                    )
+                    .await
+                    .expect_err(
+                        "unwrapped anthropic provider must propagate refusal without replaying",
+                    )
+            })
+            .await;
+        server.abort();
+
+        assert!(
+            err.downcast_ref::<AnthropicRefusalError>().is_some(),
+            "returned error must be the typed refusal: {err}"
+        );
+        let report = scope.take();
+        assert_eq!(
+            report.attempts().len(),
+            1,
+            "unwrapped refusal recovery must bill exactly one physical attempt"
+        );
+        assert_eq!(report.attempts()[0].provider_ref(), "test");
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(TokenUsage {
+                    input_tokens: Some(562),
+                    output_tokens: Some(0),
+                    cached_input_tokens: Some(100),
+                })
+            }
+        ));
     }
 
     #[test]

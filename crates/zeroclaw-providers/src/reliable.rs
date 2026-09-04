@@ -880,6 +880,17 @@ impl ReliableProviderTerminalFailure {
         self
     }
 
+    /// Attach an underlying terminal cause while retaining diagnostic and kind mapping.
+    pub fn with_terminal_cause(mut self, cause: anyhow::Error) -> Self {
+        self.terminal_cause = Some(cause);
+        self
+    }
+
+    /// The underlying terminal cause if one was attached.
+    pub fn terminal_cause(&self) -> Option<&anyhow::Error> {
+        self.terminal_cause.as_ref()
+    }
+
     pub fn provider(&self) -> Option<&str> {
         self.provider.as_deref()
     }

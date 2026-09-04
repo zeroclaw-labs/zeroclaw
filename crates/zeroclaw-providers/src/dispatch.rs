@@ -12,7 +12,7 @@ use zeroclaw_api::model_provider::{
     StreamResult,
 };
 
-mod accounting;
+pub(crate) mod accounting;
 
 /// Why a provider supplied usage observation cannot be billed as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

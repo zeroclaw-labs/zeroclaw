@@ -2709,6 +2709,7 @@ impl Agent {
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
             && turn_provider_recovery.is_none()
+            && turn_safeguard_fallback.is_none()
             && !turn_provider_context_truncated
             && loop_new_messages.len() == 2
             && loop_new_messages
@@ -3203,6 +3204,7 @@ impl Agent {
                     // exchange, mirroring the old "no tool calls" condition.
                     if single_text_exchange
                         && turn_provider_recovery.is_none()
+                        && turn_safeguard_fallback.is_none()
                         && !turn_provider_context_truncated
                         && let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
                     {
@@ -4858,6 +4860,102 @@ mod tests {
 
         fn alias(&self) -> &str {
             "counting-answer"
+        }
+    }
+
+    struct CountingSafeguardModelProvider {
+        calls: Arc<AtomicUsize>,
+        answer: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingSafeguardModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            Ok(self.answer.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(self.answer.clone()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            let delta = self.answer.clone();
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta(delta),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingSafeguardModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "counting-safeguard"
         }
     }
 
@@ -9612,6 +9710,145 @@ mod tests {
         assert!(second_response.contains("fallback-b"));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_non_streaming_safeguard_fallback() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(CountingSafeguardModelProvider {
+                    calls: calls.clone(),
+                    answer: answer.into(),
+                }))
+                .model_provider_name("anthropic".into())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("claude-sonnet-4-6".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("first-answer");
+        let mut second = build("second-answer");
+
+        let first_resp = first.turn("hello").await.unwrap();
+        assert!(first_resp.contains("first-answer"));
+        assert!(
+            first_resp.contains("server-fallback-model"),
+            "non-streaming safeguard fallback turn must append fallback notice"
+        );
+        let history_text = match first.history.last() {
+            Some(ConversationMessage::Chat(chat)) => chat.content.clone(),
+            _ => String::new(),
+        };
+        assert!(
+            !history_text.contains("server-fallback-model"),
+            "canonical history must not contain appended safeguard notice: {history_text}"
+        );
+
+        let second_resp = second.turn("hello").await.unwrap();
+        assert!(second_resp.contains("second-answer"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "safeguard fallback turn must bypass cache and reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_streamed_safeguard_fallback() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(CountingSafeguardModelProvider {
+                    calls: calls.clone(),
+                    answer: answer.into(),
+                }))
+                .model_provider_name("anthropic".into())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("claude-sonnet-4-6".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("first-stream");
+        let mut second = build("second-stream");
+
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+
+        let (first_resp, _) = first
+            .turn_streamed("hello", event_tx_a, None)
+            .await
+            .unwrap();
+        assert!(first_resp.contains("first-stream"));
+        assert!(
+            first_resp.contains("server-fallback-model"),
+            "streamed turn must append safeguard fallback notice"
+        );
+
+        let (second_resp, _) = second
+            .turn_streamed("hello", event_tx_b, None)
+            .await
+            .unwrap();
+        assert!(second_resp.contains("second-stream"));
+        assert!(
+            second_resp.contains("server-fallback-model"),
+            "streamed turn must append safeguard fallback notice"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "streamed safeguard fallback turn must bypass cache and reach the provider"
+        );
     }
 
     #[tokio::test]
