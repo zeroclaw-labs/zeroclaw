@@ -2103,7 +2103,21 @@ fn normalize_peer_username(raw: &str) -> String {
 
 /// Whether the inbound sender belongs to an `output_modality = "voice"` peer
 /// group on the channel the message arrived on. The answer travels to the
-/// channel as `SendMessage::force_voice`.
+/// channel as `SendMessage::force_voice` / `SendMessage::suppress_voice`.
+///
+/// Returns a tri-state, not a bool, because "no opinion" and "no" must stay
+/// distinguishable:
+///
+/// - `None` — no opinion: the channel isn't Matrix, or no voice-peer groups
+///   are configured for it. The caller must keep falling through to
+///   room-membership lookup (`room_has_voice_peer`), which itself understands
+///   an empty/wildcard peer list via `allowlist::voice_peers_verdict`.
+///   Collapsing this case into `Some(false)` would bypass that handling.
+/// - `Some(true)` — the sender matches a configured voice peer.
+/// - `Some(false)` — voice peers ARE configured for this channel and the
+///   sender is not among them. This is the authoritative negative: callers
+///   must not fall back to room membership, or a non-member sender in a room
+///   that also contains a voice-group member would incorrectly get voiced.
 ///
 /// The decision lives here because this is the only place that holds both the
 /// sender and the reply target. A channel that inspects its own outbound
@@ -2129,10 +2143,10 @@ fn normalize_peer_username(raw: &str) -> String {
 fn sender_prefers_voice(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
-) -> bool {
+) -> Option<bool> {
     let channel_type = msg.channel.as_str();
     if !channel_type.starts_with("matrix") {
-        return false;
+        return None;
     }
     let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
     let voice_peers: Vec<String> = ctx
@@ -2142,10 +2156,34 @@ fn sender_prefers_voice(
         .map(|p| normalize_peer_username(&p))
         .collect();
     if voice_peers.is_empty() {
-        return false;
+        return None;
     }
     let sender = normalize_peer_username(msg.sender.as_str());
-    crate::allowlist::is_user_allowed(&voice_peers, &sender, crate::allowlist::Match::Sensitive)
+    Some(crate::allowlist::is_user_allowed(
+        &voice_peers,
+        &sender,
+        crate::allowlist::Match::Sensitive,
+    ))
+}
+
+/// Maps a [`sender_prefers_voice`] verdict to the
+/// `(suppress_voice_override, force_voice_override)` pair the no-`send_via`
+/// reply-delivery arm passes down to `SendMessage` / `finalize_draft`.
+///
+/// Broken out of that call site so the mapping — which is the fix for the
+/// negative-sender-verdict regression (an authoritative "not a voice peer"
+/// must suppress voice rather than fall back to room-membership lookup) — is
+/// unit-testable on its own, and so a delivery-level test that mounts real
+/// Matrix room membership (in `matrix.rs`, where that scaffolding lives) can
+/// drive the exact production mapping without reconstructing the large
+/// `ChannelRuntimeContext` this module builds `sender_prefers_voice`'s input
+/// from.
+pub(crate) fn voice_override_from_sender_verdict(verdict: Option<bool>) -> (Option<bool>, bool) {
+    match verdict {
+        Some(true) => (None, true),
+        Some(false) => (Some(true), false),
+        None => (None, false),
+    }
 }
 
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -7727,13 +7765,24 @@ async fn process_channel_message_body(
                 (ch, recipient, suppress, force_voice)
             } else {
                 // No `send_via` override: the peer group the sender belongs to
-                // decides. `suppress_voice` stays `None` so a `text` group is
-                // still the channel default rather than an explicit override.
+                // decides. A positive verdict sets `force_voice` with
+                // `suppress_voice` left `None` (a `text` group stays the
+                // channel default rather than an explicit override). A
+                // negative verdict is authoritative — the sender is known to
+                // be outside every voice group configured for this channel —
+                // so it is carried as an explicit `suppress_voice_override`
+                // rather than left to fall back to room-membership lookup,
+                // which would incorrectly voice a reply to a non-member
+                // sender in a room that also contains a voice-group member.
+                // `None` (no groups configured, or a non-Matrix channel)
+                // keeps that membership fallback intact.
+                let (suppress, force_voice) =
+                    voice_override_from_sender_verdict(sender_prefers_voice(&ctx, &msg));
                 (
                     target_channel.clone(),
                     msg.reply_target.clone(),
-                    None,
-                    sender_prefers_voice(&ctx, &msg),
+                    suppress,
+                    force_voice,
                 )
             };
 
@@ -26782,6 +26831,26 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn voice_override_from_sender_verdict_makes_the_negative_authoritative() {
+        assert_eq!(
+            voice_override_from_sender_verdict(Some(true)),
+            (None, true),
+            "a matching sender forces voice with no suppress override"
+        );
+        assert_eq!(
+            voice_override_from_sender_verdict(Some(false)),
+            (Some(true), false),
+            "a sender confirmed outside every configured voice group must \
+             suppress voice explicitly, not merely withhold force_voice"
+        );
+        assert_eq!(
+            voice_override_from_sender_verdict(None),
+            (None, false),
+            "no opinion leaves both overrides unset so room-membership lookup still runs"
+        );
+    }
+
+    #[test]
     fn sender_prefers_voice_is_matrix_only() {
         // A voice group whose member matches by every rule this function applies,
         // on a channel it does not serve. Telegram decides modality for itself
@@ -26795,8 +26864,9 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        assert!(
-            !sender_prefers_voice(&ctx, &telegram_msg("@alice")),
+        assert_eq!(
+            sender_prefers_voice(&ctx, &telegram_msg("@alice")),
+            None,
             "a matching Telegram voice group must not be answered here"
         );
     }
@@ -26811,13 +26881,18 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        assert!(sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
-        assert!(
-            !sender_prefers_voice(&ctx, &matrix_msg("@mallory:server")),
-            "a sender outside the group keeps the text default"
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(true)
         );
-        assert!(
-            !sender_prefers_voice(&ctx, &matrix_msg("!room:server")),
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@mallory:server")),
+            Some(false),
+            "a sender outside the group is an authoritative negative, not 'no opinion'"
+        );
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("!room:server")),
+            Some(false),
             "the room id is not a peer identity and must never match"
         );
     }
@@ -26829,7 +26904,10 @@ BTC is currently around $65,000 based on latest tool output."#
         groups.insert("open".into(), voice_peer_group("matrix.default", &["*"]));
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        assert!(sender_prefers_voice(&ctx, &matrix_msg("@anyone:server")));
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@anyone:server")),
+            Some(true)
+        );
     }
 
     #[test]
@@ -26842,13 +26920,19 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        assert!(sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            Some(true)
+        );
     }
 
     #[test]
     fn a_mirror_peer_group_does_not_voice() {
         // `mirror` is the default modality and Matrix does not implement it;
-        // only an explicit `voice` group speaks.
+        // only an explicit `voice` group speaks. Because `channel_voice_peers`
+        // filters non-voice groups out entirely, this is "no voice groups
+        // configured" (`None`), not "sender rejected by a voice group"
+        // (`Some(false)`).
         let tmp = tempfile::TempDir::new().unwrap();
         let mut groups = std::collections::HashMap::new();
         groups.insert(
@@ -26857,7 +26941,10 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            None
+        );
     }
 
     #[test]
@@ -26866,7 +26953,11 @@ BTC is currently around $65,000 based on latest tool output."#
         let ctx =
             channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
 
-        assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            None,
+            "no voice-peer groups configured at all is 'no opinion', not a negative verdict"
+        );
     }
 
     #[test]
@@ -26879,7 +26970,11 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
 
-        assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+        assert_eq!(
+            sender_prefers_voice(&ctx, &matrix_msg("@alice:server")),
+            None,
+            "matrix has no voice peers configured for it, so this is 'no opinion'"
+        );
     }
 
     #[test]
@@ -26887,10 +26982,10 @@ BTC is currently around $65,000 based on latest tool output."#
         // This test documents the current (broken) behavior and will need updating when
         // Telegram's sender-side voice-group resolution is implemented as a follow-up.
         // Today: `sender_prefers_voice` is gated to Matrix only, so Telegram voice groups
-        // are ignored at the routing layer (the function returns false). This is correct
+        // are ignored at the routing layer (the function returns `None`). This is correct
         // by accident — the real bug is Telegram's own `is_voice_chat` path, which compares
         // chat IDs against user-peer lists. When fixed, both Telegram and Matrix will use
-        // the same sender-side resolution, and this test should then assert `true`.
+        // the same sender-side resolution, and this test should then assert `Some(true)`.
         // For now it confirms the gate works: Telegram voice groups do not leak into
         // `sender_prefers_voice` output.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -26909,8 +27004,9 @@ BTC is currently around $65,000 based on latest tool output."#
             content: "hello".into(),
             ..Default::default()
         };
-        assert!(
-            !sender_prefers_voice(&ctx, &msg),
+        assert_eq!(
+            sender_prefers_voice(&ctx, &msg),
+            None,
             "Telegram is gated out; the voice-group config is ignored (safe, but not the intended design)"
         );
     }

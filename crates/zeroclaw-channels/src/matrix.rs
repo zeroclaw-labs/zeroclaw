@@ -5674,6 +5674,165 @@ mod tests {
             );
         }
 
+        /// Delivery-level regression: a non-member sender's reply must stay
+        /// text-only even in a room that also holds a voice-group member.
+        /// Before the fix, the orchestrator's no-`send_via` reply arm kept
+        /// only the positive sender verdict (`force_voice`); a negative
+        /// verdict collapsed to `force_voice = false` with no
+        /// `suppress_voice` override, so `should_voice` fell back to
+        /// `room_has_voice_peer` and voiced the reply anyway because the
+        /// room's *other* occupant, `@alice:server`, was a voice peer.
+        ///
+        /// Drives the real production mapping
+        /// (`orchestrator::voice_override_from_sender_verdict`) — not a
+        /// hand-rolled stand-in — with the tri-state a non-member sender like
+        /// `@bob:server` actually gets (`Some(false)`, asserted separately in
+        /// `orchestrator::tests::matrix_voice_group_member_gets_a_voiced_reply_by_user_id`),
+        /// so this test is tied to that mapping and fails to build without
+        /// it. `matrix.rs`'s own `suppress_voice` handling predates the fix
+        /// and would pass this scenario either way, which is why the room
+        /// membership and the mapping call both have to be present here
+        /// rather than hand-constructing an already-suppressed `SendMessage`.
+        #[tokio::test]
+        async fn a_non_member_senders_reply_stays_text_only_in_a_room_with_a_voice_peer() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(
+                &homeserver,
+                room_id.as_str(),
+                &["@alice:server", "@bob:server"],
+            )
+            .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            // Alice being a voice peer in this room must not matter for
+            // Bob's reply: nothing may ever be uploaded for it.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            let (suppress, force_voice) =
+                crate::orchestrator::voice_override_from_sender_verdict(Some(false));
+            assert_eq!(
+                (suppress, force_voice),
+                (Some(true), false),
+                "sanity-check the mapping this test depends on"
+            );
+
+            let mut send_msg = SendMessage::new("reply to bob", room_id.as_str());
+            if suppress.unwrap_or(false) {
+                send_msg = send_msg.suppress_voice();
+            } else if force_voice {
+                send_msg = send_msg.force_voice();
+            }
+
+            channel
+                .send_final(&send_msg)
+                .await
+                .expect("text reply is delivered");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "a non-member sender's reply must never be synthesized, even \
+                 though the room also holds voice-group member @alice:server"
+            );
+        }
+
+        /// Same regression as above, for the streaming-finalization path the
+        /// reviewer named explicitly: `finalize_draft`'s shared voice-note
+        /// gate (after the per-`stream_mode` branch) must also honor the
+        /// mapped `suppress_voice` rather than falling back to room
+        /// membership. `MatrixStreamMode::Off` (the channel default here)
+        /// makes the per-mode branch a no-op, so this needs no live draft —
+        /// it exercises exactly the shared gate at issue.
+        #[tokio::test]
+        async fn finalize_draft_keeps_a_non_member_senders_reply_text_only() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(
+                &homeserver,
+                room_id.as_str(),
+                &["@alice:server", "@bob:server"],
+            )
+            .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            let (suppress, _force_voice) =
+                crate::orchestrator::voice_override_from_sender_verdict(Some(false));
+
+            channel
+                .finalize_draft(
+                    room_id.as_str(),
+                    "draft-1",
+                    "reply to bob",
+                    suppress.unwrap_or(false),
+                )
+                .await
+                .expect("finalize_draft succeeds with no live draft in Off stream mode");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "streaming finalization must also treat a non-member sender's \
+                 negative verdict as authoritative, even though the room \
+                 holds voice-group member @alice:server"
+            );
+        }
+
         #[tokio::test]
         async fn synthesis_failure_still_delivers_the_text_reply() {
             let room_id = owned_room_id!("!room:server");
