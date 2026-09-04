@@ -37079,7 +37079,7 @@ stream_tool_arguments = [
 
     #[test]
     async fn set_prop_sop_max_concurrent_total() {
-        // #9902 reported `config set sop.max_concurrent_total` as "Unknown
+        // `config set sop.max_concurrent_total` was reported as returning "Unknown
         // property". It resolves today, but only through the derive's nested
         // delegation (`Config` -> `SopConfig`), and no named test covers it:
         // the bulk scalar sweep swallows unsettable keys into a counter, so a

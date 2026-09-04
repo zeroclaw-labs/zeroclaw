@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn sop_show_concurrency_strings_format_in_all_locales() {
-        // #9902: `sop show` printed only the SOP's declared `max_concurrent`
+        // `sop show` printed only the SOP's declared `max_concurrent`
         // while the shared `sop.max_concurrent_total` pool was what actually
         // bound. Both lines must render, with the value substituted, in every
         // locale a user can select.

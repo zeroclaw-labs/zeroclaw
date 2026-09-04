@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn sop_global_pool_contract_appears_in_generated_reference() {
         // `max_concurrent_total` is a POOL shared by every SOP, not a per-SOP
-        // allowance. In #9902 an operator raised one SOP's `max_concurrent`
+        // allowance. An operator raised one SOP's `max_concurrent`
         // twice and measured no change, because the binding ceiling was this
         // global key. `first_line` truncates a field description to its FIRST
         // line, so reflowing that doc comment onto a second line would silently

@@ -1627,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn sops_list_carries_the_global_concurrency_ceiling() {
-        // #9902: the listing returned each SOP's declared `max_concurrent` but
+        // The listing returned each SOP's declared `max_concurrent` but
         // not the shared `sop.max_concurrent_total` pool that actually binds,
         // so a client could render only a cap that may never be reachable.
         let tmp = tempfile::tempdir().unwrap();
