@@ -603,19 +603,25 @@ mod tests {
 
     #[tokio::test]
     async fn stale_open_entry_is_purged_without_consumption() {
-        let _guard = test_lock();
-        // A stale `Open` entry is always an orphan: the callback's ack
-        // wait is bounded at 5s, so by 2× the TTL no live queued message
-        // can still own it, and the lazy sweep reclaims it.
-        insert_entry_for_test(
-            "selection-stale-open",
-            ClaimState::Open,
-            super::DELIVERY_ACK_ENTRY_TTL * 2,
-        );
-        assert!(is_registered("selection-stale-open"));
-        super::confirm("ordinary-message");
+        // Exercise the sweep against local state: publishing an intentionally
+        // expired entry in the process-global registry would let any concurrent
+        // runtime-command path purge the fixture before this test observes it.
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let mut pending = std::collections::HashMap::from([(
+            "selection-stale-open".to_string(),
+            super::PendingDeliveryAck {
+                sender,
+                claim: Arc::new(Mutex::new(ClaimState::Open)),
+                inserted_at: tokio::time::Instant::now()
+                    .checked_sub(super::DELIVERY_ACK_ENTRY_TTL * 2)
+                    .unwrap_or_else(tokio::time::Instant::now),
+            },
+        )]);
+
+        assert!(pending.contains_key("selection-stale-open"));
+        super::purge_expired(&mut pending);
         assert!(
-            !is_registered("selection-stale-open"),
+            !pending.contains_key("selection-stale-open"),
             "stale open entry must be reclaimed without consumption"
         );
     }
