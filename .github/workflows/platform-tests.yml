@@ -38,7 +38,14 @@ jobs:
   platform-tests:
     name: Platform Test (${{ matrix.name }})
     needs: [fmt]
-    continue-on-error: true
+    # macOS is a supported target ahead of Windows and has passed 20/20 recent
+    # runs, so its result is honest and a regression turns this workflow red.
+    # Windows stays masked ONLY because one known test is red -- see
+    # cron::scheduler::tests::agent_cron_run_keeps_workspace_through_shell_on_retry_and_concurrency,
+    # where the cron shell reports a POSIX path (/tmp/...) instead of the
+    # Windows scheduler workspace. Re-enable by deleting this expression once
+    # that test is fixed; do not widen it to hide new failures.
+    continue-on-error: ${{ matrix.name == 'Windows' }}
     strategy:
       fail-fast: false
       matrix:

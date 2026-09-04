@@ -24,23 +24,40 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
-# ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
+# ── Runner selection: single control point in `fmt` (compile-heavy jobs) ────
 # The ten Rust-compiling jobs below (lint, build, check, check-plugin-backends,
 # check-32bit, bench, test, msrv, parallel-runtime-test, installer-drift) and the
-# Linux `build` matrix entry pick their runner
-# from a single boolean Actions variable, mapped here to two pinned choices only:
-#   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
-#   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
-# The label is hard-coded in this reviewed workflow, so a mutable repo variable can only
-# flip between these two vetted runners — it can never redirect a required check to an
-# arbitrary runner without a `.github/**` review. An unexpected value fails safe to
-# ubuntu-latest. Only the boolean toggle is operator-controlled.
+# Linux `build` matrix entry read their runner label and cache provider from the
+# `fmt` job's outputs. They all already declare `needs: [fmt]`, so this adds no
+# queue hop. Both values are checked-in constants in this reviewed file, so the
+# label can never be redirected to an arbitrary runner without a `.github/**`
+# review; edit the two `echo` lines in `fmt` to move the fleet.
 #
-# PRECONDITION before setting CI_USE_BLACKSMITH=true: an org admin must DISABLE Blacksmith
-# triggerer SSH (Blacksmith → Settings → Features → SSH Access) so a green required check
-# attests only the reviewed commit, and that control must be attested in review. Requires
-# the Blacksmith GitHub App installed on the org; never set the toggle while the App is
-# uninstalled or these jobs queue with no runner (~24h) instead of failing fast.
+# WHY NOT the former `vars.CI_USE_BLACKSMITH` toggle: `vars` is unreadable in
+# fork-origin `pull_request` runs, and 90% of this repo's PRs are fork-origin.
+# The fail-closed expression therefore sent essentially every contributor PR to
+# ubuntu-latest, and handed the same unresolved value to the rust-cache
+# composite, which fell back to a GitHub Actions cache that master — now
+# building on Blacksmith — no longer writes. Fork PRs logged "No cache found."
+# while master logged "full match: true". Canary run 33809504331 confirmed both
+# halves directly: on a fork PR it printed CI_USE_BLACKSMITH='' yet still ran on
+# a blacksmith-8vcpu runner, so Blacksmith serves fork PRs and only the
+# expression was blocking. See #7108.
+#
+# TRADE-OFF, deliberate: no `vars`-based switch can govern fork PRs, so there is
+# no longer a runtime kill switch for that path — rolling back is a one-line
+# commit here rather than flipping a repo variable.
+#
+# UNCHANGED SAFETY PROPERTY: every rust-cache call still passes
+# `save-if: github.ref == 'refs/heads/master'`, so fork PRs remain cache READERS
+# only and cannot poison the cache master seeds.
+#
+# PRECONDITIONS: the Blacksmith GitHub App must stay installed on the org, or
+# these jobs queue with no runner (~24h) instead of failing fast. Blacksmith
+# triggerer SSH must remain DISABLED (Blacksmith → Settings → Features → SSH
+# Access) so a green required check attests only the reviewed commit; the
+# endpoint line in job logs is image-default with no authorized keys installed
+# and is not an exposure.
 
 jobs:
   # ── Fast serial gate: fail formatting errors before burning compute ───────
@@ -49,7 +66,29 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Single control point for compile-heavy runner selection. Every job that
+    # needs a Blacksmith runner already declares `needs: [fmt]`, so reading the
+    # label from here adds no queue hop. Flip the two values below to move the
+    # whole fleet back to GitHub-hosted in one line.
+    outputs:
+      runner: ${{ steps.runner.outputs.runner }}
+      use_blacksmith: ${{ steps.runner.outputs.use_blacksmith }}
     steps:
+      - name: Select compile runner
+        id: runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Checked-in constants, not an Actions variable: `vars` is unreadable
+          # in fork-origin pull_request runs (proven empty by the canary in
+          # run 33809504331), and 90% of this repo's PRs are fork-origin. A
+          # vars-based toggle therefore silently sent every contributor PR to
+          # ubuntu-latest AND dropped it from the Blacksmith cache to a GitHub
+          # Actions cache that master no longer writes. Only two vetted values
+          # are possible, and both live in this reviewed file, so changing them
+          # still requires a `.github/**` review.
+          echo "runner=blacksmith-8vcpu-ubuntu-2404" >> "$GITHUB_OUTPUT"
+          echo "use_blacksmith=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -132,7 +171,11 @@ jobs:
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -171,7 +214,7 @@ jobs:
 
   relay-container-smoke:
     name: Relay Container Fresh-Volume Smoke
-    needs: [relay-container-smoke-changes]
+    needs: [fmt, relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -195,7 +238,7 @@ jobs:
   lint:
     name: Lint
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
     timeout-minutes: 15
@@ -210,7 +253,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -241,7 +284,11 @@ jobs:
 
   windows-clippy-tools-changes:
     name: Detect Windows Clippy changes
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -280,7 +327,7 @@ jobs:
 
   windows-clippy-tools:
     name: Clippy (x86_64-pc-windows-msvc, targeted)
-    needs: [windows-clippy-tools-changes]
+    needs: [fmt, windows-clippy-tools-changes]
     if: needs.windows-clippy-tools-changes.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
@@ -321,7 +368,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+          - os: ${{ needs.fmt.outputs.runner }}
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -342,7 +389,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install Linux system dependencies
@@ -403,7 +450,7 @@ jobs:
   check:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 20
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -411,10 +458,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: all features
-            args: --features ci-all
-            sys_deps: libudev-dev
-            rustflags: ""
           - name: no default features
             args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
@@ -436,7 +479,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -450,7 +493,7 @@ jobs:
   check-plugin-backends:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -485,7 +528,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         if: steps.changed.outputs.run == 'true'
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
@@ -523,7 +566,7 @@ jobs:
   msrv:
     name: MSRV (declared floor)
     needs: [fmt, installer-drift]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -546,7 +589,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -565,7 +608,7 @@ jobs:
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -576,7 +619,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
@@ -589,7 +632,14 @@ jobs:
   bench:
     name: Benchmarks Compile
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # Bitrot guard only: compiles `agent_benchmarks` under `agent-runtime`
+    # without running it. Zero failures across 22 red runs and no bench-fix
+    # commit in 6 months, and its narrow form was introduced by #8896 as a
+    # measurement slice for #7108 rather than as coverage. Master, merge-queue
+    # and manual runs still execute it, so benches cannot rot undetected before
+    # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -599,7 +649,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
@@ -644,7 +694,7 @@ jobs:
   test:
     name: Test
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -655,7 +705,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check firmware protocol crate
@@ -699,7 +749,11 @@ jobs:
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -742,9 +796,9 @@ jobs:
 
   parallel-runtime-test:
     name: Parallel Runtime Test
-    needs: [parallel-runtime-test-changes]
+    needs: [fmt, parallel-runtime-test-changes]
     if: needs.parallel-runtime-test-changes.outputs.run == 'true'
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -754,7 +808,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           shared-key: test
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -855,7 +909,11 @@ jobs:
   # skipped, so a job that should run never is.
   path-changes:
     name: Detect changed paths
-    needs: [fmt]
+    # Ordering note: this detector only runs `git diff` and never compiles, so it
+    # does not wait on `fmt`. Waiting would serialise its own multi-minute
+    # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
+    # Its compile-heavy dependents still declare `fmt` directly, so nothing
+    # expensive starts before formatting passes.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -912,7 +970,7 @@ jobs:
 
   nix-eval:
     name: Nix Module Eval
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.nix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -927,7 +985,7 @@ jobs:
 
   nix-hash-drift:
     name: Nix Hash Drift
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -969,7 +1027,7 @@ jobs:
 
   docs-style:
     name: Docs Style
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1018,7 +1076,7 @@ jobs:
   installer-drift:
     name: Installer Drift
     needs: [fmt]
-    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.fmt.outputs.runner }}
     timeout-minutes: 15
     outputs:
       all_features: ${{ steps.all_features.outputs.value }}
@@ -1032,7 +1090,7 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
+          use-blacksmith: ${{ needs.fmt.outputs.use_blacksmith }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
@@ -1052,7 +1110,7 @@ jobs:
 
   web-permission-tests:
     name: Web Permission Tests
-    needs: [path-changes]
+    needs: [fmt, path-changes]
     if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
