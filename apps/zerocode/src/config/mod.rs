@@ -79,6 +79,23 @@ fn migrate_legacy_copy_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     true
 }
 
+fn migrate_legacy_chat_jump_binding(
+    rows: &mut HashMap<String, ChordSpec>,
+    action: ChatTabAction,
+    legacy: Chord,
+) -> bool {
+    let key = action.action_key();
+    let Some(ChordSpec::Many(chords)) = rows.get(&key) else {
+        return false;
+    };
+    if chords.as_slice() != std::slice::from_ref(&legacy) {
+        return false;
+    }
+
+    rows.insert(key, ChordSpec::Many(action.default_chords()));
+    true
+}
+
 /// The `[theme]` section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ThemeSection {
@@ -605,6 +622,23 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
                         ChatTabAction::CopySelection.default_chords(),
                     ))
                     .context("serializing migrated Copy binding")?;
+                    let bindings = doc
+                        .get_mut("keybindings")
+                        .and_then(toml::Value::as_table_mut)
+                        .context("accessing parsed keybindings table")?;
+                    bindings.insert(key, value);
+                    migrated_keybindings = true;
+                }
+                for (action, legacy) in [
+                    (ChatTabAction::JumpStart, Chord::char('g')),
+                    (ChatTabAction::JumpEnd, Chord::char('G')),
+                ] {
+                    if !migrate_legacy_chat_jump_binding(&mut rows, action, legacy) {
+                        continue;
+                    }
+                    let key = action.action_key();
+                    let value = toml::Value::try_from(ChordSpec::Many(action.default_chords()))
+                        .context("serializing migrated chat jump binding")?;
                     let bindings = doc
                         .get_mut("keybindings")
                         .and_then(toml::Value::as_table_mut)
@@ -1491,6 +1525,47 @@ mod tests {
             doc["keybindings"]["chat.copy_selection"].as_str(),
             Some("y")
         );
+    }
+
+    #[test]
+    fn legacy_chat_jump_defaults_migrate_without_touching_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"g\"]\n\"chat.jump_end\" = [\"G\"]\n\"dashboard.up\" = [\"k\"]\n\n[future]\nkeep = 1\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            ChatTabAction::JumpStart.default_chords()
+        );
+        assert_eq!(
+            resolved["chat"]["jump_end"],
+            ChatTabAction::JumpEnd.default_chords()
+        );
+        assert_eq!(resolved["dashboard"]["up"], vec![Chord::char('k')]);
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["future"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn customized_chat_jump_bindings_are_not_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"chat.jump_start\" = [\"alt+home\"]\n\"chat.jump_end\" = \"G\"\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["chat"]["jump_start"],
+            vec!["alt+home".parse::<Chord>().unwrap()]
+        );
+        assert_eq!(resolved["chat"]["jump_end"], vec![Chord::char('G')]);
     }
 
     #[test]

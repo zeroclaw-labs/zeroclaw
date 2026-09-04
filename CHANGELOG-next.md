@@ -47,6 +47,8 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ### Providers and Runtime
 
+- Add opt-in Anthropic `thinking.display` beta support: a new `agent.thinking.display` config knob (`off` (default) / `omitted` / `updates` / `summarized`) threads through native thinking params, and requests that set it carry the `thinking-display-updates-2026-08-18` beta header (#10529). Display-enabled requests now use the streaming response path, so readable thinking progress arrives live; signed reasoning payloads travel on a replay-only channel and never appear in user-visible events. Adaptive-only models (Opus 4.7, Fable 5.1) get `adaptive`-style thinking requests instead of the rejected fixed-budget shape; signature-only reasoning blocks (e.g. under `omitted`) are retained for exact tool-use replay. Anthropic thinking progress is human-readable everywhere (previously the raw signed JSON could reach thinking surfaces).
+
 - Default newly created persisted OpenAI model slots to the Responses API with native tool calling, without changing existing persisted entries or bare provider references (#9021).
 - Propagate OpenAI Responses usage and carry model context-window metadata from the models.dev catalog (#9360, #9347).
 - Add configurable model vision capabilities and improve provider timeouts, streamed retries, tool-call argument handling, multimodal fallback, and Gemini thought-signature preservation (#9099, #8947, #9113, #9372, #8931, #9102, #8935).

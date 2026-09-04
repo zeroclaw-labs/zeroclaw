@@ -158,8 +158,8 @@ keyactions! {
         ScrollDown              [] => "scroll down",
         PageUp                  [Chord::key(KeyCode::PageUp)] => "page up",
         PageDown                [Chord::key(KeyCode::PageDown)] => "page down",
-        JumpStart               [Chord::char('g')] => "jump to start",
-        JumpEnd                 [Chord::char('G')] => "jump to end",
+        JumpStart               [Chord::char('g'), Chord::with(KeyCode::Home, KeyModifiers::CONTROL)] => "jump to start",
+        JumpEnd                 [Chord::char('G'), Chord::with(KeyCode::End, KeyModifiers::CONTROL)] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
         // and queue navigation conflict (alt+up/down).
         BrowseEnter             [
@@ -467,6 +467,33 @@ mod tests {
         assert_eq!(
             LogsTabAction::from_chord(&terminal_copy),
             Some(LogsTabAction::CopySelection)
+        );
+    }
+
+    #[test]
+    fn long_transcript_navigation_chords_preserve_plain_input_home_and_end() {
+        let home = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+
+        assert_eq!(
+            InputBarAction::from_chord(&home),
+            Some(InputBarAction::CursorStart)
+        );
+        assert_eq!(
+            InputBarAction::from_chord(&end),
+            Some(InputBarAction::CursorEnd)
+        );
+        assert_eq!(InputBarAction::from_chord(&ctrl_home), None);
+        assert_eq!(InputBarAction::from_chord(&ctrl_end), None);
+        assert_eq!(
+            ChatTabAction::from_chord(&ctrl_home),
+            Some(ChatTabAction::JumpStart)
+        );
+        assert_eq!(
+            ChatTabAction::from_chord(&ctrl_end),
+            Some(ChatTabAction::JumpEnd)
         );
     }
 }

@@ -47,10 +47,15 @@ cargo mdbook check                       # validate .po format (run before a tra
 
 | Tool | Install |
 |---|---|
-| [`mdbook`](https://rust-lang.github.io/mdBook/) | `cargo install mdbook --locked` |
+| [`mdbook`](https://rust-lang.github.io/mdBook/) | `cargo install mdbook --version 0.5.4 --locked` |
+| [`mdbook-mermaid`](https://github.com/badboy/mdbook-mermaid) | `cargo install mdbook-mermaid --version 0.17.1` |
 | [`mdbook-i18n-helpers`](https://github.com/google/mdbook-i18n-helpers) | `cargo install mdbook-i18n-helpers --locked` |
 | `cargo` | <https://rustup.rs> |
 | `gettext` (msgfmt, msgmerge) | `apt install gettext` / `brew install gettext` |
+
+The `mdbook-mermaid` version is pinned, but its published lockfile still
+selects the mdBook 0.5.0 preprocessor. Leave off `--locked` for that tool so
+Cargo resolves the compatible 0.5.x preprocessor used by mdBook 0.5.4.
 
 ## What gets built where
 

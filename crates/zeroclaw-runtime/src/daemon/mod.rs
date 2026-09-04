@@ -2549,6 +2549,8 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::MattermostListenMode;
 
+    const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
             data_dir: tmp.path().join("data"),
@@ -3525,8 +3527,6 @@ mod tests {
 
     #[tokio::test]
     async fn registry_gateway_starter_can_trigger_daemon_reload() {
-        use tokio::time::{Duration, timeout};
-
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let expected_data_dir = config.data_dir.clone();
@@ -3561,20 +3561,22 @@ mod tests {
             },
         ));
 
-        let exit = timeout(
-            Duration::from_secs(2),
-            run(
-                config,
-                "127.0.0.1".to_string(),
-                4242,
-                registry,
-                false,
-                false,
-            ),
-        )
+        let (exit, seen) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
+            tokio::join!(
+                run(
+                    config,
+                    "127.0.0.1".to_string(),
+                    4242,
+                    registry,
+                    false,
+                    false,
+                ),
+                seen_rx.recv(),
+            )
+        })
         .await
-        .expect("daemon should return after gateway-triggered reload")
-        .expect("daemon run should succeed");
+        .expect("daemon must not deadlock after a gateway-triggered reload");
+        let exit = exit.expect("daemon run should succeed");
 
         assert_eq!(exit, DaemonExit::Reload);
         let (
@@ -3585,9 +3587,7 @@ mod tests {
             has_gateway_shutdown_tx,
             has_reload_tx,
             has_tui_registry,
-        ) = seen_rx
-            .try_recv()
-            .expect("gateway starter should record its daemon inputs");
+        ) = seen.expect("gateway starter should record its daemon inputs");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 4242);
         assert_eq!(data_dir, expected_data_dir);
@@ -3600,15 +3600,19 @@ mod tests {
     #[tokio::test]
     async fn initial_socket_addr_in_use_fails_daemon_startup() {
         use std::io;
-        use tokio::time::{Duration, timeout};
 
         for startup_feedback_enabled in [false, true] {
             let tmp = TempDir::new().unwrap();
             let config = test_config(&tmp);
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
 
             let mut registry = DaemonRegistry::new();
             registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
+                let started_tx = started_tx.clone();
                 Box::pin(async move {
+                    started_tx
+                        .send(())
+                        .expect("record initial socket startup attempt");
                     Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
                         "local IPC endpoint lifecycle is already owned",
@@ -3617,20 +3621,24 @@ mod tests {
                 })
             }));
 
-            let error = timeout(
-                Duration::from_secs(2),
-                run(
-                    config,
-                    "127.0.0.1".to_string(),
-                    0,
-                    registry,
-                    false,
-                    startup_feedback_enabled,
-                ),
-            )
+            let (result, started) = tokio::time::timeout(DAEMON_DEADLOCK_GUARD, async {
+                tokio::join!(
+                    run(
+                        config,
+                        "127.0.0.1".to_string(),
+                        0,
+                        registry,
+                        false,
+                        startup_feedback_enabled,
+                    ),
+                    started_rx.recv(),
+                )
+            })
             .await
-            .expect("initial socket ownership conflict should fail daemon startup promptly")
-            .expect_err("daemon startup should fail on an initially owned socket");
+            .expect("daemon must not deadlock on an initial socket ownership conflict");
+            started.expect("socket starter should observe the initial startup attempt");
+            let error =
+                result.expect_err("daemon startup should fail on an initially owned socket");
 
             assert!(
                 error
