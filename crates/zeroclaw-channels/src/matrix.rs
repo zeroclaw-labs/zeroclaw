@@ -5769,13 +5769,13 @@ mod tests {
             );
         }
 
-        /// Same regression as above, for the streaming-finalization path the
-        /// reviewer named explicitly: `finalize_draft`'s shared voice-note
-        /// gate (after the per-`stream_mode` branch) must also honor the
-        /// mapped `suppress_voice` rather than falling back to room
-        /// membership. `MatrixStreamMode::Off` (the channel default here)
-        /// makes the per-mode branch a no-op, so this needs no live draft —
-        /// it exercises exactly the shared gate at issue.
+        /// Same regression as above, for the streaming-finalization path:
+        /// `finalize_draft`'s shared voice-note gate (after the
+        /// per-`stream_mode` branch) must also honor the mapped
+        /// `suppress_voice` rather than falling back to room membership.
+        /// `MatrixStreamMode::Off` (the channel default here) makes the
+        /// per-mode branch a no-op, so this needs no live draft — it
+        /// exercises exactly the shared gate at issue.
         #[tokio::test]
         async fn finalize_draft_keeps_a_non_member_senders_reply_text_only() {
             let room_id = owned_room_id!("!room:server");
