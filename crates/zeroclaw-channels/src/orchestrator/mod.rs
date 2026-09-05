@@ -3007,6 +3007,26 @@ fn build_scope_override_summary(
     )
 }
 
+fn is_bare_model_picker_command(content: &str) -> bool {
+    let mut parts = content.split_whitespace();
+    let Some(command) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let mut command_parts = command.split('@');
+    let base = command_parts.next().unwrap_or_default();
+    let bot_name = command_parts.next();
+    command_parts.next().is_none()
+        && base.eq_ignore_ascii_case("/model")
+        && bot_name.is_none_or(|name| !name.is_empty())
+}
+
+fn scrub_native_model_picker_error(error: &anyhow::Error) -> String {
+    zeroclaw_runtime::security::scrub(&error.to_string())
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -3023,6 +3043,48 @@ async fn handle_runtime_command_if_needed(
     let sender_key = runtime_conversation_history_key(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+
+    if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
+        let request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: msg.sender.clone(),
+            requesting_user_id: msg.platform_sender_id.clone().unwrap_or_default(),
+            reply_target: msg.reply_target.clone(),
+            thread_ts: msg.thread_ts.clone(),
+            channel_alias: msg
+                .channel_alias
+                .clone()
+                .unwrap_or_else(|| msg.channel.clone()),
+            owner_agent_alias: ctx.agent_alias.as_str().to_string(),
+            current_model_provider: current.model_provider.clone(),
+            current_model: current.model.clone(),
+            model_routes: ctx
+                .model_routes
+                .iter()
+                .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
+                    hint: route.hint.clone(),
+                    model_provider: route.model_provider.clone(),
+                    model: route.model.clone(),
+                })
+                .collect(),
+        };
+        match channel.present_model_picker(&request).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "channel_alias": request.channel_alias.as_str(),
+                            "error": scrub_native_model_picker_error(&err),
+                        })),
+                    "Native model picker failed; falling back to text response"
+                );
+            }
+        }
+    }
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
@@ -3174,8 +3236,36 @@ async fn handle_runtime_command_if_needed(
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
             } else {
-                apply_model_ref(&mut current, &ctx.model_routes, &model);
-                set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                // Authoritative picker-revocation claim at the mutation
+                // point. The early dispatch gate in
+                // `process_channel_message_body` can pass while the
+                // selection is still registered; the callback's bounded ack
+                // wait may then elapse while the message works through the
+                // media/link pipeline, revoking the registration before this
+                // handler runs. `apply_if_not_revoked` runs the route write
+                // while holding the selection's claim lock, so the
+                // callback's `revoke` can never slip between the check and
+                // the mutation — whichever side locks the claim first owns
+                // the outcome. Only Telegram picker selections register a
+                // delivery ack (always as `/model <hint>`), so ordinary
+                // traffic has no claim and always applies. A revoked
+                // selection returns early as handled-but-inert: no route
+                // mutation, no response, no provider turn.
+                #[cfg(feature = "channel-telegram")]
+                let picker_applied =
+                    crate::model_picker_delivery::apply_if_not_revoked(&msg.id, || {
+                        apply_model_ref(&mut current, &ctx.model_routes, &model);
+                        set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                    });
+                #[cfg(not(feature = "channel-telegram"))]
+                {
+                    apply_model_ref(&mut current, &ctx.model_routes, &model);
+                    set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                }
+                #[cfg(feature = "channel-telegram")]
+                if !picker_applied {
+                    return true;
+                }
 
                 let mut resp = channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",
@@ -6264,6 +6354,16 @@ async fn process_channel_message_body(
         return;
     }
 
+    // A picker selection whose bounded delivery-ack wait elapsed was
+    // already reported as unavailable with its keyboard cohort restored;
+    // the late message must stay inert instead of applying the route change
+    // or being reported as handled. Ordinary traffic never registered a
+    // delivery ack, so `take_revoked` is a no-op for it.
+    #[cfg(feature = "channel-telegram")]
+    if crate::model_picker_delivery::take_revoked(&msg.id) {
+        return;
+    }
+
     // The early ack is spawned (fire-and-forget) so it lands before the
     // enrichment/model pipeline without blocking it. The join handle is kept so
     // any early-return reconciliation can await the add before removing the 👀,
@@ -6385,6 +6485,13 @@ async fn process_channel_message_body(
         );
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        // Confirm picker-selection delivery only now that the command was
+        // actually handled: the Telegram callback waits on this
+        // acknowledgement before reporting the selection as queued, so a
+        // message dropped anywhere earlier (receiver shutdown, routing
+        // miss) never looks applied. No-op for ordinary messages.
+        #[cfg(feature = "channel-telegram")]
+        crate::model_picker_delivery::confirm(&msg.id);
         reconcile_early_ack(
             ctx.as_ref(),
             &msg,
@@ -8031,6 +8138,19 @@ async fn dispatch_worker(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
+    // Dispatch ownership of a picker selection's delivery-ack registration,
+    // held from the moment this worker owns the dequeued message: across
+    // the wait for the sender's previous turn (a newer message can cancel
+    // this worker there, so `process_channel_message` returns before the
+    // body runs), every early exit of the body (hook cancel, self-loop
+    // drop, passive context), a task abort, and normal completion. The drop
+    // settles whatever the registry still holds for this message, so a
+    // selection that never reached the mutation point cannot leave a
+    // revoked marker behind for the daemon's lifetime. No-op for ordinary
+    // traffic and for a selection that was confirmed, applied, or consumed
+    // as revoked by the body.
+    #[cfg(feature = "channel-telegram")]
+    let _dispatch_ownership = crate::model_picker_delivery::DispatchOwnership::hold(&msg.id);
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
@@ -8593,6 +8713,23 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+/// Drop guard reclaiming abandoned model-picker delivery-ack
+/// registrations when the production dispatch pipeline (`start_channels`)
+/// tears down — whether it returns normally or its future is dropped on
+/// shutdown. Only then is the runtime queue definitively dead, so no live
+/// queued selection can lose its revocation authority. Tests drive
+/// `run_message_dispatch_loop` directly and never pass through here, so
+/// their registry entries are untouched.
+#[cfg(feature = "channel-telegram")]
+struct ModelPickerAckCleanupGuard;
+
+#[cfg(feature = "channel-telegram")]
+impl Drop for ModelPickerAckCleanupGuard {
+    fn drop(&mut self) {
+        crate::model_picker_delivery::clear_abandoned();
+    }
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -8696,8 +8833,16 @@ async fn run_message_dispatch_loop(
         }
 
         // ── Debounce: accumulate rapid messages per sender ──────────
-        // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" {
+        // CLI messages bypass debouncing so the interactive loop stays
+        // responsive. Runtime-control commands bypass too: newline-joining a
+        // `/model`-style command onto pending ordinary text would hide it
+        // from `parse_runtime_command` (the combined content starts with the
+        // ordinary text) and silently drop the control action after the
+        // channel already confirmed it. Ordinary messages keep their
+        // existing debounce semantics, including any already pending.
+        let msg = if msg.channel != "cli"
+            && parse_runtime_command(&msg.channel, &msg.content).is_none()
+        {
             let debounce_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
 
             // Resolve effective debounce window: per-channel override wins,
@@ -13115,6 +13260,11 @@ pub async fn start_channels(
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
+    // Declared before the dispatch loop so it drops after it: on any
+    // `start_channels` teardown the production queue is gone and abandoned
+    // picker ack registrations are reclaimed.
+    #[cfg(feature = "channel-telegram")]
+    let _picker_ack_cleanup = ModelPickerAckCleanupGuard;
     run_message_dispatch_loop(rx, router, max_in_flight).await;
 
     for h in listener_handles {
@@ -14866,6 +15016,54 @@ temperature = 0.3
     /// Identity is checked via `Arc::ptr_eq`, not by inspecting fields.
     struct NamedMockChannel {
         name: &'static str,
+    }
+
+    #[derive(Default)]
+    struct ModelPickerRecordingChannel {
+        requests: tokio::sync::Mutex<Vec<zeroclaw_api::channel::ChannelModelPickerRequest>>,
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ModelPickerRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Telegram,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "main"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ModelPickerRecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn present_model_picker(
+            &self,
+            request: &zeroclaw_api::channel::ChannelModelPickerRequest,
+        ) -> anyhow::Result<bool> {
+            self.requests.lock().await.push(request.clone());
+            Ok(true)
+        }
     }
 
     impl ::zeroclaw_api::attribution::Attributable for NamedMockChannel {
@@ -26646,6 +26844,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    #[test]
+    fn native_model_picker_is_limited_to_the_bare_model_command() {
+        assert!(is_bare_model_picker_command("/model"));
+        assert!(is_bare_model_picker_command(" /MODEL@zeroclaw_bot "));
+        assert!(!is_bare_model_picker_command("/model fast"));
+        assert!(!is_bare_model_picker_command("/model --help"));
+        assert!(!is_bare_model_picker_command("/models"));
+    }
+
+    #[test]
+    fn native_model_picker_errors_are_scrubbed_before_logging() {
+        let error = anyhow::Error::msg(
+            "request failed for https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage",
+        );
+        let scrubbed = scrub_native_model_picker_error(&error);
+
+        assert!(scrubbed.contains("[REDACTED_BOT_TOKEN]"));
+        assert!(!scrubbed.contains("123456:ABC-def_GHI"));
+    }
+
     // Build a ChannelRuntimeContext with a Config that has peer_groups
     // populated for the agent-scope authorization tests below. Mirrors
     // `channel_runtime_context_for_defaults_test` but lets the caller
@@ -27053,6 +27271,963 @@ BTC is currently around $65,000 based on latest tool output."#
             content: "/model --agent gpt-4o".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn bare_model_picker_command_uses_current_session_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "message-7".into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            thread_ts: Some("thread-9".into()),
+            content: "/model".into(),
+            ..Default::default()
+        };
+        let sender_key = conversation_history_key(&msg);
+        ctx.route_overrides.lock().unwrap().insert(
+            sender_key,
+            ChannelRouteSelection {
+                model_provider: "anthropic.work".into(),
+                model: "claude-sonnet-4-5".into(),
+                api_key: None,
+            },
+        );
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(handled);
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        let requests = channel_impl.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].requesting_user, "test_user");
+        assert_eq!(requests[0].requesting_user_id, "123");
+        assert_eq!(requests[0].reply_target, "chat-42");
+        assert_eq!(requests[0].thread_ts.as_deref(), Some("thread-9"));
+        assert_eq!(requests[0].channel_alias, "main");
+        assert_eq!(requests[0].owner_agent_alias, "agentX");
+        assert_eq!(requests[0].current_model_provider, "anthropic.work");
+        assert_eq!(requests[0].current_model, "claude-sonnet-4-5");
+        assert_eq!(requests[0].model_routes.len(), 1);
+        assert_eq!(requests[0].model_routes[0].hint, "fast");
+        assert_eq!(requests[0].model_routes[0].model_provider, "anthropic.work");
+        assert_eq!(requests[0].model_routes[0].model, "claude-sonnet-4-5");
+    }
+
+    #[tokio::test]
+    async fn model_picker_selection_command_keeps_existing_session_semantics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "message-8".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(handled);
+        assert!(channel_impl.requests.lock().await.is_empty());
+        assert_eq!(channel_impl.sent_messages.lock().await.len(), 1);
+        let route = ctx
+            .route_overrides
+            .lock()
+            .unwrap()
+            .get(&conversation_history_key(&msg))
+            .cloned()
+            .expect("selection remains a per-sender session override");
+        assert_eq!(route.model_provider, "anthropic.work");
+        assert_eq!(route.model, "claude-sonnet-4-5");
+    }
+
+    /// Regression: with a nonzero debounce window, a picker selection
+    /// (`/model <hint>` synthesized by the Telegram callback path as an
+    /// ordinary `ChannelMessage`) must not be newline-joined onto a pending
+    /// ordinary message from the same sender — the combined content no
+    /// longer parses as a runtime command, so the switch would be lost
+    /// while the channel UI already reported success. The control command
+    /// must bypass debounce while the ordinary message keeps its window.
+    #[tokio::test]
+    async fn message_dispatch_debounce_preserves_model_picker_selection_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.debounce_ms = 300;
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "openrouter.default".into(),
+            model: "fast-model".into(),
+            api_key: None,
+        }]);
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        ctx.model_provider = provider_impl.clone();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("telegram.main".to_string(), channel);
+        ctx.channels_by_name = Arc::new(channels_by_name);
+        let runtime_ctx = Arc::new(ctx);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+        let ordinary = zeroclaw_api::channel::ChannelMessage {
+            id: "ordinary-1".into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            content: "hello".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        // Mirror `TelegramChannel::model_picker_selection_message`: an
+        // ordinary ChannelMessage whose content is the `/model <hint>`
+        // control command, arriving while `ordinary` is still pending.
+        let selection = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection".into(),
+            content: "/model fast".into(),
+            timestamp: 2,
+            ..ordinary.clone()
+        };
+        let sender_key = conversation_history_key(&selection);
+        tx.send(ordinary).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(selection).await.unwrap();
+        drop(tx);
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        let route = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap()
+            .get(&sender_key)
+            .cloned()
+            .expect("picker selection must still apply the per-sender model switch");
+        assert_eq!(route.model_provider, "openrouter.default");
+        assert_eq!(route.model, "fast-model");
+
+        let calls = provider_impl.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the ordinary message dispatches exactly one provider turn"
+        );
+        let user_inputs = calls[0]
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            user_inputs.iter().any(|content| content.contains("hello")),
+            "ordinary content must reach the provider, got {user_inputs:?}"
+        );
+        assert!(
+            user_inputs
+                .iter()
+                .all(|content| !content.contains("/model")),
+            "control command must not leak into the provider turn: {user_inputs:?}"
+        );
+    }
+
+    /// Regression for the ack-timeout race: a picker selection whose
+    /// bounded delivery-ack wait elapsed was revoked by the Telegram
+    /// callback (keyboard cohort restored, `unavailable` answered) while
+    /// the message was still queued. When dispatch dequeues it late, the
+    /// selection must stay inert — no route override, no provider turn, no
+    /// response — instead of applying the route change after the UI
+    /// reported failure.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_late_revoked_model_picker_selection_stays_inert() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        ctx.model_provider = provider_impl.clone();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("telegram.main".to_string(), channel);
+        ctx.channels_by_name = Arc::new(channels_by_name);
+        let runtime_ctx = Arc::new(ctx);
+
+        let selection = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection_revoked".into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        // Mirror the timed-out callback: the selection was registered before
+        // the queue handoff and revoked when the bounded ack wait elapsed.
+        let _delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        crate::model_picker_delivery::revoke(&selection.id);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "revoked picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(
+            provider_impl.calls.lock().unwrap().is_empty(),
+            "revoked picker selection must not reach a provider turn"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "revoked picker selection must not be reported as handled"
+        );
+        // The dispatch gate consumed the revoked marker exactly once.
+        assert!(!crate::model_picker_delivery::take_revoked(&selection.id));
+    }
+
+    /// Test hook that cancels every inbound message before dispatch, like
+    /// an operator's `on_message_received` policy hook would.
+    #[cfg(feature = "channel-telegram")]
+    struct CancelInboundMessageHook;
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for CancelInboundMessageHook {
+        fn name(&self) -> &str {
+            "cancel-inbound-message"
+        }
+
+        async fn on_message_received(
+            &self,
+            _message: zeroclaw_api::channel::ChannelMessage,
+        ) -> zeroclaw_runtime::hooks::HookResult<zeroclaw_api::channel::ChannelMessage> {
+            zeroclaw_runtime::hooks::HookResult::Cancel("blocked by test hook".to_string())
+        }
+    }
+
+    /// Telegram dispatch context for the picker drop regressions: optionally
+    /// an inbound hook that cancels every message before the delivery-ack
+    /// gate runs, optionally interrupt-on-new-message for Telegram.
+    #[cfg(feature = "channel-telegram")]
+    fn picker_dispatch_context(
+        zeroclaw_dir: &std::path::Path,
+        cancel_inbound: bool,
+        interrupt_telegram: bool,
+    ) -> (
+        Arc<ChannelRuntimeContext>,
+        Arc<HistoryCaptureModelProvider>,
+        Arc<TelegramRecordingChannel>,
+    ) {
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        ctx.model_provider = provider_impl.clone();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("telegram.main".to_string(), channel);
+        ctx.channels_by_name = Arc::new(channels_by_name);
+        if cancel_inbound {
+            let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+            hook_runner.register(Box::new(CancelInboundMessageHook));
+            ctx.hooks = Some(Arc::new(hook_runner));
+        }
+        ctx.interrupt_on_new_message = InterruptOnNewMessageConfig {
+            telegram: interrupt_telegram,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        };
+        (Arc::new(ctx), provider_impl, channel_impl)
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    fn picker_selection_message(id: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            timestamp: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Regression for the pre-gate lifecycle leak: the callback's bounded
+    /// ack wait elapsed (revoked marker retained for the late dispatch),
+    /// then an `on_message_received` hook cancelled the dequeued selection
+    /// before the `take_revoked` gate ran. Nothing downstream can consume
+    /// that marker any more, so the dispatch's ownership drop must reclaim
+    /// it: the registry is empty afterwards, the route untouched, and
+    /// nothing reported as handled.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_hook_cancel_reclaims_revoked_model_picker_selection() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            picker_dispatch_context(tmp.path(), true, false);
+        let selection =
+            picker_selection_message("telegram_model_picker_selection_hook_cancel_revoked");
+        // Mirror the timed-out callback: registered before the queue
+        // handoff, revoked when the bounded ack wait elapsed.
+        let _delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        crate::model_picker_delivery::revoke(&selection.id);
+        assert!(crate::model_picker_delivery::is_registered(&selection.id));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        assert!(
+            !crate::model_picker_delivery::is_registered(&selection.id),
+            "revoked marker of a hook-cancelled selection must be reclaimed"
+        );
+        assert!(!crate::model_picker_delivery::take_revoked(&selection.id));
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "hook-cancelled picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(
+            provider_impl.calls.lock().unwrap().is_empty(),
+            "hook-cancelled picker selection must not reach a provider turn"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "hook-cancelled picker selection must not be reported as handled"
+        );
+    }
+
+    /// The same pre-gate drop while the callback is still inside its
+    /// bounded ack wait: the dispatch's ownership drop must end that wait
+    /// at once and the callback's revoke must win, so the picker is
+    /// restored without waiting for the timeout and nothing stays
+    /// registered.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_hook_cancel_releases_waiting_model_picker_callback() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            picker_dispatch_context(tmp.path(), true, false);
+        let selection =
+            picker_selection_message("telegram_model_picker_selection_hook_cancel_waiting");
+        let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        delivery_ack.mark_enqueued();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        let woken = tokio::time::timeout(Duration::from_secs(1), delivery_ack.wait()).await;
+        assert!(
+            matches!(woken, Ok(Err(_))),
+            "dropped dispatch must release the waiting callback: {woken:?}"
+        );
+        assert!(matches!(
+            crate::model_picker_delivery::revoke(&selection.id),
+            crate::model_picker_delivery::RevokeOutcome::Won
+        ));
+        assert!(!crate::model_picker_delivery::is_registered(&selection.id));
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "hook-cancelled picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(provider_impl.calls.lock().unwrap().is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+    }
+
+    /// Regression for the drop before the message body even starts: with
+    /// interrupt-on-new-message enabled, a worker first waits for the
+    /// sender's previous turn to finish. A newer message for the same
+    /// sender can cancel this worker during that wait, so
+    /// `process_channel_message` returns on its initial cancellation check
+    /// and `process_channel_message_body` never runs. The dispatch
+    /// ownership is held from the start of the worker, so the waiting
+    /// callback is released at once, its revoke wins, and nothing stays
+    /// registered; the route is untouched.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatch_worker_cancelled_while_waiting_for_previous_turn_settles_model_picker_selection()
+     {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            picker_dispatch_context(tmp.path(), false, true);
+        let selection =
+            picker_selection_message("telegram_model_picker_selection_cancelled_while_waiting");
+        let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        delivery_ack.mark_enqueued();
+
+        // The sender's previous turn is still running: it holds the
+        // in-flight slot and its completion is pending.
+        let scope_key = interruption_scope_key(&selection);
+        let previous_token = CancellationToken::new();
+        let previous_completion = Arc::new(InFlightTaskCompletion::new());
+        let in_flight = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        in_flight.lock().await.insert(
+            scope_key.clone(),
+            InFlightSenderTaskState {
+                task_id: 0,
+                cancellation: previous_token.clone(),
+                completion: Arc::clone(&previous_completion),
+            },
+        );
+        let task_sequence = Arc::new(AtomicU64::new(1));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let worker_ctx = Arc::clone(&runtime_ctx);
+        let worker_msg = selection.clone();
+        let worker_in_flight = Arc::clone(&in_flight);
+        let worker_sequence = Arc::clone(&task_sequence);
+        let worker = zeroclaw_spawn::spawn!(dispatch_worker(
+            worker_ctx,
+            worker_msg,
+            worker_in_flight,
+            worker_sequence,
+            permit,
+        ));
+
+        // Wait until the worker has registered itself (task id 1) and is
+        // interrupting the previous turn.
+        let worker_token = loop {
+            let registered = in_flight
+                .lock()
+                .await
+                .get(&scope_key)
+                .filter(|state| state.task_id == 1)
+                .map(|state| state.cancellation.clone());
+            if let Some(token) = registered {
+                break token;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // A newer message for the same sender interrupts this worker while
+        // it is still waiting; only then does the previous turn finish.
+        worker_token.cancel();
+        previous_completion.mark_done();
+        worker.await.unwrap();
+        assert!(
+            previous_token.is_cancelled(),
+            "the worker must have taken the interrupt path"
+        );
+
+        let woken = tokio::time::timeout(Duration::from_secs(1), delivery_ack.wait()).await;
+        assert!(
+            matches!(woken, Ok(Err(_))),
+            "cancelled worker must release the waiting callback: {woken:?}"
+        );
+        assert!(matches!(
+            crate::model_picker_delivery::revoke(&selection.id),
+            crate::model_picker_delivery::RevokeOutcome::Won
+        ));
+        assert!(!crate::model_picker_delivery::is_registered(&selection.id));
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "cancelled picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(provider_impl.calls.lock().unwrap().is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+    }
+
+    /// Regression for the late-revocation race *past* the early dispatch
+    /// gate: the selection passes the `take_revoked` gate in
+    /// `process_channel_message_body` still registered, then the callback's
+    /// bounded ack wait elapses (revoking the registration) while the
+    /// message works through the media/link pipeline — before
+    /// `handle_runtime_command_if_needed` runs. The authoritative check at
+    /// the mutation point must leave the route untouched and the selection
+    /// inert: no route override, no switch response, marker consumed once.
+    /// Exercises `handle_runtime_command_if_needed` directly, i.e. already
+    /// past the early gate, so the gate cannot mask a missing late check.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn runtime_command_late_revoked_model_picker_selection_does_not_mutate_route() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection_revoked_past_gate".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        // Past the early gate still registered (the gate leaves
+        // non-revoked entries in place); the ack timeout then fires before
+        // the command handler runs.
+        let _delivery_ack = crate::model_picker_delivery::register(&msg.id);
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+        crate::model_picker_delivery::revoke(&msg.id);
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(
+            handled,
+            "revoked selection must be reported handled so it is not re-dispatched to the agent"
+        );
+        assert!(
+            ctx.route_overrides.lock().unwrap().is_empty(),
+            "late-revoked selection must not write a route override"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "late-revoked selection must not produce a switch response"
+        );
+        assert!(
+            channel_impl.requests.lock().await.is_empty(),
+            "late-revoked selection must not re-open the picker"
+        );
+        // The authoritative check consumed the revoked marker exactly once.
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn telegram_model_picker_username_change_updates_only_current_sender_session() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn wait_for_request(server: &MockServer, suffix: &str) {
+            for _ in 0..200 {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path().ends_with(suffix))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for Telegram request ending in {suffix}");
+        }
+
+        fn callback_update(
+            update_id: i64,
+            callback_id: &str,
+            callback_data: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "update_id": update_id,
+                "callback_query": {
+                    "id": callback_id,
+                    "from": { "id": 123, "username": "renamed_user" },
+                    "message": {
+                        "message_id": 77,
+                        "message_thread_id": 9,
+                        "chat": { "id": -10042 }
+                    },
+                    "data": callback_data,
+                }
+            })
+        }
+
+        async fn mount_listener_mocks(
+            server: &MockServer,
+            update: serde_json::Value,
+            edit_path: &str,
+        ) {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/getUpdates$"))
+                .and(body_partial_json(serde_json::json!({ "timeout": 0 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": []
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/getUpdates$"))
+                .and(body_partial_json(serde_json::json!({ "timeout": 30 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": [update]
+                })))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(edit_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        fn callback_for_button(
+            requests: &[wiremock::Request],
+            endpoint: &str,
+            label: &str,
+        ) -> String {
+            let request = requests
+                .iter()
+                .rev()
+                .find(|request| request.url.path().ends_with(endpoint))
+                .expect("Telegram keyboard edit request");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_array().unwrap())
+                .find(|button| {
+                    button["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(label))
+                })
+                .and_then(|button| button["callback_data"].as_str())
+                .expect("matching model-picker button")
+                .to_string()
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut picker_config = Config::default();
+        picker_config.channels.telegram.insert(
+            "main".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        picker_config.providers.models.openai.insert(
+            "primary".into(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-current".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        picker_config.providers.models.anthropic.insert(
+            "work".into(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-5".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        picker_config.agents.insert(
+            "assistant".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.main".into()],
+                model_provider: "openai.primary".into(),
+                ..Default::default()
+            },
+        );
+        picker_config.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }];
+        let picker_routes = picker_config
+            .model_routes
+            .iter()
+            .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
+                hint: route.hint.clone(),
+                model_provider: route.model_provider.clone(),
+                model: route.model.clone(),
+            })
+            .collect();
+        let telegram = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "main",
+                Arc::new(|| vec!["123".into()]),
+                false,
+            )
+            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_api_base(server.uri()),
+        );
+        let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: "original_user".into(),
+            requesting_user_id: "123".into(),
+            reply_target: "-10042:9".into(),
+            thread_ts: Some("9".into()),
+            channel_alias: "main".into(),
+            owner_agent_alias: "assistant".into(),
+            current_model_provider: "openai.primary".into(),
+            current_model: "gpt-current".into(),
+            model_routes: picker_routes,
+        };
+        assert!(
+            telegram
+                .present_model_picker(&picker_request)
+                .await
+                .unwrap()
+        );
+        let provider_callback = callback_for_button(
+            &server.received_requests().await.unwrap(),
+            "editMessageText",
+            "anthropic.work",
+        );
+
+        server.reset().await;
+        mount_listener_mocks(
+            &server,
+            callback_update(1, "open-provider", &provider_callback),
+            r"/bot[^/]+/editMessageText$",
+        )
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let navigation_channel = Arc::clone(&telegram);
+        let navigation_tx = tx.clone();
+        let navigation_listener =
+            zeroclaw_spawn::spawn!(async move { navigation_channel.listen(navigation_tx).await });
+        wait_for_request(&server, "editMessageText").await;
+        wait_for_request(&server, "answerCallbackQuery").await;
+        navigation_listener.abort();
+        let _ = navigation_listener.await;
+        assert!(
+            rx.try_recv().is_err(),
+            "navigation must not queue a command"
+        );
+        let selection_callback = callback_for_button(
+            &server.received_requests().await.unwrap(),
+            "editMessageText",
+            "claude-sonnet-4-5",
+        );
+
+        server.reset().await;
+        mount_listener_mocks(
+            &server,
+            callback_update(2, "select-model", &selection_callback),
+            r"/bot[^/]+/editMessageReplyMarkup$",
+        )
+        .await;
+        let selection_channel = Arc::clone(&telegram);
+        let selection_listener =
+            zeroclaw_spawn::spawn!(async move { selection_channel.listen(tx).await });
+        let queued = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Telegram selection callback must reach the runtime queue")
+            .expect("runtime queue must remain open");
+        // Mirror the orchestrator's dispatch-side confirmation: the
+        // callback only disables the keyboard and answers `queued` once the
+        // runtime acknowledges the selection reached command handling.
+        crate::model_picker_delivery::confirm(&queued.id);
+        wait_for_request(&server, "editMessageReplyMarkup").await;
+        wait_for_request(&server, "answerCallbackQuery").await;
+        selection_listener.abort();
+        let _ = selection_listener.await;
+
+        assert_eq!(queued.sender, "renamed_user");
+        assert_eq!(queued.platform_sender_id.as_deref(), Some("123"));
+        assert_eq!(queued.content, "/model fast");
+        assert_eq!(queued.thread_ts.as_deref(), Some("9"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let mut original_sender_message = queued.clone();
+        original_sender_message.sender = "original_user".into();
+        let original_key = conversation_history_key(&original_sender_message);
+        let current_key = conversation_history_key(&queued);
+        ctx.route_overrides.lock().unwrap().insert(
+            original_key.clone(),
+            ChannelRouteSelection {
+                model_provider: "openrouter.default".into(),
+                model: "original-session-model".into(),
+                api_key: None,
+            },
+        );
+        let response_channel = Arc::new(ModelPickerRecordingChannel::default());
+        let response_channel_trait: Arc<dyn Channel> = response_channel.clone();
+
+        assert!(
+            handle_runtime_command_if_needed(&ctx, &queued, Some(&response_channel_trait)).await
+        );
+
+        let overrides = ctx.route_overrides.lock().unwrap();
+        assert_ne!(original_key, current_key);
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[&original_key].model, "original-session-model");
+        assert_eq!(overrides[&current_key].model_provider, "anthropic.work");
+        assert_eq!(overrides[&current_key].model, "claude-sonnet-4-5");
     }
 
     #[tokio::test]
@@ -29152,6 +30327,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
+                platform_sender_id: None,
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -32093,6 +33269,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
+                platform_sender_id: None,
                 reply_target: "chat-image-route".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),

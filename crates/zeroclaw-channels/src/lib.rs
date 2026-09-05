@@ -14,6 +14,8 @@ pub mod listing;
 pub mod login_events;
 pub mod login_probe;
 pub mod login_relink;
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod model_picker_delivery;
 pub mod orchestrator;
 pub mod paced_channel;
 pub mod util;

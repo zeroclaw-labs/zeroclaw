@@ -9248,6 +9248,7 @@ path = "{trigger_path}"
         zeroclaw_api::channel::ChannelMessage {
             id: "msg-1".into(),
             sender: sender.into(),
+            platform_sender_id: None,
             reply_target: sender.into(),
             content: content.into(),
             channel: "linq".into(),
