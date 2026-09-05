@@ -657,9 +657,13 @@ mod tests {
                 "every bridged message body must be the fixed marker: {record}"
             );
         }
+        let bridged_broadcast_count = broadcast
+            .iter()
+            .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+            .filter(|frame| frame["attributes"]["log.target"].is_string())
+            .count();
         assert_eq!(
-            broadcast.len(),
-            BRIDGED_RECORD_COUNT,
+            bridged_broadcast_count, BRIDGED_RECORD_COUNT,
             "every third-party record must also reach the live broadcast: {broadcast:?}"
         );
 
