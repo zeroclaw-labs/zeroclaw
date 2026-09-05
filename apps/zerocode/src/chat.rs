@@ -94,6 +94,21 @@ pub(crate) enum PaneKind {
     Acp,
 }
 
+/// Process cwd for a fresh local Code session. Chat and remote transports
+/// omit cwd so the daemon uses the agent workspace or an explicit picker.
+fn local_code_session_cwd(
+    pane_kind: PaneKind,
+    transport: crate::client::Transport,
+) -> Option<String> {
+    if pane_kind == PaneKind::Acp && transport == crate::client::Transport::Local {
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+    } else {
+        None
+    }
+}
+
 impl PaneKind {
     /// Short name for this pane (no padding — callers format as needed).
     pub(crate) fn name(self) -> String {
@@ -804,17 +819,17 @@ impl Chat {
         // A resume must not re-point the session at the TUI's launch directory:
         // pass no cwd so the daemon keeps the retained session's own cwd.
         //
-        // A fresh session also passes no cwd unless the user explicitly picked
-        // one (the remote ACP CWD picker). That lets the daemon resolve the
-        // selected agent's configured workspace instead of forcing the TUI's
-        // launch directory — for Local and WSS alike. An explicit
-        // caller-supplied cwd still wins over that default.
+        // Fresh Chat sessions omit cwd so the daemon uses the selected agent's
+        // workspace. Fresh local Code sessions pin the process cwd so file and
+        // shell tools operate on the project zerocode was launched from. An
+        // explicit caller-supplied cwd (the remote ACP picker) still wins.
         let cwd_str: Option<String> = if resume.is_some() {
             None
         } else {
             cwd_override
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string)
+                .or_else(|| local_code_session_cwd(self.pane_kind, self.rpc.transport()))
         };
         if is_cancelled(cancellation) {
             return;
@@ -975,14 +990,14 @@ impl Chat {
             });
         }
 
-        // A restart mints a fresh session: pass no cwd so the daemon resolves
-        // the selected agent's configured workspace rather than the TUI's
-        // launch directory. The remote ACP path above re-prompts via the CWD
-        // picker, so only that explicit choice overrides the agent workspace.
+        // Chat restarts omit cwd so the daemon keeps the agent workspace.
+        // Local Code restarts pin the process cwd. Remote ACP re-prompts via
+        // the picker above.
+        let cwd_str = local_code_session_cwd(pane_kind, rpc.transport());
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, None, None).await
+            rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
         } else {
-            rpc.session_new(&alias, None).await
+            rpc.session_new(&alias, cwd_str.as_deref()).await
         };
         match new_session {
             Ok(s) => {
@@ -10530,6 +10545,31 @@ mod tests {
         assert_eq!(state.agent_alias, "alpha");
     }
 
+    #[test]
+    fn local_code_session_cwd_only_pins_local_acp() {
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Local),
+            None
+        );
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Wss),
+            None
+        );
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Wss),
+            None
+        );
+        let expected = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Local),
+            Some(expected)
+        );
+    }
+
     #[tokio::test]
     async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
@@ -10570,11 +10610,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
+    async fn fresh_local_acp_session_sends_process_cwd() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
+        let expected_cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -10603,7 +10648,9 @@ mod tests {
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        assert!(params["cwd"].is_null());
+        // Code sessions pin the directory zerocode was launched from so file
+        // and shell tools operate on that project, not the agent workspace.
+        assert_eq!(params["cwd"], expected_cwd);
 
         init.abort();
     }
@@ -10635,6 +10682,55 @@ mod tests {
             &rpc,
             &request,
             serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+        );
+
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "restart should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_local_acp_session_sends_process_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let expected_cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        assert_eq!(params["chat_mode"], "acp");
+        assert_eq!(params["cwd"], expected_cwd);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": expected_cwd }),
         );
 
         let request = next_rpc_request(&mut rx, "restart should close the old session").await;

@@ -18,6 +18,12 @@ zerocode finds the daemon's local endpoint automatically: `<data_dir>/data/daemo
 on Unix, `\\.\pipe\zeroclaw-<hash>` on Windows. If the daemon isn't running,
 zerocode spawns an ephemeral one.
 
+Local **Code** sessions start in the directory you launched zerocode from, so
+file and shell tools operate on that project. Local **Chat** sessions still use
+the selected agent's configured workspace. Remote (WSS) Code sessions keep the
+directory picker. Existing sessions keep their own working directory when you
+resume them.
+
 ## Switching sessions
 
 In the **Chat** and **Code** panes you can load or switch existing sessions without restarting zerocode:
