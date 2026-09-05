@@ -382,6 +382,7 @@ impl Tool for FileUploadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -511,6 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_uploads_with_multipart_and_headers() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("hello.txt");
@@ -551,6 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_reports_non_2xx_response() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("hello.txt");
@@ -700,6 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_truncates_multibyte_response_without_panicking() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("hello.txt");
@@ -739,6 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_bounds_oversized_response_read() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("hello.txt");

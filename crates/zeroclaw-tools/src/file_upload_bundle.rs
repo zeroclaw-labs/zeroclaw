@@ -545,6 +545,7 @@ impl Tool for FileUploadBundleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -771,6 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_uploads_bundle_with_multipart_parts_and_headers() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("index.html"), b"<html></html>").unwrap();
@@ -847,6 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_reports_non_2xx_response() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let server = MockServer::start().await;
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("a.txt"), b"a").unwrap();
@@ -1031,6 +1034,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_truncates_over_limit_response_with_multibyte_boundary() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         // Use a small response-body limit so we can craft a tight test
         // without allocating megabytes.
         let body_limit: usize = 64;
@@ -1098,6 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_marks_over_limit_ascii_response_as_truncated() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let body_limit: usize = 64;
 
         // Pure ASCII, no multi-byte char near the cut point, so

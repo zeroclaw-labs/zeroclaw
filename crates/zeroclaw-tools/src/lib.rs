@@ -92,6 +92,14 @@ pub mod wrappers;
 #[cfg(all(test, unix))]
 mod coding_agent_budget_tests;
 
+/// Crate-wide test-only synchronization and helpers shared across tool test
+/// modules that touch the same process-global state (for example the runtime
+/// proxy config in `zeroclaw_config::schema`). Kept out of `tests/` so sibling
+/// modules in the same library test binary can serialize on one lock instead of
+/// racing on global state.
+#[cfg(test)]
+mod test_support;
+
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_store",
     "memory_recall",
