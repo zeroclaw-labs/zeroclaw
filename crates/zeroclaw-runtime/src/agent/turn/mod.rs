@@ -5,6 +5,7 @@ pub(crate) mod call_prep;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
+pub(crate) mod elicitation;
 pub(crate) mod events;
 pub(crate) mod execution;
 pub(crate) mod history_append;
@@ -467,6 +468,101 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
     }
 
+    // Pre-turn tool-elicitation prefilter. Gated on the per-agent
+    // `tool_elicitation` runtime-profile flag (default off; fail closed when
+    // config or alias is absent) and on channel origin in v1. Scans the RAW
+    // latest user message — before the memory-context preamble is prepended —
+    // and appends the one-line hint to that message's content, the same
+    // rides-the-user-turn idiom as memory context: a separate system message
+    // would be hoisted to context start by provider-side normalization,
+    // exactly the weak position this design rejects. Ephemeral by
+    // construction: the user turn is persisted before this Vec is built, so
+    // the mutation never reaches stored history. Telemetry records tool
+    // names only, never message text.
+    let mut hinted_tool: Option<String> = None;
+    let mut hint_call_recorded = false;
+    if ingress.origin == zeroclaw_api::ingress::TurnOrigin::Channel
+        && config
+            .zip(agent_alias)
+            .is_some_and(|(cfg, alias)| cfg.effective_tool_elicitation(alias))
+        && let Some(last_user_idx) = turn_state.history.iter().rposition(|m| m.role == "user")
+    {
+        // Idempotence is runtime-owned, keyed by turn id: a model-switch
+        // retry re-enters with the same turn id and the already-mutated
+        // history, and must neither stack the hint nor re-fire the events.
+        // Content is deliberately not consulted — a user message containing
+        // the hint marker must not be able to suppress a real hint or arm
+        // the call telemetry without an injection.
+        if let Some(prior) = elicitation::hint_record_for(turn_id) {
+            hinted_tool = Some(prior.tool);
+            hint_call_recorded = prior.call_recorded;
+        } else if let Some(tool_name) = {
+            // Scan every tool the turn can advertise and execute: the
+            // static registry plus the activated deferred set (snapshotted
+            // out of the lock before matching).
+            let activated_snapshot: Vec<std::sync::Arc<dyn crate::tools::Tool>> = activated_tools
+                .map(|at| {
+                    let guard = match at.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Tool)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                "activated-tool lock poisoned while scanning invocation triggers; recovering guard for read"
+                            );
+                            poisoned.into_inner()
+                        }
+                    };
+                    guard.tools()
+                })
+                .unwrap_or_default();
+            elicitation::scan_for_trigger_hit(
+                &p1_text.to_lowercase(),
+                tools_registry,
+                &activated_snapshot,
+                excluded_tools,
+            )
+        } {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "trace_id": turn_id,
+                    })),
+                "prefilter_hit"
+            );
+            let existing = &turn_state.history[last_user_idx].content;
+            turn_state.history[last_user_idx].content =
+                format!("{existing}\n\n{}", elicitation::hint_message(&tool_name));
+            elicitation::record_hint(turn_id, &tool_name);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "trace_id": turn_id,
+                    })),
+                "hint_injected"
+            );
+            hinted_tool = Some(tool_name);
+        }
+    }
+    // Ends the turn's hint record on every exit except the model-switch
+    // handoff (defused there), so the retry still sees it.
+    let mut hint_turn_guard = hinted_tool
+        .is_some()
+        .then(|| elicitation::HintTurnGuard::new(turn_id));
+
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -715,6 +811,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     provider_name, model, new_model_provider, new_model
                 )
             );
+            // The same turn re-enters the engine after the switch; keep its
+            // hint record alive so the retry neither stacks the hint nor
+            // re-fires the injection events.
+            if let Some(guard) = hint_turn_guard.as_mut() {
+                guard.defuse();
+            }
             return Err(ModelSwitchRequested {
                 model_provider: new_model_provider.clone(),
                 model: new_model.clone(),
@@ -1268,6 +1370,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
+        }
+
+        // Third elicitation telemetry event: the hinted tool was
+        // actually called this turn. Invocation-only — it correlates the
+        // hint with the call and deliberately claims nothing about the
+        // tool's own result (that is `tool_call_result`'s job), so the
+        // outcome stays Unknown even for a successful execution. Emitted at
+        // most once per turn; tool names only, never message text.
+        if let Some(hinted) = &hinted_tool
+            && !hint_call_recorded
+            && executed_completed_calls.iter().any(|c| c.name == *hinted)
+        {
+            hint_call_recorded = true;
+            elicitation::record_hint_call(turn_id);
+            ::zeroclaw_log::record!(
+                INFO,
+                elicitation::hinted_call_event(hinted, iteration + 1, turn_id),
+                "tool_called_after_hint"
+            );
         }
 
         record_executed_outcomes(

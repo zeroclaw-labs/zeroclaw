@@ -452,6 +452,7 @@ pub fn filter_by_allowed_tools(
 }
 
 // Re-export from zeroclaw-types for backwards compatibility.
+pub use crate::agent::turn::elicitation::TurnHintScope;
 pub use zeroclaw_api::TOOL_LOOP_SESSION_KEY;
 pub use zeroclaw_api::TOOL_LOOP_THREAD_ID;
 
@@ -880,6 +881,11 @@ async fn agent_turn_with_sop_reassembly(
     sop_reassembly: Option<SopStepReassembly<'_>>,
 ) -> Result<String> {
     let turn_id = turn_id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string);
+    // No caller of this wrapper retries model switches with the same turn
+    // id, so this frame is the outermost owner of the turn: it backstops
+    // the elicitation hint record on every exit, a propagated switch error
+    // included.
+    let _hint_scope = TurnHintScope::new(&turn_id);
     #[cfg(test)]
     if let Some(hook) = AGENT_TURN_SOP_REASSEMBLY_TEST_HOOK
         .lock()
@@ -1246,6 +1252,10 @@ pub async fn run(
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
+        // This frame owns the turn id and the model-switch retries below, so
+        // it backstops the turn's elicitation hint record: a handoff that
+        // never re-enters the loop must not leak it.
+        let _hint_scope = TurnHintScope::new(&turn_id);
         let channel_name = if interactive { "cli" } else { "daemon" };
         let _flush_guard = interactive.then(|| observability::FlushGuard::new(observer.clone()));
         if interactive

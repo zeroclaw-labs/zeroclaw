@@ -7103,6 +7103,11 @@ async fn process_channel_message_body(
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
     }
     let turn_id = uuid::Uuid::new_v4().to_string();
+    // This frame owns the turn id and the model-switch retry below, so it
+    // backstops the turn's elicitation hint record: a switch handoff whose
+    // provider resolution or construction fails never re-enters the loop,
+    // and the record must not outlive the turn.
+    let _hint_scope = zeroclaw_runtime::agent::loop_::TurnHintScope::new(&turn_id);
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
     // /api/events/history) for channel-originated turns — mirroring the CLI
