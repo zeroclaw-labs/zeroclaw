@@ -2583,6 +2583,227 @@ fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
     ))
 }
 
+/// Markdown spans whose doubled marker collapses to WhatsApp's single one.
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_INLINE_SPANS: [(&str, char); 3] = [("**", '*'), ("__", '_'), ("~~", '~')];
+
+/// Convert Markdown to WhatsApp's formatting dialect.
+///
+/// WhatsApp renders `*bold*`, `_italic_`, `~strikethrough~`, `` `code` ``,
+/// ``` ```monospace``` ```, bullet and numbered lists and `>` quotes natively,
+/// and auto-links bare URLs, so only the markers Markdown spells differently
+/// are rewritten. Text already written in WhatsApp style passes through
+/// unchanged.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_to_whatsapp(text: &str) -> String {
+    let mut result_lines: Vec<String> = Vec::new();
+    // Length of the backtick run that opened the current fenced block.
+    let mut open_fence: Option<usize> = None;
+
+    for line in text.split('\n') {
+        let trimmed = line.trim_start();
+        let run = backtick_run(trimmed, 0);
+
+        if let Some(fence) = open_fence {
+            // Only a run at least as long as the opener with nothing but
+            // whitespace after it closes the block (CommonMark fenced code
+            // blocks); a shorter run or one carrying an info string is content.
+            if run >= fence && trimmed[run..].trim().is_empty() {
+                open_fence = None;
+            }
+            result_lines.push(line.to_string());
+            continue;
+        }
+
+        // An opening fence is three or more backticks whose info string holds
+        // no backtick — ```mono``` on one line is a WhatsApp monospace span.
+        if run >= 3 && !trimmed[run..].contains('`') {
+            // WhatsApp shares the backtick fence but has no notion of an info
+            // string, so it would render `rust` as the first code line.
+            let indent = &line[..line.len() - trimmed.len()];
+            result_lines.push(format!("{indent}{}", &trimmed[..run]));
+            open_fence = Some(run);
+            continue;
+        }
+
+        // Headings: `## Title` → `*Title*`. WhatsApp has no heading of its own.
+        let after_hashes = line.trim_start_matches('#');
+        let level = line.len() - after_hashes.len();
+        if (1..=6).contains(&level) && after_hashes.starts_with(' ') {
+            // The whole line is bold, so `# **Title**` sheds its own bold
+            // markers instead of gaining a second wrapper around them.
+            let title = markdown_inline_to_whatsapp_in(after_hashes.trim(), true);
+            result_lines.push(format!("*{title}*"));
+            continue;
+        }
+
+        result_lines.push(markdown_inline_to_whatsapp(line));
+    }
+
+    result_lines.join("\n")
+}
+
+/// Rewrite the inline Markdown markers of a single non-fenced line.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_inline_to_whatsapp(line: &str) -> String {
+    markdown_inline_to_whatsapp_in(line, false)
+}
+
+/// [`markdown_inline_to_whatsapp`] for text that is already inside a bold
+/// span, where a nested `**bold**` contributes only its text.
+#[cfg(feature = "whatsapp-web")]
+fn markdown_inline_to_whatsapp_in(line: &str, inside_bold: bool) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Inline code is copied verbatim so markers inside it stay literal. A
+        // span closes at the next backtick run of exactly the opening length
+        // (CommonMark code spans); an unmatched run is literal text.
+        if bytes[i] == b'`' {
+            let run = backtick_run(line, i);
+            let end = match find_backtick_run(line, i + run, run) {
+                Some(close) => close + run,
+                None => i + run,
+            };
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
+
+        // A bare URL is copied through whole so the `_`, `*` and `~` in its
+        // path stay literal; WhatsApp auto-links it as written.
+        if let Some(end) = bare_url_end(line, i) {
+            out.push_str(&line[i..end]);
+            i = end;
+            continue;
+        }
+
+        // `**bold**` → `*bold*`, `__x__` → `_x_`, `~~strike~~` → `~strike~`.
+        // A single marker is already WhatsApp syntax, so a leading `* ` list
+        // bullet and a lone `*bold*` both fall through untouched.
+        if let Some(&(marker, replacement)) = WHATSAPP_INLINE_SPANS
+            .iter()
+            .find(|(marker, _)| line[i..].starts_with(marker))
+            && let Some(end) = line[i + 2..].find(marker)
+        {
+            let inner = &line[i + 2..i + 2 + end];
+            if inside_bold && replacement == '*' {
+                out.push_str(inner);
+            } else {
+                out.push(replacement);
+                out.push_str(inner);
+                out.push(replacement);
+            }
+            i += 4 + end;
+            continue;
+        }
+
+        // `[text](url)` → `text: url`; WhatsApp auto-links the bare URL. The
+        // destination runs to the parenthesis that balances the opener
+        // (CommonMark link destinations), so `(b)` inside a path survives.
+        if bytes[i] == b'['
+            && let Some(bracket_end) = line[i + 1..].find(']')
+        {
+            let after_bracket = i + 1 + bracket_end + 1;
+            if after_bracket < len
+                && bytes[after_bracket] == b'('
+                && let Some(paren_end) = balanced_paren_end(line, after_bracket)
+            {
+                let text = &line[i + 1..i + 1 + bracket_end];
+                let destination = &line[after_bracket + 1..paren_end];
+                // A link title after the destination has no WhatsApp form.
+                let url = destination.split_whitespace().next().unwrap_or("");
+                out.push_str(text);
+                out.push_str(": ");
+                out.push_str(url);
+                i = paren_end + 1;
+                continue;
+            }
+        }
+
+        let ch = line[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+/// Length of the backtick run starting at byte `at`.
+#[cfg(feature = "whatsapp-web")]
+fn backtick_run(text: &str, at: usize) -> usize {
+    text.as_bytes()[at..]
+        .iter()
+        .take_while(|&&b| b == b'`')
+        .count()
+}
+
+/// Byte index of the first backtick run of exactly `len` at or after `from`.
+#[cfg(feature = "whatsapp-web")]
+fn find_backtick_run(text: &str, from: usize, len: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let run = backtick_run(text, i);
+        if run == len {
+            return Some(i);
+        }
+        i += run;
+    }
+    None
+}
+
+/// End of the bare URL starting at byte `at`, if one starts there. The URL
+/// runs to whitespace or `<`, less trailing punctuation and an unbalanced `)`
+/// (GFM autolink extension), so `(see https://x/y).` links `https://x/y`.
+#[cfg(feature = "whatsapp-web")]
+fn bare_url_end(text: &str, at: usize) -> Option<usize> {
+    let rest = &text[at..];
+    if !(rest.starts_with("http://") || rest.starts_with("https://")) {
+        return None;
+    }
+    let mut end = at
+        + rest
+            .find(|c: char| c.is_whitespace() || c == '<')
+            .unwrap_or(rest.len());
+    while let Some(last) = text[at..end].chars().next_back() {
+        let url = &text[at..end];
+        let unbalanced_paren = last == ')' && url.matches(')').count() > url.matches('(').count();
+        if !unbalanced_paren && !"?!.,:*_~'\"".contains(last) {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    Some(end)
+}
+
+/// Byte index of the `)` that balances the `(` at `open`, or `None` when the
+/// parentheses never balance.
+#[cfg(feature = "whatsapp-web")]
+fn balanced_paren_end(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, byte) in text.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(feature = "whatsapp-web")]
 impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2841,7 +3062,7 @@ impl Channel for WhatsAppWebChannel {
 
         // Send text message
         let outgoing = waproto::whatsapp::Message {
-            conversation: Some(text_content),
+            conversation: Some(markdown_to_whatsapp(&text_content)),
             ..Default::default()
         };
 
@@ -7483,5 +7704,186 @@ mod tests {
             assert_eq!(got_token, token.to_lowercase());
             assert_eq!(got, want);
         }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_inline_markers_collapse_to_whatsapp_syntax() {
+        assert_eq!(markdown_to_whatsapp("**bold**"), "*bold*");
+        assert_eq!(markdown_to_whatsapp("__underscored__"), "_underscored_");
+        assert_eq!(markdown_to_whatsapp("~~gone~~"), "~gone~");
+        assert_eq!(
+            markdown_to_whatsapp("a **b** and ~~c~~ and __d__ end"),
+            "a *b* and ~c~ and _d_ end"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_headings_become_bold_lines() {
+        assert_eq!(markdown_to_whatsapp("# Title"), "*Title*");
+        assert_eq!(markdown_to_whatsapp("###### Deep"), "*Deep*");
+        // Seven hashes is not a heading, and neither is a bare `#tag`.
+        assert_eq!(markdown_to_whatsapp("####### Nope"), "####### Nope");
+        assert_eq!(markdown_to_whatsapp("#tag"), "#tag");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn markdown_links_become_text_then_url() {
+        assert_eq!(
+            markdown_to_whatsapp("see [the docs](https://example.com/x) now"),
+            "see the docs: https://example.com/x now"
+        );
+        // A bare URL is left for WhatsApp to auto-link.
+        assert_eq!(
+            markdown_to_whatsapp("https://example.com/x"),
+            "https://example.com/x"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_native_constructs_pass_through() {
+        let native = "- first\n- second\n1. one\n2. two\n> quoted\n`inline code`";
+        assert_eq!(markdown_to_whatsapp(native), native);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn already_whatsapp_styled_text_is_unchanged() {
+        let styled = "*bold* and _italic_ and ~struck~ and `code`";
+        assert_eq!(markdown_to_whatsapp(styled), styled);
+        assert_eq!(
+            markdown_to_whatsapp(&markdown_to_whatsapp("**bold** and __italic__")),
+            "*bold* and _italic_"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn leading_list_marker_is_not_read_as_bold() {
+        assert_eq!(markdown_to_whatsapp("* item one"), "* item one");
+        assert_eq!(
+            markdown_to_whatsapp("* item one\n* item two"),
+            "* item one\n* item two"
+        );
+        assert_eq!(markdown_to_whatsapp("* **hot** item"), "* *hot* item");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn code_fences_keep_their_contents_and_lose_the_language_tag() {
+        assert_eq!(
+            markdown_to_whatsapp("```rust\nlet x = **y**;\n```"),
+            "```\nlet x = **y**;\n```"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("```\n# not a heading\n[a](b)\n```"),
+            "```\n# not a heading\n[a](b)\n```"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mixed_hebrew_and_english_gains_no_direction_marks() {
+        let input = "## סיכום Summary\n**חשוב**: ראה [the docs](https://example.com) עכשיו";
+        let rendered = markdown_to_whatsapp(input);
+        assert_eq!(
+            rendered,
+            "*סיכום Summary*\n*חשוב*: ראה the docs: https://example.com עכשיו"
+        );
+        assert!(!rendered.contains('\u{200f}'));
+        assert!(!rendered.contains('\u{200e}'));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn multi_line_message_converts_heading_list_and_bold() {
+        let input = "# Report\n\nThe **build** is green.\n\n- run `cargo test`\n- read [the log](https://ci.example.com/1)\n";
+        assert_eq!(
+            markdown_to_whatsapp(input),
+            "*Report*\n\nThe *build* is green.\n\n- run `cargo test`\n- read the log: https://ci.example.com/1\n"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bare_url_bytes_survive_unchanged() {
+        let url = "https://example.test/a__b__c";
+        assert_eq!(markdown_to_whatsapp(url), url);
+        assert_eq!(
+            markdown_to_whatsapp("see https://example.test/a__b__c now"),
+            "see https://example.test/a__b__c now"
+        );
+        // Trailing punctuation and an unbalanced `)` belong to the sentence,
+        // not the URL, so the markers after a URL still convert.
+        assert_eq!(
+            markdown_to_whatsapp("(see https://example.test/x_(y)_z). **ok**"),
+            "(see https://example.test/x_(y)_z). *ok*"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("**https://example.test/a~~b~~c**"),
+            "*https://example.test/a~~b~~c*"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn link_destination_keeps_balanced_parentheses() {
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a_(b)/c)"),
+            "docs: https://example.test/a_(b)/c"
+        );
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a__b \"title\") tail"),
+            "docs: https://example.test/a__b tail"
+        );
+        // An unbalanced destination is not a link, and the URL still passes whole.
+        assert_eq!(
+            markdown_to_whatsapp("[docs](https://example.test/a_(b"),
+            "[docs](https://example.test/a_(b"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn code_span_closes_only_on_a_matching_backtick_run() {
+        assert_eq!(markdown_to_whatsapp("``a **b**``"), "``a **b**``");
+        assert_eq!(
+            markdown_to_whatsapp("``has ` inside`` and **bold**"),
+            "``has ` inside`` and *bold*"
+        );
+        // An unmatched run is literal text and does not swallow the line.
+        assert_eq!(markdown_to_whatsapp("``open **bold**"), "``open *bold*");
+        assert_eq!(markdown_to_whatsapp("```mono __x__```"), "```mono __x__```");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn longer_fence_encloses_a_triple_backtick_example() {
+        let input = "````\n```rust\nlet x = **y**;\n```\n[a](b)\n````\n**after**";
+        assert_eq!(
+            markdown_to_whatsapp(input),
+            "````\n```rust\nlet x = **y**;\n```\n[a](b)\n````\n*after*"
+        );
+        // A fence line carrying an info string never closes a block.
+        assert_eq!(
+            markdown_to_whatsapp("```\n```rust\n**x**\n```\n**y**"),
+            "```\n```rust\n**x**\n```\n*y*"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn bold_heading_is_wrapped_once_and_stays_put() {
+        assert_eq!(markdown_to_whatsapp("# **Title**"), "*Title*");
+        assert_eq!(
+            markdown_to_whatsapp(&markdown_to_whatsapp("# **Title**")),
+            "*Title*"
+        );
+        // Bold inside a heading is redundant: the whole line is already bold.
+        assert_eq!(markdown_to_whatsapp("## Plain **part**"), "*Plain part*");
+        assert_eq!(markdown_to_whatsapp("## `**` and __u__"), "*`**` and _u_*");
     }
 }
