@@ -1,6 +1,7 @@
 use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
+use crate::helpers::response_body;
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
@@ -11,19 +12,57 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
+// AnySearch skill protocol identifier. Keep this synchronized with the
+// upstream anysearch-ai/anysearch-skill CLIENT_HEADER value.
+const ANYSEARCH_CLIENT_HEADER: &str = "skill/3.0.1";
+const ANYSEARCH_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+const ANYSEARCH_CONFIG_PARSE_ERROR: &str = "anysearch_config_parse_failed";
+
+fn anysearch_config_parse_line(contents: &str, error: &toml::de::Error) -> Option<usize> {
+    let offset = error.span()?.start.min(contents.len());
+    Some(
+        contents[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+    )
+}
+
+fn anysearch_config_parse_attrs(path: &Path, line: Option<usize>) -> serde_json::Value {
+    let mut attrs = serde_json::json!({
+        "path": path.display().to_string(),
+        "search_provider": "anysearch",
+        "error_code": ANYSEARCH_CONFIG_PARSE_ERROR,
+    });
+    if let Some(line) = line {
+        attrs["line"] = line.into();
+    }
+    attrs
+}
+
+fn anysearch_config_parse_error(path: &Path, line: Option<usize>) -> anyhow::Error {
+    let location = line.map_or_else(String::new, |line| format!(", line {line}"));
+    anyhow::Error::msg(format!(
+        "Failed to parse config file {} for AnySearch API key ({ANYSEARCH_CONFIG_PARSE_ERROR}{location})",
+        path.display()
+    ))
+}
+
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
-/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly).
+/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
+/// AnySearch (optional API key; anonymous access has a lower quota).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
-/// The Bocha key has no boot-time snapshot at all — it is always resolved from
-/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
-/// canonical `[web_search] bocha_api_key` field stays the single source of
-/// truth and rotation/removal takes effect without a restart.
+/// Bocha and AnySearch keys have no boot-time snapshot at all — they are always
+/// resolved from `config.toml` at use time, so their canonical `[web_search]`
+/// fields stay the single source of truth and rotation/removal takes effect
+/// without a restart.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,
@@ -33,6 +72,10 @@ pub struct WebSearchTool {
     boot_tavily_api_key: Option<String>,
     /// Boot-time Jina AI key snapshot.
     boot_jina_api_key: Option<String>,
+    /// Canonical AnySearch value when supplied by a runtime environment
+    /// override. The outer `Option` records that an override was applied; an
+    /// inner `None` explicitly selects anonymous mode.
+    anysearch_api_key_override: Option<Option<String>>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
@@ -56,6 +99,7 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: None,
             boot_jina_api_key: jina_api_key,
+            anysearch_api_key_override: None,
             searxng_instance_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -81,12 +125,42 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: tavily_api_key,
             boot_jina_api_key: jina_api_key,
+            anysearch_api_key_override: None,
             searxng_instance_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
             secrets_encrypt,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_config_and_anysearch_override(
+        model_provider: String,
+        brave_api_key: Option<String>,
+        tavily_api_key: Option<String>,
+        jina_api_key: Option<String>,
+        anysearch_api_key_override: Option<Option<String>>,
+        searxng_instance_url: Option<String>,
+        max_results: usize,
+        timeout_secs: u64,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+    ) -> Self {
+        let mut tool = Self::new_with_config(
+            model_provider,
+            brave_api_key,
+            tavily_api_key,
+            jina_api_key,
+            searxng_instance_url,
+            max_results,
+            timeout_secs,
+            config_path,
+            secrets_encrypt,
+        );
+        tool.anysearch_api_key_override =
+            anysearch_api_key_override.map(|key| key.filter(|value| !value.is_empty()));
+        tool
     }
 
     /// Resolve the Brave API key, preferring the boot-time value but falling
@@ -837,6 +911,172 @@ impl WebSearchTool {
         Ok(render_results(results_header(query, "Bocha"), blocks))
     }
 
+    fn resolve_anysearch_api_key(&self) -> anyhow::Result<Option<String>> {
+        if let Some(key) = &self.anysearch_api_key_override {
+            return Ok(key.clone());
+        }
+
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "anysearch",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for AnySearch API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for AnySearch API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(&contents).map_err(|error| {
+                let line = anysearch_config_parse_line(&contents, &error);
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(anysearch_config_parse_attrs(&self.config_path, line)),
+                    "web_search: failed to parse config for AnySearch API key"
+                );
+                anysearch_config_parse_error(&self.config_path, line)
+            })?;
+
+        let Some(raw_key) = config
+            .web_search
+            .anysearch_api_key
+            .filter(|key| !key.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            Ok((!plaintext.is_empty()).then_some(plaintext))
+        } else {
+            Ok(Some(raw_key))
+        }
+    }
+
+    async fn search_anysearch(&self, query: &str) -> anyhow::Result<String> {
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+        self.search_anysearch_with_client(&client, "https://api.anysearch.com/v1/search", query)
+            .await
+    }
+
+    async fn search_anysearch_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let api_key = self.resolve_anysearch_api_key()?;
+        let body = serde_json::json!({
+            "query": query,
+            "max_results": self.max_results,
+        });
+
+        let request = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("X-Anysearch-Client", ANYSEARCH_CLIENT_HEADER);
+        let request = match api_key {
+            Some(key) => request.bearer_auth(key),
+            None => request,
+        };
+        let response = request.json(&body).send().await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("anysearch", status));
+        }
+
+        let response_body =
+            response_body::read_bounded(response, Some(ANYSEARCH_RESPONSE_LIMIT_BYTES)).await?;
+        if response_body.overflowed {
+            anyhow::bail!(
+                "AnySearch response exceeds the {} byte size limit",
+                ANYSEARCH_RESPONSE_LIMIT_BYTES
+            );
+        }
+        let json: serde_json::Value = serde_json::from_slice(&response_body.bytes)
+            .map_err(|_| anyhow::Error::msg("Invalid AnySearch API response"))?;
+        self.parse_anysearch_results(&json, query)
+    }
+
+    fn parse_anysearch_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        if let Some(code) = json.get("code").and_then(|code| code.as_i64())
+            && code != 0
+        {
+            let message = json
+                .get("message")
+                .and_then(|message| message.as_str())
+                .unwrap_or("(no message)");
+            anyhow::bail!(
+                "AnySearch returned error (code {code}): {}",
+                cap_provider_error(message)
+            );
+        }
+
+        let results = json
+            .get("data")
+            .and_then(|data| data.get("results"))
+            .and_then(|results| results.as_array())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "anysearch"})),
+                    "web_search: invalid AnySearch response"
+                );
+                anyhow::Error::msg("Invalid AnySearch API response")
+            })?;
+
+        if results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks = Vec::new();
+        for (index, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|title| title.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|url| url.as_str()).unwrap_or("");
+            let body = result
+                .get("content")
+                .and_then(|content| content.as_str())
+                .filter(|content| !content.is_empty())
+                .or_else(|| result.get("snippet").and_then(|snippet| snippet.as_str()))
+                .unwrap_or("");
+
+            let mut block = vec![format!("{}. {}", index + 1, title), format!("   {url}")];
+            if !body.is_empty() {
+                block.push(format!("   {}", cap_result_content(body)));
+            }
+            blocks.push(block);
+        }
+
+        Ok(render_results(results_header(query, "AnySearch"), blocks))
+    }
+
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         let results = json
             .get("web")
@@ -1432,6 +1672,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
             WebSearchProviderRoute::Jina => self.search_jina(query).await?,
             WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
+            WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
         };
 
         Ok(ToolResult {
@@ -2190,6 +2431,7 @@ mod tests {
             boot_brave_api_key: None,
             boot_tavily_api_key: None,
             boot_jina_api_key: None,
+            anysearch_api_key_override: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),
             max_results: 5,
             timeout_secs: 15,
@@ -2655,6 +2897,366 @@ mod tests {
         assert_eq!(body["freshness"], "noLimit");
     }
 
+    fn anysearch_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "anysearch".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            secrets_encrypt,
+        )
+    }
+
+    #[test]
+    fn test_resolve_anysearch_api_key_supports_anonymous_rotation_and_encryption() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = anysearch_tool(config_path.clone(), true);
+        assert_eq!(tool.resolve_anysearch_api_key().unwrap(), None);
+
+        std::fs::write(
+            &config_path,
+            "[web_search]\nanysearch_api_key = \"plain-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tool.resolve_anysearch_api_key().unwrap().as_deref(),
+            Some("plain-key")
+        );
+
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("rotated-secret").unwrap();
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nanysearch_api_key = \"{encrypted}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            tool.resolve_anysearch_api_key().unwrap().as_deref(),
+            Some("rotated-secret")
+        );
+    }
+
+    #[test]
+    fn test_resolve_anysearch_api_key_uses_environment_override_without_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = WebSearchTool::new_with_config_and_anysearch_override(
+            "anysearch".to_string(),
+            None,
+            None,
+            None,
+            Some(Some("environment-only-key".to_string())),
+            None,
+            5,
+            15,
+            config_path,
+            true,
+        );
+
+        assert_eq!(
+            tool.resolve_anysearch_api_key().unwrap().as_deref(),
+            Some("environment-only-key")
+        );
+    }
+
+    #[test]
+    fn test_resolve_anysearch_api_key_blank_environment_override_forces_anonymous_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nanysearch_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = WebSearchTool::new_with_config_and_anysearch_override(
+            "anysearch".to_string(),
+            None,
+            None,
+            None,
+            Some(None),
+            None,
+            5,
+            15,
+            config_path,
+            true,
+        );
+
+        assert_eq!(tool.resolve_anysearch_api_key().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_anysearch_malformed_config_error_never_discloses_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let secret = "secret-that-must-not-escape";
+        let contents = format!("[web_search]\nanysearch_api_key = {secret}\n");
+        std::fs::write(&config_path, &contents).unwrap();
+        let tool = anysearch_tool(config_path.clone(), false);
+
+        let parse_error = toml::from_str::<zeroclaw_config::schema::Config>(&contents)
+            .expect_err("unquoted credential must be rejected");
+        let line = anysearch_config_parse_line(&contents, &parse_error);
+        assert_eq!(line, Some(2));
+        assert_eq!(
+            anysearch_config_parse_attrs(&config_path, line),
+            serde_json::json!({
+                "path": config_path.display().to_string(),
+                "search_provider": "anysearch",
+                "error_code": ANYSEARCH_CONFIG_PARSE_ERROR,
+                "line": 2,
+            })
+        );
+
+        let error = tool.resolve_anysearch_api_key().unwrap_err();
+        for rendering in [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(rendering.contains(ANYSEARCH_CONFIG_PARSE_ERROR));
+            assert!(!rendering.contains(secret));
+            assert!(!rendering.contains("anysearch_api_key"));
+        }
+
+        let end_to_end_error = tool
+            .search_anysearch_with_client(
+                &reqwest::Client::new(),
+                "http://127.0.0.1:1/v1/search",
+                "query",
+            )
+            .await
+            .unwrap_err();
+        assert!(!format!("{end_to_end_error:?}").contains(secret));
+        assert!(
+            end_to_end_error
+                .to_string()
+                .contains(ANYSEARCH_CONFIG_PARSE_ERROR)
+        );
+    }
+
+    #[test]
+    fn test_parse_anysearch_results_and_errors() {
+        let tool = WebSearchTool::new("anysearch".to_string(), None, None, 5, 15);
+        let response = serde_json::json!({
+            "code": 0,
+            "message": "success",
+            "data": {
+                "results": [
+                    {
+                        "title": "AnySearch Example",
+                        "url": "https://example.com/result",
+                        "snippet": "short snippet",
+                        "content": "long content"
+                    },
+                    {
+                        "title": "Content fallback",
+                        "url": "https://example.org/result",
+                        "content": "fallback content"
+                    }
+                ],
+                "metadata": {"total_results": 2, "search_time_ms": 10}
+            }
+        });
+        let rendered = tool.parse_anysearch_results(&response, "rust").unwrap();
+        assert!(rendered.contains("via AnySearch"));
+        assert!(rendered.contains("AnySearch Example"));
+        assert!(rendered.contains("long content"));
+        assert!(!rendered.contains("short snippet"));
+        assert!(rendered.contains("fallback content"));
+
+        let empty = serde_json::json!({"code": 0, "data": {"results": []}});
+        assert!(
+            tool.parse_anysearch_results(&empty, "rust")
+                .unwrap()
+                .contains("No results found")
+        );
+
+        let api_error = serde_json::json!({"code": -1, "message": "invalid request"});
+        let error = tool
+            .parse_anysearch_results(&api_error, "rust")
+            .unwrap_err();
+        assert!(error.to_string().contains("code -1"));
+        assert!(error.to_string().contains("invalid request"));
+
+        let invalid = serde_json::json!({"code": 0, "data": {}});
+        assert!(
+            tool.parse_anysearch_results(&invalid, "rust")
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid AnySearch API response")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anysearch_requests_omit_or_send_authorization_as_configured() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(header("x-anysearch-client", ANYSEARCH_CLIENT_HEADER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "message": "success",
+                "data": {"results": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = anysearch_tool(config_path.clone(), false);
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/v1/search", server.uri());
+        tool.search_anysearch_with_client(&client, &endpoint, "anonymous query")
+            .await
+            .unwrap();
+
+        let anonymous_requests = server.received_requests().await.unwrap();
+        assert_eq!(anonymous_requests.len(), 1);
+        assert!(!anonymous_requests[0].headers.contains_key("authorization"));
+        let anonymous_body: serde_json::Value =
+            serde_json::from_slice(&anonymous_requests[0].body).unwrap();
+        assert_eq!(anonymous_body["query"], "anonymous query");
+        assert_eq!(anonymous_body["max_results"], 5);
+        assert!(anonymous_body.get("api_key").is_none());
+
+        let authenticated_server = MockServer::start().await;
+        std::fs::write(
+            &config_path,
+            "[web_search]\nanysearch_api_key = \"anysearch-secret\"\n",
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(header("x-anysearch-client", ANYSEARCH_CLIENT_HEADER))
+            .and(header("authorization", "Bearer anysearch-secret"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&authenticated_server)
+            .await;
+        let error = tool
+            .search_anysearch_with_client(
+                &client,
+                &format!("{}/v1/search", authenticated_server.uri()),
+                "authenticated query",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("anysearch"));
+        assert!(error.contains("search_status=unavailable"));
+        assert!(!error.contains("anysearch-secret"));
+        let authenticated_requests = authenticated_server.received_requests().await.unwrap();
+        assert_eq!(authenticated_requests.len(), 1);
+        let authenticated_body: serde_json::Value =
+            serde_json::from_slice(&authenticated_requests[0].body).unwrap();
+        assert!(authenticated_body.get("api_key").is_none());
+        assert!(
+            !String::from_utf8_lossy(&authenticated_requests[0].body).contains("anysearch-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anysearch_request_respects_client_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(200))
+                    .set_body_json(serde_json::json!({
+                        "code": 0,
+                        "data": {"results": []}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = anysearch_tool(config_path, false);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let error = tool
+            .search_anysearch_with_client(
+                &client,
+                &format!("{}/v1/search", server.uri()),
+                "timeout query",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anysearch_rejects_chunked_response_at_byte_limit_without_waiting_for_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let oversized = vec![b'x'; ANYSEARCH_RESPONSE_LIMIT_BYTES + 1];
+            stream
+                .write_all(format!("{:x}\r\n", oversized.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&oversized).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = anysearch_tool(config_path, false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            tool.search_anysearch_with_client(
+                &reqwest::Client::new(),
+                &format!("http://{addr}/v1/search"),
+                "bounded query",
+            ),
+        )
+        .await
+        .expect("bounded reader must reject overflow before the server closes")
+        .unwrap_err();
+        assert!(result.to_string().contains("1048576 byte size limit"));
+    }
+
     // ── Format characterization ──────────────────────────────────────────
     //
     // These pin the *exact* rendered output of every provider parser for
@@ -2758,6 +3360,31 @@ mod tests {
             "Search results for: rust (via Bocha)\n\
              1. First Title\n   https://example.com/one\n   Example Site · 2025-01-15\n   AI summary\n\
              2. Second Title\n   https://example.org/two\n   raw only"
+        );
+    }
+
+    #[test]
+    fn anysearch_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("anysearch".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"code": 0, "data": {"results": [
+            {
+                "title": "First Title",
+                "url": "https://example.com/one",
+                "snippet": "First body",
+                "content": "Longer first body"
+            },
+            {
+                "title": "Second Title",
+                "url": "https://example.org/two",
+                "content": "Fallback body"
+            }
+        ]}});
+        let result = tool.parse_anysearch_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via AnySearch)\n\
+             1. First Title\n   https://example.com/one\n   Longer first body\n\
+             2. Second Title\n   https://example.org/two\n   Fallback body"
         );
     }
 
@@ -2908,6 +3535,25 @@ mod tests {
             "bocha must cap both the AI summary and the snippet fallback"
         );
         assert!(!rendered.contains(&long), "bocha leaked full content");
+
+        // AnySearch: both the preferred short `snippet` and the `content`
+        // fallback must pass through the shared cap.
+        let anysearch = WebSearchTool::new("anysearch".to_string(), None, None, 5, 15);
+        let rendered = anysearch
+            .parse_anysearch_results(
+                &serde_json::json!({"code": 0, "data": {"results": [
+                    {"title": "T", "url": "https://example.com", "snippet": long},
+                    {"title": "T2", "url": "https://example.org", "content": long}
+                ]}}),
+                "q",
+            )
+            .unwrap();
+        assert_eq!(
+            rendered.matches(&expected).count(),
+            2,
+            "anysearch must cap both the snippet and content fallback"
+        );
+        assert!(!rendered.contains(&long), "anysearch leaked full content");
     }
 
     // ── Total output cap ─────────────────────────────────────────────────

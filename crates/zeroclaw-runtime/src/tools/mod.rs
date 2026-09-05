@@ -1213,11 +1213,15 @@ pub fn all_tools_with_runtime(
         // against the default DuckDuckGo scrape path, which gets the machine
         // blocked.
         tool_arcs.push(Arc::new(RateLimitedTool::new(
-            WebSearchTool::new_with_config(
+            WebSearchTool::new_with_config_and_anysearch_override(
                 root_config.web_search.search_provider.clone(),
                 root_config.web_search.brave_api_key.clone(),
                 root_config.web_search.tavily_api_key.clone(),
                 root_config.web_search.jina_api_key.clone(),
+                root_config
+                    .pre_override_snapshots
+                    .contains_key("web_search.anysearch_api_key")
+                    .then(|| root_config.web_search.anysearch_api_key.clone()),
                 root_config.web_search.searxng_instance_url.clone(),
                 root_config.web_search.max_results,
                 root_config.web_search.timeout_secs,
