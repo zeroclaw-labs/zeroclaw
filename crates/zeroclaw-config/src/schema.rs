@@ -12043,9 +12043,11 @@ pub fn validate_memory_semantics(
 /// `dm_policy` and `group_policy` are consulted under BOTH modes, so they are
 /// not reported here.
 ///
-/// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
-/// list is empty, so under `group_policy = "allowlist"` an empty list is an
-/// allowlist that admits every group. That holds under both modes.
+/// `allowed_groups` is separate. It is the group-identity gate and is consulted
+/// under both modes, so it is never inert. `is_group_chat_allowed` returns true
+/// for an empty list only under `group_policy = "all"`; under every other policy
+/// an empty list admits no group. That closure is reported below by its own
+/// warning rather than as an inert key.
 ///
 /// Warnings only, no behaviour change to the validator itself. But be precise
 /// about WHICH reliance is reported, because this sentence used to promise more
@@ -12094,29 +12096,32 @@ pub fn validate_whatsapp_semantics(
         }
     }
 
-    // An empty allowed_groups only creates UNINTENDED open access where the
-    // effective policy would otherwise have consulted the list. Two
-    // configurations must stay quiet:
+    // The empty group-identity gate moved from admit-all to policy-selected.
+    // The warning is therefore a migration notice about a capability the
+    // operator is LOSING, not a fail-open alarm, and only `allowlist` loses
+    // anything. Two policies must stay quiet, because neither changed:
     //
-    //   group_policy = "ignore"    the channel gate drops every group message
-    //                              downstream, so nothing is permitted. Warning here
-    //                              also told the operator to set exactly this, and
-    //                              then kept firing after they did.
-    //   group_policy = "all"       an explicit opt-in to open group access. Warning
-    //                              here reports a deliberate choice as unsafe.
+    //   group_policy = "all"      admits every group before and after.
+    //   group_policy = "ignore"   rejects every group before and after. It is
+    //                             mode-independent in the chat-type gate, so
+    //                             this holds for business as well as personal;
+    //                             only the gate doing the rejecting moved.
     //
-    // group_policy is consulted under BOTH modes, so this predicate is
-    // mode-independent: the unintended case is `allowlist`, where an empty list
-    // is an allowlist that admits every group.
-    let empty_list_permits_all = wa.group_policy == WhatsAppChatPolicy::Allowlist;
-
-    if wa.allowed_groups.is_empty() && empty_list_permits_all {
+    // The predicate is shared with the Web transport's startup notice rather
+    // than restated here, so `config validate` and the runtime cannot drift
+    // into disagreeing about which configurations changed.
+    if wa.allowed_groups.is_empty()
+        && whatsapp_empty_group_list_is_newly_closed(&wa.mode, &wa.group_policy)
+    {
+        let remedy = whatsapp_empty_group_list_remedy(&wa.group_policy);
         out.push(crate::validation_warnings::ValidationWarning::new(
-            "whatsapp_empty_group_allowlist_permits_all",
+            "whatsapp_empty_group_list_serves_no_group",
             format!(
-                "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
-                 group the linked account belongs to. List the group JIDs you intend to \
-                 serve, or set group_policy = \"ignore\" to serve no group at all."
+                "channels.whatsapp.{alias}.allowed_groups is empty and \
+                 group_policy is \"allowlist\", so this channel answers NO \
+                 group. An empty list used to admit every group at the \
+                 identity gate; that gate is now decided by group_policy. To \
+                 restore group access, {remedy}."
             ),
             format!("channels.whatsapp.{alias}.allowed_groups"),
         ));
@@ -16117,6 +16122,63 @@ pub enum WhatsAppChatPolicy {
     All,
 }
 
+/// Whether an empty `allowed_groups` is a capability the operator is LOSING.
+///
+/// The change this reports is narrow: the empty group-identity gate moves from
+/// admit-all to policy-selected. Only a configuration that previously reached
+/// the chat-type gate and was admitted there loses anything.
+///
+/// Two policies lose nothing and are therefore never reported:
+///
+/// - `all` admits every group before and after.
+/// - `ignore` rejects every group before and after. It is mode-independent in
+///   the chat-type gate, so a Business channel with `ignore` was already closed
+///   just as a Personal one was. Reporting it would tell an operator their
+///   channel used to answer every group and offer ways to reopen a policy they
+///   set deliberately.
+///
+/// `mode` is accepted so callers need not know that the answer is currently
+/// mode-independent, and so a future policy that IS mode-sensitive has a place
+/// to land without changing every call site.
+///
+/// Shared rather than duplicated: the Web transport emits a startup notice from
+/// this same predicate, so the runtime behavior and the `config validate` warning
+/// cannot drift into disagreeing about which configurations changed.
+pub fn whatsapp_empty_group_list_is_newly_closed(
+    _mode: &WhatsAppWebMode,
+    group_policy: &WhatsAppChatPolicy,
+) -> bool {
+    !matches!(
+        group_policy,
+        WhatsAppChatPolicy::All | WhatsAppChatPolicy::Ignore
+    )
+}
+
+/// How to restore group access, phrased for the policy actually in force.
+///
+/// Shared rather than duplicated for the same reason as the predicate above:
+/// the Web transport's startup notice and the `config validate` warning must
+/// not offer different remedies for the same configuration.
+///
+/// The `ignore` arm exists because naming `allowed_groups` there would be an
+/// INEFFECTIVE remedy. A listed group passes the group-identity gate and is
+/// then dropped by the chat-type gate, so populating the list changes nothing
+/// and the operator has to choose a different policy instead.
+pub fn whatsapp_empty_group_list_remedy(group_policy: &WhatsAppChatPolicy) -> &'static str {
+    match group_policy {
+        WhatsAppChatPolicy::Ignore => {
+            "group_policy = \"ignore\" serves no group by design; set \
+             group_policy = \"all\" to admit every group, or \
+             group_policy = \"allowlist\" together with the group JIDs you \
+             intend to serve"
+        }
+        _ => {
+            "list the group JIDs you intend to serve in allowed_groups, or \
+             set group_policy = \"all\" to admit every group"
+        }
+    }
+}
+
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
@@ -16249,7 +16311,8 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
     /// Allowed group chats by JID (Web mode). An empty list (the default)
-    /// permits all groups; a non-empty list drops every group message whose
+    /// admits NO group unless `group_policy = "all"`, which admits every
+    /// group; a non-empty list drops every group message whose
     /// chat JID matches no entry. Each entry matches either the full group
     /// JID (`123456789012345@g.us`) or the JID user part - the segment before
     /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
@@ -41736,7 +41799,7 @@ allowed_users = []
     }
 
     const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
-    const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
+    const WA_CLOSED_GROUPS_WARNING: &str = "whatsapp_empty_group_list_serves_no_group";
 
     /// A config carrying both `phone_number_id` and a Web selector runs as
     /// Cloud, and the Cloud transport consults none of the Web chat-policy
@@ -41774,7 +41837,7 @@ allowed_groups = []
             "a Cloud-backed channel must not be diagnosed against the Web chat-policy gate"
         );
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
             "the Web group gate is not in a Cloud channel's path, so an empty \
              allowed_groups grants no group access here"
         );
@@ -41795,8 +41858,8 @@ allowed_groups = []
             "removing the Cloud selector must restore the inert-key diagnostic"
         );
         assert!(
-            !warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
-            "removing the Cloud selector must restore the open-groups diagnostic"
+            !warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "removing the Cloud selector must restore the empty-group diagnostic"
         );
     }
 
@@ -41867,7 +41930,7 @@ phone_number_id = "1234567890"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
-        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty());
     }
 
     /// A disabled channel cannot answer anything, so it must stay quiet.
@@ -41881,11 +41944,12 @@ session_path = "/tmp/wa-session"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
-        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty());
     }
 
-    /// The group gate runs in BOTH modes and returns true when the list is
-    /// empty, which makes the default the open case.
+    /// The group gate runs in BOTH modes and now returns false when the list is
+    /// empty under any policy but `all`, so the default is the newly-CLOSED
+    /// case and the operator is told which capability they lost.
     #[test]
     async fn whatsapp_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -41895,7 +41959,7 @@ mode = "personal"
 session_path = "/tmp/wa-session"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        let warnings = warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
@@ -41911,14 +41975,13 @@ session_path = "/tmp/wa-session"
 allowed_groups = ["123@g.us"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty());
     }
 
-    /// The remediation the warning itself recommends must SILENCE the warning.
-    /// Under personal mode the channel gate drops every group message when
-    /// group_policy = "ignore", so an empty list permits nothing. Warning here
-    /// told the operator to set exactly this and then kept firing after they
-    /// did, which is the defect this test pins.
+    /// Personal mode with group_policy = "ignore" ALREADY dropped every group
+    /// message before this change, so nothing closed and the operator lost no
+    /// capability. A migration notice here would report a change that did not
+    /// happen to this configuration.
     #[test]
     async fn whatsapp_personal_ignore_groups_is_not_flagged() {
         let toml = r#"
@@ -41930,9 +41993,9 @@ group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
-            "group_policy = \"ignore\" drops every group message, so an empty \
-             allowed_groups permits nothing and the warning must not fire"
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "personal + \"ignore\" already dropped every group message, so \
+             nothing closed and the migration notice must not fire"
         );
     }
 
@@ -41950,15 +42013,15 @@ group_policy = "all"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
             "group_policy = \"all\" is an explicit opt-in to open groups and must \
              not be reported as an unintended configuration"
         );
     }
 
-    /// The default group_policy is `allowlist`, so an empty list really does
-    /// admit every group. This is the positive case that must survive narrowing
-    /// the warning.
+    /// The default group_policy is `allowlist`, under which an empty list admits
+    /// no group, so business mode with no policy set is the newly-closed case.
+    /// This is the positive case that must survive narrowing the warning.
     #[test]
     async fn whatsapp_business_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -41968,7 +42031,7 @@ mode = "business"
 session_path = "/tmp/wa-session"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        let warnings = warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING);
         assert_eq!(
             warnings.len(),
             1,
@@ -41977,11 +42040,15 @@ session_path = "/tmp/wa-session"
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
 
-    /// Business mode now consults group_policy, so `ignore` closes group access
-    /// there exactly as it does under personal mode. Warning that an empty list
-    /// "permits EVERY group" would be false for this configuration.
+    /// Business + `ignore` must NOT warn. The base already contains the merged
+    /// change that made both chat policies apply under both modes, so `ignore`
+    /// rejected every group before this PR and rejects every group after it.
+    /// Only the gate doing the rejecting moved, from the chat-type gate to the
+    /// earlier identity gate. Warning here would tell an operator their channel
+    /// used to answer every group and offer to reopen a policy they set
+    /// deliberately.
     #[test]
-    async fn whatsapp_business_ignore_group_policy_is_not_flagged() {
+    async fn whatsapp_business_ignore_group_policy_is_not_flagged_as_newly_closed() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
@@ -41991,9 +42058,90 @@ group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
-            "group_policy = \"ignore\" drops every group message under both modes, \
-             so the open-groups warning must not fire"
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "business + \"ignore\" was already closed before this change, so nothing              was lost and nothing may be reported"
+        );
+
+        // CONTROL: the same config differing only in group_policy DOES warn, so
+        // the silence above is this policy being excluded rather than the check
+        // never matching this alias at all.
+        let allowlist = toml.replace("group_policy = \"ignore\"", "group_policy = \"allowlist\"");
+        let cfg: Config = toml::from_str(&allowlist).unwrap();
+        assert_eq!(
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).len(),
+            1,
+            "business + \"allowlist\" with an empty list does newly close"
+        );
+    }
+
+    /// The six-cell predicate that BOTH the startup notice and `config validate`
+    /// consume. Asserted directly here so the shared contract is pinned once,
+    /// rather than only observed through whichever surface happens to call it.
+    #[test]
+    async fn whatsapp_empty_group_list_newly_closed_matrix() {
+        use WhatsAppChatPolicy as P;
+        use WhatsAppWebMode as M;
+        let cases = [
+            (M::Business, P::Allowlist, true),
+            (M::Personal, P::Allowlist, true),
+            // `ignore` and `all` are mode-independent in the chat-type gate, so
+            // each pairs with its opposite-mode row. `ignore` rejected every
+            // group before and after; `all` admits every group before and
+            // after. Neither loses a capability, so neither is reported.
+            (M::Business, P::Ignore, false),
+            (M::Personal, P::Ignore, false),
+            (M::Business, P::All, false),
+            (M::Personal, P::All, false),
+        ];
+        for (mode, policy, expected) in cases {
+            assert_eq!(
+                whatsapp_empty_group_list_is_newly_closed(&mode, &policy),
+                expected,
+                "{mode:?} + {policy:?} newly-closed should be {expected}"
+            );
+        }
+    }
+
+    /// The remedy must never tell an `ignore` channel to populate
+    /// `allowed_groups`: a listed group passes the identity gate and the
+    /// chat-type gate drops it anyway, so that advice cannot work.
+    #[test]
+    async fn whatsapp_empty_group_list_remedy_is_policy_aware() {
+        use WhatsAppChatPolicy as P;
+        let ignore = whatsapp_empty_group_list_remedy(&P::Ignore);
+        assert!(
+            ignore.contains("serves no group by design"),
+            "the ignore remedy must explain the policy: {ignore}"
+        );
+        assert!(
+            !ignore.contains("list the group JIDs you intend to serve in allowed_groups"),
+            "the ignore remedy must not offer a list, which cannot reopen it: {ignore}"
+        );
+        for policy in [P::Allowlist, P::All] {
+            let other = whatsapp_empty_group_list_remedy(&policy);
+            assert!(
+                other.contains("allowed_groups"),
+                "{policy:?} is reopened by a list, so the remedy must name it: {other}"
+            );
+        }
+    }
+
+    /// The `all` opt-in still admits every group under BOTH modes, so nothing
+    /// closed and no migration notice is owed. Control for the two rows above:
+    /// without it, a validator that warned unconditionally would still pass them.
+    #[test]
+    async fn whatsapp_business_all_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+group_policy = "all"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "group_policy = \"all\" still admits every group, so nothing closed"
         );
     }
 

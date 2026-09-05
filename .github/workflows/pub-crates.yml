@@ -1,0 +1,255 @@
+name: Pub crates.io
+
+# Publishes the workspace to crates.io. Split into two jobs on purpose:
+#
+#   preflight — packages and compiles every crate from its own tarball, with no
+#               environment gate and no token. Nothing here can mutate crates.io.
+#   publish   — the irreversible upload, behind the `crates-io` environment gate.
+#
+# The gate sits *after* preflight so the approver sees a green dry run before
+# approving. crates.io versions can be yanked but never replaced or deleted, so
+# an approval here is the last reversible moment.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      release_sha:
+        description: "Commit the release was built from; preflight fails unless the tag resolves to it"
+        required: false
+        type: string
+      dry_run:
+        description: "Run preflight only (no upload)"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        description: "Repository-scoped crates.io token; referenced only by the protected publish job"
+        required: true
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Run preflight only (no upload)"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: crates-io-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Preflight (package + verify)
+    runs-on: ubuntu-latest
+    # A cold multi-package verification compiles each extracted tarball against
+    # Cargo's ephemeral registry. Warm local evidence is ~13 minutes, but a
+    # first runner with an empty cache needs materially more headroom.
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
+      msrv: ${{ steps.meta.outputs.msrv }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Validate tag and resolve version
+        id: meta
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag must be vX.Y.Z format. Got: ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          msrv="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "::error::Tag ${RELEASE_TAG} does not match workspace version ${cargo_version}."
+            exit 1
+          fi
+          if [[ ! "$msrv" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Could not read [workspace.package] rust-version (got '${msrv}')."
+            exit 1
+          fi
+
+          # The format check above only proves the string looks like a tag. A
+          # branch of the same name would resolve too, so confirm it really is a
+          # tag before anything downstream trusts it.
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}" >/dev/null; then
+            echo "::error::${RELEASE_TAG} is not a tag in this repository."
+            exit 1
+          fi
+
+          # Pin the exact commit preflight verified. The publish job checks this
+          # out rather than re-resolving the tag, so a tag moved between the two
+          # jobs cannot cause an unverified commit to be published with the token.
+          sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+
+          # When the caller knows which commit the release was built from, refuse
+          # to publish anything else. Without this, the tag could be moved between
+          # building the binaries and publishing the crates, and the two would
+          # describe different trees under one version number.
+          if [[ -n "${RELEASE_SHA:-}" && "$sha" != "$RELEASE_SHA" ]]; then
+            echo "::error::Tag ${RELEASE_TAG} resolves to ${sha}, but the release was built from ${RELEASE_SHA}."
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "sha=$sha"
+            echo "msrv=$msrv"
+          } >> "$GITHUB_OUTPUT"
+          echo "Preflight pinned ${RELEASE_TAG} to ${sha}"
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ steps.meta.outputs.msrv }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The root crate's `include` ships `/web/dist/**/*`, and those files are
+      # gitignored build output, so a checkout alone leaves only logo.png. Build
+      # it here exactly as the release workflow's `web` job does, so the
+      # published tarball is complete rather than half-empty.
+      #
+      # Note what this does NOT do: `cargo install` copies executables into
+      # ~/.cargo/bin and does not install packaged data files, and the gateway
+      # looks for web/dist relative to the CWD, the executable, /zeroclaw-data,
+      # /usr/share, or XDG data. None of those is the registry source directory,
+      # so a `cargo install zeroclaw` still reports the dashboard as unavailable.
+      # Delivering it to cargo installs needs the assets embedded in the binary,
+      # which `embedded-web` cannot currently do from a registry build. Tracked
+      # as follow-up; the install script and packaged builds are unaffected.
+      - name: Build web dashboard
+        run: cargo web build
+
+      - name: Validate crates.io publish contract
+        run: cargo test --locked --test architecture publish_contract
+
+      - name: Preflight
+        shell: bash
+        # Registry packages are keyed by name/version. Reusing a cached target
+        # across source revisions of the same unreleased version can preserve
+        # stale metadata, so the tarball verification gets a fresh target while
+        # the earlier contract test still benefits from rust-cache.
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/crates-io-package-target
+        run: ./scripts/release/publish-crates.sh "${{ steps.meta.outputs.version }}"
+
+      - name: Summarize
+        if: always()
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ inputs.release_tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "### crates.io preflight"
+            echo "- tag: \`${TAG}\`"
+            echo "- version: \`${VERSION}\`"
+            echo "- dry_run: \`${DRY_RUN}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish to crates.io
+    needs: [preflight]
+    if: ${{ inputs.dry_run == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # v0.8.5 creates the relay protocol, shared TLS, and ZeroRelay crate names.
+    # Creation is throttled much harder than updates, so keep enough room for
+    # the reactive backoff to finish without timing out midway through an
+    # irreversible sequence. Later coordinated releases normally upload only
+    # new versions of the existing set.
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zeroclaw
+    steps:
+      # The immutable SHA preflight verified, not the tag. Re-resolving the tag
+      # here would let a tag moved between the jobs publish a commit that never
+      # passed preflight, using a token this job holds and preflight does not.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ needs.preflight.outputs.msrv }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cargo web build
+
+      - name: Publish
+        id: publish
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "::error::The repository secret CARGO_REGISTRY_TOKEN is required to publish."
+            echo "::error::Mint one at https://crates.io/settings/tokens. A crate that does not"
+            echo "::error::yet exist needs the publish-new scope, not just publish-update."
+            exit 1
+          fi
+          ./scripts/release/publish-crates.sh --execute "$VERSION"
+
+      # Must branch on the publish outcome: `if: always()` with an unconditional
+      # success banner is worst on the run that actually needs reading — a
+      # partial, irreversible publish would be reported as complete.
+      - name: Summarize
+        if: always()
+        shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          if [[ "$OUTCOME" == "success" ]]; then
+            {
+              echo "### Published to crates.io"
+              echo "- version: \`${VERSION}\`"
+              echo "- verify: \`cargo install zeroclaw --version ${VERSION} --locked\`"
+              echo "- https://crates.io/crates/zeroclaw/${VERSION}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### crates.io publish did NOT complete (outcome: \`${OUTCOME}\`)"
+              echo "Some crates may already be uploaded — uploads cannot be undone."
+              echo "Check the Publish step log for the last crate it reported, then"
+              echo "re-run this workflow for the same tag; it skips what already landed."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

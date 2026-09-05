@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "HTTP/WebSocket gateway for ZeroClaw — REST API, web dashboard, webhooks."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 # Internal workspace crates

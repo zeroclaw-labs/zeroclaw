@@ -23,6 +23,20 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
   exit 1
 fi
 
+MSRV="$(awk '
+  /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+  /^\[/ { in_workspace_package = 0 }
+  in_workspace_package && /^rust-version[[:space:]]*=/ {
+    split($0, fields, "\"")
+    print fields[2]
+    exit
+  }
+' "$REPO_ROOT/Cargo.toml")"
+if [[ ! "$MSRV" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "error: invalid or missing [workspace.package] rust-version: $MSRV" >&2
+  exit 1
+fi
+
 echo "Syncing all version references to $VERSION ..."
 
 changed=0
@@ -33,7 +47,7 @@ bump() {
     echo "  skip (missing): $file"
     return
   fi
-  if grep -qE "$pattern" "$target"; then
+  if grep -qE -- "$pattern" "$target"; then
     sed -i '' -E "s|$pattern|$replacement|g" "$target" 2>/dev/null \
       || sed -i -E "s|$pattern|$replacement|g" "$target"
     echo "  updated: $file"
@@ -69,6 +83,12 @@ echo "Windows setup.bat..."
 bump "setup.bat" \
   'set "VERSION=[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
   "set \"VERSION=${VERSION}\""
+bump "setup.bat" \
+  'set "RUST_MIN_VERSION=[0-9]+\.[0-9]+(\.[0-9]+)?"' \
+  "set \"RUST_MIN_VERSION=${MSRV}\""
+bump "setup.bat" \
+  'Rust [0-9]+\.[0-9]+(\.[0-9]+)?[+] \(auto-installed if missing\)' \
+  "Rust ${MSRV}+ (auto-installed if missing)"
 
 # ── Workspace Cargo.toml ───────────────────────────────────────────
 # Bumps [workspace.package] version (the root version inherited by every child
@@ -138,6 +158,9 @@ echo "Workflow descriptions..."
 bump ".github/workflows/discord-release.yml" \
   '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\)' \
   "(e.g. v${VERSION})"
+bump "scripts/release/publish-crates.sh" \
+  '--execute [0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)? # real publish, assert version' \
+  "--execute ${VERSION} # real publish, assert version"
 
 # ── Docs book examples + matching i18n catalogs ────────────────────
 # Two surgical patterns, both anchored enough to skip release-runbook
