@@ -44,6 +44,17 @@ zeroclaw-tls = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.26"
+# Shared CA / server-cert / CSR fixtures for the frontdoor enrollment tests, so
+# the relay does not duplicate the rcgen boilerplate the daemon tests already own.
+zeroclaw-tls = { workspace = true, features = ["testing"] }
+# The frontdoor enrollment test drives the REAL daemon enrollment endpoint
+# (pairing-code consumption, CSR signing, ledger delivery) through a real relay,
+# rather than a stub that could agree with a wrong implementation. Test-only:
+# none of this reaches the shipped relay binary.
+zeroclaw-runtime = { workspace = true }
+zeroclaw-config = { workspace = true }
+tokio-util = "0.7"
+zeroize = "1.8"
 # `test-util` enables tokio's paused-clock test runtime so the refusal-write
 # budget regression asserts instantly instead of sleeping out the real budget.
 # Test-only: it does not reach the shipped binary. Mirrors apps/zerocode.

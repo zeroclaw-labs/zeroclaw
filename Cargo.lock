@@ -14657,9 +14657,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.29.0",
+ "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "zeroclaw-config",
  "zeroclaw-relay-proto",
+ "zeroclaw-runtime",
  "zeroclaw-tls",
+ "zeroize",
 ]
 
 [[package]]

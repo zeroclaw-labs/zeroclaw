@@ -121,6 +121,12 @@ struct Cli {
     #[arg(long)]
     status_file: Option<String>,
 
+    /// Serve the browser enrollment frontdoor (default off). Enabling makes this
+    /// relay a trusted code origin AND a participant in browser enrollment - see
+    /// relay.example.toml [frontdoor] for the trust implications.
+    #[arg(long)]
+    frontdoor: bool,
+
     /// Explicitly allow OPEN, tokenless registration on a public (non-loopback)
     /// bind. Without this, such a configuration refuses to start: any daemon on
     /// the internet could register and squat unclaimed node-ids. Prefer setting
@@ -141,6 +147,18 @@ struct FileConfig {
     admission: AdmissionFile,
     #[serde(default)]
     limits: LimitsFile,
+    #[serde(default)]
+    frontdoor: FrontdoorFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrontdoorFile {
+    /// Serve the browser enrollment frontdoor from this relay. OFF by default:
+    /// enabling makes this relay a trusted code origin for enrolling browsers
+    /// and a principal in their enrollment (see relay.example.toml for the
+    /// trust implications).
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -395,6 +413,7 @@ async fn main() -> Result<()> {
             .max_registered_nodes
             .or(file.limits.max_registered_nodes)
             .unwrap_or(1024),
+        frontdoor_enabled: cli.frontdoor || file.frontdoor.enabled.unwrap_or(false),
     };
 
     // Fail closed (AGENTS.md: new external surfaces default closed): an OPEN,
@@ -414,9 +433,28 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding relay on {bind}"))?;
     let addr = listener.local_addr()?;
     eprintln!(
-        "zerorelay listening on {addr} (outer TLS, mode: {:?})",
-        cfg.registration_mode
+        "zerorelay listening on {addr} (outer TLS, mode: {:?}, frontdoor: {})",
+        cfg.registration_mode,
+        if cfg.frontdoor_enabled { "on" } else { "off" }
     );
+    if cfg.frontdoor_enabled {
+        eprintln!(
+            "zerorelay WARNING: the browser enrollment frontdoor is enabled. This \
+             relay now SERVES the enrollment page and PERFORMS the enrollment \
+             exchange with the daemon on each browser's behalf, because a browser \
+             cannot speak the daemon's TLS enrollment protocol itself. For those \
+             browsers this relay therefore sees the PAIRING CODE and the ISSUED \
+             CERTIFICATE, and could use a pairing code it observes to enrol a \
+             client of its own. It does NOT see their private keys, which are \
+             generated in the browser. Browser enrollment through this relay is \
+             relay-terminated, not end-to-end: anyone who can modify this relay \
+             can intercept it. The short-auth-string only lets an operator DETECT \
+             a substituted daemon CA. Browsers are offered enrollment only - no \
+             sessions - and the blind-forwarder guarantee still holds for the RPC \
+             plane and for zerocode/native enrollment. Disable [frontdoor] to \
+             withdraw that trust."
+        );
+    }
 
     let server = RelayServer::new(cfg);
     spawn_sighup_reloader(
