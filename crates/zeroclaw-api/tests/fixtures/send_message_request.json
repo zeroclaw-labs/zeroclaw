@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "SendMessage",
+  "params": {
+    "tenant": "tenant-a",
+    "message": {
+      "messageId": "msg-fixture-1",
+      "role": "ROLE_USER",
+      "parts": [{ "text": "Fixture conformance test" }]
+    }
+  }
+}

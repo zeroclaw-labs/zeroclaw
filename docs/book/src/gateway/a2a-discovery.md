@@ -12,7 +12,7 @@ is illustrative.
 
 The two discovery GETs are unauthenticated: the catalog card and the per-alias
 agent card are readable without a token so a peer can discover your published
-surface before pairing. The `message/send` POST is different. It runs a full
+surface before pairing. The `SendMessage` POST is different. It runs a full
 tool-enabled agent turn, so it is behind the gateway's pairing auth like every
 other write surface. When `[gateway] require_pairing` is on (the default), pass
 a pairing-derived bearer token on the task POST:
@@ -20,8 +20,9 @@ a pairing-derived bearer token on the task POST:
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
   -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "A2A-Version: 1.0" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{...}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{...}}'
 ```
 
 An unauthenticated task POST gets `401`, never an agent turn. The discovery GETs
@@ -238,58 +239,59 @@ outside world can see.
 ## Sending a task
 
 Once you have an agent's interface URL and a skill, you send work as a JSON-RPC
-`message/send` POST to that URL:
+`SendMessage` POST to that URL, advertising the A2A protocol version you speak
+in the `A2A-Version` header (this server speaks `1.0`):
 
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
   -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "A2A-Version: 1.0" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
-        "role": "user",
-        "parts": [{ "kind": "text", "text": "Reply with PONG" }]
+        "messageId": "msg-1",
+        "role": "ROLE_USER",
+        "parts": [{ "text": "Reply with PONG" }]
       }
     }
   }'
 ```
 
-The agent runs the turn and answers with a completed task. The reply is the text
-part inside the task's artifact:
+The agent runs the turn and answers with a completed task. The reply is the
+text part inside the task's artifact; the result is a `SendMessageResponse`
+whose `task` branch carries the `Task`:
 
 ```
 {
     "id": 1,
     "jsonrpc": "2.0",
     "result": {
-        "artifacts": [
-            {
-                "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": "PONG"
-                    }
-                ]
-            }
-        ],
-        "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
-        "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
-        "kind": "task",
-        "status": {
-            "state": "completed"
+        "task": {
+            "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
+            "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
+            "status": { "state": "TASK_STATE_COMPLETED" },
+            "artifacts": [
+                {
+                    "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
+                    "parts": [
+                        { "text": "PONG" }
+                    ]
+                }
+            ]
         }
     }
 }
 ```
 
 The interface URL is the same for discovery and for tasks; only the request
-changes. The endpoint accepts only `message/send`; any other `method` returns a
-JSON-RPC `-32601`, an empty message returns `-32602`, and a body that is not
-JSON-RPC returns HTTP `400`.
+changes. The endpoint accepts only `SendMessage` and only `A2A-Version: 1.0`;
+any other `method` returns a JSON-RPC `-32601`, an empty message returns
+`-32602`, an unsupported version returns a `VERSION_NOT_SUPPORTED` error, and a
+body that is not JSON-RPC returns HTTP `400`.
 
 ## Exposure and the one sharp edge
 
@@ -310,7 +312,7 @@ HTTP/1.1 200 OK
 content-type: text/html
 ```
 
-Discovery (the `.well-known` paths) and the `message/send` POST are the supported
+Discovery (the `.well-known` paths) and the `SendMessage` POST are the supported
 surface. A bare GET on the interface URL is not part of the protocol; read the
 card at the `.well-known` path instead.
 
@@ -412,6 +414,60 @@ personal, a `deploy` agent at team, and a `query` agent at data. To use any of
 them it fetches that agent's card and sends a task to that agent's URL, exactly
 as shown above. Nothing changes per deployment; it is the same two reads and one
 POST, pointed at a different host.
+
+## Calling out: the outbound A2A client
+
+Everything above is a deployment being discovered and called. The mirror
+direction is outbound: one deployment delegates tasks to a remote A2A agent and
+uses the replies in its own work. That is the outbound client, configured under
+`[a2a.client]`. It is off by default and registers nothing until you turn it on,
+so an unconfigured install carries no outbound A2A footprint.
+
+```toml
+[a2a.client]
+enabled = true                  # registers the a2a_* tools; default false
+
+[[a2a.client.peers]]
+name = "team"                   # the `peer` argument to every a2a_* tool
+base_url = "https://team.example.com"
+token = "${TEAM_A2A_TOKEN}"     # resolved from env at call time; empty = anonymous
+tags = ["production"]
+```
+
+Each `peer` names a remote A2A server origin. The client derives the well-known
+card path and the JSON-RPC task path from `base_url`; an agent caller never types
+a URL, only the `peer` name.
+
+Credentials are typed as secrets. A `token` of `${VAR}` is resolved from the
+environment at call time, a literal value is sent as-is, and an empty value
+sends no `Authorization` header. Because the field is marked a secret, config and
+schema surfaces treat it as write-only encrypted material rather than a readable
+value. That is the same secret posture `http_request` uses for its auth tokens.
+
+Outbound calls are an SSRF surface, so the policy defaults to rejecting peers on
+private, loopback, and link-local hosts. For a local or intra-net deployment
+pointed at `127.0.0.1` or an RFC1918 segment, either set `allow_private_hosts =
+true` or add the specific hosts to `allowed_private_hosts`; the allowlist pins
+just those hosts without loosening the global posture. Hostname resolution is
+pinned to the addresses that passed the guard, redirects are disabled, response
+bodies are bounded by `max_response_bytes`, and each request has a
+`request_timeout_secs` cap.
+
+The four tools differ in impact. `a2a_discover` and `a2a_get_task` are read
+operations and are not charged as actions. `a2a_send` and `a2a_cancel` mutate
+peer state, so they are Act operations: they require approval by default, and a
+read-only autonomy mode denies them before any network I/O. Treat `a2a_send` as a
+remote-execution grant to whichever skills the peer publishes.
+
+Turning the outbound client off is containment, not rollback. Setting
+`[a2a.client] enabled = false` stops the `a2a_*` tools from registering, which is
+the right move to contain an outbound egress incident immediately. It does not
+undo the inbound gateway migration (the `SendMessage` v1 surface) or the shared
+wire-model change, which ship in the same release: an external caller that
+already speaks v1 keeps working, and an operator who wants the pre-v1 inbound
+behavior must roll back the whole release rather than flip this one switch. The
+gateway version negotiation, the JSONRPC method names, and the enum and Part
+shapes all moved to v1 together.
 
 ## Use cases
 
