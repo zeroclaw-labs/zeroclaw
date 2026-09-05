@@ -148,6 +148,11 @@ name = "strum_macros"
 version = "=0.27.2"
 
 [[bans.skip]]
+name = "syn"
+version = "=2.0.117"
+reason = "whatsapp-rust 0.7 requires async-trait >=0.1.91 (syn 3); existing proc macros still require syn 2"
+
+[[bans.skip]]
 name = "thiserror"
 version = "=1.0.69"
 

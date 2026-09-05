@@ -4724,6 +4724,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
             )
         );
     }
+    if config.retired_node_transport_config {
+        eprintln!(
+            "{}",
+            t(
+                "cli-config-section-retired-node-transport",
+                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
     // Must follow the trace sink init above, or the record has no destination.
@@ -5099,6 +5108,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     host,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
+                    let endpoint = format!("{host}:{port}");
 
                     let action = if rotate {
                         PaircodeAction::RotateAll
@@ -5167,7 +5177,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         }
                         Err(e) => {
                             println!(
-                                "❌ Failed to fetch pairing code from gateway at {host}:{port}"
+                                "{}",
+                                ta(
+                                    "cli-pairing-fetch-failed",
+                                    &[("endpoint", &endpoint)],
+                                    &format!(
+                                        "❌ Failed to fetch pairing code from gateway at {endpoint}"
+                                    ),
+                                )
                             );
                             println!(
                                 "{}",
@@ -8721,26 +8738,37 @@ fn paircode_no_code_message(
     if let Some(message) = gateway_message.filter(|m| !m.trim().is_empty()) {
         lines.push(format!("⚠️  {message}"));
     } else if require_pairing {
-        lines
-            .push("🔐 Gateway pairing is enabled, but no active pairing code is available.".into());
+        lines.push(t(
+            "cli-pairing-no-code",
+            "🔐 Gateway pairing is enabled, but no active pairing code is available.",
+        ));
     } else {
         lines.push(t(
             "cli-pairing-disabled",
             "⚠️  Gateway pairing is disabled in config.",
         ));
-        lines.push("All requests will be accepted without authentication.".into());
-        lines.push("To enable pairing, set [gateway] require_pairing = true.".into());
+        lines.push(t(
+            "cli-pairing-requests-accepted",
+            "All requests will be accepted without authentication.",
+        ));
+        lines.push(t(
+            "cli-pairing-enable-config",
+            "To enable pairing, set [gateway] require_pairing = true.",
+        ));
         return indent_paircode_lines(lines);
     }
 
     lines.push(String::new());
     match action {
         PaircodeAction::Show => {
-            lines.push(
-                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one."
-                    .into(),
-            );
-            lines.push("To pair another device, run:".into());
+            lines.push(t(
+                "cli-pairing-show-only",
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+            ));
+            lines.push(t(
+                "cli-pairing-pair-another",
+                "To pair another device, run:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8749,7 +8777,10 @@ fn paircode_no_code_message(
                 Some("--new"),
             ));
             lines.push(String::new());
-            lines.push("To revoke existing pairings and mint a replacement code, run:".into());
+            lines.push(t(
+                "cli-pairing-revoke-replace",
+                "To revoke existing pairings and mint a replacement code, run:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8759,14 +8790,14 @@ fn paircode_no_code_message(
             ));
         }
         PaircodeAction::AddClient => {
-            lines.push(
-                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset."
-                    .into(),
-            );
-            lines.push(
-                "Try again shortly, or revoke existing pairings and mint a replacement code:"
-                    .into(),
-            );
+            lines.push(t(
+                "cli-pairing-new-code-unavailable",
+                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+            ));
+            lines.push(t(
+                "cli-pairing-retry-or-rotate",
+                "Try again shortly, or revoke existing pairings and mint a replacement code:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8776,8 +8807,14 @@ fn paircode_no_code_message(
             ));
         }
         PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
-            lines.push("The rotate request completed without returning a replacement code.".into());
-            lines.push("Check whether pairing is enabled, then request a new device code:".into());
+            lines.push(t(
+                "cli-pairing-rotate-no-code",
+                "The rotate request completed without returning a replacement code.",
+            ));
+            lines.push(t(
+                "cli-pairing-check-enabled",
+                "Check whether pairing is enabled, then request a new device code:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8789,7 +8826,7 @@ fn paircode_no_code_message(
     }
 
     lines.push(String::new());
-    lines.push("To inspect the running gateway:".into());
+    lines.push(t("cli-pairing-inspect", "To inspect the running gateway:"));
     lines.push(format!(
         "    open http://{}:{port}",
         gateway_browser_host(host)
@@ -11326,7 +11363,10 @@ mod tests {
             Some("Pairing is active but no new code available (already paired or code expired)"),
         );
 
-        assert!(msg.contains("only displays an existing active code; it does not mint"));
+        assert!(msg.contains(&t(
+            "cli-pairing-show-only",
+            "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+        )));
         assert!(msg.contains("zeroclaw gateway get-paircode --new"));
         assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
         assert!(msg.contains("open http://127.0.0.1:42617"));
@@ -11413,8 +11453,115 @@ mod tests {
             Some("Pairing is active but no new code available (already paired or code expired)"),
         );
 
-        assert!(msg.contains("did not mint a new pairing code"));
+        assert!(msg.contains(&t(
+            "cli-pairing-new-code-unavailable",
+            "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+        )));
         assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_localized_output_for_show_and_disabled_branches() {
+        let default = config::GatewayConfig::default();
+        let show = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+        let expected_show = indent_paircode_lines(vec![
+            t(
+                "cli-pairing-no-code",
+                "🔐 Gateway pairing is enabled, but no active pairing code is available.",
+            ),
+            String::new(),
+            t(
+                "cli-pairing-show-only",
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+            ),
+            t("cli-pairing-pair-another", "To pair another device, run:"),
+            "    zeroclaw gateway get-paircode --new".into(),
+            String::new(),
+            t(
+                "cli-pairing-revoke-replace",
+                "To revoke existing pairings and mint a replacement code, run:",
+            ),
+            "    zeroclaw gateway get-paircode --rotate".into(),
+            String::new(),
+            t("cli-pairing-inspect", "To inspect the running gateway:"),
+            "    open http://127.0.0.1:42617".into(),
+        ]);
+        assert_eq!(show, expected_show);
+
+        let disabled = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            false,
+            None,
+        );
+        let expected_disabled = indent_paircode_lines(vec![
+            t(
+                "cli-pairing-disabled",
+                "⚠️  Gateway pairing is disabled in config.",
+            ),
+            t(
+                "cli-pairing-requests-accepted",
+                "All requests will be accepted without authentication.",
+            ),
+            t(
+                "cli-pairing-enable-config",
+                "To enable pairing, set [gateway] require_pairing = true.",
+            ),
+        ]);
+        assert_eq!(disabled, expected_disabled);
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_localized_action_recovery_branches() {
+        let default = config::GatewayConfig::default();
+        let add_client = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::AddClient,
+            true,
+            None,
+        );
+        assert!(add_client.contains(&t(
+            "cli-pairing-new-code-unavailable",
+            "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+        )));
+        assert!(add_client.contains(&t(
+            "cli-pairing-retry-or-rotate",
+            "Try again shortly, or revoke existing pairings and mint a replacement code:",
+        )));
+
+        let rotate = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::RotateAll,
+            true,
+            None,
+        );
+        assert!(rotate.contains(&t(
+            "cli-pairing-rotate-no-code",
+            "The rotate request completed without returning a replacement code.",
+        )));
+        assert!(rotate.contains(&t(
+            "cli-pairing-check-enabled",
+            "Check whether pairing is enabled, then request a new device code:",
+        )));
     }
 
     #[test]

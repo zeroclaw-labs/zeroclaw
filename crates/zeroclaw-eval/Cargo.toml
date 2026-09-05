@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Agent evaluation harness for ZeroClaw — Phase 0: deterministic replay of LLM trace fixtures through the real agent loop."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-api.workspace = true

@@ -87,4 +87,4 @@ docker run --read-only -v /path/to/workspace:/workspace zeroclaw gateway
 
 ### CI Enforcement
 
-The `source-images` job in `.github/workflows/docker-image-pr.yml` builds the default production image and verifies that the resulting image is configured to run as `65534:65534`.
+The `source-images` job in `.github/workflows/docker-image-pr.yml` verifies that its loaded default and Alpine `linux/amd64` images are configured to run as `65534:65534`.

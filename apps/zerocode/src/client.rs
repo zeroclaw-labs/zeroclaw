@@ -437,6 +437,16 @@ fn replace_connection_state(state: &Mutex<ConnectionState>, next: ConnectionStat
     }
 }
 
+fn disconnect_rpc(rpc: &RpcOutbound, state: &Mutex<ConnectionState>, reason: String) {
+    replace_connection_state(
+        state,
+        ConnectionState::Disconnected {
+            reason: reason.clone(),
+        },
+    );
+    rpc.fail_pending(&format!("Connection closed: {reason}"));
+}
+
 fn clone_connection_state(state: &Mutex<ConnectionState>) -> ConnectionState {
     match state.lock() {
         Ok(state) => state.clone(),
@@ -1405,18 +1415,6 @@ impl RpcClient {
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let writer_task = tokio::spawn(async move {
-            let mut w = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if w.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
-
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
@@ -1426,6 +1424,22 @@ impl RpcClient {
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
+        let rpc_for_writer = Arc::downgrade(&rpc);
+        let conn_state_for_writer = conn_state.clone();
+        let writer_task = tokio::spawn(async move {
+            let mut writer = write_half;
+            while let Some(mut line) = writer_rx.recv().await {
+                if !line.ends_with('\n') {
+                    line.push('\n');
+                }
+                if let Err(error) = writer.write_all(line.as_bytes()).await {
+                    if let Some(rpc) = rpc_for_writer.upgrade() {
+                        disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                    }
+                    break;
+                }
+            }
+        });
 
         let rpc_for_reader = rpc.clone();
         let read_task = tokio::spawn(async move {
@@ -1435,21 +1449,15 @@ impl RpcClient {
                 buf.clear();
                 match reader.read_line(&mut buf).await {
                     Ok(0) => {
-                        replace_connection_state(
+                        disconnect_rpc(
+                            &rpc_for_reader,
                             &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: "EOF (daemon closed connection)".to_string(),
-                            },
+                            "EOF (daemon closed connection)".to_string(),
                         );
                         break;
                     }
                     Err(e) => {
-                        replace_connection_state(
-                            &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: e.to_string(),
-                            },
-                        );
+                        disconnect_rpc(&rpc_for_reader, &conn_state_for_reader, e.to_string());
                         break;
                     }
                     Ok(_) => {}
@@ -1637,14 +1645,6 @@ impl RpcClient {
         let (mut sink, mut stream) = ws_stream.split();
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let writer_task = tokio::spawn(async move {
-            while let Some(line) = writer_rx.recv().await {
-                if sink.send(Message::Text(line.into())).await.is_err() {
-                    break;
-                }
-            }
-        });
-
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
         let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
         let notif_tx_for_reader = notif_tx.clone();
@@ -1654,6 +1654,18 @@ impl RpcClient {
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
         let conn_state_for_reader = conn_state.clone();
+        let rpc_for_writer = Arc::downgrade(&rpc);
+        let conn_state_for_writer = conn_state.clone();
+        let writer_task = tokio::spawn(async move {
+            while let Some(line) = writer_rx.recv().await {
+                if let Err(error) = sink.send(Message::Text(line.into())).await {
+                    if let Some(rpc) = rpc_for_writer.upgrade() {
+                        disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                    }
+                    break;
+                }
+            }
+        });
 
         let rpc_for_reader = rpc.clone();
         let read_task = tokio::spawn(async move {
@@ -1675,29 +1687,20 @@ impl RpcClient {
                         let reason = frame
                             .map(|f| f.reason.to_string())
                             .unwrap_or_else(|| "server closed connection".to_string());
-                        replace_connection_state(
-                            &conn_state_for_reader,
-                            ConnectionState::Disconnected { reason },
-                        );
+                        disconnect_rpc(&rpc_for_reader, &conn_state_for_reader, reason);
                         break;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Binary(_))) => continue,
                     Some(Err(e)) => {
-                        replace_connection_state(
-                            &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: e.to_string(),
-                            },
-                        );
+                        disconnect_rpc(&rpc_for_reader, &conn_state_for_reader, e.to_string());
                         break;
                     }
                     None => {
-                        replace_connection_state(
+                        disconnect_rpc(
+                            &rpc_for_reader,
                             &conn_state_for_reader,
-                            ConnectionState::Disconnected {
-                                reason: "EOF (WSS connection closed)".to_string(),
-                            },
+                            "EOF (WSS connection closed)".to_string(),
                         );
                         break;
                     }
@@ -2333,6 +2336,7 @@ impl RpcClient {
                 "tui_id": tui_id,
                 "exclude_memory": true,
                 "chat_mode": "acp",
+                "interaction_surface": "zerocode_code",
             }),
         )
         .await
@@ -3831,6 +3835,8 @@ pub struct LogsQueryParams {
 #[serde(rename_all = "snake_case")]
 pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub log_path: Option<String>,
     /// Legacy cursor: `(timestamp, id)` to feed back as `until_ts` +
     /// `until_id` for older. Tie-breaks same-timestamp events by
     /// lexicographic id, which can drop earlier-written events when id
@@ -3852,6 +3858,24 @@ pub struct LogsQueryResult {
 #[serde(rename_all = "snake_case")]
 pub struct LogsGetResult {
     pub event: serde_json::Value,
+}
+
+#[cfg(test)]
+mod logs_query_tests {
+    use super::LogsQueryResult;
+
+    #[test]
+    fn older_response_without_log_path_remains_compatible() {
+        let result: LogsQueryResult = serde_json::from_value(serde_json::json!({
+            "events": [],
+            "next_cursor": null,
+            "next_cursor_line_offset": null,
+            "at_end": true
+        }))
+        .expect("older logs/query response");
+
+        assert!(result.log_path.is_none());
+    }
 }
 
 // ── Session / Agents types ───────────────────────────────────────
@@ -4211,21 +4235,59 @@ pub struct MemoryGetResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionMessagesResult {
     pub messages: Vec<MessageEntry>,
-    /// Total persisted messages for the session. With `start`, lets
+    /// Total projected entries for the session. With `start`, lets
     /// the Sessions pane size scrollback affordances without keeping
     /// the full history in memory.
     #[serde(default)]
     pub total: usize,
-    /// Index of `messages[0]` in the full persisted history.
+    /// Index of `messages[0]` in the full projected history.
     #[serde(default)]
     pub start: usize,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub kind: MessageEntryKind,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod message_entry_kind_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_message_entry_kind_remains_readable() {
+        let entry: MessageEntry = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "future entry",
+            "kind": "future_kind"
+        }))
+        .expect("unknown additive kind should remain readable");
+
+        assert_eq!(entry.kind, MessageEntryKind::Unknown);
+    }
 }
 
 impl MessageEntry {
@@ -4688,6 +4750,43 @@ mod session_method_tests {
     }
 
     #[tokio::test]
+    async fn session_new_acp_declares_closed_zerocode_code_surface() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client
+                .session_new_acp("my-agent", Some("/tmp/work"), Some("s-acp"))
+                .await
+        });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_new_acp must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/new");
+        assert_eq!(req["params"]["chat_mode"], "acp");
+        assert_eq!(req["params"]["interaction_surface"], "zerocode_code");
+        assert!(
+            req["params"].get("interaction_context").is_none(),
+            "ZeroCode must not send prompt prose or capability claims"
+        );
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s-acp","workspace_dir":"/tmp/work"})),
+            None,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_new_acp must resolve")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn session_cancel_sends_session_id() {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
@@ -4917,6 +5016,101 @@ mod notification_tests {
         assert_eq!(answer["pong"], true);
         assert!(inbound_rx.try_recv().is_err(), "inbound rx must stay empty");
         assert!(notif_rx.try_recv().is_err(), "notif rx must stay empty");
+    }
+
+    async fn assert_disconnect_fails_pending_request(reason: &str) {
+        let (rpc, _notif_tx, _notif_rx, _inbound_tx, _inbound_rx, mut writer_rx) = route_fixture();
+        let call_task = {
+            let rpc = Arc::clone(&rpc);
+            tokio::spawn(async move { rpc.request("long-running", Value::Null).await })
+        };
+        writer_rx.recv().await.expect("request wrote a frame");
+        assert_eq!(rpc.pending_count(), 1);
+
+        let connection_state = Mutex::new(ConnectionState::Connected);
+        disconnect_rpc(&rpc, &connection_state, reason.to_string());
+
+        let error = call_task.await.unwrap().unwrap_err();
+        assert_eq!(error.code, jsonrpc::error_codes::INTERNAL_ERROR);
+        assert_eq!(error.message, format!("Connection closed: {reason}"));
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(matches!(
+            clone_connection_state(&connection_state),
+            ConnectionState::Disconnected { reason: actual } if actual == reason
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_reader_disconnect_fails_pending_request() {
+        assert_disconnect_fails_pending_request("EOF (daemon closed connection)").await;
+    }
+
+    #[tokio::test]
+    async fn wss_reader_disconnect_fails_pending_request() {
+        assert_disconnect_fails_pending_request("EOF (WSS connection closed)").await;
+    }
+
+    #[tokio::test]
+    async fn request_after_disconnect_is_rejected_without_write() {
+        let (rpc, _notif_tx, _notif_rx, _inbound_tx, _inbound_rx, mut writer_rx) = route_fixture();
+        let connection_state = Mutex::new(ConnectionState::Connected);
+        let reason = "EOF (daemon closed connection)";
+        disconnect_rpc(&rpc, &connection_state, reason.to_string());
+
+        let error = rpc.request("too-late", Value::Null).await.unwrap_err();
+
+        assert_eq!(error.code, jsonrpc::error_codes::INTERNAL_ERROR);
+        assert_eq!(error.message, format!("Connection closed: {reason}"));
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a closed transport must reject the request before writing a frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_failure_settles_admitted_and_rejects_future_request() {
+        let (rpc, _notif_tx, _notif_rx, _inbound_tx, _inbound_rx, mut writer_rx) = route_fixture();
+        let admitted = {
+            let rpc = Arc::clone(&rpc);
+            tokio::spawn(async move { rpc.request("admitted", Value::Null).await })
+        };
+        writer_rx
+            .recv()
+            .await
+            .expect("admitted request wrote a frame");
+
+        let connection_state = Mutex::new(ConnectionState::Connected);
+        let reason = "broken pipe";
+        disconnect_rpc(&rpc, &connection_state, reason.to_string());
+
+        let admitted_error = admitted.await.unwrap().unwrap_err();
+        let future_error = rpc.request("future", Value::Null).await.unwrap_err();
+        assert_eq!(
+            admitted_error.message,
+            format!("Connection closed: {reason}")
+        );
+        assert_eq!(future_error.message, admitted_error.message);
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "writer failure must close admission before a future frame is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn weak_writer_owner_allows_receiver_to_close() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let writer_owner = Arc::downgrade(&rpc);
+
+        drop(rpc);
+
+        assert!(writer_owner.upgrade().is_none());
+        assert!(
+            writer_rx.recv().await.is_none(),
+            "dropping external RPC owners must close the writer receiver"
+        );
     }
 
     /// Notification frames — method, no id — should reach the

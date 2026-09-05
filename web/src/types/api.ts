@@ -1,38 +1,6 @@
-export interface StatusResponse {
-  version?: string;
-  /** Dotted `<type>.<alias>` of the first configured model provider, or null
-   *  when none is configured. "provider" alone is reserved — always qualify. */
-  model_provider: string | null;
-  model: string;
-  temperature: number;
-  uptime_seconds: number;
-  /** RFC 3339 wall-clock of daemon start. Stable across the daemon's
-   *  lifetime so the Logs page can default `since_ts` to "since daemon
-   *  start" without a separate `/api/logs` round-trip. */
-  daemon_started_at?: string;
-  gateway_port: number;
-  locale: string;
-  memory_backend: string;
-  paired: boolean;
-  channels: Record<string, boolean>;
-  health: HealthSnapshot;
-  /** Self-process resource snapshot. Populated on Linux, macOS, Windows,
-   * and FreeBSD via the `sysinfo` crate; on unsupported hosts
-   * `rss_bytes = 0` and `cpu_percent = null`. */
-  process?: ProcessStats;
-  /** Whether the gateway is configured to poll for newer releases and show an
-   *  update indicator (`gateway.check_updates`, default true). */
-  check_updates?: boolean;
-  /** Whether browser-triggered self-upgrade is enabled
-   *  (`gateway.allow_self_upgrade`, default false). Gates the upgrade button. */
-  allow_self_upgrade?: boolean;
-  /** How a post-upgrade restart is achieved: `supervised` (systemd/launchd
-   *  relaunches on exit), `self_respawn` (bare unix — the daemon detached-spawns
-   *  the new binary), or `manual` (container / non-unix bare — no auto-restart). */
-  restart_mode?: "supervised" | "self_respawn" | "manual";
-  /** Command to show the operator for finishing an upgrade with a restart. */
-  restart_hint?: string;
-}
+import type { components } from "../lib/api-generated";
+
+export type StatusResponse = components["schemas"]["StatusResponse"];
 
 export interface ProcessStats {
   rss_bytes: number;

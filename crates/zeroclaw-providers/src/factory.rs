@@ -250,6 +250,7 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         b = b.tls_ca_cert_path(cert_path);
     }
+    b = b.tool_result_image_policy(opts.tool_result_image_policy);
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
@@ -2065,7 +2066,10 @@ mod tests {
         );
         assert_eq!(
             ZerorouterEndpoint::default().uri(),
-            "http://localhost:8080/v1"
+            "https://zerorouter.ai/v1",
+            "the default must be the hosted deployment — a localhost default \
+             gives a zero-config user a connection refusal or a stray dev \
+             instance's partial catalog"
         );
         assert!(
             !ZerorouterModelProviderConfig::default()
