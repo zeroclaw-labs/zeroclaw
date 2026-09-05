@@ -163,17 +163,33 @@ impl MediaAttachment {
         self.marker.as_ref().map(|m| m.target.as_str())
     }
 
+    /// Return the target of a channel-rendered image marker that points at a
+    /// remote URL while the attachment bytes remain available in memory.
+    ///
+    /// Such a marker is a fallback reference rather than an owned,
+    /// reloadable image: the default provider path does not fetch remote
+    /// images. A later media-enrichment stage can therefore remove this exact
+    /// channel marker and replace it with the typed bytes without treating a
+    /// sender-authored marker as channel metadata.
+    pub fn channel_rendered_remote_image_target(&self) -> Option<&str> {
+        self.marker.as_ref().and_then(|marker| {
+            (marker.kind == MarkerKind::Image && is_remote_reference(&marker.target))
+                .then_some(marker.target.as_str())
+        })
+    }
+
     /// Whether the receiving channel already rendered a marker whose
     /// disposition a later enrichment stage must not override.
     ///
     /// See [`MarkerKind::defers_enrichment`]. The channel saw the payload, the
     /// sender's declared type, and the transport's own notion of what was
     /// sent, so its image-or-document verdict wins over a second, payload-only
-    /// classification downstream.
+    /// classification downstream. A remote URL image fallback is excluded:
+    /// its typed bytes can replace the URL when remote fetching is disabled.
     pub fn channel_rendered_owned_disposition(&self) -> bool {
         self.marker
             .as_ref()
-            .is_some_and(|m| m.kind.defers_enrichment())
+            .is_some_and(|m| m.kind.defers_enrichment() && !is_remote_reference(&m.target))
     }
 
     /// Classify this attachment into a [`MediaKind`].
@@ -257,6 +273,10 @@ impl MediaAttachment {
     pub fn provider_loadable_image_mime(&self) -> Option<&'static str> {
         provider_loadable_image_mime_for(&self.file_name, &self.data)
     }
+}
+
+fn is_remote_reference(reference: &str) -> bool {
+    reference.starts_with("http://") || reference.starts_with("https://")
 }
 
 /// The provider-loadable image MIME for a `(file_name, bytes)` pair, or `None`

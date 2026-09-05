@@ -35,6 +35,7 @@ pub struct AcpSessionData {
     pub session_uuid: String,
     pub agent_alias: String,
     pub workspace_dir: String,
+    pub interaction_surface: Option<String>,
     pub token_count: u64,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -85,6 +86,7 @@ impl AcpSessionStore {
                  session_uuid  TEXT NOT NULL UNIQUE,
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
+                 interaction_surface TEXT,
                  token_count   INTEGER NOT NULL DEFAULT 0,
                  killed_at     TEXT,
                  created_at    TEXT NOT NULL,
@@ -133,6 +135,9 @@ impl AcpSessionStore {
 
         Self::ensure_plan_json_column(&conn)
             .context("Failed to migrate ACP session plan column")?;
+
+        Self::ensure_interaction_surface_column(&conn)
+            .context("Failed to migrate ACP session interaction surface")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -207,6 +212,44 @@ impl AcpSessionStore {
         }
     }
 
+    /// Idempotent migration for the host-validated interaction surface bound
+    /// to the session. NULL identifies sessions created before the field was
+    /// introduced or by ACP entry points that do not declare a UI surface.
+    fn ensure_interaction_surface_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "interaction_surface" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute(
+            "ALTER TABLE acp_sessions ADD COLUMN interaction_surface TEXT",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session interaction surface"),
+        }
+    }
+
     /// Record a new session. Returns the integer `id` assigned by SQLite.
     pub fn create_session(
         &self,
@@ -214,16 +257,57 @@ impl AcpSessionStore {
         agent_alias: &str,
         workspace_dir: &str,
     ) -> Result<i64> {
+        self.create_session_with_interaction_surface(session_uuid, agent_alias, workspace_dir, None)
+    }
+
+    /// Record a session with an optional host-validated interaction surface.
+    pub fn create_session_with_interaction_surface(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+        workspace_dir: &str,
+        interaction_surface: Option<&str>,
+    ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO acp_sessions
-               (session_uuid, agent_alias, workspace_dir, token_count, created_at, last_activity)
-             VALUES (?1, ?2, ?3, 0, ?4, ?4)",
-            params![session_uuid, agent_alias, workspace_dir, now],
+               (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
+            params![
+                session_uuid,
+                agent_alias,
+                workspace_dir,
+                interaction_surface,
+                now
+            ],
         )
         .context("Failed to create ACP session")?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Bind an unlabelled legacy session to a validated surface exactly once.
+    /// Returns the durable value after the update so the caller can reject a
+    /// concurrent or pre-existing mismatch.
+    pub fn bind_interaction_surface_if_unset(
+        &self,
+        session_uuid: &str,
+        interaction_surface: &str,
+    ) -> Result<String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE acp_sessions
+             SET interaction_surface = ?1
+             WHERE session_uuid = ?2 AND interaction_surface IS NULL",
+            params![interaction_surface, session_uuid],
+        )
+        .context("Failed to bind ACP session interaction surface")?;
+        conn.query_row(
+            "SELECT interaction_surface FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("unknown session_uuid: {session_uuid}"))
     }
 
     /// Load session metadata and full message history for restore.
@@ -232,7 +316,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -240,19 +324,27 @@ impl AcpSessionStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         );
 
-        let (session_id, agent_alias, workspace_dir, token_count, created_at_s, last_activity_s) =
-            match row {
-                Ok(r) => r,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(e).context("Failed to query ACP session"),
-            };
+        let (
+            session_id,
+            agent_alias,
+            workspace_dir,
+            interaction_surface,
+            token_count,
+            created_at_s,
+            last_activity_s,
+        ) = match row {
+            Ok(r) => r,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e).context("Failed to query ACP session"),
+        };
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
@@ -263,6 +355,7 @@ impl AcpSessionStore {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
@@ -277,7 +370,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity, killed_at
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -285,10 +378,11 @@ impl AcpSessionStore {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         );
@@ -297,6 +391,7 @@ impl AcpSessionStore {
             session_id,
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count,
             created_at_s,
             last_activity_s,
@@ -319,6 +414,7 @@ impl AcpSessionStore {
             session_uuid: session_uuid.to_string(),
             agent_alias,
             workspace_dir,
+            interaction_surface,
             token_count: token_count.max(0) as u64,
             created_at,
             last_activity,
@@ -958,8 +1054,48 @@ mod tests {
         assert_eq!(data.session_uuid, "sess-abc");
         assert_eq!(data.agent_alias, "personal_code");
         assert_eq!(data.workspace_dir, "/home/user/project");
+        assert_eq!(data.interaction_surface, None);
         assert_eq!(data.token_count, 0);
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn interaction_surface_round_trips_and_legacy_binding_is_one_way() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session_with_interaction_surface(
+                "sess-surface",
+                "alpha",
+                "/tmp/proj",
+                Some("zerocode_code"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session("sess-surface")
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("zerocode_code")
+        );
+
+        store
+            .create_session("sess-legacy", "alpha", "/tmp/proj")
+            .unwrap();
+        assert_eq!(
+            store
+                .bind_interaction_surface_if_unset("sess-legacy", "zerocode_code")
+                .unwrap(),
+            "zerocode_code"
+        );
+        assert_eq!(
+            store
+                .bind_interaction_surface_if_unset("sess-legacy", "different_surface")
+                .unwrap(),
+            "zerocode_code",
+            "a later caller must not relabel an already-bound session"
+        );
     }
 
     #[test]

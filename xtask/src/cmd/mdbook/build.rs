@@ -1,5 +1,6 @@
 use crate::cmd::mdbook::refs::{build_api, build_refs};
 use crate::util::*;
+use anyhow::Context as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -41,7 +42,7 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     );
     prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
-    let preprocessor_env = peer_groups_preprocessor_env();
+    let preprocessor_env = mdbook_xtask_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
@@ -53,8 +54,8 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
         if Some(&entry.code) != primary_locale.as_ref() {
             cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
         }
-        if let Some((key, value)) = &preprocessor_env {
-            cmd.env(key, value);
+        if let Some(env) = &preprocessor_env {
+            cmd.envs(env.iter().map(|(key, value)| (key, value)));
         }
         run_cmd(&mut cmd)?;
     }
@@ -248,11 +249,20 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
             if !prefixes.iter().any(|p| rel_str.starts_with(p)) {
                 continue;
             }
-            let file_name = file.file_name().unwrap().to_string_lossy();
+            let file_name = file
+                .file_name()
+                .with_context(|| format!("asset path has no file name: {}", file.display()))?
+                .to_string_lossy();
             if let Some(unhashed_name) = strip_chrome_hash(&file_name) {
-                let dest_rel = rel.parent().unwrap().join(unhashed_name);
+                let dest_rel = rel
+                    .parent()
+                    .with_context(|| format!("asset path has no parent: {}", rel.display()))?
+                    .join(unhashed_name);
                 let dest = shared_dir.join(&dest_rel);
-                std::fs::create_dir_all(dest.parent().unwrap())?;
+                let dest_parent = dest.parent().with_context(|| {
+                    format!("shared asset destination has no parent: {}", dest.display())
+                })?;
+                std::fs::create_dir_all(dest_parent)?;
                 std::fs::copy(&file, &dest)?;
                 let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
                 // Store (locale-relative hashed path, unhashed shared-relative path).

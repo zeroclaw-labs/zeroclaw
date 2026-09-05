@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use reqwest::header::HeaderValue;
 
 use zeroclaw_config::schema::{Config, TtsProviderConfig};
 
@@ -12,6 +13,9 @@ const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
 
 /// Default HTTP request timeout for TTS API calls.
 const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+const GOOGLE_TTS_ENDPOINT: &str = "https://texttospeech.googleapis.com/v1/text:synthesize";
+const GOOGLE_TTS_API_KEY_HEADER: &str = "x-goog-api-key";
 
 /// Maximum time allowed for a local ffmpeg transcode.
 const FFMPEG_TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -208,6 +212,40 @@ impl ElevenLabsTtsProvider {
                 .context("Failed to build HTTP client for ElevenLabs TTS")?,
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("ElevenLabs TTS API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_synthesize_request(&self, text: &str, voice: &str) -> Result<reqwest::RequestBuilder> {
+        if !voice
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("ElevenLabs voice ID contains invalid characters: {voice}");
+        }
+
+        let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
+        let body = serde_json::json!({
+            "text": text,
+            "model_id": self.model_id,
+            "voice_settings": {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+            },
+        });
+        let api_key = self.sensitive_api_key_header()?;
+
+        Ok(self
+            .client
+            .post(&url)
+            .header("xi-api-key", api_key)
+            .json(&body))
+    }
 }
 
 #[async_trait::async_trait]
@@ -222,27 +260,8 @@ impl TtsProvider for ElevenLabsTtsProvider {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        if !voice
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            bail!("ElevenLabs voice ID contains invalid characters: {voice}");
-        }
-        let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
-        let body = serde_json::json!({
-            "text": text,
-            "model_id": self.model_id,
-            "voice_settings": {
-                "stability": self.stability,
-                "similarity_boost": self.similarity_boost,
-            },
-        });
-
         let resp = self
-            .client
-            .post(&url)
-            .header("xi-api-key", &self.api_key)
-            .json(&body)
+            .build_synthesize_request(text, voice)?
             .send()
             .await
             .context("Failed to send ElevenLabs TTS request")?;
@@ -320,6 +339,34 @@ impl GoogleTtsProvider {
                 .context("Failed to build HTTP client for Google TTS")?,
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("Google TTS API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_synthesize_request(&self, text: &str, voice: &str) -> Result<reqwest::RequestBuilder> {
+        let body = serde_json::json!({
+            "input": { "text": text },
+            "voice": {
+                "languageCode": self.language_code,
+                "name": voice,
+            },
+            "audioConfig": {
+                "audioEncoding": "MP3",
+            },
+        });
+        let api_key = self.sensitive_api_key_header()?;
+
+        Ok(self
+            .client
+            .post(GOOGLE_TTS_ENDPOINT)
+            .header(GOOGLE_TTS_API_KEY_HEADER, api_key)
+            .json(&body))
+    }
 }
 
 #[async_trait::async_trait]
@@ -334,23 +381,8 @@ impl TtsProvider for GoogleTtsProvider {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        let url = "https://texttospeech.googleapis.com/v1/text:synthesize";
-        let body = serde_json::json!({
-            "input": { "text": text },
-            "voice": {
-                "languageCode": self.language_code,
-                "name": voice,
-            },
-            "audioConfig": {
-                "audioEncoding": "MP3",
-            },
-        });
-
         let resp = self
-            .client
-            .post(url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
+            .build_synthesize_request(text, voice)?
             .send()
             .await
             .context("Failed to send Google TTS request")?;
@@ -663,14 +695,6 @@ impl EdgeTtsProvider {
             binary_args: Vec::new(),
             timeout: TTS_HTTP_TIMEOUT,
         })
-    }
-
-    /// Test-only constructor that accepts a script path and timeout so tests
-    /// can drive the `edge-tts` subprocess. The production [`new`](Self::new)
-    /// allowlist stays a security boundary; this exists only in Unix test builds.
-    #[cfg(all(test, unix))]
-    fn new_with_binary(alias: &str, binary_path: &str, timeout: std::time::Duration) -> Self {
-        Self::new_with_command(alias, binary_path, &[], timeout)
     }
 
     #[cfg(all(test, unix))]
@@ -1242,6 +1266,14 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn write_edge_tts_fixture(path: &std::path::Path, script: String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
     fn piped_shell_child(script: &str) -> tokio::process::Child {
         use std::process::Stdio;
 
@@ -1334,6 +1366,143 @@ mod tests {
             },
         );
         cfg
+    }
+
+    fn elevenlabs_tts_provider(api_key: &str) -> ElevenLabsTtsProvider {
+        ElevenLabsTtsProvider::new(
+            "test",
+            &TtsProviderConfig {
+                api_key: Some(api_key.to_string()),
+                ..TtsProviderConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn elevenlabs_synthesize_request_preserves_endpoint_body_and_sensitive_header() {
+        let credential = "synthetic-elevenlabs-key";
+        let provider = elevenlabs_tts_provider(credential);
+        let request = provider
+            .build_synthesize_request("hello world", "voice_123")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.elevenlabs.io/v1/text-to-speech/voice_123"
+        );
+
+        let header = request
+            .headers()
+            .get("xi-api-key")
+            .expect("ElevenLabs TTS API key header");
+        assert_eq!(header.to_str().unwrap(), credential);
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("ElevenLabs TTS request body should be bytes");
+        let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "text": "hello world",
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.5,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn elevenlabs_tts_rejects_control_characters_without_echoing_credential() {
+        let credential = "synthetic-elevenlabs-key\r\ninjected: value";
+        let provider = elevenlabs_tts_provider(credential);
+
+        let error = match provider.build_synthesize_request("hello", "voice_123") {
+            Ok(_) => panic!("control characters must be rejected before dispatch"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "ElevenLabs TTS API key contains invalid header characters"
+        );
+        assert!(!error.to_string().contains(credential));
+    }
+
+    fn google_tts_provider(api_key: &str) -> GoogleTtsProvider {
+        GoogleTtsProvider::new(
+            "test",
+            &TtsProviderConfig {
+                api_key: Some(api_key.to_string()),
+                ..TtsProviderConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn google_synthesize_request_preserves_endpoint_body_and_sensitive_header() {
+        let credential = "synthetic-google-tts-key";
+        let provider = google_tts_provider(credential);
+        let request = provider
+            .build_synthesize_request("hello world", "en-US-Standard-A")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(request.url().as_str(), GOOGLE_TTS_ENDPOINT);
+        assert!(!request.url().as_str().contains(credential));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+
+        let header = request
+            .headers()
+            .get(GOOGLE_TTS_API_KEY_HEADER)
+            .expect("Google TTS API key header");
+        assert_eq!(header.to_str().unwrap(), credential);
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("Google TTS request body should be bytes");
+        let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "input": { "text": "hello world" },
+                "voice": {
+                    "languageCode": "en-US",
+                    "name": "en-US-Standard-A",
+                },
+                "audioConfig": {
+                    "audioEncoding": "MP3",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn google_tts_rejects_control_characters_without_echoing_credential() {
+        let credential = "synthetic-google-tts-key\r\ninjected: value";
+        let provider = google_tts_provider(credential);
+        let error = match provider.build_synthesize_request("hello", "en-US-Standard-A") {
+            Ok(_) => panic!("control characters must be rejected before dispatch"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Google TTS API key contains invalid header characters"
+        );
+        assert!(!error.to_string().contains(credential));
     }
 
     fn config_with_piper_alias() -> Config {
@@ -1654,8 +1823,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn edge_tts_removes_temp_output_when_read_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         // Fake `edge-tts`: records the `--write-media` output path, writes an
         // unreadable artifact there, and exits successfully, forcing the
         // output-read failure path.
@@ -1668,11 +1835,10 @@ mod tests {
         ));
         let script = script_path.to_str().unwrap();
         let sidecar = out_path_file.to_str().unwrap();
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 out=\n\
+                "out=\n\
                  prev=\n\
                  for a in \"$@\"; do\n\
                    if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
@@ -1683,12 +1849,13 @@ mod tests {
                  chmod 000 \"$out\"\n\
                  exit 0\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let provider =
-            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_secs(5));
+        );
+        let provider = EdgeTtsProvider::new_with_command(
+            "test",
+            "/bin/sh",
+            &[script],
+            std::time::Duration::from_secs(5),
+        );
         let err = provider
             .synthesize("hello", "en-US-AriaNeural")
             .await
@@ -1777,7 +1944,7 @@ mod tests {
         ));
         let script = script_path.to_str().unwrap();
         let sidecar = out_path_file.to_str().unwrap();
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
                 "out=\n\
@@ -1791,8 +1958,7 @@ mod tests {
                  printf '%s\\n%s\\n' \"$out\" \"$$\" > \"{sidecar}\"\n\
                  while :; do : > \"$out\"; sleep 0.05; done\n"
             ),
-        )
-        .unwrap();
+        );
 
         // Short timeout so the hanging fake binary trips the timeout path fast.
         let provider = EdgeTtsProvider::new_with_command(
@@ -1839,7 +2005,7 @@ mod tests {
         ));
         let script = script_path.to_str().unwrap();
         let sidecar = out_path_file.to_str().unwrap();
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
                 "out=\n\
@@ -1853,8 +2019,7 @@ mod tests {
                  printf '%s\\n%s\\n' \"$out\" \"$$\" > \"{sidecar}\"\n\
                  while :; do : > \"$out\"; sleep 0.05; done\n"
             ),
-        )
-        .unwrap();
+        );
 
         // Generous provider timeout: the abort (not the timeout) must drop the
         // waiting future, and the child needs time to start under test load.
@@ -1927,8 +2092,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn edge_tts_cancellation_cleanup_does_not_block_current_thread_runtime() {
-        use std::os::unix::fs::PermissionsExt;
-
         // A child that ignores SIGTERM for a few seconds then exits on its
         // own, so the artifact's bounded reap is genuinely pending while we
         // probe the runtime. The old `Drop` polled `std::thread::sleep` on the
@@ -1940,25 +2103,22 @@ mod tests {
             temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
         let script = script_path.to_str().unwrap();
         let out = artifact_path.to_str().unwrap();
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 : > \"{out}\"\n\
+                ": > \"{out}\"\n\
                  trap '' TERM\n\
                  sleep 3\n\
                  exit 0\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("current-thread runtime");
         rt.block_on(async {
-            let child = tokio::process::Command::new(script)
+            let child = tokio::process::Command::new("/bin/sh")
+                .arg(script)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true)
@@ -2016,8 +2176,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn edge_tts_cleanup_completes_after_runtime_shutdown() {
-        use std::os::unix::fs::PermissionsExt;
-
         // A child that ignores SIGTERM for a few seconds then exits on its own,
         // so the artifact's bounded reap is genuinely pending when the runtime
         // is torn down. The reaper must finish (reap + remove the temp file)
@@ -2032,26 +2190,23 @@ mod tests {
             temp_dir.join(format!("zeroclaw_edgetts_out_{}.mp3", uuid::Uuid::new_v4()));
         let script = script_path.to_str().unwrap();
         let out = artifact_path.to_str().unwrap();
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 : > \"{out}\"\n\
+                ": > \"{out}\"\n\
                  trap '' TERM\n\
                  sleep 2\n\
                  exit 0\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+        );
         {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("current-thread runtime");
             rt.block_on(async {
-                let child = tokio::process::Command::new(script)
+                let child = tokio::process::Command::new("/bin/sh")
+                    .arg(script)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .kill_on_drop(true)
@@ -2091,8 +2246,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn edge_tts_reaper_confirms_hard_kill_exit_before_removing_artifact() {
-        use std::os::unix::fs::PermissionsExt;
-
         // Force the hard-escalation path of `reap_and_remove`: a child that
         // ignores SIGTERM and would otherwise outlive the default five-second
         // grace. A test-kit `grace` well under the child's lifetime makes the
@@ -2113,18 +2266,14 @@ mod tests {
         // window passes and only the hard kill can end the child. A busy loop
         // keeps the tracked shell itself alive (no orphaned `sleep` to linger
         // after the SIGKILL); the reaper's hard kill is the sole way out.
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 : > \"{out}\"\n\
+                ": > \"{out}\"\n\
                  trap '' TERM\n\
                  while :; do :; done\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+        );
         // Spawn the child inside a current-thread runtime (as synthesis does),
         // then hand it to the detached reaper thread exactly as `Drop` does.
         // The reaper runs its own short grace (well under the child's 30 s
@@ -2135,7 +2284,8 @@ mod tests {
             .build()
             .expect("current-thread runtime");
         let (child, child_pid) = rt.block_on(async {
-            let child = tokio::process::Command::new(script)
+            let child = tokio::process::Command::new("/bin/sh")
+                .arg(script)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -2239,8 +2389,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn edge_tts_descendant_holding_stderr_is_bounded_and_cleaned() {
-        use std::os::unix::fs::PermissionsExt;
-
         // The direct `edge-tts` child exits successfully, but a background
         // descendant keeps the stderr pipe open, so EOF never arrives. The
         // reader join must be bounded (not hang synthesis) and the artifact
@@ -2256,11 +2404,10 @@ mod tests {
         let script = script_path.to_str().unwrap();
         let sidecar = out_path_file.to_str().unwrap();
         let pidfile = pid_file.to_str().unwrap();
-        std::fs::write(
+        write_edge_tts_fixture(
             &script_path,
             format!(
-                "#!/bin/sh\n\
-                 out=\n\
+                "out=\n\
                  prev=\n\
                  for a in \"$@\"; do\n\
                    if [ \"$prev\" = \"--write-media\" ]; then out=\"$a\"; fi\n\
@@ -2272,15 +2419,16 @@ mod tests {
                  echo $! > \"{pidfile}\"\n\
                  exit 0\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+        );
         // The direct child exits immediately; the provider timeout bounds only
         // the post-exit stderr drain that never EOFs. A few seconds leaves room
         // for the child to start under load while keeping the drain bound.
-        let provider =
-            EdgeTtsProvider::new_with_binary("test", script, std::time::Duration::from_secs(2));
+        let provider = EdgeTtsProvider::new_with_command(
+            "test",
+            "/bin/sh",
+            &[script],
+            std::time::Duration::from_secs(2),
+        );
         let bounded = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             provider.synthesize("hello", "en-US-AriaNeural"),

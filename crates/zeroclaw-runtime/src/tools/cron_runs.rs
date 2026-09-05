@@ -10,11 +10,16 @@ const MAX_RUN_OUTPUT_CHARS: usize = 500;
 
 pub struct CronRunsTool {
     config: Arc<Config>,
+    /// Owning agent — run history for another agent's job is not readable.
+    agent_alias: String,
 }
 
 impl CronRunsTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, agent_alias: impl Into<String>) -> Self {
+        Self {
+            config,
+            agent_alias: agent_alias.into(),
+        }
     }
 }
 
@@ -70,12 +75,23 @@ impl Tool for CronRunsTool {
             }
         };
 
+        let job_id = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
+            Ok(job) => job.id,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-        match cron::list_runs(&self.config, job_id, limit) {
+        match cron::list_runs(&self.config, &job_id, limit) {
             Ok(runs) => {
                 let runs: Vec<RunView> = runs
                     .into_iter()
@@ -173,7 +189,7 @@ mod tests {
         )
         .unwrap();
 
-        let tool = CronRunsTool::new(cfg.clone());
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
         let result = tool
             .execute(json!({ "job_id": job.id, "limit": 5 }))
             .await
@@ -187,7 +203,7 @@ mod tests {
     async fn errors_when_job_id_missing() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronRunsTool::new(cfg);
+        let tool = CronRunsTool::new(cfg, TEST_AGENT);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(
@@ -195,6 +211,46 @@ mod tests {
                 .error
                 .unwrap_or_default()
                 .contains("Missing 'job_id'")
+        );
+    }
+
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
+    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            "other-agent",
+            Some("secret_job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cannot_read_another_agents_run_history() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let theirs = other_agents_job(&cfg);
+        let now = chrono::Utc::now();
+        cron::record_run(&cfg, &theirs.id, now, now, "ok", Some("private-output"), 5).unwrap();
+
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
+        let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(
+            !format!("{:?}", result.output).contains("private-output"),
+            "another agent's job output must not leak"
         );
     }
 }

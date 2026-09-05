@@ -52,6 +52,7 @@ const GENERIC_REGISTRY_TERMS: &[&str] = &[
     "Custom",
     "Email",
     "Manifest",
+    "Plugin",
     "Voice Call",
     "Webhook",
 ];
@@ -378,12 +379,18 @@ fn collect_fenced_code_literals(text: &str, literals: &mut Vec<ProtectedLiteral>
         let Some(language) = fence_language else {
             continue;
         };
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
             continue;
         }
 
         match language {
-            FenceLanguage::Toml => collect_toml_literals(trimmed, literals),
+            FenceLanguage::Toml => {
+                let machine_line = trimmed
+                    .strip_prefix('#')
+                    .map(str::trim_start)
+                    .unwrap_or(trimmed);
+                collect_toml_literals(machine_line, literals);
+            }
             FenceLanguage::Yaml => collect_yaml_literals(trimmed, literals),
             FenceLanguage::Json => collect_json_literals(trimmed, literals),
             FenceLanguage::Generic => collect_generic_code_literal(trimmed, literals),
@@ -803,6 +810,7 @@ mod tests {
     #[test]
     fn ignores_generic_registry_terms() {
         assert!(!texts("Command").contains(&"Command".to_string()));
+        assert!(!texts("Plugin").contains(&"Plugin".to_string()));
     }
 
     #[test]
@@ -1062,6 +1070,24 @@ mod tests {
         let literals = texts(source);
         assert!(literals.contains(&"[observability]".to_string()));
         assert!(literals.contains(&"runtime_trace_mode".to_string()));
+    }
+
+    #[test]
+    fn extracts_commented_toml_fence_keys() {
+        let source =
+            "```toml\n[enroll]\n# bind = \"0.0.0.0\" # default\n# port = 9782 # default\n```";
+        let literals = texts(source);
+        assert!(literals.contains(&"bind".to_string()));
+        assert!(literals.contains(&"port".to_string()));
+
+        let translation = "```toml\n[enroll]\n# デフォルト\n# デフォルト\n```";
+        assert_eq!(
+            missing_protected_literal(source, translation),
+            Some(ProtectedLiteral {
+                text: "bind".to_string(),
+                reason: "machine-facing code literal changed",
+            })
+        );
     }
 
     #[test]

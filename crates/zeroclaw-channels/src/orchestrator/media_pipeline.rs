@@ -42,9 +42,23 @@ impl<'a> MediaPipeline<'a> {
             return original_text.to_string();
         }
 
+        let mut text = original_text.to_string();
         let mut annotations = Vec::new();
 
         for attachment in attachments {
+            // Discord can render an image URL when saving the downloaded
+            // bytes fails. The typed envelope still owns those bytes, so
+            // replace exactly one channel-rendered URL marker with the inline
+            // representation this pipeline is about to add. Removing from
+            // the end preserves a sender-authored marker with the same URL in
+            // the message caption.
+            if self.vision_available
+                && self.config.describe_images
+                && let Some(target) = attachment.channel_rendered_remote_image_target()
+            {
+                text = remove_last_channel_image_marker(&text, target);
+            }
+
             // A channel that saved these bytes and rendered a marker for them
             // has already classified this attachment, with more to go on than
             // the pipeline has: the payload, the sender's declared type, and
@@ -104,9 +118,9 @@ impl<'a> MediaPipeline<'a> {
             enriched.push('\n');
         }
 
-        if !original_text.is_empty() {
+        if !text.is_empty() {
             enriched.push('\n');
-            enriched.push_str(original_text);
+            enriched.push_str(&text);
         }
 
         enriched.trim().to_string()
@@ -156,6 +170,18 @@ impl<'a> MediaPipeline<'a> {
     fn process_video(&self, attachment: &MediaAttachment) -> String {
         format!("[Video: {} attached]", attachment.file_name)
     }
+}
+
+fn remove_last_channel_image_marker(text: &str, target: &str) -> String {
+    let marker = format!("[IMAGE:{target}]");
+    let Some(start) = text.rfind(&marker) else {
+        return text.to_string();
+    };
+    let end = start + marker.len();
+    let mut cleaned = String::with_capacity(text.len() - marker.len());
+    cleaned.push_str(&text[..start]);
+    cleaned.push_str(&text[end..]);
+    cleaned
 }
 
 fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
@@ -453,6 +479,46 @@ mod tests {
             !result.contains("IMAGE:data:"),
             "uuid-prefixed save names must still join to their marker: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn discord_remote_image_fallback_replaces_its_channel_marker() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+        let url = "https://cdn.discordapp.com/attachments/1/photo.jpg";
+        let attachment = MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some("image/jpeg".to_string()),
+            marker: Some(RenderedMarker {
+                target: url.to_string(),
+                kind: MarkerKind::Image,
+            }),
+        };
+        let original = format!("caption\n\n[IMAGE:{url}]");
+
+        let result = pipeline.process(&original, &[attachment]).await;
+
+        assert!(
+            !result.contains(url),
+            "the fallback URL must be replaced: {result}"
+        );
+        assert_eq!(
+            result.matches("[IMAGE:data:").count(),
+            1,
+            "the typed bytes must produce one inline image marker: {result}"
+        );
+        assert!(result.contains("caption"));
+    }
+
+    #[test]
+    fn discord_remote_image_fallback_removes_only_the_last_matching_marker() {
+        let url = "https://cdn.discordapp.com/attachments/1/photo.jpg";
+        let original = format!("[IMAGE:{url}] is part of the caption\n\n[IMAGE:{url}]");
+
+        let result = remove_last_channel_image_marker(&original, url);
+
+        assert_eq!(result, format!("[IMAGE:{url}] is part of the caption\n\n"));
     }
 
     #[tokio::test]

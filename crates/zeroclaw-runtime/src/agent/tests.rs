@@ -336,7 +336,9 @@ fn build_agent_with(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(dispatcher)
@@ -353,7 +355,9 @@ fn build_agent_with_memory(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -370,7 +374,9 @@ fn build_agent_with_config(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -1151,7 +1157,9 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 #[tokio::test]
 async fn builder_fails_without_provider() {
     let result = Agent::builder()
-        .tools(vec![])
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -1539,6 +1547,32 @@ fn xml_dispatcher_generates_tool_instructions() {
     assert!(
         !instructions.contains("echo"),
         "dispatcher should not duplicate tool listing"
+    );
+}
+
+/// This builder used to carry an abridged copy of the tool-call
+/// guidance (no `CRITICAL:` line, no worked example) while `loop_`'s builder
+/// carried the full text, so tool-use behavior depended on which builder
+/// produced the prompt. It must now emit the shared block verbatim.
+#[test]
+fn xml_dispatcher_emits_shared_tool_call_guidance() {
+    use crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let instructions = XmlToolDispatcher.prompt_instructions(&tools);
+
+    assert!(
+        instructions.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
+        "dispatcher prompt drifted from the shared tool-call block:\n{instructions}"
+    );
+    assert!(
+        instructions.contains("CRITICAL: Output actual <tool_call> tags"),
+        "dispatcher prompt lost the emit-real-tags directive"
+    );
+    assert!(
+        instructions
+            .contains("You MUST respond with a real call naming one of your available tools"),
+        "dispatcher prompt lost the worked example"
     );
 }
 

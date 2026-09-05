@@ -6,7 +6,7 @@ An agent lists the channels it answers on; see [Agents](../agents/overview.md) f
 
 Channels are implementations of the `Channel` trait in `zeroclaw-api`. Each one is feature-gated at compile time, so a minimal build only includes the channels you want.
 
-The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, Discord, and filesystem. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Standard pre-built binaries add Matrix, Lark, and WhatsApp Web; the Android artifact omits WhatsApp Web for target compatibility. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
+The default ZeroClaw build includes a lean channel bundle: ACP, webhook, email, Telegram, Discord, and filesystem. These cover local/editor sessions, gateway ingress, and common first-run external messaging without compiling every bundled platform integration. Standard distribution artifacts add Git, Matrix, Lark, and WhatsApp Web; the Android artifact omits WhatsApp Web for target compatibility. For source installs that need the historical broad channel set, run `install.sh --source --preset full`, build with `--features channels-full`, or use individual `channel-*` features for selective builds:
 
 <div class="os-tabs-src">
 
@@ -36,7 +36,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
 | Signal | `channel-signal` | [Signal](./signal.md) |
-| Twitch | `channel-twitch` | No dedicated guide |
+| Twitch | `channel-twitch` | [Twitch](./social.md#twitch) |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
 | iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |

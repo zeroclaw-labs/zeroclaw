@@ -8,7 +8,7 @@ With the GitHub provider, ZeroClaw authenticates as a **GitHub App** and replies
 
 With the Gitea/Forgejo provider, ZeroClaw authenticates with a personal access token against the instance's Gitea-compatible API and replies as the token owner.
 
-> **Build note:** the git channel is **not included** in the lean default build. Build with `--features channel-git` (or `channels-full`). The `channel-git` feature pulls in every wired forge provider in one build, so a single binary serves all supported forges; there is no smaller per-provider build subset to select.
+> **Build note:** the Git channel is included in standard distribution artifacts, but not in the lean Cargo default. Custom source builds must add `channel-git`; builds that disable default features must also add `agent-runtime`. The `channel-git` feature pulls in every wired forge provider, so a single binary serves all supported forges; there is no smaller per-provider build subset to select.
 
 ## Who can talk to the agent
 
