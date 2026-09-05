@@ -24,6 +24,10 @@ plugins-wasmtime = [
   "dep:rustls",
   "dep:tokio-rustls",
   "dep:webpki-roots",
+  # The operator's own trust decision. Provider HTTPS already reads the
+  # platform store; plugin egress reading a different set of roots on the same
+  # machine is the divergence this dependency removes.
+  "dep:rustls-native-certs",
 ]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
@@ -61,8 +65,10 @@ http-body-util = { version = "0.1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
 webpki-roots = { version = "1.0.6", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", default-features = false, features = ["io-util", "net"] }
 zeroclaw-config = { path = "../zeroclaw-config" }
