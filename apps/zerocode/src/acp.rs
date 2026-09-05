@@ -22,24 +22,65 @@ impl Acp {
         self.inner.init().await
     }
 
-    pub(crate) fn set_resume_session_id(&mut self, sid: Option<String>) {
-        self.inner.set_resume_session_id(sid);
+    pub(crate) fn set_resume_sessions(&mut self, entries: Vec<chat::ResumeEntry>) {
+        self.inner.set_resume_sessions(entries);
     }
 
-    pub(crate) fn set_resume_agent_alias(&mut self, alias: Option<String>) {
-        self.inner.set_resume_agent_alias(alias);
+    pub(crate) fn resume_entries(&self) -> Vec<chat::ResumeEntry> {
+        self.inner.resume_entries()
     }
 
-    pub(crate) fn current_session_id(&self) -> Option<&str> {
-        self.inner.current_session_id()
+    pub(crate) fn commit_reconnect_handoff(&mut self) {
+        self.inner.commit_reconnect_handoff();
     }
 
-    pub(crate) fn current_agent_alias(&self) -> Option<&str> {
-        self.inner.current_agent_alias()
+    pub(crate) fn session_summaries(&self) -> Vec<chat::SidebarSessionSummary> {
+        self.inner.session_summaries()
+    }
+
+    pub(crate) fn owns_session(&self, session_id: &str) -> bool {
+        self.inner.owns_session(session_id)
+    }
+
+    pub(crate) fn try_install_elicitation(
+        &mut self,
+        request: crate::client::RpcInboundRequest,
+    ) -> chat::ElicitationRouting {
+        self.inner.try_install_elicitation(request)
+    }
+
+    pub(crate) fn note_elicitation_drop(&mut self) {
+        self.inner.note_elicitation_drop();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_session_for_test(&mut self, session_id: &str) {
+        self.inner.activate_session_for_test(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_elicitation_for_test(&self) -> bool {
+        self.inner.has_pending_elicitation_for_test()
+    }
+
+    pub(crate) async fn focus_session(&mut self, session_id: &str) -> bool {
+        self.inner.focus_session(session_id).await
+    }
+
+    pub(crate) async fn add_agent_session(&mut self, agent_alias: &str) {
+        self.inner.add_agent_session(agent_alias).await;
+    }
+
+    pub(crate) async fn close_session(&mut self, session_id: &str) -> bool {
+        self.inner.close_session(session_id).await
     }
 
     pub(crate) async fn refresh_if_inactive(&mut self) {
         self.inner.refresh_if_inactive().await;
+    }
+
+    pub(crate) fn tick_transport_events(&mut self) {
+        self.inner.tick_transport_events();
     }
 
     pub(crate) fn draw(&mut self, frame: &mut ratatui::Frame, area: Rect) {

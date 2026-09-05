@@ -82,6 +82,10 @@ Switch to the **Quickstart** pane:
 
 {{#include ../_snippets/zerocode-pane-nav-keys.md}}
 
+You can also choose **» Quickstart** in the agent sidebar. Pressing **Esc**
+returns to the pane that opened Quickstart, whether you entered from the
+keyboard mode bar, a mode-bar click, or the sidebar launcher.
+
 Inside the pane:
 
 {{#include ../_snippets/zerocode-quickstart-pane-keys.md}}

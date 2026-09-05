@@ -20,6 +20,8 @@ use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionS
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTBOUND_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTBOUND_RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// ONE absolute budget for the entire client-side relay setup: the TCP connect,
 /// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
@@ -113,6 +115,7 @@ pub mod method {
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_STATE: &str = "session/state";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
@@ -235,14 +238,13 @@ pub struct RpcInboundRequest {
     pub params: Value,
 }
 
-/// Buffer capacity for the server-initiated inbound-request broadcast.
+/// Buffer size for the `session/update` notification broadcast.
 ///
-/// These frames are response-bearing (today: `elicitation/create`): a dropped
-/// one parks the daemon's tool call until the session timeout. The buffer is
-/// sized generously so a busy TUI draw loop does not lag the receiver and lose
-/// an elicitation. The Chat pane additionally surfaces a `Lagged` overflow so
-/// the rare drop is diagnosable rather than a silent hang.
-pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+/// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
+/// background sessions live): chunk volume multiplies between draw-loop
+/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
+/// session's status dot in "running" forever.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
 
 // ── Typed session updates ────────────────────────────────────────
 
@@ -303,6 +305,24 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+}
+
+impl SessionUpdate {
+    /// The session this update belongs to. Every variant carries the id;
+    /// multi-session panes route on it before applying the update.
+    pub fn session_id(&self) -> &str {
+        match self {
+            SessionUpdate::AgentMessageChunk { session_id, .. }
+            | SessionUpdate::AgentThoughtChunk { session_id, .. }
+            | SessionUpdate::ToolCall { session_id, .. }
+            | SessionUpdate::ToolResult { session_id, .. }
+            | SessionUpdate::ApprovalRequest { session_id, .. }
+            | SessionUpdate::ContextUsage { session_id, .. }
+            | SessionUpdate::HistoryTrimmed { session_id, .. }
+            | SessionUpdate::TurnComplete { session_id, .. }
+            | SessionUpdate::Plan { session_id, .. } => session_id,
+        }
+    }
 }
 
 /// Wire mirror of the daemon's `TurnCompletionOutcome`. Decoded straight from
@@ -621,7 +641,7 @@ async fn request_initialize(
 fn route_inbound_frame(
     rpc: &Arc<RpcOutbound>,
     notif_tx: &broadcast::Sender<RpcNotification>,
-    inbound_tx: &broadcast::Sender<RpcInboundRequest>,
+    inbound_tx: &mpsc::UnboundedSender<RpcInboundRequest>,
     frame: Value,
 ) {
     let id = frame.get(field::ID).cloned();
@@ -674,11 +694,10 @@ pub struct RpcClient {
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
-    /// Broadcast channel for server-initiated requests that expect a
-    /// response (today: `elicitation/create`). The Chat widget for the
-    /// targeted session subscribes and answers via
-    /// [`RpcClient::respond_to_inbound_request`].
-    inbound_requests_bcast: broadcast::Sender<RpcInboundRequest>,
+    /// Single-consumer queue for server-initiated requests that expect a
+    /// response (today: `elicitation/create`). Keeping the receiver here until
+    /// the app claims it preserves requests that arrive during pane startup.
+    inbound_requests_rx: Mutex<Option<mpsc::UnboundedReceiver<RpcInboundRequest>>>,
     connection_state: Arc<Mutex<ConnectionState>>,
     /// TUI session UID assigned by the daemon during initialize.
     pub tui_id: Option<String>,
@@ -1414,12 +1433,11 @@ impl RpcClient {
             .with_context(|| format!("connecting to {}", socket.display()))?;
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(64);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) =
-            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -1428,15 +1446,22 @@ impl RpcClient {
         let conn_state_for_writer = conn_state.clone();
         let writer_task = tokio::spawn(async move {
             let mut writer = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if let Err(error) = writer.write_all(line.as_bytes()).await {
-                    if let Some(rpc) = rpc_for_writer.upgrade() {
-                        disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(mut line) => {
+                        if !line.ends_with('\n') {
+                            line.push('\n');
+                        }
+                        if let Err(error) = writer.write_all(line.as_bytes()).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
                     }
-                    break;
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
@@ -1530,7 +1555,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -1644,12 +1669,11 @@ impl RpcClient {
 
         let (mut sink, mut stream) = ws_stream.split();
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
-        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(64);
+        let rpc = Arc::new(jsonrpc::RpcOutbound::new_transport(writer_tx));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) =
-            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         let inbound_tx_for_reader = inbound_tx.clone();
 
         let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
@@ -1657,12 +1681,19 @@ impl RpcClient {
         let rpc_for_writer = Arc::downgrade(&rpc);
         let conn_state_for_writer = conn_state.clone();
         let writer_task = tokio::spawn(async move {
-            while let Some(line) = writer_rx.recv().await {
-                if let Err(error) = sink.send(Message::Text(line.into())).await {
-                    if let Some(rpc) = rpc_for_writer.upgrade() {
-                        disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(line) => {
+                        if let Err(error) = sink.send(Message::Text(line.into())).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
                     }
-                    break;
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
@@ -1768,7 +1799,7 @@ impl RpcClient {
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -1860,6 +1891,36 @@ impl RpcClient {
         clone_connection_state(&self.connection_state)
     }
 
+    pub async fn flush_outbound(&self) -> bool {
+        self.flush_outbound_with_timeout(OUTBOUND_FLUSH_TIMEOUT)
+            .await
+    }
+
+    /// Keep a replaced transport alive long enough to drain terminal replies
+    /// that missed the fast handoff deadline, then reclaim all of its tasks.
+    pub fn retire_after_outbound_flush(self: Arc<Self>) {
+        self.retire_after_outbound_flush_with_timeout(OUTBOUND_RETIRE_TIMEOUT);
+    }
+
+    fn retire_after_outbound_flush_with_timeout(self: Arc<Self>, timeout: Duration) {
+        tokio::spawn(async move {
+            let _ = self.flush_outbound_with_timeout(timeout).await;
+            self.shutdown();
+        });
+    }
+
+    async fn flush_outbound_with_timeout(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.rpc.flush_outbound())
+            .await
+            .is_ok_and(|flushed| flushed)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn disconnect_for_test(&self, reason: &str) {
+        disconnect_rpc(&self.rpc, &self.connection_state, reason.to_string());
+    }
+
     // ── Notifications ─────────────────────────────────────────────
 
     /// Get a receiver for server-initiated notifications.
@@ -1867,12 +1928,16 @@ impl RpcClient {
         self.notifications_bcast.subscribe()
     }
 
-    /// Get a receiver for server-initiated JSON-RPC requests that
-    /// expect a response (today: `elicitation/create`). The Chat
-    /// widget subscribes per Code tab, filters by `params.sessionId`,
-    /// surfaces a modal, and answers via [`Self::respond_to_inbound_request`].
-    pub fn subscribe_inbound_requests(&self) -> broadcast::Receiver<RpcInboundRequest> {
-        self.inbound_requests_bcast.subscribe()
+    /// Claim the sole receiver for server-initiated JSON-RPC requests that
+    /// expect a response (today: `elicitation/create`). The app resolves
+    /// `params.sessionId` to the owning pane and answers via
+    /// [`Self::respond_to_inbound_request`].
+    pub fn take_inbound_requests(&self) -> Result<mpsc::UnboundedReceiver<RpcInboundRequest>> {
+        self.inbound_requests_rx
+            .lock()
+            .map_err(|_| anyhow::Error::msg("inbound request receiver mutex poisoned"))?
+            .take()
+            .context("inbound request receiver already claimed")
     }
 
     /// Send a JSON-RPC response back to the daemon for a previously
@@ -1888,6 +1953,18 @@ impl RpcClient {
             anyhow::bail!("writer task closed before response could be sent");
         }
         Ok(())
+    }
+
+    /// Stop accepting server-initiated requests without retiring the writer.
+    /// Router replacement uses this before its final receiver drain so every
+    /// request accepted by the old reader remains answerable on the old
+    /// transport. Full [`Self::shutdown`] follows after those responses have
+    /// been queued.
+    pub async fn quiesce_inbound_reader(&self) {
+        self.read_task.abort();
+        while !self.read_task.is_finished() {
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Ask the daemon to start streaming log events as notifications.
@@ -2336,6 +2413,7 @@ impl RpcClient {
                 "tui_id": tui_id,
                 "exclude_memory": true,
                 "chat_mode": "acp",
+                "keep_siblings": true,
                 "interaction_surface": "zerocode_code",
             }),
         )
@@ -2345,6 +2423,10 @@ impl RpcClient {
     /// Create or rehydrate a session. When `session_id` is `Some`, the daemon
     /// creates the session with that ID, restoring persisted history if it
     /// exists — effectively "attaching" to a prior session.
+    ///
+    /// Always sends `keep_siblings: true`: zerocode tracks every session it
+    /// opens (agent sidebar) and closes them explicitly, so the daemon's
+    /// idle-sibling eviction sweep must not reap the tracked backgrounds.
     pub async fn session_new_with_id(
         &self,
         agent_alias: &str,
@@ -2354,7 +2436,13 @@ impl RpcClient {
         let tui_id = self.tui_id.as_deref();
         self.call(
             method::SESSION_NEW,
-            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd, "session_id": session_id, "tui_id": tui_id }),
+            serde_json::json!({
+                "agent_alias": agent_alias,
+                "cwd": cwd,
+                "session_id": session_id,
+                "tui_id": tui_id,
+                "keep_siblings": true,
+            }),
         )
         .await
     }
@@ -2362,6 +2450,14 @@ impl RpcClient {
     pub async fn session_cancel(&self, session_id: &str) -> Result<SessionCancelResult> {
         self.call(
             method::SESSION_CANCEL,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_state(&self, session_id: &str) -> Result<SessionStateResult> {
+        self.call(
+            method::SESSION_STATE,
             serde_json::json!({ "session_id": session_id }),
         )
         .await
@@ -2408,12 +2504,22 @@ impl RpcClient {
         self.call(method::SESSION_APPROVE, params).await
     }
 
-    pub async fn session_close(&self, session_id: &str) -> Result<Value> {
-        self.call(
+    pub async fn session_close(&self, session_id: &str) -> Result<()> {
+        let request = self.rpc.request(
             method::SESSION_CLOSE,
             serde_json::json!({ "session_id": session_id }),
-        )
-        .await
+        );
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) if error.code == jsonrpc::error_codes::SESSION_NOT_FOUND => Ok(()),
+            Ok(Err(error)) => anyhow::bail!(
+                "RPC {}: {} ({})",
+                method::SESSION_CLOSE,
+                error.message,
+                error.code
+            ),
+            Err(_) => anyhow::bail!("RPC {}: timed out after 5s", method::SESSION_CLOSE),
+        }
     }
 
     pub async fn session_kill(&self, session_id: &str) -> Result<()> {
@@ -2612,6 +2718,8 @@ impl RpcClient {
     // ── Test-only constructors ────────────────────────────────────
 
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
+    /// Broadcast buffers are large enough for scripted notification-routing
+    /// tests to enqueue a burst before the pane drains it.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
         Self::with_rpc_parts(outbound, Transport::Local, None)
@@ -2641,8 +2749,8 @@ impl RpcClient {
         transport: Transport,
         relay_pump: Option<tokio::task::JoinHandle<()>>,
     ) -> Self {
-        let (notif_tx, _) = tokio::sync::broadcast::channel(1);
-        let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
+        let (notif_tx, _) = tokio::sync::broadcast::channel(64);
+        let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             rpc: outbound,
             read_task: tokio::spawn(async {}),
@@ -2652,13 +2760,24 @@ impl RpcClient {
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
             transport,
             commands: Vec::new(),
         }
+    }
+
+    /// Test-only: inject a notification as if the daemon had sent it.
+    /// Subscribers created before this call (e.g. a pane's drain receiver)
+    /// observe it on their next `try_recv`.
+    #[cfg(test)]
+    pub fn push_notification_for_test(&self, method: &str, params: Value) {
+        let _ = self.notifications_bcast.send(RpcNotification {
+            method: method.to_string(),
+            params,
+        });
     }
 
     /// Stop this client's transport and release everything it holds open.
@@ -3892,6 +4011,18 @@ pub struct SessionNewResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionStateResult {
+    pub state: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// `Some(empty)` is an authoritative cleared plan. `None` keeps
+    /// compatibility with older daemons that do not expose plan state.
+    #[serde(default)]
+    pub plan: Option<Vec<crate::wire::PlanEntry>>,
+}
+
 /// Session-scoped overrides mirror of
 /// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
 /// `session/configure`; every field is optional and omitted when `None`.
@@ -4811,6 +4942,35 @@ mod session_method_tests {
     }
 
     #[tokio::test]
+    async fn session_state_sends_session_id_and_returns_lifecycle() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_state("s1").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_state must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/state");
+        assert_eq!(req["params"]["session_id"], "s1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","state":"running"})),
+            None,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_state must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.state, "running");
+    }
+
+    #[tokio::test]
     async fn cron_runs_sends_job_id_and_limit() {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
@@ -4972,8 +5132,8 @@ mod notification_tests {
         Arc<RpcOutbound>,
         broadcast::Sender<RpcNotification>,
         broadcast::Receiver<RpcNotification>,
-        broadcast::Sender<RpcInboundRequest>,
-        broadcast::Receiver<RpcInboundRequest>,
+        mpsc::UnboundedSender<RpcInboundRequest>,
+        mpsc::UnboundedReceiver<RpcInboundRequest>,
         mpsc::Receiver<String>,
     );
 
@@ -4985,7 +5145,7 @@ mod notification_tests {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, notif_rx) = broadcast::channel::<RpcNotification>(16);
-        let (inbound_tx, inbound_rx) = broadcast::channel::<RpcInboundRequest>(16);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         (rpc, notif_tx, notif_rx, inbound_tx, inbound_rx, writer_rx)
     }
 
@@ -5016,6 +5176,137 @@ mod notification_tests {
         assert_eq!(answer["pong"], true);
         assert!(inbound_rx.try_recv().is_err(), "inbound rx must stay empty");
         assert!(notif_rx.try_recv().is_err(), "notif rx must stay empty");
+    }
+
+    #[tokio::test]
+    async fn flush_outbound_waits_for_delayed_writer_before_shutdown() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_by_writer = Arc::clone(&delivered);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(_) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        delivered_by_writer.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        assert!(client.flush_outbound().await);
+        assert!(
+            delivered.load(std::sync::atomic::Ordering::Acquire),
+            "flush must wait for the delayed frame before the writer is retired"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn flush_outbound_times_out_when_writer_is_stalled() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(1);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = RpcClient::with_rpc(rpc);
+
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await,
+            "a stalled writer must not strand reconnect adoption"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_keeps_timed_out_writer_alive_until_terminal_frame_drains() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_writer = Arc::clone(&release);
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_writer = Arc::clone(&delivered);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(_) => {
+                        release_writer.notified().await;
+                        delivered_writer.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+        let client = Arc::new(client);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await
+        );
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_secs(1));
+        tokio::task::yield_now().await;
+        assert!(
+            !client.writer_task.as_ref().unwrap().is_finished(),
+            "a missed fast flush must not abort the writer immediately"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !delivered.load(std::sync::atomic::Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal frame should drain during bounded retirement");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.writer_task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement should reclaim the writer after its flush");
+    }
+
+    #[tokio::test]
+    async fn retirement_reclaims_a_permanently_stalled_writer_after_deadline() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            if matches!(
+                writer_rx.recv().await,
+                Some(jsonrpc::OutboundMessage::Frame(_))
+            ) {
+                let _ = blocked_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+        let client = Arc::new(client);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        blocked_rx.await.expect("writer should stall on the frame");
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_millis(20));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.writer_task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement deadline should reclaim a permanently stalled writer");
     }
 
     async fn assert_disconnect_fails_pending_request(reason: &str) {
@@ -5170,6 +5461,44 @@ mod notification_tests {
         route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
         let req = inbound_rx.try_recv().expect("inbound request routed");
         assert_eq!(req.id, serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn response_bearing_requests_are_lossless_beyond_old_broadcast_capacity() {
+        let (rpc, notif_tx, _notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
+        for index in 0..2048 {
+            route_inbound_frame(
+                &rpc,
+                &notif_tx,
+                &inbound_tx,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "elicitation/create",
+                    "params": { "sessionId": "session-1" }
+                }),
+            );
+        }
+
+        for index in 0..2048 {
+            let request = inbound_rx.try_recv().expect("request retained in order");
+            assert_eq!(request.id, serde_json::json!(index));
+        }
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn response_bearing_request_queue_has_exactly_one_owner() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(writer_tx)));
+
+        let _owner = client
+            .take_inbound_requests()
+            .expect("first app owner claims the receiver");
+        let error = client
+            .take_inbound_requests()
+            .expect_err("a second owner must be rejected");
+        assert!(error.to_string().contains("already claimed"));
     }
 
     fn make_notification(method: &str, params: serde_json::Value) -> RpcNotification {

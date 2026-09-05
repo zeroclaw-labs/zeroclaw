@@ -76,7 +76,7 @@ the operating system:
 | Method | Direction | Description |
 |---|---|---|
 | `initialize` | client -> daemon | Authenticate and negotiate protocol version |
-| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
+| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
 | `session/close` | client -> daemon | Close and clean up a session |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |

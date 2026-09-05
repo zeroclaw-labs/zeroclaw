@@ -388,6 +388,10 @@ rpc_type! {
         pub turn_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub turn_started_at: Option<String>,
+        /// Authoritative live-session TodoWrite plan. Older/persisted
+        /// sessions omit this field because they have no runtime plan owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plan: Option<Vec<zeroclaw_api::plan::PlanEntry>>,
     }
 }
 

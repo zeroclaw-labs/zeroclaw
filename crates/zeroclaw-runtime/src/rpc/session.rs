@@ -74,6 +74,15 @@ pub struct RpcSession {
     pub generation: u64,
 }
 
+/// Canonical live-session data returned when `session/new` reattaches to an
+/// ID that is already present in the process-local session store.
+pub struct ResumedRpcSession {
+    pub agent: Arc<Mutex<Agent>>,
+    pub agent_alias: String,
+    pub workspace_dir: String,
+    pub message_count: usize,
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -203,6 +212,69 @@ impl SessionStore {
         session.generation = generation;
         sessions.insert(id, session);
         Ok(())
+    }
+
+    /// Publish a newly constructed session only when no live incarnation is
+    /// already present. `session/new` uses this at the external boundary so
+    /// two concurrent resume requests cannot replace one another.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        mut session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return Err("session already exists");
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
+        sessions.insert(id, session);
+        Ok(())
+    }
+
+    /// Rebind a caller to the canonical live session without replacing its
+    /// `Agent`. A supplied session ID is a resume selector: when the live
+    /// incarnation already exists, rebuilding it would fork provider history
+    /// from an in-flight predecessor turn.
+    pub async fn resume_existing(
+        &self,
+        id: &str,
+        agent_alias: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        owner_tui_id: Option<String>,
+    ) -> Result<Option<ResumedRpcSession>, &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return Ok(None);
+        };
+        if session.agent_alias != agent_alias {
+            return Err("session belongs to a different agent");
+        }
+        if &session.chat_mode != chat_mode {
+            return Err("session uses a different chat mode");
+        }
+
+        if owner_tui_id.is_some() {
+            session.owner_tui_id = owner_tui_id;
+        }
+        session.last_active = Instant::now();
+        let message_count = session
+            .agent
+            .try_lock()
+            .map(|agent| agent.history().len())
+            .unwrap_or_default();
+        Ok(Some(ResumedRpcSession {
+            agent: Arc::clone(&session.agent),
+            agent_alias: session.agent_alias.clone(),
+            workspace_dir: session.workspace_dir.clone(),
+            message_count,
+        }))
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -408,10 +480,11 @@ impl SessionStore {
     /// box from config, keeping model_provider-build logic out of the store.
     ///
     /// `generation` must match the session's current generation (captured
-    /// before the caller built the provider box). If the session was replaced
-    /// under the same ID — e.g. by `session/new` or ACP rehydration — while
-    /// the provider was being built, the generations won't match and this
-    /// call becomes a no-op (returns `false`).
+    /// before the caller built the provider box). If the session was removed
+    /// and recreated or replaced by ACP rehydration while the provider was
+    /// being built, the generations won't match and this call becomes a no-op
+    /// (returns `false`). Live same-ID `session/new` requests resume the
+    /// existing incarnation.
     ///
     /// When `temperature` is `Some(v)`, the captured agent's temperature is
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
@@ -748,6 +821,17 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(id)
+    }
+
+    /// Generation of the runtime-owned turn currently executing for a
+    /// session. This is the authoritative live-turn identity for RPC status;
+    /// persisted session metadata is not updated on every RPC turn.
+    pub fn inflight_turn_generation(&self, id: &str) -> Option<u64> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .map(|(generation, _)| *generation)
     }
 
     pub async fn kill_session(&self, id: &str) -> bool {
