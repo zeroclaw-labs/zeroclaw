@@ -9112,6 +9112,7 @@ fn build_channel_by_id(
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_passive_group_context(tg.passive_group_context)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
@@ -10394,6 +10395,7 @@ fn collect_configured_channels(
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_passive_group_context(tg.passive_group_context)
                     .with_transcription(config.transcription.clone())
                     .with_agent_transcription_provider(agent_transcription_provider.clone())
                     .with_typed_transcription_providers(
@@ -33401,6 +33403,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
@@ -33430,6 +33433,7 @@ This is an example JSON object for profile settings."#;
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
