@@ -34,7 +34,7 @@ pub async fn process_file_entry(
     use sha2::{Digest, Sha256};
 
     // 1. Resolve bytes + filename + mime_type.
-    let (bytes, filename, mime_type, original_path) = if let Some(ref b64) = entry.data_b64 {
+    let (bytes, filename, original_path) = if let Some(ref b64) = entry.data_b64 {
         let decoded = STANDARD
             .decode(b64)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid base64: {e}")))?;
@@ -49,11 +49,7 @@ pub async fn process_file_entry(
             ));
         }
         let fname = entry.filename.as_deref().unwrap_or("upload").to_string();
-        let mime = entry
-            .mime_type
-            .clone()
-            .unwrap_or_else(|| mime_from_filename(&fname));
-        (decoded, fname, mime, None)
+        (decoded, fname, None)
     } else if let Some(ref path) = entry.path {
         if is_wss {
             return Err(rpc_err(
@@ -82,11 +78,7 @@ pub async fn process_file_entry(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "upload".to_string());
-        let mime = entry
-            .mime_type
-            .clone()
-            .unwrap_or_else(|| mime_from_filename(&fname));
-        (bytes, fname, mime, Some(path.clone()))
+        (bytes, fname, Some(path.clone()))
     } else {
         return Err(rpc_err(
             INVALID_PARAMS,
@@ -130,9 +122,16 @@ pub async fn process_file_entry(
     .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?;
     let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
 
-    let kind = attachment_kind(&mime_type);
+    // IMAGE iff the multimodal loader will actually accept these bytes under
+    // this name — the canonical provider-loadable contract from
+    // `zeroclaw_api::media` — never a declared MIME. A MIME the loader
+    // rejects (image/svg+xml, image/bmp, image/heic) used to earn an
+    // [IMAGE:] marker whose payload the provider path then dropped in
+    // favour of a "could not be loaded" note, stranding the upload.
+    let is_image =
+        zeroclaw_api::media::provider_loadable_image_mime_for(&sanitized, &bytes).is_some();
     let is_clipboard = matches!(entry.source, FileSource::Clipboard);
-    let marker = if kind == "IMAGE" {
+    let marker = if is_image {
         let display_path =
             image_marker_display_path(original_path.as_deref(), &workspace_path, is_clipboard);
         format!("[IMAGE:{display_path}]")
@@ -195,25 +194,6 @@ fn image_marker_display_path<'a>(
     }
 }
 
-/// Derive MIME type from filename extension via `mime_guess`.
-/// Falls back to `application/octet-stream` for unknown extensions.
-fn mime_from_filename(name: &str) -> String {
-    mime_guess::from_path(name)
-        .first_or_octet_stream()
-        .to_string()
-}
-
-/// Map MIME type to attachment kind for markers.
-fn attachment_kind(mime: &str) -> &'static str {
-    if mime.starts_with("image/") {
-        "IMAGE"
-    } else if mime == "application/pdf" {
-        "DOCUMENT"
-    } else {
-        "FILE"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,27 +207,84 @@ mod tests {
             .any(|component| matches!(component, Component::Normal(name) if name == OsStr::new("uploads")))
     }
 
-    #[test]
-    fn mime_from_filename_common_types() {
-        assert_eq!(mime_from_filename("photo.png"), "image/png");
-        assert_eq!(mime_from_filename("photo.jpg"), "image/jpeg");
-        assert_eq!(mime_from_filename("doc.pdf"), "application/pdf");
-        assert_eq!(mime_from_filename("data.csv"), "text/csv");
-        assert_eq!(
-            mime_from_filename("unknown.zzzzz"),
-            "application/octet-stream"
+    #[tokio::test]
+    async fn svg_becomes_a_document_marker_not_an_image() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        // Declared image MIME cannot earn an [IMAGE:] marker: the provider
+        // loader refuses SVG, so promising it to the model strands the file.
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>")),
+            filename: Some("logo.svg".into()),
+            mime_type: Some("image/svg+xml".into()),
+            source: FileSource::File,
+        };
+        let r = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+        assert!(
+            r.marker.starts_with("[Document: logo.svg]"),
+            "expected document marker, got {}",
+            r.marker
         );
-        assert_eq!(mime_from_filename("noext"), "application/octet-stream");
     }
 
-    #[test]
-    fn attachment_kind_maps_correctly() {
-        assert_eq!(attachment_kind("image/png"), "IMAGE");
-        assert_eq!(attachment_kind("image/jpeg"), "IMAGE");
-        assert_eq!(attachment_kind("image/svg+xml"), "IMAGE");
-        assert_eq!(attachment_kind("application/pdf"), "DOCUMENT");
-        assert_eq!(attachment_kind("application/zip"), "FILE");
-        assert_eq!(attachment_kind("text/plain"), "FILE");
+    #[tokio::test]
+    async fn extensionless_png_bytes_are_an_image_by_magic() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        // No filename, no MIME: the payload's magic bytes alone decide.
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n', 0, 0];
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(png)),
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+        let r = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+        assert!(
+            r.marker.starts_with("[IMAGE:"),
+            "expected image marker, got {}",
+            r.marker
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_image_mime_cannot_widen_acceptance() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        // Text bytes under a text name: a lying image/png MIME changes nothing.
+        let entry = FileEntry {
+            path: None,
+            data_b64: Some(STANDARD.encode(b"plain text")),
+            filename: Some("note.txt".into()),
+            mime_type: Some("image/png".into()),
+            source: FileSource::File,
+        };
+        let r = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+        assert!(
+            r.marker.starts_with("[Document: note.txt]"),
+            "expected document marker, got {}",
+            r.marker
+        );
     }
 
     #[test]
