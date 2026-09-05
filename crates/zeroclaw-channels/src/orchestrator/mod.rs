@@ -35680,26 +35680,40 @@ This is an example JSON object for profile settings."#;
             .await
             .expect("first turn must reach the classifier precheck gate");
         // Give B and C time to register, cancel the older turns and settle into
-        // their wait for the cancelled older completions.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        {
-            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
-            assert!(
-                completed.is_empty(),
-                "no turn may complete while the first is still pinned in the precheck, got {completed:?}"
+        // their wait for the cancelled older completions. A worker that waits
+        // only for the NEWEST cancelled turn (B) would let C start processing
+        // while A is still pinned in the cancellation-insensitive precheck — C
+        // would then make a second classifier call and a history call, and the
+        // asserts below would fire. Poll the invariants until a deadline
+        // instead of sleeping a fixed interval: a slow scheduler must neither
+        // flake the test nor hide the regression behind an unmet sleep (the
+        // asserts fail the moment the bug surfaces, and C gets the whole
+        // deadline to reach its wait before A is released).
+        let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+        loop {
+            {
+                let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    completed.is_empty(),
+                    "no turn may complete while the first is still pinned in the precheck, got {completed:?}"
+                );
+            }
+            assert_eq!(
+                provider.history_calls.load(Ordering::SeqCst),
+                0,
+                "no turn may reach the agent loop while the first is still pinned in the precheck"
             );
+            assert_eq!(
+                provider.classifier_calls.load(Ordering::SeqCst),
+                1,
+                "exactly the first turn may enter the (cancellation-insensitive) precheck; \
+                 a later turn entering processing before the first exits is the cascade bug"
+            );
+            if tokio::time::Instant::now() >= settle_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            provider.history_calls.load(Ordering::SeqCst),
-            0,
-            "no turn may reach the agent loop while the first is still pinned in the precheck"
-        );
-        assert_eq!(
-            provider.classifier_calls.load(Ordering::SeqCst),
-            1,
-            "exactly the first turn may enter the (cancellation-insensitive) precheck; \
-             a later turn entering processing before the first exits is the cascade bug"
-        );
         // Release A: it is cancelled, so its agent loop aborts; only then may C
         // start and run to completion.
         release.notify_waiters();
