@@ -249,6 +249,21 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     false
 }
 
+/// The `YYYY-MM-DD` prefix of an RFC3339 timestamp, or `None` when the value
+/// is not shaped like one. Deliberately a prefix check rather than a full
+/// parse: every backend is expected to store RFC3339 (asserted for SQLite in
+/// `sqlite_timestamp_loading_is_rfc3339_round_trippable`), and a backend that
+/// does not should silently render the untagged line rather than surface a
+/// half-parsed date to the model.
+fn recalled_on(timestamp: &str) -> Option<&str> {
+    let date = timestamp.get(..10)?;
+    let ok = date.as_bytes().iter().enumerate().all(|(i, b)| match i {
+        4 | 7 => *b == b'-',
+        _ => b.is_ascii_digit(),
+    });
+    ok.then_some(date)
+}
+
 pub async fn render_memory_context(
     mem: &dyn Memory,
     observer: &dyn Observer,
@@ -359,7 +374,15 @@ pub async fn render_memory_context(
         };
 
         let mut line = String::new();
-        let _ = writeln!(line, "- {}: {}", entry.key, content);
+        // Stamp the recall date. Without it a four-day-old sentence renders
+        // identically to the live user turn it is prepended to, and the model
+        // has no way to tell them apart — an observed cause of stale values
+        // being copied into fresh tool calls. Backends that do not store an
+        // RFC3339 timestamp fall back to the untagged form.
+        let _ = match recalled_on(&entry.timestamp) {
+            Some(date) => writeln!(line, "- [recalled {date}] {}: {}", entry.key, content),
+            None => writeln!(line, "- {}: {}", entry.key, content),
+        };
         let line_chars = line.chars().count();
         if used_chars + line_chars > cfg.max_total_chars {
             break;
@@ -654,6 +677,67 @@ mod tests {
 
     // ── renderer ──────────────────────────────────────────────────────────
 
+    #[test]
+    fn recalled_on_takes_the_date_from_an_rfc3339_timestamp() {
+        assert_eq!(
+            recalled_on("2026-09-01T16:35:55.123456789-04:00"),
+            Some("2026-09-01")
+        );
+        assert_eq!(recalled_on("2026-09-01T00:00:00Z"), Some("2026-09-01"));
+    }
+
+    // A backend that stores something else renders the untagged line rather
+    // than a half-parsed date.
+    #[test]
+    fn recalled_on_rejects_anything_not_shaped_like_a_date() {
+        assert_eq!(recalled_on(""), None);
+        assert_eq!(recalled_on("2026-09-0"), None);
+        assert_eq!(recalled_on("yesterday!!"), None);
+        assert_eq!(recalled_on("2026/09/01T00:00:00Z"), None);
+        assert_eq!(recalled_on("20260901T00:00:00Z"), None);
+    }
+
+    // Multi-byte content must not panic the 10-byte prefix slice.
+    #[test]
+    fn recalled_on_is_safe_on_a_non_ascii_timestamp() {
+        assert_eq!(recalled_on("20261日01T00:00:00Z"), None);
+    }
+
+    #[tokio::test]
+    async fn an_entry_without_a_usable_timestamp_renders_untagged() {
+        let mut e = entry(
+            "user_preference",
+            "prefers concise answers",
+            MemoryCategory::Core,
+            Some(0.9),
+        );
+        e.timestamp = "not-a-timestamp".into();
+        let mem = FixtureMemory::with(vec![e]);
+        let observer = RecordingObserver::default();
+
+        let context = render_memory_context(
+            &mem,
+            &observer,
+            "how should I answer",
+            &[],
+            &MemoryInjectConfig::default(),
+            false,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "t",
+                channel_name: "test",
+            },
+        )
+        .await;
+
+        assert!(
+            context.contains("- user_preference: prefers concise answers"),
+            "unparseable timestamp must fall back to the untagged line, got: {context}"
+        );
+        assert!(!context.contains("[recalled"), "got: {context}");
+    }
+
     #[tokio::test]
     async fn renders_wrapped_block_and_emits_one_recall_event() {
         let mem = FixtureMemory::with(vec![entry(
@@ -681,7 +765,7 @@ mod tests {
         .await;
 
         assert!(context.starts_with(MEMORY_CONTEXT_OPEN));
-        assert!(context.contains("- user_preference: prefers concise answers"));
+        assert!(context.contains("] user_preference: prefers concise answers"));
         assert!(context.ends_with(&format!("{MEMORY_CONTEXT_CLOSE}\n\n")));
         assert_eq!(observer.recalls.lock().as_slice(), &[(1, true)]);
     }
@@ -820,7 +904,7 @@ mod tests {
         .await;
 
         assert!(!context.contains("said hi earlier"));
-        assert!(context.contains("- fact: server is prod-3"));
+        assert!(context.contains("] fact: server is prod-3"));
     }
 
     #[tokio::test]
@@ -862,7 +946,7 @@ mod tests {
         assert!(!context.contains("transcript blob"));
         assert!(!context.contains("[IMAGE:"));
         assert!(!context.contains("<tool_result"));
-        assert!(context.contains("- keeper: real knowledge"));
+        assert!(context.contains("] keeper: real knowledge"));
     }
 
     #[tokio::test]
@@ -895,8 +979,8 @@ mod tests {
         .await;
 
         assert!(!context.contains("barely related"));
-        assert!(context.contains("- high: very related"));
-        assert!(context.contains("- unscored: keyword backend"));
+        assert!(context.contains("] high: very related"));
+        assert!(context.contains("] unscored: keyword backend"));
     }
 
     #[tokio::test]
@@ -928,8 +1012,8 @@ mod tests {
         .await;
 
         // Entry cap: 4 of the 5 render.
-        assert!(context.contains("- d: four"));
-        assert!(!context.contains("- e: five"));
+        assert!(context.contains("] d: four"));
+        assert!(!context.contains("] e: five"));
         // Per-entry cap: the 900-char content is ellipsis-truncated.
         assert!(context.contains("..."));
         assert!(!context.contains(&long));
@@ -965,9 +1049,9 @@ mod tests {
         )
         .await;
 
-        assert!(context.contains("- a: "));
-        assert!(context.contains("- b: "));
-        assert!(!context.contains("- c: "));
+        assert!(context.contains("] a: "));
+        assert!(context.contains("] b: "));
+        assert!(!context.contains("] c: "));
     }
 
     #[tokio::test]
@@ -1007,10 +1091,10 @@ mod tests {
         .await;
 
         // First scope wins the duplicate key; both uniques render; one event.
-        assert!(context.contains("- shared: from history scope"));
+        assert!(context.contains("] shared: from history scope"));
         assert!(!context.contains("from sender scope"));
-        assert!(context.contains("- only_first: h"));
-        assert!(context.contains("- only_sender: s"));
+        assert!(context.contains("] only_first: h"));
+        assert!(context.contains("] only_sender: s"));
         assert_eq!(observer.recalls.lock().as_slice(), &[(3, true)]);
     }
 
@@ -1063,7 +1147,7 @@ mod tests {
         )
         .await;
 
-        assert!(first.contains("- fact: server is prod-3"));
+        assert!(first.contains("] fact: server is prod-3"));
         assert_eq!(
             first, second,
             "direct backend recall must render identically"
@@ -1101,8 +1185,7 @@ mod tests {
     /// cannot distinguish the rerank arm), a Conversation entry, a stale
     /// scored entry old enough for time decay to drop it, and an autosave
     /// key the skip set filters on every arm. Recall order is fixture order.
-    fn golden_corpus() -> Vec<MemoryEntry> {
-        let now = chrono::Utc::now();
+    fn golden_corpus(now: chrono::DateTime<chrono::Utc>) -> Vec<MemoryEntry> {
         vec![
             scored_entry(
                 "alpha",
@@ -1193,38 +1276,47 @@ mod tests {
     // near-duplicate pair renders twice, recall order is preserved). Later
     // pipeline stages re-prove against these.
     const GOLDEN_FULL: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        - chat: user said hello\n\
+        - [recalled {today}] alpha: deploy target is prod-cluster-3\n\
+        - [recalled {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [recalled {today}] beta: team standup moved to 0930\n\
+        - [recalled {today}] chat: user said hello\n\
         [/Memory context]\n\n";
     const GOLDEN_NO_CONVERSATION: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
+        - [recalled {today}] alpha: deploy target is prod-cluster-3\n\
+        - [recalled {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [recalled {today}] beta: team standup moved to 0930\n\
         [/Memory context]\n\n";
-    const GOLDEN_TIGHT_BUDGET: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+    // Entry-count cap: unaffected by the recall stamp.
+    const GOLDEN_TIGHT_ENTRY_BUDGET: &str = "[Memory context]\n\
+        - [recalled {today}] alpha: deploy target is prod-cluster-3\n\
+        - [recalled {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        [/Memory context]\n\n";
+    // Character cap: the recall stamp is charged to `max_total_chars` like any
+    // other part of the line, so a tight budget now fits one entry where it
+    // fitted two. That is the intended trade — an unlabelled entry the model
+    // mistakes for live input is worse than one entry fewer — and this golden
+    // pins the cost.
+    const GOLDEN_TIGHT_CHAR_BUDGET: &str = "[Memory context]\n\
+        - [recalled {today}] alpha: deploy target is prod-cluster-3\n\
         [/Memory context]\n\n";
     // Rerank arm on the same corpus: the blend re-sorts, MMR demotes the
     // near-duplicate to the tail, the trim drops the unscored Conversation
     // entry, and `stale` survives (the blend's recency factor replaces the
     // decay drop). Divergence from the flags-off goldens is the point.
     const GOLDEN_RERANK: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - beta: team standup moved to 0930\n\
-        - stale: quarterly report workflow uses legacy tool\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [recalled {today}] alpha: deploy target is prod-cluster-3\n\
+        - [recalled {today}] beta: team standup moved to 0930\n\
+        - [recalled {stale}] stale: quarterly report workflow uses legacy tool\n\
+        - [recalled {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
         [/Memory context]\n\n";
     // Conversation exclusion is an eligibility boundary, so it runs before
     // duplicate collapse and MMR. Once the ineligible rows are removed, this
     // fixture is below the advanced-strategy threshold and keeps blend order.
     const GOLDEN_RERANK_NO_CONVERSATION: &str = "[Memory context]\n\
-        - alpha: deploy target is prod-cluster-3\n\
-        - alpha_dup: deploy target is prod-cluster-3 for staging\n\
-        - beta: team standup moved to 0930\n\
-        - stale: quarterly report workflow uses legacy tool\n\
+        - [recalled {today}] alpha: deploy target is prod-cluster-3\n\
+        - [recalled {today}] alpha_dup: deploy target is prod-cluster-3 for staging\n\
+        - [recalled {today}] beta: team standup moved to 0930\n\
+        - [recalled {stale}] stale: quarterly report workflow uses legacy tool\n\
         [/Memory context]\n\n";
 
     #[tokio::test]
@@ -1302,7 +1394,7 @@ mod tests {
                     max_entries: 2,
                     ..flags_off
                 },
-                GOLDEN_TIGHT_BUDGET,
+                GOLDEN_TIGHT_ENTRY_BUDGET,
             ),
             (
                 "tight_total_char_budget",
@@ -1313,7 +1405,7 @@ mod tests {
                     max_total_chars: 100,
                     ..flags_off
                 },
-                GOLDEN_TIGHT_BUDGET,
+                GOLDEN_TIGHT_CHAR_BUDGET,
             ),
             (
                 "rerank_on_interactive",
@@ -1333,8 +1425,17 @@ mod tests {
             ),
         ];
 
+        // One clock for the fixture and the expectations, so the recall
+        // stamps cannot straddle a UTC midnight mid-test.
+        let now = chrono::Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let stale = (now - chrono::Duration::days(60))
+            .format("%Y-%m-%d")
+            .to_string();
+
         for (name, origin, has_session, suppress, cfg, want) in cases {
-            let mem = FixtureMemory::with(golden_corpus());
+            let mem = FixtureMemory::with(golden_corpus(now));
+            let want = want.replace("{today}", &today).replace("{stale}", &stale);
             let got = render_for_origin(origin, has_session, suppress, &mem, &cfg).await;
             assert_eq!(got, want, "golden mismatch for case {name}");
         }
@@ -1391,9 +1492,9 @@ mod tests {
             },
         )
         .await;
-        assert!(context.contains("- a: "));
-        assert!(context.contains("- b: "));
-        assert!(context.contains("- c: "));
+        assert!(context.contains("] a: "));
+        assert!(context.contains("] b: "));
+        assert!(context.contains("] c: "));
 
         // Rerank on with a 2-slot trim: MMR demotes the near-duplicate below
         // the unrelated entry and the trim drops it.
@@ -1429,11 +1530,11 @@ mod tests {
             },
         )
         .await;
-        let a_pos = context.find("- a: ").expect("top entry renders");
-        let c_pos = context.find("- c: ").expect("diverse entry renders");
+        let a_pos = context.find("] a: ").expect("top entry renders");
+        let c_pos = context.find("] c: ").expect("diverse entry renders");
         assert!(a_pos < c_pos, "relevance leader stays first");
         assert!(
-            !context.contains("- b: "),
+            !context.contains("] b: "),
             "near-duplicate must be demoted out of the trimmed set"
         );
     }
@@ -1740,7 +1841,7 @@ mod tests {
             !context.contains("channel_history"),
             "ineligible row dropped"
         );
-        assert!(context.contains("- fact_e: epsilon elderberry"));
+        assert!(context.contains("] fact_e: epsilon elderberry"));
     }
 
     /// Composed score-domain regression: current SQLite recall owns BM25
@@ -1818,10 +1919,10 @@ mod tests {
         .await;
 
         let best = context
-            .find("- best_match: ")
+            .find("] best_match: ")
             .expect("the relevance leader survives the configured floor");
         let supporting = context
-            .find("- supporting_match: ")
+            .find("] supporting_match: ")
             .expect("the weaker relevant entry survives the configured floor");
         assert!(best < supporting, "BM25 relevance order survives blending");
     }

@@ -6330,7 +6330,7 @@ mod tests {
         )
         .await;
         assert!(msg.starts_with(zeroclaw_memory::MEMORY_CONTEXT_OPEN));
-        assert!(msg.contains("- remembered: the server is prod-3"));
+        assert!(msg.contains("] remembered: the server is prod-3"));
         assert!(msg.ends_with("what server?"));
         assert_eq!(recalls.len(), 1);
         assert!(recalls[0].1, "recall event must report success");
