@@ -1285,6 +1285,20 @@ impl Chat {
 
     async fn execute_context_menu_request(&mut self, request: ChatContextMenuRequest) {
         match request {
+            ChatContextMenuRequest::AddToChat(target) => {
+                let ChatPhase::Active(ref mut state) = self.phase else {
+                    return;
+                };
+                if target.kind != CopyHitKind::Transcript {
+                    return;
+                }
+                let quote = markdown_quote(&target.text);
+                if !state.input_bar.append_text_at_end(&quote) {
+                    return;
+                }
+                state.clear_transcript_selection();
+                state.mark_dirty_full();
+            }
             ChatContextMenuRequest::CopyTranscript(target) => {
                 let ChatPhase::Active(ref mut state) = self.phase else {
                     return;
@@ -1322,6 +1336,7 @@ impl Chat {
                     crate::mouse::copy_osc52(&text);
                     state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
                 }
+                ChatContextMenuAction::AddToChat => {}
                 ChatContextMenuAction::Edit => {
                     let ChatPhase::Active(ref mut state) = self.phase else {
                         return;
@@ -1860,23 +1875,7 @@ impl Chat {
         // it before selection clearing or input dispatch so Esc cannot leak
         // into the editor and Enter cannot submit a prompt.
         if state.context_menu.is_some() {
-            use crate::keymap::ModalAction;
-            let request = match ModalAction::from_chord(&key) {
-                Some(ModalAction::Up) => {
-                    state.context_menu_select_step(-1);
-                    None
-                }
-                Some(ModalAction::Down) => {
-                    state.context_menu_select_step(1);
-                    None
-                }
-                Some(ModalAction::Confirm) => state.take_context_menu_request(),
-                Some(ModalAction::Cancel) => {
-                    state.dismiss_context_menu();
-                    None
-                }
-                _ => None,
-            };
+            let request = state.handle_context_menu_key(&key);
             if let Some(request) = request {
                 self.execute_context_menu_request(request).await;
             }
@@ -2831,6 +2830,12 @@ impl Chat {
         }
 
         if let ChatPhase::Active(ref mut state) = self.phase {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+                && state.transcript_drag_active
+            {
+                state.finish_transcript_drag();
+            }
+
             // The file explorer renders above every parent overlay.
             if state.input_bar.has_file_explorer() {
                 let consumed = state.input_bar.handle_mouse(mouse);
@@ -3060,7 +3065,12 @@ impl Chat {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
                     MouseEventKind::ScrollDown => state.scroll_down(3),
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(region) = state
+                        if (mouse.modifiers.contains(KM::SHIFT)
+                            || mouse.modifiers.contains(KM::ALT))
+                            && state.transcript_selection.is_some()
+                        {
+                            state.update_transcript_drag(col, row);
+                        } else if let Some(region) = state
                             .copy_hit_regions
                             .iter()
                             .find(|region| {
@@ -3069,24 +3079,21 @@ impl Chat {
                             })
                             .cloned()
                         {
-                            if state.copy_text_and_clear_selection(&region.text) {
+                            if region.action == CopyHitAction::AddToChat {
+                                self.execute_context_menu_request(
+                                    ChatContextMenuRequest::AddToChat(region),
+                                )
+                                .await;
+                            } else if state.copy_text_and_clear_selection(&region.text) {
                                 match region.kind {
-                                    CopyHitKind::Code => {
-                                        state.set_copy_feedback(CopyFeedbackTarget::Code(
-                                            region.group,
-                                        ));
-                                    }
+                                    CopyHitKind::Code => state
+                                        .set_copy_feedback(CopyFeedbackTarget::Code(region.group)),
                                     CopyHitKind::Transcript => {
                                         state.set_overlay_copy_feedback(region.rect);
                                     }
                                     CopyHitKind::Message => {}
                                 }
                             }
-                        } else if (mouse.modifiers.contains(KM::SHIFT)
-                            || mouse.modifiers.contains(KM::ALT))
-                            && state.transcript_selection.is_some()
-                        {
-                            state.update_transcript_drag(col, row);
                         } else {
                             state.clear_mouse_highlight();
                             state.begin_transcript_drag(col, row);
@@ -4342,10 +4349,21 @@ fn context_menu_action_label(action: ChatContextMenuAction) -> String {
     let key = match action {
         ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
         ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
+        ChatContextMenuAction::AddToChat => "zc-chat-context-menu-add-to-chat",
         ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
         ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
     };
     crate::i18n::t(key)
+}
+
+fn markdown_quote(text: &str) -> String {
+    let mut quote = text
+        .split('\n')
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    quote.push('\n');
+    quote
 }
 
 fn should_copy_current_selection(state: &ChatState, key: &KeyEvent) -> bool {
@@ -4441,6 +4459,7 @@ fn copy_region(
         text: text.to_string(),
         kind: CopyHitKind::Code,
         group,
+        action: CopyHitAction::Copy,
     })
 }
 
@@ -4467,6 +4486,7 @@ fn code_context_region(
         text: text.to_string(),
         kind: CopyHitKind::Code,
         group,
+        action: CopyHitAction::Copy,
     })
 }
 
@@ -4487,6 +4507,70 @@ fn centered_message_copy_rect(label: &str, anchor: Rect, body: Rect) -> Option<R
 
     let x = body.x.saturating_add(body.width.saturating_sub(cells) / 2);
     Some(Rect::new(x, row, cells, 1))
+}
+
+fn transcript_action_rects(
+    copy_label: &str,
+    add_to_chat_label: &str,
+    selection: Rect,
+    body: Rect,
+) -> Option<[(Rect, CopyHitAction); 2]> {
+    use unicode_width::UnicodeWidthStr;
+
+    if body.width == 0 || body.height == 0 || selection.height == 0 {
+        return None;
+    }
+    let copy_width = UnicodeWidthStr::width(copy_label) as u16 + 2;
+    let add_to_chat_width = UnicodeWidthStr::width(add_to_chat_label) as u16 + 2;
+    if copy_width < 3 || add_to_chat_width < 3 {
+        return None;
+    }
+
+    let horizontal_width = copy_width
+        .saturating_add(1)
+        .saturating_add(add_to_chat_width);
+    let (button_width, button_height, horizontal) = if horizontal_width <= body.width {
+        (horizontal_width, 3, true)
+    } else {
+        (copy_width.max(add_to_chat_width), 7, false)
+    };
+    if button_width > body.width || button_height > body.height {
+        return None;
+    }
+
+    let below = selection.y.saturating_add(selection.height);
+    let body_bottom = body.y.saturating_add(body.height);
+    let y = if below.saturating_add(button_height) <= body_bottom {
+        below
+    } else if selection.y >= body.y.saturating_add(button_height) {
+        selection.y.saturating_sub(button_height)
+    } else {
+        body_bottom.saturating_sub(button_height)
+    };
+    let x = body
+        .x
+        .saturating_add(body.width.saturating_sub(button_width) / 2);
+
+    if horizontal {
+        let copy_rect = Rect::new(x, y, copy_width, 3);
+        let add_to_chat_rect = Rect::new(
+            x.saturating_add(copy_width).saturating_add(1),
+            y,
+            add_to_chat_width,
+            3,
+        );
+        Some([
+            (copy_rect, CopyHitAction::Copy),
+            (add_to_chat_rect, CopyHitAction::AddToChat),
+        ])
+    } else {
+        let copy_rect = Rect::new(x, y, copy_width, 3);
+        let add_to_chat_rect = Rect::new(x, y.saturating_add(4), add_to_chat_width, 3);
+        Some([
+            (copy_rect, CopyHitAction::Copy),
+            (add_to_chat_rect, CopyHitAction::AddToChat),
+        ])
+    }
 }
 
 fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
@@ -4711,6 +4795,10 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
         .copy_hit_regions
         .retain(|region| region.kind != CopyHitKind::Transcript);
 
+    if state.transcript_drag_active {
+        return;
+    }
+
     let Some(snapshot) = &state.transcript_snapshot else {
         return;
     };
@@ -4723,26 +4811,37 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
     let Some(anchor) = snapshot.selection_anchor_rect(selection) else {
         return;
     };
-    let label = message_copy_label();
-    let Some(rect) = centered_message_copy_rect(&label, anchor, snapshot.area) else {
+    let copy_label = context_menu_action_label(ChatContextMenuAction::Copy);
+    let add_to_chat_label = context_menu_action_label(ChatContextMenuAction::AddToChat);
+    let Some(rects) =
+        transcript_action_rects(&copy_label, &add_to_chat_label, anchor, snapshot.area)
+    else {
         return;
     };
 
-    state.copy_hit_regions.push(CopyHitRegion {
-        rect,
-        text,
-        kind: CopyHitKind::Transcript,
-        group: 0,
-    });
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            label,
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center),
-        rect,
-    );
+    for ((rect, action), label) in rects.into_iter().zip([copy_label, add_to_chat_label]) {
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect,
+            text: text.clone(),
+            kind: CopyHitKind::Transcript,
+            group: 0,
+            action,
+        });
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                theme::accent_style().add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme::accent_style()),
+            ),
+            rect,
+        );
+    }
 }
 
 fn render_message_copy_overlay(f: &mut Frame, state: &ChatState, body: Rect) {
@@ -5756,17 +5855,29 @@ struct CopyHitRegion {
     text: String,
     kind: CopyHitKind,
     group: usize,
+    action: CopyHitAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyHitAction {
+    Copy,
+    AddToChat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatContextMenuAction {
     SendNow,
     Copy,
+    AddToChat,
     Edit,
     Delete,
 }
 
 const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
+const CHARACTER_SELECTION_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::AddToChat,
+    ChatContextMenuAction::Copy,
+];
 const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
     ChatContextMenuAction::SendNow,
     ChatContextMenuAction::Copy,
@@ -5783,6 +5894,9 @@ enum ChatContextMenuTarget {
 impl ChatContextMenuTarget {
     fn actions(&self) -> &'static [ChatContextMenuAction] {
         match self {
+            Self::Transcript(target) if target.kind == CopyHitKind::Transcript => {
+                CHARACTER_SELECTION_CONTEXT_ACTIONS
+            }
             Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
             Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
         }
@@ -5828,6 +5942,7 @@ impl ChatContextMenu {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatContextMenuRequest {
+    AddToChat(CopyHitRegion),
     CopyTranscript(CopyHitRegion),
     Queue {
         id: u64,
@@ -5931,6 +6046,9 @@ pub struct ChatState {
     transcript_snapshot: Option<TranscriptSnapshot>,
     /// Normal-mode character selection within `transcript_snapshot`.
     transcript_selection: Option<TranscriptSelection>,
+    /// Whether the left-button transcript selection gesture is still active.
+    /// Action buttons appear only after mouse-up so they cannot move under the pointer.
+    transcript_drag_active: bool,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable `[Copy]` labels from the last draw.
@@ -6064,6 +6182,7 @@ impl ChatState {
             mouse_down_entry: None,
             transcript_snapshot: None,
             transcript_selection: None,
+            transcript_drag_active: false,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
@@ -6155,6 +6274,7 @@ impl ChatState {
 
     fn clear_transcript_selection(&mut self) {
         self.transcript_selection = None;
+        self.transcript_drag_active = false;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -6180,6 +6300,7 @@ impl ChatState {
             head: point,
             dragged: false,
         });
+        self.transcript_drag_active = true;
         true
     }
 
@@ -6200,10 +6321,12 @@ impl ChatState {
             head,
             dragged: head != anchor,
         });
+        self.transcript_drag_active = true;
         true
     }
 
     fn finish_transcript_drag(&mut self) {
+        self.transcript_drag_active = false;
         if self
             .transcript_selection
             .is_some_and(|selection| !selection.dragged)
@@ -6330,6 +6453,7 @@ impl ChatState {
                     text,
                     kind: CopyHitKind::Transcript,
                     group: 0,
+                    action: CopyHitAction::Copy,
                 })
             }
             None => None,
@@ -6353,6 +6477,7 @@ impl ChatState {
                                 text,
                                 kind: CopyHitKind::Message,
                                 group: *idx,
+                                action: CopyHitAction::Copy,
                             })
                         })
                 })
@@ -6413,12 +6538,38 @@ impl ChatState {
         true
     }
 
+    fn handle_context_menu_key(&mut self, key: &KeyEvent) -> Option<ChatContextMenuRequest> {
+        use crate::keymap::ModalAction;
+
+        match ModalAction::from_chord(key) {
+            Some(ModalAction::Up) => {
+                self.context_menu_select_step(-1);
+                None
+            }
+            Some(ModalAction::Down) => {
+                self.context_menu_select_step(1);
+                None
+            }
+            Some(ModalAction::Confirm) => self.take_context_menu_request(),
+            Some(ModalAction::Cancel) => {
+                self.dismiss_context_menu();
+                None
+            }
+            _ => None,
+        }
+    }
+
     fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
+        let action = self.context_menu.as_ref()?.selected_action()?;
         let menu = self.context_menu.take()?;
-        let action = menu.selected_action()?;
         match (menu.target, action) {
             (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
                 Some(ChatContextMenuRequest::CopyTranscript(target))
+            }
+            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::AddToChat)
+                if target.kind == CopyHitKind::Transcript =>
+            {
+                Some(ChatContextMenuRequest::AddToChat(target))
             }
             (ChatContextMenuTarget::Queue(id), action) => {
                 Some(ChatContextMenuRequest::Queue { id, action })
@@ -6855,6 +7006,7 @@ impl ChatState {
             text,
             kind: CopyHitKind::Message,
             group: idx,
+            action: CopyHitAction::Copy,
         })
     }
 
@@ -7998,6 +8150,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
+        crossterm::style::Print(crate::config_manager::mouse_shift_capture_sequence(false)),
         crossterm::terminal::LeaveAlternateScreen
     );
 
@@ -8011,6 +8164,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
+        crossterm::style::Print(crate::config_manager::mouse_shift_capture_sequence(true)),
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -8593,6 +8747,198 @@ mod tests {
     }
 
     #[test]
+    fn markdown_quote_preserves_empty_and_trailing_lines() {
+        assert_eq!(
+            markdown_quote("first\n\nlast\n"),
+            "> first\n> \n> last\n> \n"
+        );
+    }
+
+    #[test]
+    fn transcript_context_menu_add_to_chat_requires_character_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("hello")));
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(10, 5, 10, 4),
+            &["hello", "", "", ""],
+        ));
+        state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 1, row: 0 },
+            head: CellPoint { column: 3, row: 0 },
+            dragged: true,
+        });
+
+        assert!(state.open_transcript_context_menu(10, 5));
+        assert_eq!(
+            state
+                .context_menu
+                .as_ref()
+                .expect("menu opens")
+                .target
+                .actions(),
+            CHARACTER_SELECTION_CONTEXT_ACTIONS
+        );
+
+        state.dismiss_context_menu();
+        state.clear_transcript_selection();
+        assert!(state.open_transcript_context_menu(10, 5));
+        assert_eq!(
+            state
+                .context_menu
+                .as_ref()
+                .expect("message menu opens")
+                .target
+                .actions(),
+            TRANSCRIPT_CONTEXT_ACTIONS
+        );
+    }
+
+    #[tokio::test]
+    async fn add_to_chat_appends_quote_without_mutating_turn_queue_or_attachments() {
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.input_bar.insert_text("draft");
+        active.input_bar.add_attachment(att("keep.txt"));
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("queued".to_string(), Vec::new())
+            .expect("queue message");
+        active.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 5, row: 0 },
+            dragged: true,
+        });
+        active.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 20, 4),
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "first\n\n世界".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+                action: CopyHitAction::Copy,
+            }),
+            selected: 0,
+        });
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let request = {
+            let ChatPhase::Active(state) = &mut chat.phase else {
+                panic!("expected active chat");
+            };
+            state.handle_context_menu_key(&KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+        };
+        chat.execute_context_menu_request(request.expect("add-to-chat request"))
+            .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.input_bar.input(), "draft\n\n> first\n> \n> 世界\n");
+        assert_eq!(state.input_bar.cursor(), state.input_bar.input().len());
+        assert_eq!(state.input_bar.pending_attachments().len(), 1);
+        assert!(state.context_menu.is_none());
+        assert!(state.transcript_selection.is_none());
+        assert!(state.turn_in_flight);
+        assert_eq!(state.queue_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mouse_add_to_chat_uses_context_menu_action_and_dismisses_after_success() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.input_bar.insert_text("draft");
+        active.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 5, row: 0 },
+            dragged: true,
+        });
+        active.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(4, 4, 20, 4),
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "selected".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+                action: CopyHitAction::Copy,
+            }),
+            selected: 0,
+        });
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.input_bar.input(), "draft\n\n> selected\n");
+        assert!(state.context_menu.is_none());
+        assert!(state.transcript_selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn dismissing_character_selection_menu_preserves_composer_and_selection() {
+        let (mut chat, _rx) = test_chat();
+        let mut active = state();
+        active.input_bar.insert_text("draft");
+        active.input_bar.add_attachment(att("keep.txt"));
+        let selection = TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 5, row: 0 },
+            dragged: true,
+        };
+        active.transcript_selection = Some(selection);
+        active.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 20, 4),
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "selected".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+                action: CopyHitAction::Copy,
+            }),
+            selected: 0,
+        });
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(
+            state
+                .handle_context_menu_key(&KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ))
+                .is_none()
+        );
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.context_menu.is_none());
+        assert_eq!(state.transcript_selection, Some(selection));
+        assert_eq!(state.input_bar.input(), "draft");
+        assert_eq!(state.input_bar.pending_attachments().len(), 1);
+    }
+
+    #[test]
     fn empty_character_selection_never_falls_back_to_another_copy_target() {
         let mut state = state();
         state
@@ -8631,6 +8977,7 @@ mod tests {
             text: "echo hi".to_string(),
             kind: CopyHitKind::Code,
             group: 7,
+            action: CopyHitAction::Copy,
         });
 
         assert!(state.open_transcript_context_menu(2, 2));
@@ -8688,6 +9035,7 @@ mod tests {
                 text: "hello".to_string(),
                 kind: CopyHitKind::Message,
                 group: 0,
+                action: CopyHitAction::Copy,
             }),
             selected: 0,
         });
@@ -8701,6 +9049,35 @@ mod tests {
                 text,
                 ..
             }) if text == "hello"
+        ));
+    }
+
+    #[test]
+    fn add_to_chat_context_menu_request_dismisses_the_menu() {
+        let mut state = state();
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 16, 4),
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
+                rect: Rect::new(0, 0, 5, 1),
+                text: "hello".to_string(),
+                kind: CopyHitKind::Transcript,
+                group: 0,
+                action: CopyHitAction::Copy,
+            }),
+            selected: CHARACTER_SELECTION_CONTEXT_ACTIONS
+                .iter()
+                .position(|action| *action == ChatContextMenuAction::AddToChat)
+                .expect("character selection menu includes Add to Chat"),
+        });
+
+        let request = state
+            .take_context_menu_request()
+            .expect("add-to-chat request");
+
+        assert!(state.context_menu.is_none());
+        assert!(matches!(
+            request,
+            ChatContextMenuRequest::AddToChat(CopyHitRegion { text, .. }) if text == "hello"
         ));
     }
 
@@ -8765,6 +9142,7 @@ mod tests {
             text: "whole message".to_string(),
             kind: CopyHitKind::Message,
             group: 0,
+            action: CopyHitAction::Copy,
         });
         assert!(state.copy_current_selection());
         assert_eq!(state.browse_cursor, None);
@@ -8972,6 +9350,7 @@ mod tests {
                 text: "he".to_string(),
                 kind: CopyHitKind::Transcript,
                 group: 0,
+                action: CopyHitAction::Copy,
             });
             state.copy_feedback = Some(CopyFeedback {
                 target: CopyFeedbackTarget::Overlay(Rect::new(0, 0, 2, 1)),
@@ -9068,26 +9447,55 @@ mod tests {
         let (mut chat, _rx) = test_chat();
         let mut state = state();
         state.transcript_snapshot = Some(transcript_snapshot(
-            Rect::new(1, 1, 20, 1),
-            &["hello               "],
+            Rect::new(1, 1, 40, 8),
+            &["hello                               "],
         ));
         assert!(state.begin_transcript_drag(1, 1));
         assert!(state.update_transcript_drag(2, 1));
-        state.finish_transcript_drag();
 
         let area = Rect::new(0, 0, 80, 20);
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| render_transcript_copy_overlay(frame, &mut state))
+            .expect("draw active selection gesture");
+        assert!(
+            state
+                .copy_hit_regions
+                .iter()
+                .all(|region| region.kind != CopyHitKind::Transcript)
+        );
+
+        state.finish_transcript_drag();
+        terminal
+            .draw(|frame| render_transcript_copy_overlay(frame, &mut state))
             .expect("draw copy action");
-        let region = state
+        let regions = state
             .copy_hit_regions
             .iter()
-            .find(|region| region.kind == CopyHitKind::Transcript)
+            .filter(|region| region.kind == CopyHitKind::Transcript)
             .cloned()
-            .expect("selection exposes transcript copy action");
-        assert_eq!(region.text, "he");
+            .collect::<Vec<_>>();
+        assert_eq!(regions.len(), 2);
+        assert!(regions.iter().all(|region| region.text == "he"));
+        assert!(regions.iter().all(|region| region.rect.height == 3));
+        assert_eq!(
+            terminal.backend().buffer()[(regions[0].rect.x, regions[0].rect.y)].symbol(),
+            "┌"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(regions[0].rect.x + 1, regions[0].rect.y + 1)].symbol(),
+            "C"
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(regions[1].rect.x + 1, regions[1].rect.y + 1)].symbol(),
+            "A"
+        );
+        let region = regions
+            .iter()
+            .find(|region| region.action == CopyHitAction::Copy)
+            .expect("selection exposes transcript copy action")
+            .clone();
         assert_eq!(state.copy_feedback, None);
 
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -9117,6 +9525,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcript_drag_finishes_when_mouse_up_lands_in_queue_sidebar() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(1, 1, 40, 8),
+            &["hello                               "],
+        ));
+        assert!(state.begin_transcript_drag(1, 1));
+        assert!(state.update_transcript_drag(2, 1));
+        state.turn_in_flight = true;
+        state
+            .enqueue_message("queued".to_string(), Vec::new())
+            .expect("queue message");
+        state.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 12));
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 45,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(!state.transcript_drag_active);
+        assert_eq!(state.transcript_selected_text().as_deref(), Some("he"));
+    }
+
+    #[test]
+    fn transcript_action_buttons_place_below_or_above_selection() {
+        let below = transcript_action_rects(
+            "Copy",
+            "Add to Chat",
+            Rect::new(0, 2, 20, 1),
+            Rect::new(0, 0, 40, 10),
+        )
+        .expect("buttons fit");
+        assert_eq!(below[0].0.y, 3);
+        assert_eq!(below[1].0.y, 3);
+        assert_eq!(below[0].1, CopyHitAction::Copy);
+        assert_eq!(below[1].1, CopyHitAction::AddToChat);
+
+        let above = transcript_action_rects(
+            "Copy",
+            "Add to Chat",
+            Rect::new(0, 8, 20, 1),
+            Rect::new(0, 0, 40, 10),
+        )
+        .expect("buttons fit above");
+        assert_eq!(above[0].0.y, 5);
+        assert_eq!(above[1].0.y, 5);
+    }
+
+    #[test]
+    fn transcript_action_buttons_stack_vertically_when_narrow() {
+        let buttons = transcript_action_rects(
+            "Copy",
+            "Add to Chat",
+            Rect::new(0, 0, 14, 1),
+            Rect::new(0, 0, 14, 10),
+        )
+        .expect("stacked buttons fit");
+        assert_eq!(buttons[0].0.y + 4, buttons[1].0.y);
+        assert_eq!(buttons[0].0.x, buttons[1].0.x);
+        assert_eq!(buttons[0].0.height, 3);
+        assert_eq!(buttons[1].0.height, 3);
+    }
+
+    #[tokio::test]
+    async fn transcript_selection_add_to_chat_action_uses_direct_mouse_path() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state.input_bar.insert_text("draft");
+        state.input_bar.add_attachment(att("keep.txt"));
+        state.turn_in_flight = true;
+        state
+            .enqueue_message("queued".to_string(), Vec::new())
+            .expect("queue message");
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(1, 1, 40, 8),
+            &["hello                               "],
+        ));
+        assert!(state.begin_transcript_drag(1, 1));
+        assert!(state.update_transcript_drag(2, 1));
+        state.finish_transcript_drag();
+
+        let area = Rect::new(0, 0, 80, 20);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_transcript_copy_overlay(frame, &mut state))
+            .expect("draw action buttons");
+        let region = state
+            .copy_hit_regions
+            .iter()
+            .find(|region| region.action == CopyHitAction::AddToChat)
+            .expect("selection exposes add-to-chat action")
+            .rect;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: region.x + 1,
+                row: region.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.input_bar.input(), "draft\n\n> he\n");
+        assert_eq!(state.input_bar.cursor(), state.input_bar.input().len());
+        assert_eq!(state.input_bar.pending_attachments().len(), 1);
+        assert!(state.turn_in_flight);
+        assert_eq!(state.queue_len(), 1);
+        assert!(
+            !state.info_message.as_ref().is_some_and(|message| {
+                message.text == crate::i18n::t("zc-chat-copied-clipboard")
+            })
+        );
+        assert!(state.transcript_selection.is_none());
+    }
+
+    #[tokio::test]
     async fn copy_shift_or_option_click_extends_character_selection_from_original_anchor() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -9129,6 +9676,13 @@ mod tests {
         assert!(state.begin_transcript_drag(16, 5));
         assert!(state.update_transcript_drag(19, 5));
         state.finish_transcript_drag();
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(20, 6, 2, 1),
+            text: "button".to_string(),
+            kind: CopyHitKind::Transcript,
+            group: 0,
+            action: CopyHitAction::Copy,
+        });
 
         chat.phase = ChatPhase::Active(Box::new(state));
         for kind in [
@@ -11642,6 +12196,7 @@ mod tests {
             text: "echo hi".to_string(),
             kind: CopyHitKind::Code,
             group: 0,
+            action: CopyHitAction::Copy,
         });
         chat.phase = ChatPhase::Active(Box::new(state));
 
@@ -14027,6 +14582,7 @@ mod tests {
             text: "stale".to_string(),
             kind: CopyHitKind::Message,
             group: 0,
+            action: CopyHitAction::Copy,
         });
         s.copy_feedback = Some(CopyFeedback {
             target: CopyFeedbackTarget::Overlay(Rect::new(1, 1, 8, 1)),

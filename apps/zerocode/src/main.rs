@@ -588,6 +588,7 @@ fn force_restore_terminal() {
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableBracketedPaste,
+            crossterm::style::Print(config_manager::mouse_shift_capture_sequence(false)),
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );

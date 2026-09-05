@@ -1102,6 +1102,24 @@ impl InputBarState {
         self.update_autocomplete();
     }
 
+    /// Append text to the composer without replacing or inserting into the
+    /// user's current draft selection. This is used for transcript context,
+    /// which must preserve the draft and leave the cursor at the end.
+    pub(crate) fn append_text_at_end(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        if !self.input.is_empty() {
+            self.input.push_str("\n\n");
+        }
+        self.input.push_str(text);
+        self.cursor =
+            crate::text_navigation::normalize_grapheme_cursor(&self.input, self.input.len());
+        self.clear_selection();
+        self.dismiss_autocomplete();
+        true
+    }
+
     pub fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
         self.file_explorer.is_none()
             && !self.input.is_empty()
@@ -2631,6 +2649,37 @@ mod tests {
         bar.move_cursor_left();
         bar.insert_text("XX");
         assert_eq!(bar.input(), "helXXlo");
+    }
+
+    #[test]
+    fn append_text_at_end_populates_empty_draft_without_separator() {
+        let mut bar = input_bar_with_shared_commands();
+
+        assert!(bar.append_text_at_end("> selected"));
+        assert_eq!(bar.input(), "> selected");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn append_text_at_end_preserves_draft_selection_attachments_and_unicode_cursor() {
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("draft 世界");
+        bar.move_cursor_left();
+        bar.selection = Some((0, "draft".len()));
+        bar.add_attachment(PendingAttachment {
+            path: PathBuf::from("keep.png"),
+            mime_type: "image/png".to_string(),
+            filename: "keep.png".to_string(),
+            size_bytes: 4,
+            source: crate::attachment::AttachmentSource::File,
+        });
+
+        assert!(bar.append_text_at_end("> 引用\n> \n> é"));
+        assert_eq!(bar.input(), "draft 世界\n\n> 引用\n> \n> é");
+        assert_eq!(bar.cursor(), bar.input().len());
+        assert!(bar.selection.is_none());
+        assert_eq!(bar.pending_attachments().len(), 1);
+        assert_eq!(bar.pending_attachments()[0].filename, "keep.png");
     }
 
     #[test]
