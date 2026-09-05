@@ -3099,6 +3099,12 @@ impl SecurityPolicy {
     }
 
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: Windows spellings such as `nul` are not
+        // canonicalizable paths.
+        if is_null_device(resolved) {
+            return true;
+        }
         // Keep the target in the same filesystem namespace as every policy
         // prefix, even when a caller supplies an absolute but not yet fully
         // resolved spelling. Failure to resolve (for example, a symlink cycle)
@@ -3177,37 +3183,81 @@ impl SecurityPolicy {
         false
     }
 
-    /// Return the canonical allowlisted root directory that authorizes reading
-    /// `resolved`: the workspace first, then read-write roots, then read-only
-    /// roots. Callers bind a directory-handle-scoped open (cap-std beneath/
-    /// no-follow) to this boundary instead of re-walking a pathname that could be
-    /// swapped between the readability check and the open. Returns `None` when no
-    /// bounded allowlist root contains the path (e.g. a fully permissive,
-    /// non-`workspace_only` policy, or a device path) — there is then no
-    /// confinement boundary to bind to. Assumes `resolved` is already canonical
-    /// and has passed [`Self::is_resolved_path_readable`].
-    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
-        let workspace_root = self
-            .workspace_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.workspace_dir.clone());
-        if resolved.starts_with(&workspace_root) {
-            return Some(workspace_root);
-        }
-        for root in self
-            .allowed_roots
-            .iter()
-            .chain(self.allowed_roots_read_only.iter())
-        {
+    fn configured_approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        let mut approved_roots = Vec::new();
+        for root in std::iter::once(&self.workspace_dir).chain(self.allowed_roots.iter()) {
             let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return Some(canonical);
+            if resolved.starts_with(&canonical) && !approved_roots.contains(&canonical) {
+                approved_roots.push(canonical);
             }
         }
-        None
+        if include_read_only {
+            for root in &self.allowed_roots_read_only {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                if resolved.starts_with(&canonical) && !approved_roots.contains(&canonical) {
+                    approved_roots.push(canonical);
+                }
+            }
+        }
+        approved_roots
+    }
+
+    fn approved_roots(&self, resolved: &Path, include_read_only: bool) -> Vec<PathBuf> {
+        // A non-workspace-only policy authorizes paths outside every configured
+        // root (subject to the ordinary forbidden-path checks). It therefore
+        // has no bounded discovery root; callers may continue searching for a
+        // parent-owned resource. The compatibility accessor below retains the
+        // configured-root result for handle-bound file delivery.
+        if !self.workspace_only {
+            return Vec::new();
+        }
+        self.configured_approved_roots(resolved, include_read_only)
+    }
+
+    /// Return every canonical bounded root that authorizes reading `resolved`.
+    ///
+    /// A path can be covered by overlapping grants, such as a workspace nested
+    /// in a broader explicit allowed root. Callers that discover a parent-owned
+    /// resource must consider every applicable boundary; choosing the first one
+    /// would make valid access depend on grant order. Returns an empty vector
+    /// when no bounded allowlist root contains the path (for example, a fully
+    /// permissive non-`workspace_only` policy or a device path). Assumes
+    /// `resolved` is already canonical and has passed
+    /// [`Self::is_resolved_path_readable`].
+    pub fn approved_read_roots(&self, resolved: &Path) -> Vec<PathBuf> {
+        self.approved_roots(resolved, true)
+    }
+
+    /// Return the first canonical configured root that authorizes reading
+    /// `resolved`.
+    ///
+    /// This compatibility accessor intentionally ignores `workspace_only` to
+    /// preserve the existing configured-root contract for handle-bound callers.
+    /// It is not the first value from [`Self::approved_read_roots`];
+    /// parent-resource discovery must use that plural accessor instead.
+    pub fn approved_read_root(&self, resolved: &Path) -> Option<PathBuf> {
+        self.configured_approved_roots(resolved, true)
+            .into_iter()
+            .next()
+    }
+
+    /// Return every canonical bounded root that authorizes writing `resolved`.
+    ///
+    /// This intentionally excludes `allowed_roots_read_only`; callers use it
+    /// when a parent-owned resource may be discovered before a mutation.
+    /// Assumes `resolved` is already canonical and has passed
+    /// [`Self::is_resolved_path_allowed`].
+    pub fn approved_write_roots(&self, resolved: &Path) -> Vec<PathBuf> {
+        self.approved_roots(resolved, false)
     }
 
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
+        // Preserve the unconditional null-device exception before attempting
+        // filesystem resolution: Windows spellings such as `nul` are not
+        // canonicalizable paths.
+        if is_null_device(resolved) {
+            return true;
+        }
         // See `is_resolved_path_readable`: authorization compares the target,
         // allow roots, and forbidden entries only after the same resolution
         // step, and fails closed when no trustworthy target can be produced.
@@ -3215,10 +3265,6 @@ impl SecurityPolicy {
             return false;
         };
         let resolved = resolved_path.as_path();
-
-        if is_null_device(resolved) {
-            return true;
-        }
 
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
@@ -7942,37 +7988,90 @@ mod tests {
     }
 
     #[test]
-    fn approved_read_root_returns_workspace_for_contained_paths() {
+    fn approved_read_roots_returns_every_applicable_boundary() {
         let ws = tempfile::tempdir().unwrap();
         let ws_canon = ws.path().canonicalize().unwrap();
         let policy = SecurityPolicy {
             workspace_dir: ws.path().to_path_buf(),
             ..SecurityPolicy::default()
         };
-        // A path inside the workspace binds to the canonical workspace root.
+        // A path inside the workspace is bounded by its canonical workspace root.
+        assert_eq!(
+            policy.approved_read_roots(&ws_canon.join("sub").join("a.txt")),
+            vec![ws_canon.clone()]
+        );
         assert_eq!(
             policy.approved_read_root(&ws_canon.join("sub").join("a.txt")),
             Some(ws_canon.clone())
         );
-        // A path outside every allowlist has no bounded root.
+        // A path outside every allowlist has no bounded roots.
         let outside = tempfile::tempdir().unwrap();
         let outside_canon = outside.path().canonicalize().unwrap();
-        assert_eq!(policy.approved_read_root(&outside_canon.join("x")), None);
+        assert!(
+            policy
+                .approved_read_roots(&outside_canon.join("x"))
+                .is_empty()
+        );
     }
 
     #[test]
-    fn approved_read_root_honors_read_only_allowlist() {
-        let ws = tempfile::tempdir().unwrap();
-        let ro = tempfile::tempdir().unwrap();
-        let ro_canon = ro.path().canonicalize().unwrap();
+    fn unrestricted_policy_has_no_discovery_boundary_but_preserves_handle_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_canon = workspace.path().canonicalize().unwrap();
         let policy = SecurityPolicy {
-            workspace_dir: ws.path().to_path_buf(),
-            allowed_roots_read_only: vec![ro.path().to_path_buf()],
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: false,
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let path = workspace_canon.join("nested").join("file.txt");
+
+        assert!(policy.approved_read_roots(&path).is_empty());
+        assert!(policy.approved_write_roots(&path).is_empty());
+        assert_eq!(policy.approved_read_root(&path), Some(workspace_canon));
+    }
+
+    #[test]
+    fn approved_read_roots_include_overlapping_readable_grants() {
+        let parent = tempfile::tempdir().unwrap();
+        let nested_workspace = parent.path().join("workspace");
+        std::fs::create_dir(&nested_workspace).unwrap();
+        let parent_canon = parent.path().canonicalize().unwrap();
+        let workspace_canon = nested_workspace.canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: nested_workspace,
+            allowed_roots: vec![parent.path().to_path_buf()],
+            allowed_roots_read_only: vec![parent.path().to_path_buf()],
             ..SecurityPolicy::default()
         };
         assert_eq!(
-            policy.approved_read_root(&ro_canon.join("doc.pdf")),
-            Some(ro_canon.clone())
+            policy.approved_read_roots(&workspace_canon.join("doc.pdf")),
+            vec![workspace_canon, parent_canon]
+        );
+    }
+
+    #[test]
+    fn approved_write_roots_exclude_read_only_parent_grants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let child = parent.path().join("writable-child");
+        std::fs::create_dir(&child).unwrap();
+        let parent_canon = parent.path().canonicalize().unwrap();
+        let child_canon = child.canonicalize().unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![child.clone()],
+            allowed_roots_read_only: vec![parent.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            policy.approved_read_roots(&child_canon.join("file")),
+            vec![child_canon.clone(), parent_canon]
+        );
+        assert_eq!(
+            policy.approved_write_roots(&child_canon.join("file")),
+            vec![child_canon]
         );
     }
 
