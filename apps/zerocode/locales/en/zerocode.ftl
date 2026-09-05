@@ -175,6 +175,7 @@ zc-logs-section-trace = Trace
 zc-logs-section-attribution = Attribution
 zc-logs-section-attributes = Attributes
 zc-logs-preview-only = Full payload unavailable — showing preview fields only.
+zc-logs-persisted-path = Persisted log: { $path }
 zc-logs-no-event-selected = No event selected
 zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply

@@ -199,7 +199,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.4",
+      "version": "0.8.5",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],

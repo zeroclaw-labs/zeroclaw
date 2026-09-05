@@ -12,7 +12,8 @@ if [[ ! -f "$INSTALL_SH" ]]; then
 fi
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+diagnostic_tmp="$(mktemp)"
+trap 'rm -f "$tmp" "$diagnostic_tmp"' EXIT
 
 if ! awk '
   /^detect_target_triple\(\) \{/ { in_func = 1 }
@@ -33,6 +34,16 @@ mock_os=""
 mock_arch=""
 mock_libc="gnu"
 mock_sysctl_arm64="0"
+mock_termux_dir="0"
+TERMUX_VERSION=""
+
+function [ {
+  if [[ "$#" -eq 3 && "$1" == "-d" && "$2" == "/data/data/com.termux" ]]; then
+    [[ "$mock_termux_dir" == "1" ]]
+  else
+    builtin [ "$@"
+  fi
+}
 
 uname() {
   case "${1:-}" in
@@ -69,12 +80,66 @@ assert_triple() {
   mock_arch="$arch"
   mock_libc="$libc"
   mock_sysctl_arm64="$sysctl_arm64"
+  mock_termux_dir="0"
+  TERMUX_VERSION=""
   actual="$(detect_target_triple)"
   if [[ "$actual" == "$expected" ]]; then
     pass=$((pass + 1))
   else
     fail=$((fail + 1))
     failures+=("${os}/${arch}/${libc}/sysctl=${sysctl_arm64}: expected '${expected}', got '${actual}'")
+  fi
+}
+
+assert_termux_triple() {
+  local arch="$1" expected="$2" actual
+  mock_os="Linux"
+  mock_arch="$arch"
+  mock_libc="gnu"
+  mock_sysctl_arm64="0"
+  mock_termux_dir="0"
+  TERMUX_VERSION="0.118"
+  actual="$(detect_target_triple)"
+  if [[ "$actual" == "$expected" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    failures+=("Termux/${arch}: expected '${expected}', got '${actual}'")
+  fi
+}
+
+assert_termux_dir_triple() {
+  local arch="$1" expected="$2" actual
+  mock_os="Linux"
+  mock_arch="$arch"
+  mock_libc="gnu"
+  mock_sysctl_arm64="0"
+  mock_termux_dir="1"
+  TERMUX_VERSION=""
+  actual="$(detect_target_triple)"
+  if [[ "$actual" == "$expected" ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    failures+=("Termux directory/${arch}: expected '${expected}', got '${actual}'")
+  fi
+}
+
+assert_unsupported_termux_arch() {
+  local arch="$1" actual diagnostic
+  mock_os="Linux"
+  mock_arch="$arch"
+  mock_libc="gnu"
+  mock_sysctl_arm64="0"
+  mock_termux_dir="0"
+  TERMUX_VERSION="0.118"
+  actual="$(detect_target_triple 2>"$diagnostic_tmp")"
+  diagnostic=$(<"$diagnostic_tmp")
+  if [[ -z "$actual" && "$diagnostic" == *"Unsupported Android architecture: $arch"* ]]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    failures+=("Termux/${arch}: expected empty target and unsupported-architecture diagnostic, got '${actual}' / '${diagnostic}'")
   fi
 }
 
@@ -92,6 +157,11 @@ assert_triple Linux armv7l gnu 0 armv7-unknown-linux-gnueabihf
 assert_triple Linux armv6l gnu 0 arm-unknown-linux-gnueabihf
 assert_triple Linux armv5l gnu 0 arm-unknown-linux-gnueabihf
 assert_triple Linux ppc gnu 0 ""
+
+assert_termux_triple aarch64 aarch64-linux-android
+assert_termux_triple arm64 aarch64-linux-android
+assert_termux_dir_triple aarch64 aarch64-linux-android
+assert_unsupported_termux_arch x86_64
 
 assert_triple FreeBSD x86_64 gnu 0 ""
 

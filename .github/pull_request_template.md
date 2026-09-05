@@ -90,7 +90,7 @@ Medium/high-risk PRs must fill:
 
 ---
 
-**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and any missing manual labels via the sidebar. The PR path labeler only owns path/scope labels from `.github/labeler.yml`. Contributors without label permission can note obvious label mismatches in a comment. Canonical colon-scoped labels use no-space spelling; during migration, copy exact live label spelling from the GitHub UI.
+**Labels** live in the GitHub label UI, not in the body. The PR path labeler owns path/scope labels from `.github/labeler.yml`, and the PR size labeler owns canonical `size:*` labels. Maintainers and reviewers with label permissions still set `risk:*` and any missing manual labels via the sidebar. Contributors without label permission can note obvious label mismatches in a comment. Canonical colon-scoped labels use no-space spelling; during migration, copy exact live label spelling from the GitHub UI.
 
 **Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
 or `Created with Claude Code` to the PR body or commit-message tail. Human
