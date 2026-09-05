@@ -12,6 +12,7 @@ Use this page when a change touches a schema, CLI flag, feature or hardware inve
 | CLI reference | Clap command tree in `src/main.rs` | `cargo mdbook refs` or `cargo mdbook build`, through `markdown-help` | `docs/book/src/reference/cli.md` | Ignored derived file | CLI reference chapter |
 | Installation paths | Typed route contracts in `xtask/src/generate/spec.rs` and generated behavior bodies in the installer renderers | `cargo generate installers`, through `xtask/src/generate/docs.rs` and `xtask/src/generate/install_sh.rs` | `docs/book/src/_snippets/install.md`, generated Unix command blocks in README and platform guides, generated route and picker-helper regions in `install.sh`, and the Windows prebuilt block in `docs/book/src/setup/windows.md` | Tracked generated surfaces | README-linked first-time setup, executable Unix routes, Quickstart, and platform setup pages |
 | SOP syntax reference | `parse_steps` syntax catalog in `crates/zeroclaw-runtime/src/sop/mod.rs` and `ConditionOp::catalog()` | `cargo generate sop-syntax`, through `xtask/src/generate/sop_syntax.rs` | Marked parser-behavior and condition-operator regions in `docs/book/src/sop/syntax.md` | Tracked generated regions | SOP authoring reference |
+| PR-review CI freshness | Typed `ReviewCiPolicy` in `xtask/src/generate/review_docs.rs` | `cargo generate review-docs` | Marked regions in the PR-review skill, review protocol, contributor guide, and reviewer playbook | Tracked generated zones | Human and agent-assisted PR reviews |
 | Rust API reference | Public Rust items across workspace crates | `cargo doc` inside `cargo mdbook refs` or `cargo mdbook build` | `target/doc/`, copied to `docs/book/book/api/` | Ignored build output | Published API reference |
 | Feature matrix | Channel inventory, model-provider slots, default tools, and `docs/book/feature-matrix-parity.toml` | `xtask/src/cmd/mdbook/feature_matrix.rs` during locale builds | `docs/book/src/_snippets/feature-matrix-*.md` | Ignored derived snippets | Feature comparison pages through `{{#include}}` |
 | Hardware tables | Hardware board registry and tool catalog, transport descriptions in the generator, release workflow targets, and the low-memory threshold in `install.sh` | `xtask/src/cmd/mdbook/hardware.rs` during locale builds | `docs/book/src/_snippets/hardware-*.md` | Ignored derived snippets | Hardware and release-target guides |
@@ -44,7 +45,7 @@ The docs deployment workflow initializes the translation submodule, installs the
 
 ## Tracked and build-only outputs
 
-Tracked files are reviewable inputs or templates: authored Markdown, `locales.toml`, `docs/book/peer-groups.toml`, feature-matrix parity metadata, theme templates, Rust/WIT sources, and workflow definitions. The `docs/book/po` path is a tracked gitlink to the separate translation-catalog repository; its contents and release tags have their own lifecycle.
+Tracked files are reviewable inputs or templates: authored Markdown, `locales.toml`, `docs/book/peer-groups.toml`, feature-matrix parity metadata, theme templates, Rust/WIT sources, and workflow definitions. Tracked generated zones are explicit mixed-source regions: edit their canonical typed policy or registry and regenerate instead of editing between their markers. The `docs/book/po` path is a tracked gitlink to the separate translation-catalog repository; its contents and release tags have their own lifecycle.
 
 Ignored files are reproducible materializations: CLI and config references, most generated snippets, rustdoc, rendered HTML, locale-switcher JavaScript, generated theme CSS, and the dashboard TypeScript API client. They may exist in a working tree after a docs build without belonging in a commit. The tracked installation surfaces are explicit exceptions: `docs/book/src/_snippets/install.md`, generated Unix command blocks in README and platform guides, generated route and picker-helper regions in `install.sh`, and the Windows prebuilt block in `docs/book/src/setup/windows.md`.
 
@@ -58,13 +59,14 @@ Different checks cover different failure classes:
 | --- | --- | --- |
 | Docs quality gate | Changed Markdown passes prose em-dash policy and markdownlint | Ignored references or snippets were regenerated from current code |
 | Added-link gate | New local Markdown links in the compared diff resolve | Existing links, generated links outside the diff, or rendered navigation all work |
+| `cargo generate review-docs --check` | Every tracked PR-review policy zone matches the typed CI-freshness contract | The policy is substantively correct for every future GitHub state |
 | `cargo mdbook check` | PO catalogs parse and pass generated-response, protected-literal, and local-path audits | CLI/config references and ignored snippets match current Rust sources |
 | `cargo mdbook refs` | CLI/config reference Markdown and rustdoc can be generated from current code | Every locale and theme assembles into a complete site |
 | `cargo mdbook build` | Full references, snippets, locale builds, rendered links, and site assembly complete | Ignored outputs are committed or compared by ordinary PR CI |
 | Translation pin workflow | The `docs/book/po` gitlink is initialized and satisfies the catalog-repository pin contract | Catalog coverage is complete or translation quality is acceptable |
 | Docs deployment | The selected ref builds and can be merged into the versioned `gh-pages` layout | A normal source PR regenerated every ignored output before review |
 
-Required PR CI runs the docs quality and added-link gates, but it does not run the full mdBook build for every documentation change. Reviewers should request the narrowest additional evidence that covers the changed generator or rendered boundary instead of assuming green prose checks prove generated output is current.
+Required PR CI runs the docs quality and added-link gates, while the workspace test suite enforces freshness and idempotence for the tracked review-policy zones. It does not run the full mdBook build for every documentation change. Reviewers should request the narrowest additional evidence that covers the changed generator or rendered boundary instead of assuming green prose checks prove generated output is current.
 
 ## Correction rules
 
@@ -72,6 +74,7 @@ Required PR CI runs the docs quality and added-link gates, but it does not run t
 - Fix CLI reference errors in the Clap command definition or Markdown-help generator.
 - Fix stable installation behavior in the typed route contract or its renderer, then run `cargo generate installers`; do not hand-edit the tracked installation snippet.
 - Fix SOP syntax behavior or operator descriptions in the runtime parser catalog, then run `cargo generate sop-syntax`; do not hand-edit the marked lists in the syntax reference.
+- Fix repeated PR-review CI-freshness facts in `xtask/src/generate/review_docs.rs`, then run `cargo generate review-docs`; do not hand-edit the marked review-policy zones.
 - Fix source-backed snippet errors in the owning registry, metadata file, contract, or snippet generator.
 - Fix theme-list drift in `themes.json` or the marked-region generator, not by hand-editing generated buttons.
 - Fix translated content or fallback behavior through the catalog lifecycle, not in rendered locale HTML.
@@ -81,6 +84,7 @@ Required PR CI runs the docs quality and added-link gates, but it does not run t
 ## Source pointers
 
 - mdBook command composition: `xtask/src/cmd/mdbook/`
+- Tracked PR-review policy zones: `xtask/src/generate/review_docs.rs`
 - CLI and config references: `xtask/src/cmd/mdbook/refs.rs`
 - Locale builds and site assembly: `xtask/src/cmd/mdbook/build.rs`
 - mdBook preprocessor configuration: `docs/book/book.toml`

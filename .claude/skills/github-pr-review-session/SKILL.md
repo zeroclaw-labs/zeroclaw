@@ -122,8 +122,11 @@ auto-invoke `pr-architecture-check`.
 Follow `docs/book/src/contributing/pr-review-protocol.md` exactly for every PR.
 
 The protocol specifies:
+<!-- >>> generated:review-fetch-state by `cargo generate review-docs` - do not edit <<< -->
 - **What to fetch** (PR metadata, comments, inline threads, formal reviews,
-  diff, RFCs) — run all fetches in a single parallel batch
+  diff, RFCs, current merge state, base drift against `master`, and required
+  checks) — run all fetches in a single parallel batch
+<!-- >>> end generated:review-fetch-state <<< -->
 - **Which foundations documents to read** based on what the PR touches — the
   relevance table is in the protocol; always read at minimum
   `docs/book/src/foundations/fnd-005-contribution-culture.md`
@@ -135,6 +138,12 @@ The protocol specifies:
 - **Template and public-artifact checks** — run the checks defined in the
   protocol before approving
 - **The verdict decision tree** — which flag to use based on review state
+<!-- >>> generated:review-ci-freshness-summary by `cargo generate review-docs` - do not edit <<< -->
+- **CI freshness and base-drift classification** — current GitHub
+  state and the protocol's precedence rules classify base drift and a
+  post-refresh pending `CI Required Gate` rerun as warnings without
+  hiding current failures, evidence gaps, or conflicts
+<!-- >>> end generated:review-ci-freshness-summary <<< -->
 - **The feedback taxonomy** (🔴 / 🟡 / ✅ / 🔵 / 🟢), including the required
   H3 review-body heading format that starts each formal finding with the
   taxonomy emoji
