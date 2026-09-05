@@ -1228,3 +1228,21 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+# ── Evaluation harness ──
+cli-eval-failed-case-records =   failed-case records: {$dir}/
+cli-eval-flaky-unconfirmed-regression =   flaky (unconfirmed regression): {$id}
+cli-eval-baseline-comparison =   baseline comparison:
+cli-eval-comparison-new = new
+cli-eval-comparison-removed = removed (warn) - in baseline, absent now
+cli-eval-comparison-unverifiable = changed - refresh baseline
+cli-eval-comparison-current-error = RUN ERROR - errored before producing a record
+cli-eval-comparison-improvement = improvement
+cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
+cli-eval-comparison-regression = REGRESSION ({$categories})
+cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
+cli-eval-comparison-unchanged = unchanged
+cli-eval-capability-pass-rate = pass rate {$rate}%
+cli-eval-capability-pass-rate-was = pass rate {$rate}% (was {$baseline_rate}%)
+cli-eval-capability-saturation-warning = {"  "}saturation warning: >=95% - consider graduating to regression/
+cli-eval-unknown-suite-kind = unknown --suite-kind '{$kind}' (expected 'regression' or 'capability')
