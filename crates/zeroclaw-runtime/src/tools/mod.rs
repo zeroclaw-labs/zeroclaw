@@ -1023,10 +1023,11 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider
+    // LLM task tool — registered using the calling agent's provider.
+    // Preserves family + alias identity so alias-specific typed config
+    // (e.g. requires_openai_auth) survives into llm_task execution.
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = family.to_string();
         let llm_task_model = entry
             .model
             .clone()
@@ -1035,7 +1036,9 @@ pub fn all_tools_with_runtime(
             zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            llm_task_provider,
+            config.clone(),
+            family.to_string(),
+            alias.to_string(),
             llm_task_model,
             entry.temperature,
             entry.api_key.clone(),
@@ -4381,6 +4384,119 @@ permissions = ["http_client"]
         assert!(
             names.contains(&"shell"),
             "positive control: the registry must still be populated"
+        );
+    }
+
+    // ── Regression: alias-specific provider config ───────────────────
+
+    /// Regression test: llm_task must preserve alias-specific
+    /// provider configuration so that families with typed alias fields
+    /// (e.g. OpenAI with `requires_openai_auth`) are constructed via the
+    /// alias-aware factory, not the legacy name-only factory.
+    ///
+    /// This test goes through the real `all_tools_with_runtime` registration
+    /// path — the same code that runs in production — then calls `execute()`
+    /// on the resulting `llm_task` tool and checks the error message.
+    ///
+    /// - On old master: `LlmTaskTool` stores only the family name ("openai"),
+    ///   `execute()` uses `create_model_provider_with_options("openai", …)`
+    ///   which passes `config=None, alias="default"` → falls back to
+    ///   `openai_missing_entry_fallback_config()` (requires_openai_auth=false)
+    ///   → creates standard `OpenAiModelProvider` → fails with a generic
+    ///   HTTP/auth error that does NOT mention "openai-codex".
+    ///
+    /// - On fixed branch: `LlmTaskTool` stores config + family + alias,
+    ///   `execute()` uses `create_model_provider_for_alias(&config, "openai",
+    ///   "codex", …)` → finds the typed alias with requires_openai_auth=true
+    ///   → creates `OpenAiCodexModelProvider` → fails at OAuth credential
+    ///   resolution with an error mentioning "openai-codex".
+    #[tokio::test]
+    async fn llm_task_uses_alias_aware_provider_for_alias_config() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, BrowserConfig, Config, HttpRequestConfig, MemoryConfig,
+            ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig, WebFetchConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+
+        // Config: agent "test-agent" with model_provider = "openai.codex",
+        // where codex has requires_openai_auth = true.
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.codex".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &HttpRequestConfig::default(),
+            &WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let llm_task = tools
+            .iter()
+            .find(|t| t.name() == "llm_task")
+            .expect("llm_task must be registered for agent with model_provider");
+
+        let result = llm_task
+            .execute(serde_json::json!({"prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "execute must fail without credentials");
+        let error = result.error.expect("error must be present");
+
+        // The alias-aware factory routes openai.codex (requires_openai_auth=true)
+        // to OpenAiCodexModelProvider, whose credential resolution fails with
+        // an error mentioning "openai-codex".  The legacy factory would create
+        // a standard OpenAI provider whose error does NOT mention "openai-codex".
+        assert!(
+            error.contains("openai-codex"),
+            "llm_task should construct the Codex provider for \
+             openai.codex (requires_openai_auth=true), producing an \
+             openai-codex credential error; got: {error}"
         );
     }
 }
