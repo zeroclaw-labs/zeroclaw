@@ -8235,7 +8235,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), or "bocha" (Bocha AI, requires API key — Chinese-friendly, <https://open.bochaai.com>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (Bocha AI, requires API key — Chinese-friendly, <https://open.bochaai.com>), or "serply" (Serply, Google web results, requires API key, <https://serply.io>)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -8262,6 +8262,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bocha_api_key: Option<String>,
+    /// Serply API key (required if search_provider is `"serply"`). Obtain at <https://serply.io>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub serply_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -8294,6 +8300,7 @@ impl Default for WebSearchConfig {
             tavily_api_key: None,
             jina_api_key: None,
             bocha_api_key: None,
+            serply_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
