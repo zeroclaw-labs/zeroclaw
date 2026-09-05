@@ -12,6 +12,28 @@ use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
+/// Status recorded when the scheduler passes over an occurrence at startup.
+pub const STATUS_SKIPPED: &str = "skipped";
+
+/// Status recorded when a due job cannot be run because no enabled agent owns
+/// it. Distinct from `error`: nothing was attempted.
+pub const STATUS_NO_OWNER: &str = "no_owner";
+
+const SKIPPED_ON_STARTUP: &str = "skipped: catch_up_on_startup disabled";
+
+/// How a job's state advances once the scheduler is done with an occurrence.
+///
+/// A one-shot has no next occurrence, so it is disabled rather than
+/// rescheduled. Every caller that finishes with an occurrence needs this same
+/// decision, whether the job ran, was skipped, or could not be run at all.
+pub(crate) fn completion_action_for(job: &CronJob) -> RunCompletionAction {
+    if matches!(job.schedule, Schedule::At { .. }) {
+        RunCompletionAction::Disable
+    } else {
+        RunCompletionAction::Reschedule
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
     Reschedule,
@@ -781,33 +803,22 @@ pub fn reschedule_after_run_with_status(
     }
 }
 
+/// Advance or disable an overdue job at startup without executing it.
+///
+/// Records the skip on the job the same way a completed run is recorded, so
+/// `cron list` and run history show that an occurrence was passed over. The
+/// recurring branch previously advanced `next_run` and wrote nothing else,
+/// which made a job skipped on every restart indistinguishable from one
+/// running normally.
 pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
-    if matches!(job.schedule, Schedule::At { .. }) {
-        // One-shot job whose scheduled moment has already passed —
-        // disable it so it won't execute late.
-        let bounded_output = truncate_cron_output("skipped — catch_up_on_startup disabled");
-        with_initialized_connection(config, |conn| {
-            conn.execute(
-                "UPDATE cron_jobs
-                 SET enabled = 0, last_run = ?1, last_status = 'skipped', last_output = ?2
-                 WHERE id = ?3",
-                params![now.to_rfc3339(), bounded_output, job.id],
-            )
-            .context("Failed to disable overdue one-shot cron job on startup skip")?;
-            Ok(())
-        })
-    } else {
-        // Recurring job — advance next_run to the next future occurrence.
-        let next_run = next_run_for_schedule(&job.schedule, now)?;
-        with_initialized_connection(config, |conn| {
-            conn.execute(
-                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
-                params![next_run.to_rfc3339(), job.id],
-            )
-            .context("Failed to advance next_run on startup skip")?;
-            Ok(())
-        })
-    }
+    persist_run_completion_state(
+        config,
+        job,
+        now,
+        STATUS_SKIPPED,
+        Some(SKIPPED_ON_STARTUP),
+        completion_action_for(job),
+    )
 }
 
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
@@ -1425,12 +1436,15 @@ pub fn sync_declarative_jobs(
                 // entries that no agent claims are skipped with a warning
                 // rather than silently bound to a magic alias.
                 let Some(agent_alias) = config.agent_for_cron_job(id) else {
+                    // Configured-but-unownable is a config error, not a
+                    // routine skip: the job is never inserted, so it leaves no
+                    // row, no history and no status for anyone to notice later.
                     ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"job_id": id})),
-                        "Skipping declarative cron job: no [agents.<x>].cron_jobs entry claims this id"
+                        "Declarative cron job is not scheduled: no enabled agent lists this id in [agents.<x>].cron_jobs, so it will never run"
                     );
                     continue;
                 };
@@ -2138,6 +2152,25 @@ mod tests {
             1,
             "after release the job is due again until it is rescheduled"
         );
+    }
+
+    #[test]
+    fn skip_missed_run_records_the_skip_on_a_recurring_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        force_due(&config, &job.id);
+        let overdue = get_job(&config, &job.id).unwrap();
+
+        skip_missed_run(&config, &overdue, Utc::now()).unwrap();
+
+        // Advancing next_run without recording anything made a job skipped on
+        // every restart indistinguishable from one running normally.
+        let after = get_job(&config, &job.id).unwrap();
+        assert_eq!(after.last_status.as_deref(), Some(STATUS_SKIPPED));
+        assert!(after.last_run.is_some(), "the skip must be dated");
+        assert!(after.next_run > overdue.next_run, "and still advance");
+        assert!(after.enabled, "a recurring job stays enabled");
     }
 
     #[test]

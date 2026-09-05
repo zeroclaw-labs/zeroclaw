@@ -1,6 +1,6 @@
 use crate::cron::store::{
-    RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
-    persist_run_result,
+    RunCompletionAction, STATUS_NO_OWNER, completion_action_for, persist_manual_run_result,
+    persist_run_completion_state, persist_run_result,
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
@@ -692,6 +692,24 @@ async fn process_due_jobs(
     let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
         let Some(agent_alias) = resolve_owning_agent(config, &job) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
+            // Record the refusal and move the schedule on. Without this the row
+            // stays permanently due: it is re-selected, claimed, warned about
+            // and released on every poll, forever, while `cron list` still
+            // reports it as never having run.
+            let reason = format!(
+                "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
+                id = job.id
+            );
+            if let Err(e) = persist_run_completion_state(
+                config,
+                &job,
+                Utc::now(),
+                STATUS_NO_OWNER,
+                Some(&reason),
+                completion_action_for(&job),
+            ) {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})), "Cron job: failed to record unresolved owner");
+            }
             let _ = release_job(config, &job.id);
             return None;
         };
@@ -939,10 +957,8 @@ async fn persist_job_result(
 
     let action = if is_one_shot_auto_delete(job) && outcome.success {
         RunCompletionAction::Delete
-    } else if matches!(job.schedule, Schedule::At { .. }) {
-        RunCompletionAction::Disable
     } else {
-        RunCompletionAction::Reschedule
+        completion_action_for(job)
     };
 
     let job_state_at = Utc::now();
@@ -3251,6 +3267,39 @@ mod tests {
             cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
             "a skipped orphan job's in-flight lock must be released, not leaked"
         );
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_owning_agent_is_recorded_and_stops_spinning() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo orphan").unwrap();
+        let before = cron::get_job(&config, &job.id).unwrap();
+
+        // Drop the owning agent from config, which is what an operator editing
+        // `[agents]` does. The row keeps its stored alias and nothing claims it.
+        config.agents.remove(TEST_AGENT);
+        assert!(resolve_owning_agent(&config, &before).is_none());
+
+        process_due_jobs(
+            &config,
+            vec![before.clone()],
+            &unique_component("no-owner"),
+            &None,
+        )
+        .await;
+
+        // Previously this wrote nothing at all, so the row stayed permanently
+        // due, was re-claimed on every poll, and `cron list` still showed it as
+        // never having run.
+        let after = cron::get_job(&config, &job.id).expect("the row still exists");
+        assert_eq!(after.last_status.as_deref(), Some(STATUS_NO_OWNER));
+        assert!(after.last_run.is_some(), "the refusal must be dated");
+        // The other half of the fix, that the schedule advances so the row
+        // leaves the due set instead of respinning every poll, needs a genuinely
+        // overdue row and is covered by
+        // `store::tests::skip_missed_run_records_the_skip_on_a_recurring_job`,
+        // which shares the same `persist_run_completion_state` path.
     }
 
     #[tokio::test]

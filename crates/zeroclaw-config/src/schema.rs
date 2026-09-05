@@ -8381,6 +8381,18 @@ pub struct BackupConfig {
     #[serde(default = "default_backup_destination_dir")]
     pub destination_dir: String,
     /// Optional cron expression for scheduled automatic backups.
+    ///
+    /// Setting this alone does not schedule anything. The scheduler synthesizes
+    /// a declarative job with the id `__builtin_backup`, and declarative jobs
+    /// run under an owning agent, so exactly one enabled agent must claim it:
+    ///
+    /// ```toml
+    /// [agents.default]
+    /// cron_jobs = ["__builtin_backup"]
+    /// ```
+    ///
+    /// Without that entry the job is never created, and the only symptom is one
+    /// error at daemon start.
     #[serde(default)]
     pub schedule_cron: Option<String>,
     /// IANA timezone for `schedule_cron`.
