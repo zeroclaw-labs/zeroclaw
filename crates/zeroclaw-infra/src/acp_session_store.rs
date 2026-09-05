@@ -48,6 +48,13 @@ pub enum AcpSessionRestore {
     Restorable(AcpSessionData),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSessionAccess {
+    Owned,
+    Foreign,
+    Missing,
+}
+
 /// Lightweight summary for the ACP session picker. Avoids loading the full
 /// message history just to render a one-line label per session.
 pub struct AcpSessionSummary {
@@ -363,6 +370,115 @@ impl AcpSessionStore {
         }))
     }
 
+    /// Load a durable ACP transcript only when both its UUID and owning agent
+    /// match. Keeping the alias predicate in SQL makes an unknown UUID and a
+    /// UUID owned by another agent indistinguishable to callers.
+    pub fn load_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<Option<AcpSessionData>> {
+        let conn = self.conn.lock();
+
+        let row = conn
+            .query_row(
+                "SELECT id, agent_alias, workspace_dir, token_count, created_at, last_activity
+                 FROM acp_sessions
+                 WHERE session_uuid = ?1 AND agent_alias = ?2",
+                params![session_uuid, agent_alias],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("Failed to query ACP session for agent")?;
+
+        let Some((
+            session_id,
+            owner_alias,
+            workspace_dir,
+            token_count,
+            created_at_s,
+            last_activity_s,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
+        let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
+        let messages = Self::load_messages(&conn, session_id)?;
+
+        Ok(Some(AcpSessionData {
+            session_uuid: session_uuid.to_string(),
+            agent_alias: owner_alias,
+            workspace_dir,
+            token_count: token_count.max(0) as u64,
+            created_at,
+            last_activity,
+            messages,
+        }))
+    }
+
+    /// Classify an exact ACP session key without exposing the foreign owner.
+    /// Callers use `Foreign` and `Missing` to make the same fail-closed response
+    /// while still avoiding an unsafe fallback to another session backend.
+    pub fn classify_session_for_agent(
+        &self,
+        session_uuid: &str,
+        agent_alias: &str,
+    ) -> Result<AcpSessionAccess> {
+        let conn = self.conn.lock();
+        let owner = conn
+            .query_row(
+                "SELECT agent_alias FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("Failed to classify ACP session owner")?;
+        Ok(match owner {
+            Some(owner) if owner == agent_alias => AcpSessionAccess::Owned,
+            Some(_) => AcpSessionAccess::Foreign,
+            None => AcpSessionAccess::Missing,
+        })
+    }
+
+    /// Whether `session_uuid` is a live ACP session owned by `agent_alias`.
+    pub fn is_live_session_for_agent(&self, session_uuid: &str, agent_alias: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM acp_sessions
+                 WHERE session_uuid = ?1 AND agent_alias = ?2 AND killed_at IS NULL
+             )",
+            params![session_uuid, agent_alias],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("Failed to check live ACP session ownership")
+    }
+
+    /// Every durable ACP session key, used only to fail closed when a Chat key
+    /// collides with the separate ACP namespace.
+    pub fn list_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT session_uuid FROM acp_sessions")
+            .context("Failed to prepare ACP session key query")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to query ACP session keys")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read ACP session keys")
+    }
+
     /// Load only durable ACP rows that are allowed to become live sessions.
     /// Killed rows keep their transcript for history/export but are terminal
     /// for runtime restore paths.
@@ -473,6 +589,65 @@ impl AcpSessionStore {
                 last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
                 session_uuid,
                 agent_alias,
+                workspace_dir,
+                token_count: token_count.max(0) as u64,
+                message_count: msg_count.max(0) as usize,
+            });
+        }
+        Ok(out)
+    }
+
+    /// List live ACP sessions owned by `agent_alias`, ordered by most recent
+    /// activity. Killed rows remain available to export through
+    /// `list_sessions_by_agent`, but are not live sessions for agent-facing
+    /// session tools.
+    pub fn list_live_sessions_by_agent(&self, agent_alias: &str) -> Result<Vec<AcpSessionSummary>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.session_uuid,
+                        s.agent_alias,
+                        s.workspace_dir,
+                        s.token_count,
+                        s.created_at,
+                        s.last_activity,
+                        (SELECT COUNT(*) FROM acp_messages m WHERE m.session_id = s.id) AS message_count
+                 FROM acp_sessions s
+                 WHERE s.agent_alias = ?1 AND s.killed_at IS NULL
+                 ORDER BY s.last_activity DESC",
+            )
+            .context("Failed to prepare live ACP session query for agent")?;
+
+        let rows = stmt
+            .query_map(params![agent_alias], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .context("Failed to query live ACP sessions for agent")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                session_uuid,
+                owner_alias,
+                workspace_dir,
+                token_count,
+                created_s,
+                activity_s,
+                msg_count,
+            ) = row.context("Failed to read live ACP session row")?;
+            out.push(AcpSessionSummary {
+                created_at: parse_ts(&created_s, "created_at", &session_uuid),
+                last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
+                session_uuid,
+                agent_alias: owner_alias,
                 workspace_dir,
                 token_count: token_count.max(0) as u64,
                 message_count: msg_count.max(0) as usize,
@@ -1553,6 +1728,135 @@ mod tests {
         let list = store.list_sessions().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].session_uuid, "sess-live");
+    }
+
+    #[test]
+    fn list_live_sessions_by_agent_filters_owner_and_killed_rows() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("alpha-old", "alpha", "/ws/old")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .create_session("alpha-new", "alpha", "/ws/new")
+            .unwrap();
+        store
+            .append_turn(
+                "alpha-new",
+                &[ConversationMessage::Chat(ChatMessage::user("hello"))],
+            )
+            .unwrap();
+        store
+            .create_session("alpha-killed", "alpha", "/ws/killed")
+            .unwrap();
+        store.mark_session_killed("alpha-killed").unwrap();
+        store
+            .create_session("beta-live", "beta", "/ws/beta")
+            .unwrap();
+
+        let list = store.list_live_sessions_by_agent("alpha").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].session_uuid, "alpha-new");
+        assert_eq!(list[0].message_count, 1);
+        assert_eq!(list[1].session_uuid, "alpha-old");
+        assert!(list.iter().all(|summary| summary.agent_alias == "alpha"));
+        assert!(
+            store
+                .list_live_sessions_by_agent("missing")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn load_session_for_agent_authorizes_uuid_and_preserves_projection() {
+        let (_tmp, store) = open_store();
+        store.create_session("owned", "alpha", "/ws/alpha").unwrap();
+        store
+            .append_turn(
+                "owned",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("hello")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("calling".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: Some("thinking".into()),
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "done".into(),
+                        tool_name: String::new(),
+                    }]),
+                ],
+            )
+            .unwrap();
+
+        let data = store
+            .load_session_for_agent("owned", "alpha")
+            .unwrap()
+            .expect("matching owner should load");
+        assert_eq!(data.agent_alias, "alpha");
+        assert_eq!(data.messages.len(), 3);
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(message)
+                if message.role == "user" && message.content == "hello"
+        ));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::AssistantToolCalls {
+                text: Some(text),
+                tool_calls,
+                reasoning_content: Some(reasoning),
+            }
+                if text == "calling"
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "tc-1"
+                    && reasoning == "thinking"
+        ));
+        assert!(matches!(
+            &data.messages[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "tc-1"
+                    && results[0].content == "done"
+        ));
+
+        // SQL-level authorization deliberately gives the same result for a
+        // foreign owner and a UUID that does not exist.
+        assert!(
+            store
+                .load_session_for_agent("owned", "beta")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_session_for_agent("unknown", "alpha")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.classify_session_for_agent("owned", "alpha").unwrap(),
+            AcpSessionAccess::Owned
+        );
+        assert_eq!(
+            store.classify_session_for_agent("owned", "beta").unwrap(),
+            AcpSessionAccess::Foreign
+        );
+        assert_eq!(
+            store
+                .classify_session_for_agent("unknown", "alpha")
+                .unwrap(),
+            AcpSessionAccess::Missing
+        );
+        assert!(store.is_live_session_for_agent("owned", "alpha").unwrap());
+        assert_eq!(store.list_session_ids().unwrap(), vec!["owned"]);
     }
 
     #[test]

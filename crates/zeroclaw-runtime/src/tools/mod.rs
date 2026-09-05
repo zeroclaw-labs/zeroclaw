@@ -109,8 +109,8 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
+    SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -805,7 +805,7 @@ pub(crate) fn plugin_host_services(
     zeroclaw_plugins::services::PluginHostServices::new(config)
 }
 
-/// Create full tool registry including memory tools and optional Composio.
+/// Create the full tool registry without an ACP session read view.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
@@ -832,10 +832,66 @@ pub fn all_tools_with_runtime(
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+) -> AllToolsResult {
+    all_tools_with_runtime_and_acp_sessions(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+    )
+}
+
+/// Create the full tool registry with an optional ACP session read view.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_acp_sessions(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
     // Live config handle for `send_via` peer-group authority. `Some` from the
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    acp_sessions: Option<AcpSessionReadView>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1444,13 +1500,34 @@ pub fn all_tools_with_runtime(
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
-        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsHistoryTool::new(
-            backend.clone(),
-            security.clone(),
-        )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        if let Some(acp_sessions) = acp_sessions {
+            tool_arcs.push(Arc::new(SessionsCurrentTool::with_acp_sessions(
+                backend.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsListTool::with_acp_sessions(
+                backend.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsHistoryTool::with_acp_sessions(
+                backend.clone(),
+                security.clone(),
+                acp_sessions.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsSendTool::with_acp_sessions(
+                backend,
+                security.clone(),
+                acp_sessions,
+            )));
+        } else {
+            tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
+            tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
+            tool_arcs.push(Arc::new(SessionsHistoryTool::new(
+                backend.clone(),
+                security.clone(),
+            )));
+            tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        }
     }
 
     // LinkedIn integration (config-gated)
