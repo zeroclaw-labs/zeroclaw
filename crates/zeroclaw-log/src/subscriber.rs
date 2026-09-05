@@ -559,6 +559,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(256);
         crate::broadcast::set_broadcast_hook(tx);
 
+        crate::writer::record_event(crate::event::LogEvent::new(
+            crate::event::Severity::Info,
+            "migration-test",
+            crate::event::EventCategory::Internal,
+        ));
+
         // Real entry point: installs the capture layer *and* the bridge.
         crate::try_install_capture_subscriber();
 
