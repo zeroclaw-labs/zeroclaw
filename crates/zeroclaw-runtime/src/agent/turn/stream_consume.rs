@@ -334,9 +334,10 @@ pub(crate) async fn consume_provider_streaming_response(
                 {
                     let _ = tx.send(StreamDelta::Reasoning(delta.clone())).await;
                 }
-                if let Some(tx) = event_tx {
+                if let Some(tx) = event_tx
+                    && tx.send(TurnEvent::Thinking { delta }).await.is_ok()
+                {
                     visible_event_output = true;
-                    let _ = tx.send(TurnEvent::Thinking { delta }).await;
                 }
             }
             // Durable replay-only finalized reasoning: appended to
@@ -828,7 +829,7 @@ mod tests {
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
             Box::pin(futures_util::stream::iter(vec![
-                Ok(StreamEvent::TextDelta(StreamChunk::reasoning("internal"))),
+                Ok(StreamEvent::ThinkingDelta("internal".to_string())),
                 Ok(StreamEvent::Final),
             ]))
         }
@@ -1231,6 +1232,34 @@ mod tests {
             event_rx.recv().await,
             Some(TurnEvent::Thinking { delta }) if delta == "internal"
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_thinking_event_send_keeps_empty_terminal_replayable() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);
+        drop(event_rx);
+        let error = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("a reasoning-only terminal stream must fail");
+
+        let semantic_empty = error
+            .downcast_ref::<StreamSemanticEmptyCompletion>()
+            .expect("failure stays typed");
+        assert!(
+            semantic_empty.replayable,
+            "a failed immutable thinking send cannot suppress recovery"
+        );
     }
 
     #[tokio::test]

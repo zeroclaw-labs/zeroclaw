@@ -191,17 +191,19 @@ const ANTHROPIC_OAUTH_BETA_FEATURES: &str =
 /// (`thinking.display` controls omitted/updates/summarized thinking blocks).
 const ANTHROPIC_THINKING_DISPLAY_BETA: &str = "thinking-display-updates-2026-08-18";
 
-/// Flush an in-flight streaming thinking block as a durable reasoning chunk.
+/// Flush an in-flight streaming reasoning block as a durable reasoning chunk.
 ///
 /// Emits the accumulated `{"thinking":..,"signature":..}` JSON object in the
 /// exact newline-joined representation the non-streaming `reasoning_content`
 /// contract uses (subsequent blocks are '\n'-prefixed so the consumer's raw
 /// concatenation round-trips). Returns `false` when the receiver is gone and
 /// the caller should stop pumping the stream.
-async fn flush_streaming_thinking_block(
+async fn flush_streaming_reasoning_block(
     thinking_text: &mut String,
     thinking_signature: &mut String,
+    redacted_thinking_data: &mut Option<String>,
     thinking_block_active: &mut bool,
+    thinking_block_index: &mut Option<usize>,
     reasoning_block_emitted: &mut bool,
     tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
 ) -> bool {
@@ -210,7 +212,21 @@ async fn flush_streaming_thinking_block(
     }
     let thinking = std::mem::take(thinking_text);
     let signature = std::mem::take(thinking_signature);
+    let redacted_data = redacted_thinking_data.take();
     *thinking_block_active = false;
+    *thinking_block_index = None;
+    if let Some(data) = redacted_data {
+        let mut payload = String::new();
+        if *reasoning_block_emitted {
+            payload.push('\n');
+        }
+        payload.push_str(&serde_json::json!({ "redacted_thinking": data }).to_string());
+        *reasoning_block_emitted = true;
+        return tx
+            .send(Ok(StreamEvent::ReasoningFinalized(payload)))
+            .await
+            .is_ok();
+    }
     // `omitted` display and some `updates` blocks legitimately carry an
     // empty `thinking` field with a required signature; the signature alone
     // must reach replay or tool-use continuation breaks.
@@ -2371,7 +2387,10 @@ impl AnthropicModelProvider {
         // shape exactly (newline-joined `{"thinking":..,"signature":..}`).
         let mut thinking_text = String::new();
         let mut thinking_signature = String::new();
+        let mut redacted_thinking_data = None;
         let mut thinking_block_active = false;
+        let mut thinking_block_index = None;
+        let mut reasoning_lifecycle_invalid = false;
         let mut reasoning_block_emitted = false;
 
         let mut input_tokens: Option<u64> = None;
@@ -2571,11 +2590,6 @@ impl AnthropicModelProvider {
                                     | "web_search_tool_result"
                                     | "mcp_tool_use"
                                     | "mcp_tool_result"
-                                    // Server-side fallback marks a model
-                                    // boundary with a start/stop pair and no
-                                    // delta. It is protocol state, not a
-                                    // client-executable tool or display text.
-                                    | "fallback"
                             )
                         });
                     let started = match (content_block_index, block_type) {
@@ -2614,25 +2628,43 @@ impl AnthropicModelProvider {
                         ) {
                             saw_server_tool_activity = true;
                         }
-                        // Defensive flush: a block start without a prior stop
-                        // means the previous thinking block never closed.
-                        if !flush_streaming_thinking_block(
-                            &mut thinking_text,
-                            &mut thinking_signature,
-                            &mut thinking_block_active,
-                            &mut reasoning_block_emitted,
-                            tx,
-                        )
-                        .await
+                        if started && thinking_block_active {
+                            // Anthropic's streaming contract closes each
+                            // block before it starts the next. Do not turn an
+                            // overlapping reasoning lifecycle into a valid
+                            // replay payload by silently flushing it.
+                            terminal_completion_error
+                                .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                            reasoning_lifecycle_invalid = true;
+                        } else if started && matches!(block_type, "thinking" | "redacted_thinking")
                         {
-                            return;
-                        }
-                        if block_type == "thinking" {
+                            let Some(index) = content_block_index else {
+                                terminal_completion_error
+                                    .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
+                                continue;
+                            };
                             thinking_block_active = true;
+                            thinking_block_index = Some(index);
                             thinking_text.clear();
                             thinking_signature.clear();
+                            redacted_thinking_data = None;
+                            reasoning_lifecycle_invalid = false;
+                            if block_type == "redacted_thinking" {
+                                match block
+                                    .get("data")
+                                    .and_then(serde_json::Value::as_str)
+                                    .filter(|data| !data.is_empty())
+                                {
+                                    Some(data) => redacted_thinking_data = Some(data.to_string()),
+                                    None => {
+                                        terminal_completion_error.get_or_insert(
+                                            TerminalCompletionError::InvalidTerminalReason,
+                                        );
+                                    }
+                                }
+                            }
                         }
-                        if block_type == "tool_use" {
+                        if started && block_type == "tool_use" {
                             // Starting a native tool block is already an
                             // externally meaningful action boundary. A later
                             // incomplete terminal state must not replay this
@@ -2753,8 +2785,12 @@ impl AnthropicModelProvider {
                             }
                         }
                         (Some("thinking"), Some(delta), Some("thinking_delta")) => {
-                            if let Some(text) =
-                                delta.get("thinking").and_then(serde_json::Value::as_str)
+                            if let (Some(index), Some(text)) = (
+                                index,
+                                delta.get("thinking").and_then(serde_json::Value::as_str),
+                            ) && thinking_block_active
+                                && thinking_block_index == Some(index)
+                                && !reasoning_lifecycle_invalid
                             {
                                 if !text.is_empty()
                                     && tx
@@ -2770,8 +2806,12 @@ impl AnthropicModelProvider {
                             }
                         }
                         (Some("thinking"), Some(delta), Some("signature_delta")) => {
-                            if let Some(signature) =
-                                delta.get("signature").and_then(serde_json::Value::as_str)
+                            if let (Some(index), Some(signature)) = (
+                                index,
+                                delta.get("signature").and_then(serde_json::Value::as_str),
+                            ) && thinking_block_active
+                                && thinking_block_index == Some(index)
+                                && !reasoning_lifecycle_invalid
                             {
                                 thinking_signature.push_str(signature);
                             } else {
@@ -2835,16 +2875,31 @@ impl AnthropicModelProvider {
                                 .get_or_insert(TerminalCompletionError::InvalidTerminalReason);
                         }
                     }
-                    if !flush_streaming_thinking_block(
-                        &mut thinking_text,
-                        &mut thinking_signature,
-                        &mut thinking_block_active,
-                        &mut reasoning_block_emitted,
-                        tx,
-                    )
-                    .await
+                    if closed
+                        && content_block_index == thinking_block_index
+                        && !reasoning_lifecycle_invalid
+                        && !flush_streaming_reasoning_block(
+                            &mut thinking_text,
+                            &mut thinking_signature,
+                            &mut redacted_thinking_data,
+                            &mut thinking_block_active,
+                            &mut thinking_block_index,
+                            &mut reasoning_block_emitted,
+                            tx,
+                        )
+                        .await
                     {
                         return;
+                    }
+                    if closed
+                        && content_block_index == thinking_block_index
+                        && reasoning_lifecycle_invalid
+                    {
+                        thinking_text.clear();
+                        thinking_signature.clear();
+                        redacted_thinking_data = None;
+                        thinking_block_active = false;
+                        thinking_block_index = None;
                     }
                 }
                 "message_delta" => {
@@ -2988,20 +3043,9 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_stop" => {
-                    // A thinking block still active at message_stop never got
-                    // its content_block_stop; flush it rather than silently
-                    // dropping the accumulated reasoning.
-                    if !flush_streaming_thinking_block(
-                        &mut thinking_text,
-                        &mut thinking_signature,
-                        &mut thinking_block_active,
-                        &mut reasoning_block_emitted,
-                        tx,
-                    )
-                    .await
-                    {
-                        return;
-                    }
+                    // An unclosed reasoning block is invalid framing. Do not
+                    // emit its partial state: `ReasoningFinalized` is reserved
+                    // for a closed block safe to reuse in continuation.
                     if collect_debug_metadata {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -3029,13 +3073,11 @@ impl AnthropicModelProvider {
                             (!open_content_block_indices.is_empty())
                                 .then_some(TerminalCompletionError::InvalidTerminalReason)
                         })
-                        // `message_stop` is the clean terminal marker. A
-                        // preceding `message_delta` supplies a reason when
-                        // Anthropic emits one, but its absence is not itself
-                        // malformed after every indexed block has closed.
-                        // A malformed *present* message_delta remains latched
-                        // above and can never become Final here.
-                        ;
+                        .or_else(|| {
+                            last_stop_reason
+                                .is_none()
+                                .then_some(TerminalCompletionError::InvalidTerminalReason)
+                        });
                     if let Some(error) = error {
                         Self::emit_terminal_completion_failure(
                             tx,
@@ -4527,7 +4569,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
     }
 
     #[tokio::test]
-    async fn streaming_server_fallback_block_without_delta_completes_cleanly() {
+    async fn streaming_fallback_block_is_rejected_even_with_terminal_reason() {
         use std::io::Cursor;
 
         let bytes = b"event: message_start\n\
@@ -4544,12 +4586,243 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
 
-        assert!(
-            matches!(rx.recv().await, Some(Ok(StreamEvent::Usage(usage))) if usage.output_tokens == Some(5))
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(!saw_final, "unpreserved fallback state cannot be final");
+        assert_eq!(
+            failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
         );
-        assert!(matches!(rx.recv().await, Some(Ok(StreamEvent::Final))));
-        drop(tx);
-        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_block_without_terminal_reason_is_invalid() {
+        use std::io::Cursor;
+
+        // A fallback has no delta of its own, but cannot be accepted before
+        // ZeroClaw has an ordered continuation representation for it.
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(8);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            !saw_final,
+            "fallback without terminal framing cannot be final"
+        );
+        assert_eq!(
+            failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_without_terminal_reason_is_invalid() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(8);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(!saw_final, "ordinary streams need a terminal reason");
+        assert_eq!(
+            failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_does_not_excuse_a_later_missing_terminal_reason() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(8);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(!saw_final, "fallback cannot excuse later ordinary framing");
+        assert_eq!(
+            failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_redacted_thinking_reaches_tool_continuation_in_order() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque-provider-payload\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"lookup\",\"input\":{\"q\":\"status\"}}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(8);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut events = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            events.push(event.expect("fixture must parse"));
+        }
+        assert!(matches!(events.last(), Some(StreamEvent::Final)));
+        assert!(matches!(
+            &events[..],
+            [StreamEvent::ReasoningFinalized(payload), StreamEvent::ToolCall(_), StreamEvent::Final]
+                if payload == r#"{"redacted_thinking":"opaque-provider-payload"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_redacted_thinking_requires_opaque_data() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(8);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(!saw_final, "redacted reasoning without data cannot replay");
+        assert_eq!(
+            failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_overlapping_thinking_lifecycles_are_invalid() {
+        use std::io::Cursor;
+
+        let bytes = b"event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(8);
+        AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
+
+        let mut saw_final = false;
+        let mut saw_finalized_reasoning = false;
+        let mut failure = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            match event {
+                Ok(StreamEvent::Final) => saw_final = true,
+                Ok(StreamEvent::ReasoningFinalized(_)) => saw_finalized_reasoning = true,
+                Err(StreamError::TerminalCompletion(error)) => failure = Some(error),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(!saw_final, "overlapping reasoning blocks cannot finalize");
+        assert!(
+            !saw_finalized_reasoning,
+            "overlap cannot emit durable replay reasoning"
+        );
+        assert_eq!(
+            failure.map(|failure| failure.reason),
+            Some(TerminalCompletionError::InvalidTerminalReason)
+        );
     }
 
     #[test]
@@ -6121,6 +6394,8 @@ event: content_block_start\n\
 data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
@@ -10809,6 +11084,8 @@ event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
@@ -10932,11 +11209,11 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
-    async fn message_stop_flushes_unclosed_thinking_block() {
+    async fn message_stop_drops_unclosed_thinking_block() {
         use std::io::Cursor;
 
-        // No content_block_stop for the thinking block: the accumulated
-        // reasoning must still be flushed at message_stop, not dropped.
+        // No content_block_stop means this is incomplete provider state, not
+        // durable reasoning that a later continuation can replay.
         let bytes = b"event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
 event: content_block_start\n\
@@ -10951,14 +11228,14 @@ data: {\"type\":\"message_stop\"}\n\n";
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
         AnthropicModelProvider::parse_anthropic_sse_from_reader(reader, &tx, None).await;
 
-        let mut finalized = None;
+        let mut saw_finalized = false;
         let mut saw_final = false;
         let mut terminal_failure = None;
         while let Ok(Some(ev)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             match ev {
-                Ok(StreamEvent::ReasoningFinalized(payload)) => finalized = Some(payload),
+                Ok(StreamEvent::ReasoningFinalized(_)) => saw_finalized = true,
                 Ok(StreamEvent::Final) => saw_final = true,
                 Ok(_) => {}
                 Err(StreamError::TerminalCompletion(failure)) => terminal_failure = Some(failure),
@@ -10966,11 +11243,10 @@ data: {\"type\":\"message_stop\"}\n\n";
             }
         }
 
-        let payload = finalized.expect("unclosed thinking block must be flushed");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&payload).expect("flushed payload must be a JSON object");
-        assert_eq!(parsed["thinking"], "orphan");
-        assert_eq!(parsed["signature"], "sigX");
+        assert!(
+            !saw_finalized,
+            "unclosed thinking cannot become durable replay content"
+        );
         assert!(!saw_final, "an unclosed block cannot finalize the stream");
         assert_eq!(
             terminal_failure.map(|failure| failure.reason),
@@ -11006,6 +11282,8 @@ event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"live\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
                     axum::body::Body::from_stream(futures_util::stream::once(async move {
@@ -11127,6 +11405,8 @@ event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
@@ -11180,6 +11460,8 @@ event: content_block_delta\n\
 data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sigB\"}}\n\n\
 event: content_block_stop\n\
 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\n";
         let reader = tokio::io::BufReader::new(Cursor::new(bytes.as_slice()));
