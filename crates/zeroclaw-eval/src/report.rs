@@ -16,9 +16,14 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error, produced at least one grade,
+    /// and every grade passed.
+    ///
+    /// Fixture admission rejects assertion-free cases, but this aggregation
+    /// boundary also fails closed so a caller cannot manufacture a green
+    /// report from an empty grade vector.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && !self.grades.is_empty() && self.grades.iter().all(|g| g.passed)
     }
 
     fn checks_passed(&self) -> usize {
@@ -43,6 +48,12 @@ impl SuiteReport {
 
     pub fn all_passed(&self) -> bool {
         self.cases.iter().all(CaseReport::passed)
+    }
+
+    /// Process exit code for a completed run: 0 iff every case passed.
+    /// Kept as a pure function so the CLI gate is testable at its real boundary.
+    pub fn exit_code(&self) -> i32 {
+        if self.all_passed() { 0 } else { 1 }
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -119,6 +130,7 @@ mod tests {
             check: check.to_string(),
             passed,
             detail: detail.to_string(),
+            category: crate::grader::GradeCategory::Response,
         }
     }
 
@@ -152,8 +164,8 @@ mod tests {
         );
         // A run error fails the case even when every check passed.
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
-        // No checks and no error passes vacuously.
-        assert!(case("a", vec![], None).passed());
+        // No checks cannot certify a passing case.
+        assert!(!case("a", vec![], None).passed());
     }
 
     #[test]
@@ -168,6 +180,27 @@ mod tests {
         assert_eq!(suite.passed_count(), 1);
         assert_eq!(suite.failed_count(), 2);
         assert!(!suite.all_passed());
+    }
+
+    #[test]
+    fn exit_code_is_zero_when_all_cases_pass() {
+        let suite = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert!(suite.all_passed());
+        assert_eq!(suite.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_is_one_when_any_case_fails() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        assert!(!suite.all_passed());
+        assert_eq!(suite.exit_code(), 1);
     }
 
     #[test]
@@ -223,5 +256,10 @@ mod tests {
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
+        // Each grade now carries its category (snake_case) in the JSON report.
+        assert_eq!(
+            json["cases"][0]["grades"][0]["category"].as_str(),
+            Some("response")
+        );
     }
 }
