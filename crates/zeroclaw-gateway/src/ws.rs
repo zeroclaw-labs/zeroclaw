@@ -244,6 +244,37 @@ async fn resolve_ws_memory_handle(
         .map(Some)
 }
 
+/// Provider, model, and temperature for the turn-end WS memory
+/// consolidation: the agent's own provider entry and the model that served
+/// the turn — the same pairing the channel orchestrator passes to its
+/// consolidation — instead of the gateway-wide boot default. `turn_model`
+/// (which may reflect a mid-session model switch) wins when non-empty;
+/// otherwise the entry's configured model is used. Returns `None` when the
+/// agent's `model_provider` no longer resolves — e.g. the entry was removed
+/// by a config reload between turn start and turn end — in which case
+/// consolidation is skipped rather than silently rerouted to an unrelated
+/// entry.
+fn ws_consolidation_model(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    turn_model: &str,
+) -> Option<(
+    Box<dyn zeroclaw_api::model_provider::ModelProvider>,
+    String,
+    Option<f64>,
+)> {
+    let (provider_type, provider_alias, entry) =
+        config.resolved_model_provider_for_agent(agent_alias)?;
+    let provider_ref = format!("{provider_type}.{provider_alias}");
+    let (provider, _, model) = zeroclaw_runtime::agent::agent::build_session_model_provider(
+        config,
+        &provider_ref,
+        Some(turn_model),
+    )
+    .ok()?;
+    Some((provider, model, entry.temperature))
+}
+
 async fn handle_ws_sop_frame<S>(
     parsed: &serde_json::Value,
     state: &AppState,
@@ -1415,13 +1446,33 @@ async fn process_chat_message(
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
                 if let Some(mem) = ws_memory.clone() {
-                    let model_provider = state.model_provider.clone();
-                    let model = state.model.clone();
-                    let temperature = state.temperature;
+                    // Consolidate with the agent's own provider entry and the
+                    // model that served the turn — the same pairing the
+                    // channel orchestrator hands to its consolidation — so
+                    // background extraction runs on the entry the
+                    // conversation actually used, not the gateway-wide boot
+                    // default.
+                    let agent_alias = turn_alias.clone();
+                    let turn_model_owned = turn_model.clone();
                     let memory_config = state.config.read().memory.clone();
                     let user_msg = content.to_string();
                     let assistant_resp = outcome.response.clone();
+                    let live_config = Arc::clone(&state.config);
                     zeroclaw_spawn::spawn!(async move {
+                        let config = live_config.read().clone();
+                        let Some((model_provider, model, temperature)) =
+                            ws_consolidation_model(&config, &agent_alias, &turn_model_owned)
+                        else {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                "WS memory consolidation skipped"
+                            );
+                            return;
+                        };
                         if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
                             model_provider.as_ref(),
                             &model,
@@ -2348,6 +2399,67 @@ data: {\"type\":\"message_stop\"}\n\n",
             .expect_err("missing cwd should be rejected");
 
         assert!(err.to_string().contains("cwd is not a usable directory"));
+    }
+
+    #[test]
+    fn ws_consolidation_model_uses_agent_entry_not_install_default() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        // The install-wide first configured model (the openai slot precedes
+        // ollama in slot order) differs from the agent's entry, so the
+        // assertions prove the agent binding wins over the install-wide pick.
+        config.providers.models.openai.insert(
+            "install".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("install-wide-model".to_string()),
+                    temperature: Some(0.9),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "agent".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("agent-entry-model".to_string()),
+                    temperature: Some(0.3),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "worker".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.agent".into(),
+                ..Default::default()
+            },
+        );
+
+        // The turn model (possibly session-switched) wins over the entry model.
+        let (_, model, temperature) =
+            ws_consolidation_model(&config, "worker", "session-switched-model")
+                .expect("the agent's entry must resolve");
+        assert_eq!(model, "session-switched-model");
+        assert_eq!(
+            temperature,
+            Some(0.3),
+            "consolidation must use the agent entry's temperature"
+        );
+
+        // Without a turn model, the agent entry's model is used.
+        let (_, model, _) =
+            ws_consolidation_model(&config, "worker", "").expect("the agent's entry must resolve");
+        assert_eq!(model, "agent-entry-model");
+
+        // An agent whose entry no longer resolves skips consolidation
+        // instead of falling back to an unrelated entry.
+        assert!(ws_consolidation_model(&config, "missing-agent", "m").is_none());
     }
 
     #[test]
