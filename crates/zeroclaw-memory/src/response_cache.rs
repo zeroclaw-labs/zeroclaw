@@ -1,5 +1,6 @@
 //! Response cache — avoid burning tokens on repeated prompts.
 
+use crate::sqlite_permissions::harden_sqlite_storage;
 use anyhow::Result;
 use chrono::{Duration, Local};
 use parking_lot::Mutex;
@@ -37,9 +38,8 @@ impl ResponseCache {
         max_entries: usize,
         hot_max_entries: usize,
     ) -> Result<Self> {
-        let db_dir = workspace_dir.join("memory");
-        std::fs::create_dir_all(&db_dir)?;
-        let db_path = db_dir.join("response_cache.db");
+        let db_path = workspace_dir.join("memory").join("response_cache.db");
+        harden_sqlite_storage(&db_path)?;
 
         let conn = Connection::open(&db_path)?;
 
@@ -62,6 +62,7 @@ impl ResponseCache {
             CREATE INDEX IF NOT EXISTS idx_rc_accessed ON response_cache(accessed_at);
             CREATE INDEX IF NOT EXISTS idx_rc_created ON response_cache(created_at);",
         )?;
+        harden_sqlite_storage(&db_path)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -268,10 +269,83 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn assert_owner_only_sqlite_storage(memory_dir: &Path, db_path: &Path) {
+        assert_eq!(mode(memory_dir), 0o700);
+        assert_eq!(mode(db_path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600);
+            }
+        }
+    }
+
     fn temp_cache(ttl_minutes: u32) -> (TempDir, ResponseCache) {
         let tmp = TempDir::new().unwrap();
         let cache = ResponseCache::new(tmp.path(), ttl_minutes, 1000).unwrap();
         (tmp, cache)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_cache_hardens_fresh_storage_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let db_path = memory_dir.join("response_cache.db");
+
+        let _cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+
+        assert_owner_only_sqlite_storage(&memory_dir, &db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_cache_hardens_existing_storage_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let db_path = memory_dir.join("response_cache.db");
+        let seeding_conn = Connection::open(&db_path).unwrap();
+        seeding_conn
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS response_cache (
+                     prompt_hash TEXT PRIMARY KEY,
+                     model TEXT NOT NULL,
+                     response TEXT NOT NULL,
+                     token_count INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL,
+                     accessed_at TEXT NOT NULL,
+                     hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO response_cache
+                     (prompt_hash, model, response, created_at, accessed_at)
+                 VALUES ('seed', 'local', 'private output', '2026-01-01', '2026-01-01');",
+            )
+            .unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o666)).unwrap();
+            }
+        }
+
+        let _cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+
+        assert_owner_only_sqlite_storage(&memory_dir, &db_path);
     }
 
     #[test]
