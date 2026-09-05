@@ -723,6 +723,7 @@ async fn native_hailo_rejects_call_level_thinking_before_http() {
                 tools: None,
                 thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1024,
+                    display: None,
                 }),
             },
             "qwen3:1.7b",
