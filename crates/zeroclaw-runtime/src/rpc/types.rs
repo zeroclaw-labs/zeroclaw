@@ -11,7 +11,9 @@ pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
-pub use zeroclaw_api::runtime_status::RuntimeConfigKind;
+pub use zeroclaw_api::runtime_status::{
+    RuntimeConfigKind, RuntimeShellFamily, RuntimeShellProfile,
+};
 pub use zeroclaw_config::cost::types::CostSummary;
 pub use zeroclaw_config::traits::{ConfigFieldEntry, PropKind};
 
@@ -119,6 +121,8 @@ rpc_type! {
         pub config_kind: Option<RuntimeConfigKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub local_ipc_endpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell_profile: Option<RuntimeShellProfile>,
     }
 }
 
@@ -1597,6 +1601,48 @@ mod tests {
             serde_json::from_value::<ChatMode>(json!("acp")).unwrap(),
             ChatMode::Acp
         );
+    }
+
+    #[test]
+    fn status_result_shell_profile_round_trips_and_defaults_absent() {
+        let legacy: StatusResult = serde_json::from_value(json!({
+            "server_version": "0.8.4",
+            "protocol_version": 1,
+            "active_sessions": 0,
+            "session_ids": []
+        }))
+        .unwrap();
+
+        assert_eq!(legacy.shell_profile, None);
+        let legacy_wire = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_wire.get("shell_profile").is_none());
+
+        let status = StatusResult {
+            server_version: "0.8.4".into(),
+            protocol_version: 1,
+            active_sessions: 0,
+            session_ids: vec![],
+            config_dir: None,
+            config_file: None,
+            config_kind: None,
+            local_ipc_endpoint: None,
+            shell_profile: Some(RuntimeShellProfile {
+                name: "pwsh".into(),
+                family: RuntimeShellFamily::PowerShell,
+            }),
+        };
+
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            wire["shell_profile"],
+            json!({
+                "name": "pwsh",
+                "family": "powershell"
+            })
+        );
+
+        let round_trip: StatusResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_trip.shell_profile, status.shell_profile);
     }
 
     #[test]

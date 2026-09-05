@@ -3980,7 +3980,11 @@ mod dashboard_status_tests {
             "config_dir": "/tmp/zeroclaw-profile",
             "config_file": "/tmp/zeroclaw-profile/config.toml",
             "config_kind": "temporary",
-            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock"
+            "local_ipc_endpoint": "/tmp/zeroclaw-profile/data/daemon.sock",
+            "shell_profile": {
+                "name": "pwsh",
+                "family": "powershell"
+            }
         });
 
         let status: StatusResult = serde_json::from_value(value).unwrap();

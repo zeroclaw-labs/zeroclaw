@@ -25,7 +25,7 @@ use zeroclaw_api::jsonrpc::{
     SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-use zeroclaw_api::runtime_status::RuntimeConfigKind;
+use zeroclaw_api::runtime_status::{RuntimeConfigKind, RuntimeShellProfile};
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
@@ -36,14 +36,19 @@ mod notification {
     pub const LOGS_EVENT: &str = "logs/event";
 }
 
+#[derive(Debug)]
 struct StatusRuntimeContext {
     config_dir: String,
     config_file: String,
     config_kind: RuntimeConfigKind,
     local_ipc_endpoint: String,
+    shell_profile: Option<RuntimeShellProfile>,
 }
 
-fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> StatusRuntimeContext {
+fn status_runtime_context(
+    config: &Config,
+    config_kind: RuntimeConfigKind,
+) -> Result<StatusRuntimeContext, JsonRpcError> {
     let config_file = config.config_path.display().to_string();
     let config_dir = config
         .config_path
@@ -51,13 +56,18 @@ fn status_runtime_context(config: &Config, config_kind: RuntimeConfigKind) -> St
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let local_ipc_endpoint = super::local::socket_path(config).display().to_string();
+    let shell_profile = zeroclaw_config::platform::create_runtime(&config.runtime)
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Runtime status unavailable: {e}")))?
+        .shell_profile()
+        .and_then(RuntimeShellProfile::from_runtime_profile);
 
-    StatusRuntimeContext {
+    Ok(StatusRuntimeContext {
         config_dir,
         config_file,
         config_kind,
         local_ipc_endpoint,
-    }
+        shell_profile,
+    })
 }
 
 // ── Method registry ──────────────────────────────────────────────
@@ -1245,7 +1255,7 @@ impl RpcDispatcher {
         let config_kind = zeroclaw_config::schema::classify_runtime_config_kind(&config_path).await;
         let runtime_context = {
             let config = self.ctx.config.read();
-            status_runtime_context(&config, config_kind)
+            status_runtime_context(&config, config_kind)?
         };
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
@@ -1265,6 +1275,7 @@ impl RpcDispatcher {
             config_file: Some(runtime_context.config_file),
             config_kind: Some(runtime_context.config_kind),
             local_ipc_endpoint: Some(runtime_context.local_ipc_endpoint),
+            shell_profile: runtime_context.shell_profile,
         })
     }
 
@@ -5475,9 +5486,32 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use zeroclaw_api::runtime_status::RuntimeShellFamily;
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    fn expected_default_shell_family() -> RuntimeShellFamily {
+        #[cfg(target_os = "windows")]
+        {
+            RuntimeShellFamily::Cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            RuntimeShellFamily::Posix
+        }
+    }
+
+    fn expected_default_shell_name() -> &'static str {
+        #[cfg(target_os = "windows")]
+        {
+            "cmd"
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "sh"
+        }
     }
 
     #[test]
@@ -8272,7 +8306,8 @@ mod tests {
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
 
-        let context = status_runtime_context(&config, RuntimeConfigKind::Temporary);
+        let context =
+            status_runtime_context(&config, RuntimeConfigKind::Temporary).expect("status context");
 
         assert_eq!(context.config_dir, tmp.path().display().to_string());
         assert_eq!(
@@ -8286,11 +8321,45 @@ mod tests {
                 .display()
                 .to_string()
         );
+        assert_eq!(
+            context.shell_profile.as_ref().map(|profile| profile.family),
+            Some(expected_default_shell_family())
+        );
+        assert_eq!(
+            context
+                .shell_profile
+                .as_ref()
+                .map(|profile| profile.name.as_str()),
+            Some(expected_default_shell_name())
+        );
 
         config.config_path = std::path::PathBuf::from("/opt/zeroclaw/config.toml");
         assert_eq!(
-            status_runtime_context(&config, RuntimeConfigKind::Custom).config_kind,
+            status_runtime_context(&config, RuntimeConfigKind::Custom)
+                .expect("status context")
+                .config_kind,
             RuntimeConfigKind::Custom
+        );
+    }
+
+    #[test]
+    fn status_runtime_context_propagates_invalid_runtime_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.runtime.shell = Some("   ".into());
+
+        let err = status_runtime_context(&config, RuntimeConfigKind::Temporary)
+            .expect_err("invalid runtime shell should fail status context");
+
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert!(
+            err.message.contains("runtime.shell must not be empty"),
+            "status error should preserve runtime factory validation, got: {}",
+            err.message
         );
     }
 
@@ -8319,6 +8388,17 @@ mod tests {
         assert_eq!(
             status.local_ipc_endpoint.as_deref(),
             Some(crate::rpc::local::socket_path(&config).to_str().unwrap())
+        );
+        assert_eq!(
+            status.shell_profile.as_ref().map(|profile| profile.family),
+            Some(expected_default_shell_family())
+        );
+        assert_eq!(
+            status
+                .shell_profile
+                .as_ref()
+                .map(|profile| profile.name.as_str()),
+            Some(expected_default_shell_name())
         );
     }
 
