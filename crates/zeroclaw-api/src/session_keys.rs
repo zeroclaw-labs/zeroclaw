@@ -8,6 +8,15 @@
 //! writing the JSONL file, every other layer must use the same sanitized form
 //! to keep lookups consistent across daemon restarts and persisted backends.
 
+/// Canonical transcript suffix for the legacy JSONL session backend.
+pub const JSONL_SESSION_FILE_SUFFIX: &str = ".jsonl";
+/// Canonical durable-metadata suffix paired with a JSONL transcript.
+pub const JSONL_SESSION_METADATA_FILE_SUFFIX: &str = ".metadata.json";
+/// Transcript suffix after a successful JSONL-to-SQLite migration.
+pub const JSONL_SESSION_MIGRATED_FILE_SUFFIX: &str = ".jsonl.migrated";
+/// Metadata suffix after a successful JSONL-to-SQLite migration.
+pub const JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX: &str = ".metadata.json.migrated";
+
 /// Replace every character outside `[A-Za-z0-9_-]` with `_`. Idempotent.
 ///
 /// Callers building session keys must pre-apply this so the runtime HashMap

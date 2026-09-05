@@ -543,6 +543,43 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         self.store(key, content, category, session_id).await
     }
 
+    /// Atomically replace content only when the persisted provenance still
+    /// matches the caller's observed row. The namespace, session, and agent
+    /// predicates are authorization inputs; implementations must evaluate
+    /// them in the same storage operation as the update.
+    ///
+    /// The default fails closed because composing `get` and `store` would
+    /// reopen a check/use race and could relabel a row between operations.
+    async fn update_content_if_provenance(
+        &self,
+        _key: &str,
+        _content: &str,
+        _namespace: &str,
+        _session_id: Option<&str>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!(
+            "memory backend '{}' does not support provenance-conditional updates",
+            self.name()
+        )
+    }
+
+    /// Atomically remove a row only when its persisted provenance matches.
+    /// The default fails closed for the same reason as
+    /// [`update_content_if_provenance`](Self::update_content_if_provenance).
+    async fn forget_if_provenance(
+        &self,
+        _key: &str,
+        _namespace: &str,
+        _session_id: Option<&str>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!(
+            "memory backend '{}' does not support provenance-conditional deletes",
+            self.name()
+        )
+    }
+
     /// Store a memory entry with the full additive metadata surface.
     ///
     /// Default delegates through the existing metadata method for namespace and

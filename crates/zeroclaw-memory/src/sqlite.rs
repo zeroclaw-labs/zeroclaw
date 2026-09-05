@@ -674,29 +674,7 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, None, None)
-    }
-
-    /// FTS5 BM25 search constrained to the rows a live vector-stage recall
-    /// may return for a session. Applying this predicate inside FTS keeps
-    /// excluded rows out of BM25 ranking, limiting, and normalization.
-    fn fts5_search_for_session(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, session_id, None)
-    }
-
-    fn fts5_search_for_session_and_agents(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        allowed_agent_ids: &[String],
-    ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, session_id, Some(allowed_agent_ids))
+        Self::fts5_search_scoped(conn, query, limit, None, None, None)
     }
 
     fn fts5_search_scoped(
@@ -705,6 +683,7 @@ impl SqliteMemory {
         limit: usize,
         session_id: Option<&str>,
         allowed_agent_ids: Option<&[String]>,
+        allowed_namespaces: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
@@ -755,6 +734,19 @@ impl SqliteMemory {
                 param_values.push(Box::new(agent_id.clone()));
             }
             param_idx += allowed_agent_ids.len();
+        }
+        if let Some(allowed_namespaces) = allowed_namespaces
+            && !allowed_namespaces.is_empty()
+        {
+            let namespace_placeholders = (0..allowed_namespaces.len())
+                .map(|offset| format!("?{}", param_idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND m.namespace IN ({namespace_placeholders})");
+            for namespace in allowed_namespaces {
+                param_values.push(Box::new(namespace.clone()));
+            }
+            param_idx += allowed_namespaces.len();
         }
 
         let _ = write!(sql, " ORDER BY score LIMIT ?{param_idx}");
@@ -844,24 +836,14 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::vector_search_scoped(conn, query_embedding, limit, category, session_id, None)
-    }
-
-    fn vector_search_for_agents(
-        conn: &Connection,
-        query_embedding: &[f32],
-        limit: usize,
-        category: Option<&str>,
-        session_id: Option<&str>,
-        allowed_agent_ids: &[String],
-    ) -> anyhow::Result<Vec<(String, f32)>> {
         Self::vector_search_scoped(
             conn,
             query_embedding,
             limit,
             category,
             session_id,
-            Some(allowed_agent_ids),
+            None,
+            None,
         )
     }
 
@@ -872,6 +854,7 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
         allowed_agent_ids: Option<&[String]>,
+        allowed_namespaces: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -910,6 +893,19 @@ impl SqliteMemory {
             for agent_id in allowed_agent_ids {
                 param_values.push(Box::new(agent_id.clone()));
             }
+            idx += allowed_agent_ids.len();
+        }
+        if let Some(allowed_namespaces) = allowed_namespaces
+            && !allowed_namespaces.is_empty()
+        {
+            let namespace_placeholders = (0..allowed_namespaces.len())
+                .map(|offset| format!("?{}", idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND namespace IN ({namespace_placeholders})");
+            for namespace in allowed_namespaces {
+                param_values.push(Box::new(namespace.clone()));
+            }
         }
 
         let mut stmt = conn.prepare(&sql)?;
@@ -943,11 +939,13 @@ impl SqliteMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        allowed_namespaces: Option<&[String]>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);
         let since_owned = since.map(String::from);
         let until_owned = until.map(String::from);
+        let namespaces = allowed_namespaces.map(<[String]>::to_vec);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -976,6 +974,22 @@ impl SqliteMemory {
                 let _ = write!(sql, " AND m.created_at <= ?{idx}");
                 param_values.push(Box::new(u.to_string()));
                 idx += 1;
+            }
+            if let Some(namespaces) = namespaces.as_deref()
+                && !namespaces.is_empty()
+            {
+                let namespace_placeholders = (0..namespaces.len())
+                    .map(|offset| format!("?{}", idx + offset))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(
+                    sql,
+                    " AND m.namespace IN ({namespace_placeholders})"
+                );
+                for namespace in namespaces {
+                    param_values.push(Box::new(namespace.clone()));
+                }
+                idx += namespaces.len();
             }
             let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
             #[allow(clippy::cast_possible_wrap)]
@@ -1021,7 +1035,11 @@ impl SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
         allowed_agent_ids: Option<Vec<String>>,
+        allowed_namespaces: Option<Vec<String>>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if allowed_namespaces.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
         let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
         // Time-only query: list by time range when no keywords.
         // Treat only a bare "*" as the same recent-entry request; keep
@@ -1033,7 +1051,13 @@ impl SqliteMemory {
                 self.count().await?.max(limit)
             };
             let raw = self
-                .recall_by_time_only(recall_limit, session_id, since, until)
+                .recall_by_time_only(
+                    recall_limit,
+                    session_id,
+                    since,
+                    until,
+                    allowed_namespaces.as_deref(),
+                )
                 .await?;
             if allowed_agent_ids.is_empty() {
                 return Ok(raw);
@@ -1066,6 +1090,7 @@ impl SqliteMemory {
         let keyword_weight = self.keyword_weight;
         let search_mode = self.search_mode.clone();
         let allowed = allowed_agent_ids;
+        let allowed_namespaces = allowed_namespaces.unwrap_or_default();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -1077,6 +1102,11 @@ impl SqliteMemory {
             } else {
                 Some(allowed.as_slice())
             };
+            let namespace_filter = if allowed_namespaces.is_empty() {
+                None
+            } else {
+                Some(allowed_namespaces.as_slice())
+            };
             // The vector stage is live only when an embedder produced a query
             // vector; it selects the scoped FTS variant. The BM25-only path
             // (stock `embedding_provider = "none"` => Noop embedder, and
@@ -1086,37 +1116,32 @@ impl SqliteMemory {
             // FTS5 BM25 keyword search (skip for embedding-only mode)
             let keyword_results = if search_mode == SearchMode::Embedding {
                 Vec::new()
-            } else if let Some(agent_filter) = agent_filter {
-                if vector_live {
-                    Self::fts5_search_for_session_and_agents(
-                        &conn,
-                        &query,
-                        limit * 2,
-                        session_ref,
-                        agent_filter,
-                    )
-                    .unwrap_or_default()
-                } else {
-                    Self::fts5_search_scoped(&conn, &query, limit * 2, None, Some(agent_filter))
-                        .unwrap_or_default()
-                }
-            } else if vector_live {
-                Self::fts5_search_for_session(&conn, &query, limit * 2, session_ref)
-                    .unwrap_or_default()
             } else {
-                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
+                Self::fts5_search_scoped(
+                    &conn,
+                    &query,
+                    limit * 2,
+                    vector_live.then_some(session_ref).flatten(),
+                    agent_filter,
+                    namespace_filter,
+                )
+                .unwrap_or_default()
             };
 
             // Vector similarity search (skip for BM25-only mode)
             let vector_results = if search_mode == SearchMode::Bm25 {
                 Vec::new()
             } else if let Some(ref qe) = query_embedding {
-                if let Some(agent_filter) = agent_filter {
-                    Self::vector_search_for_agents(&conn, qe, limit * 2, None, session_ref, agent_filter)
-                        .unwrap_or_default()
-                } else {
-                    Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
-                }
+                Self::vector_search_scoped(
+                    &conn,
+                    qe,
+                    limit * 2,
+                    None,
+                    session_ref,
+                    agent_filter,
+                    namespace_filter,
+                )
+                .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -1338,10 +1363,22 @@ impl SqliteMemory {
                         let _ = write!(agent_conditions, " AND m.agent_id IN ({agent_placeholders})");
                         param_idx += agent_filter.len();
                     }
+                    let mut namespace_conditions = String::new();
+                    if let Some(namespace_filter) = namespace_filter {
+                        let namespace_placeholders = (0..namespace_filter.len())
+                            .map(|offset| format!("?{}", param_idx + offset))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = write!(
+                            namespace_conditions,
+                            " AND m.namespace IN ({namespace_placeholders})"
+                        );
+                        param_idx += namespace_filter.len();
+                    }
                     let sql = format!(
                         "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
-                         WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}{agent_conditions}
+                         WHERE m.superseded_by IS NULL AND ({where_clause}){time_conditions}{agent_conditions}{namespace_conditions}
                          ORDER BY m.updated_at DESC
                          LIMIT ?{param_idx}"
                     );
@@ -1360,6 +1397,11 @@ impl SqliteMemory {
                     if let Some(agent_filter) = agent_filter {
                         for agent_id in agent_filter {
                             param_values.push(Box::new(agent_id.clone()));
+                        }
+                    }
+                    if let Some(namespace_filter) = namespace_filter {
+                        for namespace in namespace_filter {
+                            param_values.push(Box::new(namespace.clone()));
                         }
                     }
                     #[allow(clippy::cast_possible_wrap)]
@@ -1411,6 +1453,33 @@ impl SqliteMemory {
             Ok(results)
         })
         .await?
+    }
+
+    /// Recall only rows whose namespace is in `allowed_namespaces`.
+    ///
+    /// The namespace predicate is applied inside every SQLite search path
+    /// before ranking and limiting. This is the authorization boundary for
+    /// shared sidecar databases such as `discord.db`; callers must derive the
+    /// allowlist from trusted runtime/config identity, never request input.
+    pub async fn recall_in_namespaces(
+        &self,
+        allowed_namespaces: &[String],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            None,
+            Some(allowed_namespaces.to_vec()),
+        )
+        .await
     }
 
     /// Replace the live embedder in place. Shared by the runtime
@@ -1493,7 +1562,7 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall_scoped(query, limit, session_id, since, until, None)
+        self.recall_scoped(query, limit, session_id, since, until, None, None)
             .await
     }
 
@@ -1663,6 +1732,32 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = conn.lock();
             let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn forget_if_provenance(
+        &self,
+        key: &str,
+        namespace: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let namespace = namespace.to_string();
+        let session_id = session_id.map(str::to_string);
+        let agent_id = agent_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories
+                 WHERE key = ?1 AND namespace = ?2
+                   AND session_id IS ?3 AND agent_id IS ?4",
+                params![key, namespace, session_id, agent_id],
+            )?;
             Ok(affected > 0)
         })
         .await?
@@ -2047,6 +2142,59 @@ impl Memory for SqliteMemory {
         .await
     }
 
+    async fn update_content_if_provenance(
+        &self,
+        key: &str,
+        content: &str,
+        namespace: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(embedding) => embedding.map(|embedding| vector::vec_to_bytes(&embedding)),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": error.to_string(),
+                        })),
+                    "memory conditional update: embedding failed; persisting content without a vector"
+                );
+                None
+            }
+        };
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let namespace = namespace.to_string();
+        let session_id = session_id.map(str::to_string);
+        let agent_id = agent_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "UPDATE memories
+                 SET content = ?1, embedding = ?2, updated_at = ?3
+                 WHERE key = ?4 AND namespace = ?5
+                   AND session_id IS ?6 AND agent_id IS ?7",
+                params![
+                    content,
+                    embedding_bytes,
+                    Local::now().to_rfc3339(),
+                    key,
+                    namespace,
+                    session_id,
+                    agent_id,
+                ],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
     async fn store_with_options(
         &self,
         key: &str,
@@ -2198,7 +2346,7 @@ impl Memory for SqliteMemory {
         }
 
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-        self.recall_scoped(query, limit, session_id, since, until, Some(allowed))
+        self.recall_scoped(query, limit, session_id, since, until, Some(allowed), None)
             .await
     }
 
@@ -4180,6 +4328,75 @@ mod tests {
     }
 
     // ── Bulk deletion tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn provenance_conditional_update_and_delete_fail_closed() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_with_metadata(
+            "discord_1",
+            "original",
+            MemoryCategory::Custom("discord".into()),
+            Some("channel-1"),
+            Some("discord.owner"),
+            None,
+        )
+        .await
+        .unwrap();
+        let entry = mem.get("discord_1").await.unwrap().unwrap();
+
+        assert!(
+            !mem.update_content_if_provenance(
+                "discord_1",
+                "foreign update",
+                "discord.observer",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !mem.forget_if_provenance(
+                "discord_1",
+                "discord.owner",
+                Some("foreign-channel"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "original"
+        );
+
+        assert!(
+            mem.update_content_if_provenance(
+                "discord_1",
+                "owned update",
+                "discord.owner",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "owned update"
+        );
+        assert!(
+            mem.forget_if_provenance(
+                "discord_1",
+                "discord.owner",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(mem.get("discord_1").await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn sqlite_purge_namespace_deletes_only_all_matching_entries() {
