@@ -43,6 +43,8 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// How a post-upgrade restart is achieved in this environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartMode {
+    /// The ZeroClaw Desktop supervisor relaunches us after the dedicated exit.
+    DesktopSupervised,
     /// A supervisor (systemd/launchd) relaunches us after a clean exit.
     Supervised,
     /// No supervisor, but we can relaunch ourselves: after teardown the daemon
@@ -56,6 +58,7 @@ pub enum RestartMode {
 impl RestartMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            RestartMode::DesktopSupervised => "desktop_supervised",
             RestartMode::Supervised => "supervised",
             RestartMode::SelfRespawn => "self_respawn",
             RestartMode::Manual => "manual",
@@ -64,7 +67,10 @@ impl RestartMode {
 
     /// Whether the dashboard may offer (and the backend honour) auto-restart.
     pub fn auto_restartable(self) -> bool {
-        matches!(self, RestartMode::Supervised | RestartMode::SelfRespawn)
+        matches!(
+            self,
+            RestartMode::DesktopSupervised | RestartMode::Supervised | RestartMode::SelfRespawn
+        )
     }
 }
 
@@ -100,6 +106,12 @@ pub fn detect_restart() -> RestartInfo {
 }
 
 fn detect_restart_uncached() -> RestartInfo {
+    if zeroclaw_runtime::restart::is_desktop_supervised() {
+        return RestartInfo {
+            mode: RestartMode::DesktopSupervised,
+            hint: get_required_cli_string("cli-gateway-restart-hint-process"),
+        };
+    }
     // Container first — default to manual since we can't see a restart policy.
     if is_container() {
         let hint = if env_present("KUBERNETES_SERVICE_HOST") {
@@ -346,8 +358,8 @@ pub struct UpgradeRequest {
     /// Target release tag; defaults to latest.
     #[serde(default)]
     pub version: Option<String>,
-    /// After a successful swap, exit so a supervisor relaunches the new binary.
-    /// Only honoured under a detected supervisor (systemd/launchd).
+    /// After a successful swap, exit so the detected supervisor relaunches the
+    /// new binary.
     #[serde(default)]
     pub auto_restart: bool,
 }
@@ -438,6 +450,7 @@ pub async fn handle_version_upgrade(
 
     let action = if req.auto_restart {
         match restart.mode {
+            RestartMode::DesktopSupervised => RestartAction::DesktopSupervised,
             RestartMode::Supervised => RestartAction::Supervised,
             RestartMode::SelfRespawn => RestartAction::SelfRespawn {
                 // `reload_tx` is `None` exactly when the gateway runs without
@@ -609,6 +622,8 @@ async fn pump_lines<R: AsyncRead + Unpin>(reader: R, progress: Arc<Mutex<Upgrade
 enum RestartAction {
     /// Leave the swapped binary on disk; the operator restarts manually.
     None,
+    /// Ask the ZeroClaw Desktop supervisor to launch the next generation.
+    DesktopSupervised,
     /// Exit cleanly; a supervisor (systemd/launchd) or the outer daemon process
     /// relaunches the new binary. The daemon's `wait_for_exit_signal` is the
     /// shutdown receiver here (SIGTERM on unix, `restart::shutdown_notify()`
@@ -717,6 +732,18 @@ async fn run_upgrade(
 
     match action {
         RestartAction::None => set_state(&progress, UpgradeState::Done),
+        RestartAction::DesktopSupervised => {
+            if let Err(error) = zeroclaw_runtime::restart::request_desktop_restart() {
+                fail(
+                    &progress,
+                    format!("cannot arm desktop-supervised restart: {error}"),
+                );
+                return;
+            }
+            set_state(&progress, UpgradeState::Restarting);
+            tokio::time::sleep(RESTART_GRACE).await;
+            trigger_graceful_shutdown();
+        }
         RestartAction::Supervised => {
             // The binary on disk is new; exit cleanly so the supervisor
             // relaunches it. We never spawn/exec a replacement ourselves.
@@ -798,10 +825,15 @@ mod tests {
 
     #[test]
     fn restart_mode_as_str_is_stable() {
+        assert_eq!(
+            RestartMode::DesktopSupervised.as_str(),
+            "desktop_supervised"
+        );
         assert_eq!(RestartMode::Supervised.as_str(), "supervised");
         assert_eq!(RestartMode::SelfRespawn.as_str(), "self_respawn");
         assert_eq!(RestartMode::Manual.as_str(), "manual");
         assert!(RestartMode::Supervised.auto_restartable());
+        assert!(RestartMode::DesktopSupervised.auto_restartable());
         assert!(RestartMode::SelfRespawn.auto_restartable());
         assert!(!RestartMode::Manual.auto_restartable());
     }

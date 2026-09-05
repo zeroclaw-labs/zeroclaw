@@ -13,6 +13,9 @@ pub fn handle_command(
         crate::ServiceCommands::RunLaunchdDaemon => {
             anyhow::bail!("internal launchd runner must dispatch before config loading")
         }
+        crate::ServiceCommands::RunDesktopDaemon { .. } => {
+            anyhow::bail!("internal desktop runner must dispatch before config loading")
+        }
         crate::ServiceCommands::RunOpenrcLogWriter { .. } => {
             anyhow::bail!("internal OpenRC logger must dispatch before config loading")
         }

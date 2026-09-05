@@ -1,4 +1,4 @@
-//! Post-update self-respawn for bare (unsupervised) processes.
+//! Post-update restart contracts for bare and desktop-supervised processes.
 //!
 //! When the dashboard applies an upgrade with auto-restart on a process that has
 //! no supervisor (no systemd/launchd), the gateway calls [`request_respawn`] and
@@ -16,12 +16,18 @@
 //! unlinked by the swap, which is not spawnable.
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static RESPAWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static DESKTOP_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LAUNCH: OnceLock<LaunchCommand> = OnceLock::new();
+
+pub const DESKTOP_SUPERVISED_ENV: &str = "ZEROCLAW_DESKTOP_SUPERVISED";
+pub const DESKTOP_RESTART_MARKER_ENV: &str = "ZEROCLAW_DESKTOP_RESTART_MARKER";
+pub const DESKTOP_RESTART_EXIT_CODE: i32 = 75;
 
 #[derive(Clone)]
 struct LaunchCommand {
@@ -42,6 +48,49 @@ pub fn record_launch() {
 /// also trigger the daemon's graceful shutdown so the loop tears down first.
 pub fn request_respawn() {
     RESPAWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub fn is_desktop_supervised() -> bool {
+    std::env::var_os(DESKTOP_SUPERVISED_ENV).is_some_and(|value| value == "1")
+}
+
+pub fn request_desktop_restart() -> std::io::Result<()> {
+    let marker = std::env::var_os(DESKTOP_RESTART_MARKER_ENV).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "desktop restart marker is not configured by the supervisor",
+        )
+    })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let marker = PathBuf::from(marker);
+    let result = (|| {
+        let mut file = options.open(&marker)?;
+        file.write_all(b"zeroclaw-desktop-restart\n")?;
+        file.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&marker);
+        return Err(error);
+    }
+    DESKTOP_RESTART_REQUESTED.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+pub fn desktop_restart_requested() -> bool {
+    DESKTOP_RESTART_REQUESTED.load(Ordering::SeqCst)
 }
 
 /// Whether a self-respawn was requested.

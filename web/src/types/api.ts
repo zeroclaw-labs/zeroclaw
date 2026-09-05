@@ -26,10 +26,11 @@ export interface StatusResponse {
   /** Whether browser-triggered self-upgrade is enabled
    *  (`gateway.allow_self_upgrade`, default false). Gates the upgrade button. */
   allow_self_upgrade?: boolean;
-  /** How a post-upgrade restart is achieved: `supervised` (systemd/launchd
-   *  relaunches on exit), `self_respawn` (bare unix — the daemon detached-spawns
-   *  the new binary), or `manual` (container / non-unix bare — no auto-restart). */
-  restart_mode?: "supervised" | "self_respawn" | "manual";
+  /** How a post-upgrade restart is achieved: `desktop_supervised` (the desktop
+   *  app owns relaunch), `supervised` (systemd/launchd relaunches on exit),
+   *  `self_respawn` (bare unix — the daemon detached-spawns the new binary),
+   *  or `manual` (container / non-unix bare — no auto-restart). */
+  restart_mode?: "desktop_supervised" | "supervised" | "self_respawn" | "manual";
   /** Command to show the operator for finishing an upgrade with a restart. */
   restart_hint?: string;
 }
