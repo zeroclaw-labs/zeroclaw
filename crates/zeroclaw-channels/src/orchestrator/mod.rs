@@ -6284,16 +6284,6 @@ async fn process_channel_message_body(
         "channel inbound message"
     );
 
-    // Dispatch ownership of a picker selection's delivery-ack registration:
-    // every definitive exit of this function (hook cancel, self-loop drop,
-    // passive context, task abort, or normal completion) settles whatever
-    // the registry still holds for this message, so a selection that never
-    // reached the mutation point cannot leave a revoked marker behind for
-    // the daemon's lifetime. No-op for ordinary traffic and for a selection
-    // that was confirmed, applied, or consumed as revoked below.
-    #[cfg(feature = "channel-telegram")]
-    let _dispatch_ownership = crate::model_picker_delivery::DispatchOwnership::hold(&msg.id);
-
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
@@ -8148,6 +8138,19 @@ async fn dispatch_worker(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
+    // Dispatch ownership of a picker selection's delivery-ack registration,
+    // held from the moment this worker owns the dequeued message: across
+    // the wait for the sender's previous turn (a newer message can cancel
+    // this worker there, so `process_channel_message` returns before the
+    // body runs), every early exit of the body (hook cancel, self-loop
+    // drop, passive context), a task abort, and normal completion. The drop
+    // settles whatever the registry still holds for this message, so a
+    // selection that never reached the mutation point cannot leave a
+    // revoked marker behind for the daemon's lifetime. No-op for ordinary
+    // traffic and for a selection that was confirmed, applied, or consumed
+    // as revoked by the body.
+    #[cfg(feature = "channel-telegram")]
+    let _dispatch_ownership = crate::model_picker_delivery::DispatchOwnership::hold(&msg.id);
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
@@ -27480,11 +27483,14 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Telegram dispatch context whose inbound hook cancels every message
-    /// before the picker delivery-ack gate runs.
+    /// Telegram dispatch context for the picker drop regressions: optionally
+    /// an inbound hook that cancels every message before the delivery-ack
+    /// gate runs, optionally interrupt-on-new-message for Telegram.
     #[cfg(feature = "channel-telegram")]
-    fn hook_cancelled_picker_dispatch_context(
+    fn picker_dispatch_context(
         zeroclaw_dir: &std::path::Path,
+        cancel_inbound: bool,
+        interrupt_telegram: bool,
     ) -> (
         Arc<ChannelRuntimeContext>,
         Arc<HistoryCaptureModelProvider>,
@@ -27509,14 +27515,24 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert("telegram.main".to_string(), channel);
         ctx.channels_by_name = Arc::new(channels_by_name);
-        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
-        hook_runner.register(Box::new(CancelInboundMessageHook));
-        ctx.hooks = Some(Arc::new(hook_runner));
+        if cancel_inbound {
+            let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+            hook_runner.register(Box::new(CancelInboundMessageHook));
+            ctx.hooks = Some(Arc::new(hook_runner));
+        }
+        ctx.interrupt_on_new_message = InterruptOnNewMessageConfig {
+            telegram: interrupt_telegram,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        };
         (Arc::new(ctx), provider_impl, channel_impl)
     }
 
     #[cfg(feature = "channel-telegram")]
-    fn hook_cancelled_picker_selection(id: &str) -> zeroclaw_api::channel::ChannelMessage {
+    fn picker_selection_message(id: &str) -> zeroclaw_api::channel::ChannelMessage {
         zeroclaw_api::channel::ChannelMessage {
             id: id.into(),
             sender: "test_user".into(),
@@ -27547,9 +27563,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let (runtime_ctx, provider_impl, channel_impl) =
-            hook_cancelled_picker_dispatch_context(tmp.path());
+            picker_dispatch_context(tmp.path(), true, false);
         let selection =
-            hook_cancelled_picker_selection("telegram_model_picker_selection_hook_cancel_revoked");
+            picker_selection_message("telegram_model_picker_selection_hook_cancel_revoked");
         // Mirror the timed-out callback: registered before the queue
         // handoff, revoked when the bounded ack wait elapsed.
         let _delivery_ack = crate::model_picker_delivery::register(&selection.id);
@@ -27598,9 +27614,9 @@ BTC is currently around $65,000 based on latest tool output."#
         let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let (runtime_ctx, provider_impl, channel_impl) =
-            hook_cancelled_picker_dispatch_context(tmp.path());
+            picker_dispatch_context(tmp.path(), true, false);
         let selection =
-            hook_cancelled_picker_selection("telegram_model_picker_selection_hook_cancel_waiting");
+            picker_selection_message("telegram_model_picker_selection_hook_cancel_waiting");
         let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
         delivery_ack.mark_enqueued();
 
@@ -27624,6 +27640,106 @@ BTC is currently around $65,000 based on latest tool output."#
             assert!(
                 overrides.is_empty(),
                 "hook-cancelled picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(provider_impl.calls.lock().unwrap().is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+    }
+
+    /// Regression for the drop before the message body even starts: with
+    /// interrupt-on-new-message enabled, a worker first waits for the
+    /// sender's previous turn to finish. A newer message for the same
+    /// sender can cancel this worker during that wait, so
+    /// `process_channel_message` returns on its initial cancellation check
+    /// and `process_channel_message_body` never runs. The dispatch
+    /// ownership is held from the start of the worker, so the waiting
+    /// callback is released at once, its revoke wins, and nothing stays
+    /// registered; the route is untouched.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatch_worker_cancelled_while_waiting_for_previous_turn_settles_model_picker_selection()
+     {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            picker_dispatch_context(tmp.path(), false, true);
+        let selection =
+            picker_selection_message("telegram_model_picker_selection_cancelled_while_waiting");
+        let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        delivery_ack.mark_enqueued();
+
+        // The sender's previous turn is still running: it holds the
+        // in-flight slot and its completion is pending.
+        let scope_key = interruption_scope_key(&selection);
+        let previous_token = CancellationToken::new();
+        let previous_completion = Arc::new(InFlightTaskCompletion::new());
+        let in_flight = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        in_flight.lock().await.insert(
+            scope_key.clone(),
+            InFlightSenderTaskState {
+                task_id: 0,
+                cancellation: previous_token.clone(),
+                completion: Arc::clone(&previous_completion),
+            },
+        );
+        let task_sequence = Arc::new(AtomicU64::new(1));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        let worker_ctx = Arc::clone(&runtime_ctx);
+        let worker_msg = selection.clone();
+        let worker_in_flight = Arc::clone(&in_flight);
+        let worker_sequence = Arc::clone(&task_sequence);
+        let worker = zeroclaw_spawn::spawn!(dispatch_worker(
+            worker_ctx,
+            worker_msg,
+            worker_in_flight,
+            worker_sequence,
+            permit,
+        ));
+
+        // Wait until the worker has registered itself (task id 1) and is
+        // interrupting the previous turn.
+        let worker_token = loop {
+            let registered = in_flight
+                .lock()
+                .await
+                .get(&scope_key)
+                .filter(|state| state.task_id == 1)
+                .map(|state| state.cancellation.clone());
+            if let Some(token) = registered {
+                break token;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // A newer message for the same sender interrupts this worker while
+        // it is still waiting; only then does the previous turn finish.
+        worker_token.cancel();
+        previous_completion.mark_done();
+        worker.await.unwrap();
+        assert!(
+            previous_token.is_cancelled(),
+            "the worker must have taken the interrupt path"
+        );
+
+        let woken = tokio::time::timeout(Duration::from_secs(1), delivery_ack.wait()).await;
+        assert!(
+            matches!(woken, Ok(Err(_))),
+            "cancelled worker must release the waiting callback: {woken:?}"
+        );
+        assert!(matches!(
+            crate::model_picker_delivery::revoke(&selection.id),
+            crate::model_picker_delivery::RevokeOutcome::Won
+        ));
+        assert!(!crate::model_picker_delivery::is_registered(&selection.id));
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "cancelled picker selection must not write a route override: {overrides:?}"
             );
         }
         assert!(provider_impl.calls.lock().unwrap().is_empty());
