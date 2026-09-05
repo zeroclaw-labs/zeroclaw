@@ -1192,6 +1192,7 @@ tool-runtime-command-docker-allowed-root = Failed to build runtime command: Fail
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
 cli-approval-request = 🔧 Agent wants to execute: {$tool}
+cli-approval-intent = { "   " }Stated intent (agent-claimed, untrusted): {$intent}
 cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 
 # ── Tool approval (channels, #9409) ──

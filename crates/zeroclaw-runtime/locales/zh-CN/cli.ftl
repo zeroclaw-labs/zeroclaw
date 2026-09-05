@@ -1003,6 +1003,77 @@ cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败�
 cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
 cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
 cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 已有 context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {$provider_ref}: 将设置 context_window = {$ctx} (试运行)
+cli-doctor-ctxwin-set = {$provider_ref}: 已设置 context_window = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {$updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: 写入 context_window 失败: {$error}
+cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_window} 个令牌
+cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
+cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
+sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
+sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
+sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
+sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
+sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
+sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
+
+# ── 终端工具审批 ──
+# ASCII 快捷键与 Rust 响应解析器保持一致。
+cli-approval-request = 🔧 代理想要执行：{$tool}
+cli-approval-intent = { "   " }声明的意图（代理自述，不可信）：{$intent}
+cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = 需要工具批准
+channel-approval-heading-shout = 需要批准
+channel-approval-tool-label = 工具
+channel-approval-args-label = 参数
+channel-approval-btn-approve = 批准
+channel-approval-btn-deny = 拒绝
+channel-approval-btn-always = 始终
+channel-approval-tap-instruction = 点击下方按钮：
+channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
+channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-approval-group-visibility-warning =
+    这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
+channel-telegram-approval-ack-approved = 已批准
+channel-telegram-approval-ack-always-approved = 已始终批准
+channel-telegram-approval-ack-denied = 已拒绝
+channel-telegram-approval-ack-not-accepted = 审批未被接受
+channel-telegram-approval-ack-unknown = 未知操作
+channel-telegram-approval-ack-already-resolved = 审批已被处理
+channel-discord-approval-btn-allow-once = 仅本次允许
+channel-discord-approval-btn-allow-session = 本会话允许
+channel-discord-approval-btn-allow-always = 始终允许
+channel-approval-title = 批准 { $tool }？
+channel-approval-opt-allow-once = 仅本次允许
+channel-approval-opt-allow-always = 始终允许
+channel-approval-opt-reject = 拒绝
+channel-approval-opt-reject-with-edit = 编辑后拒绝
+# ── Agent vision capability errors ──
 cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
 cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
 cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。

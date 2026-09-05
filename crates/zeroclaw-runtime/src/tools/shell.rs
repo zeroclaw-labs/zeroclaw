@@ -237,10 +237,10 @@ impl Tool for ShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
-                    "default": false
+                "intent": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "What this command is meant to accomplish, in one sentence. Shown to the operator next to the real command during approval; never used for authorization."
                 }
             },
             "required": ["command"]
@@ -262,14 +262,20 @@ impl Tool for ShellTool {
 
                 anyhow::Error::msg("Missing 'command' parameter")
             })?;
-        let approved = args
+        // The runtime-injected `approved` bit means "a fingerprint-bound
+        // confirmation was consumed for THIS exact command" (RFC 7155
+        // §5.2): the loop strips any model-supplied value and only the
+        // approval gate's mint+consume writes `true`. See
+        // `agent::set_runtime_approved_arg` and the gate in
+        // `agent::turn::approval_gate`.
+        let confirmed = args
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        match self.security.validate_command_execution_for_shell(
+        match self.security.validate_command_execution_confirmed(
             command,
-            approved,
+            confirmed,
             self.runtime.shell_dialect(),
         ) {
             Ok(_) => {}
@@ -738,7 +744,10 @@ mod tests {
                 .expect("schema required field should be an array")
                 .contains(&json!("command"))
         );
-        assert!(schema["properties"]["approved"].is_object());
+        // The runtime-owned `approved` arg is intentionally absent from the
+        // schema: the model must never be told it can self-approve (RFC 7155).
+        // `agent::set_runtime_approved_arg` is the only writer on the loop path.
+        assert!(schema["properties"].get("approved").is_none());
     }
 
     #[cfg(all(any(unix, windows), not(target_os = "android")))]
@@ -1628,7 +1637,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("explicit approval")
+                .contains("operator approval")
         );
 
         let allowed = tool

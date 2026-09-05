@@ -31,6 +31,15 @@ pub use turn::{
     semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
 
+/// Tools whose execution policy consumes a runtime-owned `approved` bit.
+///
+/// The `approved` arg is runtime plumbing, NOT a model-facing parameter: no
+/// tool schema advertises it (RFC 7155 — a model must never be told it can
+/// self-approve). [`set_runtime_approved_arg`] is the only writer on the tool
+/// loop path: `call_prep` overwrites the key unconditionally before the
+/// approval gate (stripping any model-supplied value) and rewrites it with the
+/// gate's decision after, so a model-supplied `approved` can never survive
+/// into tool execution.
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -38,6 +47,11 @@ pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     )
 }
 
+/// Overwrite the runtime-owned `approved` arg for an approval-gated tool.
+///
+/// Callers must treat this as the sole authority for the bit: the tool loop
+/// always calls it (first with `false` to strip model input, then with the
+/// approval gate's decision) before dispatching the tool.
 pub(crate) fn set_runtime_approved_arg(
     tool_name: &str,
     args: &mut serde_json::Value,

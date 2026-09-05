@@ -9138,9 +9138,9 @@ command = "rm independent-delegate-marker"
             "nested tool result must report runtime fail-closed denial: {tool_messages:?}"
         );
         assert!(
-            tool_messages.iter().any(|message| {
-                message.contains("Command requires explicit approval (approved=true)")
-            }),
+            tool_messages
+                .iter()
+                .any(|message| { message.contains("Command requires operator approval") }),
             "built-in shell must still receive approved=false and enforce command policy: {tool_messages:?}"
         );
     }

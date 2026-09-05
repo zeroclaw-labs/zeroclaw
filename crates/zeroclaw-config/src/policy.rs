@@ -367,6 +367,12 @@ pub struct SecurityPolicy {
     /// Tools that always require approval in this profile. Mirrors
     /// `RiskProfileConfig.always_ask`.
     pub always_ask: Vec<String>,
+    /// Explicit `tool_policy` rules (RFC 7155 §4.3) copied from the risk
+    /// profile at construction. The three-tier rule table is compiled from
+    /// this policy's own fields on demand (see
+    /// [`compile_rule_set`](Self::compile_rule_set)), so a struct-literal
+    /// construction can never desync the table from the fields.
+    pub tool_policy: crate::tool_policy::ToolPolicyConfig,
     /// Whether the sandbox is enabled for this profile. `None`
     /// inherits the global default at the call site.
     pub sandbox_enabled: Option<bool>,
@@ -684,6 +690,10 @@ pub enum EscalationViolation {
     /// (parent) to `false`, bypassing the human-in-the-loop step the
     /// parent required.
     RequireApprovalDisabledByChild,
+    /// The child's explicit `tool_policy` rules widen the parent's on
+    /// resolved semantics (RFC 7155 §4.4): an uncovered child `Allow`,
+    /// a dropped parent `Deny`, or an extended confirmation window.
+    ToolPolicyEscalation { reason: String },
 }
 
 impl std::fmt::Display for EscalationViolation {
@@ -740,6 +750,9 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent attempts to set require_approval_for_medium_risk=false but the parent enforces it"
             ),
+            Self::ToolPolicyEscalation { reason } => {
+                write!(f, "subagent tool_policy widens the parent's: {reason}")
+            }
         }
     }
 }
@@ -771,6 +784,7 @@ impl Default for SecurityPolicy {
             excluded_tools: None,
             auto_approve: vec![],
             always_ask: vec![],
+            tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
@@ -971,7 +985,7 @@ fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Opti
 
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
-fn skip_env_assignments(s: &str) -> &str {
+pub(crate) fn skip_env_assignments(s: &str) -> &str {
     let mut rest = s;
     loop {
         let Some(word) = rest.split_whitespace().next() else {
@@ -999,7 +1013,7 @@ enum QuoteState {
     Double,
 }
 
-fn split_unquoted_segments(command: &str) -> Vec<String> {
+pub(crate) fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
@@ -1157,7 +1171,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 /// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
 /// so their `&` doesn't get flagged as a background operator.
-fn strip_fd_merge_redirects(command: &str) -> String {
+pub(crate) fn strip_fd_merge_redirects(command: &str) -> String {
     use std::sync::OnceLock;
     // Matches patterns like: 2>&1, 1>&2, >&2, <&0, 2<&-, >&-
     static FD_MERGE_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -1169,7 +1183,7 @@ fn strip_fd_merge_redirects(command: &str) -> String {
 
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_unquoted_single_ampersand(command: &str) -> bool {
+pub(crate) fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
@@ -1269,7 +1283,10 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
 
 /// Returns true if `command` contains an unquoted `>` that is NOT a safe
 /// stderr form (`2>/dev/null`, `2>&1`).
-fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialect) -> bool {
+pub(crate) fn contains_unsafe_output_redirect_for_shell(
+    command: &str,
+    dialect: ShellDialect,
+) -> bool {
     // Strip safe redirect-to-dev patterns (with word boundary enforcement),
     // then fd-merge patterns, then check for remaining `>`.
     use regex::Regex;
@@ -1320,7 +1337,7 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
-fn contains_unquoted_input_redirect(command: &str) -> bool {
+pub(crate) fn contains_unquoted_input_redirect(command: &str) -> bool {
     // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
     // with word boundary enforcement.
     use regex::Regex;
@@ -1341,7 +1358,7 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
 /// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
 /// treated as literals and therefore ignored.
-fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
+pub(crate) fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let chars: Vec<char> = command.chars().collect();
@@ -1410,7 +1427,7 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
     false
 }
 
-fn strip_wrapping_quotes(token: &str) -> &str {
+pub(crate) fn strip_wrapping_quotes(token: &str) -> &str {
     token.trim_matches(|c| c == '"' || c == '\'')
 }
 
@@ -1560,7 +1577,7 @@ fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
 /// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
-fn command_basename(raw: &str) -> &str {
+pub(crate) fn command_basename(raw: &str) -> &str {
     let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
@@ -1568,7 +1585,7 @@ fn command_basename(raw: &str) -> &str {
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
 /// matching against allowlists and risk tables. On non-Windows platforms this
 /// is a no-op that returns the input unchanged.
-fn strip_windows_exe_suffix(name: &str) -> &str {
+pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
     if cfg!(target_os = "windows") {
         name.strip_suffix(".exe")
             .or_else(|| name.strip_suffix(".cmd"))
@@ -1582,7 +1599,7 @@ fn strip_windows_exe_suffix(name: &str) -> &str {
 /// Compare two bare command names using the same semantics everywhere a
 /// command allowlist is interpreted. Path-like entries are handled by their
 /// callers and deliberately do not pass through this case-folding rule.
-fn command_names_equivalent(left: &str, right: &str) -> bool {
+pub(crate) fn command_names_equivalent(left: &str, right: &str) -> bool {
     let left_lower = left.to_ascii_lowercase();
     let right_lower = right.to_ascii_lowercase();
     if left_lower == right_lower {
@@ -1622,7 +1639,11 @@ fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     command_names_equivalent(left, right)
 }
 
-fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+pub(crate) fn is_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
         return false;
@@ -1810,7 +1831,7 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
     Some(segments)
 }
 
-fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
+pub(crate) fn split_simple_powershell_pipeline(command: &str) -> Option<Vec<String>> {
     let segments = split_powershell_pipeline_syntax(command)?;
     powershell_variables_are_simple(command).then_some(segments)
 }
@@ -1929,7 +1950,7 @@ fn is_powershell_batch_file(name: &str) -> bool {
     })
 }
 
-fn is_powershell_provider_argument(argument: &str) -> bool {
+pub(crate) fn is_powershell_provider_argument(argument: &str) -> bool {
     let argument = strip_wrapping_quotes(argument).to_ascii_lowercase();
     argument.contains("::")
         || [
@@ -2041,7 +2062,136 @@ fn powershell_named_risk(base: &str) -> Option<CommandRiskLevel> {
     None
 }
 
-fn generic_segment_risk(
+/// Whether the argument list of a known executable is safe in itself.
+///
+/// Free-function form of [`SecurityPolicy::is_args_safe`] so the
+/// tool-policy extractor (crate::tool_policy) can apply the identical
+/// per-executable argument checks while building shell actions — the
+/// checks and the extractor must never drift apart.
+pub(crate) fn args_safe(base: &str, args: &[String], args_cased: &[String]) -> bool {
+    let base = base.to_ascii_lowercase();
+    match base.as_str() {
+        "find" => {
+            // find -exec and find -ok allow arbitrary command execution
+            !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+        }
+        "git" => {
+            !args_cased.iter().any(|arg| arg == "-c")
+                && !args.iter().any(|arg| {
+                    arg == "config"
+                        || arg.starts_with("config.")
+                        || arg == "alias"
+                        || arg.starts_with("alias.")
+                })
+        }
+        "python" | "python3" => !args
+            .iter()
+            .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
+        "node" => {
+            // -e/--eval evaluates argument as JavaScript
+            // -p/--print same as --eval but prints the result
+            // starts_with covers glued form: node -e'code' (one whitespace token)
+            // Ref: https://nodejs.org/api/cli.html
+            !args.iter().any(|arg| {
+                arg.starts_with("-e")
+                    || arg.starts_with("--eval")
+                    || arg.starts_with("-p")
+                    || arg.starts_with("--print")
+            })
+        }
+        "pip" | "pip3" => {
+            // install/download fetch external packages; setup.py runs arbitrary code
+            // Ref: https://blog.phylum.io/python-package-installation-attacks/
+            !args.iter().any(|arg| arg == "install" || arg == "download")
+        }
+        "npm" => {
+            // exec can fetch+run remote packages (npx behavior)
+            // install fetches external packages; lifecycle scripts run arbitrary code
+            // Ref: https://cheatsheetseries.owasp.org/cheatsheets/NPM_Security_Cheat_Sheet.html
+            !args.iter().any(|arg| {
+                arg == "exec" || arg == "install" || arg == "i" || arg == "add" || arg == "ci"
+            })
+        }
+        "cargo" => {
+            // install fetches+builds external crate; build.rs executes arbitrary code
+            // Ref: https://shnatsel.medium.com/do-not-run-any-cargo-commands-on-untrusted-projects
+            !args.iter().any(|arg| arg == "install")
+        }
+        _ => true,
+    }
+}
+
+/// Risk classification for ONE PowerShell pipeline segment.
+///
+/// Factored out of `command_risk_level_for_shell` so the tool-policy
+/// extractor (crate::tool_policy) classifies segment risk through the exact
+/// same rules instead of a drifting copy. The unknown-name `None → High`
+/// case is deliberate: PowerShell resolves bare names through aliases,
+/// functions, cmdlets, scripts, and applications, so an unrecognized name
+/// must never be treated as low risk.
+pub(crate) fn powershell_segment_risk(segment: &str, has_pipeline: bool) -> CommandRiskLevel {
+    let mut words = segment.split_whitespace();
+    let Some(base_raw) = words.next() else {
+        return CommandRiskLevel::High;
+    };
+    let base_owned = command_basename(base_raw).to_ascii_lowercase();
+    if is_powershell_batch_file(&base_owned) {
+        return CommandRiskLevel::High;
+    }
+    let base = strip_powershell_executable_suffix(&base_owned);
+    let arguments: Vec<&str> = words.collect();
+    let arguments_lower: Vec<String> = arguments
+        .iter()
+        .map(|argument| argument.to_ascii_lowercase())
+        .collect();
+    if arguments
+        .iter()
+        .any(|argument| is_powershell_provider_argument(argument))
+        || (segment.contains('$') && (has_pipeline || !matches!(base, "write-output" | "echo")))
+    {
+        return CommandRiskLevel::High;
+    }
+
+    if base_owned.ends_with(".ps1")
+        || base_owned.ends_with(".psm1")
+        || base_owned.ends_with(".psd1")
+        || matches!(
+            base,
+            "." | "cmd"
+                | "command"
+                | "powershell"
+                | "pwsh"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "fish"
+                | "wsl"
+        )
+    {
+        return CommandRiskLevel::High;
+    }
+
+    match powershell_named_risk(base) {
+        Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
+        Some(CommandRiskLevel::Medium) => return CommandRiskLevel::Medium,
+        Some(CommandRiskLevel::Low) => return CommandRiskLevel::Low,
+        None => {}
+    }
+
+    match generic_segment_risk(base, &arguments_lower, &segment.to_ascii_lowercase()) {
+        Some(CommandRiskLevel::High) => CommandRiskLevel::High,
+        Some(CommandRiskLevel::Medium) => CommandRiskLevel::Medium,
+        Some(CommandRiskLevel::Low) => CommandRiskLevel::Low,
+        // PowerShell resolves bare names through aliases, functions,
+        // cmdlets, scripts, and applications. If none of the known
+        // command families above recognizes the name, treating it as
+        // low risk would let a mutable alias or function hide behind
+        // the wildcard allowlist.
+        None => CommandRiskLevel::High,
+    }
+}
+
+pub(crate) fn generic_segment_risk(
     base: &str,
     args: &[String],
     joined_segment: &str,
@@ -2216,69 +2366,11 @@ impl SecurityPolicy {
         let mut saw_medium = false;
         let has_pipeline = segments.len() > 1;
 
-        for segment in segments {
-            let mut words = segment.split_whitespace();
-            let Some(base_raw) = words.next() else {
-                return CommandRiskLevel::High;
-            };
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
-            if is_powershell_batch_file(&base_owned) {
-                return CommandRiskLevel::High;
-            }
-            let base = strip_powershell_executable_suffix(&base_owned);
-            let arguments: Vec<&str> = words.collect();
-            let arguments_lower: Vec<String> = arguments
-                .iter()
-                .map(|argument| argument.to_ascii_lowercase())
-                .collect();
-            if arguments
-                .iter()
-                .any(|argument| is_powershell_provider_argument(argument))
-                || (segment.contains('$')
-                    && (has_pipeline || !matches!(base, "write-output" | "echo")))
-            {
-                return CommandRiskLevel::High;
-            }
-
-            if base_owned.ends_with(".ps1")
-                || base_owned.ends_with(".psm1")
-                || base_owned.ends_with(".psd1")
-                || matches!(
-                    base,
-                    "." | "cmd"
-                        | "command"
-                        | "powershell"
-                        | "pwsh"
-                        | "sh"
-                        | "bash"
-                        | "zsh"
-                        | "fish"
-                        | "wsl"
-                )
-            {
-                return CommandRiskLevel::High;
-            }
-
-            match powershell_named_risk(base) {
-                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
-                Some(CommandRiskLevel::Medium) => {
-                    saw_medium = true;
-                    continue;
-                }
-                Some(CommandRiskLevel::Low) => continue,
-                None => {}
-            }
-
-            match generic_segment_risk(base, &arguments_lower, &segment.to_ascii_lowercase()) {
-                Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
-                Some(CommandRiskLevel::Medium) => saw_medium = true,
-                Some(CommandRiskLevel::Low) => {}
-                // PowerShell resolves bare names through aliases, functions,
-                // cmdlets, scripts, and applications. If none of the known
-                // command families above recognizes the name, treating it as
-                // low risk would let a mutable alias or function hide behind
-                // the wildcard allowlist.
-                None => return CommandRiskLevel::High,
+        for segment in &segments {
+            match powershell_segment_risk(segment, has_pipeline) {
+                CommandRiskLevel::High => return CommandRiskLevel::High,
+                CommandRiskLevel::Medium => saw_medium = true,
+                CommandRiskLevel::Low => {}
             }
         }
 
@@ -2308,44 +2400,39 @@ impl SecurityPolicy {
     /// The dialect decides platform-specific redirect safety (e.g. the Windows
     /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
     /// under a POSIX shell).
+    ///
+    /// This is the **legacy-semantics** entry (RFC 7155 §3.2 keeps it as the
+    /// shell-specific wrapper): `approved` bridges the Supervised risk-tier
+    /// asks only. An unmatched command is rejected regardless of `approved`
+    /// — used by the cron/schedule creation paths and the skill tool, where
+    /// an approval (if any) covered a different action than this command.
+    /// The agent-loop shell path uses
+    /// [`validate_command_execution_confirmed`](Self::validate_command_execution_confirmed),
+    /// where the approval is a fingerprint-bound confirmation of this exact
+    /// command.
     pub fn validate_command_execution_for_shell(
         &self,
         command: &str,
         approved: bool,
         dialect: ShellDialect,
     ) -> Result<CommandRiskLevel, String> {
-        if dialect == ShellDialect::None {
-            return Err("Command blocked: configured runtime has no shell access".into());
-        }
+        use crate::tool_policy::{Decision, ResolutionReason};
 
-        if !self.is_command_allowed_for_shell(command, dialect) {
-            return Err(format!("Command not allowed by security policy: {command}"));
-        }
-
-        let risk = self.command_risk_level_for_shell(command, dialect);
-
-        if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands
-                && !self.is_command_explicitly_allowed_for_shell(command, dialect)
-            {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
-            }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
-            }
-        }
-
-        if risk == CommandRiskLevel::Medium
-            && self.autonomy == AutonomyLevel::Supervised
-            && self.require_approval_for_medium_risk
-            && !approved
-        {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+        let resolution = self.resolve_shell_decision(command, dialect, &[]);
+        match resolution.decision {
+            Decision::Allow => {}
+            Decision::Ask => match resolution.reason {
+                ResolutionReason::SupervisedRiskAsk { .. } if approved => {}
+                ResolutionReason::SupervisedRiskAsk { level } => {
+                    return Err(format!(
+                        "Command requires operator approval: {level:?}-risk operation"
+                    ));
+                }
+                // Unmatched (or degraded-to-Ask): this entry never bridges
+                // it — the approval did not cover this exact command.
+                _ => return Err(format!("Command not allowed by security policy: {command}")),
+            },
+            Decision::Deny => return Err(self.deny_message(&resolution, command)),
         }
 
         // Path confinement here is specific to Windows shell dialects, whose
@@ -2359,81 +2446,122 @@ impl SecurityPolicy {
             return Err(format!("Command blocked: forbidden path argument: {path}"));
         }
 
-        Ok(risk)
+        Ok(self.command_risk_level_for_shell(command, dialect))
     }
 
-    fn is_command_explicitly_allowed_for_shell(
+    /// Validate a shell command for the agent-loop path, where `confirmed`
+    /// means the runtime consumed a fingerprint-bound
+    /// [`TrustedConfirmation`](zeroclaw_api::permission::TrustedConfirmation)
+    /// for THIS exact command (minted after a real operator answer).
+    ///
+    /// The confirmation bridges every `Ask` tier — the risk-tier asks AND
+    /// the unmatched default (RFC 7155 §1.3's fail-closed-to-approval: an
+    /// operator who approved the exact command may run it even when no rule
+    /// allows it). A `Deny` never bridges: no confirmation can authorize a
+    /// denied command.
+    pub fn validate_command_execution_confirmed(
+        &self,
+        command: &str,
+        confirmed: bool,
+        dialect: ShellDialect,
+    ) -> Result<CommandRiskLevel, String> {
+        use crate::tool_policy::Decision;
+
+        let resolution = self.resolve_shell_decision(command, dialect, &[]);
+        match resolution.decision {
+            Decision::Allow => {}
+            // A confirmation bridges risk-tier asks and the unmatched
+            // default — but NOT a degraded-syntax Ask: the operator
+            // approved the fingerprint of a command whose syntax could not
+            // be trusted, and the legacy gates rejected those regardless
+            // of approval.
+            Decision::Ask
+                if confirmed
+                    && !matches!(
+                        resolution.reason,
+                        crate::tool_policy::ResolutionReason::DegradedSyntax { .. }
+                    ) => {}
+            Decision::Ask => {
+                use crate::tool_policy::ResolutionReason;
+                return Err(match resolution.reason {
+                    ResolutionReason::SupervisedRiskAsk { level } => {
+                        format!("Command requires operator approval: {level:?}-risk operation")
+                    }
+                    _ => format!("Command not allowed by security policy: {command}"),
+                });
+            }
+            Decision::Deny => return Err(self.deny_message(&resolution, command)),
+        }
+
+        if shell_uses_windows_path_syntax(dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+        {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
+        Ok(self.command_risk_level_for_shell(command, dialect))
+    }
+
+    /// Resolve a shell command against the compiled rule table (RFC 7155
+    /// §3.2: the canonical resolver is the only authority). Session rules —
+    /// the narrow `Allow` patterns an "always approve" answer mints —
+    /// participate as an additional scope.
+    pub fn resolve_shell_decision(
         &self,
         command: &str,
         dialect: ShellDialect,
-    ) -> bool {
-        match dialect {
-            ShellDialect::PowerShell => {
-                let Some(segments) = split_powershell_pipeline_syntax(command) else {
-                    return false;
-                };
-                segments.iter().all(|segment| {
-                    let raw_executable =
-                        strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
-                            .trim();
-                    let base_owned = command_basename(raw_executable).to_ascii_lowercase();
-                    let base = strip_powershell_executable_suffix(&base_owned);
-                    !base.is_empty()
-                        && !is_powershell_batch_file(&base_owned)
-                        && self.allowed_commands.iter().any(|allowed| {
-                            allowed.trim() != "*"
-                                && is_powershell_allowlist_entry_match(
-                                    allowed,
-                                    raw_executable,
-                                    base,
-                                )
-                        })
-                })
-            }
-            ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command)
-            }
-            ShellDialect::None => false,
-        }
+        session_rules: &[crate::tool_policy::PolicyRule],
+    ) -> crate::tool_policy::Resolution {
+        let compiled = self.compile_rule_set();
+        let action =
+            crate::tool_policy::extract_shell_action(command, dialect, Some(&self.workspace_dir));
+        let scopes = crate::tool_policy::ResolvedScopes {
+            profile: &compiled,
+            session_rules,
+        };
+        crate::tool_policy::resolve_decision(&action, &scopes)
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
-        let segments = split_unquoted_segments(command);
-        for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+    /// Compile the three-tier rule table from this policy's own fields.
+    ///
+    /// Compiled on demand rather than stored: `SecurityPolicy` is routinely
+    /// built by struct literal with field overrides, and a stored table
+    /// would silently desync from the overridden fields. The inputs are
+    /// small (tens of entries) and resolution happens at most a couple of
+    /// times per tool call, so on-demand compilation is the option that
+    /// cannot be wrong.
+    pub fn compile_rule_set(&self) -> crate::tool_policy::CompiledRuleSet {
+        crate::tool_policy::CompiledRuleSet::compile_from_fields(
+            self.autonomy,
+            &self.allowed_commands,
+            &self.always_ask,
+            &self.auto_approve,
+            self.block_high_risk_commands,
+            self.require_approval_for_medium_risk,
+            &self.tool_policy,
+        )
+    }
 
-            if base_cmd.is_empty() {
-                continue;
+    /// The operator-facing message for a denied resolution, preserving the
+    /// legacy wording per deny reason.
+    fn deny_message(&self, resolution: &crate::tool_policy::Resolution, command: &str) -> String {
+        use crate::tool_policy::ResolutionReason;
+        match resolution.reason {
+            ResolutionReason::NoShellAccess => {
+                "Command blocked: configured runtime has no shell access".to_string()
             }
-
-            let explicitly_listed = self.allowed_commands.iter().any(|allowed| {
-                let allowed = strip_wrapping_quotes(allowed).trim();
-                // Skip wildcard — it does not count as an explicit entry.
-                if allowed.is_empty() || allowed == "*" {
-                    return false;
-                }
-                is_allowlist_entry_match(allowed, executable, base_cmd)
-            });
-
-            if !explicitly_listed {
-                return false;
+            ResolutionReason::HighRiskBlocked => {
+                "Command blocked: high-risk command is disallowed by policy".to_string()
+            }
+            ResolutionReason::EmptyCommand | ResolutionReason::DegradedSyntax { .. } => {
+                format!("Command not allowed by security policy: {command}")
+            }
+            ResolutionReason::MatchedRule { .. }
+            | ResolutionReason::Unmatched
+            | ResolutionReason::SupervisedRiskAsk { .. } => {
+                format!("Command not allowed by security policy: {command}")
             }
         }
-
-        // At least one real command must be present.
-        segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        })
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -2623,56 +2751,7 @@ impl SecurityPolicy {
     }
 
     fn is_args_safe(&self, base: &str, args: &[String], args_cased: &[String]) -> bool {
-        let base = base.to_ascii_lowercase();
-        match base.as_str() {
-            "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
-            }
-            "git" => {
-                !args_cased.iter().any(|arg| arg == "-c")
-                    && !args.iter().any(|arg| {
-                        arg == "config"
-                            || arg.starts_with("config.")
-                            || arg == "alias"
-                            || arg.starts_with("alias.")
-                    })
-            }
-            "python" | "python3" => !args
-                .iter()
-                .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
-            "node" => {
-                // -e/--eval evaluates argument as JavaScript
-                // -p/--print same as --eval but prints the result
-                // starts_with covers glued form: node -e'code' (one whitespace token)
-                // Ref: https://nodejs.org/api/cli.html
-                !args.iter().any(|arg| {
-                    arg.starts_with("-e")
-                        || arg.starts_with("--eval")
-                        || arg.starts_with("-p")
-                        || arg.starts_with("--print")
-                })
-            }
-            "pip" | "pip3" => {
-                // install/download fetch external packages; setup.py runs arbitrary code
-                // Ref: https://blog.phylum.io/python-package-installation-attacks/
-                !args.iter().any(|arg| arg == "install" || arg == "download")
-            }
-            "npm" => {
-                // exec can fetch+run remote packages (npx behavior)
-                // install fetches external packages; lifecycle scripts run arbitrary code
-                // Ref: https://cheatsheetseries.owasp.org/cheatsheets/NPM_Security_Cheat_Sheet.html
-                !args.iter().any(|arg| {
-                    arg == "exec" || arg == "install" || arg == "i" || arg == "add" || arg == "ci"
-                })
-            }
-            "cargo" => {
-                // install fetches+builds external crate; build.rs executes arbitrary code
-                // Ref: https://shnatsel.medium.com/do-not-run-any-cargo-commands-on-untrusted-projects
-                !args.iter().any(|arg| arg == "install")
-            }
-            _ => true,
-        }
+        args_safe(base, args, args_cased)
     }
 
     /// Scan `command` for forbidden path arguments against a specific shell
@@ -3548,6 +3627,16 @@ impl SecurityPolicy {
             return Err(EscalationViolation::RequireApprovalDisabledByChild);
         }
 
+        // RFC 7155 §4.4: the explicit tool_policy rules compare on RESOLVED
+        // semantics — a child Allow must be a subset of a parent Allow, a
+        // parent Deny must stay in effect, and the confirmation window may
+        // only shrink.
+        if let Err(reason) =
+            crate::tool_policy::ensure_no_rule_escalation(&self.tool_policy, &parent.tool_policy)
+        {
+            return Err(EscalationViolation::ToolPolicyEscalation { reason });
+        }
+
         Ok(())
     }
 
@@ -3625,6 +3714,7 @@ impl SecurityPolicy {
             },
             auto_approve: risk_profile.auto_approve.clone(),
             always_ask: risk_profile.always_ask.clone(),
+            tool_policy: risk_profile.tool_policy.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
@@ -3989,6 +4079,7 @@ mod tests {
             approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
+            tool_policy: crate::tool_policy::ToolPolicyConfig::default(),
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
@@ -4688,7 +4779,7 @@ mod tests {
 
         let denied = p.validate_command_execution("touch test.txt", false);
         assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"),);
+        assert!(denied.unwrap_err().contains("requires operator approval"),);
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
@@ -4752,7 +4843,14 @@ mod tests {
 
         let result = p.validate_command_execution("wget https://evil.com", true);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed"));
+        // The resolver reports the most specific reason: high-risk and not
+        // precisely allowlisted (the old flow said "not allowed" because the
+        // allowlist ran first; the block subsumes it).
+        assert!(
+            result
+                .unwrap_err()
+                .contains("high-risk command is disallowed")
+        );
     }
 
     #[test]
@@ -4783,7 +4881,7 @@ mod tests {
 
         let denied = p.validate_command_execution("curl https://api.example.com", false);
         assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"));
+        assert!(denied.unwrap_err().contains("requires operator approval"));
 
         let allowed = p.validate_command_execution("curl https://api.example.com", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::High);

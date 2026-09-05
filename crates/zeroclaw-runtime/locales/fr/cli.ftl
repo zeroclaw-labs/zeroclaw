@@ -1007,6 +1007,77 @@ cli-delegate-error-invalid-semantic-completion = L'agent '{$agent_name}' a écho
 cli-agent-error-invalid-semantic-completion = Le fournisseur de modèle a renvoyé une réponse sémantique non valide.
 cli-delegate-error-incomplete-after-provider-tools = L'agent '{$agent_name}' a échoué : le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
 cli-agent-error-incomplete-after-provider-tools = Le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: inconnu / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
+cli-doctor-ctxwin-no-model = {$provider_ref}: aucun modèle configuré, ignoré
+cli-doctor-ctxwin-would-set = {$provider_ref}: définirait context_window = {$ctx} (simulation)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window défini = {$ctx}
+cli-doctor-ctxwin-not-found = {$provider_ref}: entrée introuvable pour mise à jour
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: n'expose pas la fenêtre de contexte ou l'obtention a échoué
+cli-doctor-ctxwin-saved = {$updated} mise(s) à jour enregistrée(s) dans config.toml
+cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
+cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
+cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de context_window: {$error}
+cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$context_window} jetons
+cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
+cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La vérification des modèles a expiré. Certains catalogues de fournisseurs peuvent être inaccessibles. Vous pouvez réexécuter Doctor pour actualiser.
+
+# ── Degraded config sections (doctor diagnose, #8835) ──
+cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
+cli-doctor-degraded-section = La section de configuration `{$path}` est malformée et a été réinitialisée aux valeurs par défaut ; les valeurs de cette section ne sont PAS en vigueur. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
+sop-approval-deferred-at-capacity = Impossible de reprendre l’exécution {$run_id} : tous les créneaux d’exécution sont occupés. L’approbation reste en attente ; réessayez lorsqu’un créneau se libère.
+sop-approval-policy-unavailable = L’approbation a échoué car l’étape SOP en attente est indisponible : {$reason}. L’exécution reste en attente.
+sop-rpc-decision-invalid-state = L’exécution {$run_id} ne peut pas être résolue dans son état actuel.
+sop-rpc-decision-unauthorized = L’identité RPC n’est pas autorisée à résoudre cette étape SOP.
+sop-rpc-policy-missing = La politique d’approbation SOP « {$name} » n’est pas configurée.
+sop-rpc-policy-unavailable = La politique du SOP en attente est indisponible : {$reason}.
+
+# ── Approbation des outils dans le terminal ──
+# Les raccourcis ASCII restent alignés sur l'analyseur de réponses Rust.
+cli-approval-request = 🔧 L'agent veut exécuter : {$tool}
+cli-approval-intent = { "   " }Intention déclarée (par l'agent, non fiable) : {$intent}
+cli-approval-prompt = { "   " }[Y] Oui / [N] Non / [A] Toujours pour {$tool} :{ " " }
+
+# ── Tool approval (channels, #9409) ──
+# Human-visible copy for the operator-facing tool-approval prompt, shared
+# across the button adapters (Telegram, Discord, Slack) and the text-reply
+# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
+# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
+# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
+# always) stay hardcoded ASCII in Rust — only the surrounding prose is
+# localized here.
+channel-approval-heading = Approbation de l'outil requise
+channel-approval-heading-shout = APPROBATION REQUISE
+channel-approval-tool-label = Outil
+channel-approval-args-label = Arguments
+channel-approval-btn-approve = Approuver
+channel-approval-btn-deny = Refuser
+channel-approval-btn-always = Toujours
+channel-approval-tap-instruction = Appuyez sur un bouton ci-dessous :
+channel-approval-reply-instruction-yesno = Répondez : "{ $yes_command }", "{ $no_command }" ou "{ $always_command }"
+channel-approval-reply-instruction-approve-deny = Répondez par `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    Il s'agit d'une discussion de groupe : tout le monde ici peut voir ce code et les arguments de l'outil affichés ci-dessus. Seul un pair autorisé de ce canal peut répondre.
+channel-telegram-approval-ack-approved = Approuvé
+channel-telegram-approval-ack-always-approved = Toujours approuvé
+channel-telegram-approval-ack-denied = Refusé
+channel-telegram-approval-ack-not-accepted = Approbation non acceptée
+channel-telegram-approval-ack-unknown = Action inconnue
+channel-telegram-approval-ack-already-resolved = Approbation déjà résolue
+channel-discord-approval-btn-allow-once = Autoriser une fois
+channel-discord-approval-btn-allow-session = Autoriser pour cette session
+channel-discord-approval-btn-allow-always = Toujours autoriser
+channel-approval-title = Approuver { $tool } ?
+channel-approval-opt-allow-once = Autoriser une fois
+channel-approval-opt-allow-always = Toujours autoriser
+channel-approval-opt-reject = Rejeter
+channel-approval-opt-reject-with-edit = Rejeter avec modification
+# ── Agent vision capability errors ──
 cli-agent-vision-unsupported-by-fallback = {$marker_count} marqueur(s) d’image reçu(s), mais le model_provider de secours={$fallback_name} ne prend pas en charge les entrées visuelles
 cli-agent-vision-unsupported-by-provider = {$marker_count} marqueur(s) d’image reçu(s), mais ce model_provider ne prend pas en charge les entrées visuelles
 cli-agent-error-provider-context-window = La requête est trop volumineuse pour le modèle sélectionné. Réduisez la conversation ou choisissez un modèle avec une fenêtre de contexte plus grande.

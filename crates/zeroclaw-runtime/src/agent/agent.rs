@@ -1709,7 +1709,7 @@ impl Agent {
                 security: &security,
                 built: all_tools_result,
                 skills: &skills,
-                runtime,
+                runtime: Arc::clone(&runtime),
                 caller_allowed: None,
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
@@ -1810,6 +1810,9 @@ impl Agent {
         } else {
             ApprovalManager::for_non_interactive(risk_profile)
         };
+        // RFC 7155: the gate resolves the actual shell command, which
+        // needs the policy and the runtime's dialect.
+        approval_manager.set_policy_context(Arc::clone(&security), runtime.shell_dialect());
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {

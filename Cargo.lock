@@ -13851,15 +13851,18 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures-util",
+ "hex",
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strum 0.28.0",
  "strum_macros 0.28.0",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -85,11 +85,6 @@ impl Tool for ScheduleTool {
                     "type": "string",
                     "description": "Shell command to execute. Required for create/add/once."
                 },
-                "approved": {
-                    "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
-                    "default": false
-                },
                 "id": {
                     "type": "string",
                     "description": "Task ID. Required for get/cancel/remove/pause/resume."
@@ -605,6 +600,9 @@ mod tests {
         assert_eq!(tool.name(), "schedule");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
+        // `approved` is runtime plumbing injected by the approval gate,
+        // never a model-facing parameter (RFC 7155).
+        assert!(schema["properties"].get("approved").is_none());
     }
 
     #[tokio::test]
@@ -940,7 +938,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("not allowed")
+                .contains("high-risk command is disallowed")
         );
     }
 
@@ -1021,7 +1019,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("explicit approval")
+                .contains("operator approval")
         );
 
         let approved = tool

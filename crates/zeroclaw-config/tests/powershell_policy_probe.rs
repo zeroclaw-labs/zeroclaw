@@ -266,7 +266,7 @@ fn wildcard_and_risk_flags_keep_their_existing_approval_semantics() {
             supervised
                 .validate_command_execution_for_shell(command, false, ShellDialect::PowerShell,)
                 .unwrap_err()
-                .contains("requires explicit approval")
+                .contains("requires operator approval")
         );
         assert_eq!(
             supervised
@@ -288,7 +288,7 @@ fn wildcard_and_risk_flags_keep_their_existing_approval_semantics() {
             supervised
                 .validate_command_execution_for_shell(command, false, ShellDialect::PowerShell,)
                 .unwrap_err()
-                .contains("requires explicit approval")
+                .contains("requires operator approval")
         );
         assert_eq!(
             supervised
