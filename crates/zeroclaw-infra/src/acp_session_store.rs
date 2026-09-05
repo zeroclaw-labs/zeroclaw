@@ -816,6 +816,13 @@ impl AcpSessionStore {
     /// `AssistantToolCalls`/`ToolResults` variants. Shared by `append_turn`
     /// (adds to the existing transcript) and `replace_messages` (called
     /// after clearing it) so both write the same row shapes.
+    ///
+    /// A `Chat` message with `role == "system"` is never written: the system
+    /// prompt is runtime/operator-owned context, not a conversation turn, and
+    /// `session/messages` has no restore-side filter for it. Enforcing this
+    /// here (the one write path both callers share) means a caller that
+    /// persists an agent's full `history()` — which always starts with the
+    /// system prompt — can't leak it into durable ACP transcript rows.
     fn insert_messages(
         tx: &rusqlite::Transaction<'_>,
         session_id: i64,
@@ -828,6 +835,7 @@ impl AcpSessionStore {
 
         for msg in messages {
             match msg {
+                ConversationMessage::Chat(chat) if chat.role == "system" => continue,
                 ConversationMessage::Chat(chat) => {
                     tx.execute(
                         "INSERT INTO acp_messages
@@ -1478,6 +1486,54 @@ mod tests {
             .unwrap();
         let data = store.load_session("sess-replace").unwrap().unwrap();
         assert_eq!(data.messages.len(), 4);
+    }
+
+    #[test]
+    fn insert_messages_never_persists_a_system_row() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-system", "alpha", "/tmp/proj")
+            .unwrap();
+
+        // An agent's authoritative `history()` always leads with the system
+        // prompt. Both write paths must drop it, since durable ACP rows
+        // become `session/messages` API output with no restore-side filter.
+        let full_history = vec![
+            ConversationMessage::Chat(ChatMessage::system("you are a helpful agent")),
+            ConversationMessage::Chat(ChatMessage::user("hello")),
+            ConversationMessage::Chat(ChatMessage::assistant("hi")),
+        ];
+        store
+            .replace_messages_and_breadcrumb("sess-system", &full_history, false)
+            .unwrap();
+
+        let data = store.load_session("sess-system").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "the system row must not be persisted"
+        );
+        assert!(
+            data.messages
+                .iter()
+                .all(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system")),
+        );
+
+        // append_turn shares the same insertion path.
+        store
+            .append_turn(
+                "sess-system",
+                &[ConversationMessage::Chat(ChatMessage::system(
+                    "a later system message",
+                ))],
+            )
+            .unwrap();
+        let data = store.load_session("sess-system").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "append_turn must skip system rows too"
+        );
     }
 
     #[test]
