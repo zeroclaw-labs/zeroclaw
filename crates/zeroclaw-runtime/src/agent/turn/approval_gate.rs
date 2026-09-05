@@ -5,13 +5,16 @@ use super::context::TurnCtx;
 use super::events::StreamDelta;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
-use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use crate::approval::{
+    ApprovalRequest, ApprovalRequirement, ApprovalResponse, CliApprovalPromptOutcome,
+};
 use std::time::Duration;
 
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
+    Cancelled,
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -102,7 +105,13 @@ pub(crate) async fn gate_tool_approval(
             };
             (decision, decided_by, unanswerable)
         } else {
-            (mgr.prompt_cli(&request), None, false)
+            match mgr
+                .prompt_cli_cancellable(&request, ctx.cancellation_token)
+                .await
+            {
+                CliApprovalPromptOutcome::Decision(decision) => (decision, None, false),
+                CliApprovalPromptOutcome::Cancelled => return ApprovalGateOutcome::Cancelled,
+            }
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());

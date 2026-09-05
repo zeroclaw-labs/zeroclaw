@@ -7,9 +7,16 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(any(windows, test))]
+use std::future::Future;
 #[cfg(unix)]
 use std::io::BufReader;
 use std::io::{self, BufRead, Write};
+#[cfg(any(windows, test))]
+use std::pin::Pin;
+#[cfg(any(windows, test))]
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::RiskProfileConfig;
 
 // ── Types ────────────────────────────────────────────────────────
@@ -77,6 +84,57 @@ pub enum ApprovalRequirement {
     Prompt,
     Approved,
     NotRequired,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CliApprovalPromptOutcome {
+    Decision(ApprovalResponse),
+    Cancelled,
+}
+
+#[cfg(any(windows, test))]
+type CliApprovalReadFuture =
+    Pin<Box<dyn Future<Output = io::Result<Option<String>>> + Send + 'static>>;
+
+/// Transient reader for an interactive owner's canonical input worker.
+///
+/// The ordinary CLI approval fallback still reads the controlling terminal.
+/// Interactive owners that already serialize process stdin can scope this
+/// adapter around a turn so approval does not create a competing reader.
+#[derive(Clone)]
+#[cfg(any(windows, test))]
+pub(crate) struct CliApprovalInput {
+    read_line: Arc<dyn Fn(CancellationToken) -> CliApprovalReadFuture + Send + Sync>,
+}
+
+#[cfg(any(windows, test))]
+impl CliApprovalInput {
+    pub(crate) fn new<F, Fut>(read_line: F) -> Self
+    where
+        F: Fn(CancellationToken) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<Option<String>>> + Send + 'static,
+    {
+        Self {
+            read_line: Arc::new(move |token| Box::pin(read_line(token))),
+        }
+    }
+
+    async fn read_line(&self, cancellation_token: CancellationToken) -> io::Result<Option<String>> {
+        (self.read_line)(cancellation_token).await
+    }
+}
+
+#[cfg(any(windows, test))]
+tokio::task_local! {
+    static CLI_APPROVAL_INPUT: CliApprovalInput;
+}
+
+#[cfg(any(windows, test))]
+pub(crate) async fn scope_cli_approval_input<F: Future>(
+    input: CliApprovalInput,
+    future: F,
+) -> F::Output {
+    CLI_APPROVAL_INPUT.scope(input, future).await
 }
 
 // ── ApprovalManager ──────────────────────────────────────────────
@@ -253,6 +311,47 @@ impl ApprovalManager {
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
     }
+
+    /// Prompt through the interactive owner's input worker when one is scoped
+    /// for this turn, and stop waiting when the turn is cancelled.
+    pub(crate) async fn prompt_cli_cancellable(
+        &self,
+        request: &ApprovalRequest,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> CliApprovalPromptOutcome {
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            return CliApprovalPromptOutcome::Cancelled;
+        }
+
+        write_cli_approval_prompt(request);
+        #[cfg(any(windows, test))]
+        let line = {
+            let scoped_input = CLI_APPROVAL_INPUT.try_with(Clone::clone).ok();
+            match scoped_input {
+                Some(input) => {
+                    let token = cancellation_token
+                        .cloned()
+                        .unwrap_or_else(CancellationToken::new);
+                    input.read_line(token).await
+                }
+                None => read_cli_approval_line().map(Some),
+            }
+        };
+        #[cfg(not(any(windows, test)))]
+        let line = read_cli_approval_line().map(Some);
+
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            return CliApprovalPromptOutcome::Cancelled;
+        }
+
+        match line {
+            Ok(Some(line)) => {
+                CliApprovalPromptOutcome::Decision(parse_cli_approval_response(&line))
+            }
+            Ok(None) => CliApprovalPromptOutcome::Cancelled,
+            Err(_) => CliApprovalPromptOutcome::Decision(ApprovalResponse::No),
+        }
+    }
 }
 
 // ── CLI prompt ───────────────────────────────────────────────────
@@ -260,6 +359,16 @@ impl ApprovalManager {
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
+    write_cli_approval_prompt(request);
+
+    let Ok(line) = read_cli_approval_line() else {
+        return ApprovalResponse::No;
+    };
+
+    parse_cli_approval_response(&line)
+}
+
+fn write_cli_approval_prompt(request: &ApprovalRequest) {
     let summary = summarize_args(&request.arguments);
     let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
@@ -273,12 +382,6 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
         crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
     );
     let _ = io::stderr().flush();
-
-    let Ok(line) = read_cli_approval_line() else {
-        return ApprovalResponse::No;
-    };
-
-    parse_cli_approval_response(&line)
 }
 
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
@@ -475,6 +578,35 @@ mod tests {
         assert_eq!(parse_cli_approval_response("\n"), ApprovalResponse::No);
         assert_eq!(parse_cli_approval_response("maybe\n"), ApprovalResponse::No);
         assert_eq!(parse_cli_approval_response("[Y]\n"), ApprovalResponse::No);
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_does_not_open_a_scoped_cli_approval_prompt() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_for_input = Arc::clone(&reads);
+        let input = CliApprovalInput::new(move |_token| {
+            let reads = Arc::clone(&reads_for_input);
+            async move {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Some("yes".to_string()))
+            }
+        });
+        let token = CancellationToken::new();
+        token.cancel();
+        let manager = ApprovalManager::from_risk_profile(&supervised_config());
+        let request = ApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "echo must-not-run"}),
+        };
+
+        let outcome = scope_cli_approval_input(
+            input,
+            manager.prompt_cli_cancellable(&request, Some(&token)),
+        )
+        .await;
+
+        assert_eq!(outcome, CliApprovalPromptOutcome::Cancelled);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

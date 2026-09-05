@@ -936,6 +936,14 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+cli-agent-interactive-signal-stream-closed = Interactive Ctrl+C signal stream closed unexpectedly.
+cli-agent-interactive-input-task-unavailable = Interactive input task is unavailable: {$error}
+cli-agent-interactive-signal-task-stopped = Interactive Ctrl+C signal task stopped unexpectedly.
+cli-agent-interactive-input-task-stopped = Interactive input task stopped unexpectedly.
+cli-agent-interactive-signal-init-failed = Failed to initialize interactive Ctrl+C handling.
+cli-agent-interactive-input-init-failed = Failed to initialize interactive input handling.
+cli-agent-interactive-input-lifecycle-failed = Interactive input lifecycle failed.
+cli-agent-interactive-confirmation-input-lifecycle-failed = Interactive confirmation input lifecycle failed.
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn

@@ -234,6 +234,9 @@ pub(crate) async fn prepare_tool_calls(
                     Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
                 continue;
             }
+            ApprovalGateOutcome::Cancelled => {
+                return Err(super::outcome::ToolLoopCancelled.into());
+            }
         };
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
