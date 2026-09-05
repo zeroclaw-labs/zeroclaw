@@ -153,7 +153,7 @@ block:
 ```json
 {"session_id":"sess-1","overrides":{"model":"claude-fable-5-1","thinking_level":"high","thinking_display":"summarized"},
  "thinking_options":{"model_provider":"anthropic.default","model":"claude-fable-5-1",
-   "levels":["low","medium","high","xhigh","max"],"displays":["omitted","summarized","updates"],
+   "levels":["low","medium","high","xhigh","max"],"displays":["omitted","summarized"],
    "current_level":"high","level_source":"session","current_display":"summarized","display_source":"session"}}
 ```
 

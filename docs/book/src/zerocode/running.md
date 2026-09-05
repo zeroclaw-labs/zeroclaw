@@ -41,13 +41,13 @@ Next to the model, the chat title shows the session's reasoning **effort** and *
 | `/effort <level>` | Set the reasoning depth for this session. `/thinking` and `/think` are aliases. |
 | `/effort reset` | Drop the session's depth and return to the runtime profile default. |
 | `/display` | Open the display picker. |
-| `/display <value>` | Choose how much of the reasoning comes back: `omitted`, `summarized` or `updates`. |
+| `/display <value>` | Choose how much of the reasoning comes back: `omitted` or `summarized`. |
 | `/display reset` | Drop the session's display choice. |
 | `/effort:<level> <prompt>` | Use a depth for one message only. `/think:<level>` still works. |
 
 The options come from the daemon and follow the session's model, so the pickers list only what the model accepts:
 
-- Claude 4.7 and later (Opus 4.7, 4.8 and 5, Sonnet 5, Fable and Mythos) offer `low`, `medium`, `high`, `xhigh` and `max`, and the displays `omitted` and `summarized`. Fable and Mythos also offer `updates`, the progress notes the model writes between tool calls.
+- Claude 4.7 and later (Opus 4.7, 4.8 and 5, Sonnet 5, Fable and Mythos) offer `low`, `medium`, `high`, `xhigh` and `max`, and the displays `omitted` and `summarized`. `updates`, the progress notes some models write between tool calls, is not offered: the one family documented to write them rejected the value in a live probe, so a configured `updates` is sent as `summarized` with a warning until a model is known to take it.
 - Claude 4.6 offers no `xhigh` and no display choice.
 - Older Claude models offer `medium`, `high` and `max` only when the runtime profile sets `native_thinking = true`, because those levels spend a token budget.
 - Claude on Bedrock offers depths but no display.

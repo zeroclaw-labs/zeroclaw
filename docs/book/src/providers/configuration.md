@@ -121,11 +121,10 @@ delivered when native thinking is enabled (`agent.thinking.native_thinking
 - `omitted`: the API's own default on the current generations, so nothing is
   sent; thinking text stays withheld, and on the models that think only when
   asked this does not switch reasoning on by itself.
-- `updates`: the request carries the
-  `thinking-display-updates-2026-08-18` beta and uses the streaming
-  response path. Readable thinking progress is surfaced live while the
-  model works; the signed reasoning payload is retained separately for
-  history replay and never shown.
+- `updates`: accepted, but sent as `summarized` with a warning until a model
+  is known to take it; the one family documented to write progress notes
+  rejected the value in a live probe. When it is sent, the request carries
+  the `thinking-display-updates-2026-08-18` beta.
 - `summarized`: same streaming behavior, requesting summarized thinking.
 
 ```toml
@@ -137,11 +136,11 @@ display = "updates"
 `updates` requires an Anthropic account enrolled in the
 `thinking-display-updates` beta; without enrollment the API rejects the
 request. Set `display = "off"` (or remove the field) to return to the
-previous wire behavior. The field reaches generation 4.7 and later only, and
-progress notes reach the Fable and Mythos families only; a value the model
-does not take is dropped with a log line. A zerocode session may choose a
-different display for itself, which beats this setting; the Anthropic slot's
-`thinking_display` fills in behind both (see [Anthropic](#anthropic)).
+previous wire behavior. The field reaches generation 4.7 and later only; a
+value the model does not take is dropped with a log line. A zerocode session
+may choose a different display for itself, which beats this setting; the
+Anthropic slot's `thinking_display` fills in behind both (see
+[Anthropic](#anthropic)).
 
 ## Per-family knobs: worked examples
 
@@ -160,7 +159,7 @@ thinking_display = "summarized"
 fallback_models = ["claude-opus-5"]
 ```
 
-- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary, and `updates` returns the short progress notes the model writes between tool calls. Leave it unset for the API default, which returns reasoning blocks with their text withheld. ZeroClaw adds the beta header `updates` needs, drops a value the model generation does not take (generation 4.6 takes none, and only the Fable and Mythos families write progress notes), and lets a zerocode session choose a different display for itself; see [Session controls](../zerocode/running.md#session-controls).
+- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary. Leave it unset for the API default, which returns reasoning blocks with their text withheld. `updates`, the short progress notes some models write between tool calls, is accepted but sent as `summarized` with a warning, because the one family documented to write them rejected the value in a live probe; a display the model generation does not take at all (generation 4.6 takes none) is dropped with a warning. A zerocode session can choose a different display for itself; see [Session controls](../zerocode/running.md#session-controls).
 - `max_tokens`: reasoning counts toward this cap on the current models, so the 4096 default is low. ZeroClaw warns when an adaptive model runs at or below it. Use 16000 or more, and 32000 for agentic work.
 - `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
 - `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.

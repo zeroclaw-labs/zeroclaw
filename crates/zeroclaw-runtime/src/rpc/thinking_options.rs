@@ -347,7 +347,7 @@ mod tests {
         let mut ctx = context("anthropic.default", "claude-fable-5-1", &high);
         let options = thinking_options(&ctx);
         assert_eq!(options.levels, vec![Low, Medium, High, XHigh, Max]);
-        assert_eq!(options.displays, vec![Omitted, Summarized, Updates]);
+        assert_eq!(options.displays, vec![Omitted, Summarized]);
         assert_eq!(options.current_level, Some(High));
         assert_eq!(options.level_source, Some(LevelSource::Profile));
         assert_eq!(options.current_display, Some(Omitted));
@@ -359,11 +359,11 @@ mod tests {
         assert_eq!(options.display_source, Some(DisplaySource::Alias));
 
         ctx.session_level = Some(Max);
-        ctx.session_display = Some(Updates);
+        ctx.session_display = Some(Omitted);
         let options = thinking_options(&ctx);
         assert_eq!(options.current_level, Some(Max));
         assert_eq!(options.level_source, Some(LevelSource::Session));
-        assert_eq!(options.current_display, Some(Updates));
+        assert_eq!(options.current_display, Some(Omitted));
         assert_eq!(options.display_source, Some(DisplaySource::Session));
 
         let medium = profile(Medium, false);
@@ -383,7 +383,7 @@ mod tests {
         let mut profile = profile(High, false);
         profile.display = ThinkingDisplayMode::Summarized;
         let mut ctx = context("anthropic.default", "claude-opus-4-8", &profile);
-        ctx.alias_display = Some(Updates);
+        ctx.alias_display = Some(Omitted);
         let options = thinking_options(&ctx);
         assert_eq!(options.current_display, Some(Summarized));
         assert_eq!(options.display_source, Some(DisplaySource::Profile));
@@ -395,7 +395,7 @@ mod tests {
 
         // A profile display the generation does not take falls through.
         let mut ctx = context("anthropic.default", "claude-opus-4-6", &profile);
-        ctx.alias_display = Some(Updates);
+        ctx.alias_display = Some(Omitted);
         let options = thinking_options(&ctx);
         assert_eq!(options.current_display, None);
         assert_eq!(options.display_source, None);
@@ -477,7 +477,7 @@ mod tests {
                 "model_provider": "anthropic.default",
                 "model": "claude-fable-5-1",
                 "levels": ["low", "medium", "high", "xhigh", "max"],
-                "displays": ["omitted", "summarized", "updates"],
+                "displays": ["omitted", "summarized"],
                 "current_level": "high",
                 "level_source": "profile",
                 "current_display": "summarized",

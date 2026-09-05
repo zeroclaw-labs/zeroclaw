@@ -12161,12 +12161,12 @@ mod tests {
         let result = dispatcher
             .handle_session_configure(&json!({
                 "session_id": session_id,
-                "overrides": {"thinking_level": "xhigh", "thinking_display": "updates"}
+                "overrides": {"thinking_level": "xhigh", "thinking_display": "summarized"}
             }))
             .await
             .expect("both choices are ones this model takes");
         assert_eq!(result["overrides"]["thinking_level"], "xhigh");
-        assert_eq!(result["overrides"]["thinking_display"], "updates");
+        assert_eq!(result["overrides"]["thinking_display"], "summarized");
         let overrides = thinking_overrides_for_session(&dispatcher, &session_id).await;
         assert_eq!(
             overrides.thinking_level,
@@ -12174,7 +12174,7 @@ mod tests {
         );
         assert_eq!(
             overrides.thinking_display,
-            Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates)
+            Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized)
         );
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
@@ -12583,7 +12583,7 @@ mod tests {
                 "model_provider": "anthropic.default",
                 "model": "claude-fable-5-1",
                 "levels": ["low", "medium", "high", "xhigh", "max"],
-                "displays": ["omitted", "summarized", "updates"],
+                "displays": ["omitted", "summarized"],
                 "current_level": "high",
                 "level_source": "profile",
                 "current_display": "omitted",
@@ -12703,13 +12703,13 @@ mod tests {
         let result = dispatcher
             .handle_session_configure(&json!({
                 "session_id": session_id,
-                "overrides": {"thinking_level": "xhigh", "thinking_display": "updates"}
+                "overrides": {"thinking_level": "xhigh", "thinking_display": "summarized"}
             }))
             .await
             .expect("both choices are ones this model takes");
         assert_eq!(result["thinking_options"]["current_level"], "xhigh");
         assert_eq!(result["thinking_options"]["level_source"], "session");
-        assert_eq!(result["thinking_options"]["current_display"], "updates");
+        assert_eq!(result["thinking_options"]["current_display"], "summarized");
         assert_eq!(result["thinking_options"]["display_source"], "session");
 
         let result = dispatcher

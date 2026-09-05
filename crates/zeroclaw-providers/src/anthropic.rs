@@ -2208,16 +2208,17 @@ impl AnthropicModelProvider {
         let requested_display = thinking
             .and_then(|params| params.display)
             .or_else(|| self.thinking_display.map(Into::into));
-        let display = requested_display.filter(|display| capabilities.supports_display(*display));
-        if requested_display.is_some() && display.is_none() {
+        let display = requested_display.and_then(|display| capabilities.fit_display(display));
+        if requested_display != display {
             ::zeroclaw_log::record!(
-                DEBUG,
+                WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({
                         "model": model,
                         "requested": requested_display.map(|display| display.as_str()),
+                        "sent": display.map(|display| display.as_str()),
                     })),
-                "thinking display dropped; this model generation does not take it"
+                "thinking display fitted to what this model takes"
             );
         }
         let display = display.filter(|display| display.wire_value().is_some());
@@ -4544,7 +4545,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("adaptive thinking config for fable-5-1");
         assert_eq!(thinking.kind, "adaptive");
         assert_eq!(thinking.budget_tokens, None);
-        assert_eq!(thinking.display, Some(ThinkingDisplay::Updates));
+        // Progress notes are sent as a summary until a model is known to take them.
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
         assert!(tuning.temperature.is_none());
         assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
@@ -4638,22 +4640,24 @@ data: {\"type\":\"message_stop\"}\n\n";
     fn request_display_beats_the_alias_display() {
         use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
         use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        // The alias asks for the API default, which sends nothing; the
+        // request asks for a summary and gets it.
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
-            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
             .build();
         let params = NativeThinkingParams {
             budget_tokens: None,
             effort: None,
-            display: Some(ThinkingDisplay::Updates),
+            display: Some(ThinkingDisplay::Summarized),
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
         let thinking = tuning
             .thinking
             .as_ref()
             .expect("a chosen display sends the object");
-        assert_eq!(thinking.display, Some(ThinkingDisplay::Updates));
-        assert_eq!(tuning.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
     }
 
     #[test]
@@ -4730,7 +4734,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn progress_notes_go_only_to_the_families_that_write_them() {
+    fn progress_notes_are_sent_as_summaries_until_a_model_takes_them() {
         use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
@@ -4740,22 +4744,25 @@ data: {\"type\":\"message_stop\"}\n\n";
             effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
-        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        for model in ["claude-opus-4-7", "claude-fable-5-1"] {
+            let tuning = provider.resolve_thinking(Some(params), None, model);
+            assert_eq!(
+                tuning
+                    .thinking
+                    .as_ref()
+                    .and_then(|thinking| thinking.display),
+                Some(ThinkingDisplay::Summarized),
+                "{model} gets a summary in place of progress notes"
+            );
+            assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+        }
+
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
         assert!(
             tuning.thinking.is_none(),
-            "a dropped display leaves nothing to send"
+            "a generation that takes no display sends nothing"
         );
         assert_eq!(tuning.display, None);
-
-        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
-        assert_eq!(
-            tuning
-                .thinking
-                .as_ref()
-                .and_then(|thinking| thinking.display),
-            Some(ThinkingDisplay::Updates)
-        );
-        assert_eq!(tuning.display, Some(ThinkingDisplay::Updates));
     }
 
     #[test]
@@ -8727,7 +8734,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let config = tuning
             .thinking
             .expect("thinking config for supported model");
-        assert_eq!(config.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(config.display, Some(ThinkingDisplay::Summarized));
 
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: Some(10_000),
@@ -9061,7 +9068,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .clone()
             .expect("streaming request body must be captured");
         assert_eq!(body["stream"], serde_json::json!(true));
-        assert_eq!(body["thinking"]["display"], serde_json::json!("updates"));
+        assert_eq!(body["thinking"]["display"], serde_json::json!("summarized"));
         assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
         assert!(
             body["thinking"].get("budget_tokens").is_none(),

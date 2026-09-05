@@ -94,6 +94,22 @@ impl ThinkingCapabilities {
             .filter(|candidate| *candidate <= effort)
             .max()
     }
+
+    /// The display to send for a requested one: the request itself when the
+    /// model takes it, a readable summary in place of progress notes where
+    /// the model takes summaries, and nothing where it takes no display.
+    #[must_use]
+    pub fn fit_display(&self, display: ThinkingDisplay) -> Option<ThinkingDisplay> {
+        if self.supports_display(display) {
+            Some(display)
+        } else if display == ThinkingDisplay::Updates
+            && self.supports_display(ThinkingDisplay::Summarized)
+        {
+            Some(ThinkingDisplay::Summarized)
+        } else {
+            None
+        }
+    }
 }
 
 /// Generations before 4.6 take a token budget and nothing else.
@@ -119,16 +135,12 @@ const EFFORTS_CURRENT: &[ThinkingEffort] = &[
     ThinkingEffort::Max,
 ];
 
-/// Displays every current family takes on the Anthropic API.
+/// Displays every current family takes on the Anthropic API. Progress notes
+/// (`updates`) are not offered anywhere: the one family documented to write
+/// them, Fable 5.1, answered 400 to the value in a live probe, so a request
+/// for them is sent as a summary instead until a model is known to take it.
 const DISPLAYS_CURRENT: &[ThinkingDisplay] =
     &[ThinkingDisplay::Omitted, ThinkingDisplay::Summarized];
-
-/// Displays of the families that also write progress notes between tool calls.
-const DISPLAYS_WITH_UPDATES: &[ThinkingDisplay] = &[
-    ThinkingDisplay::Omitted,
-    ThinkingDisplay::Summarized,
-    ThinkingDisplay::Updates,
-];
 
 /// Classify what `model` accepts when served through `slot`.
 ///
@@ -137,9 +149,8 @@ const DISPLAYS_WITH_UPDATES: &[ThinkingDisplay] = &[
 /// 4.6 keep the fixed budget. Generation 4.6 thinks adaptively but takes no
 /// display. Generation 4.7 and later, and any Claude id whose version cannot
 /// be read, take every depth, so a new release needs no code change here; on
-/// the Anthropic API they also take a display, with progress notes reserved
-/// for the families that write them. The Bedrock adapter forwards no display.
-/// Ids that are not Claude models at all get no controls.
+/// the Anthropic API they also take a display. The Bedrock adapter forwards
+/// no display. Ids that are not Claude models at all get no controls.
 #[must_use]
 pub fn thinking_capabilities(slot: ClaudeProviderSlot, model: &str) -> ThinkingCapabilities {
     let lower = model.to_ascii_lowercase();
@@ -160,10 +171,7 @@ pub fn thinking_capabilities(slot: ClaudeProviderSlot, model: &str) -> ThinkingC
             efforts: EFFORTS_CURRENT,
             displays: match slot {
                 ClaudeProviderSlot::Bedrock => &[],
-                ClaudeProviderSlot::Anthropic => match claude_family(rest) {
-                    ClaudeFamily::Fable | ClaudeFamily::Mythos => DISPLAYS_WITH_UPDATES,
-                    _ => DISPLAYS_CURRENT,
-                },
+                ClaudeProviderSlot::Anthropic => DISPLAYS_CURRENT,
             },
         },
     }
@@ -422,7 +430,7 @@ mod tests {
                 ClaudeThinkingShape::Adaptive,
                 false,
                 &[Low, High, XHigh, Max],
-                &[Omitted, Summarized, Updates],
+                &[Omitted, Summarized],
             ),
             (
                 Anthropic,
@@ -430,7 +438,7 @@ mod tests {
                 ClaudeThinkingShape::Adaptive,
                 false,
                 &[Low, High, XHigh, Max],
-                &[Omitted, Summarized, Updates],
+                &[Omitted, Summarized],
             ),
             (
                 Bedrock,
@@ -508,6 +516,23 @@ mod tests {
 
         assert_eq!(ThinkingCapabilities::NONE.fit_effort(Low), None);
         assert!(!ThinkingCapabilities::NONE.supports_display(Omitted));
+    }
+
+    #[test]
+    fn fit_display_sends_summaries_in_place_of_progress_notes() {
+        let fable = thinking_capabilities(Anthropic, "claude-fable-5-1");
+        assert_eq!(fable.fit_display(Summarized), Some(Summarized));
+        assert_eq!(fable.fit_display(Omitted), Some(Omitted));
+        assert_eq!(
+            fable.fit_display(Updates),
+            Some(Summarized),
+            "progress notes are not offered anywhere yet, so a summary stands in"
+        );
+        let previous = thinking_capabilities(Anthropic, "claude-opus-4-6");
+        assert_eq!(previous.fit_display(Updates), None);
+        assert_eq!(previous.fit_display(Summarized), None);
+        let bedrock = thinking_capabilities(Bedrock, "anthropic.claude-fable-5-1");
+        assert_eq!(bedrock.fit_display(Summarized), None);
     }
 
     #[test]
