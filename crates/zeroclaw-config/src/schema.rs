@@ -15439,7 +15439,14 @@ pub enum MattermostListenMode {
 }
 
 /// Mattermost bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived, for the same reason as
+/// [`DiscordConfig`]: a derived `Default` zeroes every field, which disagrees
+/// with the serde defaults, and for `approval_timeout_secs` that disagreement
+/// is load-bearing. `0` is an already-elapsed deadline, so an alias built in
+/// Rust would deny every approval while an alias parsed from a file waits the
+/// documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mattermost"]
 pub struct MattermostConfig {
@@ -15543,6 +15550,37 @@ pub struct MattermostConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+    /// Seconds to wait for operator approval on `always_ask` tools before
+    /// auto-denying. Mattermost prompts by posting a token-prefixed message and
+    /// reading the operator's reply, so this budget covers a human noticing the
+    /// post and typing back.
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+}
+
+impl Default for MattermostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            bot_token: None,
+            login_id: None,
+            password: None,
+            channel_ids: Vec::new(),
+            team_ids: Vec::new(),
+            discover_dms: None,
+            thread_replies: None,
+            mention_only: None,
+            interrupt_on_new_message: false,
+            proxy_url: None,
+            listen_mode: MattermostListenMode::default(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+        }
+    }
 }
 
 impl ChannelConfig for MattermostConfig {

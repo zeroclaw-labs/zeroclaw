@@ -59,6 +59,44 @@ Channel discovery, `mention_only`, `thread_replies`, audio transcription, and pe
 
 To roll back, set `listen_mode = "polling"` (or remove the field; polling is the default).
 
+## Tool approval over chat (`approval_timeout_secs`)
+
+When a tool needs approval (it is in `always_ask`, or the risk profile does not auto-approve it), the agent posts the request into the channel the message came from and waits. There are two ways to answer, and which ones you get depends on `listen_mode`.
+
+**Reply with the token.** This works in every listen mode:
+
+```
+APPROVAL REQUIRED [a1b2c3]
+Tool: shell
+Args: command: pwd
+
+Reply: "a1b2c3 yes", "a1b2c3 no", or "a1b2c3 always"
+```
+
+```
+a1b2c3 yes
+a1b2c3 no
+a1b2c3 always
+```
+
+A reply that matches a pending token is consumed as a decision and never reaches the model.
+
+**Tap a reaction.** This one requires `listen_mode = "websocket"`. The bot puts ✅ and ❌ on its own prompt post; tapping one answers it. Reactions reach the bot as `reaction_added` WebSocket events, and the polling listener reads posts and never sees them, so **under `listen_mode = "polling"` no emoji are seeded**: a button that silently does nothing on a security prompt is worse than no button. If you want one-tap approvals, set `listen_mode = "websocket"` (see [WebSocket mode](#websocket-mode)).
+
+`always` has no emoji on purpose. It grants a session-scoped allowlist entry rather than permitting a single call, and a mis-tap next to ✅ is too cheap a way to widen a session, so escalating to `always` stays a typed decision.
+
+Mattermost does not offer interactive message *buttons* here. Those post to an integration URL, which requires an inbound HTTP endpoint the bot has no way to expose from a polling or WebSocket client; reactions are the one-tap affordance that works over the connection the bot already holds.
+
+**Who may answer, and where.** The token is a correlator, not a password: it travels in plaintext into the channel, so every member can read it. Two conditions therefore both have to hold. The answering user must be in the alias's [peer group](./peer-groups.md), the same authority that decides whose messages the agent will act on. And the answer must arrive in the channel the prompt was posted into: one bot serves many channels, so a token carried into a different room is not an answer there, even from an authorized user. Binding is per channel rather than per thread, so replying in the channel instead of inside the prompt's thread is fine. A reply or tap that fails either check is logged at `WARN` and ignored, and the prompt stays open so an authorized operator can still answer it in the right place.
+
+**Everyone in the channel can read the tool arguments.** The prompt includes the tool name and a summary of its arguments. Route approvals to a channel whose membership you are comfortable showing those to.
+
+`approval_timeout_secs` bounds the wait. **The default is 300 seconds, and `0` denies immediately** rather than disabling approval, so a zero is a way to refuse every gated tool, not a way to wait forever. On timeout the request is denied and the token is discarded, so a late reply or tap cannot approve a call nobody is waiting on any more. A timeout or an unreachable prompt is recorded as the runtime denying on its own authority, not as a human refusing.
+
+Decisions are final: removing a reaction does not retract an answer, and the first valid answer retires the prompt for both paths.
+
+If the bot cannot place the emoji, most often a permissions problem, it logs `failed to seed Mattermost approval reaction` at `WARN` and the prompt still works by reply.
+
 ## Direct messages
 
 Mattermost classifies channels by `type`:
