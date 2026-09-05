@@ -64,7 +64,7 @@ impl Tool for CronRunsTool {
             });
         }
 
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
+        let raw_job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {
                 return Ok(ToolResult {
@@ -75,7 +75,7 @@ impl Tool for CronRunsTool {
             }
         };
 
-        let job_id = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
+        let job_id = match cron::get_job_for_agent(&self.config, raw_job_id, &self.agent_alias) {
             Ok(job) => job.id,
             Err(e) => {
                 return Ok(ToolResult {
@@ -91,7 +91,7 @@ impl Tool for CronRunsTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-        match cron::list_runs(&self.config, &job_id, limit) {
+        match cron::list_runs_for_agent(&self.config, &job_id, &self.agent_alias, limit) {
             Ok(runs) => {
                 let runs: Vec<RunView> = runs
                     .into_iter()
@@ -248,6 +248,7 @@ mod tests {
         let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
 
         assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("not found"));
         assert!(
             !format!("{:?}", result.output).contains("private-output"),
             "another agent's job output must not leak"
