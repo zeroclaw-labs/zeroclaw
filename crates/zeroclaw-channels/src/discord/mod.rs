@@ -3426,6 +3426,17 @@ impl Channel for DiscordChannel {
         self.multi_message_delay_ms
     }
 
+    async fn multi_message_confirmed_offset(&self, recipient: &str, _message_id: &str) -> usize {
+        if self.stream_mode != zeroclaw_config::schema::StreamMode::MultiMessage {
+            return 0;
+        }
+        self.multi_message_sent_len
+            .lock()
+            .get(recipient)
+            .copied()
+            .unwrap_or(0)
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         use zeroclaw_config::schema::StreamMode;
         // Interaction replies have no channel to draft into — the recipient
@@ -3544,7 +3555,7 @@ impl Channel for DiscordChannel {
             StreamMode::MultiMessage => {
                 // Track accumulated text and send new paragraphs at \n\n boundaries.
                 // Extract paragraph (if any) under the lock, then drop it before async work.
-                let (paragraph, thread_ts) = {
+                let (paragraph, consumed, thread_ts) = {
                     let thread_ts = self
                         .multi_message_thread_ts
                         .lock()
@@ -3563,11 +3574,15 @@ impl Channel for DiscordChannel {
                         return Ok(());
                     }
 
-                    let new_text = &text[sent_so_far..];
+                    // Defensive: the counter was derived from earlier frames;
+                    // if the accumulated text was rewritten around it, degrade
+                    // to a floored boundary instead of panicking mid-character.
+                    let new_text = &text[text.floor_char_boundary(sent_so_far)..];
                     let mut scan_pos = 0;
                     let mut in_fence = false;
                     let bytes = new_text.as_bytes();
                     let mut found_paragraph = None;
+                    let mut consumed = 0;
 
                     while scan_pos < bytes.len() {
                         let ch = bytes[scan_pos];
@@ -3587,8 +3602,7 @@ impl Channel for DiscordChannel {
                             && bytes[scan_pos + 1] == b'\n'
                         {
                             let paragraph = new_text[..scan_pos].trim().to_string();
-                            let consumed = scan_pos + 2;
-                            *sent_map.entry(recipient.to_string()).or_insert(0) += consumed;
+                            consumed = scan_pos + 2;
                             if !paragraph.is_empty() {
                                 found_paragraph = Some(paragraph);
                             }
@@ -3598,28 +3612,38 @@ impl Channel for DiscordChannel {
                         scan_pos += 1;
                     }
                     // Lock is dropped here at end of block.
-                    (found_paragraph, thread_ts)
+                    (found_paragraph, consumed, thread_ts)
                 };
 
                 if let Some(paragraph) = paragraph {
                     let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
-                    if let Err(e) = self.send(&msg).await {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "multi-message paragraph send failed"
-                        );
-                    }
+                    self.send(&msg).await?;
+                    // Advance only after the transport confirms delivery. A
+                    // failed paragraph remains in the buffer for finalization.
+                    *self
+                        .multi_message_sent_len
+                        .lock()
+                        .entry(recipient.to_string())
+                        .or_insert(0) += consumed;
                     if self.multi_message_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             self.multi_message_delay_ms,
                         ))
                         .await;
                     }
+                    // Recurse to handle remaining text.
+                    return self.update_draft(recipient, message_id, text).await;
+                } else if consumed > 0 {
+                    // An empty paragraph has no transport content, so there is
+                    // no send to confirm: its delimiter advances the confirmed
+                    // coordinate immediately. Without this the scanner would
+                    // rediscover the same empty paragraph on every frame and
+                    // never reach the text behind it.
+                    *self
+                        .multi_message_sent_len
+                        .lock()
+                        .entry(recipient.to_string())
+                        .or_insert(0) += consumed;
                     // Recurse to handle remaining text.
                     return self.update_draft(recipient, message_id, text).await;
                 }
@@ -3649,20 +3673,15 @@ impl Channel for DiscordChannel {
                 .remove(recipient)
                 .unwrap_or(0);
             if text.len() > sent_so_far {
-                let remaining = text[sent_so_far..].trim().to_string();
+                // Floor defensively: the reconciled final text is built to
+                // preserve the confirmed prefix byte-for-byte, but a stale
+                // offset must degrade to re-sending a suffix, not panic.
+                let remaining = text[text.floor_char_boundary(sent_so_far)..]
+                    .trim()
+                    .to_string();
                 if !remaining.is_empty() {
                     let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
-                    if let Err(e) = self.send(&msg).await {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "multi-message final flush failed"
-                        );
-                    }
+                    self.send(&msg).await?;
                 }
             }
             return Ok(());

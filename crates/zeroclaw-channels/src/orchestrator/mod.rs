@@ -3912,6 +3912,90 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
     s.to_string()
 }
 
+/// Reconcile the canonical final response into the cumulative visible-stream
+/// byte coordinate system used by MultiMessage finalizers.
+///
+/// Discord and Matrix MultiMessage finalizers flush `final[sent_so_far..]`,
+/// where `sent_so_far` is the channel's confirmed-delivery byte offset into
+/// the cumulative visible text that `update_draft` received (`streamed_text`).
+/// The text handed to `finalize_draft` must therefore begin with exactly the
+/// confirmed bytes — otherwise the offset selects the wrong content: when the
+/// final text is shorter than `sent_so_far` the finalizer's
+/// `text.len() > sent_so_far` guard strands the tail entirely, and when it
+/// merely diverges the flush garbles it.
+///
+/// So keep the confirmed prefix `streamed_text[..sent_so_far]` as the
+/// coordinate base — those paragraphs are on the wire and cannot be unsent —
+/// and follow it with exactly the canonical content that has not been
+/// delivered yet:
+///   * nothing confirmed: the canonical response is the whole message;
+///   * the canonical response extends the confirmed paragraphs (a runtime stop
+///     reason or provider footer appended after streaming): only the unsent
+///     canonical tail follows the prefix;
+///   * final sanitization dropped an already-delivered leading paragraph (e.g.
+///     `strip_tool_narration`): the confirmed prefix stays, and the canonical
+///     response is aligned past any confirmed paragraphs it still contains so
+///     none of them is re-sent;
+///   * final sanitization rewrote the unsent tail (credential redaction, a
+///     terminal fallback replacing a malformed payload): the canonical tail is
+///     authoritative — the streamed unsent tail is never used as content, so
+///     redacted text cannot resurface on the transport;
+///   * trailing-whitespace-only divergence: every canonical byte is already
+///     confirmed, so the finalizer flushes nothing (no final-paragraph replay).
+///
+/// `sent_so_far` is clamped into `streamed_text` and floored to a UTF-8 char
+/// boundary, so a stale or misaligned offset degrades to re-sending a suffix
+/// instead of panicking mid-character.
+fn cumulative_multi_message_final_text(
+    streamed_text: &str,
+    delivered_response: &str,
+    sent_so_far: usize,
+) -> String {
+    let confirmed = streamed_text.floor_char_boundary(sent_so_far.min(streamed_text.len()));
+    let sent_prefix = &streamed_text[..confirmed];
+    if sent_prefix.is_empty() {
+        // Nothing was confirmed on the transport (draft suppressed, no
+        // paragraph boundary reached, or every send failed). The finalizer
+        // flushes from offset 0, so the canonical response is the whole
+        // message and any streamed-but-unconfirmed text is discarded in favor
+        // of the sanitized final content.
+        return delivered_response.to_string();
+    }
+    if sent_prefix.trim_end() == delivered_response.trim_end() {
+        // Trailing-whitespace-only divergence: the confirmed paragraphs
+        // already cover every canonical byte. Keep the confirmed coordinate so
+        // the finalizer flushes nothing rather than replaying the final
+        // paragraph.
+        return sent_prefix.to_string();
+    }
+    // Align the canonical response past the confirmed paragraphs it still
+    // contains. Confirmed prefixes always end at a paragraph delimiter, so
+    // this alignment can only land on canonical paragraph boundaries — a
+    // coincidental mid-word overlap cannot garble the flush.
+    let already_delivered = confirmed_canonical_prefix(sent_prefix, delivered_response);
+    format!("{sent_prefix}{}", &delivered_response[already_delivered..])
+}
+
+/// Largest byte length `k` (on a UTF-8 boundary) such that the confirmed
+/// transport prefix ends with `delivered_response[..k]` — i.e. the leading
+/// canonical bytes that have provably been delivered already and must not be
+/// flushed again. Canonical paragraphs the final sanitizer preserved still
+/// match here when it dropped earlier narration paragraphs that the stream
+/// also delivered, which is what keeps a narration-stripped final response
+/// from re-sending the paragraphs after the narration.
+fn confirmed_canonical_prefix(sent_prefix: &str, delivered_response: &str) -> usize {
+    let mut end = delivered_response.len().min(sent_prefix.len());
+    while end > 0 {
+        if delivered_response.is_char_boundary(end)
+            && sent_prefix.ends_with(&delivered_response[..end])
+        {
+            return end;
+        }
+        end -= 1;
+    }
+    0
+}
+
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
 /// way out.
 ///
@@ -3928,11 +4012,39 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///
 /// `known_tool_names` comes from the same registry the final sanitizer reads,
 /// so both boundaries judge a protocol payload by the same tool inventory.
+#[cfg(test)]
 async fn run_draft_updater(
     channel: Arc<dyn Channel>,
     reply_target: String,
     draft_id: String,
     known_tool_names: HashSet<String>,
+    streamed_text: Arc<Mutex<String>>,
+    rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
+) {
+    run_draft_updater_with_leak_detection(
+        channel,
+        reply_target,
+        draft_id,
+        known_tool_names,
+        streamed_text,
+        zeroclaw_config::schema::LeakDetectionConfig::default(),
+        OutboundContentFormat::Markdown,
+        rx,
+    )
+    .await;
+}
+
+/// As [`run_draft_updater`], but applies the same outbound leak detector as
+/// final delivery. The default wrapper keeps isolated draft tests lightweight;
+/// production always enters through this function with the resolved policy.
+async fn run_draft_updater_with_leak_detection(
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    known_tool_names: HashSet<String>,
+    streamed_text: Arc<Mutex<String>>,
+    leak_detection: zeroclaw_config::schema::LeakDetectionConfig,
+    content_format: OutboundContentFormat,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -3997,7 +4109,15 @@ async fn run_draft_updater(
             StreamDelta::Reasoning(_) => {}
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
-                let visible = sanitize_streaming_draft_text(&accumulated, &known_tool_names);
+                let visible = redact_channel_outbound_leaks(
+                    &sanitize_streaming_draft_text(&accumulated, &known_tool_names),
+                    &leak_detection,
+                    content_format,
+                );
+                // Keep the exact visible frame used for MultiMessage offsets;
+                // retaining the raw accumulation here could reintroduce a
+                // protocol payload during finalization.
+                *streamed_text.lock().unwrap_or_else(|e| e.into_inner()) = visible.clone();
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
@@ -6922,6 +7042,10 @@ async fn process_channel_message_body(
     };
 
     // Spawn the appropriate handler for the delta channel.
+    // Multi-message channels use the text accumulated by the draft updater to
+    // finalize the same cumulative stream they used for paragraph offsets.
+    // Other draft modes still finalize the canonical response unchanged.
+    let streamed_draft_text = Arc::new(Mutex::new(String::new()));
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
         if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
@@ -6958,8 +7082,21 @@ async fn process_channel_message_body(
                     .iter()
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
+                let streamed_draft_text = Arc::clone(&streamed_draft_text);
+                let leak_detection = ctx.prompt_config.security.leak_detection.clone();
+                let content_format = outbound_content_format_for_channel(&msg.channel);
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await;
+                    run_draft_updater_with_leak_detection(
+                        channel,
+                        reply_target,
+                        draft_id,
+                        known_tool_names,
+                        streamed_draft_text,
+                        leak_detection,
+                        content_format,
+                        rx,
+                    )
+                    .await;
                 }))
             }
         } else {
@@ -7728,11 +7865,29 @@ async fn process_channel_message_body(
                             .is_ok()
                     } else {
                         let suppress = suppress_voice_override.unwrap_or(false);
+                        let draft_final_response = if channel.supports_multi_message_streaming() {
+                            // Ask the transport how much of the visible stream
+                            // is confirmed-delivered before reconciling the
+                            // sanitized final response against it.
+                            let confirmed_offset = channel
+                                .multi_message_confirmed_offset(&delivery_recipient, draft_id)
+                                .await;
+                            let streamed_text = streamed_draft_text
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            cumulative_multi_message_final_text(
+                                &streamed_text,
+                                &delivered_response,
+                                confirmed_offset,
+                            )
+                        } else {
+                            delivered_response.clone()
+                        };
                         match channel
                             .finalize_draft(
                                 &delivery_recipient,
                                 draft_id,
-                                &delivered_response,
+                                &draft_final_response,
                                 suppress,
                             )
                             .await
@@ -17274,6 +17429,18 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         draft_updates: tokio::sync::Mutex<Vec<String>>,
+        /// When set, `update_draft`/`finalize_draft` faithfully model the real
+        /// Discord/Matrix MultiMessage cumulative byte-offset bookkeeping: each
+        /// `\n\n`-bounded paragraph is emitted as its own message and the final
+        /// flush sends `text[sent_so_far..]`. This lets a test exercise the exact
+        /// coordinate arithmetic under test rather than a simplified stand-in.
+        cumulative_offset: bool,
+        /// Byte offset into the cumulative visible stream already emitted as
+        /// paragraphs, mirroring the adapters' `multi_message_sent_len`.
+        multi_sent_len: std::sync::Mutex<usize>,
+        /// Paragraphs actually emitted to the room/channel, in order, including
+        /// the final flush — the messages a user would really receive.
+        emitted_paragraphs: tokio::sync::Mutex<Vec<String>>,
     }
 
     struct ExpiringTypingChannel {
@@ -17303,6 +17470,22 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
+                cumulative_offset: false,
+                multi_sent_len: std::sync::Mutex::new(0),
+                emitted_paragraphs: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A MultiMessage channel that models the real adapters' cumulative
+        /// byte-offset paragraph delivery and final flush (see
+        /// [`Self::cumulative_offset`]). `name` selects the adapter identity
+        /// (`"discord"` or `"matrix"`); both share the same offset algorithm.
+        fn multi_message_cumulative(channel_name: &'static str) -> Self {
+            Self {
+                channel_name,
+                supports_multi_message_streaming: true,
+                cumulative_offset: true,
+                ..Self::new(false, false)
             }
         }
 
@@ -17656,6 +17839,17 @@ api_key = "anthropic-key"
             self.supports_multi_message_streaming
         }
 
+        async fn multi_message_confirmed_offset(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+        ) -> usize {
+            *self
+                .multi_sent_len
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+
         async fn update_draft(
             &self,
             _recipient: &str,
@@ -17663,6 +17857,60 @@ api_key = "anthropic-key"
             text: &str,
         ) -> anyhow::Result<()> {
             self.draft_updates.lock().await.push(text.to_string());
+            if self.cumulative_offset && self.supports_multi_message_streaming {
+                // Mirror the Discord/Matrix MultiMessage `update_draft`: emit
+                // every complete `\n\n`-bounded paragraph (fence-aware) from the
+                // cumulative visible text and advance the sent-length counter
+                // exactly as the real adapters do.
+                let mut emitted = self.emitted_paragraphs.lock().await;
+                let mut sent = self
+                    .multi_sent_len
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if text.len() < *sent {
+                    // A Clear reset the accumulated text; reset our counter.
+                    *sent = 0;
+                    return Ok(());
+                }
+                loop {
+                    if text.len() <= *sent {
+                        break;
+                    }
+                    let new_text = &text[*sent..];
+                    let bytes = new_text.as_bytes();
+                    let mut scan_pos = 0;
+                    let mut in_fence = false;
+                    let mut found = false;
+                    while scan_pos < bytes.len() {
+                        let ch = bytes[scan_pos];
+                        if ch == b'`'
+                            && scan_pos + 2 < bytes.len()
+                            && bytes[scan_pos + 1] == b'`'
+                            && bytes[scan_pos + 2] == b'`'
+                            && (scan_pos == 0 || bytes[scan_pos - 1] == b'\n')
+                        {
+                            in_fence = !in_fence;
+                        }
+                        if !in_fence
+                            && ch == b'\n'
+                            && scan_pos + 1 < bytes.len()
+                            && bytes[scan_pos + 1] == b'\n'
+                        {
+                            let paragraph = new_text[..scan_pos].trim().to_string();
+                            *sent += scan_pos + 2;
+                            if !paragraph.is_empty() {
+                                emitted.push(paragraph);
+                            }
+                            found = true;
+                            break;
+                        }
+                        scan_pos += 1;
+                    }
+                    if !found {
+                        break;
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -17705,6 +17953,21 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{recipient}:{message_id}:{text}"));
+            if self.cumulative_offset && self.supports_multi_message_streaming {
+                // Mirror the Discord/Matrix MultiMessage `finalize_draft`: flush
+                // `text[sent_so_far..]` (boundary-floored) as the final message
+                // when non-empty.
+                let sent = *self
+                    .multi_sent_len
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if text.len() > sent {
+                    let remaining = text[text.floor_char_boundary(sent)..].trim().to_string();
+                    if !remaining.is_empty() {
+                        self.emitted_paragraphs.lock().await.push(remaining);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -34904,6 +35167,7 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
+            Arc::new(Mutex::new(String::new())),
             rx,
         )
         .await;
@@ -34928,6 +35192,588 @@ Done."#;
             ["Working on it.".to_string()],
             "status text must reach the transport already stripped of reasoning"
         );
+    }
+
+    /// A final sanitizer is authoritative for everything not yet confirmed on
+    /// the transport: the streamed unsent tail must never be used as content
+    /// after final redaction, while the already-delivered prefix keeps its
+    /// coordinate so the flush cannot strand or garble the sanitized tail.
+    #[test]
+    fn multi_message_finalization_never_reintroduces_finally_sanitized_text() {
+        let leaked = "narration\n\nTemporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let final_text = "Safe fallback.";
+        // The narration paragraph (11 bytes incl. its delimiter) is confirmed
+        // on the wire; the credential-bearing tail is not. The reconciled text
+        // keeps the confirmed coordinate and appends only the sanitized tail.
+        let reconciled = cumulative_multi_message_final_text(leaked, final_text, 11);
+        assert!(
+            !reconciled.contains("AKIAABCDEFGHIJKLMNOP"), // gitleaks:allow
+            "the streamed unsent tail must not resurface after final redaction: {reconciled:?}"
+        );
+        assert_eq!(
+            reconciled, "narration\n\nSafe fallback.",
+            "the confirmed prefix keeps its coordinate and the sanitized tail follows it"
+        );
+        // Nothing confirmed: the sanitized final response replaces the stream.
+        assert_eq!(
+            cumulative_multi_message_final_text(leaked, final_text, 0),
+            final_text,
+            "with nothing on the wire the streamed draft must not prefix the final response"
+        );
+        assert_eq!(
+            cumulative_multi_message_final_text("one\n\n ", "one", 5),
+            "one\n\n",
+            "trailing-whitespace-only divergence must flush nothing"
+        );
+    }
+
+    /// Unit coverage for the confirmed-delivery reconciliation branches of
+    /// [`cumulative_multi_message_final_text`]: identical, extending, dropped
+    /// leading narration, interior rewrite, unconfirmed rewrite, offset
+    /// clamping, and non-boundary offsets.
+    #[test]
+    fn cumulative_multi_message_final_text_reconciles_against_the_confirmed_prefix() {
+        // Empty stream / nothing confirmed: the canonical response is the
+        // whole message.
+        assert_eq!(
+            cumulative_multi_message_final_text("", "final answer", 0),
+            "final answer"
+        );
+        // Identical: the confirmed paragraph aligns and only the tail follows.
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\nb", "a\n\nb", 3),
+            "a\n\nb"
+        );
+        // Extends: append only the final-only tail (footer / stop reason).
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\nb", "a\n\nb\n\nc", 3),
+            "a\n\nb\n\nc"
+        );
+        // Leading narration stripped from the canonical response after being
+        // confirmed: the confirmed coordinate stays so the finalizer flushes
+        // the complete canonical tail once.
+        assert_eq!(
+            cumulative_multi_message_final_text("narration\n\nstop", "stop", 11),
+            "narration\n\nstop"
+        );
+        // Narration stripped while a later confirmed paragraph is preserved:
+        // the preserved paragraph aligns against the confirmed prefix and is
+        // not re-sent.
+        assert_eq!(
+            cumulative_multi_message_final_text(
+                "narration\n\nanswer\n\nstop",
+                "answer\n\nstop",
+                19
+            ),
+            "narration\n\nanswer\n\nstop"
+        );
+        // Divergent (terminal fallback replaced the payload) after a confirmed
+        // narration paragraph: the fallback is delivered exactly once after it.
+        assert_eq!(
+            cumulative_multi_message_final_text("narration\n\n", "fallback text", 11),
+            "narration\n\nfallback text"
+        );
+        // Divergent with nothing confirmed: the canonical response is
+        // authoritative and the streamed text is discarded entirely.
+        assert_eq!(
+            cumulative_multi_message_final_text("live XYZ", "XYZ done", 0),
+            "XYZ done"
+        );
+        // A final rewrite shorter than the confirmed offset must not strand
+        // the tail behind the finalizer's `text.len() > sent_so_far` guard.
+        assert_eq!(
+            cumulative_multi_message_final_text("one\n\ntwo\n\n", "done", 10),
+            "one\n\ntwo\n\ndone"
+        );
+        // Offsets beyond the stream clamp instead of panicking.
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\n", "a\n\nb", 100),
+            "a\n\nb"
+        );
+        // A non-boundary offset floors to the previous char boundary instead
+        // of panicking mid-character.
+        assert_eq!(
+            cumulative_multi_message_final_text("h\u{e9}llo\n\nworld", "h\u{e9}llo\n\nworld", 2),
+            "h\u{e9}llo\n\nworld"
+        );
+    }
+
+    /// Regression at the channel streaming/finalization boundary: malformed
+    /// protocol exhaustion. A tool narration and a display-safe terminal
+    /// fallback are streamed live as two MultiMessage paragraphs (the fallback
+    /// is what the stream shows once the malformed protocol payload has been
+    /// held back). MultiMessage confirms the narration paragraph live and keeps
+    /// the trailing fallback pending behind its confirmed-delivery byte offset.
+    /// Final sanitization then drops the leading narration line from the
+    /// canonical response, leaving only the fallback body. Because the
+    /// finalizer flushes `text[sent_so_far..]` against the confirmed
+    /// coordinate, the reconciled final text must keep that coordinate so the
+    /// complete fallback is delivered after the already-sent narration exactly
+    /// once: never merged into the narration paragraph, and never duplicated.
+    /// Feeding the narration-stripped canonical response in directly would
+    /// slice past the fallback with the confirmed offset and strand it.
+    #[tokio::test]
+    async fn multi_message_finalization_keeps_terminal_malformed_fallback_after_narration() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("discord"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Checking the requested records.\n\n";
+        let fallback = "I couldn't complete that response safely.";
+        // Final sanitization keeps only the fallback body after dropping the
+        // leading narration line that was already streamed live.
+        let delivered_response = fallback.to_string();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(fallback.to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(
+            sent_so_far,
+            narration.len(),
+            "the narration paragraph (incl. its delimiter) must be the confirmed prefix"
+        );
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        // The narration was already confirmed live; the reconciled text must
+        // leave the complete fallback as the unsent tail for finalization.
+        assert_eq!(
+            &final_text[sent_so_far..],
+            fallback,
+            "the confirmed offset must leave the complete fallback for finalization"
+        );
+        assert_eq!(final_text.matches(fallback).count(), 1);
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [narration.trim().to_string(), fallback.to_string()],
+            "the already-streamed narration stays put and the terminal fallback is flushed after it"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == fallback).count(),
+            1,
+            "the complete terminal fallback must be delivered exactly once"
+        );
+    }
+
+    /// Regression at the channel streaming/finalization boundary: the
+    /// max-iteration path sends only its new summary segment after prior tool
+    /// narration. Once MultiMessage has confirmed that summary paragraph, the
+    /// stop reason must still be the unsent suffix, not be lost to the
+    /// confirmed-delivery offset.
+    #[tokio::test]
+    async fn multi_message_finalization_keeps_max_iteration_stop_reason_after_narration() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("matrix"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let narration = "I checked the available sources.\n\n";
+        let summary = "Here is the best partial answer.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let terminal_segment = format!("{summary}\n\n{stop_reason}");
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(terminal_segment.clone()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        assert_eq!(
+            sent_so_far,
+            narration.len() + summary.len() + "\n\n".len(),
+            "both live paragraphs (incl. delimiters) must be the confirmed prefix"
+        );
+        // The max-iteration final response carries only the terminal segment;
+        // the narration paragraph was dropped by final sanitization.
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &terminal_segment,
+            sent_so_far,
+        );
+        assert_eq!(
+            &final_text[sent_so_far..],
+            stop_reason,
+            "the finalizer must flush the stop reason after the confirmed paragraph offset"
+        );
+        assert_eq!(final_text.matches(summary).count(), 1);
+        assert_eq!(final_text.matches(stop_reason).count(), 1);
+        assert_eq!(
+            channel_impl.draft_updates.lock().await.last(),
+            Some(&final_text)
+        );
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                summary.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the confirmed paragraphs stay put and the stop reason is flushed last"
+        );
+    }
+
+    /// Real-adapter regression for the exact confirmed-delivery arithmetic:
+    /// a leading tool narration is streamed live as its own MultiMessage
+    /// paragraph, then final sanitization drops that narration line from the
+    /// canonical response. Because the finalizer flushes `text[sent_so_far..]`
+    /// against the confirmed coordinate, the reconciled final text must keep
+    /// that coordinate so the complete stop reason is delivered exactly once.
+    /// Feeding the canonical (narration-stripped) response directly would
+    /// slice past the stop reason and drop it.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_discord()
+     {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("discord"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Looking through the available records.\n\n";
+        let answer = "Here is the best partial answer I have.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let body = format!("{answer}\n\n{stop_reason}");
+        // The final sanitizer keeps only the body after dropping the leading
+        // narration line that was already streamed live.
+        let delivered_response = body.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(body.clone())).await.unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                answer.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the already-streamed narration and body stay put and the stop reason is flushed last"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "the complete stop reason must be delivered exactly once"
+        );
+    }
+
+    /// The Matrix MultiMessage finalizer shares the same `text[sent_so_far..]`
+    /// confirmed-offset flush, so it needs the same guarantee: dropping a
+    /// streamed leading narration from the canonical response must not strand
+    /// the trailing stop reason.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_matrix()
+     {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("matrix"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Checked the linked calendars.\n\n";
+        let answer = "You have two overlapping meetings on Tuesday.";
+        let stop_reason = "Stopped early because the tool budget was exhausted.";
+        let body = format!("{answer}\n\n{stop_reason}");
+        let delivered_response = body.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(body.clone())).await.unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let sent_so_far = channel_impl
+            .multi_message_confirmed_offset("chat-1", "draft-1")
+            .await;
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+            sent_so_far,
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                answer.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the already-streamed narration and body stay put and the stop reason is flushed last"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "the complete stop reason must be delivered exactly once"
+        );
+    }
+
+    /// End-to-end held-paragraph credential regression through the REAL final
+    /// sanitizer and the cumulative finalization harness. A credential arrives
+    /// in the paragraph MultiMessage is still holding (no trailing `\n\n`), so
+    /// it was never confirmed live. The production updater redacts every draft
+    /// frame (leak detection on the streaming boundary), the production final
+    /// sanitizer redacts the canonical response, and finalization must deliver
+    /// the redacted held paragraph exactly once — never the raw credential and
+    /// never a duplicated intro.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_redacted_held_paragraph_from_real_sanitizer() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let raw_response = format!("Safe intro.\n\n{leaked} Rotate it later.");
+        for channel_name in ["discord", "matrix"] {
+            let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+                channel_name,
+            ));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(StreamDelta::Text(raw_response.clone()))
+                .await
+                .unwrap();
+            drop(tx);
+
+            let streamed = Arc::new(Mutex::new(String::new()));
+            run_draft_updater_with_leak_detection(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                no_tools(),
+                Arc::clone(&streamed),
+                zeroclaw_config::schema::LeakDetectionConfig::default(),
+                OutboundContentFormat::Markdown,
+                rx,
+            )
+            .await;
+
+            let frames = channel_impl.draft_updates.lock().await;
+            assert!(
+                frames.iter().all(|frame| !frame.contains(leaked)),
+                "{channel_name} transport received a credential-bearing draft: {frames:?}"
+            );
+            drop(frames);
+
+            // The REAL final sanitizer produces the canonical response — no
+            // manually supplied canonical string.
+            let delivered_response = sanitize_channel_response_with_leak_detection(
+                &raw_response,
+                &[],
+                &zeroclaw_config::schema::LeakDetectionConfig::default(),
+            );
+            assert!(
+                !delivered_response.contains(leaked),
+                "{channel_name}: the final sanitizer must redact the credential"
+            );
+            let intro = "Safe intro.\n\n";
+            assert!(
+                delivered_response.starts_with(intro),
+                "{channel_name}: sanitizer unexpectedly rewrote the confirmed intro: {delivered_response:?}"
+            );
+
+            let sent_so_far = channel_impl
+                .multi_message_confirmed_offset("chat-1", "draft-1")
+                .await;
+            assert_eq!(
+                sent_so_far,
+                intro.len(),
+                "{channel_name}: only the intro paragraph is confirmed; the credential paragraph is held"
+            );
+            let final_text = cumulative_multi_message_final_text(
+                &streamed.lock().unwrap_or_else(|e| e.into_inner()),
+                &delivered_response,
+                sent_so_far,
+            );
+            assert!(
+                !final_text.contains(leaked),
+                "{channel_name}: reconciliation must not resurrect the redacted credential"
+            );
+
+            channel_impl
+                .finalize_draft("chat-1", "draft-1", &final_text, false)
+                .await
+                .unwrap();
+
+            let emitted = channel_impl.emitted_paragraphs.lock().await;
+            assert_eq!(
+                emitted.len(),
+                2,
+                "{channel_name}: intro plus redacted held paragraph, exactly once each: {emitted:?}"
+            );
+            assert_eq!(emitted[0], "Safe intro.");
+            assert_eq!(
+                emitted[1],
+                delivered_response[intro.len()..].trim(),
+                "{channel_name}: the held paragraph must be delivered in its finally-sanitized form"
+            );
+            assert!(
+                emitted[1].contains("[REDACTED"),
+                "{channel_name}: the held paragraph must carry the redaction marker: {:?}",
+                emitted[1]
+            );
+            assert!(
+                emitted.iter().all(|m| !m.contains(leaked)),
+                "{channel_name}: the raw credential must never reach the transport: {emitted:?}"
+            );
+        }
+    }
+
+    /// End-to-end trailing-newline regression through the REAL final sanitizer
+    /// and the cumulative finalization harness. The stream ends on a paragraph
+    /// delimiter, so every paragraph is confirmed live; the final sanitizer
+    /// trims that trailing whitespace from the canonical response. That
+    /// coordinate-only divergence must not replay the final paragraph at
+    /// finalization.
+    #[tokio::test]
+    async fn multi_message_finalization_does_not_replay_final_paragraph_after_trailing_newline() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let raw_response = "First point.\n\nSecond point.\n\n";
+        for channel_name in ["discord", "matrix"] {
+            let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative(
+                channel_name,
+            ));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(StreamDelta::Text("First point.\n\n".to_string()))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Text("Second point.\n\n".to_string()))
+                .await
+                .unwrap();
+            drop(tx);
+
+            let streamed = Arc::new(Mutex::new(String::new()));
+            run_draft_updater(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                no_tools(),
+                Arc::clone(&streamed),
+                rx,
+            )
+            .await;
+
+            // The REAL final sanitizer trims the trailing paragraph delimiter
+            // from the canonical response.
+            let delivered_response = sanitize_channel_response(raw_response, &[]);
+            assert_eq!(
+                delivered_response, "First point.\n\nSecond point.",
+                "precondition: final sanitization trims only trailing whitespace here"
+            );
+
+            let sent_so_far = channel_impl
+                .multi_message_confirmed_offset("chat-1", "draft-1")
+                .await;
+            let final_text = cumulative_multi_message_final_text(
+                &streamed.lock().unwrap_or_else(|e| e.into_inner()),
+                &delivered_response,
+                sent_so_far,
+            );
+            channel_impl
+                .finalize_draft("chat-1", "draft-1", &final_text, false)
+                .await
+                .unwrap();
+
+            let emitted = channel_impl.emitted_paragraphs.lock().await;
+            assert_eq!(
+                emitted.as_slice(),
+                ["First point.".to_string(), "Second point.".to_string()],
+                "{channel_name}: trailing-newline divergence must not replay the final paragraph"
+            );
+        }
     }
 
     #[tokio::test]
@@ -34964,6 +35810,7 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
+            Arc::new(Mutex::new(String::new())),
             rx,
         )
         .await;
@@ -35026,6 +35873,7 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 no_tools(),
+                Arc::new(Mutex::new(String::new())),
                 rx,
             )
             .await;
@@ -35093,6 +35941,7 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 known.clone(),
+                Arc::new(Mutex::new(String::new())),
                 rx,
             )
             .await;
@@ -35134,6 +35983,7 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             known,
+            Arc::new(Mutex::new(String::new())),
             rx,
         )
         .await;
