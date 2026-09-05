@@ -2288,6 +2288,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             // projection also carries the next iteration's native-tool signal so
             // the prompt-anchor swap (and the schema estimate) match the request
             // the NEXT iteration will actually dispatch.
+            let next_protocol_model = next_vision
+                .as_ref()
+                .map(|resolved| resolved.model.as_str())
+                .unwrap_or(model);
             let (next_schema_tokens, next_use_native_tools) = match build_iteration_tool_specs(
                 model_provider,
                 model,
@@ -2295,39 +2299,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 excluded_tools,
                 activated_tools,
             ) {
-                Ok(mut next_specs) => {
-                    // Use the NEXT route's model for the native-tool capability
-                    // projection. `provider_request_model` belongs to the
-                    // request that just completed and may be stale the moment a
-                    // hook flips models; the re-resolved vision route names the
-                    // provider whose capability actually decides whether
-                    // schemas are serialized into the next request. The actual
-                    // next iteration will run `before_llm_call` again and can
-                    // select a different model, so the pre-dispatch gate
-                    // (which runs after the next hook) is the authoritative
-                    // check for that transition — this post-tool projection
-                    // reserves the larger of the two populations conservatively
-                    // so a non-native→native flip does not silently overrun.
-                    let next_protocol_model = next_vision
-                        .as_ref()
-                        .map(|resolved| resolved.model.as_str())
-                        .unwrap_or(model);
-                    next_specs.refresh_native_tool_mode(next_active_provider, next_protocol_model);
-                    let next_tokens = if next_specs.use_native_tools {
-                        crate::agent::history::estimate_tool_schema_tokens(&next_specs.tool_specs)
-                    } else {
-                        0
-                    };
-                    // Conservative: also consider the current iteration's
-                    // schema population. A hook that flips non-native→native
-                    // on the next iteration would make the next request
-                    // native while this projection would otherwise reserve 0.
-                    // Taking the max ensures the budget decision does not
-                    // under-reserve; the pre-dispatch gate remains authoritative
-                    // for the exact next-hook-selected model.
-                    let conservative_tokens = std::cmp::max(next_tokens, tool_schema_tokens);
-                    (conservative_tokens, next_specs.use_native_tools)
-                }
+                Ok(next_specs) => project_next_schema_tokens(
+                    next_specs,
+                    next_active_provider,
+                    next_protocol_model,
+                ),
                 Err(_) => (tool_schema_tokens, use_native_tools),
             };
             enforce_reported_budget(
@@ -3352,6 +3328,36 @@ async fn drive_live_sop_actions(
     Ok(())
 }
 
+/// Projects the schema-token population of the NEXT loop iteration from its
+/// freshly rebuilt `IterationToolSpecs` (which already includes any tool
+/// activated by `tool_search` this round). Returns `(schema_tokens,
+/// use_native_tools)` describing exactly the request `next_specs` predicts.
+///
+/// `next_active_provider`/`next_protocol_model` must already be the
+/// re-resolved NEXT route, not the one that just dispatched — a hook can
+/// flip models between iterations, and this is what decides whether the next
+/// request serializes native schemas at all. Returning 0 when the next route
+/// is non-native (rather than falling back to the current iteration's
+/// schema population) matters: reserving budget for a native population that
+/// belonged to a route no longer in effect can trim history the next
+/// request never needed room for. The pre-dispatch gate that runs after the
+/// next `before_llm_call` hook remains authoritative for the exact
+/// next-hook-selected model; this projection only needs to be accurate for
+/// the route already resolved here.
+fn project_next_schema_tokens(
+    mut next_specs: IterationToolSpecs,
+    next_active_provider: &dyn ModelProvider,
+    next_protocol_model: &str,
+) -> (usize, bool) {
+    next_specs.refresh_native_tool_mode(next_active_provider, next_protocol_model);
+    let next_tokens = if next_specs.use_native_tools {
+        crate::agent::history::estimate_tool_schema_tokens(&next_specs.tool_specs)
+    } else {
+        0
+    };
+    (next_tokens, next_specs.use_native_tools)
+}
+
 fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
     if let Some(first) = history.first_mut()
         && (first.content.contains(NATIVE_TOOLS_TASK_FRAMING)
@@ -3446,6 +3452,115 @@ mod surface3_tests {
         let mut history: Vec<ChatMessage> = Vec::new();
         refresh_prompt_anchor(&mut history, false);
         // Just verifying no panic.
+    }
+}
+
+#[cfg(test)]
+mod project_next_schema_tokens_tests {
+    use super::*;
+    use zeroclaw_providers::traits::ProviderCapabilities;
+
+    /// A fake provider whose `native_tool_calling` capability is fixed at
+    /// construction, so tests can name the exact route the projection sees.
+    struct FixedCapabilityProvider {
+        native_tool_calling: bool,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for FixedCapabilityProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FixedCapabilityProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FixedCapabilityProvider {
+        fn capabilities_for_model(&self, _model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: self.native_tool_calling,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_api::model_provider::ChatResponse> {
+            unimplemented!("not exercised by this projection")
+        }
+    }
+
+    fn specs_with_a_large_schema() -> IterationToolSpecs {
+        let spec = crate::tools::ToolSpec::new(
+            "a_tool",
+            "a tool with a large parameter schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "big".repeat(500),
+                    }
+                }
+            }),
+        );
+        IterationToolSpecs {
+            tool_specs: vec![spec],
+            known_tool_names: HashSet::from(["a_tool".to_string()]),
+            use_native_tools: true,
+        }
+    }
+
+    #[test]
+    fn native_to_non_native_transition_reserves_zero_schema_tokens() {
+        // The current iteration was native (`use_native_tools: true` on the
+        // specs passed in), but the next route is non-native. Charging the
+        // current iteration's schema population here — rather than what the
+        // next route actually sends — would over-reserve budget and could
+        // over-trim history the next request never needed room for.
+        let next_specs = specs_with_a_large_schema();
+        let non_native_provider = FixedCapabilityProvider {
+            native_tool_calling: false,
+        };
+        let (tokens, use_native) =
+            project_next_schema_tokens(next_specs, &non_native_provider, "some-model");
+        assert_eq!(
+            tokens, 0,
+            "a non-native next route must reserve zero schema tokens"
+        );
+        assert!(!use_native);
+    }
+
+    #[test]
+    fn native_next_route_reserves_its_own_schema_population() {
+        let next_specs = specs_with_a_large_schema();
+        let expected_tokens =
+            crate::agent::history::estimate_tool_schema_tokens(&next_specs.tool_specs);
+        let native_provider = FixedCapabilityProvider {
+            native_tool_calling: true,
+        };
+        let (tokens, use_native) =
+            project_next_schema_tokens(next_specs, &native_provider, "some-model");
+        assert_eq!(tokens, expected_tokens);
+        assert!(use_native);
     }
 }
 
