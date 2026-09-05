@@ -4,7 +4,7 @@ An RFC records a durable project-level decision before implementation. The proce
 
 Most work does not need one. The RFC trigger is deliberately narrow so that proposals which genuinely need a project-level decision are not queued behind ordinary features.
 
-RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 15. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
+RFC scope, discussion timing, and ratification rules were last set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496), accepted 2026-08-10 and adopted as FND-003 Rev. 15, then clarified by FND-003 Rev. 17. See [FND-003](../foundations/fnd-003-governance.md) for the durable protocol.
 
 ## When to file an RFC vs. just a PR
 
@@ -54,20 +54,20 @@ Ordinary revisions and clarifications during discussion do not restart the clock
 
 ## Ratification
 
-A vote runs for **72 hours** against an immutable proposal snapshot, identified by an immutable artifact or commit, or by a recorded issue-body digest plus a concise decision summary. The vote-opening comment records the snapshot, the assigned electorate, the threshold and why it applies, and the exact UTC deadline.
+A vote cycle normally stays open for **72 hours** against an immutable proposal snapshot, identified by an immutable artifact or commit, or by a recorded issue-body digest plus a concise decision summary. The vote-opening comment records the snapshot, the assigned electorate, the threshold and why it applies, that quorum requires two explicit ballots, and the exact UTC deadline. It may not add ad hoc closing conditions outside this protocol.
 
 **Electorate.** An active Core contributor is a current Core Team member who cast an explicit ballot in a formally opened RFC vote within the preceding 30 days. Any current Core Team member outside that set may still ballot; doing so joins them to that vote's electorate and reactivates them for later votes.
 
-**Ballots** are `APPROVE`, `REVISE`, or `REJECT`. `REVISE` withholds approval but does not veto. `REJECT` is a blocking objection and needs a specific reason. Your latest ballot before the deadline supersedes your earlier one.
+**Ballots** are `APPROVE`, `REVISE`, or `REJECT`. `REVISE` withholds approval but does not veto. `REJECT` is a blocking objection and needs a specific reason. Your latest ballot before the recorded deadline for the current vote cycle supersedes your earlier one.
 
 **Threshold.** Two-thirds of the final active electorate by default, rounded up to a whole voter. Quorum requires at least two explicit ballots; silence never counts toward quorum. Once quorum is met, silence from the electorate counts as `APPROVE` for ordinary votes. Unanimity is reserved for decisions whose cost or irreversibility makes a supermajority inadequate, such as license or legal-ownership changes; it requires explicit `APPROVE` from every assigned voter, and silence cannot establish it.
 
 Outcomes, applied in this order:
 
-- **Deferred**: fewer than two explicit ballots. The closing record says when it may reopen. An unchanged deferred proposal may return to a new 72-hour vote without repeating discussion.
+- **Deferred**: the vote cannot close because it has fewer than two explicit ballots, or because quorum is met with no `REJECT` but the applicable threshold or required explicit approvals are not yet satisfied. The proposal may enter another 72-hour cycle against the same immutable snapshot. Existing explicit ballots count toward quorum and outcome in the renewed cycle, and carry forward until replaced by a later ballot. A material proposal change creates a new snapshot and follows the applicable discussion or vote handling.
 - **Rejected**: quorum met and any final ballot is `REJECT`. Issue closed with the blocking objection recorded, linking any issue where the underlying problem continues. This rejects the proposal, not necessarily the problem.
-- **Accepted**: quorum met, no `REJECT`, and at least two-thirds approve explicitly or by silence. Issue carries `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Implementation PRs can proceed once that handoff is visible.
-- **Returned to discussion**: none of the above. Unresolved revision requests are recorded.
+- **Accepted**: quorum met, no `REJECT`, and the applicable threshold is satisfied. By default, that means at least two-thirds approve explicitly or by silence; exceptional-unanimous votes require explicit `APPROVE` from every assigned voter. Issue carries `status:accepted`, and the closing record addresses every `REVISE` concern rather than discarding it. Implementation PRs can proceed once that handoff is visible.
+- **Returned to discussion**: the proposal body materially changes, or the author asks to revise before a decision. The return record names the next stable proposal target or the revision needed.
 - **Withdrawn**: the author pulls it. Closed without prejudice.
 
 A vote may close early only when every member of the final active electorate has explicitly approved and no inactive Core contributor has asked for the full window. The closing record must say why it closed early.
