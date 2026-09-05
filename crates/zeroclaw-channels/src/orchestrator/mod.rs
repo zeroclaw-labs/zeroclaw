@@ -6284,6 +6284,16 @@ async fn process_channel_message_body(
         "channel inbound message"
     );
 
+    // Dispatch ownership of a picker selection's delivery-ack registration:
+    // every definitive exit of this function (hook cancel, self-loop drop,
+    // passive context, task abort, or normal completion) settles whatever
+    // the registry still holds for this message, so a selection that never
+    // reached the mutation point cannot leave a revoked marker behind for
+    // the daemon's lifetime. No-op for ordinary traffic and for a selection
+    // that was confirmed, applied, or consumed as revoked below.
+    #[cfg(feature = "channel-telegram")]
+    let _dispatch_ownership = crate::model_picker_delivery::DispatchOwnership::hold(&msg.id);
+
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
@@ -27448,6 +27458,176 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         // The dispatch gate consumed the revoked marker exactly once.
         assert!(!crate::model_picker_delivery::take_revoked(&selection.id));
+    }
+
+    /// Test hook that cancels every inbound message before dispatch, like
+    /// an operator's `on_message_received` policy hook would.
+    #[cfg(feature = "channel-telegram")]
+    struct CancelInboundMessageHook;
+
+    #[cfg(feature = "channel-telegram")]
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for CancelInboundMessageHook {
+        fn name(&self) -> &str {
+            "cancel-inbound-message"
+        }
+
+        async fn on_message_received(
+            &self,
+            _message: zeroclaw_api::channel::ChannelMessage,
+        ) -> zeroclaw_runtime::hooks::HookResult<zeroclaw_api::channel::ChannelMessage> {
+            zeroclaw_runtime::hooks::HookResult::Cancel("blocked by test hook".to_string())
+        }
+    }
+
+    /// Telegram dispatch context whose inbound hook cancels every message
+    /// before the picker delivery-ack gate runs.
+    #[cfg(feature = "channel-telegram")]
+    fn hook_cancelled_picker_dispatch_context(
+        zeroclaw_dir: &std::path::Path,
+    ) -> (
+        Arc<ChannelRuntimeContext>,
+        Arc<HistoryCaptureModelProvider>,
+        Arc<TelegramRecordingChannel>,
+    ) {
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            zeroclaw_dir,
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        ctx.model_provider = provider_impl.clone();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("telegram.main".to_string(), channel);
+        ctx.channels_by_name = Arc::new(channels_by_name);
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(CancelInboundMessageHook));
+        ctx.hooks = Some(Arc::new(hook_runner));
+        (Arc::new(ctx), provider_impl, channel_impl)
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    fn hook_cancelled_picker_selection(id: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            timestamp: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Regression for the pre-gate lifecycle leak: the callback's bounded
+    /// ack wait elapsed (revoked marker retained for the late dispatch),
+    /// then an `on_message_received` hook cancelled the dequeued selection
+    /// before the `take_revoked` gate ran. Nothing downstream can consume
+    /// that marker any more, so the dispatch's ownership drop must reclaim
+    /// it: the registry is empty afterwards, the route untouched, and
+    /// nothing reported as handled.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_hook_cancel_reclaims_revoked_model_picker_selection() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            hook_cancelled_picker_dispatch_context(tmp.path());
+        let selection =
+            hook_cancelled_picker_selection("telegram_model_picker_selection_hook_cancel_revoked");
+        // Mirror the timed-out callback: registered before the queue
+        // handoff, revoked when the bounded ack wait elapsed.
+        let _delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        crate::model_picker_delivery::revoke(&selection.id);
+        assert!(crate::model_picker_delivery::is_registered(&selection.id));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        assert!(
+            !crate::model_picker_delivery::is_registered(&selection.id),
+            "revoked marker of a hook-cancelled selection must be reclaimed"
+        );
+        assert!(!crate::model_picker_delivery::take_revoked(&selection.id));
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "hook-cancelled picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(
+            provider_impl.calls.lock().unwrap().is_empty(),
+            "hook-cancelled picker selection must not reach a provider turn"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "hook-cancelled picker selection must not be reported as handled"
+        );
+    }
+
+    /// The same pre-gate drop while the callback is still inside its
+    /// bounded ack wait: the dispatch's ownership drop must end that wait
+    /// at once and the callback's revoke must win, so the picker is
+    /// restored without waiting for the timeout and nothing stays
+    /// registered.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn message_dispatch_hook_cancel_releases_waiting_model_picker_callback() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (runtime_ctx, provider_impl, channel_impl) =
+            hook_cancelled_picker_dispatch_context(tmp.path());
+        let selection =
+            hook_cancelled_picker_selection("telegram_model_picker_selection_hook_cancel_waiting");
+        let mut delivery_ack = crate::model_picker_delivery::register(&selection.id);
+        delivery_ack.mark_enqueued();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        tx.send(selection.clone()).await.unwrap();
+        drop(tx);
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        let woken = tokio::time::timeout(Duration::from_secs(1), delivery_ack.wait()).await;
+        assert!(
+            matches!(woken, Ok(Err(_))),
+            "dropped dispatch must release the waiting callback: {woken:?}"
+        );
+        assert!(matches!(
+            crate::model_picker_delivery::revoke(&selection.id),
+            crate::model_picker_delivery::RevokeOutcome::Won
+        ));
+        assert!(!crate::model_picker_delivery::is_registered(&selection.id));
+        {
+            let overrides = runtime_ctx.route_overrides.lock().unwrap();
+            assert!(
+                overrides.is_empty(),
+                "hook-cancelled picker selection must not write a route override: {overrides:?}"
+            );
+        }
+        assert!(provider_impl.calls.lock().unwrap().is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
     }
 
     /// Regression for the late-revocation race *past* the early dispatch

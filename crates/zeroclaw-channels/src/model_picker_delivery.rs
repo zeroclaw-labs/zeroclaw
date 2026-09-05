@@ -48,6 +48,17 @@
 //!   reclaims that residue once the dispatch pipeline is definitively gone
 //!   (`start_channels` teardown), which is the only point where no live
 //!   queued selection can still hold revocation authority.
+//! - The dispatch that dequeued a selection can end before it ever reaches
+//!   the mutation point: an `on_message_received` hook cancels it, a
+//!   self-loop guard drops it, or the dispatch task is aborted. Nothing
+//!   downstream would consume that registration, so the dispatch holds a
+//!   [`DispatchOwnership`] token for the message's lifetime and its drop
+//!   settles the claim as `Dropped`: a still-waiting callback is woken so
+//!   it restores the picker at once instead of at its timeout, a revoked
+//!   marker is reclaimed, and an applied or unregistered selection is left
+//!   untouched. Only a message the dispatch definitively gave up on is
+//!   settled this way; a selection that is still queued keeps its
+//!   revocation authority.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -74,10 +85,18 @@ enum ClaimState {
     /// The callback timed out or was aborted after enqueue; the late
     /// dispatch must leave the selection inert.
     Revoked,
+    /// The dispatch that owned the dequeued message ended before the
+    /// mutation point (hook cancel, self-loop drop, task abort). No route
+    /// write can follow; the entry only survives until the waiting
+    /// callback reads it.
+    Dropped,
 }
 
 struct PendingDeliveryAck {
-    sender: tokio::sync::oneshot::Sender<()>,
+    /// `None` once the owning dispatch dropped the message: releasing the
+    /// sender ends the callback's bounded wait immediately with
+    /// `RecvError` instead of at the timeout.
+    sender: Option<tokio::sync::oneshot::Sender<()>>,
     claim: Arc<Mutex<ClaimState>>,
     inserted_at: tokio::time::Instant,
 }
@@ -112,18 +131,22 @@ pub(crate) fn registry_test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Lazily reclaim stale `Open` entries older than
+/// Lazily reclaim stale `Open` and `Dropped` entries older than
 /// [`DELIVERY_ACK_ENTRY_TTL`]. A stale `Open` entry is always an orphan:
 /// the callback's ack wait is bounded at 5s, so no live queued message can
-/// still own it. `Revoked` (and `Applied`) markers are kept regardless of
-/// age — only the late dispatch may consume a revocation. Called from
+/// still own it; a stale `Dropped` entry likewise has no dispatch left that
+/// could act on it. `Revoked` (and `Applied`) markers are kept regardless
+/// of age — only the late dispatch may consume a revocation. Called from
 /// every registry op so no background task is needed.
 fn purge_expired(pending: &mut HashMap<String, PendingDeliveryAck>) {
     pending.retain(|_, entry| {
         if entry.inserted_at.elapsed() < DELIVERY_ACK_ENTRY_TTL {
             return true;
         }
-        !matches!(*claim_lock(&entry.claim), ClaimState::Open)
+        matches!(
+            *claim_lock(&entry.claim),
+            ClaimState::Revoked | ClaimState::Applied
+        )
     });
 }
 
@@ -131,9 +154,11 @@ fn purge_expired(pending: &mut HashMap<String, PendingDeliveryAck>) {
 /// guard settles a still-`Open` registration: an enqueued selection is
 /// revoked (callback aborted mid-wait; the queued message must not apply
 /// without confirmation), a never-enqueued one is removed outright, so the
-/// sender cannot outlive the callback task in the static map. Entries in a
-/// terminal state (`Applied`/`Revoked`) are owned by the dispatch/revoke
-/// paths and left alone.
+/// sender cannot outlive the callback task in the static map. A `Dropped`
+/// entry (the dispatch already gave the message up) is removed as well:
+/// this guard is its last owner. Entries in a terminal state
+/// (`Applied`/`Revoked`) are owned by the dispatch/revoke paths and left
+/// alone.
 pub(crate) struct DeliveryAck {
     message_id: String,
     receiver: tokio::sync::oneshot::Receiver<()>,
@@ -168,7 +193,7 @@ impl Drop for DeliveryAck {
             ClaimState::Open if self.enqueued => {
                 *state = ClaimState::Revoked;
             }
-            ClaimState::Open => {
+            ClaimState::Open | ClaimState::Dropped => {
                 drop(state);
                 pending.remove(&self.message_id);
             }
@@ -188,7 +213,7 @@ pub(crate) fn register(message_id: &str) -> DeliveryAck {
     pending.insert(
         message_id.to_string(),
         PendingDeliveryAck {
-            sender,
+            sender: Some(sender),
             claim: Arc::clone(&claim),
             inserted_at: tokio::time::Instant::now(),
         },
@@ -212,7 +237,9 @@ pub(crate) fn confirm(message_id: &str) {
         *claim_lock(&entry.claim) = ClaimState::Applied;
         // A send error only means the callback already stopped waiting and
         // dropped the receiver; nothing left to propagate.
-        let _ = entry.sender.send(());
+        if let Some(sender) = entry.sender {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -243,16 +270,28 @@ pub(crate) enum RevokeOutcome {
 pub(crate) fn revoke(message_id: &str) -> RevokeOutcome {
     let mut pending = pending();
     purge_expired(&mut pending);
-    let Some(entry) = pending.get(message_id) else {
+    let Some(claim) = pending
+        .get(message_id)
+        .map(|entry| Arc::clone(&entry.claim))
+    else {
         // Only `confirm`/`apply_if_not_revoked` remove an entry the live
         // callback still owns, so a missing entry means the route already
         // mutated.
         return RevokeOutcome::AlreadyApplied;
     };
-    let mut state = claim_lock(&entry.claim);
+    let mut state = claim_lock(&claim);
     match *state {
         ClaimState::Open | ClaimState::Revoked => {
             *state = ClaimState::Revoked;
+            RevokeOutcome::Won
+        }
+        // The dispatch already gave the dequeued message up before the
+        // mutation point: the route can never apply and no late dispatch
+        // will consume the entry, so reclaim it here and let the callback
+        // restore the picker.
+        ClaimState::Dropped => {
+            drop(state);
+            pending.remove(message_id);
             RevokeOutcome::Won
         }
         ClaimState::Applied => RevokeOutcome::AlreadyApplied,
@@ -262,13 +301,18 @@ pub(crate) fn revoke(message_id: &str) -> RevokeOutcome {
 /// Consume the revoked marker for a dequeued message. Returns `true` exactly
 /// once for a selection whose callback already timed out and reported the
 /// picker as unavailable. Ordinary traffic never registered, and a confirmed
-/// selection was already removed by [`confirm`], so both return `false`.
+/// selection was already removed by [`confirm`], so both return `false`. A
+/// `Dropped` entry fails closed the same way: its dispatch already gave the
+/// message up, so nothing may apply it.
 pub(crate) fn take_revoked(message_id: &str) -> bool {
     let mut pending = pending();
     purge_expired(&mut pending);
-    let revoked = pending
-        .get(message_id)
-        .is_some_and(|entry| matches!(*claim_lock(&entry.claim), ClaimState::Revoked));
+    let revoked = pending.get(message_id).is_some_and(|entry| {
+        matches!(
+            *claim_lock(&entry.claim),
+            ClaimState::Revoked | ClaimState::Dropped
+        )
+    });
     if revoked {
         pending.remove(message_id);
         return true;
@@ -314,12 +358,12 @@ pub(crate) fn apply_if_not_revoked(message_id: &str, f: impl FnOnce()) -> bool {
             // Consume the registration and release the callback's ack wait
             // only now that the route mutation actually ran.
             let mut pending = pending();
-            if let Some(entry) = pending.remove(message_id) {
-                let _ = entry.sender.send(());
+            if let Some(sender) = pending.remove(message_id).and_then(|entry| entry.sender) {
+                let _ = sender.send(());
             }
             true
         }
-        ClaimState::Revoked => {
+        ClaimState::Revoked | ClaimState::Dropped => {
             drop(state);
             pending().remove(message_id);
             false
@@ -330,12 +374,79 @@ pub(crate) fn apply_if_not_revoked(message_id: &str, f: impl FnOnce()) -> bool {
     }
 }
 
+/// Settle the registration of a message whose owning dispatch ended without
+/// reaching the mutation point. Runs from [`DispatchOwnership`]'s drop only.
+fn settle_dropped(message_id: &str) {
+    let mut pending = pending();
+    purge_expired(&mut pending);
+    let Some(claim) = pending
+        .get(message_id)
+        .map(|entry| Arc::clone(&entry.claim))
+    else {
+        return;
+    };
+    let mut state = claim_lock(&claim);
+    match *state {
+        ClaimState::Open => {
+            // The callback is still inside its bounded wait: mark the claim
+            // so its revoke reads "dropped" rather than "already applied",
+            // and release the sender so that wait ends now instead of at
+            // its timeout. The callback's revoke (or its guard drop)
+            // removes the entry.
+            *state = ClaimState::Dropped;
+            drop(state);
+            if let Some(entry) = pending.get_mut(message_id) {
+                entry.sender.take();
+            }
+        }
+        ClaimState::Revoked => {
+            // The callback already reported the picker as unavailable; the
+            // marker only existed for a late dispatch that can no longer
+            // happen.
+            drop(state);
+            pending.remove(message_id);
+        }
+        ClaimState::Applied | ClaimState::Dropped => {}
+    }
+}
+
+/// Ownership token held by the dispatch that dequeued a message, for the
+/// whole dispatch lifetime of that message. Dropping it settles a
+/// registration that no downstream path will consume any more — the
+/// dispatch returned early (hook cancel, self-loop guard, passive context)
+/// or its task was aborted. A selection that reached [`confirm`],
+/// [`apply_if_not_revoked`] or [`take_revoked`] has already left the
+/// registry, and ordinary traffic never registered, so the drop is inert
+/// on every completed path.
+pub(crate) struct DispatchOwnership {
+    message_id: String,
+}
+
+impl DispatchOwnership {
+    pub(crate) fn hold(message_id: &str) -> Self {
+        Self {
+            message_id: message_id.to_string(),
+        }
+    }
+}
+
+impl Drop for DispatchOwnership {
+    fn drop(&mut self) {
+        settle_dropped(&self.message_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn is_registered(message_id: &str) -> bool {
+    pending().contains_key(message_id)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::time::Duration;
 
-    use super::ClaimState;
+    use super::{ClaimState, is_registered};
 
     /// Every test in this module serializes on the crate-wide registry
     /// test lock shared with the Telegram and orchestrator picker tests:
@@ -343,10 +454,6 @@ mod tests {
     /// entries (the default runner is parallel).
     fn test_lock() -> MutexGuard<'static, ()> {
         super::registry_test_lock()
-    }
-
-    fn is_registered(message_id: &str) -> bool {
-        super::pending().contains_key(message_id)
     }
 
     /// Insert an entry with a backdated timestamp. TTL tests cannot advance
@@ -358,7 +465,7 @@ mod tests {
         super::pending().insert(
             message_id.to_string(),
             super::PendingDeliveryAck {
-                sender,
+                sender: Some(sender),
                 claim: Arc::new(Mutex::new(claim)),
                 inserted_at: tokio::time::Instant::now()
                     .checked_sub(age)
@@ -610,7 +717,7 @@ mod tests {
         let mut pending = std::collections::HashMap::from([(
             "selection-stale-open".to_string(),
             super::PendingDeliveryAck {
-                sender,
+                sender: Some(sender),
                 claim: Arc::new(Mutex::new(ClaimState::Open)),
                 inserted_at: tokio::time::Instant::now()
                     .checked_sub(super::DELIVERY_ACK_ENTRY_TTL * 2)
@@ -661,5 +768,145 @@ mod tests {
         // still inside the TTL: the late dispatch can still observe them.
         let _other = super::register("selection-unrelated");
         assert!(super::take_revoked("selection-fresh-revoked"));
+    }
+
+    // The test-serialization lock is held across the ack wait on purpose:
+    // the registry is process-global and the default runner is parallel.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn dropped_selection_wakes_waiting_callback_and_settles_on_revoke() {
+        let _guard = test_lock();
+        // The dispatch dequeued the selection, but an `on_message_received`
+        // hook cancelled it before the mutation point while the callback
+        // was still inside its bounded ack wait. Dropping the dispatch
+        // ownership must end that wait at once (not at the timeout), and
+        // the callback's revoke must read "dropped": it restores the picker
+        // and leaves no residue behind.
+        let mut ack = super::register("selection-dropped-waiting");
+        ack.mark_enqueued();
+        drop(super::DispatchOwnership::hold("selection-dropped-waiting"));
+        let woken = tokio::time::timeout(Duration::from_secs(1), ack.wait()).await;
+        assert!(
+            matches!(woken, Ok(Err(_))),
+            "dropped dispatch must release the waiting callback: {woken:?}"
+        );
+        assert!(matches!(
+            super::revoke("selection-dropped-waiting"),
+            super::RevokeOutcome::Won
+        ));
+        assert!(!is_registered("selection-dropped-waiting"));
+        drop(ack);
+        assert!(!is_registered("selection-dropped-waiting"));
+    }
+
+    #[tokio::test]
+    async fn dropped_revoked_marker_is_reclaimed_by_dispatch_owner() {
+        let _guard = test_lock();
+        // The callback timed out first (revoked marker retained for the late
+        // dispatch), then the dispatch dropped the dequeued message before
+        // the gate. Nothing can consume the marker any more; the ownership
+        // drop must reclaim it instead of leaving it for the daemon's
+        // lifetime.
+        let mut ack = super::register("selection-dropped-revoked");
+        ack.mark_enqueued();
+        assert!(matches!(
+            super::revoke("selection-dropped-revoked"),
+            super::RevokeOutcome::Won
+        ));
+        drop(ack);
+        assert!(is_registered("selection-dropped-revoked"));
+        drop(super::DispatchOwnership::hold("selection-dropped-revoked"));
+        assert!(!is_registered("selection-dropped-revoked"));
+        assert!(!super::take_revoked("selection-dropped-revoked"));
+    }
+
+    #[tokio::test]
+    async fn dropped_selection_is_reclaimed_when_callback_aborts_before_revoke() {
+        let _guard = test_lock();
+        // The dispatch dropped the message while the callback was waiting,
+        // and the callback task was then aborted before it could revoke:
+        // the ack guard is the last owner and must remove the entry.
+        let mut ack = super::register("selection-dropped-aborted");
+        ack.mark_enqueued();
+        drop(super::DispatchOwnership::hold("selection-dropped-aborted"));
+        assert!(is_registered("selection-dropped-aborted"));
+        drop(ack);
+        assert!(!is_registered("selection-dropped-aborted"));
+    }
+
+    #[tokio::test]
+    async fn dropped_selection_never_applies() {
+        let _guard = test_lock();
+        // Fail closed: should a dropped entry ever meet a dispatch-side
+        // check, it reads as revoked and the route stays untouched.
+        let mut ack = super::register("selection-dropped-apply");
+        ack.mark_enqueued();
+        drop(super::DispatchOwnership::hold("selection-dropped-apply"));
+        let mut applied = false;
+        assert!(!super::apply_if_not_revoked(
+            "selection-dropped-apply",
+            || {
+                applied = true;
+            }
+        ));
+        assert!(!applied, "dropped selection must not mutate the route");
+        assert!(!is_registered("selection-dropped-apply"));
+
+        let mut gated = super::register("selection-dropped-gate");
+        gated.mark_enqueued();
+        drop(super::DispatchOwnership::hold("selection-dropped-gate"));
+        assert!(super::take_revoked("selection-dropped-gate"));
+        assert!(!is_registered("selection-dropped-gate"));
+    }
+
+    // The test-serialization lock is held across the ack wait on purpose:
+    // the registry is process-global and the default runner is parallel.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn dispatch_ownership_is_inert_for_applied_and_unregistered_messages() {
+        let _guard = test_lock();
+        // Ordinary traffic never registered, and an applied selection
+        // already left the registry: neither drop may change anything.
+        drop(super::DispatchOwnership::hold("ordinary-dropped"));
+        assert!(!is_registered("ordinary-dropped"));
+
+        let mut ack = super::register("selection-applied-then-dropped");
+        ack.mark_enqueued();
+        let ownership = super::DispatchOwnership::hold("selection-applied-then-dropped");
+        assert!(super::apply_if_not_revoked(
+            "selection-applied-then-dropped",
+            || {}
+        ));
+        drop(ownership);
+        assert!(matches!(ack.wait().await, Ok(())));
+        assert!(matches!(
+            super::revoke("selection-applied-then-dropped"),
+            super::RevokeOutcome::AlreadyApplied
+        ));
+        assert!(!is_registered("selection-applied-then-dropped"));
+    }
+
+    #[tokio::test]
+    async fn stale_dropped_entry_is_purged_without_consumption() {
+        // Local state for the same reason as the stale `Open` case: a
+        // dropped entry whose callback never came back has no owner left,
+        // so the lazy sweep may reclaim it once it is past the TTL.
+        let mut pending = std::collections::HashMap::from([(
+            "selection-stale-dropped".to_string(),
+            super::PendingDeliveryAck {
+                sender: None,
+                claim: Arc::new(Mutex::new(ClaimState::Dropped)),
+                inserted_at: tokio::time::Instant::now()
+                    .checked_sub(super::DELIVERY_ACK_ENTRY_TTL * 2)
+                    .unwrap_or_else(tokio::time::Instant::now),
+            },
+        )]);
+
+        assert!(pending.contains_key("selection-stale-dropped"));
+        super::purge_expired(&mut pending);
+        assert!(
+            !pending.contains_key("selection-stale-dropped"),
+            "stale dropped entry must be reclaimed without consumption"
+        );
     }
 }
