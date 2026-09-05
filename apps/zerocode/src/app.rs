@@ -109,9 +109,15 @@ impl<T> Drop for ReconnectAttempt<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingQuickstartChat {
     /// Open the created agent after the daemon reconnects.
-    AfterReconnect(String),
+    AfterReconnect {
+        alias: String,
+        notice: Option<String>,
+    },
     /// Open the created agent on the current live connection.
-    Immediate(String),
+    Immediate {
+        alias: String,
+        notice: Option<String>,
+    },
 }
 
 /// State that must survive a reconnect — used by Quickstart's
@@ -707,16 +713,17 @@ async fn switch_mode(
 fn take_pending_quickstart_chat(
     reconnect_state: &SharedReconnectState,
     drain: QuickstartChatDrain,
-) -> Option<String> {
+) -> Option<PendingQuickstartChat> {
     let Ok(mut guard) = reconnect_state.lock() else {
         return None;
     };
     let pending = guard.pending_quickstart_chat.take()?;
     match (drain, pending) {
-        (QuickstartChatDrain::Immediate, PendingQuickstartChat::Immediate(alias))
-        | (QuickstartChatDrain::AfterReconnect, PendingQuickstartChat::AfterReconnect(alias)) => {
-            Some(alias)
-        }
+        (QuickstartChatDrain::Immediate, pending @ PendingQuickstartChat::Immediate { .. })
+        | (
+            QuickstartChatDrain::AfterReconnect,
+            pending @ PendingQuickstartChat::AfterReconnect { .. },
+        ) => Some(pending),
         (_, other) => {
             guard.pending_quickstart_chat = Some(other);
             None
@@ -733,11 +740,15 @@ async fn consume_pending_quickstart_chat(
     if !dispatch_state.rpc_allowed() {
         return;
     }
-    let Some(alias) = take_pending_quickstart_chat(reconnect_state, QuickstartChatDrain::Immediate)
+    let Some(PendingQuickstartChat::Immediate { alias, notice }) =
+        take_pending_quickstart_chat(reconnect_state, QuickstartChatDrain::Immediate)
     else {
         return;
     };
     chat_pane.focus_agent(&alias).await;
+    if let Some(notice) = notice {
+        chat_pane.set_info_notice(notice);
+    }
     *mode = Mode::Chat;
 }
 
@@ -813,8 +824,13 @@ pub async fn run(
                     quickstart_pane::QuickstartPane::new(rpc.clone(), Arc::clone(&reconnect_state));
                 quickstart.init().await?;
                 let sop_pane = sop_pane::SopPane::new(rpc.clone());
-                if let Some(alias) = pending_start_chat {
+                if let Some(PendingQuickstartChat::AfterReconnect { alias, notice }) =
+                    pending_start_chat
+                {
                     chat_pane.focus_agent(&alias).await;
+                    if let Some(notice) = notice {
+                        chat_pane.set_info_notice(notice);
+                    }
                     mode = Mode::Chat;
                 }
                 anyhow::Ok((
@@ -3538,12 +3554,18 @@ mod tests {
         let state = SharedReconnectState::default();
         {
             let mut guard = state.lock().unwrap();
-            guard.pending_quickstart_chat = Some(PendingQuickstartChat::Immediate("scout".into()));
+            guard.pending_quickstart_chat = Some(PendingQuickstartChat::Immediate {
+                alias: "scout".into(),
+                notice: Some("credential durability warning".into()),
+            });
         }
 
         assert_eq!(
             take_pending_quickstart_chat(&state, QuickstartChatDrain::Immediate),
-            Some("scout".into())
+            Some(PendingQuickstartChat::Immediate {
+                alias: "scout".into(),
+                notice: Some("credential durability warning".into()),
+            })
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
     }
@@ -3553,8 +3575,10 @@ mod tests {
         let state = SharedReconnectState::default();
         {
             let mut guard = state.lock().unwrap();
-            guard.pending_quickstart_chat =
-                Some(PendingQuickstartChat::AfterReconnect("scout".into()));
+            guard.pending_quickstart_chat = Some(PendingQuickstartChat::AfterReconnect {
+                alias: "scout".into(),
+                notice: Some("credential durability warning".into()),
+            });
         }
 
         assert_eq!(
@@ -3563,7 +3587,10 @@ mod tests {
         );
         assert_eq!(
             state.lock().unwrap().pending_quickstart_chat,
-            Some(PendingQuickstartChat::AfterReconnect("scout".into()))
+            Some(PendingQuickstartChat::AfterReconnect {
+                alias: "scout".into(),
+                notice: Some("credential durability warning".into()),
+            })
         );
     }
 
@@ -3572,13 +3599,18 @@ mod tests {
         let state = SharedReconnectState::default();
         {
             let mut guard = state.lock().unwrap();
-            guard.pending_quickstart_chat =
-                Some(PendingQuickstartChat::AfterReconnect("scout".into()));
+            guard.pending_quickstart_chat = Some(PendingQuickstartChat::AfterReconnect {
+                alias: "scout".into(),
+                notice: Some("credential durability warning".into()),
+            });
         }
 
         assert_eq!(
             take_pending_quickstart_chat(&state, QuickstartChatDrain::AfterReconnect),
-            Some("scout".into())
+            Some(PendingQuickstartChat::AfterReconnect {
+                alias: "scout".into(),
+                notice: Some("credential durability warning".into()),
+            })
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
     }

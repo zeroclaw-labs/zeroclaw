@@ -359,6 +359,8 @@ zc-quickstart-modal-action-save = guardar
 zc-quickstart-modal-type-prefix = Tipo:
 zc-quickstart-field-label-alias = Alias
 zc-quickstart-field-help-alias = Identificador único para esta instancia de proveedor. Cámbialo de "default" si tu configuración ya tiene uno con ese alias.
+zc-quickstart-anthropic-setup-token-label = Token de configuración
+zc-quickstart-anthropic-setup-token-help = Pega el token de `claude setup-token`. ZeroClaw lo guardará en el perfil de autenticación de Anthropic de este alias y establecerá `auth_mode = "oauth"`.
 zc-quickstart-model-loading = Cargando modelos para { $provider }...
 zc-quickstart-model-retrying = Reintentando catálogo de modelos para { $provider }...
 zc-quickstart-model-catalog-empty = catálogo no disponible - escribe un nombre de modelo
@@ -370,6 +372,7 @@ zc-quickstart-status-created = Se creó `{ $alias }`. Recargando el daemon — e
 zc-quickstart-status-errors = { $count } error(es) — corrige los selectores y vuelve a enviar
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } más)
+zc-quickstart-status-more-warnings = { " " }(+{ $count } advertencia(s) más)
 zc-quickstart-status-can-create = Todos los selectores requeridos ✓. Pulsa `{ $chord }` para Crear.
 zc-quickstart-status-hint = ↑/↓ para moverte, Enter para abrir. `{ $chord }` se habilita cuando todos los selectores obligatorios están ✓.
 zc-quickstart-missing-model-provider = Elige un proveedor de modelo antes de crear.

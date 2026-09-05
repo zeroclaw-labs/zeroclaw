@@ -610,10 +610,11 @@ impl RpcDispatcher {
         );
         let mut snapshot = self.ctx.config.read().clone();
         let saved_paths = snapshot.dirty_paths.clone();
-        snapshot
-            .save_dirty()
+        let outcome = snapshot
+            .save_dirty_with_outcome()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        self.record_committed_config_warning(outcome);
         self.ctx
             .config
             .write()
@@ -641,12 +642,35 @@ impl RpcDispatcher {
             self.ctx.config_write_lock.try_lock().is_err(),
             "save_and_swap_config caller must hold ctx.config_write_lock"
         );
-        snapshot
-            .save_dirty()
+        let outcome = snapshot
+            .save_dirty_with_outcome()
             .await
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        self.record_committed_config_warning(outcome);
         *self.ctx.config.write() = snapshot;
         Ok(())
+    }
+
+    fn record_committed_config_warning(&self, outcome: zeroclaw_config::schema::ConfigSaveOutcome) {
+        if let zeroclaw_config::schema::ConfigSaveOutcome::CommittedWithDurabilityWarning(error) =
+            outcome
+        {
+            // A config/set or alias-rename response must agree with the already
+            // committed file and installed live snapshot. This narrow bridge
+            // must be replaced by a dedicated config-persistence refactor that
+            // makes every legacy save caller outcome-aware.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "config.directory_sync_after_replace_failed",
+                        "error": error.to_string(),
+                        "caller": "rpc",
+                    })),
+                "Config change committed with a directory durability warning"
+            );
+        }
     }
 
     async fn agent_rename_residue_exists(
@@ -5089,30 +5113,24 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
-        // Serializes with every other config-mutating handler for the whole
-        // clone-apply-save-swap below, so the install on success can't race
-        // a concurrent config write (see `ctx.config_write_lock`).
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        // Clone out of the lock to satisfy `&mut Config`. On success
-        // install the mutated snapshot, mirroring the gateway's
-        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
-        // the clone, so `save_and_swap_config` performs no second disk
-        // write (empty dirty set short-circuits) — just the guarded swap.
-        let mut working = self.ctx.config.read().clone();
-        let result = crate::quickstart::apply_with_surface(
-            req.submission,
-            &mut working,
-            crate::quickstart::Surface::Tui,
-        )
-        .await;
+        let quickstart_config = crate::quickstart::QuickstartConfigState::from_parts(
+            Arc::clone(&self.ctx.config),
+            Arc::clone(&self.ctx.config_write_lock),
+            Arc::clone(&self.ctx.quickstart_reload_admission),
+        );
+        let result = quickstart_config
+            .apply_and_admit_reload(req.submission, crate::quickstart::Surface::Tui)
+            .await;
         let body = match result {
-            Ok(agent) => {
-                self.save_and_swap_config(working, &config_write_guard)
-                    .await?;
+            Ok(outcome) => {
                 let reload_signalled = self.signal_daemon_reload();
+                if !reload_signalled {
+                    quickstart_config.cancel_reload_admission();
+                }
                 QuickstartApplyResult::Applied {
-                    agent,
+                    agent: outcome.agent,
                     daemon_restarted: reload_signalled,
+                    warnings: outcome.warnings,
                 }
             }
             Err(errors) => QuickstartApplyResult::Errors { errors },
@@ -7633,7 +7651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+    async fn quickstart_apply_persists_anthropic_setup_token_before_daemon_reload() {
         use zeroclaw_config::presets::{
             AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
         };
@@ -7658,17 +7676,21 @@ mod tests {
             Some(reload_tx),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        let dispatcher = RpcDispatcher::new(
+            Arc::clone(&ctx),
+            tx,
+            "test-peer-quickstart-reload:pid=1".into(),
+        );
 
         let submission = BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
                 provider_type: "anthropic".into(),
-                alias: "anthropic".into(),
+                alias: "subscription".into(),
                 model: "claude-sonnet-4-5".into(),
-                fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
-                    "sk-test".to_string(),
-                )]),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "sk-ant-oat01-test-token".to_string()),
+                ]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
             runtime_profile: SelectorChoice::Fresh("balanced".into()),
@@ -7684,7 +7706,7 @@ mod tests {
         };
 
         let result = dispatcher
-            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .handle_quickstart_apply(&json!({ "submission": submission.clone() }))
             .await
             .expect("quickstart/apply should accept reload-capable contexts");
         assert_eq!(
@@ -7692,6 +7714,31 @@ mod tests {
             "quickstart/apply result: {result:#?}"
         );
         assert_eq!(result["daemon_restarted"], true);
+        let mut second_submission = submission.clone();
+        second_submission.agent.name = "quickstart_bot_two".into();
+        let rejected = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": second_submission }))
+            .await
+            .expect("a pending reload is a valid quickstart response");
+        assert_eq!(rejected["kind"], "errors");
+        assert_eq!(rejected["errors"][0]["field"], "reload");
+        let persisted = ctx.config.read().clone();
+        let entry = persisted
+            .providers
+            .models
+            .find("anthropic", "subscription")
+            .expect("TUI apply must create the requested alias");
+        assert_eq!(entry.api_key, None, "setup token must not enter config");
+        let profile = zeroclaw_providers::auth::AuthService::from_config(&persisted)
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .expect("read persisted auth profile")
+            .expect("TUI apply must store the same-alias profile");
+        assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
+        assert!(
+            !persisted.agents.contains_key("quickstart_bot_two"),
+            "rejected queued RPC apply must not mutate the outgoing daemon config"
+        );
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -9526,6 +9573,58 @@ mod tests {
         assert!(!written.contains("[agents.alpha]"), "{written}");
         assert!(written.contains("agent = \"beta\""), "{written}");
         assert!(written.contains("default_agent = \"beta\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn alias_rename_post_rename_sync_failure_still_commits_disk_and_live_config() {
+        // `handle_config_alias_rename` persists through save_and_swap_config,
+        // rather than config/set's flush_config path. A post-rename directory
+        // sync fault still means the replacement file was committed, so the
+        // RPC must report success and publish that same snapshot live.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_agent_rename_test_config(&tmp);
+        config.save().await.expect("seed the on-disk config");
+        let config_path = config.config_path.clone();
+        let prior_disk = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("seeded config must exist on disk");
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        zeroclaw_config::schema::arm_post_replace_sync_failure_for_test(&config_path);
+        let result = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "a post-rename sync fault must still report a committed alias rename: {result:?}"
+        );
+        assert!(
+            !zeroclaw_config::schema::post_replace_sync_failure_armed(&config_path),
+            "the injected fault must fire inside alias-rename persistence"
+        );
+
+        {
+            let live = dispatcher.ctx.config.read();
+            assert!(!live.agents.contains_key("alpha"));
+            assert!(live.agents.contains_key("beta"));
+        }
+
+        let disk = tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("config.toml must survive the injected fault");
+        assert!(disk.contains("[agents.beta]"), "{disk}");
+        assert!(!disk.contains("[agents.alpha]"), "{disk}");
+
+        let backup = tokio::fs::read_to_string(config_path.with_extension("toml.bak"))
+            .await
+            .expect("durability uncertainty must retain the prior backup");
+        assert_eq!(backup, prior_disk, ".bak must retain the prior config");
     }
 
     #[tokio::test]
@@ -12154,6 +12253,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -12198,6 +12298,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -12301,6 +12402,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,

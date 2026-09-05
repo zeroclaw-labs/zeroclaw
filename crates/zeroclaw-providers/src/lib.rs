@@ -1352,6 +1352,15 @@ fn create_model_provider_inner(
     api_url: Option<&str>,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    // Config loading deliberately keeps an invalid entry available so the
+    // operator can repair it through /config. A provider factory must still
+    // fail closed before such an alias reaches auth-profile selection, where
+    // ':' has a different meaning as the profile-ID separator.
+    if config.is_some() && alias.contains(':') {
+        anyhow::bail!(
+            "model provider alias {alias:?} contains ':' and cannot be used to construct a provider"
+        );
+    }
     if let Some(idx) = raw_name.find(':') {
         let prefix = &raw_name[..idx];
         let url = raw_name[idx + 1..].trim();
@@ -3477,6 +3486,56 @@ mod tests {
         assert!(create_model_provider("llamacpp.typo", None).is_err());
     }
 
+    #[tokio::test]
+    async fn persisted_colon_alias_is_rejected_by_all_factories_before_auth_resolution() {
+        use zeroclaw_config::schema::{
+            AnthropicAuthMode, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temporary config directory");
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.providers.models.anthropic.insert(
+            "subscription:work".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig::default(),
+                auth_mode: Some(AnthropicAuthMode::OAuth),
+            },
+        );
+        config.save().await.expect("persist invalid alias fixture");
+        let serialized = std::fs::read_to_string(&config.config_path)
+            .expect("persisted fixture must be readable");
+        assert!(
+            serialized.contains("[providers.models.anthropic.\"subscription:work\"]"),
+            "fixture must exercise a persisted colon-bearing alias: {serialized}"
+        );
+
+        let direct = create_model_provider_from_ref(&config, "anthropic.subscription:work").err();
+        let resilient = create_resilient_model_provider_from_ref(
+            &config,
+            "anthropic.subscription:work",
+            None,
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .err();
+
+        for error in [direct, resilient] {
+            let error =
+                error.expect("a colon-bearing persisted alias must fail before profile lookup");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot be used to construct a provider"),
+                "unexpected rejection: {error}"
+            );
+        }
+    }
+
     // ── Error cases ──────────────────────────────────────────
 
     #[test]
@@ -4162,6 +4221,7 @@ mod tests {
                 uri: Some("https://api.default.example/v1/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            auth_mode: None,
         };
         let work_alias = AnthropicModelProviderConfig {
             base: ModelProviderConfig {
@@ -4170,6 +4230,7 @@ mod tests {
                 uri: Some("https://work-proxy.example/v1/v1/anthropic/messages".into()),
                 ..ModelProviderConfig::default()
             },
+            auth_mode: None,
         };
         config
             .providers
@@ -5052,6 +5113,7 @@ mod tests {
                     max_tokens: Some(8_192),
                     ..ModelProviderConfig::default()
                 },
+                auth_mode: None,
             },
         );
 

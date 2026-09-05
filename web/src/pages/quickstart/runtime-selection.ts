@@ -53,3 +53,37 @@ export function requiredQuickstartSelectionsComplete(input: {
     input.agentName.trim() !== ""
   );
 }
+
+/**
+ * Resolve the user-facing presentation of a provider credential field.
+ *
+ * Anthropic setup-token onboarding deliberately keeps the transport field key
+ * as `api_key`: the runtime consumes that submitted value to stage a stored
+ * auth profile and never writes it to provider config. The UI must therefore
+ * change the label and guidance without changing the submitted field key.
+ */
+export function quickstartCredentialPresentation(input: {
+  providerType: string;
+  authMode: string | undefined;
+  fieldKey: string;
+  label: string;
+  help: string | undefined;
+  setupTokenLabel: string;
+  setupTokenHelp: string;
+}): Pick<typeof input, "label" | "help"> {
+  if (
+    input.providerType === "anthropic" &&
+    input.authMode === "setup_token" &&
+    input.fieldKey === "api_key"
+  ) {
+    return {
+      label: input.setupTokenLabel,
+      help: input.setupTokenHelp,
+    };
+  }
+
+  return {
+    label: input.label,
+    help: input.help,
+  };
+}

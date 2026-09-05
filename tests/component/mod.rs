@@ -19,6 +19,8 @@ mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
 mod provider_resolution;
 mod provider_schema;
+#[cfg(feature = "agent-runtime")]
+mod quickstart_cli_boundary;
 mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;

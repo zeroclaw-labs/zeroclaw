@@ -390,6 +390,8 @@ zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
 zc-quickstart-field-label-alias = Alias
 zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
+zc-quickstart-anthropic-setup-token-label = Setup token
+zc-quickstart-anthropic-setup-token-help = Paste the token from `claude setup-token`. ZeroClaw will store it in the Anthropic auth profile for this alias and set `auth_mode = "oauth"`.
 zc-quickstart-model-loading = Loading models for { $provider }...
 zc-quickstart-model-retrying = Retrying model catalog for { $provider }...
 zc-quickstart-model-catalog-empty = catalog unavailable - type a model name
@@ -403,6 +405,7 @@ zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat w
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
+zc-quickstart-status-more-warnings = { " " }(+{ $count } more warning(s))
 zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
 zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
 zc-quickstart-missing-model-provider = Choose a model provider before creating.
