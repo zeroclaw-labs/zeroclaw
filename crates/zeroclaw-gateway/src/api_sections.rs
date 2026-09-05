@@ -1391,6 +1391,7 @@ mod tests {
             pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
                 false,
                 &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
             )),
             trust_forwarded_headers: false,
             rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),

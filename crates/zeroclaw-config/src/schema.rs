@@ -7,6 +7,7 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
+use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
@@ -7110,6 +7111,13 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
+    /// source of truth for the length and character family of every code
+    /// the gateway issues.
+    #[serde(default)]
+    #[nested]
+    pub pairing_code: PairingCodePolicy,
+
     /// Pairing dashboard configuration
     #[serde(default)]
     #[nested]
@@ -7229,6 +7237,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -7241,13 +7250,17 @@ impl Default for GatewayConfig {
 }
 
 /// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+///
+/// Code length and character family are **not** configured here. The
+/// dashboard pairing flow issues its codes through the same
+/// [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing and
+/// `zeroclaw gateway get-paircode`, so it consumes
+/// [`gateway.pairing_code`](crate::pairing::PairingCodePolicy) rather than
+/// carrying a second, dashboard-only setting.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
-    /// Length of pairing codes (default: 8)
-    #[serde(default = "default_pairing_code_length")]
-    pub code_length: usize,
     /// Time-to-live for pending pairing codes in seconds (default: 3600)
     #[serde(default = "default_pairing_ttl")]
     pub code_ttl_secs: u64,
@@ -7262,9 +7275,6 @@ pub struct PairingDashboardConfig {
     pub lockout_secs: u64,
 }
 
-fn default_pairing_code_length() -> usize {
-    8
-}
 fn default_pairing_ttl() -> u64 {
     3600
 }
@@ -7281,7 +7291,6 @@ fn default_pairing_lockout_secs() -> u64 {
 impl Default for PairingDashboardConfig {
     fn default() -> Self {
         Self {
-            code_length: default_pairing_code_length(),
             code_ttl_secs: default_pairing_ttl(),
             max_pending_codes: default_max_pending_codes(),
             max_failed_attempts: default_max_failed_attempts(),
@@ -21424,6 +21433,20 @@ impl Config {
             );
         }
 
+        // Pairing-code policy. Rejected at load rather than clamped
+        // at generation, so an operator who asks for a weak pairing code is
+        // told, not silently given a different one.
+        let pairing_code_length = self.gateway.pairing_code.length;
+        if self.gateway.pairing_code.validate().is_err() {
+            let path = "gateway.pairing_code.length";
+            validation_bail!(
+                InvalidNumericRange,
+                path,
+                "{path} = {pairing_code_length} is out of range; must be \
+                 {PAIRING_CODE_MIN_LENGTH}..={PAIRING_CODE_MAX_LENGTH}"
+            );
+        }
+
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
             let openvpn = self.tunnel.openvpn.as_ref().ok_or_else(|| {
@@ -26712,6 +26735,177 @@ enabled = true
             .expect("WebSocket ping interval upper bound must validate");
     }
 
+    // ── Pairing-code policy ──────────────────────────
+
+    /// The shipped default is the strong policy, not the six-digit code.
+    #[test]
+    async fn gateway_default_pairing_code_policy_is_the_strong_default() {
+        let config = Config::default();
+        assert_eq!(config.gateway.pairing_code, PairingCodePolicy::default());
+        assert_eq!(config.gateway.pairing_code.length, 32);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Alphanumeric
+        );
+    }
+
+    #[test]
+    async fn gateway_pairing_code_section_parses_from_toml() {
+        let config: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 24\ncharset = \"unambiguous\"\n")
+                .expect("pairing-code section parses");
+        assert_eq!(config.gateway.pairing_code.length, 24);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Unambiguous
+        );
+        config.validate().expect("24 unambiguous chars is valid");
+    }
+
+    #[test]
+    async fn validate_rejects_pairing_code_length_below_minimum() {
+        let mut config = Config::default();
+        config.gateway.pairing_code.length = PAIRING_CODE_MIN_LENGTH - 1;
+
+        let err = config
+            .validate()
+            .expect_err("a pairing code weaker than the old default must be rejected");
+
+        assert!(
+            err.to_string().contains("gateway.pairing_code.length"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_pairing_code_length_above_maximum() {
+        let mut config = Config::default();
+        config.gateway.pairing_code.length = PAIRING_CODE_MAX_LENGTH + 1;
+
+        let err = config
+            .validate()
+            .expect_err("an over-long pairing code must be rejected");
+
+        assert!(
+            err.to_string().contains("gateway.pairing_code.length"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_pairing_code_length_bounds() {
+        for length in [PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH] {
+            let mut config = Config::default();
+            config.gateway.pairing_code.length = length;
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("documented bound {length} must validate: {e}"));
+        }
+    }
+
+    /// The dashboard consumes the shared policy instead of carrying
+    /// its own length knob. A config that still names the retired
+    /// `gateway.pairing_dashboard.code_length` must load, must not resurrect
+    /// a parallel setting, and must leave `[gateway.pairing_code]` in charge.
+    #[test]
+    async fn retired_dashboard_code_length_is_not_a_parallel_setting() {
+        let config: Config = toml::from_str(
+            "[gateway.pairing_dashboard]\n\
+             code_length = 8\n\
+             code_ttl_secs = 3600\n\
+             \n\
+             [gateway.pairing_code]\n\
+             length = 20\n\
+             charset = \"unambiguous\"\n",
+        )
+        .expect("a config carrying the retired key must still load");
+
+        // The shared policy is the only thing that decides code shape.
+        assert_eq!(config.gateway.pairing_code.length, 20);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Unambiguous
+        );
+        // The dashboard section survives with its remaining fields.
+        assert_eq!(config.gateway.pairing_dashboard.code_ttl_secs, 3600);
+
+        // No settable property anywhere still offers a second code length.
+        let code_length_props: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("gateway.") && name.ends_with("code_length"))
+            .collect();
+        assert!(
+            code_length_props.is_empty(),
+            "a parallel pairing-code length setting reappeared: {code_length_props:?}"
+        );
+
+        // And exactly one pairing-code length property exists overall.
+        let length_props: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("gateway.pairing"))
+            .filter(|name| name.contains("length"))
+            .collect();
+        assert_eq!(
+            length_props,
+            vec!["gateway.pairing_code.length".to_string()],
+            "there must be exactly one pairing-code length setting"
+        );
+    }
+
+    /// The dashboard/API pairing flow and startup pairing must agree,
+    /// because both resolve the same `[gateway.pairing_code]` value.
+    #[test]
+    async fn dashboard_and_startup_pairing_share_one_policy() {
+        let config: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 12\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], config.gateway.pairing_code);
+
+        // Startup code (what the banner prints).
+        let startup = guard.pairing_code().expect("startup code");
+        // Dashboard code (`POST /api/pairing/initiate`) — the gateway
+        // re-reads live config for this argument on every mint.
+        let dashboard = guard
+            .generate_new_pairing_code(config.gateway.pairing_code)
+            .expect("dashboard code");
+
+        for code in [&startup, &dashboard] {
+            assert_eq!(code.len(), 12, "code {code} must follow the config");
+            assert!(code.chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    /// Review MAJOR-1, config half: strengthening `[gateway.pairing_code]`
+    /// changes what the *same* guard mints, with no reconstruction. Mirrors
+    /// how the gateway swaps the whole `Config` on a config write.
+    #[test]
+    async fn a_strengthened_policy_applies_without_rebuilding_the_guard() {
+        let weak: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 6\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], weak.gateway.pairing_code);
+        assert_eq!(guard.pairing_code().expect("startup code").len(), 6);
+
+        // Operator edits config; the gateway replaces the whole Config.
+        let strong: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 28\ncharset = \"unambiguous\"\n")
+                .expect("parses");
+        let minted = guard
+            .generate_new_pairing_code(strong.gateway.pairing_code)
+            .expect("mint under the new policy");
+
+        assert_eq!(minted.len(), 28, "next code must follow the new policy");
+        let alphabet = strong.gateway.pairing_code.charset.alphabet();
+        assert!(
+            minted.bytes().all(|b| alphabet.contains(&b)),
+            "code {minted} must use the new charset"
+        );
+    }
+
     fn plugin_entry_with_egress(hosts: &[&str], private: &[&str]) -> super::PluginEntryConfig {
         super::PluginEntryConfig {
             name: "gitea".to_string(),
@@ -30867,6 +31061,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,

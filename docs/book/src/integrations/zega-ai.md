@@ -44,13 +44,19 @@ ZeroClaw itself.
 The bridge implements the two pairing contracts exposed by the ZeroClaw
 gateway and tries them in order:
 
+> **Pairing codes are case-sensitive, and their shape is configurable.**
+> `[gateway.pairing_code]` sets the length (`6`–`128`) and the character
+> family (`numeric`, `alphanumeric`, or `unambiguous`); the default is 32
+> case-sensitive alphanumeric characters. Transmit the code verbatim: do
+> not upper-case it, strip characters, or assume a fixed width.
+
 ### Enhanced route: `POST /api/pair`
 
 Accepts a JSON body:
 
 ```json
 {
-  "code": "<6-digit pairing code>",
+  "code": "<pairing code>",
   "device_name": "ZEGA AI Bridge",
   "device_type": "api-bridge"
 }
@@ -69,7 +75,7 @@ Sends the pairing code in the `X-Pairing-Code` header:
 ```text
 POST /pair
 Content-Type: application/json
-X-Pairing-Code: <6-digit code>
+X-Pairing-Code: <pairing code>
 ```
 
 The bridge falls back to this route when the enhanced endpoint is

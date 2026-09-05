@@ -723,7 +723,15 @@ impl LineChannel {
         let alias = alias.into();
         let configured_peers = peer_resolver();
         let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
-            let guard = PairingGuard::new(true, &[]);
+            // Chat-channel bind codes are retyped by hand into a Telegram/
+            // LINE/WeChat message, so they deliberately keep the six-digit
+            // numeric shape. The shared-policy change re-scoped the *gateway* pairing code, not
+            // this one; changing it here would be an unreviewed UX change.
+            let guard = PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::numeric_compat(),
+            );
             if let Some(code) = guard.pairing_code() {
                 // Mirror Telegram/WeChat: a backgrounded daemon discards
                 // stdout, so surface the one-time bind code through the

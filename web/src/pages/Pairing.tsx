@@ -141,7 +141,7 @@ export default function Pairing() {
           <p className="text-xs uppercase tracking-wider mb-2 text-pc-text-muted">
             {t('pairing.pairing_code')}
           </p>
-          <div className="text-4xl font-mono font-bold tracking-[0.4em] py-4 text-pc-text">
+          <div className="text-2xl font-mono font-bold tracking-widest break-all py-4 text-pc-text">
             {pairingCode}
           </div>
           <p className="text-xs text-pc-text-muted">{t('pairing.code_hint')}</p>

@@ -444,7 +444,11 @@ mod tests {
     }
 
     fn make_pairing(require: bool) -> PairingGuard {
-        PairingGuard::new(require, &[])
+        PairingGuard::new(
+            require,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        )
     }
 
     #[test]

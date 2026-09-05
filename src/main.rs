@@ -5729,13 +5729,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
                     Box::pin(async move {
-                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
+                        let (
+                            enroll_cfg,
+                            wss_cfg,
+                            relay_cfg,
+                            data_dir,
+                            startup_pairing_code_policy,
+                        ) = {
                             let cfg = ctx.config.read();
                             (
                                 cfg.enroll.clone(),
                                 cfg.wss.clone(),
                                 cfg.relay.clone(),
                                 cfg.data_dir.clone(),
+                                cfg.gateway.pairing_code,
                             )
                         };
                         if !enroll_cfg.enabled {
@@ -5835,6 +5842,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
                             true,
                             &[],
+                            startup_pairing_code_policy,
                         ));
                         if let Some(code) = pairing.pairing_code() {
                             let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
@@ -5921,6 +5929,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             ca_key_pem,
                             ledger,
                             pairing,
+                            pairing_code_policy: {
+                                let config = ctx.config.clone();
+                                std::sync::Arc::new(move || config.read().gateway.pairing_code)
+                            },
                             static_client_pins_configured: wss_cfg
                                 .client_auth
                                 .as_ref()
