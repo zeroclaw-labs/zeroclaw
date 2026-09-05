@@ -1,10 +1,11 @@
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
-    TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
+    TOOL_LOOP_SESSION_KEY, TOOL_LOOP_THREAD_ID, ToolLoop, apply_text_tool_prompt_policy,
+    run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::approval::ApprovalManager;
+use crate::approval::{ApprovalManager, ApprovalRequirement};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -134,6 +135,31 @@ pub struct DelegateTool {
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
+    /// Binding delegation-depth ceiling for this tool's owner and its whole
+    /// subtree. Source of truth: the owning agent's runtime profile
+    /// `max_delegation_depth`. Each constructed sub-delegate tool carries the
+    /// owner's effective ceiling tightened (min) with the next target's own
+    /// profile cap, so a parent's cap binds its entire subtree and a chain
+    /// can only tighten. `None` resolves per use in `effective_max_depth`.
+    max_delegation_depth: Option<u32>,
+    /// Whether this instance may manage background delegate tasks
+    /// (`check_result`, `list_results`, `cancel_task`, `await_sessions`).
+    /// Background records live in a workspace-wide namespace without owner
+    /// identity, and a bounded sub-agent shares the delegating parent's
+    /// workspace, so handing it the management surface would let it read and
+    /// cancel tasks owned by other identities. Bounded sub-delegate tools
+    /// therefore carry delegate-only instances; every other construction
+    /// keeps the full surface.
+    background_task_management: bool,
+    /// Whether the loop calling this instance has an operator approval
+    /// route. Top-level and wrapper constructions run inside loops that own
+    /// an `ApprovalManager` (or deliberately run unguarded, for legacy test
+    /// constructors); bounded sub-agent loops do not - `delegate` sub-agent
+    /// loops never thread an approval manager, so a prompt-required call
+    /// would silently bypass the target's approval policy. When `false`, the
+    /// tool itself refuses delegation for callers whose risk profile would
+    /// prompt (supervised default or `always_ask`), failing closed.
+    operator_approval_available: bool,
     /// Parent tool registry for agentic sub-agents.
     parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Runtime adapter used to build target-owned registries for independent
@@ -274,6 +300,9 @@ impl DelegateTool {
             global_credential,
             provider_runtime_options,
             depth: 0,
+            max_delegation_depth: None,
+            background_task_management: true,
+            operator_approval_available: true,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -322,6 +351,9 @@ impl DelegateTool {
             global_credential,
             provider_runtime_options,
             depth,
+            max_delegation_depth: None,
+            background_task_management: true,
+            operator_approval_available: true,
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             runtime: None,
             multimodal_config: zeroclaw_config::schema::MultimodalConfig::default(),
@@ -544,6 +576,41 @@ impl DelegateTool {
 
         if target_mode == DelegateExecutionMode::Bounded {
             target_policy.tracker = self.security.tracker.clone();
+            // Budget binding: the tracker counter is shared, but enforcement
+            // compares it against the invoking policy's own ceiling, so a
+            // target with a looser profile ceiling would outspend the
+            // caller's budget - the escalation `ensure_no_escalation_beyond`
+            // already rejects for child ceilings. The caller's ceiling is
+            // itself the tightened chain value, so the bound holds for the
+            // whole subtree.
+            //
+            // The two fields have DIFFERENT zero semantics in the schema.
+            // `max_actions_per_hour`: `0` is a hard zero budget, so a numeric
+            // min is exact. `max_cost_per_day_cents`: `0` inherits the global
+            // limit, so a raw min could turn an unset target value into an
+            // "inherit-global" child cap looser than the caller's explicit
+            // cap. Combine cost so the result is never looser than the
+            // caller's effective ceiling: both explicit -> min, one unset ->
+            // carry the explicit one, both unset -> inherit (0).
+            //
+            // Enforcement status: the ACTION ceiling is enforced at every
+            // admission through the shared tracker. The COST ceiling is
+            // carried faithfully but NOT enforced on delegated runs today -
+            // delegated loops run without cost-tracking scope - so this
+            // clamp is future-proofing for cost enforcement, not live
+            // enforcement. See the follow-up on threading cost context into
+            // child loops.
+            target_policy.max_actions_per_hour = target_policy
+                .max_actions_per_hour
+                .min(self.security.max_actions_per_hour);
+            target_policy.max_cost_per_day_cents = match (
+                self.security.max_cost_per_day_cents,
+                target_policy.max_cost_per_day_cents,
+            ) {
+                (0, target) => target,
+                (caller, 0) => caller,
+                (caller, target) => caller.min(target),
+            };
 
             if self.security.risk_profile_name == target_policy.risk_profile_name {
                 target_policy.workspace_dir = self.security.workspace_dir.clone();
@@ -894,6 +961,80 @@ impl DelegateTool {
             .unwrap_or(3)
     }
 
+    /// The binding delegation-depth ceiling for this tool's owner.
+    ///
+    /// Source of truth: the owning agent's runtime profile
+    /// `max_delegation_depth`. Sub-delegate tools carry that ceiling tightened
+    /// with each target's own profile cap (`tightened_max_depth`), so a
+    /// parent's cap binds its entire subtree and a chain can only tighten.
+    /// When no ceiling was carried (root tools and bare test constructors),
+    /// the owner's own profile is resolved here; without a resolvable owner,
+    /// the pre-chain fallback applies (the target's profile cap, default 3),
+    /// which keeps legacy `with_depth` constructors on their historical
+    /// semantics.
+    fn effective_max_depth(&self, target_runtime_profile: &str) -> u32 {
+        if let Some(cap) = self.max_delegation_depth {
+            return cap;
+        }
+        if let Some(config) = self.root_config.as_deref()
+            && !self.caller_alias.is_empty()
+        {
+            return config
+                .runtime_profile_for_agent(&self.caller_alias)
+                .map(|profile| profile.max_delegation_depth)
+                .filter(|&cap| cap > 0)
+                .unwrap_or(3);
+        }
+        self.resolve_max_depth(target_runtime_profile)
+    }
+
+    /// The ceiling a constructed sub-delegate tool carries: this tool's
+    /// effective ceiling tightened (min) by the next target's own profile
+    /// cap. A parent's cap therefore binds its whole subtree, while a target
+    /// with a stricter profile tightens the chain from its level down.
+    fn tightened_max_depth(&self, target_runtime_profile: &str) -> u32 {
+        u32::min(
+            self.effective_max_depth(target_runtime_profile),
+            self.resolve_max_depth(target_runtime_profile),
+        )
+    }
+
+    /// Fail-closed approval check for instances whose calling loop has no
+    /// operator approval route (bounded sub-agent loops). The caller's own
+    /// risk profile decides: when it would prompt for `delegate` (supervised
+    /// default, or the tool named in `always_ask`), delegation is refused -
+    /// the identical call in a loop with an approval manager would surface
+    /// an operator prompt instead. Explicitly auto-approved profiles and
+    /// full autonomy keep the grant. Unresolvable profiles fail closed;
+    /// legacy constructors without any profile name keep their historical
+    /// unguarded behavior.
+    fn operator_approval_refusal(&self) -> Option<String> {
+        if self.operator_approval_available {
+            return None;
+        }
+        let profile_name = self.security.risk_profile_name.trim();
+        if profile_name.is_empty() {
+            return None;
+        }
+        let Some(profile) = self.risk_profiles.get(profile_name) else {
+            return Some(format!(
+                "delegation refused: risk profile {profile_name:?} could not be resolved for \
+                 the delegation approval check"
+            ));
+        };
+        let requirement =
+            ApprovalManager::from_risk_profile(profile).approval_requirement(Self::NAME);
+        if requirement == ApprovalRequirement::Prompt {
+            return Some(format!(
+                "delegation refused: risk profile {profile_name:?} requires approval for \
+                 'delegate' and bounded sub-agents have no operator approval route; add \
+                 'delegate' to the profile's auto_approve list or run the profile at full \
+                 autonomy"
+            ));
+        }
+        None
+    }
+
     /// Resolve per-call delegation timeout from the named runtime profile.
     fn resolve_delegation_timeout(&self, runtime_profile: &str) -> Option<u64> {
         if runtime_profile.is_empty() {
@@ -1043,12 +1184,33 @@ impl Tool for DelegateTool {
          (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
          prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
          Supports background execution (returns a task_id immediately), batched background waits \
-         (await_sessions), and parallel execution (runs multiple agents concurrently)."
+         (await_sessions), and parallel execution (runs multiple agents concurrently). Bounded \
+         sub-agents receive the delegate tool only when their risk profile's delegation_policy \
+         allows it; independent targets assemble their own tools."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         let delegation_permitted = self.security.delegation_policy.permits();
         let caller_profile = self.security.risk_profile_name.as_str();
+        // Delegate-only instances (bounded sub-agents) must not advertise the
+        // task-management actions they will refuse.
+        let (action_values, action_description) = if self.background_task_management {
+            (
+                DelegateAction::schema_values(),
+                "Action to perform. Default: 'delegate'. Use 'check_result' to \
+                 retrieve a background task result, 'await_sessions' to wait for \
+                 multiple background results, 'list_results' to list all background \
+                 tasks, 'cancel_task' to cancel a running background task."
+                    .to_string(),
+            )
+        } else {
+            (
+                vec![DelegateAction::Delegate.as_str()],
+                "Action to perform. Only 'delegate' is available: bounded sub-agents \
+                 cannot manage background tasks."
+                    .to_string(),
+            )
+        };
         let mut agent_names: Vec<String> = if !delegation_permitted {
             Vec::new()
         } else if let Some(config) = self.root_config.as_ref() {
@@ -1072,11 +1234,8 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": DelegateAction::schema_values(),
-                    "description": "Action to perform. Default: 'delegate'. Use 'check_result' to \
-                                    retrieve a background task result, 'await_sessions' to wait for \
-                                    multiple background results, 'list_results' to list all background \
-                                    tasks, 'cancel_task' to cancel a running background task.",
+                    "enum": action_values,
+                    "description": action_description,
                     "default": DelegateAction::Delegate.as_str()
                 },
                 "agent": {
@@ -1152,6 +1311,22 @@ impl Tool for DelegateTool {
                 )),
             });
         };
+
+        // Bounded sub-agents carry delegate-only instances: background
+        // records live in a workspace-wide namespace without owner identity,
+        // so the management surface must never reach a distinct identity
+        // sharing that workspace.
+        if !self.background_task_management && action != DelegateAction::Delegate {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(
+                    "task management actions (check_result, list_results, cancel_task, \
+                     await_sessions) are not available to bounded sub-agents"
+                        .to_string(),
+                ),
+            });
+        }
 
         match action {
             DelegateAction::CheckResult => return self.handle_check_result(&args).await,
@@ -1330,7 +1505,7 @@ impl DelegateTool {
         };
 
         // Resolve profile references
-        let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
+        let max_depth = self.effective_max_depth(&agent_config.runtime_profile);
         let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain(&agent_config.model_provider);
         let agentic = self.resolve_agentic(&agent_config.runtime_profile);
@@ -1350,6 +1525,14 @@ impl DelegateTool {
         }
 
         if admission == DelegateAdmission::Required {
+            if let Some(refusal) = self.operator_approval_refusal() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(refusal),
+                });
+            }
+
             if let Err(error) = self
                 .security
                 .enforce_tool_operation(ToolOperation::Act, "delegate")
@@ -1521,7 +1704,7 @@ impl DelegateTool {
             }
         };
 
-        let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
+        let max_depth = self.effective_max_depth(&agent_config.runtime_profile);
         if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
@@ -1531,6 +1714,14 @@ impl DelegateTool {
                     depth = self.depth,
                     max = max_depth
                 )),
+            });
+        }
+
+        if let Some(refusal) = self.operator_approval_refusal() {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(refusal),
             });
         }
 
@@ -1637,11 +1828,15 @@ impl DelegateTool {
         let security = target_policy;
         let global_credential = self.global_credential.clone();
         let provider_runtime_options = self.provider_runtime_options.clone();
-        // Monotonic descent: was `self.depth` (verbatim copy), which left the
-        // `self.depth >= max_depth` check inert — a chain of background delegations never
-        // escalated depth. Matches the documented `with_depth(parent.depth + 1)` intent.
-        // Behavior change: deep background re-delegation now saturates at `max_delegation_depth`.
-        let depth = self.depth + 1;
+        // Depth ownership: a logical hop increments depth exactly once, at the
+        // target-bound sub-delegate tool built in the bounded assembly. This
+        // wrapper re-executes the SAME hop, so it inherits `depth` and the
+        // carried depth ceiling verbatim; incrementing here double-counted
+        // background hops and refused second hops one level early.
+        let depth = self.depth;
+        let max_delegation_depth = self.max_delegation_depth;
+        let background_task_management = self.background_task_management;
+        let operator_approval_available = self.operator_approval_available;
         let parent_tools = Arc::clone(&self.parent_tools);
         let runtime = self.runtime.clone();
         let multimodal_config = self.multimodal_config.clone();
@@ -1665,16 +1860,26 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // Sender-bucket continuity (same rationale as the parallel spawn):
+        // capture the originating sender scope so every admission inside the
+        // detached task charges the caller's bucket, not the fallback
+        // __global__ budget.
+        let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, async move {
+            TOOL_LOOP_THREAD_ID.scope(
+                parent_thread_id,
+                scope_delegate_session_key(parent_session_key, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
                     global_credential,
                     provider_runtime_options,
                     depth,
+                    max_delegation_depth,
+                    background_task_management,
+                    operator_approval_available,
                     parent_tools,
                     runtime,
                     multimodal_config,
@@ -1778,7 +1983,8 @@ impl DelegateTool {
                 Self::background_task_cancels()
                     .lock()
                     .remove(&task_id_clone);
-            })
+                }),
+            )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
             ))
@@ -1786,11 +1992,20 @@ impl DelegateTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Background task started for agent '{agent_name}'.\n\
-                 task_id: {task_id}\n\
-                 Use action='check_result' with task_id='{task_id}' to retrieve the result."
-            )
+            output: if self.background_task_management {
+                format!(
+                    "Background task started for agent '{agent_name}'.\n\
+                     task_id: {task_id}\n\
+                     Use action='check_result' with task_id='{task_id}' to retrieve the result."
+                )
+            } else {
+                format!(
+                    "Background task started for agent '{agent_name}'.\n\
+                     task_id: {task_id}\n\
+                     This tool cannot check task results; report task_id='{task_id}' back to the \
+                     delegating agent so it can retrieve the result with action='check_result'."
+                )
+            }
             .into(),
             error: None,
         })
@@ -1887,15 +2102,25 @@ impl DelegateTool {
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
+        // Sender-bucket continuity: spawned tasks start with empty
+        // task-locals, so a worker that restores only the session key would
+        // charge the fallback __global__ bucket and escape the originating
+        // sender's action budget. Capture the sender scope before spawning
+        // and restore it around each worker's entire execution.
+        let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         for agent_name in &agent_names {
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
             let global_credential = self.global_credential.clone();
             let provider_runtime_options = self.provider_runtime_options.clone();
-            // Monotonic descent on the parallel path — was `self.depth` (verbatim copy),
-            // leaving the `>= max_depth` check inert (see the background path above).
-            // Behavior change: deep parallel re-delegation now saturates at `max_delegation_depth`.
-            let depth = self.depth + 1;
+            // Depth ownership on the parallel path mirrors the background
+            // wrapper: the fan-out task re-executes the SAME hop, so it
+            // inherits `depth` and the carried ceiling verbatim; the single
+            // increment lives in the bounded sub-delegate construction.
+            let depth = self.depth;
+            let max_delegation_depth = self.max_delegation_depth;
+            let background_task_management = self.background_task_management;
+            let operator_approval_available = self.operator_approval_available;
             let parent_tools = Arc::clone(&self.parent_tools);
             let runtime = self.runtime.clone();
             let multimodal_config = self.multimodal_config.clone();
@@ -1916,6 +2141,7 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let thread_scope = parent_thread_id.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1927,6 +2153,9 @@ impl DelegateTool {
                         global_credential,
                         provider_runtime_options,
                         depth,
+                        max_delegation_depth,
+                        background_task_management,
+                        operator_approval_available,
                         parent_tools,
                         runtime,
                         multimodal_config,
@@ -1943,15 +2172,23 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                    let result = TOOL_LOOP_THREAD_ID
+                        .scope(
+                            thread_scope,
+                            scope_delegate_session_key(session_key, async move {
+                                crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                    .scope(receipt_scope, async move {
+                                        Box::pin(inner.execute_sync(
+                                            &agent_name,
+                                            &prompt,
+                                            &args_clone,
+                                        ))
+                                        .await
+                                    })
                                     .await
-                            })
-                            .await
-                    })
-                    .await;
+                            }),
+                        )
+                        .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
@@ -2678,10 +2915,12 @@ impl DelegateTool {
                 let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools
                 {
                     match self.memory_for_target_agent(agent_name).await {
-                        Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
-                            .into_iter()
-                            .map(|tool| (tool.name().to_string(), tool))
-                            .collect(),
+                        Ok(Some(memory)) => {
+                            Self::memory_tools_for_target(memory, Arc::clone(&target_policy))
+                                .into_iter()
+                                .map(|tool| (tool.name().to_string(), tool))
+                                .collect()
+                        }
                         Ok(None) => HashMap::new(),
                         Err(e) => {
                             return Ok(ToolResult {
@@ -2697,27 +2936,100 @@ impl DelegateTool {
                     HashMap::new()
                 };
 
-                // Build the bounded tool set exactly as before: the parent's
-                // tools, filtered by the caller's own `is_tool_allowed` +
-                // `delegate_admits_with_mcp`, with the target's memory tools
-                // substituted in. The `parent_tools` read guard is scoped to
-                // this block so it drops BEFORE the `assemble().await` below - a
-                // parking_lot guard held across an await would make the delegate
-                // future `!Send`.
-                let filtered: Vec<Box<dyn Tool>> = {
+                // The delegate tool is retained in a bounded set only when the
+                // TARGET's own risk-profile `delegation_policy` permits
+                // delegation - the same gate the top-level delegate tool
+                // applies to its callers (L470). The caller-side filters below
+                // (`self.security.is_tool_allowed` + `delegate_admits_with_mcp`)
+                // still apply to the retained name.
+                let target_may_subdelegate = target_policy.delegation_policy.permits();
+
+                // Base bounded set (Arc form): the parent's tools minus the
+                // parent's own delegate instance. That instance carries the
+                // PARENT's `caller_alias` and security, so handing it to the
+                // sub-agent would resolve its delegation calls (reachability,
+                // per-target policy, advertised roster) as the parent - a
+                // confused-deputy shape. It is replaced below by a target-bound
+                // instance. This same list becomes that instance's
+                // `parent_tools`, so a further bounded hop inherits exactly the
+                // set its delegating parent ran with (that hop re-substitutes
+                // its own memory tools by name). The read guard is scoped to
+                // this block so it drops BEFORE the `assemble().await` below -
+                // a parking_lot guard held across an await would make the
+                // delegate future `!Send`.
+                let bounded_base_tools: Vec<Arc<dyn Tool>> = {
                     let parent_tools = self.parent_tools.read();
                     parent_tools
                         .iter()
                         .filter(|tool| tool.name() != Self::NAME)
                         .filter(|tool| self.security.is_tool_allowed(tool.name()))
                         .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
-                        .map(|tool| {
-                            target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                                Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
-                            })
-                        })
+                        .cloned()
                         .collect()
                 };
+
+                // Target-bound delegate tool: its delegation calls must resolve
+                // `delegation_policy`, reachability, and the advertised roster
+                // from the SUB-agent's identity (alias + policy), never the
+                // delegating parent's. Depth ownership: this construction is
+                // the single site that increments depth for a logical hop
+                // (`self.depth + 1`); the background/parallel wrappers inherit
+                // their depth verbatim. The carried ceiling is this tool's
+                // effective ceiling tightened (min) by the target's own
+                // profile cap, so a parent's cap binds the whole subtree
+                // (source of truth: `effective_max_depth`).
+                let sub_delegate_tool = (target_may_subdelegate
+                    && self.security.is_tool_allowed(Self::NAME)
+                    && Self::delegate_admits_with_mcp(&tool_policy, Self::NAME))
+                .then(|| {
+                    Box::new(DelegateTool {
+                        agents: Arc::clone(&self.agents),
+                        security: Arc::clone(&target_policy),
+                        global_credential: self.global_credential.clone(),
+                        provider_runtime_options: self.provider_runtime_options.clone(),
+                        depth: self.depth + 1,
+                        max_delegation_depth: Some(
+                            self.tightened_max_depth(&agent_config.runtime_profile),
+                        ),
+                        // Delegate-only: background records live in a
+                        // workspace-wide namespace without owner identity,
+                        // and this tool shares the delegating parent's
+                        // workspace, so the management surface would expose
+                        // foreign identities' tasks.
+                        background_task_management: false,
+                        // The bounded child loop has no operator approval
+                        // route, so this tool enforces the target profile's
+                        // own delegation-approval decision itself.
+                        operator_approval_available: false,
+                        parent_tools: Arc::new(RwLock::new(bounded_base_tools.clone())),
+                        runtime: self.runtime.clone(),
+                        multimodal_config: self.multimodal_config.clone(),
+                        delegate_config: self.delegate_config.clone(),
+                        workspace_dir: self.workspace_dir.clone(),
+                        cancellation_token: self.cancellation_token.child_token(),
+                        memory: self.memory.clone(),
+                        providers_models: Arc::clone(&self.providers_models),
+                        risk_profiles: Arc::clone(&self.risk_profiles),
+                        runtime_profiles: Arc::clone(&self.runtime_profiles),
+                        skill_bundles: Arc::clone(&self.skill_bundles),
+                        root_config: self.root_config.clone(),
+                        live_config: self.live_config.clone(),
+                        caller_alias: agent_name.to_string(),
+                    }) as Box<dyn Tool>
+                });
+
+                let mut filtered: Vec<Box<dyn Tool>> = bounded_base_tools
+                    .iter()
+                    .map(|tool| {
+                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
+                            Box::new(ToolArcRef::new(Arc::clone(tool))) as Box<dyn Tool>
+                        })
+                    })
+                    .collect();
+                // Appended after the inherited set; the target-bound instance
+                // takes the retained delegation slot the parent's instance used
+                // to fill implicitly.
+                filtered.extend(sub_delegate_tool);
                 // Seal the already-filtered set through the one assembly seam.
                 // The policy is `SecurityPolicy::default()` (no allow/deny
                 // lists), so `assemble`'s built-in filter is a provable identity
@@ -7959,6 +8271,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_cost_ceiling_combines_per_schema_zero_semantics() {
+        // `max_actions_per_hour` treats 0 as a hard zero, but
+        // `max_cost_per_day_cents` treats 0 as "inherit the global limit".
+        // The bounded clamp must therefore never turn an unset (0) target or
+        // caller cost value into a binding that is looser than the explicit
+        // values. Asserted on the resolved policy directly: cost is declared
+        // but not yet enforced on delegated runs.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let build = |caller_cost: u32, target_cost: u32| {
+            let mut config = Config::default();
+            for (profile, cost) in [
+                ("caller_profile", caller_cost),
+                ("target_profile", target_cost),
+            ] {
+                config.runtime_profiles.insert(
+                    profile.to_string(),
+                    RuntimeProfileConfig {
+                        max_cost_per_day_cents: cost,
+                        ..RuntimeProfileConfig::default()
+                    },
+                );
+            }
+            for alias in ["caller", "target"] {
+                config.risk_profiles.insert(
+                    format!("{alias}_profile"),
+                    RiskProfileConfig {
+                        delegation_policy: DelegationPolicy {
+                            mode: DelegationMode::Allow,
+                        },
+                        ..RiskProfileConfig::default()
+                    },
+                );
+                config.agents.insert(
+                    alias.to_string(),
+                    AliasedAgentConfig {
+                        risk_profile: format!("{alias}_profile").into(),
+                        runtime_profile: format!("{alias}_profile").into(),
+                        model_provider: "ollama.x".into(),
+                        delegates: vec![DelegateTargetConfig::bounded("target")],
+                        ..AliasedAgentConfig::default()
+                    },
+                );
+            }
+            let config = Arc::new(config);
+            let tool = delegate_tool_for_config(Arc::clone(&config));
+            let target_policy = tool.policy_for_target("target").expect("target policy");
+            target_policy.max_cost_per_day_cents
+        };
+
+        // Both explicit: the stricter wins (min).
+        assert_eq!(build(100, 30), 30, "both explicit -> min");
+        // Target unset (0 = inherit global): carry the caller's explicit cap
+        // rather than letting the child fall back to inherit-global.
+        assert_eq!(build(100, 0), 100);
+        // Caller unset (inherits global): the target's explicit cap stands.
+        assert_eq!(build(0, 30), 30);
+        // Both unset: inherit (0) on both levels.
+        assert_eq!(build(0, 0), 0);
+    }
+
+    #[tokio::test]
     async fn independent_delegate_rejects_target_always_ask() {
         // Synchronous path: the runtime must refuse an independent child before
         // the target turn starts, and the refusal must name the operator-facing
@@ -8780,6 +9157,1357 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "got: {:?}", result.error);
+    }
+
+    // ── bounded sub-delegation gating ─────────────────────────────────────
+
+    /// How the mock's emitted `delegate` call reaches the sub-agent.
+    #[derive(Clone, Copy)]
+    enum MockDelegationTransport {
+        Sync,
+        Background,
+        Parallel,
+        ListResults,
+    }
+
+    /// Loop mock for the delegating parent of a bounded sub-delegation: the
+    /// first provider call emits one `delegate` tool call, and once a tool
+    /// result is in history the final text closes the loop. The tool-result
+    /// message is captured so tests can assert exactly what the sub-agent's
+    /// delegation returned to the delegating loop.
+    struct DelegateCallThenFinalModelProvider {
+        target_agent: &'static str,
+        transport: MockDelegationTransport,
+        tool_message: std::sync::Mutex<Option<String>>,
+    }
+
+    impl DelegateCallThenFinalModelProvider {
+        fn new(target_agent: &'static str) -> Self {
+            Self::with_transport(target_agent, MockDelegationTransport::Sync)
+        }
+
+        fn new_background(target_agent: &'static str) -> Self {
+            Self::with_transport(target_agent, MockDelegationTransport::Background)
+        }
+
+        fn new_parallel(target_agent: &'static str) -> Self {
+            Self::with_transport(target_agent, MockDelegationTransport::Parallel)
+        }
+
+        fn new_list_results() -> Self {
+            Self::with_transport("leaf", MockDelegationTransport::ListResults)
+        }
+
+        fn with_transport(target_agent: &'static str, transport: MockDelegationTransport) -> Self {
+            Self {
+                target_agent,
+                transport,
+                tool_message: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn tool_message(&self) -> Option<String> {
+            self.tool_message.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for DelegateCallThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if let Some(tool_message) = request.messages.iter().find(|m| m.role == "tool") {
+                *self.tool_message.lock().unwrap() = Some(tool_message.content.clone());
+                return Ok(ChatResponse {
+                    text: Some("sub-delegation finished".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            let arguments = match self.transport {
+                MockDelegationTransport::Sync => serde_json::json!({
+                    "agent": self.target_agent,
+                    "prompt": "subtask from parent loop"
+                }),
+                MockDelegationTransport::Background => serde_json::json!({
+                    "agent": self.target_agent,
+                    "prompt": "subtask from parent loop",
+                    "background": true
+                }),
+                MockDelegationTransport::Parallel => serde_json::json!({
+                    "parallel": [self.target_agent],
+                    "prompt": "subtask from parent loop"
+                }),
+                MockDelegationTransport::ListResults => {
+                    serde_json::json!({"action": "list_results"})
+                }
+            };
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: DelegateTool::NAME.to_string(),
+                    arguments: arguments.to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for DelegateCallThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "DelegateCallThenFinalModelProvider"
+        }
+    }
+
+    /// Tool results reach the loop as a JSON envelope; decode the content
+    /// field when present so assertions see the text with real quotes.
+    fn decoded_tool_message(tool_message: &str) -> String {
+        serde_json::from_str::<serde_json::Value>(tool_message)
+            .ok()
+            .and_then(|envelope| envelope["content"].as_str().map(str::to_string))
+            .unwrap_or_else(|| tool_message.to_string())
+    }
+
+    /// Local OpenAI-compatible chat server serving the scripted responses in
+    /// order (one per request) and recording every raw request body. Extra
+    /// requests get an error body so a miscounted turn fails assertions
+    /// instead of hanging the test.
+    async fn start_scripted_chat_server(
+        responses: &[serde_json::Value],
+    ) -> (LocalChatServer, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let scripted: Vec<serde_json::Value> = responses.to_vec();
+        let task = zeroclaw_spawn::spawn!(async move {
+            let mut served = 0;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let request = read_http_request(&mut socket).await;
+                captured_clone
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_string());
+                let response = scripted.get(served).cloned().unwrap_or_else(|| {
+                    serde_json::json!({"error": {"message": "unexpected extra provider request"}})
+                });
+                write_json_response(&mut socket, response).await;
+                served += 1;
+            }
+        });
+
+        (LocalChatServer { uri, _task: task }, captured)
+    }
+
+    async fn start_final_text_chat_server(
+        text: &'static str,
+    ) -> (LocalChatServer, Arc<std::sync::Mutex<Vec<String>>>) {
+        start_scripted_chat_server(&[serde_json::json!({
+            "choices": [{"message": {"content": text}}]
+        })])
+        .await
+    }
+
+    /// Bounded-chain config: one agent per entry, each with its own risk
+    /// profile named after the alias, an explicit (and only-explicit) delegate
+    /// roster, and the shared agentic runtime profile. Delegation is allowed
+    /// exactly for the aliases named in `delegation_allow_profiles`; every
+    /// other profile keeps the default `Forbidden`. `delegate_auto_approved`
+    /// adds `delegate` to every profile's `auto_approve` (the explicit
+    /// approval a bounded child needs to delegate onward);
+    /// `always_ask_delegate` puts `delegate` in every profile's `always_ask`
+    /// (which overrides auto-approval and forces the fail-closed refusal).
+    /// The nested provider points at `nested_provider_uri` so sub-agent turns
+    /// are served by a local scripted server.
+    #[allow(clippy::too_many_arguments)]
+    fn bounded_subdelegation_fixture(
+        temp_dir: &TempDir,
+        nested_provider_uri: &str,
+        agents: &[(&str, &[&str])],
+        delegation_allow_profiles: &[&str],
+        max_delegation_depth: u32,
+        delegate_auto_approved: bool,
+        always_ask_delegate: bool,
+    ) -> Arc<Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(nested_provider_uri.to_string()),
+                    model: Some("test-model".to_string()),
+                    native_tools: Some(true),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_delegation_depth,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        for (alias, delegates) in agents {
+            let delegation_allowed = delegation_allow_profiles.contains(alias);
+            let mut auto_approve = Vec::new();
+            if delegate_auto_approved {
+                auto_approve.push("delegate".to_string());
+            }
+            let mut always_ask = Vec::new();
+            if always_ask_delegate {
+                always_ask.push("delegate".to_string());
+            }
+            config.risk_profiles.insert(
+                (*alias).to_string(),
+                RiskProfileConfig {
+                    delegation_policy: DelegationPolicy {
+                        mode: if delegation_allowed {
+                            DelegationMode::Allow
+                        } else {
+                            DelegationMode::Forbidden
+                        },
+                    },
+                    auto_approve,
+                    always_ask,
+                    ..RiskProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                (*alias).to_string(),
+                AliasedAgentConfig {
+                    risk_profile: (*alias).into(),
+                    runtime_profile: "agentic".into(),
+                    model_provider: "custom.local".into(),
+                    delegates: delegates
+                        .iter()
+                        .map(|target| DelegateTargetConfig::bounded(*target))
+                        .collect(),
+                    delegate_same_risk_profile: false,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        Arc::new(config)
+    }
+
+    /// Caller-owned delegate tool whose parent registry carries EchoTool plus
+    /// a delegate instance, so the bounded strip/retain decision is exercised
+    /// against a registry that actually contains the tool.
+    fn bounded_subdelegation_tool(config: &Arc<Config>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(config, "caller").expect("caller policy resolves"));
+        DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool),
+                Arc::new(DelegateTool::new(HashMap::new(), None, caller_policy)),
+            ])))
+    }
+
+    fn bounded_agent_config(
+        config: &Arc<Config>,
+        alias: &str,
+    ) -> zeroclaw_config::schema::AliasedAgentConfig {
+        config
+            .agents
+            .get(alias)
+            .expect("fixture agent exists")
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_stripped_when_target_policy_forbids_delegation() {
+        // Regression guard for the bounded-gating default: a target whose risk
+        // profile keeps the default `delegation_policy = forbidden` never sees
+        // a delegate tool, even when the parent registry carries one. The
+        // zero-config behavior stays identical to the previous release.
+        let temp = TempDir::new().unwrap();
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            "http://127.0.0.1:9",
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller"],
+            3,
+            false,
+            false,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &ToolCountModelProvider { expected_tools: 1 }, // EchoTool only
+                "run echo",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_retained_when_target_policy_allows_subdelegation() {
+        // Behavioral option: when the bounded target's own risk profile
+        // sets `delegation_policy = allow`, a delegate tool joins the bounded
+        // set and a one-level sub-delegation succeeds end to end.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("leaf done").await;
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            true,
+            false,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "fan out",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        let tool_message = provider
+            .tool_message()
+            .expect("leaf's reply must be fed back to middle");
+        assert!(
+            tool_message.contains("leaf done"),
+            "middle must receive leaf's reply: {tool_message:?}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "leaf's turn must be served exactly once by its configured provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_sub_delegate_resolves_reachability_from_target_identity() {
+        // Confused-deputy guard: the sub-agent's delegate call must resolve
+        // reachability from the SUB-agent's alias/delegates config, not the
+        // delegating parent's. `caller` reaches only `middle`; `middle` has an
+        // empty roster, so its attempt to reach `leaf` must be refused naming
+        // `middle` as the caller. Naive retention (handing down the caller's
+        // delegate instance) would name `caller` in the refusal and fail this
+        // assertion.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[("caller", &["middle"]), ("middle", &[]), ("leaf", &[])],
+            &["caller", "middle"],
+            3,
+            true,
+            false,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "reach beyond roster",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "middle's turn completes: {:?}",
+            result.error
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "an unreachable target's provider must never be contacted"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("not reachable from \"middle\""),
+            "refusal must resolve the caller as the sub-agent: {tool_message:?}"
+        );
+        assert!(
+            !refusal.contains("from \"caller\""),
+            "refusal must not carry the delegating parent's identity: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_sub_delegation_depth_limit_enforced_through_chain() {
+        // Bounded chain caller->middle->leaf with max_delegation_depth = 2:
+        // both hops succeed (tool depths 0 and 1), and leaf's own delegation
+        // attempt (depth 2) fails with the depth error fed back into leaf's
+        // loop - depth must increment and bind through bounded sub-chains.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_leaf_1",
+                serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
+        ])
+        .await;
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &["deep"]),
+                ("deep", &[]),
+            ],
+            &["caller", "middle", "leaf"],
+            2,
+            true,
+            false,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "descend",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "leaf's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("Delegation depth limit reached (2/2)"),
+            "leaf's delegation attempt must fail with the depth error: {:?}",
+            bodies[1]
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("leaf's reply must be fed back to middle");
+        assert!(
+            tool_message.contains("leaf finished"),
+            "leaf must complete after the refused hop: {tool_message:?}"
+        );
+    }
+
+    /// Depth-matrix config: per-agent `(alias, delegates, runtime_profile)`
+    /// with delegation allowed for every agent and the shared custom provider
+    /// pointing at `nested_provider_uri`. Runtime profile caps are explicit
+    /// `(profile, max_delegation_depth, max_actions_per_hour)` tuples so
+    /// tests can pin parent and child ceilings independently. Every profile
+    /// explicitly auto-approves `delegate`: these tests exercise delegation
+    /// mechanics, and the approval-refusal regressions live in their own
+    /// tests.
+    fn bounded_depth_matrix_fixture(
+        temp_dir: &TempDir,
+        nested_provider_uri: &str,
+        agents: &[(&str, &[&str], &str)],
+        runtime_profiles: &[(&str, u32, u32)],
+    ) -> Arc<Config> {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(nested_provider_uri.to_string()),
+                    model: Some("test-model".to_string()),
+                    native_tools: Some(true),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        for (profile, cap, actions) in runtime_profiles {
+            config.runtime_profiles.insert(
+                (*profile).to_string(),
+                RuntimeProfileConfig {
+                    agentic: true,
+                    max_delegation_depth: *cap,
+                    max_actions_per_hour: *actions,
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+        }
+        for (alias, delegates, runtime_profile) in agents {
+            config.risk_profiles.insert(
+                (*alias).to_string(),
+                RiskProfileConfig {
+                    delegation_policy: DelegationPolicy {
+                        mode: DelegationMode::Allow,
+                    },
+                    auto_approve: vec!["delegate".to_string()],
+                    ..RiskProfileConfig::default()
+                },
+            );
+            config.agents.insert(
+                (*alias).to_string(),
+                AliasedAgentConfig {
+                    risk_profile: (*alias).into(),
+                    runtime_profile: (*runtime_profile).into(),
+                    model_provider: "custom.local".into(),
+                    delegates: delegates
+                        .iter()
+                        .map(|target| DelegateTargetConfig::bounded(*target))
+                        .collect(),
+                    delegate_same_risk_profile: false,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_cap_parent_binds_subtree_against_looser_child_profile() {
+        // Parent runtime profile caps delegation at 1 while the child's own
+        // profile allows 8. The parent's cap must bind its whole subtree:
+        // hop one succeeds, and the child's delegation attempt is refused
+        // with the depth error instead of riding the child's looser cap.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap1"),
+                ("middle", &["leaf"], "cap8"),
+                ("leaf", &[], "cap8"),
+            ],
+            &[("cap1", 1, 20), ("cap8", 8, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "one hop only",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the refused second hop must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the depth refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("Delegation depth limit reached (1/1)"),
+            "second hop must be refused by the parent's binding cap: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_cap_tightens_to_stricter_child_profile() {
+        // Inverse matrix: the parent allows 8 but the child's own profile
+        // caps at 1. The carried ceiling must tighten (min), not widen (max):
+        // hop one succeeds, the child's delegation attempt is refused.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap8"),
+                ("middle", &["leaf"], "cap1"),
+                ("leaf", &[], "cap1"),
+            ],
+            &[("cap1", 1, 20), ("cap8", 8, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "one hop only",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the refused second hop must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the depth refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("Delegation depth limit reached (1/1)"),
+            "second hop must be refused by the child's tighter cap: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_background_second_hop_succeeds_at_limit_two() {
+        // Depth must increment exactly once per logical hop. With
+        // max_delegation_depth = 2, a two-hop chain whose SECOND hop is
+        // background must succeed (previously the background wrapper
+        // double-counted depth and refused the hop before it ran). The
+        // third hop is still refused at the correct depth (2/2).
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_bounded_bg_depth_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_leaf_bg",
+                serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap2"),
+                ("middle", &["leaf"], "cap2"),
+                ("leaf", &["deep"], "cap2"),
+                ("deep", &[], "cap2"),
+            ],
+            &[("cap2", 2, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config).with_workspace_dir(workspace.clone());
+        let provider = DelegateCallThenFinalModelProvider::new_background("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "background second hop",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        // The background task's id reached middle's loop in the tool result.
+        let tool_message = provider
+            .tool_message()
+            .expect("the background task receipt must be fed back to middle");
+        let task_id = decoded_tool_message(&tool_message)
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .expect("background delegation must report a task_id");
+
+        let waited = wait_for_terminal_background_result(&workspace, &task_id).await;
+        assert_eq!(
+            waited.status,
+            BackgroundTaskStatus::Completed,
+            "the background second hop must succeed: {waited:?}"
+        );
+        assert!(
+            waited
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("leaf finished"),
+            "leaf's turn must run to completion in the background task: {waited:?}"
+        );
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "leaf's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("Delegation depth limit reached (2/2)"),
+            "leaf's own delegation attempt must be refused at the correct depth: {:?}",
+            bodies[1]
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn bounded_depth_parallel_second_hop_succeeds_at_limit_two() {
+        // Same contract as the background case, for the parallel fan-out
+        // path: with max_delegation_depth = 2 the parallel second hop must
+        // succeed and the third hop must be refused at depth (2/2).
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_leaf_par",
+                serde_json::json!({"agent": "deep", "prompt": "one more hop"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "leaf finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "cap2"),
+                ("middle", &["leaf"], "cap2"),
+                ("leaf", &["deep"], "cap2"),
+                ("deep", &[], "cap2"),
+            ],
+            &[("cap2", 2, 20)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new_parallel("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "parallel second hop",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        // Parallel fan-out blocks until every child settles, so leaf's
+        // aggregated result is already in middle's captured tool message.
+        let tool_message = provider
+            .tool_message()
+            .expect("leaf's parallel result must be fed back to middle");
+        let aggregated = decoded_tool_message(&tool_message);
+        assert!(
+            aggregated.contains("leaf finished"),
+            "the parallel second hop must succeed: {tool_message:?}"
+        );
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "leaf's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("Delegation depth limit reached (2/2)"),
+            "leaf's own delegation attempt must be refused at the correct depth: {:?}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_task_management_unavailable_to_sub_agents() {
+        // The bounded child's delegate tool is delegate-only: background task
+        // records live in a workspace-wide namespace without owner identity,
+        // so the management surface must not reach a distinct identity
+        // sharing the parent's workspace. Management calls are refused before
+        // any admission, and the child never reaches leaf's provider.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            true,
+            false,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new_list_results();
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "manage parent tasks",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the refused management call must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the management refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("not available to bounded sub-agents"),
+            "task management must be refused to the bounded child: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_refused_when_target_profile_requires_approval() {
+        // A bounded child under the default supervised profile would prompt
+        // for 'delegate' in a loop with an approval manager, but sub-agent
+        // loops have no operator approval route: the tool itself must fail
+        // closed instead of silently bypassing the target's approval policy.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            false,
+            false,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "fan out",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "middle's turn completes: {:?}",
+            result.error
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the approval-refused delegation must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the approval refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("requires approval for 'delegate'"),
+            "nested delegation must be refused without an explicit approval: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_refused_when_target_always_asks_delegation() {
+        // always_ask overrides auto-approval: even a profile that lists
+        // 'delegate' in auto_approve is refused when it also demands a
+        // prompt for it, because the bounded child loop cannot prompt.
+        let temp = TempDir::new().unwrap();
+        let (server, requests) = start_final_text_chat_server("unreachable").await;
+        let config = bounded_subdelegation_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"]),
+                ("middle", &["leaf"]),
+                ("leaf", &[]),
+            ],
+            &["caller", "middle"],
+            3,
+            true,
+            true,
+        );
+        let tool = bounded_subdelegation_tool(&config);
+        let provider = DelegateCallThenFinalModelProvider::new("leaf");
+        let middle_config = bounded_agent_config(&config, "middle");
+
+        let result = tool
+            .execute_agentic(
+                "middle",
+                &middle_config,
+                "custom.local",
+                "test-model",
+                &provider,
+                "fan out",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "middle's turn completes: {:?}",
+            result.error
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "the approval-refused delegation must never contact leaf's provider"
+        );
+        let tool_message = provider
+            .tool_message()
+            .expect("the approval refusal must be fed back to middle");
+        let refusal = decoded_tool_message(&tool_message);
+        assert!(
+            refusal.contains("requires approval for 'delegate'"),
+            "always_ask must override auto-approval for the nested delegation: {tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_parent_cap_binds_subtree() {
+        // Parent runtime profile allows 1 action/hour while the child's own
+        // allows 100. The shared tracker's count is enforced against the
+        // caller's tightened ceiling at every bounded hop: the caller's
+        // single delegation spends the budget, and the child's delegation
+        // attempt is refused as exhausted instead of riding the child's
+        // looser ceiling. Hop one runs through the full delegate path so its
+        // admission actually consumes the budget.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_1",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        let result = tool
+            .execute(json!({"agent": "middle", "prompt": "one action only"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "hop one must succeed: {:?}", result.error);
+        // Exactly two requests means leaf's provider was never contacted:
+        // the child's delegation was refused before reaching it.
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("action budget exhausted"),
+            "the child's delegation must be refused by the parent's action cap: {:?}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_child_cap_tightens() {
+        // Inverse: the child's own profile is stricter (1 action/hour) than
+        // the parent's (100). The tightened ceiling carries the child's cap,
+        // so the child's delegation attempt is refused once the shared
+        // budget is spent.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_1",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget100"),
+                ("middle", &["leaf"], "budget1"),
+                ("leaf", &[], "budget1"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        let result = tool
+            .execute(json!({"agent": "middle", "prompt": "one action only"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "hop one must succeed: {:?}", result.error);
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("action budget exhausted"),
+            "the child's tighter action cap must bind its own delegation: {:?}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_parallel_second_hop_refused() {
+        // The parallel fan-out path enforces the same tightened ceiling: the
+        // parent's single action is spent on hop one, so the parallel child
+        // hop reports failure instead of consuming against the child's
+        // looser ceiling.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_1",
+                serde_json::json!({"parallel": ["leaf"], "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        let result = tool
+            .execute(json!({"agent": "middle", "prompt": "parallel fan out"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "hop one must succeed: {:?}", result.error);
+        let bodies = captured.lock().unwrap();
+        // Exactly two requests is the discriminator: with the clamp, leaf's
+        // provider is never contacted (a looser child ceiling would run its
+        // turn and add a third request). The loop surfaces only the generic
+        // parallel-failure error to the model, so the specific budget text
+        // is not observable on this path - the sync tests assert it.
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("One or more parallel agents failed"),
+            "the parallel second hop must fail rather than run: {:?}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_parallel_worker_charges_originating_sender_bucket() {
+        // Channel turns run under a sender scope; spawned parallel workers
+        // must charge the SAME bucket. Regression for the round-3 re-review
+        // blocker: the worker previously lost TOOL_LOOP_THREAD_ID across the
+        // spawn and admitted the second hop against the unused __global__
+        // bucket, escaping the parent's budget. The unscoped parallel budget
+        // test above cannot see this: unscoped, every bucket is __global__.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_1",
+                serde_json::json!({"parallel": ["leaf"], "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        let execution = tool.execute(json!({"agent": "middle", "prompt": "parallel fan out"}));
+        let result = crate::agent::loop_::scope_thread_id(Some("sender-a".to_string()), execution)
+            .await
+            .unwrap();
+
+        assert!(result.success, "hop one must succeed: {:?}", result.error);
+        let bodies = captured.lock().unwrap();
+        // Leaf must never be contacted: the parallel worker must charge the
+        // sender's exhausted bucket, not a fresh __global__ one (a worker
+        // that escapes the bucket runs leaf and adds two more requests).
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's loop makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("One or more parallel agents failed"),
+            "the parallel second hop must fail rather than run: {:?}",
+            bodies[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_background_worker_charges_originating_sender_bucket() {
+        // Background variant of the same boundary: the caller's pre-spawn
+        // admission charges the sender bucket, and the spawned worker that
+        // runs the child's own delegation must charge the same bucket rather
+        // than admitting against the fallback __global__ budget.
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_bounded_bg_budget_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_bg",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config).with_workspace_dir(workspace.clone());
+
+        let execution = tool
+            .execute(json!({"agent": "middle", "prompt": "background hop", "background": true}));
+        let result = crate::agent::loop_::scope_thread_id(Some("sender-a".to_string()), execution)
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "background hop one must succeed: {:?}",
+            result.error
+        );
+        let task_id = result
+            .output
+            .to_string()
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .map(str::trim)
+            .map(str::to_string)
+            .expect("background delegation must report a task_id");
+        let waited = wait_for_terminal_background_result(&workspace, &task_id).await;
+        assert_eq!(
+            waited.status,
+            BackgroundTaskStatus::Completed,
+            "the background worker must complete: {waited:?}"
+        );
+        let bodies = captured.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "middle's background turn makes exactly two provider requests: {bodies:?}"
+        );
+        assert!(
+            bodies[1].contains("action budget exhausted"),
+            "the child's own delegation must be refused by the sender's exhausted bucket: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_action_budget_sender_buckets_do_not_merge() {
+        // Distinct senders hold distinct buckets: exhausting sender-a's
+        // budget must leave sender-b's untouched. This pins the repair
+        // against collapsing scopes onto one key; it passes before the
+        // bucket-continuity fix too, because synchronous hops never spawn.
+        let temp = TempDir::new().unwrap();
+        let (server, captured) = start_scripted_chat_server(&[
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_a",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+            chat_completion_tool_call(
+                DelegateTool::NAME,
+                "call_mid_b",
+                serde_json::json!({"agent": "leaf", "prompt": "subtask"}),
+            ),
+            serde_json::json!({"choices": [{"message": {"content": "middle finished"}}]}),
+        ])
+        .await;
+        let config = bounded_depth_matrix_fixture(
+            &temp,
+            &server.uri,
+            &[
+                ("caller", &["middle"], "budget1"),
+                ("middle", &["leaf"], "budget100"),
+                ("leaf", &[], "budget100"),
+            ],
+            &[("budget1", 3, 1), ("budget100", 3, 100)],
+        );
+        let tool = bounded_subdelegation_tool(&config);
+
+        for (run, sender) in ["sender-a", "sender-b"].into_iter().enumerate() {
+            let execution = tool.execute(json!({"agent": "middle", "prompt": "one action"}));
+            let result = crate::agent::loop_::scope_thread_id(Some(sender.to_string()), execution)
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "{sender} hop one must succeed: {:?}",
+                result.error
+            );
+            let bodies = captured.lock().unwrap();
+            assert_eq!(
+                bodies.len(),
+                2 * (run + 1),
+                "{sender}'s turn makes exactly two provider requests: {bodies:?}"
+            );
+            assert!(
+                bodies[2 * run + 1].contains("action budget exhausted"),
+                "{sender}'s own second hop must be refused by its own exhausted bucket: {bodies:?}"
+            );
+        }
     }
 
     #[tokio::test]
