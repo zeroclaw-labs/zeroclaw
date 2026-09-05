@@ -1437,6 +1437,29 @@ pub enum SessionUpdateEvent {
         dropped_messages: usize,
         kept_turns: usize,
         reason: String,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// Provenance of `tokens_after` ("provider", "estimate", "calibrated").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget (protected newest turn plus schemas). History MAY
+        /// have been trimmed on the way to that floor, so this flag — not
+        /// `dropped_messages == 0` — is the authoritative "unsatisfiable"
+        /// signal. Absent for ordinary trims.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unsatisfiable_floor: Option<bool>,
     },
 }
 

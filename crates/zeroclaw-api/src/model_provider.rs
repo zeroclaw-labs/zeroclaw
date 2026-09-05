@@ -284,6 +284,27 @@ pub enum ConversationMessage {
     ToolResults(Vec<ToolResultMessage>),
 }
 
+/// Project a full agent conversation history down to the flat `ChatMessage`
+/// shape durable session backends store: user/assistant chat turns only,
+/// system prompt excluded (the backend restores against the caller's own
+/// system prompt, not a persisted one). `AssistantToolCalls` and
+/// `ToolResults` are tool-loop plumbing that durable session transcripts have
+/// never persisted; only the visible chat turns are kept.
+///
+/// Callers that own the agent's authoritative post-turn history (after
+/// budget-enforcement trimming) should use this to replace a durable
+/// transcript wholesale rather than appending the turn's delta on top of a
+/// transcript the agent may have already trimmed underneath it.
+pub fn durable_chat_messages(history: &[ConversationMessage]) -> Vec<ChatMessage> {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            ConversationMessage::Chat(chat) if chat.role != "system" => Some(chat.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A chunk of content from a streaming response.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {

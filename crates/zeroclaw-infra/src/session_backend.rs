@@ -90,6 +90,24 @@ pub trait SessionBackend: Send + Sync {
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
+    /// Replace a session's entire durable transcript with `messages`. Used to
+    /// keep the canonical stored history in sync with a caller-owned buffer
+    /// that trimmed or rewrote turns in place (e.g. history-budget
+    /// enforcement), rather than appending on top of a now-stale transcript.
+    /// The default clears the session (`clear_messages`) and re-appends
+    /// every message through the required `append` primitive, so every
+    /// backend gets real replacement semantics — a backend that never
+    /// overrides this does not silently drop the caller's authoritative
+    /// trimmed history. It is O(n) calls and not atomic; backends with a
+    /// native batch/transactional rewrite (JSONL, SQLite) override this.
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        self.clear_messages(session_key)?;
+        for message in messages {
+            self.append(session_key, message)?;
+        }
+        Ok(())
+    }
+
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         if self.remove_last(session_key)? {
             self.append(session_key, message)?;
@@ -192,6 +210,50 @@ pub trait SessionBackend: Send + Sync {
     /// Get the agent alias associated with a session, if recorded.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Record whether this session's persisted transcript currently starts
+    /// with the synthetic trim breadcrumb, as one canonical fact alongside
+    /// the transcript itself. Callers must not infer this from message text
+    /// on restore: a genuine first user turn that happens to equal the
+    /// localized breadcrumb string must keep its turn-boundary role, and a
+    /// crumb written under another locale must stay classified as synthetic.
+    /// No-op for backends that don't track it (the caller falls back to
+    /// treating the session as having no breadcrumb).
+    fn set_session_trim_breadcrumb(
+        &self,
+        _session_key: &str,
+        _present: bool,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the recorded breadcrumb provenance for a session. `None` means
+    /// the backend doesn't track it or no session-level state exists yet
+    /// (callers should assume `false`, not attempt text inference).
+    fn get_session_trim_breadcrumb(&self, _session_key: &str) -> std::io::Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Replace a session's durable transcript and its breadcrumb provenance
+    /// with the agent's authoritative post-turn state. Callers that own a
+    /// trimmed in-memory history must use this instead of appending only the
+    /// turn's delta. The default implementation performs two separate writes
+    /// (`rewrite_messages` then `set_session_trim_breadcrumb`); they are
+    /// serialized under the caller's lock (channel per-sender lock or the
+    /// store's mutation guard) so concurrent turns cannot interleave, but the
+    /// pair is not crash-atomic. A crash between the two writes can leave
+    /// transcript and flag temporarily out of sync, recoverable on the next
+    /// trim. Backends that can provide a transaction (e.g. SQLite) should
+    /// override this to make the pair atomic.
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        self.rewrite_messages(session_key, messages)?;
+        self.set_session_trim_breadcrumb(session_key, breadcrumb_present)
     }
 
     fn set_session_context(

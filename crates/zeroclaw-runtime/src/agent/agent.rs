@@ -308,6 +308,13 @@ impl HistoryTrimNotice {
             dropped_messages: self.dropped_messages,
             kept_turns: self.kept_turns,
             reason: self.reason,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         }
     }
 }
@@ -1125,6 +1132,14 @@ impl Agent {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history_has_trim_breadcrumb = false;
+    }
+
+    pub fn set_history_has_trim_breadcrumb(&mut self, flag: bool) {
+        self.history_has_trim_breadcrumb = flag;
+    }
+
+    pub fn history_has_trim_breadcrumb(&self) -> bool {
+        self.history_has_trim_breadcrumb
     }
 
     fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
@@ -1960,6 +1975,13 @@ impl Agent {
             channel: Some(channel),
             agent_alias,
             turn_id,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         Some(HistoryTrimNotice {
@@ -2519,6 +2541,11 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let original_loop_history_len = loop_history.len();
+        let original_loop_history_crumb = self.history_has_trim_breadcrumb;
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2586,6 +2613,7 @@ impl Agent {
                         },
                     ),
                     history: &mut loop_history,
+                    history_has_trim_breadcrumb: &mut loop_history_crumb_present,
                     channel_name: &self.channel_name,
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -2659,11 +2687,34 @@ impl Agent {
                 None,
             );
         }
-        // Pop the original user message (pushed before the loop) so the
-        // replayed canonical version, including the original user message.
-        self.history.pop();
-        for replayed in Self::replay_loop_messages(&loop_new_messages) {
-            self.history.push(replayed);
+        // Write back any token-budget trim that happened inside the loop to
+        // durable history. `loop_history` is the TurnState's history which
+        // after `sync_pending` already contains the canonical current turn
+        // (user+assistant...), so `loop_history.len()` includes both the
+        // prefix and the canonical. To detect a trim we must compare only
+        // the prefix part, not the full length which always grows via
+        // `sync_pending` and tool appends.
+        let new_prefix_len = loop_history.len().saturating_sub(loop_new_messages.len());
+        let history_trimmed_in_loop = new_prefix_len != original_loop_history_len
+            || loop_history_crumb_present != original_loop_history_crumb;
+        if history_trimmed_in_loop {
+            // The loop's history is already the authoritative full transcript
+            // (trimmed prefix + canonical). It already contains the user and
+            // assistant messages, so we can replay it directly without
+            // appending `loop_new_messages` a second time — doing so duplicated
+            // the current turn (5 messages instead of 3).
+            self.history.clear();
+            self.history
+                .extend(Self::replay_loop_messages(&loop_history));
+            self.history_has_trim_breadcrumb = loop_history_crumb_present;
+        } else {
+            // No trim: the loop did not change the prefix. Pop the pre-loop
+            // enriched user message and replay the canonical (which may be the
+            // request-enriched form, not the raw `enriched` we pushed).
+            self.history.pop();
+            for replayed in Self::replay_loop_messages(&loop_new_messages) {
+                self.history.push(replayed);
+            }
         }
         let response = match loop_result {
             Ok(response) => response,
@@ -2886,7 +2937,16 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut streamed_original_loop_history_len = loop_history.len();
+        let mut streamed_original_crumb = self.history_has_trim_breadcrumb;
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
+        // Track total canonical ChatMessage length so prefix detection is not
+        // confused by `sync_pending` which always grows `loop_history` via the
+        // canonical. After each round, prefix_len = loop_history.len() - total_canonical_len.
+        let mut total_canonical_len = 0usize;
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
@@ -3029,6 +3089,7 @@ impl Agent {
                             },
                         ),
                         history: &mut loop_history,
+                        history_has_trim_breadcrumb: &mut loop_history_crumb_present,
                         channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: cancel_token.clone(),
@@ -3122,6 +3183,25 @@ impl Agent {
             for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
+            }
+            total_canonical_len += round_added.len();
+            // Write back durable token-budget trim from loop_history.
+            // `loop_history` after this round is [trimmed_prefix + all canonical ChatMessages so far]
+            // `total_canonical_len` tracks the ChatMessage length of all canonical so far,
+            // so prefix_len = loop_history.len() - total_canonical_len.
+            let new_prefix_len = loop_history.len().saturating_sub(total_canonical_len);
+            if new_prefix_len != streamed_original_loop_history_len
+                || loop_history_crumb_present != streamed_original_crumb
+            {
+                // The prefix was trimmed (old turns dropped or crumb inserted).
+                // Rebuild durable history from the authoritative loop_history
+                // which already contains the trimmed prefix + canonical.
+                self.history.clear();
+                self.history
+                    .extend(Self::replay_loop_messages(&loop_history));
+                self.history_has_trim_breadcrumb = loop_history_crumb_present;
+                streamed_original_loop_history_len = new_prefix_len;
+                streamed_original_crumb = loop_history_crumb_present;
             }
 
             match loop_result {
@@ -7869,6 +7949,7 @@ mod tests {
                 dropped_messages,
                 kept_turns,
                 reason,
+                ..
             } = event
             {
                 trim_events.push((dropped_messages, kept_turns, reason));

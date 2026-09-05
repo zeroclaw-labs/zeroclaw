@@ -278,6 +278,19 @@ export interface WsMessage {
   timestamp?: string;
   job_id?: string;
   success?: boolean;
+  // History-trim token accounting (server → client). Absent on message-limit
+  // trims and on older daemons; clients fall back to the count-only notice.
+  token_budget?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  tokens_before_source?: string;
+  tokens_after_source?: string;
+  // The retained request cannot fit the configured budget (protected newest
+  // turn plus schemas) even after trimming. History MAY have been trimmed on
+  // the way to that floor, so this flag — not `dropped_messages === 0` — is
+  // the authoritative "unsatisfiable" signal. Absent for ordinary trims and
+  // older daemons.
+  unsatisfiable_floor?: boolean;
   // Supervised-mode tool approval (server → client). See #6522.
   request_id?: string;
   tool?: string;

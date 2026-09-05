@@ -313,6 +313,23 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before`.
+        tokens_before_source: Option<crate::agent::TokenCountSource>,
+        /// Provenance of `tokens_after`.
+        tokens_after_source: Option<crate::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget because only the protected newest turn (plus
+        /// tool schemas) remains. History MAY have been trimmed on the way to
+        /// that floor, so this flag — not `dropped_messages == 0` — is the
+        /// authoritative "unsatisfiable" signal. `None` for ordinary trims.
+        unsatisfiable_floor: Option<bool>,
     },
 }
 

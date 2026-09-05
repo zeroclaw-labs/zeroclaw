@@ -950,6 +950,7 @@ history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 # Reason carried on every history_trimmed event (WS, SSE, ACP).
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = history message limit exceeded
+history-trim-reason-recovery = context window overflow recovery
 # Remediation surfaced when the system prompt + inlined tool definitions alone
 # meet or exceed the context budget, so no amount of conversation trimming can
 # fit the request (#5808).
@@ -1035,6 +1036,7 @@ channel-runtime-fallback-footer =
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
+turn-context-budget-floor-error = The conversation history still exceeds the configured context budget after dropping every droppable turn. Raise the configured context budget, choose a model with a larger context window, or shorten the current turn.
 delegate-provider-fallback-header = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model })]
 delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (requested: { $requested_provider }/{ $requested_model }; served: { $actual_provider }/{ $actual_model }, agentic)]
 
