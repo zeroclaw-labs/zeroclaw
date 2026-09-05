@@ -902,7 +902,7 @@ jobs:
 
           # Any change to this workflow re-runs all gated families.
           wf='^\.github/workflows/ci\.yml$'
-          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/(check_internal_docs_links(_test)?\.py|docs_(quality_gate|links_gate)\.sh)$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
           emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
           # The generated dashboard contract includes schemas owned by the
@@ -988,6 +988,10 @@ jobs:
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_links_gate.sh
+      - name: Docs link gate (all internal links)
+        run: python3 scripts/ci/check_internal_docs_links.py
+      - name: Docs link checker unit tests
+        run: python3 scripts/ci/check_internal_docs_links_test.py
 
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
