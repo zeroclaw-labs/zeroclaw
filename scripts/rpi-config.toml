@@ -126,11 +126,10 @@ max_cpu_time_seconds = 60
 max_subprocesses = 10
 memory_monitoring = true
 
-[security.audit]
-enabled = true
-log_path = "audit.log"
-max_size_mb = 100
-sign_events = false
+# Command audit logging ([security.audit]) is intentionally absent: it is
+# scaffolding only, with no production writer yet. Enabling it records
+# nothing beyond a startup warning, so it is omitted rather than shipped
+# as an apparently configurable control.
 
 [security.otp]
 enabled = true
