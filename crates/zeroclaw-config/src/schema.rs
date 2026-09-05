@@ -19894,6 +19894,88 @@ struct ExtraNestedModelProviderTable {
     nested: String,
 }
 
+/// Marks a resolved peer entry as a deny rule rather than a grant.
+///
+/// Defined here because `channel_external_peers` writes the marker; the channel
+/// allowlist re-exports this constant rather than spelling the character again,
+/// so producer and consumer cannot drift. No chat platform admits a username
+/// beginning with `!`, and an entry that did would be denied rather than
+/// granted, so the reservation fails closed.
+pub const PEER_DENY_PREFIX: char = '!';
+
+/// How many `PEER_DENY_PREFIX` characters open `value`.
+fn leading_deny_prefixes(value: &str) -> usize {
+    value
+        .bytes()
+        .take_while(|byte| *byte == PEER_DENY_PREFIX as u8)
+        .count()
+}
+
+/// The grant identity `entry` names, or `None` when `entry` is a deny marker.
+///
+/// Grants and denies share one string channel, so the encoding has to stay
+/// injective even when the identity itself opens with the marker character.
+/// RFC 5322 permits `!` to open an email local-part, and the email and Gmail
+/// matchers take full addresses through this helper, so `!user@example.com` is
+/// an address an operator may legitimately grant *or* ignore. The two cases
+/// must not collide: an encoding that maps a grant of `!x` and a deny of `!x`
+/// onto the same string silently inverts one of them, which on an authorization
+/// surface is the whole failure mode.
+///
+/// So the *count* of leading markers carries the decision, not merely its
+/// presence. An identity opening with `k` markers is emitted with `2k` for a
+/// grant and `2k + 1` for a deny: an even run is a grant, an odd run is a deny,
+/// and halving the run recovers the identity in both cases. An identity that
+/// does not open with the marker keeps the original encoding, so every existing
+/// config and every entry in a persisted `config.toml` reads exactly as before.
+///
+/// | identity | as a grant | as a deny |
+/// | --- | --- | --- |
+/// | `alice` | `alice` | `!alice` |
+/// | `!alice` | `!!alice` | `!!!alice` |
+///
+/// Pairs with `peer_grant_marker` and `peer_deny_marker`.
+#[must_use]
+pub fn peer_grant_identity(entry: &str) -> Option<&str> {
+    let markers = leading_deny_prefixes(entry);
+    // An odd run is a deny; only an even one names a grant.
+    if !markers.is_multiple_of(2) {
+        return None;
+    }
+    // Dropping half the run leaves the identity's own markers in place.
+    // `PEER_DENY_PREFIX` is ASCII, so the byte index is a char boundary.
+    Some(&entry[markers / 2..])
+}
+
+/// The identity `entry` denies, or `None` when `entry` is a grant.
+///
+/// The odd-run half of the contract described on `peer_grant_identity`.
+#[must_use]
+pub fn peer_deny_identity(entry: &str) -> Option<&str> {
+    let markers = leading_deny_prefixes(entry);
+    if markers.is_multiple_of(2) {
+        return None;
+    }
+    Some(&entry[markers.div_ceil(2)..])
+}
+
+/// Encode `identity` as a grant entry: an even run of markers.
+#[must_use]
+pub fn peer_grant_marker(identity: &str) -> String {
+    let markers = leading_deny_prefixes(identity);
+    format!("{}{identity}", PEER_DENY_PREFIX.to_string().repeat(markers))
+}
+
+/// Encode `identity` as a deny marker: an odd run of markers.
+#[must_use]
+pub fn peer_deny_marker(identity: &str) -> String {
+    let markers = leading_deny_prefixes(identity);
+    format!(
+        "{}{identity}",
+        PEER_DENY_PREFIX.to_string().repeat(markers + 1)
+    )
+}
+
 /// Classification of a `peer_groups.<name>.channel` reference against the
 /// configured `[channels.*]` blocks. This is the single source of truth for
 /// resolving a raw `channel` string — `Config::validate()` consumes it for
@@ -19929,31 +20011,106 @@ enum PeerGroupChannelRef {
 }
 
 impl Config {
-    /// External-peer usernames authorized on `<channel_type>.<alias>`.
+    /// The resolved peer policy for `<channel_type>.<alias>`: every granted
+    /// entry, plus every `ignore` entry as a `PEER_DENY_PREFIX` marker.
     ///
     /// A `[peer_groups.<name>]` contributes when its `channel` field either
     /// matches `channel_type` (type-wide group, applies to every alias of
     /// that type) or matches the full dotted `"<channel_type>.<alias>"`
     /// (instance-scoped group, applies to that one alias only).
+    ///
+    /// This is an authorization input, not a list of addresses. Pass it to the
+    /// channel's allowlist helpers, which apply denies before grants under that
+    /// channel's identity rules. For a reachable account use
+    /// `channel_addressable_peers`.
     pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for group in self.peer_groups.values() {
-            let group_matches = match group.channel.split_once('.') {
-                Some((ty, al)) => ty == channel_type && al == alias,
-                None => group.channel == channel_type,
-            };
-            if !group_matches {
-                continue;
-            }
-            for peer in &group.external_peers {
-                let username = peer.as_str().to_string();
-                if seen.insert(username.clone()) {
-                    out.push(username);
-                }
-            }
-        }
+        self.channel_external_peers_for(&[channel_type], alias)
+    }
+
+    /// `channel_external_peers` for a channel written more than one way in
+    /// `peer_groups` (WeCom WebSocket is both `wecom-ws` and `wecom_ws`).
+    ///
+    /// Resolving each spelling separately and concatenating the results loses
+    /// denies: an `ignore` under one spelling and a wildcard grant under the
+    /// other never meet. One pass over every matching group keeps the contract
+    /// whole.
+    ///
+    /// Grants and denies are both returned as the operator wrote them, and
+    /// neither is applied here. Deciding a deny at this layer would need an
+    /// identity comparison, and only the channel knows what identity means:
+    /// Reddit reads `u/alice` and `alice` as one account, WhatsApp reads
+    /// `+1555...` and `1555...` as one number, Nostr rewrites npub to hex.
+    /// Subtracting with a generic rule instead resolved the two sides under
+    /// different semantics, so an `ignore` the channel would have matched
+    /// disappeared before the channel ever saw it. The peer list now carries
+    /// the whole policy to the one place that can apply it consistently.
+    pub fn channel_external_peers_for(&self, channel_types: &[&str], alias: &str) -> Vec<String> {
+        let matching_groups: Vec<_> = self
+            .peer_groups
+            .values()
+            .filter(|group| match group.channel.split_once('.') {
+                Some((ty, al)) => channel_types.contains(&ty) && al == alias,
+                None => channel_types.contains(&group.channel.as_str()),
+            })
+            .collect();
+        // Sorted because `peer_groups` is a `HashMap`: without it the resolved
+        // order varies between runs, which reaches `channel_addressable_peers`
+        // and would pick a different heartbeat target on each restart.
+        let mut out: Vec<String> = matching_groups
+            .iter()
+            .flat_map(|group| &group.external_peers)
+            .map(|peer| peer_grant_marker(peer.as_str()))
+            .collect();
+        out.sort();
+        out.dedup();
+        // Every deny travels as a `!name` marker that the channel allowlist
+        // applies ahead of any grant, including a wildcard. Sorted for a
+        // deterministic result.
+        let mut denied: Vec<String> = matching_groups
+            .iter()
+            .flat_map(|group| &group.ignore)
+            .map(|peer| peer.as_str().to_string())
+            .collect();
+        denied.sort();
+        denied.dedup();
+        out.extend(
+            denied
+                .into_iter()
+                .map(|peer| peer_deny_marker(peer.as_str())),
+        );
         out
+    }
+
+    /// Peers on `<channel_type>.<alias>` that name one reachable account.
+    ///
+    /// `channel_external_peers` answers "who is authorized", so it carries
+    /// wildcards and deny markers, neither of which is an address. Callers that
+    /// need somewhere to send a message want this instead.
+    pub fn channel_addressable_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        let resolved = self.channel_external_peers(channel_type, alias);
+        let denied: std::collections::HashSet<String> = resolved
+            .iter()
+            .filter_map(|peer| peer_deny_identity(peer))
+            .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
+            .collect();
+        // `ignore = ["*"]` denies every sender, so it leaves nothing
+        // addressable either. Subtracting only the names in the deny set misses
+        // it: a wildcard deny names nobody, so an ordinary grant survives it and
+        // heartbeat auto-detection would pick an account the policy rejects.
+        if denied.iter().any(|peer| peer == "*") {
+            return Vec::new();
+        }
+        resolved
+            .iter()
+            .filter_map(|peer| peer_grant_identity(peer))
+            .filter(|peer| peer.trim() != "*")
+            // A blank grant is not an address. `external_peers = [""]` parses,
+            // and heartbeat auto-detection takes the first entry it is handed,
+            // so leaving it in makes an empty string a proactive recipient.
+            .filter(|peer| !peer.trim().is_empty())
+            .filter(|peer| !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase()))
+            .map(str::to_string)
+            .collect()
     }
 
     /// Voice-peer usernames for `<channel_type>.<alias>` that should always
@@ -19988,6 +20145,13 @@ impl Config {
                 }
             }
         }
+        // Voice delivery is delivery, so the same `ignore` that denies a sender
+        // has to remove them here. This walked `external_peers` directly and
+        // never consulted `ignore` at all, so an explicitly ignored peer still
+        // received proactive TTS. Filtered through the addressable view rather
+        // than re-deriving the rule, so the two cannot answer differently.
+        let addressable = self.channel_addressable_peers(channel_type, alias);
+        out.retain(|peer| addressable.iter().any(|allowed| allowed == peer));
         out
     }
 
@@ -25148,6 +25312,447 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_every_ignore_across_matching_groups() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["alice", "@BlockedUser"]
+
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            external_peers = ["bob"]
+            ignore = ["blockeduser", "bob"]
+
+            [peer_groups.reddit_other]
+            channel = "reddit.other"
+            external_peers = ["mallory"]
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // Every grant and every deny travels, because whether `blockeduser`
+        // names `@BlockedUser` is a question only the channel can answer.
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec![
+                "@BlockedUser".to_string(),
+                "alice".to_string(),
+                "bob".to_string(),
+                "!blockeduser".to_string(),
+                "!bob".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            config.channel_external_peers("reddit", "other"),
+            vec![
+                "@BlockedUser".to_string(),
+                "alice".to_string(),
+                "mallory".to_string(),
+                "!alice".to_string(),
+            ]
+        );
+
+        // The addressable view is what a caller needing somewhere to send a
+        // message sees: no markers, no wildcard, and nothing an `ignore` names.
+        assert_eq!(
+            config.channel_addressable_peers("reddit", "other"),
+            vec!["@BlockedUser".to_string(), "mallory".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_a_deny_that_only_the_channel_can_match() {
+        // The blocker this encoding exists for. Reddit reads `u/alice` and
+        // `alice` as one account; a resolver comparing the raw strings kept the
+        // grant and dropped the deny, and the channel then authorized the
+        // ignored sender. Both spellings must arrive for the channel to decide.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            external_peers = ["u/alice"]
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec!["u/alice".to_string(), "!alice".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn grant_and_deny_encodings_never_collide() {
+        // The property the encoding exists for: no identity, however many
+        // markers it opens with, can be encoded as a grant and as a deny onto
+        // the same string. A collision here silently inverts an operator's
+        // rule, which is the failure this whole surface is meant to prevent.
+        let identities = [
+            "alice",
+            "*",
+            "user@example.com",
+            "!user@example.com",
+            "!!user@example.com",
+            "!!!weird",
+            "!",
+            "!!",
+        ];
+        for identity in identities {
+            let grant = super::peer_grant_marker(identity);
+            let deny = super::peer_deny_marker(identity);
+            assert_ne!(grant, deny, "encodings collide for {identity:?}");
+
+            assert_eq!(
+                super::peer_grant_identity(&grant),
+                Some(identity),
+                "grant of {identity:?} must decode to itself"
+            );
+            assert_eq!(
+                super::peer_deny_identity(&grant),
+                None,
+                "grant of {identity:?} must not read as a deny"
+            );
+
+            assert_eq!(
+                super::peer_deny_identity(&deny),
+                Some(identity),
+                "deny of {identity:?} must decode to itself"
+            );
+            assert_eq!(
+                super::peer_grant_identity(&deny),
+                None,
+                "deny of {identity:?} must not read as a grant"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn an_ignore_that_opens_with_the_deny_prefix_still_denies_under_a_wildcard() {
+        // The regression: the previous escape mapped `ignore = ["!user@..."]`
+        // onto the same string as a grant of `!user@...`, so the deny vanished
+        // and the wildcard admitted the sender.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.email_ops]
+            channel = "email.ops"
+            external_peers = ["*"]
+            ignore = ["!user@example.com"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("email", "ops");
+        assert_eq!(
+            resolved,
+            vec!["*".to_string(), "!!!user@example.com".to_string()]
+        );
+        assert_eq!(
+            super::peer_deny_identity("!!!user@example.com"),
+            Some("!user@example.com"),
+            "the deny survives the round trip"
+        );
+        assert_eq!(super::peer_grant_identity("!!!user@example.com"), None);
+        assert!(
+            config.channel_addressable_peers("email", "ops").is_empty(),
+            "the only named identity is denied, so nothing is addressable"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_escapes_a_grant_that_opens_with_the_deny_prefix() {
+        // RFC 5322 allows `!` to open an email local-part. Emitted raw, the
+        // grant would read back as a deny of `user@example.com` and invert the
+        // operator's intent on the surface whose whole job is authorization.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.email_ops]
+            channel = "email.ops"
+            external_peers = ["!user@example.com"]
+            ignore = ["blocked@example.com"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("email", "ops");
+        assert_eq!(
+            resolved,
+            vec![
+                "!!user@example.com".to_string(),
+                "!blocked@example.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            super::peer_grant_identity("!!user@example.com"),
+            Some("!user@example.com"),
+            "the escape round-trips to the address the operator wrote"
+        );
+        assert_eq!(super::peer_deny_identity("!!user@example.com"), None);
+        assert_eq!(
+            super::peer_deny_identity("!blocked@example.com"),
+            Some("blocked@example.com")
+        );
+        assert_eq!(
+            config.channel_addressable_peers("email", "ops"),
+            vec!["!user@example.com".to_string()],
+            "the escaped grant is a reachable address, unescaped"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_ignore_past_a_padded_wildcard() {
+        // A wildcard written with surrounding whitespace. Gating marker
+        // emission on the exact string `"*"` emitted nothing here, while a
+        // channel matcher that trims still granted everyone.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["15551234567"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("whatsapp", "ops"),
+            vec![" * ".to_string(), "!15551234567".to_string()]
+        );
+        assert!(
+            config
+                .channel_addressable_peers("whatsapp", "ops")
+                .is_empty(),
+            "a wildcard is not an address"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_ignore_past_a_wildcard_grant() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.bluesky_all]
+            channel = "bluesky"
+            external_peers = ["*"]
+
+            [peer_groups.bluesky_ops]
+            channel = "bluesky.ops"
+            ignore = ["alice.bsky.social", "@Mallory"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // The wildcard survives, so the deny cannot be applied by subtraction.
+        // It has to travel with the list for the channel matcher to enforce.
+        assert_eq!(
+            config.channel_external_peers("bluesky", "ops"),
+            vec![
+                "*".to_string(),
+                "!@Mallory".to_string(),
+                "!alice.bsky.social".to_string(),
+            ]
+        );
+
+        // An alias the instance-scoped ignore does not match keeps the bare
+        // wildcard, so the marker is not leaked to unrelated instances.
+        assert_eq!(
+            config.channel_external_peers("bluesky", "other"),
+            vec!["*".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_for_sees_every_spelling_of_one_channel() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.wecom_all]
+            channel = "wecom-ws.ops"
+            external_peers = ["*"]
+
+            [peer_groups.wecom_ignore]
+            channel = "wecom_ws.ops"
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // Resolved one spelling at a time, the wildcard and the ignore never
+        // meet, so no marker is emitted and concatenating the two results
+        // admits the ignored sender.
+        assert_eq!(
+            config.channel_external_peers("wecom-ws", "ops"),
+            vec!["*".to_string()]
+        );
+        assert_eq!(
+            config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], "ops"),
+            vec!["*".to_string(), "!alice".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_ignoring_the_wildcard_denies_everyone() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["*"]
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // `ignore = ["*"]` is the mirror of a wildcard grant, so it travels as
+        // a wildcard deny. The allowlist treats that as denying every sender,
+        // which is what removing the wildcard by subtraction used to achieve.
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec!["*".to_string(), "!*".to_string()]
+        );
+        assert!(config.channel_addressable_peers("reddit", "ops").is_empty());
+    }
+
+    /// The case the wildcard-grant test above does not reach. A wildcard deny
+    /// names nobody, so subtracting only the names in the deny set left an
+    /// ordinary grant standing. `auto_detect_heartbeat_channel` takes the first
+    /// addressable entry, so proactive output went to an account the policy
+    /// explicitly denies.
+    #[::core::prelude::v1::test]
+    fn wildcard_deny_leaves_no_named_grant_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["user123"]
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("telegram", "ops"),
+            vec!["user123".to_string(), "!*".to_string()]
+        );
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty(),
+            "a wildcard deny leaves nothing to address"
+        );
+        // The admission side already agreed; this is the delivery side catching up.
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty()
+        );
+    }
+
+    /// A blank grant is not a delivery address.
+    ///
+    /// `auto_detect_heartbeat_channel` takes the first entry this returns, so
+    /// leaving `""` in the set makes an empty string a proactive recipient.
+    #[::core::prelude::v1::test]
+    fn a_blank_grant_is_not_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["", "   "]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty(),
+            "a blank grant gives heartbeat auto-detection nothing to pick"
+        );
+
+        // Control: a real grant beside the blank ones is still addressable, so
+        // this cannot pass by emptying the set for every policy.
+        let mixed: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["", "user456"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert_eq!(
+            mixed.channel_addressable_peers("telegram", "ops"),
+            vec!["user456".to_string()]
+        );
+    }
+
+    /// A named deny still removes only that peer, so the wildcard-deny rule
+    /// above cannot pass by emptying the set for every policy.
+    #[::core::prelude::v1::test]
+    fn a_named_deny_leaves_other_grants_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["user123", "user456"]
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["user123"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_addressable_peers("telegram", "ops"),
+            vec!["user456".to_string()]
+        );
+    }
+
+    /// Voice delivery is delivery. This walked `external_peers` directly and
+    /// never consulted `ignore`, so an explicitly ignored peer still received
+    /// proactive TTS.
+    #[::core::prelude::v1::test]
+    fn voice_peers_drop_an_ignored_peer() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_voice]
+            channel = "telegram"
+            external_peers = ["user123", "user456"]
+            output_modality = "voice"
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["user123"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_voice_peers("telegram", "ops"),
+            vec!["user456".to_string()],
+            "an ignored peer must not receive proactive voice output"
+        );
+
+        let all_denied: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_voice]
+            channel = "telegram"
+            external_peers = ["user123"]
+            output_modality = "voice"
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert!(all_denied.channel_voice_peers("telegram", "ops").is_empty());
+    }
 
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //

@@ -860,7 +860,7 @@ impl TelegramChannel {
         mention_only: bool,
     ) -> Self {
         let alias = alias.into();
-        let has_peers = !peer_resolver().is_empty();
+        let has_peers = crate::allowlist::grants_anyone(&peer_resolver());
         let pairing = if has_peers {
             None
         } else {
@@ -1155,9 +1155,31 @@ impl TelegramChannel {
         self
     }
 
-    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
-        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+    /// The conflict message when a matching `ignore` denies `identity`.
+    ///
+    /// Asked before `try_pair`, because pairing consumes the one-time code.
+    fn pairing_deny_conflict(&self, identities: &[String]) -> Option<String> {
+        let config = self.persist.as_ref()?;
+        // The same set `is_any_user_allowed` judges at message time. Checking
+        // only the identity that would be *written* lets an `ignore` naming the
+        // username pass a bind whose numeric id is the one persisted, and every
+        // later message from that account is then rejected by the inbound gate.
+        let normalized: Vec<String> = identities
+            .iter()
+            .map(|identity| Self::normalize_identity(identity))
+            .collect();
+        let borrowed: Vec<&str> = normalized.iter().map(String::as_str).collect();
+        let cfg = config.read();
+        crate::identity_persist::external_peer_deny_conflict(
+            &cfg,
+            "telegram",
+            &self.alias,
+            &borrowed,
+            |entry, user| Self::normalize_identity(entry) == user,
+        )
+    }
 
+    async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
         let Some(config) = &self.persist else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1172,39 +1194,19 @@ impl TelegramChannel {
         if normalized.is_empty() {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
-        let group_name = format!("telegram_{}", self.alias);
-        let channel_ref: zeroclaw_config::providers::ChannelRef =
-            format!("telegram.{}", self.alias).into();
-        let snapshot = {
-            let mut cfg = config.write();
-            if !cfg.channels.telegram.contains_key(&self.alias) {
-                anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot_token <token>` to configure.",
-                    self.alias
-                );
-            }
-            let group = cfg
-                .peer_groups
-                .entry(group_name)
-                .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref,
-                    ..PeerGroupConfig::default()
-                });
-            if group
-                .external_peers
-                .iter()
-                .any(|p| Self::normalize_identity(p.as_str()) == normalized)
-            {
-                return Ok(());
-            }
-            group.external_peers.push(PeerUsername::new(normalized));
-            cfg.clone()
-        };
-        snapshot
-            .save()
-            .await
-            .context("Failed to persist Telegram peer to config.toml")?;
-        Ok(())
+        // Through the shared writer, which selects its target group by the
+        // `channel` field the runtime reader authorizes by rather than by the
+        // `peer_groups` map key. Selecting by key wrote the grant into whatever
+        // group happened to be named `telegram_<alias>`, even one whose
+        // `channel` points at a different instance, and reported success.
+        crate::identity_persist::persist_external_peer(
+            Some(config),
+            "telegram",
+            &self.alias,
+            &normalized,
+            |entry, user| Self::normalize_identity(entry) == user,
+        )
+        .await
     }
 
     fn extract_bind_code(text: &str) -> Option<&str> {
@@ -1222,6 +1224,16 @@ impl TelegramChannel {
             .as_ref()
             .and_then(PairingGuard::pairing_code)
             .is_some()
+    }
+
+    /// Whether any peer group has authorized someone on this channel.
+    ///
+    /// Effective grants only. The resolved list also carries the denies for
+    /// `ignore`, so a config holding nothing but denies, or nothing but grants
+    /// its own denies shadow, has authorized no one and the channel is still
+    /// unpaired.
+    fn has_authorized_peer(&self) -> bool {
+        crate::allowlist::grants_anyone(&(self.peer_resolver)())
     }
 
     /// Build the operator-facing `zeroclaw channel bind-telegram` command for
@@ -1847,21 +1859,36 @@ impl TelegramChannel {
         Some(Self::normalize_incoming_content(caption, bot_username))
     }
 
+    /// Single-identifier convenience kept for the unit tests; the polling
+    /// path authorizes the whole identity set at once.
+    #[cfg(test)]
     fn is_user_allowed(&self, username: &str) -> bool {
-        let identity = Self::normalize_identity(username);
+        self.is_any_user_allowed([username])
+    }
+
+    /// A Telegram sender is known by both a username and a numeric ID, so they
+    /// are evaluated together against one snapshot of the peer list. Asking per
+    /// identifier lets a deny on one be defeated by a wildcard reached through
+    /// the other.
+    fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let owned: Vec<String> = identities
+            .into_iter()
+            .map(Self::normalize_identity)
+            .collect();
+        let identities: Vec<&str> = owned.iter().map(String::as_str).collect();
         let peers: Vec<String> = (self.peer_resolver)()
             .into_iter()
             .map(|p| Self::normalize_identity(&p))
             .filter(|p| !p.is_empty())
             .collect();
-        crate::allowlist::is_user_allowed(&peers, &identity, crate::allowlist::Match::Sensitive)
-    }
-
-    fn is_any_user_allowed<'a, I>(&self, identities: I) -> bool
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        identities.into_iter().any(|id| self.is_user_allowed(id))
+        crate::allowlist::is_identity_allowed(
+            &peers,
+            &identities,
+            crate::allowlist::Match::Sensitive,
+        )
     }
 
     fn approval_callback_context(callback: &serde_json::Value) -> (Vec<String>, Option<String>) {
@@ -2018,30 +2045,56 @@ impl TelegramChannel {
             return;
         };
 
-        let mut identities = vec![normalized_username.as_str()];
-        if let Some(ref id) = normalized_sender_id {
-            identities.push(id.as_str());
-        }
+        let identities = Self::authorization_identities(message);
 
-        if self.is_any_user_allowed(identities.iter().copied()) {
+        if self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return;
         }
 
         if let Some(code) = Self::extract_bind_code(text) {
             if let Some(pairing) = self.pairing.as_ref() {
-                match pairing.try_pair(code, &chat_id).await {
-                    Ok(Some(_token)) => {
-                        let bind_identity = normalized_sender_id.clone().or_else(|| {
-                            if normalized_username.is_empty() || normalized_username == "unknown" {
-                                None
-                            } else {
-                                Some(normalized_username.clone())
-                            }
-                        });
+                let bind_identity = normalized_sender_id.clone().or_else(|| {
+                    if normalized_username.is_empty() || normalized_username == "unknown" {
+                        None
+                    } else {
+                        Some(normalized_username.clone())
+                    }
+                });
 
+                // Before the pairing transition: a denied identity can never be
+                // persisted, and `try_pair` would spend the operator's only code
+                // to reach that verdict, leaving the sender no way to retry.
+                if bind_identity.is_some()
+                    && let Some(conflict) = self.pairing_deny_conflict(&identities)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"conflict": conflict})),
+                        "refusing bind before consuming pairing code"
+                    );
+                    let _ = self
+                        .send(&SendMessage::new(
+                            "❌ This account is denied by an `ignore` entry in the runtime config. Ask the operator to remove it, then retry with the same code.",
+                            &chat_id,
+                        ))
+                        .await;
+                    return;
+                }
+
+                // Reserved, not paired: the code is held aside and the token is
+                // only minted by `commit()`. Dropping the reservation restores
+                // the code, so a persistence failure below cannot spend the
+                // operator's one-time secret on a binding that did not happen.
+                match pairing.reserve_pair(code, &chat_id).await {
+                    Ok(Some(reservation)) => {
                         if let Some(identity) = bind_identity {
                             match Box::pin(self.persist_allowed_identity(&identity)).await {
                                 Ok(()) => {
+                                    // Durable write landed, so the pairing may
+                                    // now consume the code and mint the token.
+                                    let _ = reservation.commit();
                                     let _ = self
                                         .send(&SendMessage::new(
                                             "✅ Telegram account bound successfully. You can talk to ZeroClaw now.",
@@ -2059,6 +2112,12 @@ impl TelegramChannel {
                                     );
                                 }
                                 Err(e) => {
+                                    // The write is the binding. Leaving the
+                                    // reservation uncommitted drops the token
+                                    // and hands the code back, so a sender the
+                                    // admission matcher still rejects never
+                                    // holds the only spent code.
+                                    drop(reservation);
                                     ::zeroclaw_log::record!(
                                         ERROR,
                                         ::zeroclaw_log::Event::new(
@@ -2067,17 +2126,19 @@ impl TelegramChannel {
                                         )
                                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                         .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                                        "failed to persist allowlist after bind"
+                                        "rolled back bind: could not persist allowlist"
                                     );
                                     let _ = self
                                         .send(&SendMessage::new(
-                                            "⚠️ Bound for this runtime, but failed to persist config. Access may be lost after restart; check config file permissions.",
+                                            "❌ Could not save the binding, so nothing was changed. Your code is still valid; ask the operator to check the config file, then retry.",
                                             &chat_id,
                                         ))
                                         .await;
                                 }
                             }
                         } else {
+                            // Nothing to persist means nothing was bound.
+                            drop(reservation);
                             let _ = self
                                 .send(&SendMessage::new(
                                     "❌ Could not identify your Telegram account. Ensure your account has a username or stable user ID, then retry.",
@@ -2165,7 +2226,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // unpaired. Once peers exist (resolved live), the one-time code is
         // moot and the hint just confuses an operator who already authorized
         // someone — the "already assigned but still asks" complaint.
-        if self.pairing_code_active() && (self.peer_resolver)().is_empty() {
+        if self.pairing_code_active() && !self.has_authorized_peer() {
             let _ = self
                 .send(&SendMessage::new(
                     "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
@@ -2331,14 +2392,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         }
 
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let (_, _, sender_identity) = Self::extract_sender_info(message);
 
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
+        let identities = Self::authorization_identities(message);
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -2563,14 +2621,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         }
 
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let (_, _, sender_identity) = Self::extract_sender_info(message);
 
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
+        let identities = Self::authorization_identities(message);
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -2715,6 +2770,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             ..Default::default()
         }))
+    }
+
+    /// The identifiers this sender can be authorized by.
+    ///
+    /// Deliberately not `extract_sender_info`'s `username`, which substitutes
+    /// the display placeholder `"unknown"` when Telegram sends no username at
+    /// all. That string is a label, not an identifier, and passing it to the
+    /// allowlist let a sender with no usable identity ride a wildcard grant. A
+    /// sender genuinely named `unknown` still authorizes, because presence is
+    /// read from the JSON field rather than from the placeholder's spelling.
+    fn authorization_identities(message: &serde_json::Value) -> Vec<String> {
+        let from = message.get("from");
+        let mut out = Vec::new();
+        if let Some(username) = from
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+        {
+            out.push(username.to_string());
+        }
+        if let Some(id) = from
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            out.push(id.to_string());
+        }
+        out
     }
 
     /// Extract sender username and display identity from a Telegram message object.
@@ -2909,14 +2990,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
 
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let (_, _, sender_identity) = Self::extract_sender_info(message);
 
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
+        let identities = Self::authorization_identities(message);
 
-        if !self.is_any_user_allowed(identities.iter().copied()) {
+        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
             return None;
         }
 
@@ -6035,6 +6113,29 @@ mod tests {
     }
 
     #[test]
+    fn telegram_deny_on_one_identity_is_not_defeated_by_the_other() {
+        // A sender is authorized from its username and its numeric ID, so a
+        // deny naming either must not lose to the wildcard on the other.
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into(), "!alice".into()]),
+            mention_only,
+        );
+        assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
+        assert!(ch.is_any_user_allowed(["bob", "987654321"]));
+
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into(), "!123456789".into()]),
+            mention_only,
+        );
+        assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
+    }
+
+    #[test]
     fn telegram_user_allowed_by_numeric_id_identity() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -6080,6 +6181,340 @@ mod tests {
             mention_only,
         );
         assert!(!ch.pairing_code_active());
+    }
+
+    #[test]
+    fn telegram_pairing_stays_active_when_only_denies_are_configured() {
+        // The resolved peer list carries a deny for every `ignore` entry, so a
+        // config with `ignore` and no grant resolves non-empty while having
+        // authorized nobody. Reading that as "already paired" would leave the
+        // operator unable to pair at all.
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["!alice".into()]),
+            false,
+        );
+        assert!(ch.pairing_code_active());
+        assert!(!ch.has_authorized_peer());
+    }
+
+    #[test]
+    fn telegram_pairing_stays_active_when_every_grant_is_shadowed() {
+        // A grant cancelled by a deny is not authorization. Counting it as one
+        // suppressed the bind code while the admission matcher admitted nobody,
+        // which is an operator with no accepted sender and no route back.
+        for shadowed in [
+            vec!["alice".to_string(), "!alice".to_string()],
+            vec!["*".to_string(), "!*".to_string()],
+        ] {
+            let ch = TelegramChannel::new(
+                "t".into(),
+                "telegram_test_alias",
+                Arc::new(move || shadowed.clone()),
+                false,
+            );
+            assert!(
+                ch.pairing_code_active(),
+                "the bind code must still be issued"
+            );
+            assert!(!ch.has_authorized_peer());
+            assert!(!ch.is_any_user_allowed(["alice", "123456789"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_reports_a_conflict_instead_of_appending_a_shadowed_grant() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The other end of the re-enabled prompt. Pairing is offered again once
+        // a shadowed grant stops counting as authorization, so the bind must not
+        // dead-end by appending a grant the same `ignore` shadows.
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "t".to_string(),
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.default".to_string()),
+                external_peers: vec![PeerUsername::new("123456789".to_string())],
+                ignore: vec![PeerUsername::new("123456789".to_string())],
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(RwLock::new(config));
+
+        let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
+            .with_persistence(Arc::clone(&config));
+
+        let err = ch
+            .persist_allowed_identity("123456789")
+            .await
+            .expect_err("an ignored identity must not be persisted as a grant");
+        let message = err.to_string();
+        assert!(
+            message.contains("ignore"),
+            "names the field to edit: {message}"
+        );
+        assert!(
+            !message.contains("123456789"),
+            "the identity is personal data and the bind path logs this error: {message}"
+        );
+
+        let cfg = config.read();
+        assert_eq!(
+            cfg.peer_groups
+                .get("telegram_default")
+                .expect("group untouched")
+                .external_peers
+                .len(),
+            1,
+            "no second, equally shadowed grant was appended"
+        );
+        assert!(!crate::allowlist::is_user_allowed(
+            &cfg.channel_external_peers("telegram", "default"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_keeps_the_one_time_code_when_an_ignore_denies_the_sender() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // Pairing is irreversible: `try_pair` consumes the code and mints a
+        // token. A deny discovered after that spends the operator's only code
+        // on a pairing the admission matcher then rejects, and
+        // `pairing_code_active()` is false, so the sender cannot retry.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let config_with = |ignored: bool| {
+            let mut config = Config::default();
+            config.channels.telegram.insert(
+                "default".to_string(),
+                zeroclaw_config::schema::TelegramConfig {
+                    bot_token: "t".to_string(),
+                    ..Default::default()
+                },
+            );
+            config.peer_groups.insert(
+                "telegram_default".to_string(),
+                PeerGroupConfig {
+                    channel: ChannelRef::new("telegram.default".to_string()),
+                    ignore: if ignored {
+                        vec![PeerUsername::new("123456789".to_string())]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+            );
+            Arc::new(RwLock::new(config))
+        };
+
+        let bind = |ignored: bool| {
+            let uri = mock_server.uri();
+            async move {
+                let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
+                    .with_persistence(config_with(ignored))
+                    .with_api_base(uri);
+                let code = ch
+                    .pairing
+                    .as_ref()
+                    .expect("no configured peers, so pairing is offered")
+                    .pairing_code()
+                    .expect("a fresh guard issues a code");
+                ch.handle_unauthorized_message(&serde_json::json!({
+                    "message": {
+                        "text": format!("/bind {code}"),
+                        "from": {"id": 123_456_789},
+                        "chat": {"id": 42},
+                    }
+                }))
+                .await;
+                ch.pairing
+                    .as_ref()
+                    .expect("guard outlives the handler")
+                    .pairing_code()
+            }
+        };
+
+        assert!(
+            bind(true).await.is_some(),
+            "a denied identity must not spend the operator's only pairing code"
+        );
+        // Control: the same handler on the same fixture *does* consume the code
+        // when nothing denies the sender, so the assertion above is not vacuous.
+        assert!(
+            bind(false).await.is_none(),
+            "an admissible identity still pairs and consumes the code"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_honors_a_deny_naming_only_the_username() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // A Telegram account is one identity spelled two ways, and the inbound
+        // gate judges both. The pairing precheck used to ask only about the
+        // identity it would write, the numeric id, so an `ignore` on the
+        // username let the bind consume the code and persist the id, leaving an
+        // account the channel still refuses on every later message.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "t".to_string(),
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.default".to_string()),
+                // Names the username only. The numeric id is not mentioned.
+                ignore: vec![PeerUsername::new("alice".to_string())],
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(RwLock::new(config));
+
+        let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
+            .with_persistence(Arc::clone(&config))
+            .with_api_base(mock_server.uri());
+
+        let code = ch
+            .pairing
+            .as_ref()
+            .expect("no configured peers, so pairing is offered")
+            .pairing_code()
+            .expect("a fresh guard issues a code");
+
+        ch.handle_unauthorized_message(&serde_json::json!({
+            "message": {
+                "text": format!("/bind {code}"),
+                "from": {"id": 123_456_789, "username": "alice"},
+                "chat": {"id": 42},
+            }
+        }))
+        .await;
+
+        assert_eq!(
+            ch.pairing
+                .as_ref()
+                .expect("guard outlives the handler")
+                .pairing_code()
+                .as_deref(),
+            Some(code.as_str()),
+            "a deny on any identifier of the account must refuse before the code is spent"
+        );
+        assert!(
+            config
+                .read()
+                .peer_groups
+                .get("telegram_default")
+                .expect("group untouched")
+                .external_peers
+                .is_empty(),
+            "nothing was persisted for a denied account"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_rolls_back_when_the_writer_rejects_a_group_collision() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        // The deny precheck cannot see this one: nothing is denied. The writer
+        // refuses later, because the conventional key is already held by a group
+        // pointing at another instance, and writing there would authorize the
+        // identity on a channel nobody asked for. Before the rollback that left
+        // the sender holding a runtime-only token, the code spent, and no way to
+        // retry without restarting the daemon.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "t".to_string(),
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "telegram_default".to_string(),
+            PeerGroupConfig {
+                // The conventional key for `telegram.default`, but it belongs
+                // to a different instance.
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(RwLock::new(config));
+
+        let ch = TelegramChannel::new("t".into(), "default", Arc::new(Vec::new), false)
+            .with_persistence(Arc::clone(&config))
+            .with_api_base(mock_server.uri());
+
+        let guard = ch.pairing.as_ref().expect("pairing offered");
+        let code = guard.pairing_code().expect("a fresh guard issues a code");
+
+        ch.handle_unauthorized_message(&serde_json::json!({
+            "message": {
+                "text": format!("/bind {code}"),
+                "from": {"id": 123_456_789},
+                "chat": {"id": 42},
+            }
+        }))
+        .await;
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "a bind that could not be persisted hands the code back"
+        );
+        assert!(
+            !guard.is_paired(),
+            "no runtime-only token survives a bind the writer rejected"
+        );
+        assert!(
+            config
+                .read()
+                .peer_groups
+                .get("telegram_default")
+                .expect("group untouched")
+                .external_peers
+                .is_empty(),
+            "the other instance's group was not written into"
+        );
     }
 
     #[test]
@@ -6205,6 +6640,58 @@ mod tests {
         assert_eq!(msg.reply_target, "-100200300");
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.id, "telegram_-100200300_33");
+    }
+
+    /// Telegram substitutes the display placeholder `"unknown"` when a sender
+    /// has no username. That is a label, not an identifier, and passing it to
+    /// the allowlist let a sender with no usable identity ride a wildcard.
+    #[test]
+    fn wildcard_does_not_admit_a_sender_with_no_usable_identity() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        // No `username`, no `id`: nothing the operator could ever have listed.
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 33,
+                "text": "hello",
+                "from": {},
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "a sender with no identifier must not be dispatched under a wildcard"
+        );
+
+        // A sender genuinely named `unknown` is a real account and still passes,
+        // because presence is read from the JSON field, not the placeholder.
+        let named_unknown = serde_json::json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 34,
+                "text": "hello",
+                "from": { "id": 555, "username": "unknown" },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        assert!(ch.parse_update_message(&named_unknown).is_some());
+
+        // And an id alone is still a usable identifier.
+        let id_only = serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 35,
+                "text": "hello",
+                "from": { "id": 555 },
+                "chat": { "id": -100_200_300 }
+            }
+        });
+        assert!(ch.parse_update_message(&id_only).is_some());
     }
 
     #[test]

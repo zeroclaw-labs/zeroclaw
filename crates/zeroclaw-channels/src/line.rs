@@ -231,11 +231,22 @@ fn is_line_user_allowed(state: &LineState, user_id: &str) -> bool {
 /// Persist a newly-paired LINE userId into `peer_groups.line_<alias>.external_peers`
 /// via the shared Config handle. Mirrors telegram/wechat's `persist_allowed_identity`.
 /// No-op-with-warn when `state.persist` is unset (test fixtures).
-async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
+/// The conflict message when a matching `ignore` denies `user_id`.
+///
+/// Asked before `try_pair`, because pairing consumes the one-time code.
+fn line_pairing_deny_conflict(state: &LineState, user_id: &str) -> Option<String> {
+    let config = state.persist.as_ref()?;
+    let cfg = config.read();
+    crate::identity_persist::external_peer_deny_conflict(
+        &cfg,
+        "line",
+        &state.alias,
+        &[user_id.trim()],
+        |entry, user| entry.trim() == user,
+    )
+}
 
+async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyhow::Result<()> {
     let Some(config) = &state.persist else {
         ::zeroclaw_log::record!(
             WARN,
@@ -250,35 +261,17 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
     if normalized.is_empty() {
         anyhow::bail!("Cannot persist empty LINE userId");
     }
-    let group_name = format!("line_{}", state.alias);
-    let channel_ref = ChannelRef::new(format!("line.{}", state.alias));
-    let snapshot = {
-        let mut cfg = config.write();
-        if !cfg.channels.line.contains_key(&state.alias) {
-            anyhow::bail!("Missing [channels.line.{}] section", state.alias);
-        }
-        let group = cfg
-            .peer_groups
-            .entry(group_name)
-            .or_insert_with(|| PeerGroupConfig {
-                channel: channel_ref,
-                ..PeerGroupConfig::default()
-            });
-        if group
-            .external_peers
-            .iter()
-            .any(|p| p.as_str() == normalized)
-        {
-            return Ok(());
-        }
-        group.external_peers.push(PeerUsername::new(normalized));
-        cfg.clone()
-    };
-    snapshot
-        .save()
-        .await
-        .context("Failed to persist LINE paired userId to config.toml")?;
-    Ok(())
+    // Through the shared writer, which selects its target group by the
+    // `channel` field the runtime reader authorizes by rather than by the
+    // `peer_groups` map key.
+    crate::identity_persist::persist_external_peer(
+        Some(config),
+        "line",
+        &state.alias,
+        &normalized,
+        |entry, user| entry == user,
+    )
+    .await
 }
 
 async fn handle_webhook(
@@ -521,13 +514,69 @@ async fn handle_webhook(
                                 LineChannel::build_sender_obj(&name, &icon)
                             };
                             if let Some(ref guard) = state.pairing {
-                                match guard.try_pair(code, user_id).await {
-                                    Ok(Some(_)) => {
+                                // Before the pairing transition: a denied identity can
+                                // never be persisted, and `try_pair` would spend the
+                                // operator's only code to reach that verdict.
+                                if let Some(conflict) = line_pairing_deny_conflict(&state, user_id)
+                                {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({"conflict": conflict})),
+                                        "refusing bind before consuming pairing code"
+                                    );
+                                    if let Some(ref token) = bind_reply_token {
+                                        send_bind_reply(
+                                            &state.client,
+                                            &state.channel_access_token,
+                                            &state.api_base_url,
+                                            token,
+                                            &i18n::get_required_cli_string(
+                                                "channel-line-bind-denied",
+                                            ),
+                                            bind_sender.clone(),
+                                        )
+                                        .await;
+                                    }
+                                    continue;
+                                }
+                                // Reserved, not paired: `commit()` below is what
+                                // consumes the code and mints the token, so a
+                                // failed write leaves the code usable.
+                                match guard.reserve_pair(code, user_id).await {
+                                    Ok(Some(reservation)) => {
                                         if let Err(e) =
                                             persist_line_paired_identity(&*state, user_id).await
                                         {
-                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "paired userId= but persist failed");
+                                            // Reply with the failure message
+                                            // rather than the success one: the
+                                            // write is what admits this sender,
+                                            // and the spent code was their only
+                                            // retry.
+                                            drop(reservation);
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"user_id": user_id, "e": e.to_string()})), "rolled back bind: could not persist paired userId=");
+                                            if let Some(ref token) = bind_reply_token {
+                                                send_bind_reply(
+                                                    &state.client,
+                                                    &state.channel_access_token,
+                                                    &state.api_base_url,
+                                                    token,
+                                                    &i18n::get_required_cli_string(
+                                                        "channel-line-bind-not-saved",
+                                                    ),
+                                                    bind_sender.clone(),
+                                                )
+                                                .await;
+                                            }
+                                            continue;
                                         } else {
+                                            // Durable write landed, so the
+                                            // pairing may consume the code.
+                                            let _ = reservation.commit();
                                             ::zeroclaw_log::record!(
                                                 INFO,
                                                 ::zeroclaw_log::Event::new(
@@ -722,7 +771,9 @@ impl LineChannel {
 
         let alias = alias.into();
         let configured_peers = peer_resolver();
-        let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
+        let pairing = if dm_policy == LineDmPolicy::Pairing
+            && !crate::allowlist::grants_anyone(&configured_peers)
+        {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
                 // Mirror Telegram/WeChat: a backgrounded daemon discards
@@ -2631,6 +2682,184 @@ mod tests {
         );
 
         api_server.verify().await;
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_bind_keeps_the_one_time_code_when_an_ignore_denies_the_sender() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        // `try_pair` consumes the code and mints a token before persistence
+        // consults the deny; discovering it afterwards leaves the operator's
+        // only code spent on a pairing the admission matcher rejects, with no
+        // route to retry.
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/chat/loading/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
+        let mut config = Config::default();
+        config.channels.line.insert(
+            "line_test_alias".to_string(),
+            zeroclaw_config::schema::LineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "line_line_test_alias".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("line.line_test_alias".to_string()),
+                ignore: vec![PeerUsername::new("Unew".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+
+        // The guard is shared into `LineState`, so it outlives the move into
+        // the webhook task and still answers for the code afterwards.
+        let guard = ch.pairing.as_ref().expect("pairing offered").clone();
+        let code = guard.pairing_code().expect("a fresh guard issues a code");
+
+        let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Unew", &format!("/bind {code}"), "rt-denied"),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "a denied identity must not spend the operator's only pairing code"
+        );
+
+        let reqs = api_server.received_requests().await.unwrap();
+        let reply_req = reqs
+            .iter()
+            .find(|r| r.url.path() == "/v2/bot/message/reply")
+            .expect("the sender is told why the bind was refused");
+        let body: serde_json::Value = serde_json::from_slice(&reply_req.body).unwrap();
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-denied"),
+            "the refusal is reported, not a success reply"
+        );
+
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn webhook_bind_rolls_back_when_the_writer_rejects_a_group_collision() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        // Nothing is denied, so the precheck passes; the writer refuses because
+        // the conventional key belongs to another instance. LINE used to log
+        // that error and reply with `channel-line-bind-success` anyway.
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/chat/loading/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&api_server)
+            .await;
+
+        let mut config = Config::default();
+        config.channels.line.insert(
+            "line_test_alias".to_string(),
+            zeroclaw_config::schema::LineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "line_line_test_alias".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("line.other".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = LineChannel::new(
+            "tok".into(),
+            "mysecret".into(),
+            LineDmPolicy::Pairing,
+            LineGroupPolicy::Open,
+            "line_test_alias",
+            empty_resolver(),
+            0,
+        )
+        .with_api_base_url(&api_server.uri())
+        .with_persistence(Arc::new(parking_lot::RwLock::new(config)));
+
+        let guard = ch.pairing.as_ref().expect("pairing offered").clone();
+        let code = guard.pairing_code().expect("a fresh guard issues a code");
+
+        let (port, _rx, abort) = spawn_webhook(ch, "Ubot").await;
+
+        post_signed(
+            port,
+            "mysecret",
+            &dm_event("Unew", &format!("/bind {code}"), "rt-collision"),
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            guard.pairing_code().as_deref(),
+            Some(code.as_str()),
+            "a bind that could not be persisted hands the code back"
+        );
+        assert!(
+            !guard.is_paired(),
+            "no runtime-only token survives a bind the writer rejected"
+        );
+
+        let reqs = api_server.received_requests().await.unwrap();
+        let reply_req = reqs
+            .iter()
+            .find(|r| r.url.path() == "/v2/bot/message/reply")
+            .expect("the sender is told the bind was not saved");
+        let body: serde_json::Value = serde_json::from_slice(&reply_req.body).unwrap();
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-not-saved"),
+            "the failure is reported, not the success message"
+        );
+
         abort.abort();
     }
 

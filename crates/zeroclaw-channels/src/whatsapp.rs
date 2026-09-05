@@ -164,6 +164,46 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a config entry and a phone-like value name the same WhatsApp
+/// account.
+///
+/// A raw number, a `+` number and a JID are three spellings of one account, so
+/// every decision taken against a resolved peer list has to canonicalize before
+/// comparing. Both surfaces admit the same accounts and share this rule: a deny
+/// written as a raw number has to shadow a wildcard grant reached through the
+/// `+E.164` spelling the Cloud webhook produces, and a deny written as a JID has
+/// to shadow a grant written as `+E.164` in the Web path's persistence writer.
+/// An exact comparison here reads the deny as naming a different account and
+/// lets the wildcard admit a sender the operator ignored.
+pub(crate) fn phone_matches(entry: &str, phone: &str) -> bool {
+    match (normalize_phone_token(entry), normalize_phone_token(phone)) {
+        (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
+        _ => false,
+    }
+}
+
+/// Normalize a phone-like token to canonical E.164 (`+<digits>`).
+/// Accepts raw numbers, `+` numbers, and JIDs (uses the user part before `@`).
+pub(crate) fn normalize_phone_token(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let user_part = trimmed
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(trimmed)
+        .trim();
+
+    let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(format!("+{digits}"))
+    }
+}
+
 pub struct WhatsAppChannel {
     access_token: String,
     endpoint_id: String,
@@ -325,9 +365,14 @@ impl WhatsAppChannel {
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
+    ///
+    /// Matched with [`phone_matches`] rather than an exact comparison. The
+    /// webhook rewrites Meta's raw `from` to `+E.164` before asking, so an exact
+    /// matcher reads `ignore = ["15551234567"]` as naming a different account
+    /// and the wildcard grant admits a sender the operator ignored.
     fn is_number_allowed(&self, phone: &str) -> bool {
         let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_allowed(&peers, phone, crate::allowlist::Match::Sensitive)
+        crate::allowlist::is_user_allowed_by(&peers, phone, phone_matches)
     }
 
     /// Get the verify token for webhook verification
@@ -1086,6 +1131,128 @@ mod tests {
             Arc::new(Vec::new),
         );
         assert!(!ch.is_number_allowed("+1234567890"));
+    }
+
+    /// Resolve peers the way the gateway does, from config, so these cover the
+    /// config-to-webhook boundary rather than a hand-built vector.
+    fn peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("whatsapp", alias)
+    }
+
+    fn channel_with_peers(peers: Vec<String>) -> WhatsAppChannel {
+        WhatsAppChannel::new(
+            "tok".into(),
+            "123".into(),
+            "ver".into(),
+            "ops",
+            Arc::new(move || peers.clone()),
+        )
+    }
+
+    fn text_webhook_from(from: &str) -> serde_json::Value {
+        serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": from,
+                            "timestamp": "1699999999",
+                            "type": "text",
+                            "text": { "body": "hello" }
+                        }]
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn config_wildcard_with_raw_number_ignore_denies_the_webhook_sender() {
+        // Meta sends `from` without a `+`, and the webhook rewrites it to
+        // `+E.164` before asking. An exact matcher therefore read
+        // `ignore = ["15551234567"]` as naming some other account and the
+        // wildcard grant admitted the sender the operator had written down.
+        let ch = channel_with_peers(peers_from_config(
+            r#"
+            [peer_groups.whatsapp_all]
+            channel = "whatsapp"
+            external_peers = ["*"]
+
+            [peer_groups.whatsapp_blocked]
+            channel = "whatsapp.ops"
+            ignore = ["15551234567"]
+            "#,
+            "ops",
+        ));
+
+        assert!(
+            ch.parse_webhook_payload(&text_webhook_from("15551234567"))
+                .is_empty(),
+            "an ignored sender must not ride the wildcard"
+        );
+        assert_eq!(
+            ch.parse_webhook_payload(&text_webhook_from("15559999999"))
+                .len(),
+            1,
+            "an unignored sender still rides the wildcard"
+        );
+    }
+
+    #[test]
+    fn config_ignore_spellings_all_deny_the_same_webhook_sender() {
+        // Raw, `+E.164` and JID are three spellings of one account, so the deny
+        // has to land whichever one the operator reached for.
+        for ignored in ["15551234567", "+15551234567", "15551234567@s.whatsapp.net"] {
+            let ch = channel_with_peers(peers_from_config(
+                &format!(
+                    r#"
+                    [peer_groups.whatsapp_all]
+                    channel = "whatsapp"
+                    external_peers = ["*"]
+
+                    [peer_groups.whatsapp_blocked]
+                    channel = "whatsapp.ops"
+                    ignore = ["{ignored}"]
+                    "#
+                ),
+                "ops",
+            ));
+
+            assert!(
+                ch.parse_webhook_payload(&text_webhook_from("15551234567"))
+                    .is_empty(),
+                "`ignore = [\"{ignored}\"]` must deny the same account"
+            );
+        }
+    }
+
+    #[test]
+    fn config_grant_written_without_a_plus_admits_the_webhook_sender() {
+        // The same identity rule on the grant side. This spelling previously
+        // admitted nobody at all, because the webhook compared `+15551234567`
+        // against the literal `15551234567`.
+        let ch = channel_with_peers(peers_from_config(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = ["15551234567"]
+            "#,
+            "ops",
+        ));
+
+        assert_eq!(
+            ch.parse_webhook_payload(&text_webhook_from("15551234567"))
+                .len(),
+            1
+        );
+        assert!(
+            ch.parse_webhook_payload(&text_webhook_from("15559999999"))
+                .is_empty()
+        );
     }
 
     #[test]

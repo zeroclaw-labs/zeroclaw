@@ -8823,12 +8823,51 @@ pub fn channel_alias_configured(config: &Config, channel_type: &str, alias: &str
     }
 }
 
+/// The `peer_groups` key that holds bindings for `<channel_type>.<alias>`, or
+/// `None` when no group carries that ref yet.
+///
+/// For reporting where a binding lives. The writer selects its target by the
+/// group's `channel` field, so the conventional `<type>_<alias>` name is a
+/// guess that may name nothing at all.
+#[must_use]
+pub fn channel_peer_group_key(config: &Config, channel_type: &str, alias: &str) -> Option<String> {
+    crate::identity_persist::instance_group_key(config, channel_type, alias)
+}
+
+/// The `peer_groups` key that already authorizes `identity`, for reporting an
+/// `already_bound` result without guessing a name. See
+/// [`crate::identity_persist::authorizing_group_key`].
+#[must_use]
+pub fn channel_authorizing_group_key(
+    config: &Config,
+    channel_type: &str,
+    alias: &str,
+    identity: &str,
+) -> Option<String> {
+    crate::identity_persist::authorizing_group_key(
+        config,
+        channel_type,
+        alias,
+        identity,
+        |entry, user| {
+            entry.trim().trim_start_matches('@').to_lowercase()
+                == user.trim().trim_start_matches('@').to_lowercase()
+        },
+    )
+}
+
 /// Add `identity` to the peer group bound to `<type>.<alias>` in-place.
 ///
-/// Returns `Ok(true)` when the identity was newly added, `Ok(false)` when it
-/// was already present. Pure config mutation — no disk write, no daemon
-/// restart — so it is the single core shared by the CLI
-/// (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
+/// Returns `Ok(Some(key))` naming the `peer_groups` key actually written when
+/// the identity was newly added, `Ok(None)` when it was already present, and
+/// `Err` when an `ignore` entry denies the identity, because neither of those
+/// answers would leave it admissible. Callers that report where the identity
+/// landed must use the returned key: the writer selects its target by the
+/// group's `channel` field, so a custom key such as `[peer_groups.ops]` is a
+/// legitimate destination and the conventional `<type>_<alias>` name may not
+/// exist at all. Pure config
+/// mutation — no disk write, no daemon restart — so it is the single core
+/// shared by the CLI (`bind_telegram_identity`) and the gateway bind endpoint. The `channel`
 /// field is the dotted `<type>.<alias>` ref so authorization stays scoped to
 /// the bound alias; a bare type would broaden the peer across every alias of
 /// that type.
@@ -8837,10 +8876,7 @@ pub fn bind_channel_identity_into(
     channel_type: &str,
     alias: &str,
     identity: &str,
-) -> Result<bool> {
-    use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::providers::ChannelRef;
-
+) -> Result<Option<String>> {
     let Some(normalize) = channel_identity_normalizer(channel_type) else {
         anyhow::bail!(
             "Channel type `{channel_type}` does not support identity binding \
@@ -8865,31 +8901,29 @@ pub fn bind_channel_identity_into(
         );
     }
 
-    let group_name = format!("{channel_type}_{alias}");
-    let channel_ref = format!("{channel_type}.{alias}");
-    let group = config
-        .peer_groups
-        .entry(group_name)
-        .or_insert_with(|| PeerGroupConfig {
-            channel: ChannelRef::new(channel_ref),
-            ..PeerGroupConfig::default()
-        });
-
-    if group
-        .external_peers
-        .iter()
-        .any(|p| normalize(p.as_str()) == normalized)
-    {
-        return Ok(false);
-    }
-
-    group.external_peers.push(PeerUsername::new(normalized));
-    Ok(true)
+    // Everything after the closed-set and alias gates is the shared paired
+    // identity write, so it goes through the one writer that selects its target
+    // the way the runtime reader selects it: by the group's `channel` field,
+    // never by the `peer_groups` map key. Keys are arbitrary, so a group keyed
+    // `telegram_alerts` may carry `channel = "telegram.other"`; opening it by
+    // key wrote the grant where this channel's reader never looks while another
+    // channel's reader picked it up, and still reported success.
+    crate::identity_persist::merge_external_peer(
+        config,
+        channel_type,
+        alias,
+        &normalized,
+        |entry, identity| normalize(entry) == normalize(identity),
+    )
 }
 
 /// Telegram-specific thin wrapper over [`bind_channel_identity_into`], kept
 /// for the CLI entry point and its unit tests.
-fn bind_telegram_identity_into(config: &mut Config, identity: &str, alias: &str) -> Result<bool> {
+fn bind_telegram_identity_into(
+    config: &mut Config,
+    identity: &str,
+    alias: &str,
+) -> Result<Option<String>> {
     bind_channel_identity_into(config, "telegram", alias, identity)
 }
 
@@ -8897,7 +8931,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str, alias: &str
     let normalized = normalize_telegram_identity(identity);
     let mut updated = config.clone();
 
-    if !bind_telegram_identity_into(&mut updated, identity, alias)? {
+    if bind_telegram_identity_into(&mut updated, identity, alias)?.is_none() {
         println!("✅ Telegram identity already bound to telegram.{alias}: {normalized}");
         return Ok(());
     }
@@ -9487,8 +9521,7 @@ fn build_channel_by_id(
                 let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                    let external_peers = wecom_ws_external_peers(&config, &alias);
 
                     if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                         WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -9936,6 +9969,18 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+/// The resolved peer policy for a WeCom WebSocket alias.
+///
+/// This channel is written both `wecom-ws` and `wecom_ws` in `peer_groups`, and
+/// every startup path has to resolve both spellings in one pass: resolving them
+/// separately and concatenating leaves a wildcard under one spelling unaware of
+/// an `ignore` under the other. Named once so the one-shot and normal startup
+/// paths cannot answer this differently again.
+#[cfg(feature = "channel-wecom-ws")]
+pub(crate) fn wecom_ws_external_peers(config: &Config, alias: &str) -> Vec<String> {
+    config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], alias)
+}
+
 /// Fold constructed channel plugins into the configured-channel set.
 ///
 /// Plugin channels join the ordinary set rather than getting a lifecycle of
@@ -10319,6 +10364,15 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .parent()
         .map(|p| p.join("state").join("matrix").join(alias))
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
+#[cfg(any(feature = "channel-bluesky", feature = "channel-reddit"))]
+fn live_external_peer_resolver(
+    config: Arc<RwLock<Config>>,
+    channel_type: &'static str,
+    alias: String,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    Arc::new(move || config.read().channel_external_peers(channel_type, &alias))
 }
 
 fn collect_configured_channels(
@@ -11545,8 +11599,7 @@ fn collect_configured_channels(
             let snapshot = wc_ws.clone();
             Arc::new(move || {
                 let config = cfg_arc.read();
-                let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                let external_peers = wecom_ws_external_peers(&config, &alias);
 
                 if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                     WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -11722,6 +11775,8 @@ fn collect_configured_channels(
         if !rd.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -11732,6 +11787,7 @@ fn collect_configured_channels(
                 rd.refresh_token.clone(),
                 rd.username.clone(),
                 rd.subreddits.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -11755,6 +11811,8 @@ fn collect_configured_channels(
         if !bs.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
@@ -11762,6 +11820,7 @@ fn collect_configured_channels(
                 alias.clone(),
                 bs.handle.clone(),
                 bs.app_password.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -13626,6 +13685,51 @@ pub(crate) mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[cfg(feature = "channel-reddit")]
+    #[test]
+    fn reddit_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.ops]
+            channel = "reddit.ops"
+            external_peers = ["authorized-redditor"]
+
+            [peer_groups.other]
+            channel = "reddit.other"
+            external_peers = ["wrong-redditor"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver =
+            live_external_peer_resolver(Arc::new(RwLock::new(config)), "reddit", "ops".to_string());
+
+        assert_eq!(resolver(), vec!["authorized-redditor".to_string()]);
+    }
+
+    #[cfg(feature = "channel-bluesky")]
+    #[test]
+    fn bluesky_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.work]
+            channel = "bluesky.work"
+            external_peers = ["allowed.bsky.social"]
+
+            [peer_groups.other]
+            channel = "bluesky.other"
+            external_peers = ["wrong.bsky.social"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver = live_external_peer_resolver(
+            Arc::new(RwLock::new(config)),
+            "bluesky",
+            "work".to_string(),
+        );
+
+        assert_eq!(resolver(), vec!["allowed.bsky.social".to_string()]);
+    }
 
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.
@@ -33450,7 +33554,7 @@ This is an example JSON object for profile settings."#;
     fn bind_telegram_into_non_default_alias_is_resolvable() {
         let mut config = config_with_telegram_alias("alerts");
         let newly = bind_telegram_identity_into(&mut config, "123456789", "alerts").unwrap();
-        assert!(newly, "first bind should report newly added");
+        assert!(newly.is_some(), "first bind should report newly added");
         // The live resolver the channel uses must now see the identity.
         assert!(
             config
@@ -33491,9 +33595,15 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_telegram_into_is_idempotent() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_telegram_identity_into(&mut config, "123", "alerts").unwrap());
         assert!(
-            !bind_telegram_identity_into(&mut config, "123", "alerts").unwrap(),
+            bind_telegram_identity_into(&mut config, "123", "alerts")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            bind_telegram_identity_into(&mut config, "123", "alerts")
+                .unwrap()
+                .is_none(),
             "second bind of same identity should report already present"
         );
         assert_eq!(
@@ -33528,7 +33638,11 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn bind_channel_into_uses_scoped_dotted_channel_ref() {
         let mut config = config_with_telegram_alias("alerts");
-        assert!(bind_channel_identity_into(&mut config, "telegram", "alerts", "@user").unwrap());
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "@user")
+                .unwrap()
+                .is_some()
+        );
         let group = config
             .peer_groups
             .get("telegram_alerts")
@@ -33548,6 +33662,227 @@ This is an example JSON object for profile settings."#;
             config
                 .channel_external_peers("telegram", "other")
                 .is_empty()
+        );
+    }
+
+    /// Install an `ignore` entry on the peer group the bound alias resolves
+    /// from, the way an operator blocklisting an account would.
+    #[cfg(feature = "channel-telegram")]
+    fn ignore_identity_on(config: &mut Config, channel_type: &str, alias: &str, identity: &str) {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        config.peer_groups.insert(
+            format!("{channel_type}_{alias}_blocked"),
+            PeerGroupConfig {
+                channel: ChannelRef::new(format!("{channel_type}.{alias}")),
+                ignore: vec![PeerUsername::new(identity.to_string())],
+                ..PeerGroupConfig::default()
+            },
+        );
+    }
+
+    /// The CLI and the HTTP bind endpoint share this core, and the in-channel
+    /// `/bind` writers already refuse a write an `ignore` would shadow. This
+    /// core appended the grant and reported success, so the operator was told
+    /// the account was bound while the admission matcher still rejected it.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_an_identity_an_ignore_denies() {
+        let mut config = config_with_telegram_alias("alerts");
+        ignore_identity_on(&mut config, "telegram", "alerts", "123456789");
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("a denied identity must not report a successful bind");
+        assert!(
+            err.to_string().contains("ignore"),
+            "error should tell the operator what to edit, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("123456789"),
+            "identities are personal data and callers log this error: {err}"
+        );
+        assert!(
+            config
+                .peer_groups
+                .get("telegram_alerts")
+                .is_none_or(|g| g.external_peers.is_empty()),
+            "a refused bind must not leave a grant behind"
+        );
+        // The refusal is only honest if the identity really was inadmissible.
+        assert!(!crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("telegram", "alerts"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    /// A grant a deny shadows is not a usable binding either, so the
+    /// already-present answer would be just as false as the success one. This
+    /// is why the deny is checked before the idempotency short-circuit.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_denied_identity_that_is_already_granted() {
+        let mut config = config_with_telegram_alias("alerts");
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        ignore_identity_on(&mut config, "telegram", "alerts", "123456789");
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("a shadowed grant must be reported, not answered `already bound`");
+        assert!(err.to_string().contains("ignore"), "got: {err}");
+    }
+
+    /// The deny is matched with the channel's own identity rule, so the
+    /// spelling the operator reached for does not decide whether it lands.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_differently_spelled_deny() {
+        // Telegram strips a leading `@`, so `@zeroclaw_user` and
+        // `zeroclaw_user` are one account on both sides of the comparison.
+        for ignored in ["@zeroclaw_user", "zeroclaw_user"] {
+            for bound in ["@zeroclaw_user", "zeroclaw_user"] {
+                let mut config = config_with_telegram_alias("alerts");
+                ignore_identity_on(&mut config, "telegram", "alerts", ignored);
+                assert!(
+                    bind_channel_identity_into(&mut config, "telegram", "alerts", bound).is_err(),
+                    "`ignore = [\"{ignored}\"]` must refuse a bind of `{bound}`"
+                );
+            }
+        }
+    }
+
+    /// An unrelated `ignore` must not block a legitimate bind.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_still_binds_an_unignored_identity() {
+        let mut config = config_with_telegram_alias("alerts");
+        ignore_identity_on(&mut config, "telegram", "alerts", "999999999");
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::allowlist::is_user_allowed(
+            &config.channel_external_peers("telegram", "alerts"),
+            "123456789",
+            crate::allowlist::Match::Sensitive,
+        ));
+    }
+
+    /// Peer-group map keys are arbitrary; the runtime authorizes by the
+    /// group's `channel` field. Selecting the write target by key therefore
+    /// appended the grant to whatever group happened to be named
+    /// `telegram_alerts`, even one bound to a different instance, and reported
+    /// success while the requested channel stayed unauthorized.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_does_not_write_through_a_mismatched_group_key() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.channels.telegram.insert(
+            "other".to_string(),
+            config.channels.telegram["alerts"].clone(),
+        );
+        // Conventional key for `alerts`, but bound to `other`.
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.other".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let err = bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+            .expect_err("the conventional key belongs to another channel");
+        assert!(
+            err.to_string().contains("telegram.other"),
+            "the error should name the channel ref that actually owns the key, got: {err}"
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "nothing may be written into another channel's group"
+        );
+        // And the other channel did not silently gain the peer either.
+        assert!(
+            config
+                .channel_external_peers("telegram", "other")
+                .is_empty()
+        );
+    }
+
+    /// The bare-type variant: a group keyed `telegram_alerts` carrying
+    /// `channel = "telegram"` reads for every alias, so appending there would
+    /// broaden the grant across all of them.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_refuses_a_bare_type_key_collision() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "telegram_alerts".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789").is_err()
+        );
+        assert!(
+            config.peer_groups["telegram_alerts"]
+                .external_peers
+                .is_empty(),
+            "a type-wide group must not be widened by an alias-scoped bind"
+        );
+    }
+
+    /// The write lands in the group the reader matches even when that group is
+    /// not the conventionally named one.
+    #[cfg(feature = "channel-telegram")]
+    #[test]
+    fn bind_channel_into_writes_into_the_group_the_reader_matches() {
+        use zeroclaw_config::multi_agent::PeerGroupConfig;
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = config_with_telegram_alias("alerts");
+        config.peer_groups.insert(
+            "some_other_name".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.alerts".to_string()),
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert!(
+            bind_channel_identity_into(&mut config, "telegram", "alerts", "123456789")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            config.peer_groups["some_other_name"].external_peers.len(),
+            1,
+            "the identity belongs in the group whose channel ref the reader matches"
+        );
+        assert!(
+            !config.peer_groups.contains_key("telegram_alerts"),
+            "no conventional group should be minted when one already reads for this channel"
+        );
+        assert!(
+            config
+                .channel_external_peers("telegram", "alerts")
+                .contains(&"123456789".to_string())
         );
     }
 
