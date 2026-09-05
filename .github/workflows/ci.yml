@@ -697,9 +697,9 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # `channel-matrix` is outside `default-channels`, so the workspace run
       # above does not execute Matrix's feature-gated library regressions. This
-      # step covers transcription-provider resolution for the Matrix channel.
-      - name: Run Matrix transcription provider resolution tests
-        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::tests::transcription_provider_resolution"
+      # step is what actually executes them.
+      - name: Run Matrix channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
