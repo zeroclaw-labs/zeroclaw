@@ -15418,7 +15418,7 @@ pub struct SlackConfig {
     ///
     /// Off by default: these senders are not humans, so accepting them widens
     /// who can drive the agent. Enabling this does **not** bypass
-    /// authorization — the posting app's bot ID still has to match the
+    /// authorization: the posting app's bot ID still has to match the
     /// channel's peer allowlist, so allow specific bot IDs rather than `"*"`
     /// unless every app in the workspace is trusted. This agent's own posts
     /// are always ignored regardless of this setting.
