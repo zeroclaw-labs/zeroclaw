@@ -3857,11 +3857,72 @@ pub struct AliasedAgentConfig {
     #[serde(skip)]
     pub resolved: ResolvedRuntime,
 
+    /// Grant this agent read access to `<install>/shared/`, the host-wide
+    /// shared directory ([`Config::shared_workspace_dir`]).
+    ///
+    /// Deny by default. `false`, which is the default and the value every
+    /// config written before this flag existed carries, leaves the agent's
+    /// reach exactly as it was: nothing under `<install>/shared/` except the
+    /// code-enforced `shared/skills/` read-only wire that
+    /// `SecurityPolicy::for_agent` installs for every agent regardless of
+    /// this flag. (That wire covers the whole `shared/skills/` directory,
+    /// not a per-bundle subdirectory.)
+    ///
+    /// `true` puts `<install>/shared/` on the READ-ONLY allowlist tier
+    /// (`SecurityPolicy::allowed_roots_read_only`): the agent may read
+    /// anywhere under it, and may write nowhere under it. This replaces
+    /// hand-written absolute `[risk_profiles.<alias>].allowed_roots`
+    /// entries, which force the operator to encode the install layout and
+    /// silently break when the install moves.
+    ///
+    /// Read-only is deliberate. Allowlist matching is a path-prefix test
+    /// and explicit allowed roots are checked ahead of `forbidden_paths`,
+    /// so a writable grant on the whole of `shared/` would shadow the
+    /// narrower `shared/skills/` read-only wire and let this agent
+    /// overwrite skills that other agents execute. Write access to
+    /// `shared/`, if ever wanted, needs a narrower surface than this flag.
+    ///
+    /// Location: `<install>/shared/` derives from the config file's own
+    /// directory (`config_path.parent()/shared`), NOT from `data_dir`. An
+    /// install that points `data_dir` elsewhere still shares the directory
+    /// beside `config.toml`.
+    ///
+    /// Scope: the file tools honor this tier in every case; the shell
+    /// path has two limits the tier does not fix. With an OS sandbox
+    /// active (Landlock/Seatbelt), shell commands touching `shared/` are
+    /// denied outright, because the sandbox is built from the workspace
+    /// dir alone and does not yet receive allowlist tiers. That denial is
+    /// fail-closed, an availability gap, tracked by the open sandbox
+    /// tier-propagation PR. With the sandbox disabled or pass-through, the
+    /// static argument scan is the only remaining boundary: a shell
+    /// REDIRECT target must belong to a write tier, so a redirect writing
+    /// into `shared/` is refused even with this flag on, and the same rule
+    /// covers every read-only root including the `shared/skills/` wire.
+    /// The residual limit is positional: for a non-redirect argument the
+    /// scan cannot tell a read from a write, so such an argument is still
+    /// accepted when the target is readable, and the OS sandbox remains
+    /// the complete write boundary for shell.
+    ///
+    /// Discoverability: glob-style path search goes through
+    /// `SecurityPolicy::is_under_allowed_root`, which deliberately ignores
+    /// the read-only tier, so files under `shared/` are readable by the
+    /// file tools but are not enumerated by that search.
+    ///
+    /// Env opt-in follows the usual convention:
+    /// `ZEROCLAW_agents__<alias>__can_use_shared_workspace=true`.
+    #[tab(Workspace)]
+    #[serde(default)]
+    pub can_use_shared_workspace: bool,
+
     /// Per-agent workspace block (`[agents.<alias>.workspace]`).
     /// Holds the agent's filesystem path, cross-agent access allowlist,
     /// filesystem-escape boolean, and cross-agent memory allowlist.
     /// Default is fully jailed (no cross-agent access). See
     /// `crate::multi_agent::AgentWorkspaceConfig`.
+    ///
+    /// The workspace-escape capability lives on this block as
+    /// `unrestricted_filesystem`; it is deny-by-default and independent of
+    /// `can_use_shared_workspace`.
     #[tab(Workspace)]
     #[serde(default)]
     #[nested]
@@ -3918,6 +3979,9 @@ impl Default for AliasedAgentConfig {
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
+            // Deny by default: an agent reaches `<install>/shared/` only
+            // when the operator opts in explicitly.
+            can_use_shared_workspace: false,
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
@@ -28833,6 +28897,46 @@ timeout_secs = 12
             .expect("[agents.default] parses into agents map");
         assert!(!agent.precheck.enabled);
         assert_eq!(agent.precheck.timeout_secs, 12);
+    }
+
+    #[test]
+    async fn agent_shared_workspace_flag_defaults_off_and_parses_from_agent_block() {
+        // Absent key → deny. This is the value every config written
+        // before the flag existed carries, so this pins the migration
+        // promise: old configs keep today's reach.
+        let without = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+"#;
+        let parsed = parse_test_config(without);
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("[agents.default] parses into agents map");
+        assert!(
+            !agent.can_use_shared_workspace,
+            "can_use_shared_workspace must default to false (deny) when the key is absent"
+        );
+
+        // Explicit opt-in on the `[agents.<alias>]` block.
+        let with = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+can_use_shared_workspace = true
+"#;
+        let parsed = parse_test_config(with);
+        let agent = parsed
+            .agents
+            .get("default")
+            .expect("[agents.default] parses into agents map");
+        assert!(
+            agent.can_use_shared_workspace,
+            "can_use_shared_workspace = true on [agents.<alias>] must round-trip into the agent config"
+        );
     }
 
     #[test]
