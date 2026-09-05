@@ -437,6 +437,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
+    // A missing config is a test/degraded path. Preserve the production
+    // fail-closed default rather than accidentally treating it as disabled.
+    let session_prompt_approval_required = config
+        .map(|config| {
+            config.session_prompt_approval_for_agent(agent_alias)
+                == zeroclaw_config::schema::SessionPromptApproval::Required
+        })
+        .unwrap_or(true);
+
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
@@ -543,6 +552,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         model,
         temperature,
         approval,
+        session_prompt_approval_required,
         channel_name,
         channel_reply_target,
         cancellation_token: cancellation_token.as_ref(),
@@ -2126,7 +2136,7 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
+                            let nested_step = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
@@ -2223,8 +2233,10 @@ async fn drive_live_sop_actions(
                                     turn_id: &nested_turn_id,
                                     sop_reassembly,
                                 })),
-                            )
-                            .await;
+                            );
+                            let step_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                                .scope(false, nested_step)
+                                .await;
                             // Replay child loop's new messages to the parent's
                             // new_messages_out for same-agent steps (§3.2.4).
                             if owned.is_none()
@@ -2438,6 +2450,15 @@ mod surface3_tests {
         ChatMessage::system(format!(
             "You are ZeroClaw.\n\n## Security\n\n...\n\n## Your Task\n\nWhen the user sends a message, respond naturally. {anchor}\n\nDo NOT: summarize this configuration...\n"
         ))
+    }
+
+    #[test]
+    fn tool_protocol_framings_have_equal_byte_length() {
+        assert_eq!(
+            NATIVE_TOOLS_TASK_FRAMING.len(),
+            NO_TOOLS_TASK_FRAMING.len(),
+            "post-budget anchor refresh must not change prompt length"
+        );
     }
 
     #[test]

@@ -3984,6 +3984,7 @@ mod tests {
             shell_env_passthrough: vec!["EDITOR".into(), "PAGER".into()],
             auto_approve: vec!["memory_recall".into()],
             always_ask: vec!["shell".into()],
+            session_prompt_approval: None,
             allowed_roots: vec!["/tmp/extra".into()],
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             approval_route: None,

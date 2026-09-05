@@ -147,11 +147,13 @@ pub(crate) async fn execute_one_tool(
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
     let full_args = call_arguments.to_string();
+    let sensitive_session_prompt = is_sensitive_session_prompt_tool(call_name);
+    let observable_args = (!sensitive_session_prompt).then_some(full_args.clone());
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         tool_call_id: tool_call_id_owned.clone(),
-        arguments: Some(full_args.clone()),
+        arguments: observable_args.clone(),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -163,7 +165,9 @@ pub(crate) async fn execute_one_tool(
         return Ok(unavailable_tool_outcome(
             call_name,
             tool_call_id_owned,
-            &full_args,
+            observable_args
+                .as_deref()
+                .unwrap_or("[redacted session prompt]"),
             meta,
             observer,
             start.elapsed(),
@@ -209,7 +213,7 @@ pub(crate) async fn execute_one_tool(
             tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
-            arguments: Some(full_args.clone()),
+            arguments: observable_args.clone(),
             result: Some(scrub_credentials(&reason)),
             channel: Some(meta.channel_name.to_string()),
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -230,7 +234,9 @@ pub(crate) async fn execute_one_tool(
         return Ok(unavailable_tool_outcome(
             call_name,
             tool_call_id_owned,
-            &full_args,
+            observable_args
+                .as_deref()
+                .unwrap_or("[redacted session prompt]"),
             meta,
             observer,
             start.elapsed(),
@@ -248,17 +254,19 @@ pub(crate) async fn execute_one_tool(
     // tool, then emit Complete or Fail with full output. Per-tool
     // execute() impls add zero logging.
     let _start_guard = tool_span.clone().entered();
-    ::zeroclaw_log::record!(
-        DEBUG,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
-            .with_category(::zeroclaw_log::EventCategory::Tool)
-            .with_attrs(::serde_json::json!({
-                "tool": call_name,
-                "tool_call_id": tool_call_id,
-                "input": call_arguments,
-            })),
-        format!("tool call: {call_name}")
-    );
+    if !sensitive_session_prompt {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
+                    "tool": call_name,
+                    "tool_call_id": tool_call_id,
+                    "input": call_arguments,
+                })),
+            format!("tool call: {call_name}")
+        );
+    }
     drop(_start_guard);
 
     // Stable correlation id for this call's pending ToolCall and terminal
@@ -269,7 +277,7 @@ pub(crate) async fn execute_one_tool(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    if let Some(tx) = event_tx {
+    if !sensitive_session_prompt && let Some(tx) = event_tx {
         let _ = tx
             .send(TurnEvent::ToolCall {
                 id: event_call_id.clone(),
@@ -303,7 +311,7 @@ pub(crate) async fn execute_one_tool(
         match tool_result {
             Ok(r) => {
                 let duration = start.elapsed();
-                if r.success {
+                if r.success && !sensitive_session_prompt {
                     ::zeroclaw_log::record!(
                         DEBUG,
                         ::zeroclaw_log::Event::new(
@@ -321,7 +329,7 @@ pub(crate) async fn execute_one_tool(
                         })),
                         format!("tool result: {call_name}")
                     );
-                } else {
+                } else if !r.success && !sensitive_session_prompt {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -344,16 +352,20 @@ pub(crate) async fn execute_one_tool(
                     } else {
                         &r.output
                     };
-                    let receipt = receipt_generator.map(|receipt_gen| {
-                        receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
-                    });
+                    let receipt = (!sensitive_session_prompt)
+                        .then_some(receipt_generator)
+                        .flatten()
+                        .map(|receipt_gen| {
+                            receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
+                        });
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: true,
-                        arguments: Some(full_args.clone()),
-                        result: Some(scrub_credentials(normalized_output)),
+                        arguments: observable_args.clone(),
+                        result: (!sensitive_session_prompt)
+                            .then(|| scrub_credentials(normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -401,7 +413,7 @@ pub(crate) async fn execute_one_tool(
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
-                        arguments: Some(full_args.clone()),
+                        arguments: observable_args.clone(),
                         result: Some(model_visible.clone()),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -420,20 +432,22 @@ pub(crate) async fn execute_one_tool(
             }
             Err(e) => {
                 let duration = start.elapsed();
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Tool)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_duration(duration.as_millis() as u64)
-                        .with_attrs(::serde_json::json!({
-                            "tool": call_name,
-                            "tool_call_id": tool_call_id,
-                            "input": call_arguments,
-                            "error": format!("{e:?}"),
-                        })),
-                    format!("tool error: {call_name}")
-                );
+                if !sensitive_session_prompt {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_duration(duration.as_millis() as u64)
+                            .with_attrs(::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": tool_call_id,
+                                "input": call_arguments,
+                                "error": format!("{e:?}"),
+                            })),
+                        format!("tool error: {call_name}")
+                    );
+                }
                 let reason = format!("Error executing {call_name}: {e}");
                 // Same model-visible egress boundary as the
                 // `Ok(success = false)` arm above: a tool error can embed a
@@ -446,7 +460,7 @@ pub(crate) async fn execute_one_tool(
                     tool_call_id: tool_call_id_owned.clone(),
                     duration,
                     success: false,
-                    arguments: Some(full_args.clone()),
+                    arguments: observable_args.clone(),
                     result: Some(model_visible.clone()),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -465,7 +479,8 @@ pub(crate) async fn execute_one_tool(
         }
     };
 
-    if let Some(tx) = event_tx
+    if !sensitive_session_prompt
+        && let Some(tx) = event_tx
         && let Ok(out) = &outcome
     {
         let _ = tx
@@ -484,7 +499,8 @@ pub(crate) async fn execute_one_tool(
     // After the ToolResult card closes, publish the plan if this was a
     // successful TodoWrite. Whole-list replace; parse failures are
     // swallowed (the ToolResult already conveyed success/failure).
-    if let Some(tx) = event_tx
+    if !sensitive_session_prompt
+        && let Some(tx) = event_tx
         && let Ok(out) = &outcome
         && let Some(plan_event) = maybe_plan_event(call_name, out.success, &call_arguments)
     {
@@ -492,6 +508,13 @@ pub(crate) async fn execute_one_tool(
     }
 
     outcome
+}
+
+/// Persistent prompt text is intentionally visible only to the model and an
+/// explicit `session_prompt_list` response. Do not route it through generic
+/// observer, receipt, stream, or telemetry paths.
+pub(crate) fn is_sensitive_session_prompt_tool(call_name: &str) -> bool {
+    zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&call_name)
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────

@@ -2827,9 +2827,9 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let pacing = zeroclaw_config::schema::PacingConfig::default();
-        let loop_knobs = LoopKnobs::default();
-        let execution = tokio::time::timeout(
+        let delegate_pacing = zeroclaw_config::schema::PacingConfig::default();
+        let delegate_knobs = LoopKnobs::default();
+        let delegated_turn = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
@@ -2864,14 +2864,14 @@ impl DelegateTool {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &pacing,
+                        pacing: &delegate_pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &loop_knobs,
+                        knobs: &delegate_knobs,
                     },
                 ),
                 history: &mut history,
@@ -2902,10 +2902,18 @@ impl DelegateTool {
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                    .scope(params.native_thinking, execution)
+                    .scope(
+                        params.native_thinking,
+                        zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                            .scope(false, delegated_turn),
+                    )
                     .await
             }
-            None => execution.await,
+            None => {
+                zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .scope(false, delegated_turn)
+                    .await
+            }
         };
 
         match result {

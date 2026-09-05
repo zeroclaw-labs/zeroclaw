@@ -34,9 +34,20 @@ pub(crate) fn build_iteration_tool_specs(
     activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
 ) -> Result<IterationToolSpecs> {
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
+    // Native session-prompt tools are meaningful only in a daemon-owned
+    // primary chat turn. Generic/one-shot construction keeps the concrete
+    // implementations available to supported callers but must not advertise
+    // an unusable capability to the model.
+    let session_prompt_tools_allowed = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+        .try_with(|allowed| *allowed)
+        .unwrap_or(false);
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+        .filter(|tool| {
+            !excluded_tools.iter().any(|ex| ex == tool.name())
+                && (session_prompt_tools_allowed
+                    || !crate::tools::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()))
+        })
         .map(|tool| tool.spec())
         .collect();
     if let Some(at) = activated_tools {

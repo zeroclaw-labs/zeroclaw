@@ -970,6 +970,7 @@ channel-runtime-progress-compacting-context = Compacting context
 channel-runtime-progress-finalizing-response = Finalizing response
 channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
+channel-runtime-new-session-failed = Unable to reset the persistent session. The existing session remains active.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
@@ -978,6 +979,8 @@ channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized fo
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 channel-runtime-no-reply-refused = 🚫 I can't help with that request.
 channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
+channel-runtime-session-prompt-load-failed = ⚠️ I couldn't load the persistent session context, so this request was not sent to the model.
+channel-runtime-session-prompt-budget-exceeded = ⚠️ The persistent session context exceeds the system prompt budget, so this request was not sent to the model.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`
@@ -1193,6 +1196,7 @@ tool-runtime-command-docker-allowed-root = Failed to build runtime command: Fail
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
 cli-approval-request = 🔧 Agent wants to execute: {$tool}
 cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
+cli-approval-prompt-yesno = { "   " }[Y]es / [N]o:{ " " }
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
@@ -1224,6 +1228,7 @@ channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow
 channel-approval-title = Approve { $tool }?
+session-prompt-approval-heading = Approve persistent session-prompt mutation
 channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject

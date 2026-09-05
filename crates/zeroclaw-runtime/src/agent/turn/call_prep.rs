@@ -42,6 +42,10 @@ fn tool_call_signature(tool_name: &str, tool_args: &serde_json::Value) -> (Strin
     (tool_name.trim().to_ascii_lowercase(), args_json)
 }
 
+fn is_sensitive_session_prompt_tool(tool_name: &str) -> bool {
+    crate::agent::tool_execution::is_sensitive_session_prompt_tool(tool_name)
+}
+
 async fn record_duplicate_tool_call(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
@@ -50,22 +54,24 @@ async fn record_duplicate_tool_call(
 ) -> ToolExecutionOutcome {
     let duplicate =
         format!("Skipped duplicate tool call '{tool_name}' with identical arguments in this turn.");
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-            .with_category(::zeroclaw_log::EventCategory::Tool)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "model": ctx.model,
-                "iteration": iteration + 1,
-                "tool": tool_name,
-                "arguments": scrub_credentials(&tool_args.to_string()),
-                "result": duplicate,
-                "deduplicated": true,
-                "trace_id": ctx.turn_id,
-            })),
-        "tool_call_result"
-    );
+    if !is_sensitive_session_prompt_tool(tool_name) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model": ctx.model,
+                    "iteration": iteration + 1,
+                    "tool": tool_name,
+                    "arguments": scrub_credentials(&tool_args.to_string()),
+                    "result": duplicate,
+                    "deduplicated": true,
+                    "trace_id": ctx.turn_id,
+                })),
+            "tool_call_result"
+        );
+    }
     if let Some(tx) = ctx.on_delta {
         let _ = tx
             .send(StreamDelta::Status(format!(
@@ -107,17 +113,28 @@ pub(crate) async fn prepare_tool_calls(
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
-        if let Some(hooks) = ctx.hooks {
+        let incoming_sensitive_session_prompt = is_sensitive_session_prompt_tool(&tool_name);
+        // A prompt attachment becomes provider-visible system context on a
+        // later turn. Its body is intentionally limited to the provider,
+        // explicit list results, and the exact approval surface; hooks are
+        // independent extension points and therefore must not receive it.
+        if !incoming_sensitive_session_prompt && let Some(hooks) = ctx.hooks {
             match hooks
                 .run_before_tool_call(tool_name.clone(), tool_args.clone())
                 .await
             {
                 crate::hooks::HookResult::Cancel(reason) => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
+                    if !incoming_sensitive_session_prompt {
+                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
+                    }
                     let cancelled = format!("Cancelled by hook: {reason}");
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                    if !incoming_sensitive_session_prompt {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Cancel
+                            )
                             .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
@@ -128,8 +145,9 @@ pub(crate) async fn prepare_tool_calls(
                                 "result": cancelled,
                                 "trace_id": ctx.turn_id,
                             })),
-                        "tool_call_result"
-                    );
+                            "tool_call_result"
+                        );
+                    }
                     if let Some(tx) = ctx.on_delta {
                         let _ = tx
                             .send(StreamDelta::Status(format!(
@@ -150,7 +168,7 @@ pub(crate) async fn prepare_tool_calls(
                     // Streaming consumers still see the call and its
                     // hook-cancel outcome as a ToolCall/ToolResult pair,
                     // as the direct execution path always emitted.
-                    if let Some(tx) = ctx.event_tx {
+                    if !incoming_sensitive_session_prompt && let Some(tx) = ctx.event_tx {
                         emit_tool_call_pair(tx, call, &outcome).await;
                     }
                     ordered_results[idx] =
@@ -174,6 +192,7 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+        let sensitive_session_prompt = is_sensitive_session_prompt_tool(&tool_name);
 
         let requires_prompt = ctx
             .approval
@@ -227,7 +246,7 @@ pub(crate) async fn prepare_tool_calls(
                 // Streaming consumers see the denied/replaced call and its
                 // synthesized result (e.g. a DenyWithEdit replacement) as a
                 // ToolCall/ToolResult pair, as the direct path always did.
-                if let Some(tx) = ctx.event_tx {
+                if !sensitive_session_prompt && let Some(tx) = ctx.event_tx {
                     emit_tool_call_pair(tx, call, &outcome).await;
                 }
                 ordered_results[idx] =
@@ -247,30 +266,34 @@ pub(crate) async fn prepare_tool_calls(
             continue;
         }
 
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": tool_name.clone(),
-                    "arguments": scrub_credentials(&tool_args.to_string()),
-                    "trace_id": ctx.turn_id,
-                })),
-            "tool_call_start"
-        );
+        if !sensitive_session_prompt {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": tool_name.clone(),
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_start"
+            );
+        }
 
         // ── Progress: tool start ────────────────────────────
         send_progress(ctx.on_delta, ProgressEvent::RunningTool).await;
-        let stream_call = ctx.on_delta.map(|_| StreamToolCall {
-            arguments: Arc::new(tool_args.clone()),
-            tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
-                tools_registry,
-                activated_tools,
-                &tool_name,
-            ),
-        });
+        let stream_call = (!sensitive_session_prompt)
+            .then_some(())
+            .and(ctx.on_delta.map(|_| StreamToolCall {
+                arguments: Arc::new(tool_args.clone()),
+                tool_provenance: crate::agent::tool_execution::resolved_tool_provenance(
+                    tools_registry,
+                    activated_tools,
+                    &tool_name,
+                ),
+            }));
         if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call.as_ref()) {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -387,6 +410,7 @@ mod tests {
             model: "test-model",
             temperature: None,
             approval: None,
+            session_prompt_approval_required: true,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,

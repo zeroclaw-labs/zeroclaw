@@ -209,6 +209,24 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
     }
 
+    /// Atomically capture the concrete Agent and its session incarnation for
+    /// turn admission. Callers must validate this snapshot again after taking
+    /// the per-session queue, but must never combine separate `get_agent` and
+    /// `get_generation` reads: a same-ID replacement could otherwise pair an
+    /// old Agent with a successor's generation.
+    pub async fn admission_snapshot(
+        &self,
+        id: &str,
+    ) -> Option<(Arc<Mutex<Agent>>, u64, crate::rpc::types::ChatMode)> {
+        self.sessions.lock().await.get(id).map(|session| {
+            (
+                session.agent.clone(),
+                session.generation,
+                session.chat_mode.clone(),
+            )
+        })
+    }
+
     pub(crate) async fn lock_model_provider_update(
         &self,
         id: &str,
@@ -736,6 +754,26 @@ impl SessionStore {
             .get(id)
             .map(|(_, token)| {
                 self.record_cancel_cause(id, cause);
+                token.cancel();
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Cancel an in-flight turn only if `id` still names the observed live
+    /// session incarnation. Lifecycle callers use this before waiting on the
+    /// per-session queue, so a queued delete cannot cancel a same-ID successor.
+    pub async fn cancel_session_at_generation(&self, id: &str, expected_generation: u64) -> bool {
+        let sessions = self.sessions.lock().await;
+        if sessions.get(id).map(|session| session.generation) != Some(expected_generation) {
+            return false;
+        }
+        self.record_cancel_cause(id, CancelCause::ClientRpc);
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(_, token)| {
                 token.cancel();
                 true
             })
@@ -1401,6 +1439,39 @@ mod tests {
             g_a, g_a2,
             "replacing a same-ID session must bump the generation"
         );
+    }
+
+    #[tokio::test]
+    async fn admission_snapshot_keeps_agent_and_generation_from_one_incarnation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "same-id".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let (predecessor, predecessor_generation, predecessor_mode) = store
+            .admission_snapshot("same-id")
+            .await
+            .expect("predecessor snapshot");
+
+        store
+            .insert(
+                "same-id".into(),
+                RpcSession::new(make_agent(), "x", ".", crate::rpc::types::ChatMode::Acp),
+            )
+            .await
+            .unwrap();
+        let (successor, successor_generation, successor_mode) = store
+            .admission_snapshot("same-id")
+            .await
+            .expect("successor snapshot");
+
+        assert!(!Arc::ptr_eq(&predecessor, &successor));
+        assert_ne!(predecessor_generation, successor_generation);
+        assert_eq!(predecessor_mode, crate::rpc::types::ChatMode::Chat);
+        assert_eq!(successor_mode, crate::rpc::types::ChatMode::Acp);
     }
 
     #[tokio::test]

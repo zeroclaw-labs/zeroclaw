@@ -23,6 +23,14 @@ pub mod session_keys;
 pub mod tool;
 pub mod vad;
 
+/// Reserved names for tools that manage durable session-prompt attachments.
+/// Every policy and presentation boundary must use this single vocabulary.
+pub const SESSION_PROMPT_TOOL_NAMES: [&str; 3] = [
+    "session_prompt_list",
+    "session_prompt_set",
+    "session_prompt_delete",
+];
+
 tokio::task_local! {
     /// Current thread/sender ID for per-sender rate limiting.
     /// Set by the agent loop, read by SecurityPolicy.
@@ -35,6 +43,11 @@ tokio::task_local! {
     /// Session key for the currently active session.
     /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
+
+    /// Capability marker for primary durable chat turns. It is deliberately
+    /// absent from ACP, one-shot, delegate, cron, and auxiliary executions so
+    /// session prompt tools cannot create unsupported attachment records.
+    pub static TOOL_LOOP_SESSION_PROMPTS_ALLOWED: bool;
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.

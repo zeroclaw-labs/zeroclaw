@@ -76,6 +76,7 @@
   - [Delegation & SubAgents](./agents/delegation.md)
   - [Runtime internals](./agents/internals.md)
   - [History management](./agents/history-management.md)
+  - [Persistent session prompts](./agents/session-prompts.md)
 - [Model Providers](./providers/overview.md)
   - [Provider catalog](./providers/catalog.md)
   - [Configuration](./providers/configuration.md)

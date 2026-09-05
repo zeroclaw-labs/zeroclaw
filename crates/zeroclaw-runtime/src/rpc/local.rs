@@ -925,6 +925,29 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_stale_start_is_serialized_before_cleanup() {
+        // A concurrently spawned child can inherit the temporary listener
+        // before this test drops it, making the stale endpoint appear live.
+        // Run the real body in a dedicated child so no other test can retain
+        // that descriptor during the stale-cleanup assertion.
+        if std::env::var_os(CONCURRENT_STALE_START_TEST_CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("resolve current test binary");
+            let status = tokio::process::Command::new(exe)
+                .arg("rpc::local::tests::concurrent_stale_start_is_serialized_before_cleanup")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(CONCURRENT_STALE_START_TEST_CHILD_ENV, "1")
+                .status()
+                .await
+                .expect(
+                    "relaunch concurrent_stale_start_is_serialized_before_cleanup in isolation",
+                );
+            assert!(
+                status.success(),
+                "isolated concurrent_stale_start_is_serialized_before_cleanup failed: {status}"
+            );
+            return;
+        }
+
         use std::os::unix::fs::MetadataExt;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -993,6 +1016,13 @@ mod tests {
     /// runs its real assertions instead of relaunching itself again.
     #[cfg(unix)]
     const ENDPOINT_LOCK_TEST_CHILD_ENV: &str = "ZEROCLAW_ENDPOINT_LOCK_TEST_CHILD";
+
+    /// Set on the re-executed child so
+    /// `concurrent_stale_start_is_serialized_before_cleanup` runs its real
+    /// assertions instead of relaunching itself again.
+    #[cfg(unix)]
+    const CONCURRENT_STALE_START_TEST_CHILD_ENV: &str =
+        "ZEROCLAW_CONCURRENT_STALE_START_TEST_CHILD";
 
     #[cfg(unix)]
     #[tokio::test]

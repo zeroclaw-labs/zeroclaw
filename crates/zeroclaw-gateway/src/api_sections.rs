@@ -342,6 +342,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                     zeroclaw_config::sections::Section::Hardware
                         | zeroclaw_config::sections::Section::Mcp
                         | zeroclaw_config::sections::Section::Skills
+                        | zeroclaw_config::sections::Section::SessionPromptApproval
                 ),
                 None => section_has_picker_for_key(&key),
             };
@@ -505,9 +506,11 @@ fn picker_items_for(
         | Section::EmbeddingRoutes => {
             PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
         }
-        Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
-            PickerDispatch::DirectForm
-        }
+        Section::Hardware
+        | Section::Mcp
+        | Section::Skills
+        | Section::SessionPromptApproval
+        | Section::QuickstartState => PickerDispatch::DirectForm,
     }
 }
 
@@ -1050,7 +1053,11 @@ pub async fn handle_section_select(
             };
             (prefix, true)
         }
-        Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
+        Section::Hardware
+        | Section::Mcp
+        | Section::Skills
+        | Section::SessionPromptApproval
+        | Section::QuickstartState => {
             return error_response(
                 ConfigApiError::new(
                     ConfigApiCode::PathNotFound,
@@ -1838,8 +1845,13 @@ mod tests {
             Section::SkillBundles,
             Section::RiskProfiles,
             Section::RuntimeProfiles,
+            Section::SessionPromptApproval,
         ];
-        let direct_form = [Section::Hardware, Section::Mcp];
+        let direct_form = [
+            Section::Hardware,
+            Section::Mcp,
+            Section::SessionPromptApproval,
+        ];
         for section in all {
             match picker_items_for(*section, &cfg) {
                 PickerDispatch::Items(_items) => {

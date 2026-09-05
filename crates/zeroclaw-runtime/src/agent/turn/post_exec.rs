@@ -27,34 +27,38 @@ pub(crate) async fn record_executed_outcomes(
         .zip(stream_calls.iter())
         .zip(executed_outcomes)
     {
+        let sensitive_session_prompt =
+            crate::agent::tool_execution::is_sensitive_session_prompt_tool(&call.name);
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
         // outcome to history, logs, hooks, and ordered_results.
 
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_outcome(if outcome.success {
-                    ::zeroclaw_log::EventOutcome::Success
-                } else {
-                    ::zeroclaw_log::EventOutcome::Failure
-                })
-                .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
-                .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
-                    "iteration": iteration + 1,
-                    "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
-                    "trace_id": ctx.turn_id,
-                })),
-            "tool_call_result"
-        );
+        if !sensitive_session_prompt {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(if outcome.success {
+                        ::zeroclaw_log::EventOutcome::Success
+                    } else {
+                        ::zeroclaw_log::EventOutcome::Failure
+                    })
+                    .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX))
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": call.name.clone(),
+                        "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
+                        "output": scrub_credentials(&outcome.output),
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_result"
+            );
+        }
 
         // ── Hook: after_tool_call (void) ─────────────────
-        if let Some(hooks) = ctx.hooks {
+        if !sensitive_session_prompt && let Some(hooks) = ctx.hooks {
             let tool_result_obj = crate::tools::ToolResult {
                 success: outcome.success,
                 output: outcome.output.clone().into(),

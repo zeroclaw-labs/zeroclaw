@@ -217,6 +217,12 @@ impl ActivatedToolSet {
     }
 
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        // Native session-prompt operations have unqualified names. Do not
+        // resolve a deferred MCP suffix onto them: the runtime associates
+        // those names with special approval and redaction rules.
+        if zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&name) {
+            return None;
+        }
         if let Some(tool) = self.get(name) {
             return Some(tool);
         }
@@ -431,6 +437,48 @@ mod tests {
         let mut set = ActivatedToolSet::new();
         set.activate("docker-mcp__extract_text".into(), Arc::new(FakeTool));
         assert!(set.get_resolved("extract_text").is_some());
+    }
+
+    #[test]
+    fn activated_set_does_not_resolve_session_prompt_suffixes() {
+        use async_trait::async_trait;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
+
+        struct FakeTool;
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                "server__session_prompt_set"
+            }
+            fn description(&self) -> &str {
+                "fake tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
+            }
+        }
+
+        let mut set = ActivatedToolSet::new();
+        set.activate("server__session_prompt_set".into(), Arc::new(FakeTool));
+        assert!(set.get_resolved("server__session_prompt_set").is_some());
+        assert!(set.get_resolved("session_prompt_set").is_none());
     }
 
     #[test]

@@ -1,7 +1,62 @@
 //! Trait abstraction for session persistence backends.
 
+use crate::session_prompts::{SessionPrompt, SessionPromptSetOutcome};
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use zeroclaw_api::model_provider::ChatMessage;
+
+/// Task-local transport wrapper for the canonical session backend.
+#[derive(Clone)]
+pub struct ScopedSessionBackend(pub Arc<dyn SessionBackend>);
+
+tokio::task_local! {
+    /// Canonical durable chat backend for the active primary turn. Session
+    /// prompt tools use this instead of opening an independent SQLite handle.
+    pub static TOOL_LOOP_SESSION_BACKEND: Option<ScopedSessionBackend>;
+}
+
+/// Ephemeral prompt-budget snapshot for the active primary turn.
+///
+/// The runtime/channel owner derives this immediately before the tool loop
+/// from its complete host-authored prompt, before session attachments are
+/// appended. It is advisory admission evidence only: final prompt assembly
+/// remains the authoritative fail-closed guard because later turn state can
+/// still change the host prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPromptBudget {
+    host_prompt_bytes: usize,
+    max_system_prompt_chars: usize,
+}
+
+impl SessionPromptBudget {
+    pub fn new(host_prompt_bytes: usize, max_system_prompt_chars: usize) -> Self {
+        Self {
+            host_prompt_bytes,
+            max_system_prompt_chars,
+        }
+    }
+
+    /// Whether one completely rendered attachment section fits the current
+    /// primary-turn prompt. A zero limit is the existing unlimited setting.
+    pub fn permits(&self, rendered_attachments: &str) -> bool {
+        self.max_system_prompt_chars == 0
+            || self
+                .host_prompt_bytes
+                .saturating_add(if rendered_attachments.is_empty() {
+                    0
+                } else {
+                    rendered_attachments.len().saturating_add(2)
+                })
+                <= self.max_system_prompt_chars
+    }
+}
+
+tokio::task_local! {
+    /// Best-effort admission snapshot for session-prompt mutations in the
+    /// active primary turn. It is intentionally absent from unsupported and
+    /// auxiliary calls.
+    pub static TOOL_LOOP_SESSION_PROMPT_BUDGET: Option<SessionPromptBudget>;
+}
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -68,6 +123,58 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// List prompt attachments belonging to exactly one durable session.
+    fn list_session_prompts(&self, _session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    fn set_session_prompt(
+        &self,
+        _session_key: &str,
+        _id: &str,
+        _content: &str,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    /// Atomically validate a proposed attachment collection against the
+    /// primary turn's best-effort budget before persisting it.
+    ///
+    /// SQLite is the only supported durable prompt backend. Backends that do
+    /// not implement this operation must not silently skip budget admission.
+    fn set_session_prompt_with_budget(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+        budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        if budget.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "session prompt budget admission requires SQLite persistence",
+            ));
+        }
+        self.set_session_prompt(session_key, id, content)
+    }
+
+    fn delete_session_prompt(&self, _session_key: &str, _id: &str) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    /// Reset history and session prompt attachments while retaining the session identity.
+    fn reset_session(&self, session_key: &str) -> std::io::Result<usize> {
+        self.clear_messages(session_key)
+    }
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
@@ -284,5 +391,20 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn session_prompt_budget_counts_the_attachment_separator() {
+        let budget = SessionPromptBudget::new(10, 16);
+        assert!(budget.permits("tail"));
+        assert!(
+            !budget.permits("tail!"),
+            "the two newlines separating a non-empty attachment tail must count"
+        );
+    }
+
+    #[test]
+    fn unlimited_session_prompt_budget_permits_any_rendered_tail() {
+        assert!(SessionPromptBudget::new(usize::MAX, 0).permits("tail"));
     }
 }

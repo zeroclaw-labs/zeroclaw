@@ -490,6 +490,8 @@ zc-chat-approval-action-allow = Allow
 zc-chat-approval-action-always = Always
 zc-chat-approval-action-reject = Reject
 zc-chat-approval-action-edit = Edit
+zc-chat-approval-scroll-hint = scroll details
+zc-chat-help-scroll-approval = Scroll approval details
 
 
 zc-chat-clipboard-you = You: { $text }

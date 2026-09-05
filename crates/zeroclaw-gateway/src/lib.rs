@@ -551,11 +551,13 @@ pub struct AppState {
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
     /// Per-session cancellation tokens for aborting in-flight agent responses.
-    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
-    /// current turn. Entries are inserted before each turn and removed after
-    /// completion (normal or cancelled).
+    /// Key is session_key (e.g. `gw_<session_id>`); each value is bound to the
+    /// queue incarnation that admitted the turn. Entries are inserted before
+    /// each turn and removed after completion (normal or cancelled).
     pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, (u64, tokio_util::sync::CancellationToken)>,
+        >,
     >,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
@@ -1599,6 +1601,42 @@ pub async fn run_gateway(
             None
         },
     };
+
+    // The gateway owns a separate queue from RPC. Reclaim idle actor slots
+    // and their tombstones here; connected WebSockets retain a lifecycle
+    // lease, so this cannot erase an incarnation still held by a socket.
+    {
+        let reaper_queue = Arc::clone(&state.session_queue);
+        let mut reaper_shutdown = state.shutdown_tx.subscribe();
+        zeroclaw_spawn::spawn!(async move {
+            const TICK: Duration = Duration::from_secs(60);
+            let mut interval = tokio::time::interval(TICK);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let queue_evicted = reaper_queue.evict_idle().await;
+                        if queue_evicted > 0 {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_attrs(::serde_json::json!({
+                                        "evicted_queue_slots": queue_evicted,
+                                    })),
+                                "Gateway session queue: released idle actor-queue slots"
+                            );
+                        }
+                    }
+                    changed = reaper_shutdown.changed() => {
+                        if changed.is_err() || *reaper_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Build router with middleware
     let inner = Router::new()

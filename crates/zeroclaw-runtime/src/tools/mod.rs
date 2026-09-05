@@ -109,8 +109,8 @@ pub use zeroclaw_tools::send_via::{
     AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
-    SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
-    SessionsListTool, SessionsSendTool,
+    SessionDeleteTool, SessionPromptDeleteTool, SessionPromptListTool, SessionPromptSetTool,
+    SessionResetTool, SessionsCurrentTool, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
 };
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
@@ -118,6 +118,8 @@ pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+
+pub(crate) use zeroclaw_api::SESSION_PROMPT_TOOL_NAMES;
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
@@ -419,10 +421,14 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
         runtime,
         nat64_prefixes,
     );
-    let existing_names: std::collections::HashSet<String> = tools_registry
+    let mut existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
         .map(|t| t.name().to_string())
         .collect();
+    // These names are reserved for the native session-prompt capability even
+    // while it is disabled.  Otherwise a skill could claim one of them and be
+    // mistaken for the sensitive built-in operation at execution time.
+    existing_names.extend(SESSION_PROMPT_TOOL_NAMES.map(str::to_owned));
     for tool in skill_tools {
         if existing_names.contains(tool.name()) {
             ::zeroclaw_log::record!(
@@ -444,6 +450,7 @@ pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
                 )
             );
         } else {
+            existing_names.insert(tool.name().to_string());
             tools_registry.push(tool);
         }
     }
@@ -1450,7 +1457,18 @@ pub fn all_tools_with_runtime(
             backend.clone(),
             security.clone(),
         )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(
+            backend.clone(),
+            security.clone(),
+        )));
+        if config.channels.session_prompts_enabled
+            && config.channels.session_persistence
+            && config.channels.session_backend == "sqlite"
+        {
+            tool_arcs.push(Arc::new(SessionPromptListTool::new(security.clone())));
+            tool_arcs.push(Arc::new(SessionPromptSetTool::new(security.clone())));
+            tool_arcs.push(Arc::new(SessionPromptDeleteTool::new(security.clone())));
+        }
     }
 
     // LinkedIn integration (config-gated)
@@ -1829,6 +1847,11 @@ pub fn all_tools_with_runtime(
                         .iter()
                         .map(|tool| tool.name().to_string())
                         .collect();
+                    registered_names.extend(
+                        SESSION_PROMPT_TOOL_NAMES
+                            .iter()
+                            .map(|name| (*name).to_string()),
+                    );
                     if root_config.pipeline.enabled {
                         registered_names.insert(PipelineTool::NAME.to_string());
                     }
@@ -2273,6 +2296,45 @@ permissions = ["http_client"]
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 7);
+    }
+
+    #[test]
+    fn session_prompt_tools_follow_the_feature_gate() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&MemoryConfig::default(), tmp.path(), None).unwrap(),
+        );
+        let mut config = test_config(&tmp);
+        config.channels.session_prompts_enabled = true;
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            memory,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"session_prompt_list"));
+        assert!(names.contains(&"session_prompt_set"));
+        assert!(names.contains(&"session_prompt_delete"));
     }
 
     #[cfg(feature = "plugins-wasm")]

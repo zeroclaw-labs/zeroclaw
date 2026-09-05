@@ -257,6 +257,13 @@ pub struct Config {
     #[group = "Agent"]
     pub pacing: PacingConfig,
 
+    /// Operator policy for approving mutations to persistent session prompts.
+    /// Default: `required`. A risk-profile override may relax this only to
+    /// `disabled`; agents cannot select this policy for themselves.
+    #[serde(default)]
+    #[group = "Agent"]
+    pub session_prompt_approval: SessionPromptApproval,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     #[nested]
@@ -4023,6 +4030,20 @@ impl Config {
             return None;
         }
         self.risk_profiles.get(profile_alias)
+    }
+
+    /// Resolve the operator-selected session-prompt approval policy for an
+    /// agent. A profile override is deliberately narrower than the global
+    /// setting and cannot be chosen by the model during a turn.
+    #[must_use]
+    pub fn session_prompt_approval_for_agent(
+        &self,
+        agent_alias: Option<&str>,
+    ) -> SessionPromptApproval {
+        agent_alias
+            .and_then(|alias| self.risk_profile_for_agent(alias))
+            .and_then(|profile| profile.session_prompt_approval)
+            .unwrap_or(self.session_prompt_approval)
     }
 
     /// Resolve the delegate targets `caller_alias` may reach:
@@ -12859,6 +12880,11 @@ pub struct RiskProfileConfig {
     pub auto_approve: Vec<String>,
     /// Tools that always require approval in this profile.
     pub always_ask: Vec<String>,
+    /// Override the global persistent-session-prompt approval policy for
+    /// agents assigned to this profile. Omitted means inherit the global
+    /// `session_prompt_approval` setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_prompt_approval: Option<SessionPromptApproval>,
     /// Extra directory roots the agent may access.
     #[serde(alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
@@ -12936,6 +12962,7 @@ impl Default for RiskProfileConfig {
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
+            session_prompt_approval: None,
             allowed_roots: Vec::new(),
             delegation_policy: DelegationPolicy::default(),
             approval_route: None,
@@ -12946,6 +12973,21 @@ impl Default for RiskProfileConfig {
             firejail_args: Vec::new(),
         }
     }
+}
+
+/// Whether each persistent-session-prompt mutation requires a one-time,
+/// content-bound operator approval. The default is deliberately fail-closed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum SessionPromptApproval {
+    /// Require one exact operator approval for every set or delete operation.
+    #[default]
+    Required,
+    /// Disable only the special session-prompt gate; ordinary tool policy remains active.
+    Disabled,
 }
 
 /// Named runtime/LLM execution profile (`[runtime_profiles.<alias>]`).
@@ -14277,6 +14319,10 @@ pub struct ChannelsConfig {
     /// SQLite provides FTS5 search, metadata tracking, and TTL cleanup.
     #[serde(default = "default_session_backend")]
     pub session_backend: String,
+    /// Enable session-scoped persistent prompt attachments. Requires the SQLite
+    /// session backend. Default: `false`.
+    #[serde(default = "default_false")]
+    pub session_prompts_enabled: bool,
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
@@ -14698,6 +14744,7 @@ impl Default for ChannelsConfig {
             show_tool_calls: false,
             session_persistence: true,
             session_backend: default_session_backend(),
+            session_prompts_enabled: false,
             session_ttl_hours: 0,
             debounce_ms: 0,
         }
@@ -19261,6 +19308,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
+            session_prompt_approval: SessionPromptApproval::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
@@ -21413,6 +21461,17 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+
+        if self.channels.session_prompts_enabled && self.channels.session_backend != "sqlite" {
+            anyhow::bail!(
+                "channels.session_prompts_enabled requires channels.session_backend = \"sqlite\""
+            );
+        }
+        if self.channels.session_prompts_enabled && !self.channels.session_persistence {
+            anyhow::bail!(
+                "channels.session_prompts_enabled requires channels.session_persistence = true"
+            );
+        }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -28185,6 +28244,7 @@ auto_save = true
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
+            session_prompt_approval: SessionPromptApproval::Required,
             providers: {
                 let mut p = crate::providers::Providers::default();
                 p.models.openrouter.insert(
@@ -28320,6 +28380,7 @@ auto_save = true
                 show_tool_calls: true,
                 session_persistence: true,
                 session_backend: default_session_backend(),
+                session_prompts_enabled: false,
                 session_ttl_hours: 0,
                 debounce_ms: 0,
             },
@@ -28545,6 +28606,32 @@ auto_approve = ["my_custom_tool", "another_tool"]
     async fn default_auto_approve_includes_tool_search() {
         let defaults = default_auto_approve();
         assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
+    #[test]
+    async fn session_prompt_approval_defaults_to_required_and_honors_profile_override() {
+        let raw = r#"
+session_prompt_approval = "required"
+
+[agents.architect]
+risk_profile = "trusted"
+
+[risk_profiles.trusted]
+session_prompt_approval = "disabled"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.session_prompt_approval,
+            SessionPromptApproval::Required
+        );
+        assert_eq!(
+            parsed.session_prompt_approval_for_agent(Some("architect")),
+            SessionPromptApproval::Disabled
+        );
+        assert_eq!(
+            parsed.session_prompt_approval_for_agent(Some("unknown")),
+            SessionPromptApproval::Required
+        );
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.
@@ -29257,6 +29344,7 @@ default_temperature = 0.7
             retired_wati_config_sections: Vec::new(),
             retired_node_transport_config: false,
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
+            session_prompt_approval: SessionPromptApproval::Required,
             providers,
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -30225,6 +30313,7 @@ allowed_users = ["@u:matrix.org"]
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
+            session_prompts_enabled: false,
             session_ttl_hours: 0,
             debounce_ms: 0,
         };
@@ -30776,6 +30865,7 @@ allowed_numbers = ["+1", "+2"]
             show_tool_calls: true,
             session_persistence: true,
             session_backend: default_session_backend(),
+            session_prompts_enabled: false,
             session_ttl_hours: 0,
             debounce_ms: 0,
         };
@@ -30790,6 +30880,35 @@ allowed_numbers = ["+1", "+2"]
     async fn channels_default_has_no_whatsapp() {
         let c = ChannelsConfig::default();
         assert!(c.whatsapp.is_empty());
+    }
+
+    #[test]
+    async fn session_prompts_are_disabled_by_default() {
+        assert!(!ChannelsConfig::default().session_prompts_enabled);
+    }
+
+    #[test]
+    async fn validate_rejects_session_prompts_with_jsonl_backend() {
+        for backend in ["jsonl", "SQLite", "unsupported"] {
+            let mut config = Config::default();
+            config.channels.session_prompts_enabled = true;
+            config.channels.session_backend = backend.to_string();
+
+            let error = config.validate().expect_err("only SQLite must be accepted");
+            assert!(error.to_string().contains("session_prompts_enabled"));
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_session_prompts_without_session_persistence() {
+        let mut config = Config::default();
+        config.channels.session_prompts_enabled = true;
+        config.channels.session_persistence = false;
+
+        let error = config
+            .validate()
+            .expect_err("disabled session persistence must be rejected");
+        assert!(error.to_string().contains("session_persistence"));
     }
 
     #[test]

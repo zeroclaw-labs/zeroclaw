@@ -253,6 +253,23 @@ impl ApprovalManager {
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
     }
+
+    /// Ask for a single-use confirmation without offering or recording an
+    /// "always" decision. Used for operations whose exact payload must be
+    /// confirmed every time, independent of the ordinary tool allowlist.
+    pub fn prompt_cli_once(&self, title: &str, details: &str) -> bool {
+        eprintln!();
+        eprintln!("🔐 {title}");
+        eprintln!("{details}");
+        eprint!(
+            "{}",
+            crate::i18n::get_required_cli_string("cli-approval-prompt-yesno")
+        );
+        let _ = io::stderr().flush();
+        read_cli_approval_line()
+            .map(|line| matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+            .unwrap_or(false)
+    }
 }
 
 // ── CLI prompt ───────────────────────────────────────────────────
