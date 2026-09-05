@@ -1,5 +1,11 @@
+use crate::helpers::filesystem_boundary::{
+    FilesystemBoundaryError, create_dir_path_nofollow, open_absolute_dir_nofollow,
+    write_file_atomic,
+};
 use async_trait::async_trait;
+use cap_std::fs::Dir;
 use serde_json::json;
+use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
@@ -152,39 +158,78 @@ impl Tool for FileWriteTool {
         // RateLimitedTool + PathGuardedTool wrappers at registration time
         // (see zeroclaw-runtime::tools::mod).
 
+        // This tool can also be constructed directly, so reject lexical
+        // traversal before resolving or creating any part of the target path.
+        if !self.security.is_path_allowed(path) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-path-blocked",
+                    "path",
+                    path,
+                )),
+            });
+        }
+
         let full_path = self.security.resolve_tool_path(path);
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some("Invalid path: missing parent directory".into()),
+                error: Some(tool_text("tool-file-write-error-missing-parent")),
             });
         };
 
-        // Ensure parent directory exists before canonicalising.
-        tokio::fs::create_dir_all(parent).await?;
+        // Authorize the nearest existing ancestor and the prospective parent
+        // before creating anything. This prevents a denied target from leaving
+        // behind attacker-chosen directories outside the workspace boundary.
+        let mut existing_ancestor = parent;
+        loop {
+            match tokio::fs::symlink_metadata(existing_ancestor).await {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(next) = existing_ancestor.parent() else {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(tool_text("tool-file-write-error-no-existing-parent")),
+                        });
+                    };
+                    existing_ancestor = next;
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
+            }
+        }
 
-        // Canonicalise parent AFTER creation to detect symlink escapes.
-        let resolved_parent = match tokio::fs::canonicalize(parent).await {
-            Ok(p) => p,
-            Err(e) => {
+        let canonical_ancestor = tokio::fs::canonicalize(existing_ancestor).await?;
+        let missing_suffix = match parent.strip_prefix(existing_ancestor) {
+            Ok(suffix) => suffix,
+            Err(_) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(format!("Failed to resolve file path: {e}")),
+                    error: Some(tool_text_arg(
+                        "tool-file-write-error-parent-binding",
+                        "path",
+                        &parent.display().to_string(),
+                    )),
                 });
             }
         };
-
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+        let prospective_parent = canonical_ancestor.join(missing_suffix);
+        if !self.security.is_resolved_path_allowed(&prospective_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(
-                    self.security
-                        .resolved_path_violation_message(&resolved_parent),
-                ),
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-path-blocked",
+                    "path",
+                    &prospective_parent.display().to_string(),
+                )),
             });
         }
 
@@ -192,50 +237,103 @@ impl Tool for FileWriteTool {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some("Invalid path: missing file name".into()),
+                error: Some(tool_text("tool-file-write-error-missing-name")),
             });
         };
-
-        let resolved_target = resolved_parent.join(file_name);
-
-        if self.security.is_runtime_config_path(&resolved_target) {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(
-                    self.security
-                        .runtime_config_violation_message(&resolved_target),
-                ),
-            });
-        }
-
-        // If the target already exists and is a symlink, refuse to follow it
-        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
-            && meta.file_type().is_symlink()
+        let prospective_target = prospective_parent.join(file_name);
+        if self.security.is_runtime_config_path(&full_path)
+            || self.security.is_runtime_config_path(&prospective_target)
         {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!(
-                    "Refusing to write through symlink: {}",
-                    resolved_target.display()
+                error: Some(tool_text_arg(
+                    "tool-file-write-error-runtime-config",
+                    "path",
+                    &prospective_target.display().to_string(),
                 )),
             });
         }
 
-        match tokio::fs::write(&resolved_target, &bytes).await {
-            Ok(()) => Ok(ToolResult {
+        let capability_relative = match prospective_parent.strip_prefix(&canonical_ancestor) {
+            Ok(relative) => relative,
+            Err(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(tool_text("tool-file-write-error-capability-binding")),
+                });
+            }
+        };
+        let capability_root = canonical_ancestor;
+        let capability_relative = capability_relative.to_path_buf();
+        let file_name = file_name.to_os_string();
+        let display_path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let parent_dir = match create_dir_beneath(&capability_root, &capability_relative) {
+                Ok(dir) => dir,
+                Err(error) => match error.downcast_ref::<FilesystemBoundaryError>() {
+                    Some(boundary) if boundary.is_denied() => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(localize_filesystem_boundary(boundary)),
+                        });
+                    }
+                    _ => return Err(error),
+                },
+            };
+
+            // The returned parent handle is the bound authority. Re-resolving
+            // the ambient pathname here would reintroduce a post-mutation race.
+            match parent_dir.symlink_metadata(&file_name) {
+                Ok(meta) if meta.is_symlink() => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(tool_text_arg(
+                            "tool-file-write-error-symlink",
+                            "path",
+                            &prospective_target.display().to_string(),
+                        )),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            write_file_atomic(&parent_dir, Path::new(&file_name), &bytes)?;
+            Ok(ToolResult {
                 success: true,
-                output: format!("Written {} bytes to {path}", bytes.len()).into(),
+                output: format!("Written {} bytes to {display_path}", bytes.len()).into(),
                 error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Failed to write file: {e}")),
-            }),
-        }
+            })
+        })
+        .await?
     }
+}
+
+fn create_dir_beneath(root: &Path, relative: &Path) -> anyhow::Result<Dir> {
+    let root = open_absolute_dir_nofollow(root)?;
+    Ok(create_dir_path_nofollow(&root, relative)?)
+}
+
+fn localize_filesystem_boundary(error: &FilesystemBoundaryError) -> String {
+    match error.localization() {
+        Some((key, path)) => {
+            crate::i18n::get_required_tool_string_with_args(key, &[("path", &path)])
+        }
+        None => error.to_string(),
+    }
+}
+
+fn tool_text(key: &str) -> String {
+    crate::i18n::get_required_tool_string(key)
+}
+
+fn tool_text_arg(key: &str, name: &str, value: &str) -> String {
+    crate::i18n::get_required_tool_string_with_args(key, &[(name, value)])
 }
 
 #[cfg(test)]
@@ -339,6 +437,20 @@ mod tests {
         assert_eq!(content, "written!");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_propagates_unexpected_install_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("occupied")).unwrap();
+        let tool = test_tool(dir.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"path": "occupied", "content": "data"}))
+            .await;
+
+        assert!(result.is_err());
+        assert!(dir.path().join("occupied").is_dir());
     }
 
     #[tokio::test]
@@ -449,6 +561,91 @@ mod tests {
             "expected 'Path blocked' error, got: {:?}",
             result.error
         );
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_parent_before_creating_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside_parent = root.path().join("outside").join("nested");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let tool = test_tool(workspace);
+        let result = tool
+            .execute(json!({
+                "path": outside_parent.join("blocked.txt").to_string_lossy(),
+                "content": "blocked"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            !root.path().join("outside").exists(),
+            "authorization must happen before parent creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_write_rejects_runtime_config_before_creating_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        let protected_parent = workspace.join("missing-config-dir");
+        let protected_path = protected_parent.join("config.toml");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            config_path: Some(protected_path.clone()),
+            ..SecurityPolicy::default()
+        });
+        let tool = FileWriteTool::new(security);
+
+        let result = tool
+            .execute(json!({
+                "path": protected_path.to_string_lossy(),
+                "content": "blocked"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            !protected_parent.exists(),
+            "runtime-config rejection must precede parent creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_rejects_runtime_config_through_symlinked_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_workspace = root.path().join("real-workspace");
+        let workspace_link = root.path().join("workspace-link");
+        tokio::fs::create_dir_all(&real_workspace).await.unwrap();
+        symlink(&real_workspace, &workspace_link).unwrap();
+        let protected_parent = workspace_link.join("missing-config-dir");
+        let protected_path = protected_parent.join("config.toml");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace_link,
+            config_path: Some(protected_path.clone()),
+            ..SecurityPolicy::default()
+        });
+        let tool = FileWriteTool::new(security);
+
+        let result = tool
+            .execute(json!({
+                "path": protected_path.to_string_lossy(),
+                "content": "blocked"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(!real_workspace.join("missing-config-dir").exists());
     }
 
     #[tokio::test]
@@ -669,7 +866,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("escapes workspace")
+                .contains("Path blocked by security policy")
         );
         assert!(!outside.join("hijack.txt").exists());
 
@@ -761,6 +958,53 @@ mod tests {
         assert_eq!(content, "original", "original file must not be modified");
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_replaces_hard_link_without_mutating_external_inode() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside.txt");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+        std::fs::hard_link(&outside, workspace.join("linked.txt")).unwrap();
+        let tool = test_tool(workspace.clone());
+
+        let result = tool
+            .execute(json!({"path": "linked.txt", "content": "workspace"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("linked.txt")).unwrap(),
+            "workspace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_preserves_existing_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("script.sh");
+        std::fs::write(&script, "old").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tool = test_tool(root.path().to_path_buf());
+
+        let result = tool
+            .execute(json!({"path": "script.sh", "content": "new"}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(
+            std::fs::metadata(script).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[tokio::test]

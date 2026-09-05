@@ -62,7 +62,7 @@ boundaries because they add platform, dependency, network, or UI surface area.
 | `execute_pipeline` | Config-gated tool chaining. | Keep gated until tool chaining policy, per-step receipts, and caller allowlists are stable enough to judge whether it is core. |
 | `knowledge` | Config-gated knowledge surface. | Keep gated while relationship memory and graph workflows are still being promoted into user-facing docs and skills. |
 | `file_upload`, `file_upload_bundle`, `file_download` | Config-gated data movement. | Keep gated; these are policy-sensitive data movement tools and need an explicit replacement before externalization. |
-| `backup`, `data_management` | Local-state mutation surface. | Consider a clearer feature/config boundary because both mutate local state outside ordinary file edit flows. |
+| `backup`, `data_management` | Backup mutates local state; data management currently exposes retention preview and storage statistics only. | Keep explicit config boundaries. Re-enable confirmed data-management purge only after its owned categories, confirmation/audit behavior, and rollback contract are defined. |
 | `screenshot`, `image_info`, `canvas` | Visual/UI tool surface. | Keep for now; classify with the visual/UI tool surface once plugin and dashboard boundaries settle. |
 | `llm_task` | Provider-dependent subtask execution. | Keep until provider-scoped subtask execution has a separate contract from delegation. |
 | `security_ops` | Config-gated security operations. | Keep gated; security operations need first-party policy visibility until a plugin can advertise equivalent permissions, receipts, and rollback. |
