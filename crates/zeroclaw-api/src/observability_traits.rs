@@ -283,25 +283,6 @@ pub enum ObserverEvent {
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
     },
-    /// A deployment has started.
-    DeploymentStarted {
-        /// Identifier for the deployment (e.g., commit SHA or release tag).
-        deploy_id: String,
-    },
-    /// A deployment has completed successfully.
-    DeploymentCompleted {
-        deploy_id: String,
-        /// Commit SHA that was deployed.
-        commit_sha: String,
-    },
-    /// A deployment has failed.
-    DeploymentFailed {
-        deploy_id: String,
-        /// Human-readable failure reason.
-        reason: String,
-    },
-    /// Recovery from a failed deployment has completed.
-    RecoveryCompleted { deploy_id: String },
     /// The agent trimmed oldest whole turns from history to fit either the
     /// context token budget or the configured message limit. Carries the cut
     /// accounting so dashboards and clients can surface a visible "context was
@@ -330,10 +311,6 @@ pub enum ObserverMetric {
     ActiveSessions(u64),
     /// Current depth of the inbound message queue.
     QueueDepth(u64),
-    /// Time elapsed from commit to deployment (lead time for changes).
-    DeploymentLeadTime(Duration),
-    /// Time elapsed to recover from a failed deployment.
-    RecoveryTime(Duration),
 }
 
 /// Core observability trait for recording agent runtime telemetry.

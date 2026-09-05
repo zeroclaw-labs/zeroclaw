@@ -1,4 +1,3 @@
-pub mod dora;
 pub mod log;
 pub mod multi;
 pub mod noop;
