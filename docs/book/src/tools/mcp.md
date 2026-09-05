@@ -214,3 +214,104 @@ treated as **untrusted**: it is provenance-wrapped, secret-scrubbed, and
 length-bounded before entering context. Access to `mcp_resources` / `mcp_prompts`
 and to specific servers is governed by your agent's tool access policy (risk
 profile), and narrows correctly when delegating to subagents.
+
+## Example: Build Remote Agent (`gbr`)
+
+[Build Remote Agent](https://grokbuildremote.com/) is a pairing device: a phone
+app spectates (and can inject into) this ZeroClaw host through free MIT
+`gbr-agent`. Protocol `gbr/1`. Independent product by Linespotting AB. Not
+affiliated with xAI or SpaceX.
+
+Run `gbr-agent` on the **host**. Do not copy it into a sandbox. Attach only
+loopback Bot API `http://127.0.0.1:8788` or stdio `gbr-mcp`. Phone is spectator
+and veto. Never paste mailbox keys as plaintext in `config.toml`. ZeroClaw chat
+channels are not `gbr/1`.
+
+Loopback limits *network* exposure. It is **not** process authentication.
+Another local process can call `:8788` unless you set `GBR_BOT_REQUIRE_KEY=1`
+and give `gbr-mcp` the matching mailbox key through ZeroClaw secret-managed
+MCP `env` (not a plaintext mailbox key in `config.toml`).
+
+`gbr-mcp` logs tool-call arguments to `~/.gbr/logs/gbr-mcp-YYYY-MM-DD.jsonl`
+at info, default retention 7 days. Secret redaction does not strip ordinary
+inject text. For the safe baseline set `GBR_MCP_LOG_BODIES=0` on the `gbr`
+server `env` in ZeroCode Config. Delete or disable those logs if you do not
+want a second persistence surface outside ZeroClaw history.
+
+Omission of `mcp_bundles` is not a grant: define the server **and** grant it.
+
+Need **Node.js 20+** (`mcp/gbr-mcp` `engines.node >=20`). Pin GitHub Release
+**v0.6.2** (checksum the installer, then the binary). Do not paste live
+website `curl | bash`. See
+[PINNED-INSTALL.md](https://github.com/LinespottingOrg/GrokBuildRemote-Agents/blob/v0.6.2/docs/PINNED-INSTALL.md).
+
+Terminal 1 (leave this process running):
+
+```bash
+gbr-agent version    # need v0.6.2
+export GBR_BOT_REQUIRE_KEY=1
+gbr-agent pair
+gbr-agent run
+```
+
+After pairing, obtain the mailbox key from the phone (Settings -> Bot API) or
+from the host pairing file `~/.gbr/device.json` (`mailbox_key`). The pinned
+`gbr-mcp` client reads `GBR_MAILBOX_KEY` from its options or process
+environment; it does not load that pairing file. With `GBR_BOT_REQUIRE_KEY=1`,
+a fresh shell that omits the key makes unauthorized Bot API requests.
+
+Terminal 2 (MCP install and diagnose; `gbr-agent run` must already be up).
+Paste the key into a silent prompt so the value is not stored in shell history:
+
+```bash
+git clone --branch v0.6.2 --depth 1 https://github.com/LinespottingOrg/GrokBuildRemote-Agents.git
+cd GrokBuildRemote-Agents/mcp/gbr-mcp
+node -v    # v20+
+npm install
+IFS= read -rs GBR_MAILBOX_KEY   # paste key, Enter; no echo, no history
+export GBR_MAILBOX_KEY
+export GBR_MCP_LOG_BODIES=0
+node bin/gbr-mcp.js --diagnose
+```
+
+The `export` lines above apply only to this diagnostic shell. They do not
+configure the ZeroClaw-spawned `gbr` server. Define the server and grant it:
+
+```toml
+[[mcp.servers]]
+name = "gbr"
+command = "node"
+args = ["/absolute/path/to/GrokBuildRemote-Agents/mcp/gbr-mcp/bin/gbr-mcp.js"]
+
+[mcp_bundles.gbr]
+servers = ["gbr"]
+
+[agents.assistant]
+mcp_bundles = ["gbr"]
+```
+
+Then set both `GBR_MAILBOX_KEY` and `GBR_MCP_LOG_BODIES=0` on that server's
+`env` through ZeroCode Config (`/config` -> `mcp.servers` -> `gbr` -> `env`).
+The mailbox key is a secret field: use the masked prompt (encrypted secrets
+store) or a 1Password `op://vault/item/field` reference. Do not put the raw
+key in `config.toml`. The CLI equivalent is:
+
+```sh
+zeroclaw config set mcp.servers.gbr.env.GBR_MAILBOX_KEY
+zeroclaw config set mcp.servers.gbr.env.GBR_MCP_LOG_BODIES 0
+```
+
+All MCP environment values use ZeroClaw's masked secret prompt, so the
+trailing `0` is not consumed as the value. Enter `0` at that prompt.
+
+Restart the affected session after changing bundles or `env`. HTTP without MCP,
+after `gbr-agent run` with `GBR_BOT_REQUIRE_KEY=1`:
+
+```bash
+IFS= read -rs GBR_MAILBOX_KEY
+export GBR_MAILBOX_KEY
+curl -sS -H "X-GBR-Key: $GBR_MAILBOX_KEY" http://127.0.0.1:8788/health
+curl -sS -H "X-GBR-Key: $GBR_MAILBOX_KEY" http://127.0.0.1:8788/v1/sessions
+```
+
+Docs: [BOT-API.md](https://github.com/LinespottingOrg/GrokBuildRemote-Agents/blob/v0.6.2/docs/BOT-API.md)
