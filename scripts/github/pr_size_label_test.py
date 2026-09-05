@@ -383,7 +383,7 @@ class PrSizeLabelTest(unittest.TestCase):
             workflow.index("- name: Apply size label from PR metadata"),
         )
         self.assertIn("issues: write", workflow)
-        self.assertIn("pull-requests: read", workflow)
+        self.assertIn("pull-requests: write", workflow)
 
     def test_workflow_fetch_step_fails_closed(self) -> None:
         fetch_step = workflow_step_run("Fetch trusted workflow classifier")
