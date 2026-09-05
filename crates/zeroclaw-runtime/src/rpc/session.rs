@@ -23,6 +23,10 @@ pub enum CancelCause {
     AdminKill,
     /// The session was explicitly removed/torn down while a turn was live.
     SessionRemoved,
+    /// The RPC connection generation that accepted the turn was closed.
+    /// This includes EOF and daemon reload cancellation. The turn must not
+    /// outlive the outbound channel that owns its notifications.
+    ConnectionClosed,
 }
 
 impl CancelCause {
@@ -31,6 +35,7 @@ impl CancelCause {
             CancelCause::ClientRpc => "client_rpc",
             CancelCause::AdminKill => "admin_kill",
             CancelCause::SessionRemoved => "session_removed",
+            CancelCause::ConnectionClosed => "connection_closed",
         }
     }
 }
@@ -770,6 +775,17 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.to_string(), cause);
+    }
+
+    /// Record a fallback cause without overwriting a more specific cancel
+    /// that won the race (for example an explicit client cancel immediately
+    /// before the transport disconnects).
+    pub fn record_cancel_cause_if_absent(&self, id: &str, cause: CancelCause) {
+        self.cancel_causes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(id.to_string())
+            .or_insert(cause);
     }
 
     /// Drain the recorded cancel cause for a session. Returns `None` only

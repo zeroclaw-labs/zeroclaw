@@ -39,6 +39,11 @@ const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
 /// before declaring the peer dead and tearing the connection down.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Best-effort deadline for flushing a WebSocket Close frame during daemon
+/// cancellation. A suspended or black-holed peer must not retain the detached
+/// writer task and its TLS/socket resources indefinitely.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Bound on ONE outbound frame write to an established peer.
 ///
 /// The read side already declares a peer dead after [`HEARTBEAT_IDLE`] plus
@@ -629,8 +634,52 @@ enum Control {
     Ping,
 }
 
-pub struct WssTransport {
-    reader: futures_util::stream::SplitStream<WebSocketStream<ScannedTlsStream>>,
+async fn run_writer<S>(
+    mut sink: S,
+    mut writer_rx: mpsc::Receiver<String>,
+    mut control_rx: mpsc::Receiver<Control>,
+    cancel: CancellationToken,
+    close_timeout: Duration,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            line = writer_rx.recv() => match line {
+                Some(line) => Message::Text(line.into()),
+                None => break,
+            },
+            ctrl = control_rx.recv() => match ctrl {
+                Some(Control::Ping) => Message::Ping(Vec::new().into()),
+                None => break,
+            },
+        };
+        let sent = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = tokio::time::timeout(PEER_WRITE_TIMEOUT, sink.send(msg)) => {
+                matches!(result, Ok(Ok(())))
+            },
+        };
+        if !sent {
+            break;
+        }
+    }
+
+    // Close the receivers before awaiting best-effort protocol cleanup. This
+    // immediately releases any dispatcher parked on a full outbound queue.
+    drop(writer_rx);
+    drop(control_rx);
+    let _ = tokio::time::timeout(close_timeout, sink.close()).await;
+}
+
+pub struct WssTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    reader: futures_util::stream::SplitStream<WebSocketStream<ScanningStream<S>>>,
     writer_tx: mpsc::Sender<String>,
     control_tx: mpsc::Sender<Control>,
     peer_label: String,
@@ -644,54 +693,31 @@ pub struct WssTransport {
     incomplete_message_timeout: Duration,
 }
 
-impl WssTransport {
+impl<S> WssTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     /// Module-private: a transport is only well-formed when its parser sits
     /// behind the frame scanner the listener installs, so only the listener can
     /// build one.
     fn new(
-        ws: WebSocketStream<ScannedTlsStream>,
+        ws: WebSocketStream<ScanningStream<S>>,
         remote_addr: SocketAddr,
         scanner: Arc<SharedScanner>,
         incomplete_message_timeout: Duration,
+        cancel: CancellationToken,
     ) -> Self {
         let peer_label = format!("wss:{remote_addr}");
         let (sink, stream) = ws.split();
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        let (control_tx, mut control_rx) = mpsc::channel::<Control>(8);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
+        let (control_tx, control_rx) = mpsc::channel::<Control>(8);
         zeroclaw_spawn::spawn!(async move {
-            let mut sink = sink;
-            loop {
-                let msg = tokio::select! {
-                    line = writer_rx.recv() => match line {
-                        Some(line) => Message::Text(line.into()),
-                        None => break,
-                    },
-                    ctrl = control_rx.recv() => match ctrl {
-                        Some(Control::Ping) => Message::Ping(Vec::new().into()),
-                        None => break,
-                    },
-                };
-                // An authenticated peer that stops reading parks this write once
-                // the socket buffer fills. Unbounded, the outbound queue fills
-                // behind it and the dispatcher parks on its own response, so it
-                // never returns to `next_frame` and the heartbeat that would
-                // have retired the session never runs again. A timeout here is
-                // a peer that has stopped reading, not one that is merely slow.
-                if !matches!(
-                    tokio::time::timeout(PEER_WRITE_TIMEOUT, sink.send(msg)).await,
-                    Ok(Ok(()))
-                ) {
-                    break;
-                }
-            }
-            // Returning here drops both receivers, and that is what unwedges
-            // the rest of the session: a dispatcher parked on a full outbound
-            // queue fails at once instead of waiting on a sink nobody is
-            // draining, and `next_frame` sees the writer depart and returns, so
-            // the session task unwinds through the session permit and the
-            // per-certificate quota guard. Nothing may be awaited after this
-            // loop without closing the receivers first.
+            // Session approval channels and log forwarders retain writer
+            // senders past disconnect, so channel closure alone cannot end
+            // this task. Cancellation interrupts an in-flight send, then
+            // gives the Close-frame flush a bounded best-effort window.
+            run_writer(sink, writer_rx, control_rx, cancel, CLOSE_TIMEOUT).await;
         });
 
         Self {
@@ -707,7 +733,10 @@ impl WssTransport {
 }
 
 #[async_trait]
-impl RpcTransport for WssTransport {
+impl<S> RpcTransport for WssTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     fn writer(&self) -> mpsc::Sender<String> {
         self.writer_tx.clone()
     }
@@ -922,6 +951,8 @@ pub async fn run_wss_listener(
         "RPC WSS listener started"
     );
 
+    let mut connection_tasks = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -932,6 +963,7 @@ pub async fn run_wss_listener(
                 );
                 break;
             }
+            Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {}
             accept = listener.accept() => {
                 let (tcp_stream, remote_addr) = match accept {
                     Ok(v) => v,
@@ -983,6 +1015,7 @@ pub async fn run_wss_listener(
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
+                let conn_cancel = cancel.child_token();
                 let handshake_timeout = limits.handshake_timeout;
                 // Consumed only after both handshakes succeed, so an unauthenticated
                 // stall can never occupy an established-session slot.
@@ -994,7 +1027,7 @@ pub async fn run_wss_listener(
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
+                connection_tasks.spawn(async move {
                     // Guarantees the `--ephemeral` counter is decremented on
                     // every exit path below, including the new timeout one.
                     let _count_guard = ClientCountGuard(count);
@@ -1060,7 +1093,12 @@ pub async fn run_wss_listener(
                         Some((ws_stream, scanner))
                     };
 
-                    let (mut ws_stream, scanner) = match tokio::time::timeout_at(deadline, setup).await {
+                    let setup_res = tokio::select! {
+                        _ = conn_cancel.cancelled() => return,
+                        res = tokio::time::timeout_at(deadline, setup) => res,
+                    };
+
+                    let (mut ws_stream, scanner) = match setup_res {
                         Ok(Some(ws)) => ws,
                         Ok(None) => return, // logged above
                         Err(_) => {
@@ -1161,12 +1199,22 @@ pub async fn run_wss_listener(
                         remote_addr,
                         scanner,
                         incomplete_message_timeout,
+                        conn_cancel.clone(),
                     );
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
-                        .with_peer_cert_fingerprint(Some(peer_cert_fp));
-                    dispatcher.run(&mut transport).await;
+                    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        conn_cancel.clone(),
+                    )
+                    .with_peer_cert_fingerprint(Some(peer_cert_fp));
+                    // The concrete dispatcher future carries the full request
+                    // state machine. Keep that state heap-backed so an active
+                    // WSS request does not depend on the executor worker's
+                    // thread-stack size.
+                    Box::pin(dispatcher.run_connection(&mut transport)).await;
 
                     // Epoch-checked: a relay flap can leave this session draining
                     // long after the client has reconnected and re-adopted the
@@ -1194,6 +1242,19 @@ pub async fn run_wss_listener(
                     }
                 });
             }
+        }
+    }
+
+    // Drain accepted connection tasks. Each connection cancels its prompts
+    // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
+    // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
+    // exceeds that window, force-abort remaining connection tasks and join them.
+    tokio::select! {
+        _ = async {
+            while connection_tasks.join_next().await.is_some() {}
+        } => {}
+        _ = tokio::time::sleep(Duration::from_millis(5500)) => {
+            connection_tasks.shutdown().await;
         }
     }
 
@@ -1450,8 +1511,793 @@ mod frame_scanner_tests {
 
 #[cfg(test)]
 mod accept_error_tests {
-    use super::is_recoverable_accept_error;
+    use super::{
+        Control, DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS, ScanningStream, WssTransport,
+        is_recoverable_accept_error, run_writer,
+    };
+    use crate::rpc::dispatch::{Method, RpcDispatcher};
+    use crate::rpc::types::InitializeParams;
+    use futures_util::{SinkExt, StreamExt};
     use std::io::{Error, ErrorKind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::jsonrpc::{JSONRPC_VERSION, JsonRpcRequest};
+
+    struct NonReadingPeer {
+        write_polled: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for NonReadingPeer {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NonReadingPeer {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.write_polled.store(true, Ordering::Release);
+            Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_bounds_send_and_close_for_non_reading_peer() {
+        let write_polled = Arc::new(AtomicBool::new(false));
+        let websocket = WebSocketStream::from_raw_socket(
+            NonReadingPeer {
+                write_polled: Arc::clone(&write_polled),
+            },
+            Role::Server,
+            None,
+        )
+        .await;
+        let (sink, _stream) = websocket.split();
+        let (writer_tx, writer_rx) = mpsc::channel(1);
+        let (_control_tx, control_rx) = mpsc::channel::<Control>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+
+        let writer = zeroclaw_spawn::spawn!(run_writer(
+            sink,
+            writer_rx,
+            control_rx,
+            writer_cancel,
+            Duration::from_millis(10),
+        ));
+        writer_tx.send("response".to_owned()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !write_polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the WebSocket sink should attempt the blocked network write");
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(100), writer)
+            .await
+            .expect("cancellation and bounded Close must release the writer task")
+            .expect("writer task should not panic");
+    }
+
+    fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
+        serde_json::to_string(&JsonRpcRequest::new(
+            method.wire_name(),
+            serde_json::to_value(params).unwrap(),
+            serde_json::Value::Number(id.into()),
+        ))
+        .unwrap()
+    }
+
+    async fn assert_reload_drains_wss_connection_generation() {
+        use crate::rpc::dispatch::connection_test_support::{QUEUED_SID, RUNNING_SID, fixture};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = fixture(tmp.path()).await;
+        let queued_guard = fixture
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(QUEUED_SID)
+            .await
+            .expect("test should hold the queued session actor");
+        let listener_cancel = CancellationToken::new();
+        let connection_cancel = listener_cancel.child_token();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (server_io, scanner) = ScanningStream::new(server_io);
+        let (server_ws, client_ws) = tokio::join!(
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None),
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None),
+        );
+        let mut transport = WssTransport::new(
+            server_ws,
+            "127.0.0.1:43110".parse().unwrap(),
+            scanner,
+            Duration::from_secs(DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS),
+            connection_cancel.clone(),
+        );
+        let writer_tx = crate::rpc::transport::RpcTransport::writer(&transport);
+        let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+            Arc::clone(&fixture.ctx),
+            writer_tx,
+            "wss:127.0.0.1:43110".to_string(),
+            connection_cancel,
+        );
+        let connection = zeroclaw_spawn::spawn!(async move {
+            dispatcher.run_connection(&mut transport).await;
+        });
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+        };
+        client_sink
+            .send(Message::Text(
+                rpc_request(Method::Initialize, &init, 1).into(),
+            ))
+            .await
+            .unwrap();
+        let initialized = client_stream
+            .next()
+            .await
+            .expect("initialize response frame")
+            .expect("initialize response should be valid");
+        let initialized: serde_json::Value = serde_json::from_str(
+            initialized
+                .to_text()
+                .expect("initialize response should be text"),
+        )
+        .unwrap();
+        assert_eq!(initialized["jsonrpc"], JSONRPC_VERSION);
+        assert!(initialized["error"].is_null());
+
+        client_sink
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": RUNNING_SID, "prompt": "run"}),
+                    2,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fixture.provider_started.notified())
+            .await
+            .expect("running prompt should reach the provider");
+
+        client_sink
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": QUEUED_SID, "prompt": "queue"}),
+                    3,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second prompt should be waiting in the session actor queue");
+
+        listener_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(7), connection)
+            .await
+            .expect("WSS connection must drain generation-owned prompt tasks")
+            .expect("WSS connection task should not panic");
+
+        assert!(
+            fixture.provider_dropped.load(Ordering::Acquire),
+            "reload must cancel and join the running provider future"
+        );
+        assert_eq!(
+            fixture.queued_provider_calls.load(Ordering::Acquire),
+            0,
+            "a queued prompt from the closed generation must never execute"
+        );
+        assert_eq!(
+            fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await,
+            1,
+            "only the deliberate test holder should remain queued"
+        );
+        assert!(!fixture.ctx.sessions.has_inflight_turn(RUNNING_SID));
+        drop(queued_guard);
+    }
+
+    #[test]
+    fn reload_drains_running_and_queued_prompts_for_wss_connection_generation() {
+        std::thread::Builder::new()
+            .name("wss-connection-generation".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(assert_reload_drains_wss_connection_generation());
+            })
+            .unwrap()
+            .join()
+            .expect("WSS connection generation test thread should not panic");
+    }
+
+    #[derive(Debug)]
+    struct NoServerVerify;
+
+    impl rustls::client::danger::ServerCertVerifier for NoServerVerify {
+        fn verify_server_cert(
+            &self,
+            _e: &rustls::pki_types::CertificateDer<'_>,
+            _i: &[rustls::pki_types::CertificateDer<'_>],
+            _n: &rustls::pki_types::ServerName<'_>,
+            _o: &[u8],
+            _t: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _m: &[u8],
+            _c: &rustls::pki_types::CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _m: &[u8],
+            _c: &rustls::pki_types::CertificateDer<'_>,
+            _d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    fn test_client_connector(
+        client_cert_pem: &str,
+        client_key_pem: &str,
+    ) -> tokio_tungstenite::Connector {
+        use std::io::Write;
+        let mut cf = tempfile::NamedTempFile::new().unwrap();
+        cf.write_all(client_cert_pem.as_bytes()).unwrap();
+        cf.flush().unwrap();
+        let mut kf = tempfile::NamedTempFile::new().unwrap();
+        kf.write_all(client_key_pem.as_bytes()).unwrap();
+        kf.flush().unwrap();
+
+        let chain = zeroclaw_tls::load_certs(cf.path().to_str().unwrap()).unwrap();
+        let key = zeroclaw_tls::load_private_key(kf.path().to_str().unwrap()).unwrap();
+        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoServerVerify))
+        .with_client_auth_cert(chain, key)
+        .unwrap();
+        tokio_tungstenite::Connector::Rustls(Arc::new(client_cfg))
+    }
+
+    async fn assert_reload_replacement_generation_waits_for_durable_session_prompt_wss() {
+        use crate::rpc::context::RpcContext;
+        use crate::rpc::dispatch::connection_test_support::insert_session;
+        use crate::rpc::session::SessionStore;
+        use async_trait::async_trait;
+        use tokio::sync::Notify;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const DURABLE_SID: &str = "durable-reload-session-wss";
+
+        struct HoldOnDrop {
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        impl Drop for HoldOnDrop {
+            fn drop(&mut self) {
+                self.log.lock().unwrap().push("gen1_unwind_start");
+                let (lock, cvar) = &*self.allow_finish;
+                let mut finished = lock.lock().unwrap();
+                while !*finished {
+                    finished = cvar.wait(finished).unwrap();
+                }
+                self.is_running.store(false, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_ended");
+            }
+        }
+
+        struct BlockingGen1Provider {
+            started: Arc<Notify>,
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for BlockingGen1Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.is_running.store(true, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_started");
+                let _drop_guard = HoldOnDrop {
+                    allow_finish: Arc::clone(&self.allow_finish),
+                    is_running: Arc::clone(&self.is_running),
+                    log: Arc::clone(&self.log),
+                };
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                Ok("gen1 finished".to_string())
+            }
+        }
+
+        impl Attributable for BlockingGen1Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "blocking-gen1"
+            }
+        }
+
+        struct ObservantGen2Provider {
+            gen1_is_running: Arc<AtomicBool>,
+            started: Arc<Notify>,
+            overlap_detected: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ObservantGen2Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if self.gen1_is_running.load(Ordering::SeqCst) {
+                    self.overlap_detected.store(true, Ordering::SeqCst);
+                    self.log.lock().unwrap().push("OVERLAP_DETECTED");
+                }
+                self.log.lock().unwrap().push("gen2_started");
+                self.started.notify_one();
+                self.log.lock().unwrap().push("gen2_ended");
+                Ok("gen2 finished".to_string())
+            }
+        }
+
+        impl Attributable for ObservantGen2Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "observant-gen2"
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mats = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let ca_pem = std::fs::read_to_string(&mats.ca_cert_path).unwrap();
+        let ca_key_pem = std::fs::read_to_string(&mats.ca_key_path).unwrap();
+        let client = zeroclaw_tls::issue_client_cert(&ca_pem, &ca_key_pem, "test-client").unwrap();
+
+        let acceptor1 = super::build_tls_acceptor(
+            mats.server_cert_path.to_str().unwrap(),
+            mats.server_key_path.to_str().unwrap(),
+            mats.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+
+        let gen1_started = Arc::new(Notify::new());
+        let allow_gen1_finish = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gen1_is_running = Arc::new(AtomicBool::new(false));
+        let gen2_started = Arc::new(Notify::new());
+        let overlap_detected = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let port1 = free_port().await;
+        let addr1: std::net::SocketAddr = format!("127.0.0.1:{port1}").parse().unwrap();
+
+        let config1 = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
+        let sessions1 = Arc::new(SessionStore::new(64, queue1));
+        let ctx1 = RpcContext::for_persistence_tests(
+            config1,
+            sessions1,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+
+        insert_session(
+            &ctx1,
+            tmp.path(),
+            DURABLE_SID,
+            Box::new(BlockingGen1Provider {
+                started: Arc::clone(&gen1_started),
+                allow_finish: Arc::clone(&allow_gen1_finish),
+                is_running: Arc::clone(&gen1_is_running),
+                log: Arc::clone(&log),
+            }),
+        )
+        .await;
+
+        let cancel1 = CancellationToken::new();
+        let count1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancel1_for_listener = cancel1.clone();
+        let ctx1_for_listener = Arc::clone(&ctx1);
+        let count1_for_listener = Arc::clone(&count1);
+
+        let gen1_listener_handle = zeroclaw_spawn::spawn!(async move {
+            super::run_wss_listener(
+                ctx1_for_listener,
+                cancel1_for_listener,
+                count1_for_listener,
+                acceptor1,
+                addr1,
+                super::WssLimits::default(),
+            )
+            .await
+        });
+
+        let connector1 = test_client_connector(&client.cert_pem, &client.key_pem);
+        let url1 = format!("wss://127.0.0.1:{port1}/");
+        let ws1 = async {
+            let started = std::time::Instant::now();
+            loop {
+                match tokio_tungstenite::connect_async_tls_with_config(
+                    &url1,
+                    None,
+                    false,
+                    Some(connector1.clone()),
+                )
+                .await
+                {
+                    Ok((ws, _)) => return ws,
+                    Err(e) => {
+                        if started.elapsed() > Duration::from_secs(5) {
+                            panic!("timed out connecting to Gen 1: {e:?}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+            }
+        }
+        .await;
+
+        let (mut client_sink1, mut client_stream1) = ws1.split();
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+        };
+        client_sink1
+            .send(Message::Text(
+                rpc_request(Method::Initialize, &init, 1).into(),
+            ))
+            .await
+            .unwrap();
+        let _ = client_stream1.next().await.unwrap().unwrap();
+
+        // Send prompt to Generation 1
+        client_sink1
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 1"}),
+                    2,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), gen1_started.notified())
+            .await
+            .expect("Gen 1 prompt should reach provider");
+
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must be running"
+        );
+
+        // Trigger reload on Generation 1
+        cancel1.cancel();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !gen1_listener_handle.is_finished(),
+            "Gen 1 WSS listener must NOT finish while prompt is held in cancellation"
+        );
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must remain active while draining"
+        );
+
+        let tmp_path = tmp.path().to_path_buf();
+        let chat_backend2 = chat_backend.clone();
+        let gen1_is_running_for_gen2 = Arc::clone(&gen1_is_running);
+        let gen2_started_clone = Arc::clone(&gen2_started);
+        let overlap_detected_clone = Arc::clone(&overlap_detected);
+        let log_clone = Arc::clone(&log);
+        let client_cert_pem = client.cert_pem.clone();
+        let client_key_pem = client.key_pem.clone();
+
+        let gen2_task = zeroclaw_spawn::spawn!(async move {
+            // Gen 2 waits for Gen 1 listener to cleanly shut down
+            gen1_listener_handle
+                .await
+                .unwrap()
+                .expect("Gen 1 WSS listener should exit Ok");
+
+            let port2 = free_port().await;
+            let addr2: std::net::SocketAddr = format!("127.0.0.1:{port2}").parse().unwrap();
+
+            let acceptor2 = super::build_tls_acceptor(
+                mats.server_cert_path.to_str().unwrap(),
+                mats.server_key_path.to_str().unwrap(),
+                mats.ca_cert_path.to_str().unwrap(),
+                &[],
+                "",
+            )
+            .unwrap();
+
+            let config2 = zeroclaw_config::schema::Config {
+                data_dir: tmp_path.clone(),
+                config_path: tmp_path.join("config.toml"),
+                ..Default::default()
+            };
+            let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
+            let sessions2 = Arc::new(SessionStore::new(64, queue2));
+            let ctx2 = RpcContext::for_persistence_tests(
+                config2,
+                sessions2,
+                Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+
+            insert_session(
+                &ctx2,
+                &tmp_path,
+                DURABLE_SID,
+                Box::new(ObservantGen2Provider {
+                    gen1_is_running: gen1_is_running_for_gen2,
+                    started: gen2_started_clone,
+                    overlap_detected: overlap_detected_clone,
+                    log: log_clone,
+                }),
+            )
+            .await;
+
+            let cancel2 = CancellationToken::new();
+            let count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cancel2_for_listener = cancel2.clone();
+            let handle2 = zeroclaw_spawn::spawn!(async move {
+                super::run_wss_listener(
+                    ctx2,
+                    cancel2_for_listener,
+                    count2,
+                    acceptor2,
+                    addr2,
+                    super::WssLimits::default(),
+                )
+                .await
+            });
+
+            let connector2 = test_client_connector(&client_cert_pem, &client_key_pem);
+            let url2 = format!("wss://127.0.0.1:{port2}/");
+            let ws2 = async {
+                let started = std::time::Instant::now();
+                loop {
+                    match tokio_tungstenite::connect_async_tls_with_config(
+                        &url2,
+                        None,
+                        false,
+                        Some(connector2.clone()),
+                    )
+                    .await
+                    {
+                        Ok((ws, _)) => return ws,
+                        Err(e) => {
+                            if started.elapsed() > Duration::from_secs(5) {
+                                panic!("timed out connecting to Gen 2: {e:?}");
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                }
+            }
+            .await;
+
+            let (mut client_sink2, mut client_stream2) = ws2.split();
+            let init = InitializeParams {
+                protocol_version: 1,
+                tui_id: None,
+                tui_sig: None,
+                env: Default::default(),
+                client_capabilities: None,
+            };
+            client_sink2
+                .send(Message::Text(
+                    rpc_request(Method::Initialize, &init, 1).into(),
+                ))
+                .await
+                .unwrap();
+            let _ = client_stream2.next().await.unwrap().unwrap();
+
+            client_sink2
+                .send(Message::Text(
+                    rpc_request(
+                        Method::SessionPrompt,
+                        &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 2"}),
+                        3,
+                    )
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            cancel2.cancel();
+            handle2
+                .await
+                .unwrap()
+                .expect("Gen 2 WSS listener should exit Ok");
+            drop(client_sink2);
+        });
+
+        // While Gen 1 is held in cancellation, verify Gen 2 has not started its prompt
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must still be held"
+        );
+        let current_log = log.lock().unwrap().clone();
+        assert_eq!(
+            current_log,
+            vec!["gen1_started", "gen1_unwind_start"],
+            "Prompt 2 must not have started yet"
+        );
+
+        // Now allow Gen 1 prompt to complete its cooperative cancellation unwind
+        {
+            let (lock, cvar) = &*allow_gen1_finish;
+            let mut finished = lock.lock().unwrap();
+            *finished = true;
+            cvar.notify_all();
+        }
+
+        // Gen 2 task should now complete cleanly
+        tokio::time::timeout(Duration::from_secs(5), gen2_task)
+            .await
+            .expect("Gen 2 reload handoff should finish within timeout")
+            .expect("Gen 2 task should not panic");
+
+        assert!(
+            !overlap_detected.load(Ordering::SeqCst),
+            "Prompt 2 must not overlap with Prompt 1 on durable session"
+        );
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log,
+            vec![
+                "gen1_started",
+                "gen1_unwind_start",
+                "gen1_ended",
+                "gen2_started",
+                "gen2_ended"
+            ],
+            "Generations must execute sequentially with Gen 1 fully drained before Gen 2 begins"
+        );
+
+        drop(client_sink1);
+    }
+
+    #[test]
+    fn reload_replacement_generation_waits_for_durable_session_prompt_wss() {
+        std::thread::Builder::new()
+            .name("wss-reload-durable-session".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        assert_reload_replacement_generation_waits_for_durable_session_prompt_wss(),
+                    );
+            })
+            .unwrap()
+            .join()
+            .expect("WSS reload durable session test thread should not panic");
+    }
 
     #[cfg(unix)]
     #[test]

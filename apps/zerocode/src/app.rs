@@ -741,6 +741,64 @@ async fn consume_pending_quickstart_chat(
     *mode = Mode::Chat;
 }
 
+/// Grace period before respawning an owned ephemeral daemon whose
+/// process still looks alive. An in-place daemon reload rebinds the
+/// socket within a couple of seconds, so a disconnect with a live
+/// daemon process usually means a reload is in flight — respawning
+/// immediately would race it for the socket endpoint.
+const EPHEMERAL_RESPAWN_GRACE: Duration = Duration::from_secs(10);
+
+fn should_respawn_ephemeral(
+    owned_pid: Option<u32>,
+    already_respawned: bool,
+    disconnected_for: Duration,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    let Some(pid) = owned_pid else {
+        return false;
+    };
+    if already_respawned {
+        return false;
+    }
+    !pid_alive(pid) || disconnected_for >= EPHEMERAL_RESPAWN_GRACE
+}
+
+pub(crate) fn reconnect_matches_owned_daemon(
+    owned_pid: Option<u32>,
+    pending_respawn_pid: Option<u32>,
+    server_pid: Option<u32>,
+) -> bool {
+    pending_respawn_pid
+        .or(owned_pid)
+        .is_none_or(|expected_pid| server_pid == Some(expected_pid))
+}
+
+fn record_automatic_respawn_failure(
+    owned_daemon_pid: &mut Option<u32>,
+    needs_intervention: &mut bool,
+) {
+    // The original owned process is already dead and the one automatic
+    // replacement has definitively failed. Release the stale identity gate so
+    // a compatible manual restart can be adopted by the polling loop.
+    *owned_daemon_pid = None;
+    *needs_intervention = true;
+}
+
+/// Probe whether the owned daemon process still exists. `kill(pid, 0)`
+/// succeeds (or fails with EPERM) while the process is alive.
+#[cfg(unix)]
+fn ephemeral_daemon_pid_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows has no cheap liveness probe wired up here; report alive so
+/// the grace period governs respawn instead of a spurious kill result.
+#[cfg(not(unix))]
+fn ephemeral_daemon_pid_alive(_pid: u32) -> bool {
+    true
+}
+
 // ── Top-level entry point ────────────────────────────────────────
 
 /// Run the TUI event loop. Owns the full session lifecycle: when the
@@ -756,7 +814,7 @@ pub async fn run(
     reconnect_state: SharedReconnectState,
     config_dir: &std::path::Path,
     target: &crate::ConnectTarget,
-    owns_ephemeral: bool,
+    mut owned_daemon_pid: Option<u32>,
     initial_leg: crate::ActiveLeg,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
@@ -771,6 +829,8 @@ pub async fn run(
     let mut reconnect_attempt: Option<ReconnectAttempt<(RpcClient, crate::ActiveLeg)>> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
+    let mut disconnected_at: Option<Instant> = None;
+    let mut pending_respawn: Option<crate::SpawnedDaemon> = None;
 
     // Which transport leg the live connection sits on, and when the direct path
     // was last re-probed. While on the relay leg of a route that also has a
@@ -1053,16 +1113,41 @@ pub async fn run(
         }
 
         // Recovery stays inside the responsive event loop. During each disconnected
-        // episode an owned ephemeral daemon is respawned at most once, attached daemons
-        // are never spawned, and both modes keep polling for manual recovery.
+        // episode an owned ephemeral daemon is respawned at most once — only once the
+        // process is confirmed dead or the reload grace period elapses — attached
+        // daemons are never spawned, and both modes keep polling for manual recovery.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
             // A direct-path probe belongs to the relay session that started it.
             // Do not retain a candidate across a disconnect or transport change.
             direct_reprobe_attempt = None;
-            if owns_ephemeral && !ephemeral_respawn_done {
+            if let Some(daemon) = pending_respawn.as_mut() {
+                match daemon.has_exited() {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        pending_respawn = None;
+                        record_automatic_respawn_failure(
+                            &mut owned_daemon_pid,
+                            &mut needs_intervention,
+                        );
+                    }
+                }
+            }
+            let since = *disconnected_at.get_or_insert_with(Instant::now);
+            if should_respawn_ephemeral(
+                owned_daemon_pid,
+                ephemeral_respawn_done,
+                since.elapsed(),
+                ephemeral_daemon_pid_alive,
+            ) {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(socket) = target {
-                    let _ = crate::spawn_ephemeral_daemon(config_dir, socket);
+                    match crate::spawn_owned_ephemeral_daemon(config_dir, socket) {
+                        Ok(daemon) => pending_respawn = Some(daemon),
+                        Err(_) => record_automatic_respawn_failure(
+                            &mut owned_daemon_pid,
+                            &mut needs_intervention,
+                        ),
+                    }
                 }
             }
 
@@ -1090,6 +1175,19 @@ pub async fn run(
                     // The connect prefers the direct path and falls back to the
                     // relay, so a reconnect lands on whichever leg is reachable.
                     if let Ok((new_client, leg)) = result {
+                        let pending_respawn_pid =
+                            pending_respawn.as_ref().map(crate::SpawnedDaemon::id);
+                        if !reconnect_matches_owned_daemon(
+                            owned_daemon_pid,
+                            pending_respawn_pid,
+                            new_client.server_pid,
+                        ) {
+                            new_client.shutdown();
+                            if pending_respawn_pid.is_none() {
+                                needs_intervention = true;
+                            }
+                            continue;
+                        }
                         // A reconnect may land on a DIFFERENT leg than the one
                         // that dropped: direct can fall back to the relay, and a
                         // relay session can come back direct. The leg is
@@ -1102,12 +1200,17 @@ pub async fn run(
                             reconnect_last_attempt = None;
                             ephemeral_respawn_done = false;
                             needs_intervention = false;
+                            disconnected_at = None;
+                            if let Some(daemon) = pending_respawn.take() {
+                                owned_daemon_pid = Some(daemon.id());
+                                daemon.detach();
+                            }
                         }
                         // Adopted or not, go round again: a failed rebuild means
                         // the daemon flapped mid-init, and the previous client is
                         // back in place for the next throttle window.
                         continue;
-                    } else if owns_ephemeral && ephemeral_respawn_done {
+                    } else if owned_daemon_pid.is_some() && ephemeral_respawn_done {
                         // The one permitted respawn did not come back — flag
                         // for the user. We keep polling above, so a manual
                         // daemon restart still recovers.
@@ -3581,6 +3684,120 @@ mod tests {
             Some("scout".into())
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
+
+    #[test]
+    fn unowned_session_never_respawns() {
+        assert!(!should_respawn_ephemeral(
+            None,
+            false,
+            Duration::from_secs(3600),
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn owned_dead_daemon_respawns_immediately() {
+        assert!(should_respawn_ephemeral(
+            Some(1),
+            false,
+            Duration::ZERO,
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn owned_live_daemon_waits_out_reload_grace() {
+        assert!(!should_respawn_ephemeral(
+            Some(1),
+            false,
+            EPHEMERAL_RESPAWN_GRACE - Duration::from_millis(1),
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn owned_live_daemon_respawns_after_grace() {
+        assert!(should_respawn_ephemeral(
+            Some(1),
+            false,
+            EPHEMERAL_RESPAWN_GRACE,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn respawn_happens_at_most_once_per_episode() {
+        assert!(!should_respawn_ephemeral(
+            Some(1),
+            true,
+            Duration::from_secs(3600),
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn owned_reconnect_accepts_only_the_expected_daemon_identity() {
+        assert!(reconnect_matches_owned_daemon(Some(11), None, Some(11)));
+        assert!(!reconnect_matches_owned_daemon(Some(11), None, Some(12)));
+        assert!(!reconnect_matches_owned_daemon(Some(11), None, None));
+    }
+
+    #[test]
+    fn respawned_daemon_identity_takes_precedence_during_readiness() {
+        assert!(reconnect_matches_owned_daemon(Some(11), Some(22), Some(22)));
+        assert!(!reconnect_matches_owned_daemon(
+            Some(11),
+            Some(22),
+            Some(11)
+        ));
+        assert!(!reconnect_matches_owned_daemon(
+            Some(11),
+            Some(22),
+            Some(33)
+        ));
+    }
+
+    #[test]
+    fn attached_reconnect_accepts_any_compatible_daemon() {
+        assert!(reconnect_matches_owned_daemon(None, None, Some(33)));
+        assert!(reconnect_matches_owned_daemon(None, None, None));
+    }
+
+    #[test]
+    fn failed_automatic_replacement_releases_stale_pid_for_manual_recovery() {
+        let mut owned_pid = Some(11);
+        let mut pending_pid = Some(22);
+        let manual_pid = Some(33);
+        let mut needs_intervention = false;
+
+        assert!(
+            !reconnect_matches_owned_daemon(owned_pid, pending_pid, manual_pid),
+            "exact replacement identity must remain enforced while it is active"
+        );
+
+        // The automatic child exits: production drops `pending_respawn`, then
+        // records the definitive failure through this transition.
+        pending_pid = None;
+        record_automatic_respawn_failure(&mut owned_pid, &mut needs_intervention);
+
+        assert!(owned_pid.is_none());
+        assert!(needs_intervention);
+        assert!(
+            reconnect_matches_owned_daemon(owned_pid, pending_pid, manual_pid),
+            "a compatible manual restart must be accepted after replacement failure"
+        );
+    }
+
+    #[test]
+    fn ephemeral_respawn_grace_outlasts_daemon_reload_rebind() {
+        assert_eq!(EPHEMERAL_RESPAWN_GRACE, Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_process_probe_reports_alive() {
+        assert!(ephemeral_daemon_pid_alive(std::process::id()));
     }
 }
 

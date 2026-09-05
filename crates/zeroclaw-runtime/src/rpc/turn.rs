@@ -81,7 +81,7 @@ where
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
 
-    let mut turn_handle = zeroclaw_spawn::spawn!(async move {
+    let turn_handle = zeroclaw_spawn::spawn!(async move {
         let mut guard = agent.lock().await;
         let sk = attribution.session_key.clone();
         crate::agent::loop_::scope_session_key(attribution.session_key, async move {
@@ -112,12 +112,38 @@ where
         .await
     });
 
+    struct TurnHandleGuard(
+        Option<
+            tokio::task::JoinHandle<
+                std::result::Result<
+                    crate::agent::agent::StreamedTurnSuccess,
+                    crate::agent::agent::StreamedTurnError,
+                >,
+            >,
+        >,
+    );
+
+    impl Drop for TurnHandleGuard {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    let mut turn_handle_guard = TurnHandleGuard(Some(turn_handle));
+
     let mut accumulated_text = String::new();
 
     let drain =
         drain_until_done_or_cancelled(&mut event_rx, &cancel, &mut accumulated_text, &on_event)
             .await;
     let _ = session_key; // consumed above
+
+    let mut turn_handle = turn_handle_guard
+        .0
+        .take()
+        .expect("turn_handle present in guard");
 
     match drain {
         DrainOutcome::Completed => {
@@ -134,6 +160,7 @@ where
                 ),
                 Err(_) => {
                     turn_handle.abort();
+                    let _ = turn_handle.await;
                     Ok(TurnOutcome::Cancelled {
                         partial_text: accumulated_text,
                         messages: Vec::new(),

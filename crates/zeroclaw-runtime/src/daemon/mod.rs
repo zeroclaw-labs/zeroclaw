@@ -1047,7 +1047,11 @@ pub async fn run(
 
     channels_cancel.cancel();
 
-    const GRACE_WINDOW: Duration = Duration::from_millis(500);
+    // Grace window for cooperative shutdown. Must exceed turn cancellation grace
+    // (turn::CANCEL_GRACE, 5s) plus RPC listener connection drain timeout (5.5s)
+    // so listener supervisors can finish joining connection tasks before the daemon
+    // falls back to hard abort.
+    const GRACE_WINDOW: Duration = Duration::from_millis(6000);
     let deadline = tokio::time::Instant::now() + GRACE_WINDOW;
     let mut remaining: Vec<JoinHandle<()>> = Vec::new();
     for mut handle in handles {

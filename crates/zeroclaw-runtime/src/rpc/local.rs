@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::Config;
@@ -18,6 +18,10 @@ use zeroclaw_config::schema::Config;
 use platform::LocalStream;
 
 const MAX_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Best-effort deadline for half-closing a local stream after daemon
+/// cancellation. Windows named-pipe shutdown can wait on a non-reading peer.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -53,8 +57,6 @@ pub fn socket_path(config: &Config) -> PathBuf {
 
 // ── Transport ────────────────────────────────────────────────────
 
-/// Platform-neutral half-write type produced by `tokio::io::split`.
-type LocalWriteHalf = tokio::io::WriteHalf<LocalStream>;
 /// Platform-neutral half-read type produced by `tokio::io::split`.
 type LocalReadHalf = tokio::io::ReadHalf<LocalStream>;
 
@@ -64,23 +66,49 @@ pub struct LocalTransport {
     peer_label: String,
 }
 
+async fn run_writer<W>(
+    mut writer: W,
+    mut writer_rx: mpsc::Receiver<String>,
+    cancel: CancellationToken,
+    shutdown_timeout: Duration,
+) where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let mut line = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            line = writer_rx.recv() => match line {
+                Some(line) => line,
+                None => break,
+            },
+        };
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        let written = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => false,
+            result = writer.write_all(line.as_bytes()) => result.is_ok(),
+        };
+        if !written {
+            break;
+        }
+    }
+    let _ = tokio::time::timeout(shutdown_timeout, writer.shutdown()).await;
+}
+
 impl LocalTransport {
-    pub fn new(stream: LocalStream) -> Self {
+    pub fn new(stream: LocalStream, cancel: CancellationToken) -> Self {
         let peer_label = platform::peer_label_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        zeroclaw_spawn::spawn!(async move {
-            let mut writer: LocalWriteHalf = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
+        // Session approval channels and log forwarders retain writer senders
+        // past disconnect, so channel closure alone cannot end this task.
+        // Cancellation interrupts both queue waits and an in-flight write;
+        // shutdown is bounded for suspended local peers.
+        zeroclaw_spawn::spawn!(run_writer(write_half, writer_rx, cancel, SHUTDOWN_TIMEOUT));
 
         Self {
             reader: BufReader::new(read_half),
@@ -116,7 +144,16 @@ impl RpcTransport for LocalTransport {
     }
 }
 
-// ── Listener ─────────────────────────────────────────────────────
+/// RAII decrement guard for the client counter held by an accepted connection
+/// task. The counter drives `--ephemeral` shutdown, so a missed decrement
+/// would keep an idle daemon alive forever.
+struct ClientCountGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Run the local IPC RPC listener as a daemon subsystem.
 /// `client_count` is incremented on connect, decremented on disconnect.
@@ -150,6 +187,8 @@ pub async fn run_local_listener(
         "RPC local IPC listening"
     );
 
+    let mut connection_tasks = tokio::task::JoinSet::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -160,6 +199,7 @@ pub async fn run_local_listener(
                 );
                 break;
             }
+            Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {}
             accept = platform::accept(&mut listener, &path) => {
                 let stream = match accept {
                     Ok(v) => v,
@@ -184,15 +224,31 @@ pub async fn run_local_listener(
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
+                let conn_cancel = cancel.child_token();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
-                    let mut transport = LocalTransport::new(stream);
+                connection_tasks.spawn(async move {
+                    let _count_guard = ClientCountGuard(count);
+                    let mut transport = LocalTransport::new(stream, conn_cancel.clone());
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    dispatcher.run(&mut transport).await;
+                    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        conn_cancel.clone(),
+                    );
+                    tokio::select! {
+                        _ = dispatcher.run(&mut transport) => {}
+                        _ = conn_cancel.cancelled() => {}
+                    }
+                    // Keep this sequencing in the connection task instead of
+                    // wrapping it in `RpcDispatcher::run_connection`: the
+                    // dispatcher request future is large enough that the
+                    // extra nested async frame can overflow Tokio's normal
+                    // worker stack in ordinary local-listener tests.
+                    dispatcher.shutdown().await;
 
                     // Epoch-checked for the same reason as the WSS teardown: a
                     // reconnect adopting this TUI id must not be evicted by the
@@ -217,10 +273,21 @@ pub async fn run_local_listener(
                         .instrument(span)
                         .await;
                     }
-
-                    count.fetch_sub(1, Ordering::Relaxed);
                 });
             }
+        }
+    }
+
+    // Drain accepted connection tasks. Each connection cancels its prompts
+    // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
+    // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
+    // exceeds that window, force-abort remaining connection tasks and join them.
+    tokio::select! {
+        _ = async {
+            while connection_tasks.join_next().await.is_some() {}
+        } => {}
+        _ = tokio::time::sleep(Duration::from_millis(5500)) => {
+            connection_tasks.shutdown().await;
         }
     }
 
@@ -652,6 +719,21 @@ mod tests {
         let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(SessionStore::new(64, session_queue));
         RpcContext::minimal(config, sessions)
+    }
+
+    #[cfg(unix)]
+    fn test_ctx_with_event_tx(
+        tmp: &std::path::Path,
+        event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    ) -> Arc<RpcContext> {
+        let config = Config {
+            data_dir: tmp.to_path_buf(),
+            config_path: tmp.join("config.toml"),
+            ..Config::default()
+        };
+        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(SessionStore::new(64, session_queue));
+        RpcContext::minimal_with_event_tx(config, sessions, event_tx)
     }
 
     fn test_client_count() -> Arc<AtomicUsize> {
@@ -1296,6 +1378,560 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_closes_client_connection_despite_parked_writer_sender() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
+        let ctx = test_ctx_with_event_tx(tmp.path(), event_tx.clone());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
+        });
+
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+
+        // Park a live writer-sender clone inside the detached logs
+        // forwarder task; a cancelled daemon must close the connection
+        // even while this holder keeps the writer channel open.
+        writer
+            .write_all(rpc_request(Method::LogsSubscribe, &serde_json::json!({}), 2).as_bytes())
+            .await
+            .unwrap();
+        let (_frame, result): (_, serde_json::Value) = read_result(&mut reader).await;
+        assert_eq!(result["subscribed"], true);
+
+        cancel.cancel();
+
+        // The client write half stays open: EOF must come purely from the
+        // server-side half-close.
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("cancelled daemon must half-close the client connection");
+        assert_eq!(read.unwrap(), 0, "client should observe EOF, got: {line:?}");
+
+        wait_for_client_count(&count, 0).await;
+
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    async fn assert_reload_drains_local_connection_generation() {
+        use crate::rpc::dispatch::connection_test_support::{QUEUED_SID, RUNNING_SID, fixture};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = fixture(tmp.path()).await;
+        let sock_path = fixture.ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let queued_guard = fixture
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(QUEUED_SID)
+            .await
+            .expect("test should hold the queued session actor");
+
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&fixture.ctx);
+        let server_count = Arc::clone(&count);
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
+        });
+
+        wait_for_socket(&sock_path).await;
+        let (_reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": RUNNING_SID, "prompt": "run"}),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fixture.provider_started.notified())
+            .await
+            .expect("running prompt should reach the provider");
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": QUEUED_SID, "prompt": "queue"}),
+                    3,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second prompt should be waiting in the session actor queue");
+
+        cancel.cancel();
+        wait_for_client_count(&count, 0).await;
+
+        assert!(
+            fixture
+                .provider_dropped
+                .load(std::sync::atomic::Ordering::Acquire),
+            "reload must cancel and join the running provider future"
+        );
+        assert_eq!(
+            fixture
+                .queued_provider_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a queued prompt from the closed generation must never execute"
+        );
+        assert_eq!(
+            fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await,
+            1,
+            "only the deliberate test holder should remain queued"
+        );
+        assert!(!fixture.ctx.sessions.has_inflight_turn(RUNNING_SID));
+        drop(queued_guard);
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_drains_running_and_queued_prompts_for_local_connection_generation() {
+        assert_reload_drains_local_connection_generation().await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_reload_replacement_generation_waits_for_durable_session_prompt_local() {
+        use crate::rpc::dispatch::connection_test_support::insert_session;
+        use async_trait::async_trait;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::Notify;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        const DURABLE_SID: &str = "durable-reload-session";
+
+        struct HoldOnDrop {
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        impl Drop for HoldOnDrop {
+            fn drop(&mut self) {
+                self.log.lock().unwrap().push("gen1_unwind_start");
+                let (lock, cvar) = &*self.allow_finish;
+                let mut finished = lock.lock().unwrap();
+                while !*finished {
+                    finished = cvar.wait(finished).unwrap();
+                }
+                self.is_running.store(false, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_ended");
+            }
+        }
+
+        struct BlockingGen1Provider {
+            started: Arc<Notify>,
+            allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            is_running: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for BlockingGen1Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                self.is_running.store(true, Ordering::SeqCst);
+                self.log.lock().unwrap().push("gen1_started");
+                let _drop_guard = HoldOnDrop {
+                    allow_finish: Arc::clone(&self.allow_finish),
+                    is_running: Arc::clone(&self.is_running),
+                    log: Arc::clone(&self.log),
+                };
+                self.started.notify_one();
+                std::future::pending::<()>().await;
+                Ok("gen1 finished".to_string())
+            }
+        }
+
+        impl Attributable for BlockingGen1Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "blocking-gen1"
+            }
+        }
+
+        struct ObservantGen2Provider {
+            gen1_is_running: Arc<AtomicBool>,
+            started: Arc<Notify>,
+            overlap_detected: Arc<AtomicBool>,
+            log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ObservantGen2Provider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                if self.gen1_is_running.load(Ordering::SeqCst) {
+                    self.overlap_detected.store(true, Ordering::SeqCst);
+                    self.log.lock().unwrap().push("OVERLAP_DETECTED");
+                }
+                self.log.lock().unwrap().push("gen2_started");
+                self.started.notify_one();
+                self.log.lock().unwrap().push("gen2_ended");
+                Ok("gen2 finished".to_string())
+            }
+        }
+
+        impl Attributable for ObservantGen2Provider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+            fn alias(&self) -> &str {
+                "observant-gen2"
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+
+        let gen1_started = Arc::new(Notify::new());
+        let allow_gen1_finish = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gen1_is_running = Arc::new(AtomicBool::new(false));
+        let gen2_started = Arc::new(Notify::new());
+        let overlap_detected = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Generation 1 setup
+        let config1 = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
+        let sessions1 = Arc::new(SessionStore::new(64, queue1));
+        let ctx1 = RpcContext::for_persistence_tests(
+            config1,
+            sessions1,
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+
+        insert_session(
+            &ctx1,
+            tmp.path(),
+            DURABLE_SID,
+            Box::new(BlockingGen1Provider {
+                started: Arc::clone(&gen1_started),
+                allow_finish: Arc::clone(&allow_gen1_finish),
+                is_running: Arc::clone(&gen1_is_running),
+                log: Arc::clone(&log),
+            }),
+        )
+        .await;
+
+        let cancel1 = CancellationToken::new();
+        let count1 = Arc::new(AtomicUsize::new(0));
+        let cancel1_for_listener = cancel1.clone();
+        let ctx1_for_listener = Arc::clone(&ctx1);
+        let count1_for_listener = Arc::clone(&count1);
+
+        let gen1_listener_handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(
+                ctx1_for_listener,
+                cancel1_for_listener,
+                count1_for_listener,
+                None,
+            )
+            .await
+        });
+
+        wait_for_socket(&sock_path).await;
+        let (_reader1, mut writer1) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count1, 1).await;
+
+        // Send prompt to Generation 1
+        writer1
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 1"}),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), gen1_started.notified())
+            .await
+            .expect("Gen 1 prompt should reach provider");
+
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must be running"
+        );
+
+        // Trigger reload on Generation 1
+        cancel1.cancel();
+
+        // Give any spurious eager exit a moment to trigger (without the fix, listener would return immediately)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !gen1_listener_handle.is_finished(),
+            "Gen 1 listener must NOT finish while prompt is held in cancellation"
+        );
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must remain active while draining"
+        );
+
+        // Spawn replacement generation (Generation 2) task.
+        // It awaits Generation 1 listener exit, exactly like daemon reload / supervisor handoff,
+        // then runs its own listener and attempts to prompt the same durable session.
+        let tmp_path = tmp.path().to_path_buf();
+        let chat_backend2 = chat_backend.clone();
+        let gen1_is_running_for_gen2 = Arc::clone(&gen1_is_running);
+        let gen2_started_clone = Arc::clone(&gen2_started);
+        let overlap_detected_clone = Arc::clone(&overlap_detected);
+        let log_clone = Arc::clone(&log);
+        let sock_path2 = sock_path.clone();
+
+        let gen2_task = zeroclaw_spawn::spawn!(async move {
+            // Gen 2 waits for Gen 1 listener to cleanly shut down
+            gen1_listener_handle
+                .await
+                .unwrap()
+                .expect("Gen 1 listener should exit Ok");
+
+            let config2 = zeroclaw_config::schema::Config {
+                data_dir: tmp_path.clone(),
+                config_path: tmp_path.join("config.toml"),
+                ..Default::default()
+            };
+            let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
+            let sessions2 = Arc::new(SessionStore::new(64, queue2));
+            let ctx2 = RpcContext::for_persistence_tests(
+                config2,
+                sessions2,
+                Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+                None,
+            );
+
+            insert_session(
+                &ctx2,
+                &tmp_path,
+                DURABLE_SID,
+                Box::new(ObservantGen2Provider {
+                    gen1_is_running: gen1_is_running_for_gen2,
+                    started: gen2_started_clone,
+                    overlap_detected: overlap_detected_clone,
+                    log: log_clone,
+                }),
+            )
+            .await;
+
+            let cancel2 = CancellationToken::new();
+            let count2 = Arc::new(AtomicUsize::new(0));
+            let cancel2_for_listener = cancel2.clone();
+            let handle2 = zeroclaw_spawn::spawn!(async move {
+                run_local_listener(ctx2, cancel2_for_listener, count2, None).await
+            });
+
+            wait_for_socket(&sock_path2).await;
+            let (_reader2, mut writer2) = do_initialize(&sock_path2).await;
+
+            writer2
+                .write_all(
+                    rpc_request(
+                        Method::SessionPrompt,
+                        &serde_json::json!({"session_id": DURABLE_SID, "prompt": "prompt 2"}),
+                        3,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            // Wait for Gen 2 prompt to execute
+            let _ = tokio::time::sleep(Duration::from_millis(150)).await;
+
+            cancel2.cancel();
+            handle2
+                .await
+                .unwrap()
+                .expect("Gen 2 listener should exit Ok");
+            drop(writer2);
+        });
+
+        // While Gen 1 is held in cancellation, verify Gen 2 has not started its prompt
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            gen1_is_running.load(Ordering::SeqCst),
+            "Gen 1 prompt must still be held"
+        );
+        let current_log = log.lock().unwrap().clone();
+        assert_eq!(
+            current_log,
+            vec!["gen1_started", "gen1_unwind_start"],
+            "Prompt 2 must not have started yet"
+        );
+
+        // Now allow Gen 1 prompt to complete its cooperative cancellation unwind
+        {
+            let (lock, cvar) = &*allow_gen1_finish;
+            let mut finished = lock.lock().unwrap();
+            *finished = true;
+            cvar.notify_all();
+        }
+
+        // Gen 2 task should now complete cleanly
+        tokio::time::timeout(Duration::from_secs(5), gen2_task)
+            .await
+            .expect("Gen 2 reload handoff should finish within timeout")
+            .expect("Gen 2 task should not panic");
+
+        assert!(
+            !overlap_detected.load(Ordering::SeqCst),
+            "Prompt 2 must not overlap with Prompt 1 on durable session"
+        );
+        let final_log = log.lock().unwrap().clone();
+        assert_eq!(
+            final_log,
+            vec![
+                "gen1_started",
+                "gen1_unwind_start",
+                "gen1_ended",
+                "gen2_started",
+                "gen2_ended"
+            ],
+            "Generations must execute sequentially with Gen 1 fully drained before Gen 2 begins"
+        );
+
+        drop(writer1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_replacement_generation_waits_for_durable_session_prompt_local() {
+        std::thread::Builder::new()
+            .name("local-reload-durable-session".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        assert_reload_replacement_generation_waits_for_durable_session_prompt_local(
+                        ),
+                    );
+            })
+            .unwrap()
+            .join()
+            .expect("local reload durable session test thread should not panic");
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_non_reading_peer_write_and_bounds_shutdown() {
+        let (server, mut non_reading_peer) = tokio::io::duplex(1);
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(1);
+        let cancel = CancellationToken::new();
+        let writer_cancel = cancel.clone();
+        let writer_task = zeroclaw_spawn::spawn!(run_writer(
+            server,
+            writer_rx,
+            writer_cancel,
+            Duration::from_millis(50),
+        ));
+
+        // Preload a frame larger than the duplex capacity. With the peer
+        // reading only the first byte and then stopping, `write_all` cannot
+        // finish.
+        writer_tx.send("x".repeat(64 * 1024)).await.unwrap();
+        let mut first_byte = [0_u8; 1];
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            non_reading_peer.read_exact(&mut first_byte),
+        )
+        .await
+        .expect("writer must start the queued frame")
+        .expect("read first queued byte");
+        assert_eq!(first_byte, [b'x']);
+        assert!(
+            !writer_task.is_finished(),
+            "writer must be pending on the non-reading local peer"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(250), writer_task)
+            .await
+            .expect("cancellation and bounded shutdown must release the writer")
+            .expect("writer task must not panic");
+
+        // Keep the sender alive through cancellation: EOF must result from
+        // releasing the stream, not from closing the writer queue.
+        let mut buffered = Vec::new();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            non_reading_peer.read_to_end(&mut buffered),
+        )
+        .await
+        .expect("released local stream must reach EOF")
+        .expect("read buffered prefix");
+        drop(writer_tx);
     }
 
     #[cfg(windows)]
