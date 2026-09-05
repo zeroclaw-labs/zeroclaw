@@ -1,3 +1,5 @@
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+mod acp_cli;
 #[cfg(feature = "channel-acp-server")]
 mod acp_session_cwd_stdio;
 #[cfg(feature = "agent-runtime")]
