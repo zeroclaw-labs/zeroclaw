@@ -3,8 +3,26 @@ use super::traits::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// A resolved cross-agent memory grant. `None` means all categories are
+/// visible; `Some` is an exact category-name allowlist.
+#[derive(Debug, Clone)]
+pub struct AgentMemoryGrant {
+    pub agent_id: String,
+    pub categories: Option<HashSet<String>>,
+}
+
+impl AgentMemoryGrant {
+    #[must_use]
+    pub fn unrestricted(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            categories: None,
+        }
+    }
+}
 
 pub struct AgentScopedMemory {
     /// The wrapped backend. `Arc<dyn Memory>` to slot into the existing
@@ -19,6 +37,10 @@ pub struct AgentScopedMemory {
     /// additional UUIDs come from the configured `read_memory_from`
     /// allowlist resolved at construction.
     allowed_agent_ids: HashSet<String>,
+    /// Optional exact category allowlists keyed by resolved agent UUID.
+    /// The bound agent is always inserted with `None` so it sees all of its
+    /// own rows regardless of sibling grants.
+    allowed_categories: HashMap<String, Option<HashSet<String>>>,
 }
 
 impl AgentScopedMemory {
@@ -28,14 +50,43 @@ impl AgentScopedMemory {
         agent_id: impl Into<String>,
         allowed_sibling_agent_ids: impl IntoIterator<Item = String>,
     ) -> Self {
+        let grants = allowed_sibling_agent_ids
+            .into_iter()
+            .map(AgentMemoryGrant::unrestricted);
+        Self::new_with_grants(inner, agent_id, grants)
+    }
+
+    /// Construct a scoped wrapper with per-agent category grants.
+    pub fn new_with_grants(
+        inner: Arc<dyn Memory>,
+        agent_id: impl Into<String>,
+        grants: impl IntoIterator<Item = AgentMemoryGrant>,
+    ) -> Self {
         let agent_id = agent_id.into();
-        let mut allowed_agent_ids: HashSet<String> =
-            allowed_sibling_agent_ids.into_iter().collect();
+        let mut allowed_agent_ids = HashSet::new();
+        let mut allowed_categories = HashMap::new();
+        for grant in grants {
+            allowed_agent_ids.insert(grant.agent_id.clone());
+            match allowed_categories.entry(grant.agent_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(grant.categories);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Duplicate grants are invalid configuration. If one
+                    // reaches this lower-level constructor despite the
+                    // factory guard, deny the source completely rather than
+                    // letting iteration order widen a scoped grant.
+                    entry.insert(Some(HashSet::new()));
+                }
+            }
+        }
         allowed_agent_ids.insert(agent_id.clone());
+        allowed_categories.insert(agent_id.clone(), None);
         Self {
             inner,
             agent_id,
             allowed_agent_ids,
+            allowed_categories,
         }
     }
 
@@ -44,6 +95,74 @@ impl AgentScopedMemory {
     /// borrowed slice. Stable iteration order is not required.
     fn allowed_slice(&self) -> Vec<&str> {
         self.allowed_agent_ids.iter().map(String::as_str).collect()
+    }
+
+    fn entry_allowed(&self, entry: &MemoryEntry) -> bool {
+        let Some(agent_id) = entry.agent_id.as_deref() else {
+            // Backends intentionally surface legacy, unattributed rows from
+            // recall_for_agents; preserve that compatibility behavior.
+            return true;
+        };
+        let Some(categories) = self.allowed_categories.get(agent_id) else {
+            return false;
+        };
+        categories
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&entry.category.to_string()))
+    }
+
+    fn filter_entries(&self, entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        entries
+            .into_iter()
+            .filter(|entry| self.entry_allowed(entry))
+            .collect()
+    }
+
+    fn filter_attributed_entries(&self, entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+        entries
+            .into_iter()
+            .filter(|entry| entry.agent_id.is_some() && self.entry_allowed(entry))
+            .collect()
+    }
+
+    async fn recall_with_category_refill(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .inner
+                .recall_for_agents(
+                    allowed_agent_ids,
+                    query,
+                    fetch_limit,
+                    session_id,
+                    since,
+                    until,
+                )
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered = self.filter_entries(entries);
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 }
 
@@ -207,8 +326,7 @@ impl Memory for AgentScopedMemory {
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let allowed = self.allowed_slice();
-        self.inner
-            .recall_for_agents(&allowed, query, limit, session_id, since, until)
+        self.recall_with_category_refill(&allowed, query, limit, session_id, since, until)
             .await
     }
 
@@ -224,8 +342,7 @@ impl Memory for AgentScopedMemory {
         if caller_allowed.is_empty() {
             let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
             return self
-                .inner
-                .recall_for_agents(&bound, query, limit, session_id, since, until)
+                .recall_with_category_refill(&bound, query, limit, session_id, since, until)
                 .await;
         }
 
@@ -237,8 +354,7 @@ impl Memory for AgentScopedMemory {
         if intersected.is_empty() {
             return Ok(Vec::new());
         }
-        self.inner
-            .recall_for_agents(&intersected, query, limit, session_id, since, until)
+        self.recall_with_category_refill(&intersected, query, limit, session_id, since, until)
             .await
     }
 
@@ -250,7 +366,9 @@ impl Memory for AgentScopedMemory {
             if sibling == &self.agent_id {
                 continue;
             }
-            if let Some(hit) = self.inner.get_for_agent(key, sibling).await? {
+            if let Some(hit) = self.inner.get_for_agent(key, sibling).await?
+                && self.entry_allowed(&hit)
+            {
                 return Ok(Some(hit));
             }
         }
@@ -261,7 +379,10 @@ impl Memory for AgentScopedMemory {
         if agent_id != self.agent_id && !self.allowed_agent_ids.iter().any(|a| a == agent_id) {
             return Ok(None);
         }
-        self.inner.get_for_agent(key, agent_id).await
+        self.inner
+            .get_for_agent(key, agent_id)
+            .await
+            .map(|entry| entry.filter(|entry| self.entry_allowed(entry)))
     }
 
     async fn list(
@@ -270,14 +391,7 @@ impl Memory for AgentScopedMemory {
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let entries = self.inner.list(category, session_id).await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| {
-                e.agent_id
-                    .as_deref()
-                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
-            })
-            .collect())
+        Ok(self.filter_attributed_entries(entries))
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
@@ -348,14 +462,7 @@ impl Memory for AgentScopedMemory {
         // Scope to the bound + allowlisted agents so a wrapper-using
         // caller does not see the install-wide row total.
         let entries = self.inner.list(None, None).await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| {
-                e.agent_id
-                    .as_deref()
-                    .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
-            })
-            .count())
+        Ok(self.filter_attributed_entries(entries).len())
     }
 
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
@@ -412,14 +519,31 @@ impl Memory for AgentScopedMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit * 2, session_id, since, until)
-            .await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace)
-            .take(limit)
-            .collect())
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered: Vec<MemoryEntry> = entries
+                .into_iter()
+                .filter(|e| e.namespace == namespace)
+                .take(limit)
+                .collect();
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered);
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered);
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {
@@ -680,6 +804,211 @@ mod tests {
             hits.iter().any(|e| e.key == "sibling-key"),
             "rows attributed to an allowlisted sibling must surface"
         );
+    }
+
+    #[tokio::test]
+    async fn category_grant_filters_sibling_rows_but_not_own_rows() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "beta-family",
+                "beta family",
+                MemoryCategory::Custom("family".into()),
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_with_agent(
+                "beta-daily",
+                "beta daily",
+                MemoryCategory::Daily,
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let family = wrapper.recall("beta", 10, None, None, None).await.unwrap();
+        assert!(family.iter().any(|entry| entry.key == "beta-family"));
+        assert!(!family.iter().any(|entry| entry.key == "beta-daily"));
+
+        wrapper
+            .store("own-daily", "own daily", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        let own = wrapper
+            .recall("own daily", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(own.iter().any(|entry| entry.key == "own-daily"));
+    }
+
+    #[tokio::test]
+    async fn category_grant_refills_after_denied_rows_consume_limit() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        for idx in 0..12 {
+            inner
+                .store_with_agent(
+                    &format!("beta-denied-{idx}"),
+                    "needle denied row",
+                    MemoryCategory::Daily,
+                    None,
+                    None,
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+        inner
+            .store_with_agent(
+                "beta-allowed",
+                "needle allowed row",
+                MemoryCategory::Custom("family".into()),
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let results = wrapper.recall("needle", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "beta-allowed");
+    }
+
+    #[tokio::test]
+    async fn category_grant_refills_recent_rows_after_denied_matches_consume_limit() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "beta-allowed",
+                "recent allowed row",
+                MemoryCategory::Custom("family".into()),
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+        for idx in 0..12 {
+            inner
+                .store_with_agent(
+                    &format!("beta-denied-{idx}"),
+                    "recent denied row",
+                    MemoryCategory::Daily,
+                    None,
+                    None,
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let results = wrapper.recall("*", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "beta-allowed");
+    }
+
+    #[tokio::test]
+    async fn namespaced_recall_refills_after_allowed_rows_in_other_namespaces() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "beta-wanted",
+                "needle wanted",
+                MemoryCategory::Custom("family".into()),
+                None,
+                Some("wanted"),
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+        for idx in 0..2 {
+            inner
+                .store_with_agent(
+                    &format!("beta-other-{idx}"),
+                    "needle other",
+                    MemoryCategory::Custom("family".into()),
+                    None,
+                    Some("other"),
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        for query in ["needle", "*"] {
+            let results = wrapper
+                .recall_namespaced("wanted", query, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "query={query}");
+            assert_eq!(results[0].key, "beta-wanted", "query={query}");
+        }
     }
 
     #[tokio::test]

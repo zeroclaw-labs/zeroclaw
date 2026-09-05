@@ -9453,7 +9453,9 @@ mod tests {
         reviewer
             .workspace
             .read_memory_from
-            .push(AgentAlias::new("alpha"));
+            .push(zeroclaw_config::multi_agent::MemoryGrant::Agent(
+                AgentAlias::new("alpha"),
+            ));
         config.agents.insert("reviewer".to_string(), reviewer);
 
         let mut group = PeerGroupConfig::default();
@@ -9514,7 +9516,9 @@ mod tests {
         );
         assert_eq!(
             config.agents["reviewer"].workspace.read_memory_from,
-            vec![zeroclaw_config::multi_agent::AgentAlias::new("beta")]
+            vec![zeroclaw_config::multi_agent::MemoryGrant::Agent(
+                zeroclaw_config::multi_agent::AgentAlias::new("beta")
+            )]
         );
         assert_eq!(
             config.peer_groups["crew"].agents,

@@ -308,7 +308,12 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
     {
         table.remove(&serde_name);
     } else {
-        table.insert(serde_name, parse_prop_value(value_str, kind)?);
+        let parsed = if kind == PropKind::ObjectArray && name.ends_with("read_memory_from") {
+            parse_memory_grant_array(value_str)?
+        } else {
+            parse_prop_value(value_str, kind)?
+        };
+        table.insert(serde_name, parsed);
     }
     *target = toml::from_str(&toml::to_string(&table)?)?;
     Ok(())
@@ -569,6 +574,31 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
             })
         }
     }
+}
+
+/// Preserve the legacy `config set` and environment-override grammar for the
+/// untagged `MemoryGrant` array while still accepting its structured JSON form.
+fn parse_memory_grant_array(value_str: &str) -> anyhow::Result<toml::Value> {
+    let trimmed = value_str.trim();
+    if trimmed.is_empty() || trimmed == crate::traits::UNSET_DISPLAY {
+        return Ok(toml::Value::Array(Vec::new()));
+    }
+
+    if trimmed.starts_with('[') {
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::Error::msg(format!("invalid JSON memory grant array: {e}")))?;
+        return json_to_toml(value)
+            .ok_or_else(|| anyhow::Error::msg("JSON memory grant array contained only nulls"));
+    }
+
+    Ok(toml::Value::Array(
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty() && *item != crate::traits::UNSET_DISPLAY)
+            .map(|item| toml::Value::String(item.to_string()))
+            .collect(),
+    ))
 }
 
 /// Walk a `serde_json::Value` into a `toml::Value`, dropping any `null`s
@@ -933,6 +963,22 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("tok1"));
         assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
+    }
+
+    #[test]
+    fn parse_memory_grant_array_accepts_legacy_and_structured_forms() {
+        let legacy = parse_memory_grant_array("beta, gamma").unwrap();
+        assert_eq!(legacy.as_array().unwrap().len(), 2);
+        assert_eq!(legacy.as_array().unwrap()[0].as_str(), Some("beta"));
+
+        let mixed =
+            parse_memory_grant_array(r#"["beta", {"agent":"gamma", "categories":["facts"]}]"#)
+                .unwrap();
+        assert_eq!(mixed.as_array().unwrap().len(), 2);
+        assert_eq!(
+            mixed.as_array().unwrap()[1]["agent"],
+            toml::Value::String("gamma".into())
+        );
     }
 
     // ── validate_alias_key ────────────────────────────────────────────────

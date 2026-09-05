@@ -34,6 +34,28 @@ POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are
 
 Same-backend only. To let `researcher` recall memories that `primary` wrote, both agents must use the same memory backend (e.g. both `sqlite`). The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
 
+The legacy string form grants every category:
+
+```toml
+read_memory_from = ["primary"]
+```
+
+For least-privilege sharing, use one typed grant per source agent and list the
+exact category names that may be recalled:
+
+```toml
+read_memory_from = [
+  { agent = "primary", categories = ["core", "family"] },
+]
+```
+
+An omitted `categories` field is unrestricted. An explicitly empty category
+list is rejected, and unknown category names match nothing. Grants are
+non-transitive: a sibling's own grants do not broaden the caller's view.
+Category-scoped grants require a backend that preserves per-row categories;
+the Markdown backend rejects them during validation and again at memory
+factory construction.
+
 The bound agent always sees its own rows; the allowlist is purely additive. There is no way to *hide* an agent's own rows from itself.
 
 ## Peer group on a shared channel
@@ -47,6 +69,8 @@ The schema validator at config load enforces:
 1. Every member's `channels` list includes the group's `channel` (an agent that doesn't listen there can't peer there).
 2. Every member is a configured agent (no dangling references).
 3. `read_memory_from` does not point at the agent itself.
+4. Each source agent appears at most once in `read_memory_from`; combine all
+   categories into that one grant.
 
 ## Inspect the install
 
