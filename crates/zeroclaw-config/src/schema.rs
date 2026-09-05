@@ -24774,7 +24774,10 @@ pub struct SopConfig {
     #[serde(default = "default_sop_execution_mode")]
     pub default_execution_mode: String,
 
-    /// Maximum total concurrent SOP runs across all SOPs.
+    /// Maximum SOP runs executing at once across ALL SOPs: one shared pool, not a per-SOP allowance; a SOP's own `max_concurrent` bounds only its own runs, so an individual SOP never exceeds the smaller of the two and reaches this ceiling only when no other SOP holds a slot; runs parked at a HITL approval or a deterministic checkpoint release their slot and count against neither cap; a trigger that cannot admit is deferred and a resume that cannot re-claim reports `deferred_at_capacity`, staying parked and re-resolvable rather than oversubscribing.
+    ///
+    /// Raising this raises the ceiling for every SOP at once. To bound one SOP
+    /// alone, set that SOP's `max_concurrent` in its `SOP.toml`.
     #[serde(default = "default_sop_max_concurrent_total")]
     pub max_concurrent_total: usize,
 
@@ -37243,6 +37246,21 @@ stream_tool_arguments = [
             mx.set_prop("channels.matrix.draft_update_interval_ms", "abc")
                 .is_err()
         );
+    }
+
+    #[test]
+    async fn set_prop_sop_max_concurrent_total() {
+        // `config set sop.max_concurrent_total` was reported as returning "Unknown
+        // property". It resolves today, but only through the derive's nested
+        // delegation (`Config` -> `SopConfig`), and no named test covers it:
+        // the bulk scalar sweep swallows unsettable keys into a counter, so a
+        // regression here would not fail CI. Drive it off the whole `Config`,
+        // which is the path the CLI, gateway and RPC writers all take.
+        let mut config = Config::default();
+        config.set_prop("sop.max_concurrent_total", "8").unwrap();
+        assert_eq!(config.sop.max_concurrent_total, 8);
+        assert_eq!(config.get_prop("sop.max_concurrent_total").unwrap(), "8");
+        assert!(config.set_prop("sop.max_concurrent_total", "abc").is_err());
     }
 
     #[test]

@@ -877,6 +877,30 @@ mod tests {
     }
 
     #[test]
+    fn sop_show_concurrency_strings_format_in_all_locales() {
+        // `sop show` printed only the SOP's declared `max_concurrent`
+        // while the shared `sop.max_concurrent_total` pool was what actually
+        // bound. Both lines must render, with the value substituted, in every
+        // locale a user can select.
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in ["cli-sop-max-concurrent", "cli-sop-global-ceiling"] {
+                let value = format_ftl_message(source, locale, key, &[("value", "4")])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    value.contains('4'),
+                    "{key} in {locale} should substitute the value; got: {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cli_approval_prompt_strings_format_in_all_locales() {
         let tool = "shell";
         let cases = [

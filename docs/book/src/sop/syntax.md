@@ -30,7 +30,7 @@ happens when a trigger arrives while this SOP's execution slots are full:
 
 | Field | Default | Effect |
 |---|---:|---|
-| `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. |
+| `max_concurrent` | `1` | Maximum runs of this SOP *executing* at once. A run parked at a HITL approval or a deterministic checkpoint releases its slot, so it does not count against this. The global `max_concurrent_total` pool applies on top of it; see [Global Concurrency Ceiling](#global-concurrency-ceiling). |
 | `admission_policy` | `parallel` | How a trigger that cannot admit right now is handled (see below). |
 | `max_pending_approvals` | `0` (unlimited) | Upper bound on runs of this SOP parked at a HITL approval simultaneously. Past the bound, further triggers are deferred (backpressure), never silently dropped (except under `drop`). |
 
@@ -73,6 +73,28 @@ max_pending_approvals = 8
 [[triggers]]
 type = "manual"
 ```
+
+### Global Concurrency Ceiling
+
+The `[sop]` config caps how many runs may execute across *all* SOPs at once:
+
+| Field | Default | Effect |
+|---|---:|---|
+| `max_concurrent_total` | `4` | Maximum runs *executing* at once across every loaded SOP. Applies on top of each SOP's own `max_concurrent`; a run parked at a HITL approval or a deterministic checkpoint releases its slot and does not count against either. |
+
+This is a shared pool, not a per-SOP clamp. Two SOPs that each declare
+`max_concurrent = 8` contend for the same budget of 4, so raising one SOP's
+`max_concurrent` above `max_concurrent_total` cannot widen it: an individual SOP
+never observes more than the smaller of the two.
+
+The ceiling is enforced on a fresh start and again on resume, so a burst of
+simultaneous approvals cannot push the executing set past it. Exhaustion is
+backpressure, not loss: a trigger that cannot admit is deferred per its
+`admission_policy`, and an approval that cannot resume reports
+`deferred_at_capacity`, leaving the gate waiting and re-resolvable once a slot
+frees.
+
+Set it with `zeroclaw config set sop.max_concurrent_total <n>`.
 
 Approval broker groups and policies live in the main ZeroClaw config, not in
 per-SOP `SOP.toml` files. A step can reference a configured policy by name with
