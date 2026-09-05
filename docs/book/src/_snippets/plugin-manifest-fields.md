@@ -15,10 +15,20 @@ fields are the serde surface of `PluginManifest` in
 | `config_schema` | exactly with `config_read` | Draft 2020-12 JSON Schema for this plugin's private config; it is included in the canonical manifest bytes and therefore covered when the manifest is signed. The root must be an object with a `properties` map and `additionalProperties = false`. Every top-level property must have one explicit supported type, directly or through a local JSON Pointer: `string`, `boolean`, `integer`, `number`, `array`, or `object`. Tool and channel consumers may set `x-secret = true` directly on a top-level string property to remove it from public config and expose it through the scoped `secrets.get` host import. Tools receive public config under `__config` and may read secrets during `execute`. Channels read the current public object through `config.get` and secrets through `secrets.get` during `configure` and operational calls; both imports are unavailable during instantiation and static metadata discovery. Nested, false, or non-boolean secret markers and secret non-string properties are rejected. A schema without `config_read`, or `config_read` without a schema, is rejected. |
 | `signature` | no | Base64url Ed25519 signature over the canonical manifest bytes. Set when signing for distribution. |
 | `publisher_key` | no | Hex-encoded Ed25519 public key of the signer. |
+| `egress` | no | Optional `[egress]` table carrying a `hosts` list: the destinations this plugin declares it needs, as exact hosts (`api.example.com`) or explicit suffix patterns (`*.example.com`, which matches subdomains but not the apex). It is part of the canonical manifest bytes, so it is covered when the manifest is signed and changing it requires re-signing. Invalid grammar rejects the whole manifest at discovery and at install. Absent, empty, and "declares nothing" are the same state. |
 
 Declare only the permissions the code actually uses. An undeclared permission
 is a host surface the component cannot reach; an unnecessary declared one is
 attack surface you asked for and audit burden for whoever reviews your plugin.
+
+`[egress]` is a declaration, not a grant. Nothing in a manifest confers network
+reach: the allowlist the host enforces is the operator's
+`plugins.entries[].egress_hosts` on the instance's own `zpi1_…` row, so an
+unsigned component that writes its own `[egress]` table still reaches nothing.
+What the declaration buys is the install ceremony: `zeroclaw plugin install`
+seeds it into a row it creates and prints what it granted, and it never widens
+a row that already exists. See
+[Declaring and granting egress](../plugins/index.md#declaring-and-granting-egress).
 
 Operator values remain strings in `plugins.entries` and are encrypted when
 persisted, keyed by a versioned `zpi1_…` string derived from the host-owned

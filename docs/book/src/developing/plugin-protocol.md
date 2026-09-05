@@ -544,6 +544,49 @@ Tool and channel are the current config consumers. The memory world has no
 config import yet, so memory plugins must not request `config_read` until that
 ABI and runtime wiring land.
 
+### Declared egress (`[egress]`)
+
+**Applies to:** any plugin requesting a transport permission (`http_client`)
+
+A manifest may carry an optional `[egress]` table naming the destinations the
+plugin declares it needs:
+
+```toml
+[egress]
+hosts = ["api.example.com", "*.cdn.example.com"]
+```
+
+Entries use the strict egress grammar: exact hosts or explicit `*.suffix`
+patterns, with no allow-all form. Invalid grammar rejects the whole manifest at
+discovery and at install. The table is part of the canonical manifest bytes, so
+a signed manifest covers it and changing it requires re-signing.
+
+This is an attestation of intent, never a grant. The allowlist the host
+enforces is the operator's `plugins.entries.<instance-key>.egress_hosts`, on the
+same `zpi1_…` row that carries the instance's private `config` map, resolved
+from live config per request rather than snapshotted into the store. A
+component shipping its own `[egress]` table without an operator grant reaches
+nothing. On this release the grant alone governs that check: the declaration is
+not additionally intersected with it at request time, so declaring a host
+neither grants it nor bounds a grant the operator authored. Intersecting the
+two is later rollout work under
+[#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850).
+
+What the declaration buys is the install ceremony. `zeroclaw plugin install`
+seeds it into the `[[plugins.entries]]` row it creates, so a first install of a
+plugin that declares its destinations works without the operator transcribing
+hosts, and the seeded values are printed. It never extends a row that already
+exists: an upgrade whose declaration grew prints the difference plus the exact
+`zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
+list` reports the same gap as a standing diagnostic. Declare the destinations
+your code actually contacts, and treat a growing declaration as something every
+operator has to approve on every upgrade.
+
+Plugins whose destination is deployment configuration (a self-hosted Gitea, a
+LAN Nextcloud) should declare nothing here. The operator authors that grant
+directly on the instance row, and a manifest that declares nothing is never
+reported as having lost destinations.
+
 ## WASI Component Host
 
 The host (`crates/zeroclaw-plugins/src/component.rs`) compiles and instantiates

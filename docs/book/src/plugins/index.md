@@ -267,6 +267,107 @@ canonical host field list and defaults are in the
 [Config reference](../reference/config.md); `zeroclaw config list` shows the live
 stored values.
 
+## Declaring and granting egress
+
+A plugin's network reach is two separate facts, and only one of them is yours:
+
+- The **declaration** is the manifest's `[egress]` table (`hosts = [...]`): the
+  destinations the author says the plugin needs. It is part of the canonical
+  manifest bytes, so a signed manifest covers it. It grants nothing. An
+  unsigned component that writes its own `[egress]` table still reaches
+  nothing.
+- The **grant** is `plugins.entries.<instance-key>.egress_hosts` on the
+  instance's own `zpi1_…` row, with the narrower `egress_allow_private`
+  carveout beside it. This is the list the host enforces, read from live config
+  on each request, so your edit applies without restarting the plugin.
+
+On this release the grant alone governs. The host checks a destination against
+`egress_hosts` and does not additionally require it to appear in the manifest,
+so a declaration neither grants a host nor bounds a grant you authored. The
+declaration's job here is to seed and to diff, described below. Narrowing
+effective reach to the intersection of declaration and grant is later rollout
+work tracked in
+[#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850).
+
+An empty `egress_hosts` is the default and means no network reach at all: a
+transport permission such as `http_client` grants the surface, this field
+grants the destinations. Entries are exact hosts (`api.example.com`,
+`10.0.0.5`) or explicit suffix patterns (`*.example.com`, which matches
+subdomains but not the apex, so list the apex separately when you need it).
+Ports are not part of an entry, granting a host grants every port on it, and
+there is no `*` meaning "anywhere".
+
+`egress_hosts` is deliberately a plaintext sibling of the encrypted `config`
+map rather than a key inside it. The allowlist is the thing an operator audits,
+so it stays readable in the same file being audited while the secrets beside it
+remain `enc2:…`.
+
+### What install and list do
+
+`zeroclaw plugin install` is the one moment the two sides are reconciled
+without you typing anything:
+
+- For a row it **creates**, it seeds the declaration into `egress_hosts`,
+  prints each destination it granted, and prints the `zeroclaw config set`
+  command that edits the grant later.
+- For a row that **already exists** (an upgrade, a reinstall, or a row you
+  authored), it changes nothing. It prints the difference instead: destinations
+  the manifest declares that the row does not grant, destinations the row
+  grants that the manifest no longer declares, and the exact command that
+  applies the addition. A package update therefore cannot widen its own network
+  reach; you apply the difference deliberately.
+
+The printed command carries the union of the existing grant and the
+declaration, because `zeroclaw config set` replaces a list rather than
+appending to it. Running it as printed adds the declared destinations without
+dropping a host you authored yourself.
+
+`zeroclaw plugin list` repeats the same comparison as a standing diagnostic:
+for every installed plugin holding `http_client`, one line naming the
+destinations it declares that its row does not grant, since requests there are
+denied, plus the command that closes the gap. The reverse is never flagged. A
+grant with no matching declaration is a first-class path, not a finding: the
+plugin whose destination is deployment configuration (a self-hosted Gitea, a
+LAN Nextcloud) cannot have that host declared by its author, so you author it.
+
+When the instance's row still carries a pre-1.0 key (a package name rather than
+the `zpi1_…` key), `plugin list` always prints the rename described above,
+because the runtime resolves a grant by the `zpi1_…` key alone: whatever that
+row grants is not in effect, and requests are denied, until it is renamed. If
+the row's grant already covers everything the manifest declares, the rename is
+the whole instruction: no `zeroclaw config set` is offered, since it would
+only replace a list you already have right. If the declaration still names
+destinations the row does not grant, the rename is step one and the grant
+command is step two, and that command carries the row's existing grant forward
+so it revokes nothing you authored. Dotted `plugins.entries.<key>.…` paths
+only resolve rows already present in live config, so running the grant command
+before the rename fails with `Unknown property`; applying the printed steps in
+the printed order works. `plugin list` diagnoses this and never edits your
+config itself.
+
+`plugin list` judges a row with the same policy constructor the runtime uses
+at request time, so its verdict is the runtime's. If the runtime would refuse
+the row (a single-label wildcard such as `*.com`, an entry with boundary
+whitespace, or an `egress_allow_private` carve-out no granted host covers), the
+config loader only warns about it, but the runtime refuses the whole allowlist
+and denies every request. `plugin list` prints the runtime's reason and a grant
+command built only from the entries the runtime accepts; on a pre-1.0 row that
+command follows the rename, and the rename is never offered alone for a row the
+runtime would refuse. The printed command replaces `egress_hosts` only. If a
+private carve-out would still be refused afterwards, the report says so and
+names the row's `egress_allow_private` path, since that has to be fixed by
+hand. A refusal that is not about the row at all, a malformed
+`security.nat64_prefixes` or a zero `plugins.limits.max_connections_per_instance`,
+refuses every plugin's policy alike; `plugin list` reports it once, naming
+those two paths, prints no per-plugin lines until it is fixed, and never
+offers a per-plugin grant repair for it. `plugin install` reports an existing
+row with the same verdict, in the same words, so install and list never
+disagree about whether a grant is usable.
+
+Channel-only packages are silent on both surfaces until the alias-aware key
+path above lands, because no instance row can yet be derived to compare
+against.
+
 ## Where the trust boundary actually is
 
 The sandbox bounds what a loaded plugin can do; the signature policy bounds
