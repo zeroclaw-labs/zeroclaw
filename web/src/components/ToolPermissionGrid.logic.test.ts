@@ -6,20 +6,25 @@ import {
   applyAuthState,
   applyApprovalState,
   applyCustomPermission,
+  applyStrictMode,
   approvalLevelCaveat,
   effectiveApprovalState,
   effectiveAuthState,
   filterPermissionCatalogEntries,
   isApprovalOnlyWildcard,
   isMcpAutoAdmitted,
+  normalizeAllowedTools,
   normalizeAutonomyLevel,
+  parseDenyAllToolsDraft,
+  parseOptionalAllowedTools,
   profileLevelFromDraft,
+  serializeAllowedTools,
   type ToolPermissionGridValue,
 } from './ToolPermissionGrid.logic.ts';
 
 function sets(value: ToolPermissionGridValue) {
   return {
-    realAllowSet: new Set(value.allowedTools.filter((name) => name !== '__none__')),
+    realAllowSet: new Set((value.allowedTools ?? []).filter((name) => name !== '__none__')),
     excludedSet: new Set(value.excludedTools),
     autoApproveSet: new Set(value.autoApprove),
     alwaysAskSet: new Set(value.alwaysAsk),
@@ -36,9 +41,10 @@ test('permission catalog excludes discovered CLI executables', () => {
   assert.deepEqual(filterPermissionCatalogEntries(entries), [entries[0]]);
 });
 
-test('strict allowlists still auto-admit MCP names unless denied', () => {
+test('nonempty allowlists still auto-admit MCP names unless denied', () => {
   const value: ToolPermissionGridValue = {
-    allowedTools: ['__none__'],
+    allowedTools: ['shell'],
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [],
     alwaysAsk: [],
@@ -70,7 +76,7 @@ test('strict allowlists still auto-admit MCP names unless denied', () => {
       realAllowSet: current.realAllowSet,
       excludedSet: current.excludedSet,
     }),
-    'inherit',
+    'allow',
   );
 
   const denied = sets({ ...value, excludedTools: ['server__tool'] });
@@ -85,9 +91,117 @@ test('strict allowlists still auto-admit MCP names unless denied', () => {
   );
 });
 
+test('deny-all flag does not auto-admit MCP names', () => {
+  const value: ToolPermissionGridValue = {
+    allowedTools: null,
+    denyAllTools: true,
+    excludedTools: [],
+    autoApprove: [],
+    alwaysAsk: [],
+  };
+  const current = sets(value);
+
+  assert.equal(
+    isMcpAutoAdmitted({
+      name: 'server__tool',
+      strict: true,
+      realAllowSet: current.realAllowSet,
+      excludedSet: current.excludedSet,
+    }),
+    false,
+  );
+  assert.equal(
+    effectiveAuthState({
+      name: 'server__tool',
+      strict: true,
+      realAllowSet: current.realAllowSet,
+      excludedSet: current.excludedSet,
+    }),
+    'inherit',
+  );
+  assert.equal(
+    effectiveAuthState({
+      name: 'shell',
+      strict: true,
+      realAllowSet: current.realAllowSet,
+      excludedSet: current.excludedSet,
+    }),
+    'inherit',
+  );
+});
+
+test('legacy __none__ sentinel normalizes to the deny-all flag', () => {
+  assert.deepEqual(normalizeAllowedTools(['__none__']), {
+    allowedTools: null,
+    denyAllTools: true,
+  });
+  assert.deepEqual(normalizeAllowedTools([]), { allowedTools: null, denyAllTools: false });
+  assert.deepEqual(normalizeAllowedTools(['shell', '__none__']), {
+    allowedTools: ['shell'],
+    denyAllTools: false,
+  });
+});
+
+test('optional allowed_tools draft round-trips three states', () => {
+  const unrestricted = { allowedTools: null, denyAllTools: false };
+  assert.deepEqual(parseOptionalAllowedTools(''), unrestricted);
+  assert.deepEqual(parseOptionalAllowedTools('<unset>'), unrestricted);
+  assert.deepEqual(parseOptionalAllowedTools('null'), unrestricted);
+  // `[]` keeps its legacy unrestricted meaning in the config.
+  assert.deepEqual(parseOptionalAllowedTools('[]'), unrestricted);
+  // The legacy sentinel is the only array draft that means deny-all.
+  assert.deepEqual(parseOptionalAllowedTools('["__none__"]'), {
+    allowedTools: null,
+    denyAllTools: true,
+  });
+  assert.deepEqual(parseOptionalAllowedTools('["shell"]'), {
+    allowedTools: ['shell'],
+    denyAllTools: false,
+  });
+  assert.equal(serializeAllowedTools(null), '');
+  assert.equal(serializeAllowedTools(['shell']), '["shell"]');
+  assert.equal(parseDenyAllToolsDraft('true'), true);
+  assert.equal(parseDenyAllToolsDraft(' false '), false);
+  assert.equal(parseDenyAllToolsDraft(''), false);
+  assert.equal(parseDenyAllToolsDraft(undefined), false);
+  assert.equal(parseDenyAllToolsDraft('<unset>'), false);
+});
+
+test('strict mode toggle writes the deny-all flag, not a sentinel or []', () => {
+  const unrestricted: ToolPermissionGridValue = {
+    allowedTools: null,
+    denyAllTools: false,
+    excludedTools: [],
+    autoApprove: [],
+    alwaysAsk: [],
+  };
+  // Strict ON with nothing marked Allow is the explicit deny-all state.
+  const denyAll = applyStrictMode(unrestricted, true);
+  assert.equal(denyAll.allowedTools, null);
+  assert.equal(denyAll.denyAllTools, true);
+  // Strict OFF clears both gates.
+  const off = applyStrictMode({ ...unrestricted, allowedTools: ['shell'] }, false);
+  assert.equal(off.allowedTools, null);
+  assert.equal(off.denyAllTools, false);
+  // Allowing a tool writes an allowlist and exits deny-all.
+  const allow = applyAuthState({ ...unrestricted, denyAllTools: true }, 'shell', 'allow', true);
+  assert.deepEqual(allow.allowedTools, ['shell']);
+  assert.equal(allow.denyAllTools, false);
+  // Removing the last allowed tool under strict collapses to deny-all.
+  const inherit = applyAuthState(
+    { ...unrestricted, allowedTools: ['shell'] },
+    'shell',
+    'inherit',
+    true,
+  );
+  assert.equal(inherit.allowedTools, null);
+  assert.equal(inherit.denyAllTools, true);
+});
+
 test('approval wildcards follow runtime precedence', () => {
   const askWildcard = sets({
-    allowedTools: [],
+    allowedTools: null,
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [APPROVAL_WILDCARD, 'shell'],
     alwaysAsk: [APPROVAL_WILDCARD],
@@ -103,7 +217,8 @@ test('approval wildcards follow runtime precedence', () => {
   );
 
   const autoWildcard = sets({
-    allowedTools: [],
+    allowedTools: null,
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [APPROVAL_WILDCARD],
     alwaysAsk: [],
@@ -118,7 +233,8 @@ test('approval wildcards follow runtime precedence', () => {
   );
 
   const exactAskOverridesAutoWildcard = sets({
-    allowedTools: [],
+    allowedTools: null,
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [APPROVAL_WILDCARD],
     alwaysAsk: ['shell'],
@@ -135,7 +251,8 @@ test('approval wildcards follow runtime precedence', () => {
 
 test('approval wildcard cannot enter authorization arrays through grid actions', () => {
   const base: ToolPermissionGridValue = {
-    allowedTools: [],
+    allowedTools: null,
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [],
     alwaysAsk: [],
@@ -163,7 +280,8 @@ test('full/readonly surface a caveat but keep approval overrides live and cleara
   // delegation with no level check - so the grid must show a caveat and keep the
   // control live, not lock it to an "effective" value.
   const withAlwaysAsk: ToolPermissionGridValue = {
-    allowedTools: [],
+    allowedTools: null,
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [],
     alwaysAsk: ['shell'],
@@ -216,7 +334,8 @@ test('level normalization and FieldForm draft derivation', () => {
 
 test('custom names can be added to each permission state', () => {
   const base: ToolPermissionGridValue = {
-    allowedTools: [],
+    allowedTools: null,
+    denyAllTools: false,
     excludedTools: [],
     autoApprove: [],
     alwaysAsk: [],

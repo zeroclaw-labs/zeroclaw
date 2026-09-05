@@ -36,7 +36,7 @@ Synchronous, in-process, single tokio runtime. Nothing crosses the process bound
 1. Parent's tool loop dispatches `spawn_subagent`. The tool reads its `prompt` argument, refuses if empty.
 2. The tool checks two guards in order:
    - **Depth-1 cap.** If the calling run was itself a SubAgent (`AgentRunOverrides.is_subagent == true`), refuse with `"spawn_subagent: a subagent may not spawn its own subagents (depth-1 cap)"`. SubAgents cannot recurse.
-   - **Risk-profile tool gate.** If the parent's `[risk_profiles.<alias>].allowed_tools` is non-empty and does not list `spawn_subagent`, or `excluded_tools` lists it, refuse with a message naming the parent alias.
+   - **Risk-profile tool gate.** If the parent's `[risk_profiles.<alias>].deny_all_tools` is `true`, or `allowed_tools` is non-empty and does not list `spawn_subagent`, or `excluded_tools` lists it, refuse with a message naming the parent alias. An omitted or empty `allowed_tools` leaves the tool available (the legacy unrestricted state).
 3. The tool calls `SubAgentSpawn::for_agent` + `build`. Failures (unknown parent alias, escalating override) surface as `ToolResult { success: false, error: "subagent spawn failed: ..." }`.
 4. The tool constructs `AgentRunOverrides { security, memory: None, is_subagent: true, suppress_memory_inject: true }` (the child's `SubTurn` origin already skips engine memory injection; the flag makes the opt-out explicit) and awaits `crate::agent::run` (`crates/zeroclaw-runtime/src/agent/loop_.rs`, `pub async fn run`) inside a tracing scope keyed `subagent-<uuid>`. The parent's `tool` execution **blocks** until the child returns.
 5. The child agent loop runs to completion. Its tool registry is built fresh, with `is_subagent_caller: true` flowing into its own `SpawnSubagentTool` so any attempt to recurse is rejected at the same depth-1 gate.
@@ -81,7 +81,7 @@ Inheritance axis by axis:
 
 You don't call these tools yourself; the bot does, from inside its turn. As a user, you influence the bot's choice with how you phrase the request. There is no special command, no slash-syntax, and no JSON the user types. Whether the model picks `spawn_subagent` or `delegate` depends on its system prompt, the tool's `description` text (visible to the model), and the user's wording. **Phrasing influences; it does not force.**
 
-What CAN be made deterministic is **availability**: tools that aren't in the parent agent's registry can't be picked. The risk-profile gate lives in `[risk_profiles.<alias>].allowed_tools` and `[risk_profiles.<alias>].excluded_tools`. A non-empty `allowed_tools` list must include `spawn_subagent` or `delegate` for the model to see that tool; an empty `allowed_tools` list leaves tool availability unrestricted unless `excluded_tools` names the tool. Restart the daemon after editing the config.
+What CAN be made deterministic is **availability**: tools that aren't in the parent agent's registry can't be picked. The risk-profile gate lives in `[risk_profiles.<alias>].allowed_tools`, `[risk_profiles.<alias>].deny_all_tools`, and `[risk_profiles.<alias>].excluded_tools`. A non-empty `allowed_tools` list must include `spawn_subagent` or `delegate` for the model to see that tool; an omitted or empty `allowed_tools` leaves tool availability unrestricted unless `excluded_tools` names the tool; `deny_all_tools = true` is the explicit deny-all gate and hides both tools (an empty `allowed_tools` list is *not* deny-all). Restart the daemon after editing the config.
 
 What's verifiable end-to-end:
 
@@ -154,7 +154,7 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 The advertised roster is included in the `agent` parameter description in the tool schema. It lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
 
-In bounded agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a bounded cross-profile target whose risk profile names a tool the caller was never granted does not receive it. Bounded delegation is therefore tool-bounded, not a full `SecurityPolicy::ensure_no_escalation_beyond` check. If that intersection is empty, the target still receives a normal agentic model turn with no tools.
+In bounded agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **omitted or empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected (an empty list is the legacy unrestricted state, not deny-all). `deny_all_tools = true` is the explicit deny-all gate and yields an empty child registry. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a bounded cross-profile target whose risk profile names a tool the caller was never granted does not receive it. Bounded delegation is therefore tool-bounded, not a full `SecurityPolicy::ensure_no_escalation_beyond` check. If that intersection is empty, the target still receives a normal agentic model turn with no tools.
 
 In independent agentic delegation the sub-agent's tools are built from the target agent's own configured policy and runtime registry, like opening a fresh chat with that target. The parent registry is not used as the ceiling. The `delegate` tool is still removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
 
@@ -164,7 +164,7 @@ Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it 
 
 If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` builds the target sub-loop's tool registry from either the parent's available tools (`mode = "bounded"`) or the target's own runtime registry (`mode = "independent"`). The target risk profile then filters that registry:
 
-1. A configured empty `[risk_profiles.<target_profile>].allowed_tools` list leaves the selected registry unrestricted.
+1. An omitted or empty `[risk_profiles.<target_profile>].allowed_tools` field leaves the selected registry unrestricted. `deny_all_tools = true` is the explicit deny-all gate and yields an empty child registry.
 2. A non-empty `allowed_tools` list keeps only exact matching tool names.
 3. `[risk_profiles.<target_profile>].excluded_tools` always subtracts from the result.
 4. `delegate` is always removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
@@ -226,7 +226,7 @@ them as Fluent keys.
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
 | **Parallel fan-out** | No built-in argument; multiple calls in one turn run concurrently when `parallel_tools = true` | `parallel: [...]` runs multiple targets concurrently |
-| **Gating** | Non-empty `risk_profile.allowed_tools` must list `spawn_subagent`; `excluded_tools` must not list it | The caller's non-empty `risk_profile.allowed_tools` must list `delegate`; `excluded_tools` must not list it; caller's `delegation_policy mode = "allow"`; and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry) |
+| **Gating** | Omitted or empty `risk_profile.allowed_tools` leaves `spawn_subagent` available; `deny_all_tools = true` denies it; a non-empty list must include `spawn_subagent`; `excluded_tools` must not list it | The caller's omitted or empty `allowed_tools` leaves `delegate` available; `deny_all_tools = true` denies it; a non-empty list must include `delegate`; `excluded_tools` must not list it; caller's `delegation_policy mode = "allow"`; and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry) |
 | **Use when** | Internal subtask that should stay within the same identity | Want a different configured specialist (different model, different alias) to own the task under bounded or independent delegation |
 
 ## What's not supported

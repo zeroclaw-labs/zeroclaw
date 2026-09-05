@@ -6,14 +6,11 @@
 //  - Approval gating (ask every time / inherit / auto-approve) — does a
 //    human confirm before it runs. Bridges `auto_approve` + `always_ask`.
 //
-// The two axes aren't symmetric. An empty `allowed_tools` means
-// *unrestricted*, not deny-all, so "Strict allowlist" is a real mode toggle
-// here, not just a third row state on the Authorization axis — flipping it
-// on with nothing marked Allow writes a sentinel tool name (`__none__`, the
-// same convention operators were already hand-writing into `allowed_tools`
-// to fake a zero-tools profile) so the config still round-trips through
-// today's backend with no schema change. See `RiskProfileConfig` in
-// crates/zeroclaw-config/src/schema.rs.
+// The two axes aren't symmetric. An omitted `allowed_tools` (`null` here)
+// means *unrestricted* — and so does an explicit `[]`, which keeps its legacy
+// meaning. Deny-all is a distinct explicit state, `deny_all_tools = true`,
+// written when "Strict allowlist" is flipped on with nothing marked Allow.
+// See `RiskProfileConfig` in crates/zeroclaw-config/src/schema.rs.
 //
 // Deny always wins its axis; Ask-every-time always wins over Auto-approve
 // when a tool is in both — see crates/zeroclaw-runtime/src/approval/mod.rs.
@@ -48,6 +45,7 @@ import {
   isApprovalOnlyWildcard,
   isAlwaysAskWildcardLocked,
   isMcpAutoAdmitted,
+  isStrictAllowlist,
   realAllowedTools,
   type ApprState,
   type AuthState,
@@ -136,7 +134,7 @@ export default function ToolPermissionGrid({
     };
   }, [agent, cacheKey, reloadSeq]);
 
-  const strict = value.allowedTools.length > 0;
+  const strict = isStrictAllowlist(value);
   const realAllowSet = useMemo(
     () => new Set(realAllowedTools(value.allowedTools)),
     [value.allowedTools],

@@ -104,8 +104,12 @@ impl Tool for SpawnSubagentTool {
         let risk_profile = self.config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
-            let allowed_when_listed = rp.allowed_tools.is_empty()
-                || rp.allowed_tools.iter().any(|t| t == "spawn_subagent");
+            // `deny_all_tools` denies spawn_subagent; an absent/empty
+            // `allowed_tools` is legacy-unrestricted; a non-empty list must
+            // name spawn_subagent.
+            let allowed_when_listed = !rp.deny_all_tools
+                && (rp.allowed_tools.is_empty()
+                    || rp.allowed_tools.iter().any(|t| t == "spawn_subagent"));
             if excluded || !allowed_when_listed {
                 return Ok(ToolResult {
                     success: false,
@@ -413,6 +417,25 @@ mod tests {
         config
     }
 
+    fn config_with_deny_all_tools(alias: &str) -> Config {
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "default".to_string(),
+            RiskProfileConfig {
+                deny_all_tools: true,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            alias.to_string(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
     #[tokio::test]
     async fn refuses_when_risk_profile_excludes_spawn_subagent() {
         // Parent's non-empty risk_profile.allowed_tools omits
@@ -457,6 +480,48 @@ mod tests {
         assert!(
             !(err.contains("risk_profile") && err.contains("spawn_subagent")),
             "spawn_subagent in allowed_tools must not trigger the gate refusal, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admits_when_risk_profile_allowed_tools_is_legacy_empty() {
+        // `allowed_tools = []` is legacy-unrestricted, so the gate must not
+        // refuse. The spawn may still fail later for unrelated reasons; pin
+        // only that the gate refusal is absent.
+        let config = config_with_allowed_tools("alpha", vec![]);
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            !(err.contains("risk_profile") && err.contains("spawn_subagent")),
+            "legacy empty allowed_tools is unrestricted and must not trigger the gate refusal, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_when_risk_profile_deny_all_tools() {
+        let config = config_with_deny_all_tools("alpha");
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
+        let result = tool
+            .execute(json!({ "prompt": "hello" }))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("risk_profile") && err.contains("spawn_subagent"),
+            "deny_all_tools must deny spawn_subagent, got: {err:?}"
         );
     }
 

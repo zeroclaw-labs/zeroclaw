@@ -28,15 +28,19 @@ import { Badge, Card, PageHeader } from '@/components/ui';
 // ── Risk-profile tool access ────────────────────────────────────────────
 // Per-profile allow/exclude state for the tool-access matrix in each expanded
 // tool card. zeroclaw's gate (crates/zeroclaw-config policy + runtime):
-//   • allowed_tools EMPTY  → unrestricted (every tool allowed)
-//   • allowed_tools [list] → only those tools allowed
-//   • excluded_tools       → denylist, wins over allow
+//   • allowed_tools omitted or []  → unrestricted (every tool allowed)
+//   • deny_all_tools = true        → deny-all (nothing allowed)
+//   • allowed_tools [list]         → only those tools allowed — and any
+//     `<server>__<tool>` MCP-shaped name is auto-admitted without being
+//     listed (the runtime's `__` exception for nonempty allowlists)
+//   • excluded_tools               → denylist, wins over allow
 // So we never silently convert an unrestricted profile into an allowlist:
 // BLOCK adds to excluded_tools (no side effects on other tools); ALLOW clears
 // the exclusion and, only when the profile is already an allowlist, adds the
 // tool to it.
 interface ProfileAccess {
-  allowed: string[];
+  allowed: string[] | null;
+  denyAll: boolean;
   excluded: string[];
 }
 
@@ -56,16 +60,51 @@ function parseStrArray(raw: unknown): string[] {
     .filter(Boolean);
 }
 
+// Parse the allowed_tools entry. `null`/unset and `[]` are both the legacy
+// unrestricted state; a bare `__none__` (the pre-flag sentinel operators
+// hand-wrote to fake deny-all) is surfaced as the explicit deny-all intent.
+function parseOptionalStrArray(raw: unknown): {
+  allowed: string[] | null;
+  sentinelDenyAll: boolean;
+} {
+  if (raw == null) return { allowed: null, sentinelDenyAll: false };
+  if (typeof raw === 'string' && (raw.length === 0 || raw === '<unset>' || raw.trim() === 'null')) {
+    return { allowed: null, sentinelDenyAll: false };
+  }
+  const names = parseStrArray(raw);
+  const real = names.filter((name) => name !== '__none__');
+  if (names.includes('__none__') && real.length === 0) {
+    return { allowed: null, sentinelDenyAll: true };
+  }
+  return { allowed: real.length > 0 ? real : null, sentinelDenyAll: false };
+}
+
+function parseDenyAll(raw: unknown): boolean {
+  return raw === true || raw === 'true';
+}
+
+// Mirrors the runtime auto-admit exception: under a nonempty allowlist, any
+// name containing `__` (the `<server>__<tool>` MCP convention) is admitted
+// even when not listed. See ToolPermissionGrid.logic.ts and
+// crates/zeroclaw-tools/src/tool_search.rs.
+function isMcpAutoAdmitted(tool: string, allowed: string[]): boolean {
+  return allowed.length > 0 && tool.includes('__');
+}
+
 function isToolAllowed(tool: string, a: ProfileAccess): boolean {
   if (a.excluded.includes(tool)) return false;
-  if (a.allowed.length === 0) return true; // unrestricted
-  return a.allowed.includes(tool);
+  if (a.denyAll) return false;
+  if (a.allowed === null) return true;
+  return a.allowed.includes(tool) || isMcpAutoAdmitted(tool, a.allowed);
 }
 
 function accessReason(tool: string, a: ProfileAccess): string {
   if (a.excluded.includes(tool)) return t('tools.reason_excluded');
-  if (a.allowed.length === 0) return t('tools.reason_all_allowed');
-  return a.allowed.includes(tool) ? t('tools.reason_in_allowlist') : t('tools.reason_not_in_allowlist');
+  if (a.denyAll) return t('tools.reason_deny_all');
+  if (a.allowed === null) return t('tools.reason_all_allowed');
+  if (a.allowed.includes(tool)) return t('tools.reason_in_allowlist');
+  if (isMcpAutoAdmitted(tool, a.allowed)) return t('tools.reason_mcp_auto_admitted');
+  return t('tools.reason_not_in_allowlist');
 }
 
 export default function Tools() {
@@ -124,13 +163,18 @@ export default function Tools() {
         const entriesPerProfile = await Promise.all(
           keys.map(async (name) => {
             const { entries } = await listProps(`risk_profiles.${name}`);
-            const allowed = parseStrArray(
+            const allowlist = parseOptionalStrArray(
               entries.find((e) => e.path === `risk_profiles.${name}.allowed_tools`)?.value,
             );
+            const denyAll =
+              allowlist.sentinelDenyAll ||
+              parseDenyAll(
+                entries.find((e) => e.path === `risk_profiles.${name}.deny_all_tools`)?.value,
+              );
             const excluded = parseStrArray(
               entries.find((e) => e.path === `risk_profiles.${name}.excluded_tools`)?.value,
             );
-            return [name, { allowed, excluded }] as const;
+            return [name, { allowed: allowlist.allowed, denyAll, excluded }] as const;
           }),
         );
         if (!cancelled) setAccess(Object.fromEntries(entriesPerProfile));
@@ -149,17 +193,22 @@ export default function Tools() {
     async (profile: string, tool: string, makeAllowed: boolean) => {
       const current = access?.[profile];
       if (!current) return;
-      const allowed = [...current.allowed];
+      const allowed = current.allowed === null ? null : [...current.allowed];
+      // ALLOW under deny-all exits deny-all into a one-tool allowlist.
+      const denyAll = makeAllowed ? false : current.denyAll;
       let excluded = [...current.excluded];
       if (makeAllowed) {
         excluded = excluded.filter((x) => x !== tool);
-        if (allowed.length > 0 && !allowed.includes(tool)) allowed.push(tool);
+        if (allowed !== null && !allowed.includes(tool)) allowed.push(tool);
       } else if (!excluded.includes(tool)) {
         excluded.push(tool);
       }
       const ops: Parameters<typeof patchConfig>[0] = [];
       if (JSON.stringify(allowed) !== JSON.stringify(current.allowed)) {
         ops.push({ op: 'replace', path: `risk_profiles.${profile}.allowed_tools`, value: allowed });
+      }
+      if (denyAll !== current.denyAll) {
+        ops.push({ op: 'replace', path: `risk_profiles.${profile}.deny_all_tools`, value: denyAll });
       }
       if (JSON.stringify(excluded) !== JSON.stringify(current.excluded)) {
         ops.push({
@@ -169,7 +218,7 @@ export default function Tools() {
         });
       }
       if (ops.length === 0) return;
-      const next = { allowed, excluded };
+      const next = { allowed, denyAll, excluded };
       setAccess((prev) => (prev ? { ...prev, [profile]: next } : prev));
       setAccessError(null);
       try {
