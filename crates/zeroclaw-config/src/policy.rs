@@ -977,18 +977,34 @@ fn skip_env_assignments(s: &str) -> &str {
         let Some(word) = rest.split_whitespace().next() else {
             return rest;
         };
-        // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
+        if is_env_assignment_word(word) {
             // Advance past this word
             rest = rest[word.len()..].trim_start();
         } else {
             return rest;
         }
+    }
+}
+
+fn is_env_assignment_word(word: &str) -> bool {
+    env_assignment_name(word).is_some()
+}
+
+fn env_assignment_name(word: &str) -> Option<&str> {
+    let (raw_name, _) = word.split_once('=')?;
+    normalized_assignment_name(raw_name)
+}
+
+fn normalized_assignment_name(raw_name: &str) -> Option<&str> {
+    let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        Some(name)
+    } else {
+        None
     }
 }
 
@@ -999,11 +1015,13 @@ enum QuoteState {
     Double,
 }
 
-fn split_unquoted_segments(command: &str) -> Vec<String> {
+fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
     // Heredoc state: Some(delim) while inside a heredoc body.
     let mut heredoc_delimiter: Option<String> = None;
     // Accumulates the current line while inside a heredoc body, for terminator detection.
@@ -1035,7 +1053,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     current.push(ch);
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     current.push(ch);
                     continue;
@@ -1055,7 +1073,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                     }
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     if heredoc_delimiter.is_some() {
                         heredoc_line_buf.push(ch);
@@ -1104,7 +1122,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 }
 
                 match ch {
-                    '\'' => {
+                    '\'' if single_quotes_are_syntax => {
                         quote = QuoteState::Single;
                         current.push(ch);
                     }
@@ -1154,6 +1172,709 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
     segments
 }
 
+#[derive(Clone, Copy)]
+struct RedirectionMetadata {
+    marker_idx: usize,
+    operator_end: usize,
+    has_attached_word: bool,
+    prefix_is_unquoted: bool,
+    has_multiple_operators: bool,
+}
+
+struct ShellWord {
+    text: String,
+    is_assignment: bool,
+    redirection: Option<RedirectionMetadata>,
+}
+
+fn split_shell_words_with_metadata(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut is_assignment = false;
+    let mut assignment_prefix_is_unquoted = true;
+    let mut word_prefix_is_unquoted = true;
+    let mut redirection: Option<RedirectionMetadata> = None;
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut in_word = false;
+
+    let push_word = |words: &mut Vec<ShellWord>,
+                     current: &mut String,
+                     is_assignment: &mut bool,
+                     assignment_prefix_is_unquoted: &mut bool,
+                     word_prefix_is_unquoted: &mut bool,
+                     redirection: &mut Option<RedirectionMetadata>,
+                     in_word: &mut bool| {
+        if *in_word {
+            words.push(ShellWord {
+                text: std::mem::take(current),
+                is_assignment: *is_assignment,
+                redirection: redirection.take(),
+            });
+            *is_assignment = false;
+            *assignment_prefix_is_unquoted = true;
+            *word_prefix_is_unquoted = true;
+            *in_word = false;
+        }
+    };
+
+    for ch in segment.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                } else {
+                    current.push(ch);
+                    in_word = true;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    if matches!(ch, '$' | '`' | '"' | '\\') {
+                        current.push(ch);
+                    } else if ch != '\n' {
+                        current.push('\\');
+                        current.push(ch);
+                    }
+                    escaped = false;
+                    if !is_assignment {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' if backslash_is_literal => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                    '\\' => {
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '"' => quote = QuoteState::None,
+                    _ => {
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    current.push(ch);
+                    escaped = false;
+                    if !is_assignment {
+                        assignment_prefix_is_unquoted = false;
+                    }
+                    if redirection.is_none() {
+                        word_prefix_is_unquoted = false;
+                    }
+                    if let Some(redirection) = &mut redirection {
+                        redirection.has_attached_word = true;
+                    }
+                    in_word = true;
+                    continue;
+                }
+                match ch {
+                    '\\' if backslash_is_literal => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                    '\\' => {
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        escaped = true;
+                        in_word = true;
+                    }
+                    '\'' if single_quotes_are_syntax => {
+                        if !is_assignment {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        quote = QuoteState::Single;
+                        in_word = true;
+                    }
+                    '"' => {
+                        if !is_assignment {
+                            assignment_prefix_is_unquoted = false;
+                        }
+                        if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        } else {
+                            word_prefix_is_unquoted = false;
+                        }
+                        quote = QuoteState::Double;
+                        in_word = true;
+                    }
+                    _ if ch.is_whitespace() => {
+                        push_word(
+                            &mut words,
+                            &mut current,
+                            &mut is_assignment,
+                            &mut assignment_prefix_is_unquoted,
+                            &mut word_prefix_is_unquoted,
+                            &mut redirection,
+                            &mut in_word,
+                        );
+                    }
+                    _ => {
+                        if ch == '=' && !is_assignment && assignment_prefix_is_unquoted {
+                            is_assignment = normalized_assignment_name(&current).is_some();
+                        }
+                        if matches!(ch, '<' | '>') {
+                            match &mut redirection {
+                                Some(redirection)
+                                    if !redirection.has_attached_word
+                                        && current.len() == redirection.operator_end =>
+                                {
+                                    redirection.operator_end += ch.len_utf8();
+                                }
+                                None => {
+                                    redirection = Some(RedirectionMetadata {
+                                        marker_idx: current.len(),
+                                        operator_end: current.len() + ch.len_utf8(),
+                                        has_attached_word: false,
+                                        prefix_is_unquoted: word_prefix_is_unquoted,
+                                        has_multiple_operators: false,
+                                    });
+                                }
+                                Some(redirection) => {
+                                    redirection.has_multiple_operators = true;
+                                    redirection.has_attached_word = true;
+                                }
+                            }
+                        } else if let Some(redirection) = &mut redirection {
+                            redirection.has_attached_word = true;
+                        }
+                        current.push(ch);
+                        in_word = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    push_word(
+        &mut words,
+        &mut current,
+        &mut is_assignment,
+        &mut assignment_prefix_is_unquoted,
+        &mut word_prefix_is_unquoted,
+        &mut redirection,
+        &mut in_word,
+    );
+    words
+}
+
+fn shell_words_after_env_assignments(segment: &str, dialect: ShellDialect) -> Vec<ShellWord> {
+    let words = split_shell_words_with_metadata(segment, dialect);
+    let first_command = words
+        .iter()
+        .position(|word| !word.is_assignment)
+        .unwrap_or(words.len());
+    words.into_iter().skip(first_command).collect()
+}
+
+struct NormalizedShellCommand {
+    has_leading_env_assignment: bool,
+    words: Vec<String>,
+    has_ambiguous_redirection: bool,
+}
+
+fn normalized_shell_command(segment: &str, dialect: ShellDialect) -> NormalizedShellCommand {
+    let raw_words = split_shell_words_with_metadata(segment, dialect);
+    let mut has_leading_env_assignment = false;
+    let mut words = Vec::with_capacity(raw_words.len());
+    let mut has_ambiguous_redirection = false;
+    let mut before_executable = true;
+    let mut idx = 0;
+
+    while idx < raw_words.len() {
+        let raw = raw_words[idx].text.as_str();
+        if before_executable && raw_words[idx].is_assignment {
+            has_leading_env_assignment = true;
+            idx += 1;
+            continue;
+        }
+
+        let redirection_metadata = raw_words[idx].redirection;
+        if redirection_metadata.is_some_and(|metadata| metadata.has_multiple_operators) {
+            has_ambiguous_redirection = true;
+        }
+        let redirection = redirection_metadata.map_or(RedirectionArgument::None, |metadata| {
+            parse_redirection_argument_at(raw, metadata)
+        });
+        let (prefix, consumes_next) = match redirection {
+            RedirectionArgument::Target { prefix, .. } | RedirectionArgument::FdOnly { prefix } => {
+                (prefix, false)
+            }
+            RedirectionArgument::NeedsNextToken { prefix } => (prefix, true),
+            RedirectionArgument::None => {
+                words.push(raw_words[idx].text.clone());
+                before_executable = false;
+                idx += 1;
+                continue;
+            }
+        };
+
+        let is_io_number = !prefix.is_empty()
+            && prefix.chars().all(|c| c.is_ascii_digit())
+            && redirection_metadata.is_some_and(|metadata| metadata.prefix_is_unquoted);
+        if !prefix.is_empty() && !is_io_number {
+            words.push(prefix.to_string());
+            before_executable = false;
+        }
+        idx += if consumes_next { 2 } else { 1 };
+    }
+
+    NormalizedShellCommand {
+        has_leading_env_assignment,
+        words,
+        has_ambiguous_redirection,
+    }
+}
+
+fn is_git_write_verb(verb: &str) -> bool {
+    matches!(
+        verb.to_ascii_lowercase().as_str(),
+        "am" | "commit"
+            | "push"
+            | "pull"
+            | "reset"
+            | "clean"
+            | "rebase"
+            | "merge"
+            | "cherry-pick"
+            | "revert"
+            | "branch"
+            | "checkout"
+            | "switch"
+            | "tag"
+    )
+}
+
+fn git_command_is_write(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return false;
+    };
+    let subcommand = args[subcommand_idx].as_str();
+    if is_git_write_verb(subcommand) {
+        return true;
+    }
+
+    git_arg_eq(subcommand, "worktree")
+        && git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| !git_arg_eq(action, "list"))
+}
+
+fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        match arg {
+            "--" => return args.get(idx + 1).map(|_| idx + 1),
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+            | "--super-prefix" => {
+                idx += 2;
+            }
+            "--bare"
+            | "--no-replace-objects"
+            | "--no-lazy-fetch"
+            | "--no-optional-locks"
+            | "--literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-pager"
+            | "--paginate"
+            | "--version"
+            | "--help"
+            | "-h"
+            | "-p" => {
+                idx += 1;
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                idx += 1;
+            }
+            _ if arg.starts_with("--git-dir=")
+                || arg.starts_with("--work-tree=")
+                || arg.starts_with("--namespace=")
+                || arg.starts_with("--exec-path=")
+                || arg.starts_with("--super-prefix=") =>
+            {
+                idx += 1;
+            }
+            _ if arg.starts_with('-') => {
+                idx += 1;
+            }
+            _ => return Some(idx),
+        }
+    }
+
+    None
+}
+
+fn git_subcommand_is_policy_modeled(subcommand: &str) -> bool {
+    if subcommand.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return false;
+    }
+
+    is_git_write_verb(subcommand)
+        || matches!(
+            subcommand,
+            "add"
+                | "apply"
+                | "archive"
+                | "bisect"
+                | "blame"
+                | "bundle"
+                | "cat-file"
+                | "check-attr"
+                | "check-ignore"
+                | "check-mailmap"
+                | "check-ref-format"
+                | "clone"
+                | "count-objects"
+                | "describe"
+                | "diff"
+                | "diff-files"
+                | "diff-index"
+                | "diff-tree"
+                | "fetch"
+                | "for-each-ref"
+                | "format-patch"
+                | "fsck"
+                | "gc"
+                | "grep"
+                | "help"
+                | "init"
+                | "log"
+                | "ls-files"
+                | "ls-remote"
+                | "ls-tree"
+                | "maintenance"
+                | "merge-base"
+                | "merge-tree"
+                | "mv"
+                | "name-rev"
+                | "notes"
+                | "range-diff"
+                | "reflog"
+                | "remote"
+                | "restore"
+                | "rev-list"
+                | "rev-parse"
+                | "rm"
+                | "shortlog"
+                | "show"
+                | "show-branch"
+                | "show-ref"
+                | "sparse-checkout"
+                | "stash"
+                | "status"
+                | "submodule"
+                | "verify-commit"
+                | "verify-tag"
+                | "version"
+                | "whatchanged"
+                | "worktree"
+        )
+}
+
+fn git_delegates_to_external_command(args: &[String]) -> bool {
+    let Some(subcommand_idx) = git_effective_subcommand_index(args) else {
+        return args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg));
+    };
+
+    if args[..subcommand_idx]
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| git_arg_is_paginate(arg) || git_arg_is_external_diff_option(arg))
+    {
+        return true;
+    }
+
+    let subcommand = args[subcommand_idx].as_str();
+    if !git_subcommand_is_policy_modeled(subcommand) {
+        return true;
+    }
+
+    if git_subcommand_selects_remote_helper(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    if git_subcommand_selects_transfer_program(args, subcommand_idx, subcommand) {
+        return true;
+    }
+    let subcommand_args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    if (git_arg_eq(subcommand, "clone") && subcommand_args().any(git_arg_is_clone_process_control))
+        || (git_arg_eq(subcommand, "init")
+            && subcommand_args().any(git_arg_is_template_process_control))
+        || (git_arg_eq(subcommand, "rebase")
+            && subcommand_args().any(git_arg_is_rebase_process_control))
+    {
+        return true;
+    }
+
+    if git_arg_eq(subcommand, "difftool")
+        || git_arg_eq(subcommand, "difftool--helper")
+        || git_arg_eq(subcommand, "mergetool")
+        || git_arg_eq(subcommand, "mergetool--helper")
+        || git_arg_eq(subcommand, "submodule--helper")
+    {
+        return true;
+    }
+
+    if git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_is_external_diff_option) {
+        return true;
+    }
+
+    match subcommand.to_ascii_lowercase().as_str() {
+        "bisect" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "run")),
+        "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|arg| git_arg_eq(arg, "foreach")),
+        "grep" => {
+            git_args_before_pathspec(args, subcommand_idx + 1).any(git_arg_opens_files_in_pager)
+        }
+        "help" => git_args_before_pathspec(args, subcommand_idx + 1).any(|arg| {
+            git_arg_eq(arg, "-w") || git_arg_is_long_option_or_abbreviation(arg, "--web")
+        }),
+        _ => false,
+    }
+}
+
+fn git_args_before_pathspec(args: &[String], start: usize) -> impl Iterator<Item = &str> {
+    args[start..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+}
+
+fn git_first_non_option_before_pathspec(args: &[String], start: usize) -> Option<&str> {
+    git_args_before_pathspec(args, start).find(|arg| !arg.starts_with('-'))
+}
+
+fn git_arg_eq(arg: &str, expected: &str) -> bool {
+    arg.eq_ignore_ascii_case(expected)
+}
+
+fn git_arg_starts_with(arg: &str, prefix: &str) -> bool {
+    arg.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn git_arg_is_paginate(arg: &str) -> bool {
+    git_arg_eq(arg, "-p") || git_arg_eq(arg, "--paginate")
+}
+
+fn git_arg_is_external_diff_option(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--ext-diff")
+        || git_arg_eq(arg, "--extcmd")
+        || git_arg_starts_with(arg, "--extcmd=")
+}
+
+fn git_subcommand_selects_transfer_program(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let args = || git_args_before_pathspec(args, subcommand_idx + 1);
+    match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" => {
+            args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--upload-pack"))
+        }
+        "push" => args().any(|arg| {
+            git_arg_is_long_option_or_abbreviation(arg, "--receive-pack")
+                || git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        }),
+        "archive" => args().any(|arg| git_arg_is_long_option_or_abbreviation(arg, "--exec")),
+        _ => false,
+    }
+}
+
+fn git_arg_is_clone_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--config")
+        || git_arg_is_template_process_control(arg)
+        || git_arg_eq(arg, "-u")
+        || git_arg_starts_with(arg, "-u")
+}
+
+fn git_arg_is_template_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--template")
+}
+
+fn git_arg_is_rebase_process_control(arg: &str) -> bool {
+    git_arg_is_long_option_or_abbreviation(arg, "--exec")
+        || arg
+            .strip_prefix('-')
+            .is_some_and(|options| !options.starts_with('-') && options.contains('x'))
+}
+
+fn git_arg_is_long_option_or_abbreviation(arg: &str, option: &str) -> bool {
+    let supplied_name = arg.split_once('=').map_or(arg, |(name, _)| name);
+    supplied_name.len() > 2 && option.starts_with(supplied_name)
+}
+
+fn git_arg_selects_remote_helper(arg: &str) -> bool {
+    let endpoint = arg
+        .split_once('=')
+        .filter(|(name, _)| git_arg_is_long_option_or_abbreviation(name, "--remote"))
+        .map_or(arg, |(_, value)| value);
+    if endpoint
+        .split_once("::")
+        .is_some_and(|(transport, address)| {
+            git_remote_helper_transport_is_valid(transport) && !address.is_empty()
+        })
+    {
+        return true;
+    }
+
+    let Some((scheme, address)) = endpoint.split_once("://") else {
+        return false;
+    };
+    git_remote_helper_transport_is_valid(scheme)
+        && !address.is_empty()
+        && ![
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_remote_helper_transport_is_valid(transport: &str) -> bool {
+    let mut chars = transport.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn git_subcommand_selects_remote_helper(
+    args: &[String],
+    subcommand_idx: usize,
+    subcommand: &str,
+) -> bool {
+    let command_args = &args[subcommand_idx + 1..];
+    if subcommand == "archive" {
+        return git_archive_remote_selects_helper(command_args);
+    }
+
+    let scans_remote = match subcommand {
+        "clone" | "fetch" | "ls-remote" | "pull" | "push" => true,
+        "remote" | "submodule" => git_first_non_option_before_pathspec(args, subcommand_idx + 1)
+            .is_some_and(|action| git_arg_eq(action, "add") || git_arg_eq(action, "set-url")),
+        _ => false,
+    };
+    scans_remote
+        && command_args.iter().enumerate().any(|(idx, arg)| {
+            git_arg_selects_remote_helper(arg)
+                && !git_helper_like_arg_is_inert_value(command_args, idx, subcommand)
+        })
+}
+
+fn git_helper_like_arg_is_inert_value(args: &[String], idx: usize, subcommand: &str) -> bool {
+    match (subcommand, args) {
+        ("clone", [source, _]) if idx == 1 => git_arg_is_known_safe_remote_url(source),
+        ("submodule", [action, source, _]) if idx == 2 && git_arg_eq(action, "add") => {
+            git_arg_is_known_safe_remote_url(source)
+        }
+        _ => false,
+    }
+}
+
+fn git_arg_is_known_safe_remote_url(arg: &str) -> bool {
+    let Some((scheme, address)) = arg.split_once("://") else {
+        return false;
+    };
+    !address.is_empty()
+        && [
+            "file", "ftp", "ftps", "git", "git+ssh", "http", "https", "rsync", "ssh", "ssh+git",
+        ]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+}
+
+fn git_archive_remote_selects_helper(args: &[String]) -> bool {
+    let mut idx = 0;
+    while let Some(arg) = args.get(idx).map(String::as_str) {
+        if arg == "--" {
+            return false;
+        }
+        if let Some((name, value)) = arg.split_once('=')
+            && git_arg_is_long_option_or_abbreviation(name, "--remote")
+            && git_arg_selects_remote_helper(value)
+        {
+            return true;
+        }
+        let separated_remote =
+            !arg.contains('=') && git_arg_is_long_option_or_abbreviation(arg, "--remote");
+        if separated_remote {
+            match args.get(idx + 1).map(String::as_str) {
+                Some(value) if git_arg_selects_remote_helper(value) => return true,
+                _ => {}
+            }
+        }
+        idx += if separated_remote
+            || (!arg.contains('=')
+                && [
+                    "--add-file",
+                    "--add-virtual-file",
+                    "--format",
+                    "--output",
+                    "--prefix",
+                    "-o",
+                ]
+                .iter()
+                .any(|option| git_arg_is_option_or_abbreviation(arg, option)))
+        {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
+fn git_arg_is_option_or_abbreviation(arg: &str, option: &str) -> bool {
+    if option.starts_with("--") {
+        git_arg_is_long_option_or_abbreviation(arg, option)
+    } else {
+        git_arg_eq(arg, option)
+    }
+}
+
+fn git_arg_opens_files_in_pager(arg: &str) -> bool {
+    arg.starts_with("-O") || git_arg_is_long_option_or_abbreviation(arg, "--open-files-in-pager")
+}
+
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 /// Strip fd-merge redirect patterns (`N>&M`, `N<&M`, `>&N`, `<&N`, `N>&-`, etc.)
 /// so their `&` doesn't get flagged as a background operator.
@@ -1169,10 +1890,12 @@ fn strip_fd_merge_redirects(command: &str) -> String {
 
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_unquoted_single_ampersand(command: &str) -> bool {
+fn contains_unquoted_single_ampersand(command: &str, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax = shell_uses_single_quote_syntax(dialect);
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -1186,7 +1909,7 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -1199,12 +1922,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     // This must consume the second '&' so `&&` is not later
                     // re-read as a lone trailing '&'.
@@ -1221,9 +1944,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
 }
 
 /// Detect an unquoted character in a shell command.
-fn contains_unquoted_char(command: &str, target: char) -> bool {
+fn contains_unquoted_char(command: &str, target: char, dialect: ShellDialect) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let backslash_is_literal = shell_uses_windows_path_syntax(dialect);
+    let single_quotes_are_syntax =
+        matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell);
 
     for ch in command.chars() {
         match quote {
@@ -1237,7 +1963,7 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
@@ -1250,12 +1976,12 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                     escaped = false;
                     continue;
                 }
-                if ch == '\\' {
+                if ch == '\\' && !backslash_is_literal {
                     escaped = true;
                     continue;
                 }
                 match ch {
-                    '\'' => quote = QuoteState::Single,
+                    '\'' if single_quotes_are_syntax => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     _ if ch == target => return true,
                     _ => {}
@@ -1284,7 +2010,11 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
         .expect("static safe-device redirect regex must compile")
     });
 
-    let safe = re.replace_all(command, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        re.replace_all(command, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Windows null device: strip `>nul`, `1>nul`, `2>nul`, `2>NUL`, and the
     // `\\.\nul` device form (case-insensitive) — the platform equivalent of the
     // `/dev/null` forms stripped above. A trailing non-boundary char (e.g.
@@ -1307,7 +2037,7 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
     };
     // Also strip fd-merge redirects (2>&1, 1>&2, >&N, etc.)
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '>')
+    contains_unquoted_char(&safe, '>', dialect)
 }
 
 /// POSIX-dialect convenience wrapper for tests — the conservative default that
@@ -1320,7 +2050,7 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
 
 /// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`)
 /// or a safe input redirect from `/dev/*`.
-fn contains_unquoted_input_redirect(command: &str) -> bool {
+fn contains_unquoted_input_redirect(command: &str, dialect: ShellDialect) -> bool {
     // Strip here-strings (`<<<`) first, then heredocs (`<<`), then safe /dev/* sources
     // with word boundary enforcement.
     use regex::Regex;
@@ -1331,11 +2061,15 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
         Regex::new(r"<[ ]?/dev/(null|zero)(\s|[;&|)]|$)").expect("SAFE_INPUT_RE regex must compile")
     });
 
-    let safe = command.replace("<<<", "").replace("<<", "");
-    let safe = re.replace_all(&safe, "$2").to_string();
+    let safe = if matches!(dialect, ShellDialect::Posix) {
+        let safe = command.replace("<<<", "").replace("<<", "");
+        re.replace_all(&safe, "$2").to_string()
+    } else {
+        command.to_string()
+    };
     // Also strip fd-merge redirects (<&0, <&-, etc.) so they don't leave a bare `<`
     let safe = strip_fd_merge_redirects(&safe);
-    contains_unquoted_char(&safe, '<')
+    contains_unquoted_char(&safe, '<', dialect)
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -1400,10 +2134,155 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
         if next.is_ascii_alphanumeric()
             || matches!(
                 next,
-                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+                '_' | '{'
+                    | '('
+                    | '#'
+                    | '?'
+                    | '!'
+                    | '$'
+                    | '*'
+                    | '@'
+                    | '-'
+                    | '='
+                    | '+'
+                    | '^'
+                    | '~'
+                    | '['
+                    | '<'
             )
         {
             return true;
+        }
+    }
+
+    false
+}
+
+fn contains_unmodeled_shell_word_expansion(command: &str, dialect: ShellDialect) -> bool {
+    if command.contains("\\\n") || command.contains("\\\r\n") {
+        return true;
+    }
+
+    // cmd.exe expands `%NAME%` variables, can expand `!NAME!` variables when
+    // delayed expansion is enabled by host policy, and removes caret escapes
+    // before launching the executable. The policy does not model those
+    // transforms, so reject them before command identity or Git risk is accepted.
+    if shell_uses_windows_path_syntax(dialect) && command.contains(['%', '!', '^']) {
+        return true;
+    }
+
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut at_tilde_prefix = true;
+    let mut assignment_name_valid = true;
+    let mut assignment_name_len = 0usize;
+    let mut in_assignment_value = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
+                continue;
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                at_tilde_prefix = false;
+                assignment_name_valid = false;
+                continue;
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    at_tilde_prefix = false;
+                    assignment_name_valid = false;
+                    continue;
+                }
+                if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '<' | '>') {
+                    at_tilde_prefix = true;
+                    assignment_name_valid = true;
+                    assignment_name_len = 0;
+                    in_assignment_value = false;
+                    continue;
+                }
+                if ch == '='
+                    && !in_assignment_value
+                    && assignment_name_valid
+                    && assignment_name_len > 0
+                {
+                    in_assignment_value = true;
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                if ch == ':' && in_assignment_value {
+                    at_tilde_prefix = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
+                        continue;
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        at_tilde_prefix = false;
+                        assignment_name_valid = false;
+                        continue;
+                    }
+                    '$' if chars.peek().is_some_and(|next| matches!(*next, '\'' | '"')) => {
+                        return true;
+                    }
+                    // Parentheses participate in extended-glob syntax in
+                    // supported configurable shells such as ksh. Even when
+                    // the operator prefix is otherwise ordinary text, the
+                    // shell can replace the token after policy validation.
+                    // zsh EXTENDED_GLOB also gives unquoted `#` and `^`
+                    // pattern meaning, while infix `~` excludes a pattern.
+                    // Preserve leading and assignment-value `~` expansion.
+                    '{' | '}' | '(' | ')' | '*' | '?' | '[' => return true,
+                    '^' | '#' if dialect == ShellDialect::Posix => return true,
+                    '~' if dialect == ShellDialect::Posix && !at_tilde_prefix => return true,
+                    _ => {}
+                }
+                if !in_assignment_value {
+                    let valid_name_char = if assignment_name_len == 0 {
+                        ch.is_ascii_alphabetic() || ch == '_'
+                    } else {
+                        ch.is_ascii_alphanumeric()
+                            || ch == '_'
+                            || (ch == '+' && chars.peek().is_some_and(|next| *next == '='))
+                    };
+                    assignment_name_valid &= valid_name_char;
+                    assignment_name_len += 1;
+                }
+                at_tilde_prefix = false;
+            }
         }
     }
 
@@ -1434,6 +2313,10 @@ fn looks_like_path(candidate: &str) -> bool {
 
 fn shell_uses_windows_path_syntax(dialect: ShellDialect) -> bool {
     matches!(dialect, ShellDialect::WindowsCmd | ShellDialect::PowerShell)
+}
+
+fn shell_uses_single_quote_syntax(dialect: ShellDialect) -> bool {
+    matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
 }
 
 fn has_windows_drive_prefix(candidate: &str) -> bool {
@@ -1507,28 +2390,24 @@ enum RedirectionArgument<'a> {
     None,
 }
 
-fn parse_redirection_argument(token: &str) -> RedirectionArgument<'_> {
-    let Some(marker_idx) = token.find(['<', '>']) else {
-        return RedirectionArgument::None;
-    };
-    let prefix = token[..marker_idx].trim();
-    let mut rest = &token[marker_idx + 1..];
-    rest = rest.trim_start_matches(['<', '>']);
-    if let Some(after_amp) = rest.strip_prefix('&') {
-        let remaining = after_amp.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
-        if remaining.is_empty() {
-            return RedirectionArgument::FdOnly { prefix };
-        }
+fn parse_redirection_argument_at(
+    token: &str,
+    metadata: RedirectionMetadata,
+) -> RedirectionArgument<'_> {
+    let prefix = &token[..metadata.marker_idx];
+    let rest = &token[metadata.operator_end..];
+    if let Some(after_amp) = rest.strip_prefix('&')
+        && (after_amp == "-"
+            || (!after_amp.is_empty() && after_amp.chars().all(|c| c.is_ascii_digit())))
+    {
+        return RedirectionArgument::FdOnly { prefix };
     }
-    rest = rest.trim_start_matches('&');
-    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
-    let trimmed = rest.trim();
-    if trimmed.is_empty() {
+    if rest.is_empty() && !metadata.has_attached_word {
         RedirectionArgument::NeedsNextToken { prefix }
     } else {
         RedirectionArgument::Target {
             prefix,
-            target: trimmed,
+            target: rest,
         }
     }
 }
@@ -1546,7 +2425,7 @@ fn safe_device_redirect_names_pattern() -> String {
 
 fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
     let target = strip_wrapping_quotes(target).trim();
-    if SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
+    if matches!(dialect, ShellDialect::Posix) && SAFE_DEVICE_REDIRECT_TARGETS.contains(&target) {
         return true;
     }
     // Windows null device: `nul`/`NUL` (case-insensitive) and the full `\\.\nul`
@@ -1558,18 +2437,23 @@ fn is_safe_device_redirect_target(target: &str, dialect: ShellDialect) -> bool {
         && (target.eq_ignore_ascii_case("nul") || target.eq_ignore_ascii_case(r"\\.\nul"))
 }
 
-/// Extract the basename from a command path, handling both Unix (`/`) and
-/// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
-fn command_basename(raw: &str) -> &str {
+/// Extract the basename using the shell dialect's path separators.
+/// Windows command dialects accept both `/` and `\`, while POSIX treats `\`
+/// as a literal that can escape the following character.
+fn command_basename_for_shell(raw: &str, dialect: ShellDialect) -> &str {
     let after_fwd = raw.rsplit('/').next().unwrap_or(raw);
-    after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    if shell_uses_windows_path_syntax(dialect) {
+        after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
+    } else {
+        after_fwd
+    }
 }
 
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
-/// matching against allowlists and risk tables. On non-Windows platforms this
-/// is a no-op that returns the input unchanged.
-fn strip_windows_exe_suffix(name: &str) -> &str {
-    if cfg!(target_os = "windows") {
+/// matching against allowlists and risk tables. POSIX command dialects keep
+/// suffixes literal even when the host itself is Windows.
+fn strip_windows_exe_suffix_for_shell(name: &str, dialect: ShellDialect) -> &str {
+    if shell_uses_windows_path_syntax(dialect) {
         name.strip_suffix(".exe")
             .or_else(|| name.strip_suffix(".cmd"))
             .or_else(|| name.strip_suffix(".bat"))
@@ -1606,6 +2490,26 @@ fn command_names_equivalent(left: &str, right: &str) -> bool {
     false
 }
 
+fn command_names_equivalent_for_shell(left: &str, right: &str, dialect: ShellDialect) -> bool {
+    let left_lower = left.to_ascii_lowercase();
+    let right_lower = right.to_ascii_lowercase();
+    if left_lower == right_lower {
+        return true;
+    }
+
+    if shell_uses_windows_path_syntax(dialect) {
+        for ext in &[".exe", ".cmd", ".bat"] {
+            if right_lower == format!("{left_lower}{ext}")
+                || left_lower == format!("{right_lower}{ext}")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     let left = strip_wrapping_quotes(left).trim();
     let right = strip_wrapping_quotes(right).trim();
@@ -1622,7 +2526,12 @@ fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
     command_names_equivalent(left, right)
 }
 
-fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+fn is_allowlist_entry_match(
+    allowed: &str,
+    executable: &str,
+    executable_base: &str,
+    dialect: ShellDialect,
+) -> bool {
     let allowed = strip_wrapping_quotes(allowed).trim();
     if allowed.is_empty() {
         return false;
@@ -1645,7 +2554,7 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     // Callers lowercase the basename before it reaches here, so folding only
     // one side would leave an entry written as `Git` or `Docker` unable to
     // match anything.
-    command_names_equivalent(allowed, executable_base)
+    command_names_equivalent_for_shell(allowed, executable_base, dialect)
 }
 
 /// Decide whether a completed PowerShell token must be rejected by the bounded
@@ -2106,31 +3015,14 @@ fn generic_segment_risk(
     }
 
     match base {
-        "git" => Some(
-            if args.first().is_some_and(|verb| {
-                matches!(
-                    verb.as_str(),
-                    "commit"
-                        | "push"
-                        | "reset"
-                        | "clean"
-                        | "rebase"
-                        | "merge"
-                        | "cherry-pick"
-                        | "revert"
-                        | "branch"
-                        | "checkout"
-                        | "switch"
-                        | "tag"
-                )
-            }) {
-                CommandRiskLevel::Medium
-            } else {
-                CommandRiskLevel::Low
-            },
-        ),
+        "git" => Some(if git_command_is_write(args) {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }),
         "npm" | "pnpm" | "yarn" => Some(
             if args.first().is_some_and(|verb| {
+                let verb = verb.to_ascii_lowercase();
                 matches!(
                     verb.as_str(),
                     "install" | "add" | "remove" | "uninstall" | "update" | "publish"
@@ -2143,6 +3035,7 @@ fn generic_segment_risk(
         ),
         "cargo" => Some(
             if args.first().is_some_and(|verb| {
+                let verb = verb.to_ascii_lowercase();
                 matches!(
                     verb.as_str(),
                     "add" | "remove" | "install" | "clean" | "publish"
@@ -2167,19 +3060,31 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix)
+    }
+
+    fn command_risk_level_for_posix_like_shell(
+        &self,
+        command: &str,
+        dialect: ShellDialect,
+    ) -> CommandRiskLevel {
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(command, dialect) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(base_raw) = words.next() else {
+            let normalized = normalized_shell_command(&segment, dialect);
+            if normalized.has_ambiguous_redirection {
+                return CommandRiskLevel::High;
+            }
+            let words = normalized.words;
+            let Some(base_raw) = words.first() else {
                 continue;
             };
 
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
-            let base = strip_windows_exe_suffix(&base_owned);
+            let base_owned = command_basename_for_shell(base_raw, dialect).to_ascii_lowercase();
+            let base = strip_windows_exe_suffix_for_shell(&base_owned, dialect);
 
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+            let args: Vec<String> = words.iter().skip(1).cloned().collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
             match generic_segment_risk(base, &args, &joined_segment) {
@@ -2204,7 +3109,7 @@ impl SecurityPolicy {
     ) -> CommandRiskLevel {
         match dialect {
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                return self.command_risk_level(command);
+                return self.command_risk_level_for_posix_like_shell(command, dialect);
             }
             ShellDialect::None => return CommandRiskLevel::High,
             ShellDialect::PowerShell => {}
@@ -2221,15 +3126,16 @@ impl SecurityPolicy {
             let Some(base_raw) = words.next() else {
                 return CommandRiskLevel::High;
             };
-            let base_owned = command_basename(base_raw).to_ascii_lowercase();
+            let base_owned =
+                command_basename_for_shell(base_raw, ShellDialect::PowerShell).to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
                 return CommandRiskLevel::High;
             }
             let base = strip_powershell_executable_suffix(&base_owned);
             let arguments: Vec<&str> = words.collect();
-            let arguments_lower: Vec<String> = arguments
+            let arguments_cased: Vec<String> = arguments
                 .iter()
-                .map(|argument| argument.to_ascii_lowercase())
+                .map(|argument| (*argument).to_string())
                 .collect();
             if arguments
                 .iter()
@@ -2269,7 +3175,7 @@ impl SecurityPolicy {
                 None => {}
             }
 
-            match generic_segment_risk(base, &arguments_lower, &segment.to_ascii_lowercase()) {
+            match generic_segment_risk(base, &arguments_cased, &segment.to_ascii_lowercase()) {
                 Some(CommandRiskLevel::High) => return CommandRiskLevel::High,
                 Some(CommandRiskLevel::Medium) => saw_medium = true,
                 Some(CommandRiskLevel::Low) => {}
@@ -2318,6 +3224,19 @@ impl SecurityPolicy {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
 
+        // Path confinement here is specific to Windows shell dialects, whose
+        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
+        // scanner cannot recognize. Run it before the allowlist so a path-shaped
+        // executable cannot be rejected as merely unknown before confinement
+        // reports the actual boundary violation. POSIX path policy is already
+        // enforced by that wrapper; running it again here would reject legitimate
+        // absolute arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
+        if shell_uses_windows_path_syntax(dialect)
+            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+        {
+            return Err(format!("Command blocked: forbidden path argument: {path}"));
+        }
+
         if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -2348,17 +3267,6 @@ impl SecurityPolicy {
             );
         }
 
-        // Path confinement here is specific to Windows shell dialects, whose
-        // relative forms (`..\x`, `C:x`) the host-default PathGuardedTool
-        // scanner cannot recognize. POSIX path policy is already enforced by
-        // that wrapper; running it again here would reject legitimate absolute
-        // arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
-        if shell_uses_windows_path_syntax(dialect)
-            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
-        {
-            return Err(format!("Command blocked: forbidden path argument: {path}"));
-        }
-
         Ok(risk)
     }
 
@@ -2376,7 +3284,8 @@ impl SecurityPolicy {
                     let raw_executable =
                         strip_wrapping_quotes(segment.split_whitespace().next().unwrap_or(""))
                             .trim();
-                    let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+                    let base_owned =
+                        command_basename_for_shell(raw_executable, dialect).to_ascii_lowercase();
                     let base = strip_powershell_executable_suffix(&base_owned);
                     !base.is_empty()
                         && !is_powershell_batch_file(&base_owned)
@@ -2391,25 +3300,24 @@ impl SecurityPolicy {
                 })
             }
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command)
+                self.is_command_explicitly_allowed(command, dialect)
             }
             ShellDialect::None => false,
         }
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str) -> bool {
-        let segments = split_unquoted_segments(command);
+    fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let normalized = normalized_shell_command(segment, dialect);
+            if normalized.has_ambiguous_redirection {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -2421,7 +3329,7 @@ impl SecurityPolicy {
                 if allowed.is_empty() || allowed == "*" {
                     return false;
                 }
-                is_allowlist_entry_match(allowed, executable, base_cmd)
+                is_allowlist_entry_match(allowed, executable, base_cmd, dialect)
             });
 
             if !explicitly_listed {
@@ -2431,8 +3339,10 @@ impl SecurityPolicy {
 
         // At least one real command must be present.
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            normalized_shell_command(s.trim(), dialect)
+                .words
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -2490,7 +3400,8 @@ impl SecurityPolicy {
                 return false;
             }
 
-            let base_owned = command_basename(raw_executable).to_ascii_lowercase();
+            let base_owned = command_basename_for_shell(raw_executable, ShellDialect::PowerShell)
+                .to_ascii_lowercase();
             if is_powershell_batch_file(&base_owned) {
                 return false;
             }
@@ -2538,6 +3449,7 @@ impl SecurityPolicy {
 
         if command.contains('`')
             || contains_unquoted_shell_variable_expansion(command)
+            || contains_unmodeled_shell_word_expansion(command, dialect)
             || command.contains("<(")
             || command.contains(">(")
         {
@@ -2551,7 +3463,7 @@ impl SecurityPolicy {
         if contains_unsafe_output_redirect_for_shell(command, dialect) {
             return false;
         }
-        if contains_unquoted_input_redirect(command) {
+        if contains_unquoted_input_redirect(command, dialect) {
             return false;
         }
 
@@ -2569,28 +3481,22 @@ impl SecurityPolicy {
         // Strip fd-merge redirects (N>&M, N<&M) first so their `&` isn't
         // flagged as background chaining.
         let ampersand_check = strip_fd_merge_redirects(command);
-        if contains_unquoted_single_ampersand(&ampersand_check) {
+        if contains_unquoted_single_ampersand(&ampersand_check, dialect) {
             return false;
         }
 
         // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
+        let segments = split_unquoted_segments(command, dialect);
         for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
-            let mut words = cmd_part.split_whitespace();
-            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            // Strip inline redirections from the executable token, e.g.
-            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
-            // command name rather than the redirect target path.
-            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
-                &raw_executable[..idx]
-            } else {
-                raw_executable
-            };
-            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
-            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+            let normalized = normalized_shell_command(segment, dialect);
+            if normalized.has_ambiguous_redirection || normalized.has_leading_env_assignment {
+                return false;
+            }
+            let words = normalized.words;
+            let executable = words.first().map(String::as_str).unwrap_or_default();
+            let base_cmd_owned =
+                command_basename_for_shell(executable, dialect).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix_for_shell(&base_cmd_owned, dialect);
 
             if base_cmd.is_empty() {
                 continue;
@@ -2599,7 +3505,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd, dialect))
             {
                 return false;
             }
@@ -2608,7 +3514,7 @@ impl SecurityPolicy {
             // Both case-preserved and lowercased argument lists are provided:
             //   - `args_cased` for case-sensitive comparisons (e.g. git -C vs -c)
             //   - `args` (lowercased) for case-insensitive matches (e.g. subcommand names)
-            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args_cased: Vec<String> = words.iter().skip(1).cloned().collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args, &args_cased) {
                 return false;
@@ -2617,8 +3523,10 @@ impl SecurityPolicy {
 
         // At least one command must be present
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
+            normalized_shell_command(s.trim(), dialect)
+                .words
+                .first()
+                .is_some_and(|w| !w.is_empty())
         })
     }
 
@@ -2626,18 +3534,30 @@ impl SecurityPolicy {
         let base = base.to_ascii_lowercase();
         match base.as_str() {
             "find" => {
-                // find -exec and find -ok allow arbitrary command execution
-                !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
+                // GNU/BSD find execution predicates allow arbitrary child commands.
+                !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
             }
             "git" => {
-                !args_cased.iter().any(|arg| arg == "-c")
+                !args_cased.iter().any(|arg| arg.starts_with("-c"))
+                    && !git_delegates_to_external_command(args_cased)
                     && !args.iter().any(|arg| {
-                        arg == "config"
+                        arg == "--config-env"
+                            || arg.starts_with("--config-env=")
+                            || arg == "--exec-path"
+                            || arg.starts_with("--exec-path=")
+                            || arg == "config"
                             || arg.starts_with("config.")
                             || arg == "alias"
                             || arg.starts_with("alias.")
                     })
             }
+            // `env` is also a command carrier. Its option, assignment, and
+            // child-command grammar varies across platforms, so accepting
+            // arguments here would let the nested executable bypass this
+            // allowlist and risk-classification boundary.
+            "env" => args.is_empty(),
             "python" | "python3" => !args
                 .iter()
                 .any(|arg| arg.starts_with("-c") || arg.starts_with("-m")),
@@ -2781,24 +3701,29 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
+        for segment in split_unquoted_segments(command, dialect) {
+            let words = shell_words_after_env_assignments(&segment, dialect);
+            let Some(executable) = words.first() else {
                 continue;
             };
 
-            let executable_candidate = strip_wrapping_quotes(executable).trim();
-            let executable_without_redirect = executable_candidate
-                .find(['<', '>'])
-                .map_or(executable_candidate, |index| &executable_candidate[..index]);
+            let executable_redirect = executable
+                .redirection
+                .map_or(RedirectionArgument::None, |metadata| {
+                    parse_redirection_argument_at(&executable.text, metadata)
+                });
+
+            let executable_without_redirect = match executable_redirect {
+                RedirectionArgument::Target { prefix, .. }
+                | RedirectionArgument::NeedsNextToken { prefix }
+                | RedirectionArgument::FdOnly { prefix } => strip_wrapping_quotes(prefix).trim(),
+                RedirectionArgument::None => strip_wrapping_quotes(&executable.text).trim(),
+            };
             if !executable_has_explicit_path_allowlist(executable_without_redirect)
                 && let Some(blocked) = forbidden_non_redirect_candidate(executable_without_redirect)
             {
                 return Some(blocked);
             }
-
-            let executable_redirect = parse_redirection_argument(strip_wrapping_quotes(executable));
             let mut next_is_redirect_target = false;
             // Cover inline forms like `cat</etc/passwd`.
             match executable_redirect {
@@ -2815,8 +3740,8 @@ impl SecurityPolicy {
                 RedirectionArgument::FdOnly { .. } | RedirectionArgument::None => {}
             }
 
-            for token in words {
-                let candidate = strip_wrapping_quotes(token).trim();
+            for token in words.iter().skip(1) {
+                let candidate = strip_wrapping_quotes(&token.text).trim();
                 if candidate.is_empty() {
                     continue;
                 }
@@ -2836,7 +3761,12 @@ impl SecurityPolicy {
                     continue;
                 }
 
-                match parse_redirection_argument(candidate) {
+                let redirection = token
+                    .redirection
+                    .map_or(RedirectionArgument::None, |metadata| {
+                        parse_redirection_argument_at(&token.text, metadata)
+                    });
+                match redirection {
                     RedirectionArgument::Target { prefix, target } => {
                         if let Some(blocked) = forbidden_non_redirect_candidate(prefix) {
                             return Some(blocked);
@@ -4695,6 +5625,570 @@ mod tests {
     }
 
     #[test]
+    fn shell_policy_normalizes_non_git_executable_and_arguments() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into(), "find".into()],
+            ..SecurityPolicy::default()
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        assert!(p.is_command_allowed("c\\at ./src/main.rs"));
+        #[cfg(target_os = "windows")]
+        assert!(!p.is_command_allowed("c\\at ./src/main.rs"));
+
+        assert!(!p.is_command_allowed("find . '-exec' echo"));
+        assert_eq!(p.forbidden_path_argument("cat './src/main.rs'"), None);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("../secret.txt".into())
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            p.forbidden_path_argument("cat ..\\/secret.txt"),
+            Some("..\\/secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn posix_policy_does_not_inherit_windows_executable_syntax() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Docker executes POSIX `sh` even on a Windows host. Backslashes escape
+        // the next character there, while cmd.exe treats them as path separators.
+        for command in [r"attacker\git status", "git.exe status"] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::Posix)
+                    .is_err(),
+                "POSIX must not treat {command:?} as allowlisted git"
+            );
+            assert!(
+                p.validate_command_execution_for_shell(command, false, ShellDialect::WindowsCmd)
+                    .is_ok(),
+                "cmd.exe semantics must remain available for {command:?}"
+            );
+        }
+
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::Posix),
+            CommandRiskLevel::Low
+        );
+        assert_eq!(
+            p.command_risk_level_for_shell(r"attacker\git commit", ShellDialect::WindowsCmd),
+            CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn shell_environment_assignments_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into(), "env".into(), "ls".into(), "grep".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "ZC_ALIAS='!/usr/bin/true' git --config-env=alias.zcprobe=ZC_ALIAS zcprobe",
+            "ZC_ALIAS='!/usr/bin/true' git --config-env alias.zcprobe=ZC_ALIAS zcprobe",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.zcprobe GIT_CONFIG_VALUE_0='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_COUNT+=1 git zcprobe",
+            "GIT_CONFIG_KEY_0+=alias.zcprobe git zcprobe",
+            "GIT_CONFIG_VALUE_0+='!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_PARAMETERS+='alias.zcprobe=!/usr/bin/true' git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "GIT_CONFIG_NOGLOBAL=1 git zcprobe",
+            "GIT_CONFIG_NOSYSTEM=1 git zcprobe",
+            "GIT_CONFIG_GLOBAL=./zc-config >/dev/null git zcprobe",
+            ">/dev/null GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "git -c alias.zcprobe='!/usr/bin/true' zcprobe",
+            "git -calias.zcprobe='!/usr/bin/true' zcprobe",
+            "git '-c' foo.bar=ENV status",
+            "git '-cfoo.bar=ENV' status",
+            "git '--config-env' foo.bar=ENV status",
+            "git '--config-env=foo.bar=ENV' status",
+            "git --config-env\\=foo.bar=ENV status",
+            "git --exec-path ./tools zcprobe",
+            "git --exec-path=./tools zcprobe",
+            "env GIT_CONFIG_GLOBAL=./zc-config git zcprobe",
+            "/usr/bin/env GIT_CONFIG_SYSTEM=./zc-config git zcprobe",
+            "env git status",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("command-scope Git process controls must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in [
+            "GIT_EXEC_PATH=./tools git zcprobe",
+            "GIT_SSH_COMMAND=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "GIT_SSH_COMMAND+=./tools/zcprobe git fetch ssh://example.invalid/repo",
+            "PATH=./tools:/usr/bin git zcprobe",
+            "PATH+=:./tools git zcprobe",
+            "PATH=./tools:/usr/bin ls",
+            "PATH+=:./tools ls",
+            "LD_PRELOAD=./tools/zcprobe.so ls",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("leading environment assignments must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        assert!(p.is_command_allowed("env"));
+        let env_only = p
+            .validate_command_execution("env", false)
+            .expect("bare env has no nested command to bypass policy");
+        assert_eq!(env_only, CommandRiskLevel::Low);
+
+        for command in [
+            "git difftool --no-prompt --extcmd=./helper -- file",
+            "git difftool --no-prompt -x ./helper -- file",
+            "git difftool --tool=vimdiff -- file",
+            "git difftool--helper --extcmd=./helper -- file",
+            "git mergetool --tool=vimdiff file",
+            "git mergetool--helper --tool=vimdiff file",
+            "git diff --ext-diff -- file",
+            "git diff --ext-d -- file",
+            "git diff --ext -- file",
+            "git log --ext-diff -1",
+            "git show --ext-diff --stat HEAD",
+            "git -p status",
+            "git --paginate status",
+            "git grep -O pattern",
+            "git grep -O./pager pattern",
+            "git grep --open-files-in-pager pattern",
+            "git grep --open-files-in-pager=./pager pattern",
+            "git grep --open-files-in-pag pattern",
+            "git grep --open-files-in-pag=./pager pattern",
+            "git help -w status",
+            "git help --web status",
+            "git help --we status",
+            "git --no-pager bisect run ./helper",
+            "git -C . submodule --quiet foreach './helper'",
+            "git submodule--helper foreach -- './helper'",
+            "git zcprobe",
+            "git fetch --upload-pack=./helper origin main",
+            "git fetch --upload-pack ./helper origin main",
+            "git ls-remote --upload-pack=./helper origin",
+            "git pull --upload-pack=./helper origin main",
+            "git pull --upload-pack ./helper origin main",
+            "git push --receive-pack=./helper origin main",
+            "git push --exec ./helper origin main",
+            "git archive --exec=./helper HEAD",
+            "git archive --exec ./helper HEAD",
+            "git clone --config core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --config=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --template=./hooks https://example.invalid/repo ./dst",
+            "git clone --template ./hooks https://example.invalid/repo ./dst",
+            "git init --template=./hooks ./dst",
+            "git init --template ./hooks ./dst",
+            "git rebase --exec=./helper main",
+            "git rebase --exec ./helper main",
+            "git rebase -x ./helper main",
+            "git rebase -x./helper main",
+            "git rebase -ix ./helper main",
+            "git clone -u ./helper ssh://example.invalid/repo ./dst",
+            "git clone -u./helper ssh://example.invalid/repo ./dst",
+            "git STATUS",
+            "git COMMIT -m test",
+            "git fetch --upl=./helper origin main",
+            "git pull --upl=./helper origin main",
+            "git push --rece=./helper origin main",
+            "git push --exe=./helper origin main",
+            "git archive --exe=./helper HEAD",
+            "git clone --conf=core.sshCommand=./helper ssh://example.invalid/repo ./dst",
+            "git clone --temp=./hooks https://example.invalid/repo ./dst",
+            "git init --temp=./hooks ./dst",
+            "git rebase --exe=./helper main",
+            "git ls-remote 'ext::sh -c true'",
+            "git fetch helper::payload",
+            "git clone ext::helper ./dst",
+            "git push ext::helper main",
+            "git remote add origin ext::helper",
+            "git ls-remote evil://host/repo",
+            "git fetch evil://host/repo",
+            "git clone evil://host/repo ./dst",
+            "git push evil://host/repo main",
+            "git clone -- ext::helper ./dst",
+            "git fetch -- ext::helper main",
+            "git ls-remote -- ext::helper",
+            "git push -- ext::helper main",
+            "git ls-remote 'evil://host/repo?x=y'",
+            "git clone 'ext::helper arg=value' ./dst",
+            "git ls-remote 1foo::payload",
+            "git ls-remote 1foo://host/repo",
+            "git clone --depth 1 ext::helper ./dst",
+            "git fetch --dep 1 ext::helper",
+            "git clone --bra main ext::helper ./dst",
+            "git remote add --mas main origin ext::helper",
+            "git submodule add --na origin ext::helper ./dst",
+            "git pull -s ours ext::helper",
+            "git pull --strategy ours ext::helper",
+            "git pull --jobs ext::helper",
+            "git pull -j ext::helper",
+            "git archive --format=tar --remote=ext::helper HEAD",
+            "git archive --for=tar --rem=ext::helper HEAD",
+            "git archive --remote=https://example.invalid/repo --remote=ext::helper HEAD",
+            "git archive --remote https://example.invalid/repo --remote ext::helper HEAD",
+            "git archive --remote -- --remote=ext::helper HEAD",
+            "git clone --server-option --remote=ext::helper https://example.invalid/repo dst",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("Git delegated-execution surfaces must fail before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        for command in [
+            "git 2>&1> /dev/null commit -m test",
+            "git <&0> /dev/null commit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("ambiguous packed redirections must fail closed");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+
+        let status = p
+            .validate_command_execution("git status", false)
+            .expect("read-only Git status should remain allowed");
+        assert_eq!(status, CommandRiskLevel::Low);
+
+        for command in [
+            "git diff --stat",
+            "git diff --no-ext-diff --stat",
+            "git log --oneline -1",
+            "git show --stat --no-patch HEAD",
+            "git submodule status",
+            "git diff -- --ext-diff",
+            "git diff -- --ext-d",
+            "git diff -- --ext",
+            "git log -- --ext-diff",
+            "git submodule status foreach",
+            "git submodule status -- foreach",
+            "git bisect log run",
+            "git --no-pager status",
+            "git log -p -1",
+            "git grep -o pattern",
+            "git fetch origin main",
+            "git worktree list",
+            "git -C . worktree list --porcelain",
+            "git ls-remote origin",
+            "git clone https://example.invalid/repo ./dst",
+            "git clone git+ssh://example.invalid/repo ./dst",
+            "git clone ssh+git://example.invalid/repo ./dst",
+            "git diff -- ext::helper",
+            "git diff ext::helper",
+            "git status ext::helper",
+            "git grep -- --open-files-in-pag",
+            "git grep -- --open-files-in-pag=./pager",
+            "git help -- --we",
+            "git log -- --upload-pack=./helper",
+            "git clone https://example.invalid/repo ./dst::name",
+            "git clone https://example.invalid/repo ./evil://dst",
+            "git clone https://example.invalid/repo evil://dst",
+            "git submodule status ./evil://path",
+            "git submodule add https://example.invalid/repo evil://path",
+            "git archive --format --remote=ext::helper HEAD",
+            "git archive -- --remote=ext::helper",
+            "git archive --remote=https://example.invalid/repo --remote=ssh://example.invalid/repo HEAD",
+        ] {
+            let allowed = p
+                .validate_command_execution(command, false)
+                .expect("read-only Git commands should remain allowed");
+            assert_eq!(allowed, CommandRiskLevel::Low, "{command}");
+        }
+
+        let commit_denied = p
+            .validate_command_execution("git commit -m test", false)
+            .expect_err("Git write verbs still require approval");
+        assert!(
+            commit_denied.contains("medium-risk operation"),
+            "{commit_denied}"
+        );
+
+        for command in [
+            ">/dev/null git commit -m test",
+            "<<<payload git commit -m test",
+            "git -C . 2>&1 commit -m test",
+            "git -C . >/dev/null commit -m test",
+            "git -C . <<<payload commit -m test",
+            "git -C . <<< payload commit -m test",
+            r#"git -C . <<<" " commit -m test"#,
+            r#"git -C . <<<"" commit -m test"#,
+            r#"git -C . <<<'' commit -m test"#,
+            "git -C . <<<123 commit -m test",
+            r#"git -C . <<<"<" commit -m test"#,
+            r#"git -C . <<<">" commit -m test"#,
+            "git -C . <<<\\  commit -m test",
+            "git -C . commit -m test 2>&1",
+            "git -C . commit -m test >/dev/null",
+            "git -C . commit -m test <<<payload",
+        ] {
+            assert!(p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("redirections must not hide a Git write verb");
+            assert!(err.contains("medium-risk operation"), "{command}: {err}");
+        }
+
+        let commit_allowed = p
+            .validate_command_execution("git commit -m test", true)
+            .expect("runtime-approved Git write verb should remain allowed");
+        assert_eq!(commit_allowed, CommandRiskLevel::Medium);
+
+        let push_allowed = p
+            .validate_command_execution("git push origin main", true)
+            .expect("runtime-approved Git push to a configured remote should remain allowed");
+        assert_eq!(push_allowed, CommandRiskLevel::Medium);
+
+        let init_allowed = p
+            .validate_command_execution("git init ./dst", false)
+            .expect("plain Git init should remain allowed");
+        assert_eq!(init_allowed, CommandRiskLevel::Low);
+
+        let rebase_denied = p
+            .validate_command_execution("git rebase main", false)
+            .expect_err("Git rebase without an exec hook should still require approval");
+        assert!(rebase_denied.contains("medium-risk operation"));
+
+        let rebase_allowed = p
+            .validate_command_execution("git rebase main", true)
+            .expect("runtime-approved Git rebase without an exec hook should remain allowed");
+        assert_eq!(rebase_allowed, CommandRiskLevel::Medium);
+
+        for command in [
+            "git am ./change.mbox",
+            "git pull origin main",
+            "git -C . pull origin main",
+            "git worktree add ./dst HEAD",
+            "git -C . worktree add ./dst HEAD",
+        ] {
+            let denied = p
+                .validate_command_execution(command, false)
+                .expect_err("Git mutations and lifecycle hooks must require approval");
+            assert!(
+                denied.contains("medium-risk operation"),
+                "{command}: {denied}"
+            );
+
+            let allowed = p
+                .validate_command_execution(command, true)
+                .expect("runtime-approved Git mutations should remain available");
+            assert_eq!(allowed, CommandRiskLevel::Medium, "{command}");
+        }
+
+        let global_option_commit_denied = p
+            .validate_command_execution("git -C . commit -m test", false)
+            .expect_err("Git write verbs behind global options still require approval");
+        assert!(
+            global_option_commit_denied.contains("medium-risk operation"),
+            "{global_option_commit_denied}"
+        );
+
+        let global_option_commit_allowed = p
+            .validate_command_execution("git -C . commit -m test", true)
+            .expect("runtime-approved Git write verb behind global options should remain allowed");
+        assert_eq!(global_option_commit_allowed, CommandRiskLevel::Medium);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_literal_backslash_executable_is_not_allowlist_match() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            r#""g\it" status"#,
+            r#"'foo\git' status"#,
+            r#"'git>helper' status"#,
+            r#""git<helper" status"#,
+            r#""FOO=bar" git status"#,
+            r#"FOO\=bar git status"#,
+            r#"git\" status"#,
+            r#"\"git status"#,
+            r#""git\"" status"#,
+            r#"'git ' status"#,
+            r#"' git' status"#,
+            "git\\  status",
+            r#"'git '>/dev/null status"#,
+            r#"' git'>/dev/null status"#,
+            r#"'2'>/dev/null git status"#,
+            r#"\2>/dev/null git status"#,
+            "git\\ >/dev/null status",
+        ] {
+            let result = p.validate_command_execution(command, false);
+            assert!(result.is_err(), "{command}: {result:?}");
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_unmodeled_shell_expansions_rejected_at_policy_boundary() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            concat!("git -C . com\\", "\n", "mit -m test"),
+            "git -C {.,commit} -m test",
+            "git -C . $'commit' -m test",
+            "git -C . $\"commit\" -m test",
+            "git -C . $=verb -m test",
+            "git -C . $+verb -m test",
+            "git -C . $^verb -m test",
+            "git -C . $~verb -m test",
+            "git -C . \"$[2+3]\" -m test",
+            "git -C . \"$<\" -m test",
+            "git -C . com* -m test",
+            "git -C . @(commit) -m test",
+            "git -C . +(commit) -m test",
+            "git -C . !(status) -m test",
+            "git -C . ^status -m test",
+        ] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("unmodeled shell expansion must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in ["git -C . com#mit -m test", "git -C . crates~status -m test"] {
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("zsh extended glob must be rejected before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{err}"
+            );
+        }
+
+        for command in [
+            "git -C ~/repo status",
+            "FOO=~/repo git status",
+            "FOO=x:~/repo git status",
+        ] {
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+        }
+
+        for command in ["echo C#", "echo file~backup"] {
+            assert!(contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::Posix,
+            ));
+            assert!(!contains_unmodeled_shell_word_expansion(
+                command,
+                ShellDialect::WindowsCmd,
+            ));
+        }
+        assert!(contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::WindowsCmd,
+        ));
+        assert!(!contains_unmodeled_shell_word_expansion(
+            "echo %USERPROFILE%",
+            ShellDialect::Posix,
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backslash_executable_is_not_normalized_to_allowlisted_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("c\\at ./src/main.rs", false)
+            .expect_err("Windows path separators must not become allowlisted command text");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_single_quotes_remain_literal_executable_text() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let err = p
+            .validate_command_execution("g'i't.exe status", false)
+            .expect_err("cmd.exe single quotes must not normalize to an allowlisted executable");
+        assert!(
+            err.contains("Command not allowed by security policy"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_cmd_expansions_cannot_hide_git_write_verbs() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git %ZC_GIT_VERB%",
+            "git !ZC_GIT_VERB!",
+            "git co^mmit -m test",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("cmd.exe transformations must fail closed before execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_command_blocks_high_risk_via_wildcard() {
         // Wildcard allows the command through is_command_allowed, but
         // block_high_risk_commands still rejects it because "*" does not
@@ -5580,16 +7074,55 @@ mod tests {
             Posix
         ));
 
-        // /dev/null stays safe under BOTH dialects; a real file and a non-bare
-        // `nul`-prefixed name stay blocked under both.
+        // POSIX device paths are safe only for the POSIX shell. A real file and
+        // a non-bare `nul`-prefixed name stay blocked under both dialects.
         assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", Posix));
-        assert!(p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
+        assert!(!p.is_command_allowed_for_shell("git status 2>/dev/null", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret 2>out.txt", WindowsCmd));
         assert!(!p.is_command_allowed_for_shell("echo secret >nul.txt", WindowsCmd));
         assert!(contains_unsafe_output_redirect_for_shell(
             "echo secret >nul.txt",
             WindowsCmd
         ));
+    }
+
+    #[test]
+    fn windows_cmd_operator_and_device_redirects_are_fail_closed() {
+        use ShellDialect::{Posix, WindowsCmd};
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, WindowsCmd)
+                    .is_err(),
+                "cmd.exe must reject policy-hidden operator or POSIX device redirect: {command}"
+            );
+        }
+
+        for command in [
+            "git status 'x & whoami'",
+            r"git status x\&whoami",
+            "git status 'x | whoami'",
+            "git status 'x > /dev/null'",
+            "git status >/dev/null",
+            "git status </dev/zero",
+        ] {
+            assert!(
+                p.validate_command_execution_for_shell(command, false, Posix)
+                    .is_ok(),
+                "POSIX must retain quoted, escaped, and safe-device behavior: {command}"
+            );
+        }
     }
 
     #[test]
@@ -5657,15 +7190,34 @@ mod tests {
 
     #[test]
     fn redirect_helper_unit_tests() {
-        assert!(!contains_unquoted_input_redirect("cat << 'EOF'"));
-        assert!(!contains_unquoted_input_redirect("cat <<< 'hello'"));
-        assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
-        assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
-        assert!(!contains_unquoted_input_redirect("cat</dev/null"));
-        // Input redirect word→non-word bypass (same fix as output redirects)
-        assert!(contains_unquoted_input_redirect("cat</dev/null.secret"));
+        assert!(!contains_unquoted_input_redirect(
+            "cat << 'EOF'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat <<< 'hello'",
+            ShellDialect::Posix
+        ));
         assert!(contains_unquoted_input_redirect(
-            "cat </dev/zero/etc/passwd"
+            "cat < /etc/passwd",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "echo 'a<b'",
+            ShellDialect::Posix
+        ));
+        assert!(!contains_unquoted_input_redirect(
+            "cat</dev/null",
+            ShellDialect::Posix
+        ));
+        // Input redirect word→non-word bypass (same fix as output redirects)
+        assert!(contains_unquoted_input_redirect(
+            "cat</dev/null.secret",
+            ShellDialect::Posix
+        ));
+        assert!(contains_unquoted_input_redirect(
+            "cat </dev/zero/etc/passwd",
+            ShellDialect::Posix
         ));
         assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
         assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
@@ -5715,13 +7267,26 @@ mod tests {
     #[test]
     fn command_argument_injection_blocked() {
         let p = default_policy();
-        // find -exec is a common bypass
-        assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
-        assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
+        for command in [
+            "find . -exec rm -rf '{}' +",
+            "find / -ok cat '{}' ';'",
+            "find . -execdir git commit '{}' +",
+            "find . -okdir env GIT_CONFIG_GLOBAL=./zc-config git zcprobe '{}' ';'",
+        ] {
+            assert!(!p.is_command_allowed(command), "{command}");
+            let err = p
+                .validate_command_execution(command, false)
+                .expect_err("find command carriers must fail before child execution");
+            assert!(
+                err.contains("Command not allowed by security policy"),
+                "{command}: {err}"
+            );
+        }
         // git config/alias can execute commands
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
         assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        assert!(!p.is_command_allowed("git --config-env=alias.st=ZC_ALIAS status"));
         // Legitimate commands should still work
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
@@ -5759,10 +7324,10 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
-        assert!(p.is_command_allowed("FOO=bar ls"));
-        assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
+        // Per-invocation environment changes can alter executable resolution or
+        // command behavior before the allowlist and risk model see it.
+        assert!(!p.is_command_allowed("FOO=bar ls"));
+        assert!(!p.is_command_allowed("LANG=C grep pattern file"));
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
@@ -6032,6 +7597,16 @@ mod tests {
         // Single-quoted variant of the same shape.
         assert_eq!(
             p.forbidden_path_argument("printf '<<EOF\nbody\nEOF' /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_ignores_quoted_redirection_markers() {
+        let p = unix_forbidden_path_policy();
+
+        assert_eq!(
+            p.forbidden_path_argument("cat 'literal>' --file=/etc/passwd"),
             Some("/etc/passwd".into())
         );
     }
@@ -6960,6 +8535,41 @@ mod tests {
                 .as_deref(),
             Some(r"link\secret.txt"),
             "PowerShell backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::WindowsCmd,
+                )
+                .as_deref(),
+            Some(r"link\secret.txt"),
+            "cmd.exe backslash paths must retain workspace symlink resolution"
+        );
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat link\secret.txt",
+                    ShellDialect::Posix,
+                )
+                .as_deref(),
+            None,
+            "POSIX backslash escapes must retain their existing tokenization"
+        );
+
+        // PowerShell single quotes preserve a path with spaces as one argument.
+        // The path guard must inspect that complete path before the shell resolves
+        // the in-workspace symlink.
+        symlink(&outside, workspace.join("link dir")).unwrap();
+        assert_eq!(
+            policy
+                .forbidden_workspace_path_argument_for_shell(
+                    r"cat 'link dir\secret.txt'",
+                    ShellDialect::PowerShell,
+                )
+                .as_deref(),
+            Some(r"link dir\secret.txt"),
+            "PowerShell quoted paths must retain symlink-boundary checks"
         );
 
         // A DANGLING symlink (its target directory does not exist yet) still
