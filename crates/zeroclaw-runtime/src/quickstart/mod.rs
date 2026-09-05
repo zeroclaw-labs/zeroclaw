@@ -1,5 +1,7 @@
 //! Quickstart apply path.
 
+pub mod liveness;
+
 use serde::{Deserialize, Serialize};
 
 use zeroclaw_config::helpers::kebab_to_snake;

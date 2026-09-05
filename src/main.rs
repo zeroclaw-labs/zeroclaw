@@ -553,6 +553,10 @@ enum Commands {
         /// Alias for the new agent. Defaults to a sanitized provider name.
         #[arg(long)]
         agent: Option<String>,
+
+        /// Skip the pre-persist check that the chosen model actually answers.
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Deprecated. Use `zeroclaw quickstart`. Any flags error.
@@ -1268,6 +1272,7 @@ async fn run_quickstart_cli(
     model: Option<String>,
     api_key: Option<String>,
     agent: Option<String>,
+    no_verify: bool,
 ) -> anyhow::Result<()> {
     use dialoguer::{Confirm, Editor, FuzzySelect, Input};
     use zeroclaw_config::presets::{
@@ -2408,6 +2413,91 @@ async fn run_quickstart_cli(
             personality_files: agent_choice.personality_files,
         },
     };
+
+    // Prove the chosen model can answer before anything is persisted. A
+    // credential refusal aborts with the config untouched; an unreachable
+    // provider only warns (the machine may be offline or the endpoint
+    // local-only). Skipped for inline-auth providers, whose credential only
+    // exists after apply, and under --no-verify.
+    if !no_verify && inline_auth.is_none() {
+        use zeroclaw_runtime::quickstart::liveness::{
+            DEFAULT_PROBE_TIMEOUT, LivenessOutcome, probe_staged_model_liveness,
+        };
+        println!();
+        println!(
+            "{}",
+            t(
+                "cli-quickstart-liveness-checking",
+                "Checking that the chosen model answers before saving…"
+            )
+        );
+        match Box::pin(probe_staged_model_liveness(
+            &submission,
+            &cfg,
+            Surface::Cli,
+            DEFAULT_PROBE_TIMEOUT,
+        ))
+        .await
+        {
+            LivenessOutcome::Verified {
+                provider_ref,
+                model,
+            } => {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-liveness-ok",
+                        &[("model", &model), ("provider", &provider_ref)],
+                        "The model answered."
+                    )
+                );
+            }
+            LivenessOutcome::AuthOrAccess {
+                provider_ref,
+                detail,
+                ..
+            } => {
+                eprintln!();
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-liveness-auth",
+                        &[("provider", &provider_ref), ("detail", &detail)],
+                        "The provider rejected the credential."
+                    )
+                );
+                eprintln!(
+                    "{}",
+                    t(
+                        "cli-agent-not-created",
+                        "Your agent was not created — and nothing on disk was changed."
+                    )
+                );
+                anyhow::bail!(
+                    "{}",
+                    t(
+                        "cli-quickstart-liveness-auth-abort",
+                        "Fix the API key and run quickstart again, or pass --no-verify to skip this check."
+                    )
+                );
+            }
+            LivenessOutcome::Unreachable {
+                provider_ref,
+                detail,
+                ..
+            } => {
+                eprintln!(
+                    "{}",
+                    ta(
+                        "cli-quickstart-liveness-warn",
+                        &[("provider", &provider_ref), ("detail", &detail)],
+                        "Could not verify the model; continuing."
+                    )
+                );
+            }
+            LivenessOutcome::NotProbed { .. } => {}
+        }
+    }
 
     match Box::pin(apply_with_surface(submission, &mut cfg, Surface::Cli)).await {
         Ok(applied) => {
@@ -4913,8 +5003,16 @@ async fn async_main(command: clap::Command) -> Result<()> {
             model,
             api_key,
             agent,
+            no_verify,
         } => {
-            Box::pin(run_quickstart_cli(model_provider, model, api_key, agent)).await?;
+            Box::pin(run_quickstart_cli(
+                model_provider,
+                model,
+                api_key,
+                agent,
+                no_verify,
+            ))
+            .await?;
             Ok(())
         }
 

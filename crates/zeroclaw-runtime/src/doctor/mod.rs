@@ -326,7 +326,7 @@ pub async fn run(config: &Config) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelProbeOutcome {
+pub(crate) enum ModelProbeOutcome {
     Ok,
     Skipped,
     AuthOrAccess,
@@ -342,7 +342,7 @@ fn model_probe_status_label(outcome: ModelProbeOutcome) -> &'static str {
     }
 }
 
-fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
+pub(crate) fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     let lower = err_message.to_lowercase();
 
     if lower.contains("does not support live model discovery") {
@@ -426,7 +426,7 @@ fn configured_model_provider_api_key<'a>(
         .and_then(|entry| entry.api_key.as_deref())
 }
 
-fn create_doctor_model_provider(
+pub(crate) fn create_doctor_model_provider(
     config: &Config,
     provider_name: &str,
 ) -> anyhow::Result<Box<dyn zeroclaw_api::model_provider::ModelProvider>> {
@@ -1875,7 +1875,7 @@ fn check_command_available(cmd: &str, args: &[&str], cat: &'static str, items: &
     }
 }
 
-fn format_error_chain(error: &anyhow::Error) -> String {
+pub(crate) fn format_error_chain(error: &anyhow::Error) -> String {
     let mut parts = Vec::new();
     for cause in error.chain() {
         let message = cause.to_string();
