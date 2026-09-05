@@ -2,7 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use reqwest::multipart::{Form, Part};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -106,6 +106,38 @@ struct ModelPickerContext {
     owner_agent_alias: String,
     current: ModelPickerSelection,
     categories: Vec<ModelPickerCategory>,
+}
+
+/// Why a configured route is left out of the picker. Every exclusion is
+/// logged when the picker is built, so an operator can see which
+/// `[[model_routes]]` entries are not selectable and why instead of a route
+/// vanishing silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelPickerExclusion {
+    /// A field would not survive the `/model <hint>` command boundary or
+    /// the bounded Telegram field size (`is_safe_model_picker_field`).
+    UnsafeField,
+    /// The route is not an exact configured and live runtime route on a
+    /// configured provider.
+    Unresolvable,
+    /// `/model <hint>` resolves first-match by hint or model identifier,
+    /// and that first match is a different route: this target could never
+    /// be selected through its own hint.
+    ShadowedByRoute { shadowing_hint: String },
+    /// The same provider and model is already presented under an earlier
+    /// hint; the target stays selectable through that hint.
+    DuplicateTarget { presented_as: String },
+}
+
+impl ModelPickerExclusion {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::UnsafeField => "unsafe_field",
+            Self::Unresolvable => "unresolvable",
+            Self::ShadowedByRoute { .. } => "shadowed_by_route",
+            Self::DuplicateTarget { .. } => "duplicate_target",
+        }
+    }
 }
 
 struct ModelPickerPage<'a> {
@@ -963,37 +995,121 @@ impl TelegramChannel {
             .is_some_and(|(family, alias)| config.providers.models.find(family, alias).is_some())
     }
 
+    /// Mirror of the text resolver's match rule (`apply_model_ref`): a
+    /// `/model <hint>` argument matches a route by model identifier or by
+    /// hint, ASCII case-insensitively, first match wins.
+    fn model_picker_route_matches_argument(hint: &str, model: &str, argument: &str) -> bool {
+        model.eq_ignore_ascii_case(argument) || hint.eq_ignore_ascii_case(argument)
+    }
+
+    /// Classify why `selected` cannot be offered, or `None` when selecting
+    /// it through `/model <hint>` resolves to exactly this route.
+    fn model_picker_route_exclusion(
+        config: &Config,
+        runtime_routes: &[ModelPickerOption],
+        selected: &ModelPickerOption,
+    ) -> Option<ModelPickerExclusion> {
+        if !Self::is_safe_model_picker_field(&selected.hint)
+            || !Self::is_safe_model_picker_field(&selected.model_provider)
+            || !Self::is_safe_model_picker_field(&selected.model)
+        {
+            return Some(ModelPickerExclusion::UnsafeField);
+        }
+        let is_selected_route = |route: &zeroclaw_config::schema::ModelRouteConfig| {
+            route.hint == selected.hint
+                && route.model_provider == selected.model_provider
+                && route.model == selected.model
+        };
+        if !Self::configured_model_provider(config, &selected.model_provider)
+            || !config.model_routes.iter().any(&is_selected_route)
+            || !runtime_routes.iter().any(|route| route == selected)
+        {
+            return Some(ModelPickerExclusion::Unresolvable);
+        }
+        // The selection command is `/model <hint>`, resolved first-match
+        // against the configured routes and the live runtime routes alike.
+        // If either list resolves the hint to a different route first, this
+        // target is unreachable through its own hint and must not be shown.
+        let shadowing_configured = config
+            .model_routes
+            .iter()
+            .find(|route| {
+                Self::model_picker_route_matches_argument(&route.hint, &route.model, &selected.hint)
+            })
+            .filter(|route| !is_selected_route(route))
+            .map(|route| route.hint.clone());
+        let shadowing_runtime = runtime_routes
+            .iter()
+            .find(|route| {
+                Self::model_picker_route_matches_argument(&route.hint, &route.model, &selected.hint)
+            })
+            .filter(|route| *route != selected)
+            .map(|route| route.hint.clone());
+        shadowing_configured
+            .or(shadowing_runtime)
+            .map(|shadowing_hint| ModelPickerExclusion::ShadowedByRoute { shadowing_hint })
+    }
+
     fn model_picker_route_resolves_to(
         config: &Config,
         runtime_routes: &[ModelPickerOption],
         selected: &ModelPickerOption,
     ) -> bool {
-        Self::configured_model_provider(config, &selected.model_provider)
-            && config.model_routes.iter().any(|route| {
-                route.hint == selected.hint
-                    && route.model_provider == selected.model_provider
-                    && route.model == selected.model
-            })
-            && config
-                .model_routes
-                .iter()
-                .find(|route| {
-                    route.model.eq_ignore_ascii_case(&selected.hint)
-                        || route.hint.eq_ignore_ascii_case(&selected.hint)
-                })
-                .is_some_and(|route| {
-                    route.hint == selected.hint
-                        && route.model_provider == selected.model_provider
-                        && route.model == selected.model
-                })
-            && runtime_routes.iter().any(|route| route == selected)
-            && runtime_routes
-                .iter()
-                .find(|route| {
-                    route.model.eq_ignore_ascii_case(&selected.hint)
-                        || route.hint.eq_ignore_ascii_case(&selected.hint)
-                })
-                .is_some_and(|route| route == selected)
+        Self::model_picker_route_exclusion(config, runtime_routes, selected).is_none()
+    }
+
+    /// Operator-visible record of a route the picker will not offer. Lossy
+    /// exclusions (the target is unreachable) are warnings that name the
+    /// `[[model_routes]]` entry; a deduplicated target is only a debug
+    /// note because it stays selectable through the hint shown first.
+    fn log_model_picker_exclusion(
+        channel_alias: &str,
+        route_index: usize,
+        route: &ModelPickerOption,
+        exclusion: &ModelPickerExclusion,
+    ) {
+        let mut attrs = ::serde_json::json!({
+            "channel_alias": channel_alias,
+            "route_index": route_index,
+            "reason": exclusion.reason(),
+        });
+        // A route that failed the field check may carry control characters
+        // or oversized values: identify it by position only.
+        if !matches!(exclusion, ModelPickerExclusion::UnsafeField) {
+            attrs["hint"] = ::serde_json::Value::String(route.hint.clone());
+            attrs["model_provider"] = ::serde_json::Value::String(route.model_provider.clone());
+            attrs["model"] = ::serde_json::Value::String(route.model.clone());
+        }
+        match exclusion {
+            ModelPickerExclusion::ShadowedByRoute { shadowing_hint }
+                if Self::is_safe_model_picker_field(shadowing_hint) =>
+            {
+                attrs["shadowing_hint"] = ::serde_json::Value::String(shadowing_hint.clone());
+            }
+            ModelPickerExclusion::ShadowedByRoute { .. } => {
+                attrs["shadowing_hint_unsafe"] = ::serde_json::Value::Bool(true);
+            }
+            ModelPickerExclusion::DuplicateTarget { presented_as } => {
+                attrs["presented_as"] = ::serde_json::Value::String(presented_as.clone());
+            }
+            ModelPickerExclusion::UnsafeField | ModelPickerExclusion::Unresolvable => {}
+        }
+        if matches!(exclusion, ModelPickerExclusion::DuplicateTarget { .. }) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(attrs),
+                "Telegram model picker presents an already shown target once"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(attrs),
+                "Telegram model picker excluded a configured route; rename or fix it in config.toml"
+            );
+        }
     }
 
     fn model_picker_context(
@@ -1032,25 +1148,39 @@ impl TelegramChannel {
             .unwrap_or_default();
 
         let mut categories: Vec<ModelPickerCategory> = Vec::new();
-        let mut seen_targets = HashSet::new();
-        for route in runtime_routes {
-            if categories
-                .iter()
-                .map(|category| category.options.len())
-                .sum::<usize>()
-                >= TELEGRAM_MODEL_PICKER_MAX_OPTIONS
-            {
+        // Presented (provider, model) targets and the hint each is shown
+        // under; its length is the number of options offered so far.
+        let mut presented_targets: HashMap<(String, String), String> = HashMap::new();
+        for (route_index, route) in runtime_routes.iter().enumerate() {
+            if presented_targets.len() >= TELEGRAM_MODEL_PICKER_MAX_OPTIONS {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "channel_alias": channel_alias,
+                            "max_options": TELEGRAM_MODEL_PICKER_MAX_OPTIONS,
+                            "routes_not_evaluated": runtime_routes.len() - route_index,
+                        })),
+                    "Telegram model picker option cap reached; remaining routes are not shown"
+                );
                 break;
             }
-            let option = route.clone();
-            if !Self::is_safe_model_picker_field(&route.hint)
-                || !Self::is_safe_model_picker_field(&route.model_provider)
-                || !Self::is_safe_model_picker_field(&route.model)
-                || !Self::model_picker_route_resolves_to(config, runtime_routes, &option)
-                || !seen_targets.insert((route.model_provider.clone(), route.model.clone()))
-            {
+            let target = (route.model_provider.clone(), route.model.clone());
+            let exclusion = Self::model_picker_route_exclusion(config, runtime_routes, route)
+                .or_else(|| {
+                    presented_targets.get(&target).map(|presented_as| {
+                        ModelPickerExclusion::DuplicateTarget {
+                            presented_as: presented_as.clone(),
+                        }
+                    })
+                });
+            if let Some(exclusion) = exclusion {
+                Self::log_model_picker_exclusion(channel_alias, route_index, route, &exclusion);
                 continue;
             }
+            presented_targets.insert(target, route.hint.clone());
+            let option = route.clone();
             if let Some(category) = categories
                 .iter_mut()
                 .find(|category| category.provider_ref == route.model_provider)
@@ -7663,6 +7793,151 @@ mod tests {
                 .iter()
                 .all(|option| option.model != "claude-conflicting")
         );
+    }
+
+    #[test]
+    fn model_picker_routes_are_uniquely_selectable_or_excluded_with_a_reason() {
+        // Invariant over the whole configured route list: every route is
+        // either displayed, in which case `/model <hint>` (first match by
+        // hint or model identifier, like `apply_model_ref`) resolves to
+        // exactly that route and each provider+model target is shown once,
+        // or it is excluded with an operator-visible reason. A colliding
+        // hint is never dropped silently.
+        let mut config = model_picker_config();
+        config.model_routes.extend([
+            // Case-insensitive collision with the earlier `fast` hint on a
+            // different target: unreachable through its own hint.
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "FAST".to_string(),
+                model_provider: "anthropic.team".to_string(),
+                model: "claude-fast".to_string(),
+                api_key: None,
+            },
+            // Hint equal to an earlier route's model identifier: the text
+            // resolver would pick the `sonnet` route first.
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "claude-sonnet".to_string(),
+                model_provider: "openai.fast".to_string(),
+                model: "gpt-alias-collision".to_string(),
+                api_key: None,
+            },
+            // Same target as `reasoning` under a second hint: still
+            // reachable, presented once.
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "think".to_string(),
+                model_provider: "openai.primary".to_string(),
+                model: "gpt-reasoning".to_string(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "ghost".to_string(),
+                model_provider: "openai.not-configured".to_string(),
+                model: "gpt-ghost".to_string(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "bad\thint".to_string(),
+                model_provider: "openai.fast".to_string(),
+                model: "gpt-bad".to_string(),
+                api_key: None,
+            },
+        ]);
+        let runtime_routes = model_picker_runtime_routes(&config);
+        let context =
+            TelegramChannel::model_picker_context(&config, "main", runtime_routes.as_ref())
+                .expect("valid configured routes should remain available");
+        let displayed = context
+            .categories
+            .iter()
+            .flat_map(|category| category.options.iter())
+            .collect::<Vec<_>>();
+
+        for option in &displayed {
+            let first_match = config
+                .model_routes
+                .iter()
+                .find(|route| {
+                    route.model.eq_ignore_ascii_case(&option.hint)
+                        || route.hint.eq_ignore_ascii_case(&option.hint)
+                })
+                .expect("displayed route must resolve through the text command");
+            assert_eq!(
+                (
+                    first_match.hint.as_str(),
+                    first_match.model_provider.as_str(),
+                    first_match.model.as_str(),
+                ),
+                (
+                    option.hint.as_str(),
+                    option.model_provider.as_str(),
+                    option.model.as_str(),
+                ),
+                "displayed hint {:?} must resolve first-match to itself",
+                option.hint
+            );
+            assert_eq!(
+                TelegramChannel::model_picker_route_exclusion(
+                    &config,
+                    runtime_routes.as_ref(),
+                    option
+                ),
+                None
+            );
+        }
+        let targets = displayed
+            .iter()
+            .map(|option| (option.model_provider.as_str(), option.model.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            targets.len(),
+            displayed.len(),
+            "each provider+model target is presented once"
+        );
+
+        let exclusion = |hint: &str| {
+            let route = runtime_routes
+                .iter()
+                .find(|route| route.hint == hint)
+                .expect("configured route");
+            TelegramChannel::model_picker_route_exclusion(&config, runtime_routes.as_ref(), route)
+        };
+        assert_eq!(
+            exclusion("FAST"),
+            Some(ModelPickerExclusion::ShadowedByRoute {
+                shadowing_hint: "fast".to_string(),
+            })
+        );
+        assert_eq!(
+            exclusion("claude-sonnet"),
+            Some(ModelPickerExclusion::ShadowedByRoute {
+                shadowing_hint: "sonnet".to_string(),
+            })
+        );
+        assert_eq!(exclusion("ghost"), Some(ModelPickerExclusion::Unresolvable));
+        assert_eq!(
+            exclusion("bad\thint"),
+            Some(ModelPickerExclusion::UnsafeField)
+        );
+        // `think` resolves on its own but shares `reasoning`'s target: it is
+        // deduplicated when the picker is built, not lost.
+        assert_eq!(exclusion("think"), None);
+        assert!(displayed.iter().any(|option| option.hint == "reasoning"));
+        assert!(displayed.iter().all(|option| option.hint != "think"));
+
+        // Every configured route is accounted for: displayed, excluded by
+        // classification, or deduplicated against a displayed target.
+        let accounted = runtime_routes
+            .iter()
+            .filter(|route| {
+                displayed.iter().any(|option| **option == **route)
+                    || exclusion(&route.hint).is_some()
+                    || displayed.iter().any(|option| {
+                        option.model_provider == route.model_provider && option.model == route.model
+                    })
+            })
+            .count();
+        assert_eq!(accounted, runtime_routes.len());
+        assert_eq!(displayed.len(), 4);
     }
 
     #[test]

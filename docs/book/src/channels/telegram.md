@@ -254,7 +254,11 @@ Telegram.
   `config.toml` instead, and use `/model <hint>` only for hints that
   round-trip through the parser without being read as scope syntax.
   Unselectable options are also skipped when the provider or target no
-  longer resolves.
+  longer resolves, and so is a hint that an earlier route already claims
+  (the same hint in a different case, or a hint equal to an earlier route's
+  model identifier): `/model <hint>` would resolve to that earlier route
+  first. Every route the picker leaves out is reported in the daemon log
+  with its reason, so check the log when an expected option is missing.
 - The text alternatives remain available: `/model <hint>` for a session-scoped
   route, `/model --user <hint>` / `/model --agent <hint>` for the broader
   scopes (if permitted), and `/models <provider>` to list models of a provider.
