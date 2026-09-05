@@ -22,6 +22,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
+- `cache_passthrough`: opt into Anthropic prompt caching on chat-completions gateways that translate to the Anthropic Messages API. Adds at most two `cache_control` breakpoints per request and surfaces gateway-reported cache reads in token usage. Default `false`, requests unchanged. Requires route qualification before production use; see [Prompt cache passthrough](#prompt-cache-passthrough-chat-completions-gateways).
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -137,6 +138,81 @@ The setting requires an Anthropic account enrolled in the
 `thinking-display-updates` beta; without enrollment the API rejects the
 request. Set `display = "off"` (or remove the field) to return to the
 previous wire behavior.
+
+## Prompt cache passthrough (chat-completions gateways)
+
+`cache_passthrough = true` on a chat-completions provider alias opts its
+requests into Anthropic prompt caching. Use it on gateways that translate
+Chat Completions into the Anthropic Messages API (LiteLLM, TrueFoundry,
+and similar); the native Anthropic family already caches by default and
+ignores this field.
+
+With the flag on, requests gain at most two `cache_control` breakpoints,
+placed the same way the native Anthropic provider places them: one on the
+system prompt, and one rolling breakpoint on the last message once the
+conversation has more than one non-system message. With
+`merge_system_into_user` the system role never reaches the wire, so the
+merged first user message (or the synthetic user carrying the system text)
+carries the system-equivalent breakpoint instead. Only breakpoint-carrying
+messages change serialization.
+
+The flag also scopes to the structured request paths: agent turns, tool
+calls, and structured streaming. The text-only helpers (`chat_with_system`,
+`chat_with_history`, the legacy chunk-stream APIs) deliberately emit no
+breakpoints even with the flag on, because their responses drop token usage
+entirely; a premium cache write they triggered could never show up in
+accounting. On those helpers the flag is inert, which also means fallback
+re-entries that route through them send unmarked requests. With the flag
+off (the default), request bodies are byte-identical to previous versions.
+
+```toml
+[providers.models.custom.claude-via-gateway]
+uri = "https://<gateway-host>/v1"
+model = "<anthropic-routed model>"
+api_key = "op://platform/gateway/api-key"
+cache_passthrough = true
+```
+
+Requirements and caveats:
+
+- **Gateway support is required.** The breakpoint reaches Anthropic only
+  when the gateway forwards block-form content with `cache_control` into
+  the native Messages API. Routes that proxy the OpenAI API proper ignore
+  the field. A non-Anthropic-routed model behind the same gateway does not
+  fail loudly: the field is accepted and dropped, and the gateway may still
+  meter cache-write tokens on that route in its own usage accounting. Give
+  Anthropic-routed models a dedicated alias instead of enabling the flag on
+  a mixed entry.
+- **Size and TTL.** Anthropic caches only prefixes of at least 1024 tokens
+  (2048 on some smaller models), and entries expire after roughly five
+  minutes, refreshed on each read. Short or infrequent conversations see
+  no benefit.
+- **Writes bill at a premium.** Tokens written to the cache are billed at
+  a premium (1.25x on the observed route) and reads come back at a large
+  discount. A route that writes the cache on every request without ever
+  reading it costs more than no caching at all.
+- **Qualify the exact route first.** A gateway exposes many model aliases
+  to the same upstream account, and an alias that accepts and bills cache
+  writes can still never serve cache reads. Before relying on the flag in
+  production, send one flagged request and check the usage reports
+  `cache_creation_input_tokens > 0`; then immediately repeat the
+  byte-identical request and check for `cache_read_input_tokens > 0`.
+  Cache creation alone is not evidence that caching works. Re-run the pair
+  after any model-alias or gateway-route change.
+- **Usage reporting.** When the gateway forwards the Anthropic-shaped
+  usage counters, `cache_read_input_tokens` fills the cached-input figure
+  in token usage and cost reporting, and `cache_creation_input_tokens` is
+  written to the debug log with counts only. A response that reports zero
+  cache reads keeps the cached figure at zero rather than substituting the
+  OpenAI-shaped counter. This accounting covers the structured paths only,
+  which is exactly why the helpers without usage capture stay inert above.
+- **Tool definitions are not separately marked.** The native Anthropic
+  provider additionally marks the last tool definition, which covers
+  tool-schema tokens when no system prompt exists. This flag does not mark
+  tool definitions; requests with tools but no system prompt cache only the
+  rolling message breakpoint. The live gateway qualification showed that
+  with a system prompt present, tool-schema tokens sit inside the cached
+  prefix anyway.
 
 ## Per-family knobs: worked examples
 

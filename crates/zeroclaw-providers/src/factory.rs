@@ -254,6 +254,9 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    if opts.cache_passthrough {
+        b = b.with_cache_passthrough();
+    }
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
     // through; other shapes produce a WARN and are ignored (matching the
@@ -1811,6 +1814,33 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+    #[test]
+    fn cache_passthrough_runtime_option_reaches_provider_capability() {
+        let provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions {
+                cache_passthrough: true,
+                ..ModelProviderRuntimeOptions::default()
+            },
+        );
+        assert!(
+            provider.capabilities().prompt_caching,
+            "factory must thread cache_passthrough into the provider capability"
+        );
+
+        let default_provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(!default_provider.capabilities().prompt_caching);
+    }
 
     #[test]
     fn endpoint_registry_classifies_every_canonical_family() {

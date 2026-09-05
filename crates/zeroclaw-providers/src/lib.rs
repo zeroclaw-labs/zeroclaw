@@ -632,6 +632,11 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through OpenAI-compatible providers:
+    /// inject `cache_control` breakpoints (system prompt; rolling last
+    /// message) into request bodies and capture gateway-reported cache
+    /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
+    pub cache_passthrough: bool,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -677,6 +682,7 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            cache_passthrough: false,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -741,6 +747,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -2734,6 +2741,23 @@ mod tests {
             Some(&entry),
         );
         assert_eq!(opts.tool_result_image_policy, ToolResultImagePolicy::Omit);
+    }
+
+    #[test]
+    fn cache_passthrough_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_passthrough: true,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert!(opts.cache_passthrough);
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert!(!defaults.cache_passthrough);
     }
 
     #[test]

@@ -432,13 +432,13 @@ struct NativeToolSpec {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CacheControl {
+pub(crate) struct CacheControl {
     #[serde(rename = "type")]
     cache_type: String,
 }
 
 impl CacheControl {
-    fn ephemeral() -> Self {
+    pub(crate) fn ephemeral() -> Self {
         Self {
             cache_type: "ephemeral".to_string(),
         }
