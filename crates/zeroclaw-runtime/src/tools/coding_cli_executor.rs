@@ -6,7 +6,7 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_tools::coding_cli::{
-    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, host_native_program,
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, host_native_program_for_command,
 };
 
 pub(crate) struct RuntimeCodingCliExecutor {
@@ -107,7 +107,7 @@ fn command_env_snapshot(process: &tokio::process::Command) -> Vec<(OsString, Opt
 fn native_command(
     command: &CodingCliCommand,
 ) -> Result<tokio::process::Command, CodingCliExecutionError> {
-    let mut process = tokio::process::Command::new(host_native_program(&command.program)?);
+    let mut process = tokio::process::Command::new(host_native_program_for_command(command)?);
     process.args(&command.args);
     process.current_dir(&command.working_dir);
     Ok(process)
@@ -152,6 +152,25 @@ mod tests {
 
         let rendered = shell_command(&command);
         assert_eq!(rendered, "codex exec 'hello world' 'it'\\''s safe; really'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_command_uses_the_command_specific_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_dir = tempfile::tempdir().unwrap();
+        let launcher = launcher_dir.path().join("codex");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = CodingCliCommand::new("codex", PathBuf::from("."), 1);
+        command.env("PATH", launcher_dir.path().as_os_str());
+
+        let process = native_command(&command).unwrap();
+        assert_eq!(
+            process.as_std().get_program(),
+            launcher.canonicalize().unwrap().as_os_str()
+        );
     }
 
     #[cfg(not(target_os = "windows"))]

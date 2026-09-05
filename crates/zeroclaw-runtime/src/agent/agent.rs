@@ -12,6 +12,7 @@ use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use zeroclaw_config::schema::Config;
@@ -1563,8 +1564,13 @@ impl Agent {
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
-        let runtime: Arc<dyn platform::RuntimeAdapter> =
-            Arc::from(platform::create_runtime(&config.runtime)?);
+        let tui_path = tui_env
+            .as_ref()
+            .and_then(|env| env.get("PATH"))
+            .map(OsStr::new);
+        let runtime: Arc<dyn platform::RuntimeAdapter> = Arc::from(
+            platform::create_runtime_with_path(&config.runtime, tui_path)?,
+        );
         // Per-agent workspace becomes the SecurityPolicy boundary
         // (file_read/write/edit + shell tool jail to the agent's own
         // dir). The session-cwd override still wins so ACP sessions

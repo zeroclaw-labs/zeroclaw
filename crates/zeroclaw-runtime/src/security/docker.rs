@@ -1,12 +1,15 @@
 //! Docker sandbox (container isolation)
 
 use crate::security::traits::Sandbox;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
+use zeroclaw_config::platform::resolve_executable;
 
 /// Docker sandbox backend
 #[derive(Debug, Clone)]
 pub struct DockerSandbox {
+    launcher: Option<PathBuf>,
     image: String,
     workspace_dir: Option<PathBuf>,
 }
@@ -14,6 +17,7 @@ pub struct DockerSandbox {
 impl Default for DockerSandbox {
     fn default() -> Self {
         Self {
+            launcher: None,
             image: "alpine:latest".to_string(),
             workspace_dir: None,
         }
@@ -25,73 +29,96 @@ impl DockerSandbox {
     /// Exposed so callers constructing via with_workspace() without a custom
     /// image don't duplicate the default-image string.
     pub fn default_image() -> String {
-        Self::default().image
+        "alpine:latest".to_string()
     }
 
     /// Construct a Docker sandbox with a workspace bind-mount (read-only).
     /// Used by Python/R/Julia skills that need to access script files from
     /// the workspace inside the container.
     pub fn with_workspace(image: String, workspace_dir: PathBuf) -> std::io::Result<Self> {
-        if Self::is_installed() {
-            Ok(Self {
-                image,
-                workspace_dir: Some(workspace_dir),
-            })
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Docker not found",
-            ))
-        }
+        Self::with_resolved_launcher(image, Some(workspace_dir))
     }
 
     pub fn new() -> std::io::Result<Self> {
-        if Self::is_installed() {
-            Ok(Self::default())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Docker not found",
-            ))
-        }
+        Self::with_resolved_launcher(Self::default_image(), None)
     }
 
     pub fn with_image(image: String) -> std::io::Result<Self> {
-        if Self::is_installed() {
-            Ok(Self {
-                image,
-                workspace_dir: None,
-            })
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Docker not found",
-            ))
-        }
+        Self::with_resolved_launcher(image, None)
     }
 
     pub fn probe() -> std::io::Result<Self> {
         Self::new()
     }
 
-    fn is_installed() -> bool {
-        Command::new("docker")
+    fn with_resolved_launcher(
+        image: String,
+        workspace_dir: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let launcher = resolve_executable(OsStr::new("docker")).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("Docker launcher could not be resolved: {error}"),
+            )
+        })?;
+        let output = Command::new(&launcher)
             .arg("--version")
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Docker launcher at {} could not be probed: {error}",
+                        launcher.display()
+                    ),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("Docker launcher at {} is unavailable", launcher.display()),
+            ));
+        }
+        Ok(Self {
+            launcher: Some(launcher),
+            image,
+            workspace_dir,
+        })
+    }
+
+    fn resolve_launcher(&self) -> std::io::Result<PathBuf> {
+        if let Some(launcher) = &self.launcher {
+            return Ok(launcher.clone());
+        }
+
+        resolve_executable(OsStr::new("docker")).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("Docker launcher could not be resolved: {error}"),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            launcher: Some(PathBuf::from("docker")),
+            image: "alpine:latest".to_string(),
+            workspace_dir: None,
+        }
     }
 }
 
 impl Sandbox for DockerSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        let launcher = self.resolve_launcher()?;
         let program = cmd.get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
 
-        let mut docker_cmd = Command::new("docker");
+        let mut docker_cmd = Command::new(&launcher);
         docker_cmd.args([
             "run",
             "--rm",
@@ -120,7 +147,15 @@ impl Sandbox for DockerSandbox {
     }
 
     fn is_available(&self) -> bool {
-        Self::is_installed()
+        let launcher = match self.resolve_launcher() {
+            Ok(launcher) => launcher,
+            Err(_) => return false,
+        };
+        Command::new(launcher)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
     fn name(&self) -> &str {
@@ -151,6 +186,7 @@ mod tests {
     #[test]
     fn docker_sandbox_default_image() {
         let sandbox = DockerSandbox::default();
+        assert!(sandbox.launcher.is_none());
         assert_eq!(sandbox.image, "alpine:latest");
     }
 
@@ -159,7 +195,7 @@ mod tests {
         let result = DockerSandbox::with_image("ubuntu:latest".to_string());
         match result {
             Ok(sandbox) => assert_eq!(sandbox.image, "ubuntu:latest"),
-            Err(_) => assert!(!DockerSandbox::is_installed()),
+            Err(_) => assert!(!DockerSandbox::default().is_available()),
         }
     }
 
@@ -167,7 +203,7 @@ mod tests {
 
     #[test]
     fn docker_wrap_command_includes_isolation_flags() {
-        let sandbox = DockerSandbox::default();
+        let sandbox = DockerSandbox::for_test();
         let mut cmd = Command::new("echo");
         cmd.arg("hello");
         sandbox.wrap_command(&mut cmd).unwrap();
@@ -216,7 +252,7 @@ mod tests {
 
     #[test]
     fn docker_wrap_command_preserves_original_command() {
-        let sandbox = DockerSandbox::default();
+        let sandbox = DockerSandbox::for_test();
         let mut cmd = Command::new("ls");
         cmd.arg("-la");
         sandbox.wrap_command(&mut cmd).unwrap();
@@ -243,6 +279,7 @@ mod tests {
     #[test]
     fn docker_wrap_command_uses_custom_image() {
         let sandbox = DockerSandbox {
+            launcher: Some(PathBuf::from("docker")),
             image: "ubuntu:22.04".to_string(),
             workspace_dir: None,
         };
@@ -266,10 +303,33 @@ mod tests {
         // Can't guarantee docker is installed in tests; just verify the
         // struct shape round-trips if construction were to succeed.
         let sandbox = DockerSandbox {
+            launcher: Some(PathBuf::from("docker")),
             image: "alpine:latest".to_string(),
             workspace_dir: Some(ws_path.clone()),
         };
         assert_eq!(sandbox.workspace_dir, Some(ws_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_wrap_uses_the_resolved_launcher_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("docker");
+        std::fs::write(&launcher, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = launcher.canonicalize().unwrap();
+        let sandbox = DockerSandbox {
+            launcher: Some(launcher.clone()),
+            image: "alpine:latest".to_string(),
+            workspace_dir: None,
+        };
+
+        assert!(sandbox.is_available());
+        let mut command = Command::new("echo");
+        sandbox.wrap_command(&mut command).unwrap();
+        assert_eq!(command.get_program(), launcher.as_os_str());
     }
 
     #[test]
@@ -282,6 +342,7 @@ mod tests {
     fn docker_wrap_command_emits_bind_mount_when_workspace_configured() {
         let ws = std::path::PathBuf::from("/workspace/skills");
         let sandbox = DockerSandbox {
+            launcher: Some(PathBuf::from("docker")),
             image: "alpine:latest".to_string(),
             workspace_dir: Some(ws.clone()),
         };
@@ -318,7 +379,7 @@ mod tests {
 
     #[test]
     fn docker_wrap_command_omits_bind_mount_when_no_workspace() {
-        let sandbox = DockerSandbox::default();
+        let sandbox = DockerSandbox::for_test();
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
 

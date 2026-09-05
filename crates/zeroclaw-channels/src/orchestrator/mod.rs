@@ -14012,7 +14012,8 @@ pub(crate) mod tests {
             None,
             false,
             None,
-        );
+        )
+        .expect("all_tools test registry should build");
         let schemas: HashMap<String, Arc<serde_json::Value>> = registry
             .tools
             .iter()

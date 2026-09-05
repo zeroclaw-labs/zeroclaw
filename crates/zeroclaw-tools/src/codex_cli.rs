@@ -395,8 +395,8 @@ mod tests {
             "relative working_directory should resolve inside workspace; got {error:?}"
         );
         assert!(
-            error.contains("Codex CLI ('codex') not found in PATH"),
-            "expected missing Codex CLI after path validation; got {error:?}"
+            error.contains("Unix coding CLI executable \"codex\" could not be resolved"),
+            "expected unresolved Codex CLI after path validation; got {error:?}"
         );
     }
 

@@ -16805,7 +16805,8 @@ Let me check the result."#;
             None,
             false,
             None,
-        );
+        )
+        .expect("all_tools test registry should build");
 
         let before = tool_names(&built.tools);
         assert!(
