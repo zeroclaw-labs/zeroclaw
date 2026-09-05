@@ -168,6 +168,26 @@ test('error then new turn discards thinking captured before the error', () => {
   assert.deepEqual(state, initialTurnStreamState());
 });
 
+test('context exhaustion commits the visible partial before resetting the turn', () => {
+  const { state, completions } = runFrames([
+    { type: 'chunk', content: 'answer before ' },
+    { type: 'chunk', content: 'the overflow' },
+    { type: 'context_exhausted' },
+  ]);
+
+  assert.deepEqual(completions, [
+    { kind: 'commit', content: 'answer before the overflow', thinking: undefined },
+  ]);
+  assert.deepEqual(state, initialTurnStreamState());
+});
+
+test('context exhaustion with no streamed output does not invent a diagnostic', () => {
+  const { state, completions } = runFrames([{ type: 'context_exhausted' }]);
+
+  assert.deepEqual(completions, [{ kind: 'skip' }]);
+  assert.deepEqual(state, initialTurnStreamState());
+});
+
 // ── classifyCompletion fallback chain (full_response ?? content ?? pending) ──
 
 test('classifyCompletion falls back to frame content then pending stream', () => {

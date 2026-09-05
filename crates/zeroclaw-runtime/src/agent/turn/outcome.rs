@@ -41,6 +41,32 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug)]
+pub(crate) struct ContextExhaustedAfterRecovery {
+    message: String,
+}
+
+impl ContextExhaustedAfterRecovery {
+    pub(crate) fn new(error: &anyhow::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for ContextExhaustedAfterRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContextExhaustedAfterRecovery {}
+
+pub(crate) fn is_context_exhausted_after_recovery(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ContextExhaustedAfterRecovery>()
+        .is_some()
+}
+
+#[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
     pub(crate) message: String,
