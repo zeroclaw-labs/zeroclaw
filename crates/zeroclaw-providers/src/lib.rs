@@ -3106,9 +3106,12 @@ mod tests {
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+        // A bare route clears the inherited alias-only state back to the type
+        // default (currently `relocate`), so assert against the default rather
+        // than a fixed variant.
         assert_eq!(
             route_options.tool_result_image_policy,
-            zeroclaw_config::schema::ToolResultImagePolicy::ImageUrl
+            zeroclaw_config::schema::ToolResultImagePolicy::default()
         );
     }
 
