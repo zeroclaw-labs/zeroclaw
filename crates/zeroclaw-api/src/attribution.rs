@@ -251,6 +251,7 @@ pub enum ModelProviderKind {
     Together,
     Bedrock,
     Ollama,
+    HailoOllama,
     Gemini,
     GeminiCli,
     GrokCli,

@@ -1,11 +1,15 @@
 use crate::multimodal;
+use crate::ollama_wire::{
+    ApiChatResponse, ChatRequest, Message, OllamaToolCall, Options, OutgoingFunction,
+    OutgoingToolCall,
+};
 use crate::traits::{
     ChatMessage, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
     ToolsPayload,
 };
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 /// Matches Ollama's upstream Modelfile default
@@ -75,107 +79,6 @@ pub struct OllamaModelProvider {
     tuning: OllamaTuning,
 }
 
-// ─── Request Structures ───────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<Message>,
-    stream: bool,
-    options: Options,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    think: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct Message {
-    role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    images: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OutgoingToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OutgoingToolCall {
-    #[serde(rename = "type")]
-    kind: String,
-    function: OutgoingFunction,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OutgoingFunction {
-    name: String,
-    arguments: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct Options {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_ctx: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    num_predict: Option<i32>,
-}
-
-// ─── Response Structures ──────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct ApiChatResponse {
-    message: ResponseMessage,
-    #[serde(default)]
-    prompt_eval_count: Option<u64>,
-    #[serde(default)]
-    eval_count: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseMessage {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    tool_calls: Vec<OllamaToolCall>,
-    /// Some models return a "thinking" field with internal reasoning
-    #[serde(default)]
-    thinking: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaToolCall {
-    id: Option<String>,
-    function: OllamaFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaFunction {
-    name: String,
-    #[serde(default, deserialize_with = "deserialize_args")]
-    arguments: serde_json::Value,
-}
-
-// ─── serde Helpers ───────────────────────────────────────────────────────────
-fn deserialize_args<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-
-    if let Some(s) = value.as_str() {
-        match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(v) => Ok(v),
-            Err(_) => Ok(serde_json::json!({})),
-        }
-    } else {
-        Ok(value)
-    }
-}
 // ─── Implementation ───────────────────────────────────────────────────────────
 
 /// Typed builder for [`OllamaModelProvider`].
@@ -699,7 +602,7 @@ impl OllamaModelProvider {
                 request.messages.len(),
                 temperature,
                 request.think,
-                request.tools.as_ref().map_or(0, |t| t.len())
+                request.tools.as_ref().map_or(0, |tools| tools.len())
             )
         );
 
@@ -1109,6 +1012,7 @@ impl ::zeroclaw_api::attribution::Attributable for OllamaModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ollama_wire::OllamaFunction;
     use std::sync::{Arc, Mutex};
 
     #[test]
