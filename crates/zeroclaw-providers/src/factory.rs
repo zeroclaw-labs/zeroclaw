@@ -73,6 +73,22 @@ pub(crate) trait FamilyProviderFactory {
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key)
     }
+
+    /// Whether `key` would actually be sent as the outbound API credential by
+    /// this family's factory. Credential rotation swaps `api_key` strings, so a
+    /// rotation is only sound for keys the factory uses as the wire credential.
+    /// Unlike `fallback_auth_ready`, which asks whether the alias can construct
+    /// any authentication at all, this asks whether the selected key itself is
+    /// the credential that authenticates the request. Profiles that refresh
+    /// OAuth and ignore the key, setup tokens that switch the auth header, and
+    /// families whose key is ignored or ambient must return false.
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        has_api_key(key)
+    }
 }
 
 fn fixed_family_endpoint<T: FamilyProviderFactory>() -> &'static str {
@@ -471,6 +487,92 @@ pub(crate) fn fallback_auth_ready_for_alias(
         }
     }
     zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
+}
+
+/// Single owner of credential-rotation eligibility. Resolves the same typed
+/// per-family config slot as `dispatch_family_factory` and asks its
+/// `api_key_is_outbound_credential` capability whether the selected key is the
+/// credential that factory would actually send. Must stay in lockstep with
+/// `dispatch_family_factory` and `fallback_auth_ready_for_alias`: all three
+/// resolve `provider_kind` before falling back to the family name, share the
+/// openai missing-entry fallback, and walk the same provider-slot macro.
+/// `config` is `None` for bare (non-alias) providers, which are judged against
+/// each family's default configuration, mirroring bare dispatch.
+pub(crate) fn rotation_credential_eligible(
+    config: Option<&zeroclaw_config::schema::Config>,
+    family: &str,
+    alias: &str,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> bool {
+    let mut resolved_opts = opts.clone();
+    if let Some(config) = config {
+        let Some(entry) = config.providers.models.find(family, alias) else {
+            return false;
+        };
+        if resolved_opts.provider_api_url.is_none()
+            && let Some(uri) = entry
+                .uri
+                .as_deref()
+                .or_else(|| config.providers.models.resolved_endpoint_uri(family, alias))
+        {
+            resolved_opts.provider_api_url = Some(uri.to_string());
+        }
+        if entry.requires_openai_auth
+            && !crate::openai_codex::api_key_is_outbound_credential(&resolved_opts, key)
+        {
+            return false;
+        }
+    }
+    let opts = &resolved_opts;
+
+    let provider_kind = opts
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(family);
+
+    if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
+        return crate::openai_codex::api_key_is_outbound_credential(opts, key);
+    }
+
+    if provider_kind == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .and_then(|c| c.providers.models.openai.get(alias))
+            .unwrap_or(&default_cfg);
+        return cfg.api_key_is_outbound_credential(key, opts);
+    }
+
+    macro_rules! emit_rotation_eligible {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_kind {
+                "openai-compatible" | "openai_compatible" => {
+                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
+                    let cfg = config
+                        .and_then(|c| c.providers.models.find("openai", alias))
+                        .unwrap_or(&default_cfg);
+                    cfg.api_key_is_outbound_credential(key, opts)
+                }
+                $(
+                    $type_str => {
+                        let default_cfg: $cfg_ty;
+                        let cfg: &$cfg_ty = match config.and_then(|c| c.providers.models.$field.get(alias)) {
+                            Some(c) => c,
+                            None => {
+                                default_cfg = <$cfg_ty>::default();
+                                &default_cfg
+                            }
+                        };
+                        cfg.api_key_is_outbound_credential(key, opts)
+                    }
+                )+
+                _ => has_api_key(key),
+            }
+        }
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_rotation_eligible)
 }
 
 use zeroclaw_config::schema::{
@@ -955,6 +1057,16 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || has_non_empty_value(self.oauth_refresh_token.as_deref())
     }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        has_api_key(key)
+            && !matches!(self.auth_mode, Some(AuthMode::OAuth))
+            && !has_non_empty_value(self.oauth_refresh_token.as_deref())
+    }
 }
 
 impl CompatFamilySpec for ZaiModelProviderConfig {
@@ -1100,6 +1212,16 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         }
         Ok(Box::new(b.build()))
     }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        key.map(str::trim).is_some_and(|k| {
+            !k.is_empty() && !crate::anthropic::AnthropicModelProvider::is_setup_token(k)
+        })
+    }
 }
 
 /// Config used when the `openai` family is dispatched with **no persisted
@@ -1165,6 +1287,22 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || self.base.requires_openai_auth
+    }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        if self.base.requires_openai_auth {
+            let mut resolved_opts = opts.clone();
+            if resolved_opts.provider_api_url.is_none() {
+                resolved_opts.provider_api_url = self.base.uri.clone();
+            }
+            crate::openai_codex::api_key_is_outbound_credential(&resolved_opts, key)
+        } else {
+            has_api_key(key)
+        }
     }
 }
 
@@ -1263,6 +1401,14 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         has_api_key(key) || matches!(self.auth_mode, Some(AuthMode::OAuth))
+    }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        has_api_key(key) && !matches!(self.auth_mode, Some(AuthMode::OAuth))
     }
 }
 
@@ -1375,6 +1521,16 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
     }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        // An explicit key selects Bedrock bearer-token authentication. With no
+        // key the builder keeps the ambient AWS/SigV4 credential chain.
+        has_api_key(key)
+    }
 }
 
 impl FamilyProviderFactory for QwenModelProviderConfig {
@@ -1452,6 +1608,17 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
             || has_non_empty_value(self.oauth_refresh_token.as_deref())
             || matches!(self.auth_mode, Some(AuthMode::OAuth))
     }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        key.map(str::trim).is_some_and(|k| {
+            !k.is_empty() && !k.eq_ignore_ascii_case(crate::QWEN_OAUTH_PLACEHOLDER)
+        }) && !matches!(self.auth_mode, Some(AuthMode::OAuth))
+            && !has_non_empty_value(self.oauth_refresh_token.as_deref())
+    }
 }
 
 impl FamilyProviderFactory for GroqModelProviderConfig {
@@ -1524,6 +1691,15 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
     }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        _key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        // Subprocess wrapper ignores the key.
+        false
+    }
 }
 
 impl FamilyProviderFactory for GrokCliModelProviderConfig {
@@ -1582,6 +1758,15 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
+    }
+
+    fn api_key_is_outbound_credential(
+        &self,
+        _key: Option<&str>,
+        _opts: &ModelProviderRuntimeOptions,
+    ) -> bool {
+        // Subprocess wrapper ignores the key.
+        false
     }
 }
 
@@ -1830,6 +2015,114 @@ mod tests {
         assert!(endpoint_for_family("not_a_provider").is_none());
         assert!(endpoint_for_family("openai-compatible").is_none());
         assert!(endpoint_for_family("openai_compatible").is_none());
+    }
+
+    #[test]
+    fn bedrock_explicit_bearer_is_rotation_eligible() {
+        let options = ModelProviderRuntimeOptions::default();
+
+        assert!(rotation_credential_eligible(
+            None,
+            "bedrock",
+            "default",
+            Some("bedrock-api-key"),
+            &options,
+        ));
+        assert!(!rotation_credential_eligible(
+            None, "bedrock", "default", None, &options,
+        ));
+        assert!(!rotation_credential_eligible(
+            None,
+            "bedrock",
+            "default",
+            Some("  "),
+            &options,
+        ));
+    }
+
+    #[test]
+    fn legacy_codex_oauth_is_not_rotation_eligible_without_custom_endpoint() {
+        for family in ["openai-codex", "openai_codex", "codex"] {
+            assert!(!rotation_credential_eligible(
+                None,
+                family,
+                "default",
+                Some("stored-oauth-token"),
+                &ModelProviderRuntimeOptions::default(),
+            ));
+        }
+
+        let custom_endpoint = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://gateway.example.com/v1".to_string()),
+            ..Default::default()
+        };
+        assert!(rotation_credential_eligible(
+            None,
+            "openai-codex",
+            "default",
+            Some("gateway-api-key"),
+            &custom_endpoint,
+        ));
+    }
+
+    #[test]
+    fn configured_codex_alias_with_custom_gateway_is_rotation_eligible() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "gateway_alias".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    uri: Some("https://gateway.example.com/v1".to_string()),
+                    api_key: Some("gateway-primary-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://gateway.example.com/v1".to_string()),
+            ..Default::default()
+        };
+
+        assert!(rotation_credential_eligible(
+            Some(&config),
+            "openai",
+            "gateway_alias",
+            Some("gateway-primary-key"),
+            &options,
+        ));
+        assert!(rotation_credential_eligible(
+            Some(&config),
+            "openai",
+            "gateway_alias",
+            Some("gateway-alternate-key"),
+            &options,
+        ));
+    }
+
+    #[test]
+    fn configured_codex_alias_with_default_oauth_is_not_rotation_eligible() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "oauth_alias".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let options = ModelProviderRuntimeOptions::default();
+
+        assert!(!rotation_credential_eligible(
+            Some(&config),
+            "openai",
+            "oauth_alias",
+            Some("oauth-token"),
+            &options,
+        ));
     }
 
     #[test]

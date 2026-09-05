@@ -220,6 +220,19 @@ fn is_default_responses_url(url: &str) -> bool {
     canonical_endpoint(url) == canonical_endpoint(DEFAULT_CODEX_RESPONSES_URL)
 }
 
+/// Whether the selected key is the credential this provider sends.
+///
+/// The default Codex endpoint always authenticates with the stored OpenAI
+/// OAuth token. Only an explicit custom endpoint uses the supplied gateway
+/// key, so only that construction may participate in API-key rotation.
+pub(crate) fn api_key_is_outbound_credential(
+    options: &ModelProviderRuntimeOptions,
+    key: Option<&str>,
+) -> bool {
+    let has_key = key.map(str::trim).is_some_and(|key| !key.is_empty());
+    has_key && resolve_responses_url(options).is_ok_and(|url| !is_default_responses_url(&url))
+}
+
 pub(crate) fn first_nonempty(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         let trimmed = value.trim();
