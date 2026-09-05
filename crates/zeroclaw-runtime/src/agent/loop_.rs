@@ -662,7 +662,7 @@ pub(crate) fn build_system_prompt_for_turn(
             native_tool_specs_present,
             skills_prompt_mode,
             compact_context,
-            max_system_prompt_chars,
+            0,
             inject_memory,
             show_tool_calls,
             shell_profile,
@@ -682,7 +682,10 @@ pub(crate) fn build_system_prompt_for_turn(
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
 
-    Ok(system_prompt)
+    Ok(crate::agent::system_prompt::finalize_system_prompt(
+        system_prompt,
+        max_system_prompt_chars,
+    ))
 }
 
 pub fn make_query_summary(raw: &str) -> Option<String> {
@@ -3218,7 +3221,7 @@ pub async fn process_message(
                 native_tool_specs_present,
                 eff_prompt_injection_mode,
                 eff_compact_context,
-                eff_max_system_prompt_chars,
+                0,
                 false,
                 config.channels.show_tool_calls,
                 runtime.shell_profile().as_ref(),
@@ -3271,6 +3274,10 @@ pub async fn process_message(
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
+        system_prompt = crate::agent::system_prompt::finalize_system_prompt(
+            system_prompt,
+            eff_max_system_prompt_chars,
+        );
 
         let effective_msg_ref = effective_message.as_str();
         let runtime_capability_names: Vec<&str> = effective_tool_names.iter().copied().collect();
@@ -13537,6 +13544,42 @@ Let me check the result."#;
             !native_tool_specs_present,
             "Provider native-tool capability alone must not imply tools are available"
         );
+    }
+
+    #[test]
+    fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().expect("tempdir");
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            &format!("## Deferred\n\n{}", "界".repeat(300)),
+            &[],
+            None,
+            None,
+            &RiskProfileConfig::default(),
+            &provider,
+            &[],
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            512,
+            true,
+            false,
+            Some("THINKING_PREFIX"),
+            None,
+        )
+        .expect("turn prompt");
+
+        assert_eq!(prompt.chars().count(), 512);
+        assert!(prompt.starts_with("THINKING_PREFIX"));
+        assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("System prompt truncated"));
     }
 
     #[test]
