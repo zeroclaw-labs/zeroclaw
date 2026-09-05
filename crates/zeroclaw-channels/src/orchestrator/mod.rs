@@ -10322,6 +10322,50 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
 }
 
+/// Build the Matrix channel for `[channels.matrix.<alias>]` with every
+/// live-config resolver installed, mirroring
+/// [`build_configured_discord_channel`].
+///
+/// Extracted from [`collect_configured_channels`] so the *configured*
+/// construction path stays reachable: the loop wraps the result in
+/// `PacedChannel` and type-erases it to `Arc<dyn Channel>` immediately, so a
+/// test can otherwise never observe the resolvers this function installs.
+///
+/// Fallible because [`MatrixChannel::new`] validates `homeserver` and the
+/// credential pair; the caller logs and skips the alias on `Err`.
+#[cfg(feature = "channel-matrix")]
+pub(crate) fn build_configured_matrix_channel(
+    config_arc: &Arc<RwLock<Config>>,
+    config: &Config,
+    alias: &str,
+    mx: &zeroclaw_config::schema::MatrixConfig,
+) -> Result<MatrixChannel> {
+    let state_dir = matrix_state_dir(&config.config_path, alias);
+    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let cfg_arc = config_arc.clone();
+        let alias = alias.to_string();
+        Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
+    };
+    let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+    let transcription_config_arc = Arc::clone(config_arc);
+    let transcription_channel_key = format!("matrix.{alias}");
+    let channel = MatrixChannel::new(mx.clone(), alias.to_string(), peer_resolver, state_dir)?;
+    Ok(channel
+        .with_transcription_manager_factory(move || {
+            let config = transcription_config_arc.read();
+            if !config.transcription.enabled {
+                return None;
+            }
+            let provider =
+                resolve_agent_transcription_provider(&config, &transcription_channel_key);
+            Some(crate::matrix::build_transcription_manager(
+                &config, &provider,
+            ))
+        })
+        .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
+        .with_ack_reactions(ack))
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -10647,33 +10691,8 @@ fn collect_configured_channels(
         if !mx.enabled {
             continue;
         }
-        let state_dir = matrix_state_dir(&config.config_path, alias);
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
-        };
-        let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
-        let transcription_config_arc = Arc::clone(config_arc);
-        let transcription_channel_key = format!("matrix.{alias}");
-        match MatrixChannel::new(mx.clone(), alias.clone(), peer_resolver, state_dir) {
+        match build_configured_matrix_channel(config_arc, &config, alias, mx) {
             Ok(channel) => {
-                let channel = channel
-                    .with_transcription_manager_factory(move || {
-                        let config = transcription_config_arc.read();
-                        if !config.transcription.enabled {
-                            return None;
-                        }
-                        let provider = resolve_agent_transcription_provider(
-                            &config,
-                            &transcription_channel_key,
-                        );
-                        Some(crate::matrix::build_transcription_manager(
-                            &config, &provider,
-                        ))
-                    })
-                    .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
-                    .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
                     display_name: "Matrix",
                     alias: Some(alias.clone()),

@@ -399,6 +399,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Test Windows task-owner recovery
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+           cargo test --profile ci --locked -p zeroclaw-runtime --lib
+           --target x86_64-pc-windows-msvc
+           control_plane::authority::tests::windows_process_exit_is_detected -- --exact
 
   check:
     name: Check (${{ matrix.name }})
@@ -833,13 +840,14 @@ jobs:
           for path in (
               ".github/workflows/ci.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/pr-size-labeler.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
               yaml.safe_load(open(path))
               print(f"{path}: valid")
           PY
-      - name: Validate project dashboard planner
-        run: python3 scripts/github/project_dashboard_plan_test.py
+      - name: Validate GitHub helper scripts
+        run: python3 -m unittest discover -s scripts/github -p '*_test.py'
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \

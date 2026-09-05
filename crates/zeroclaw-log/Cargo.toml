@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Unified log emission surface: structured event schema, JSONL persistence, broadcast hook, and the record! macro every other crate emits through."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-api.workspace = true

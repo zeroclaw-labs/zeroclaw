@@ -10,7 +10,7 @@ Use this page when a change adds scheduled or autonomous work, introduces a wait
 | --- | --- | --- |
 | Cron job | Cron scheduler and store | `data/cron/jobs.db` |
 | SOP run | `SopEngine` and `SopRunStore` | Process memory by default; `data/sop/runs.db` when durable SQLite initialization succeeds |
-| Background delegation | Delegate result API, with control-plane supervision overrides when available | `<workspace>/delegate_results/<task-id>.json`; a best-effort task row in `data/control_plane.db` under a booted daemon |
+| Background delegation | Durable task control plane | A required task row in `data/control_plane.db`; output content in `<workspace>/delegate_results/<task-id>.json` |
 | Runtime-spawned subagent | Spawn site, with control-plane supervision when available | A best-effort task row in `data/control_plane.db` under a booted daemon |
 
 Durable metadata is not the same as durable execution. A result file or task row can preserve what was known and let recovery mark work lost, timed out, or terminal without preserving the process-local future that was doing the work.
@@ -39,11 +39,26 @@ Subagents inherit their parent's effective security boundary. Policy and memory 
 
 The `spawn_subagent` path is synchronous: the parent waits for the child run to finish, and this path has no local timeout or background cancellation handle.
 
-The delegate tool can run synchronously or start a background task and return a UUID. Background results are written atomically under the workspace passed to the tool and can be checked, listed, awaited in a batch, or cancelled. A live cancellation registry maps task IDs to process-local tokens; cancellation updates the persisted result and signals the running task when that live token is still available.
+The delegate tool can run synchronously or start a background task and return a UUID. A background task starts only after it can open the durable control plane, resolve its owning agent alias, and register its task row. The row is the single lifecycle authority for running, terminal, error, and recovery state. Completed output content is written atomically under the workspace passed to the tool; the task row stores its artifact reference instead of duplicating the content.
 
-Under a booted daemon, delegate and subagent producers also write task rows to the durable control plane. These writes are best-effort and independent from delegate result-file writes. Delegate result reads remain file-first; only a file still marked `running` is overlaid as `lost` or `timed_out` from control-plane state, so the two records can diverge.
+Current readers remain compatible with legacy status-bearing artifacts and legacy inline task output. The reverse is not guaranteed: artifacts written in the current output-only format are not readable by older binaries or scripts that require embedded lifecycle fields. Roll back the data directory and workspace artifacts together, or finish outstanding background work before downgrading.
 
-Current delegate and subagent rows populate agent, status, owner PID and boot ID, depth, and timestamps. They leave heartbeat, parent task, route, and principal absent. Startup recovery marks prior-boot running rows `lost`; `timed_out` applies only to producers that emit stale heartbeats, which these producers do not currently do. The task row makes an interrupted child visible but does not recreate its execution.
+A live cancellation registry maps task IDs to process-local tokens. Cancellation signals the running task when that token is still available and uses a compare-and-set terminal transition in the task store. Completion, failure, cancellation, and recovery therefore cannot overwrite one another after one terminal outcome wins.
+
+Before a background delegate publishes a terminal output artifact, it serializes the exact bytes, computes their SHA-256 digest, and persists a terminal-settlement intent containing the task id, current owner PID and boot identity, desired terminal status, artifact path/reference, digest, and terminal error. The intent is an unapplied transition; `TaskRecord.status` remains the sole persisted lifecycle authority.
+
+The delegate then atomically writes and syncs those exact bytes. A single SQLite transaction compares the still-nonterminal, owner-matched task row to the intent, records the desired terminal status and payload, and deletes the unchanged intent. Store failures before intent persistence retry without publishing the artifact; failures after publication retry promotion in-process. A competing cancellation or other terminal winner is preserved and removes the stale intent.
+
+Startup and periodic recovery process settlement intents before ordinary Lost reconciliation. Recovery acts only after proving the recorded owner is absent or its PID has been reused, validates the artifact bytes against the recorded digest, and resolves a missing or corrupt artifact conservatively as Failed with a persistence/recovery error rather than producing Completed. The random process nonce is not observable through OS process APIs, so PID plus OS start time remains conservative for same-second PID reuse: recovery treats that case as the same owner.
+
+Current delegate and subagent rows populate agent, status, owner PID and process identity, depth, and timestamps. Delegate rows also record the originating agent alias so result, wait, list, and cancellation actions cannot consume another agent's task; subagent rows still leave route absent. Both leave heartbeat, parent task, and principal absent. Startup recovery marks a running row `lost` only when the recorded owner process is provably gone or its PID has been reused; uncertain ownership fails closed. Windows recovery distinguishes a missing PID from access-denied or otherwise ambiguous probes and retains the row when absence cannot be proved. `timed_out` applies only to producers that emit stale heartbeats, which these producers do not currently do. The task row makes an interrupted child visible but does not recreate its execution.
+
+Legacy delegate result files that contain status remain readable when no task
+row exists. Terminal delegate rows created before `originator_route` was
+recorded also remain readable by exact task ID, including inline output. They
+cannot be cancelled or otherwise mutated through the legacy exception, and a
+nonterminal NULL-origin row remains hidden. New rows always require the matching
+originating alias for reads and mutations.
 
 ## Goal-mode target contract
 

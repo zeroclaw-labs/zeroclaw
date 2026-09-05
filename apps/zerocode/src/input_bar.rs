@@ -1385,7 +1385,9 @@ impl InputBarState {
         }
 
         if let KeyCode::Char(c) = key.code
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         {
             self.push_input_char(c);
             return InputBarAction::Consumed;
@@ -2311,6 +2313,17 @@ mod tests {
             crate::keymap::Chord::primary('u').effective_modifiers(),
         ));
         assert!(matches!(act, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn unbound_super_modified_character_falls_through_without_typing() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let mut bar = input_bar_with_shared_commands();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SUPER));
+
+        assert!(matches!(action, InputBarAction::NotHandled));
         assert_eq!(bar.input(), "");
     }
 

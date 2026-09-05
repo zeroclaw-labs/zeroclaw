@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ComponentHealth {
     pub status: String,
     pub updated_at: String,
@@ -15,6 +16,7 @@ pub struct ComponentHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct HealthSnapshot {
     pub pid: u32,
     pub updated_at: String,
