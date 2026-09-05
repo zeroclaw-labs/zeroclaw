@@ -1928,6 +1928,10 @@ fn parse_inbound_payload(payload: Value) -> Result<ParsedInbound> {
     })
 }
 
+// The `user--` / `group--` scope prefixes are load-bearing beyond this
+// module: the orchestrator's `is_single_party_reply_target` recognizes
+// `user--` to keep direct-message prompts free of speaker attribution.
+// Change the prefixes only together with that helper.
 fn compute_scopes(inbound: &ParsedInbound) -> ScopeDecision {
     let chat_type = inbound.chat_type.to_ascii_lowercase();
     if chat_type == "group" {
