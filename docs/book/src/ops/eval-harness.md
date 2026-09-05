@@ -1,0 +1,140 @@
+# Eval harness
+
+The eval harness (`zeroclaw eval run`, crate `crates/zeroclaw-eval`) runs agent
+evaluation *cases* (JSON trace fixtures) through the real agent loop and grades
+each run against declarative expectations. It is how ZeroClaw guards agent-loop
+behavior (tool dispatch, multi-turn ordering, response formatting, refusals)
+against regression.
+
+It is distinct from `[agent.eval]`, the in-loop response-quality scorer. The
+harness is configured under `[eval]` and invoked as a CLI subcommand.
+
+## Modes
+
+| Mode | What it does | Cost | CI |
+|---|---|---|---|
+| `replay` | Replays scripted LLM responses from the fixture through the agent loop. Fully deterministic, no network. | Free | Gated (default) |
+| `live` | Executes cases against a real provider inside a per-case sandbox (see "Live mode"). | Real tokens | Never by default |
+
+## Suite taxonomy
+
+Suites are directories of `*.json` fixtures (see `evals/README.md`):
+
+- `evals/regression/`: must stay at 100% pass. Gated in CI via
+  `crates/zeroclaw-eval/tests/regression_suite.rs`; a failure blocks merge. This
+  is the default `[eval].suite_dir`.
+- `evals/capability/` (planned): hard tasks with a low pass rate; tracked over
+  time, never gated.
+- `evals/live/` (planned): cases executed against a real provider; never run in
+  CI by default.
+
+## Running
+
+```bash
+# Replay the default regression suite:
+zeroclaw eval run
+
+# Point at a specific suite, emit machine-readable JSON:
+zeroclaw eval run --suite evals/regression --format json
+```
+
+`--suite` overrides `[eval].suite_dir`; `--mode` overrides `[eval].mode`. Suite
+loading is non-recursive: only direct `*.json` children of the suite directory
+are cases.
+
+## Live mode
+
+Live mode (`--mode live`) runs each case against a real configured provider, so it
+costs real tokens and produces non-deterministic output. It is opt-in and never
+runs in CI by default. Enable it by setting `[eval].live_provider` to a dotted
+`providers.models` reference (e.g. `"anthropic.sonnet"`); an empty value keeps live
+mode disabled.
+
+A live case omits scripted `steps` (the provider produces the responses) and may
+declare `tools` it needs and a `setup.workspace_files` map to seed the workspace.
+The requested tools are intersected with `[eval].live_allowed_tools`; the default
+(empty) allows no real tools, so a case that needs tools requires the operator to
+opt in explicitly.
+
+Each live case runs inside a sandbox:
+
+| Control | Behavior |
+|---|---|
+| Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
+| Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`, then `shell` is dropped unconditionally (see "Shell is excluded" below); empty allowlist yields only the harmless echo tool. |
+| Autonomy | `Supervised`, never `Full`. |
+| Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
+| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+
+### Shell is excluded
+
+`shell` can never be part of the live tool surface, even when a case's `tools`
+and `[eval].live_allowed_tools` both request it. `effective_live_tools`
+(`crates/zeroclaw-eval/src/live.rs`) applies a hard denylist to the allowlist
+intersection, so deny always wins.
+
+A scripted `shell` tool call in a live case is stopped *before* tool dispatch,
+by the approval gate. Because `shell` is excluded from the effective tool set,
+it is also excluded from `risk.auto_approve` (both are built from the same set
+in `run_live_case`), so its approval requirement resolves to `Prompt`. Live
+mode wires a non-interactive backchannel, so there is no operator to ask and
+the runtime denies the call by policy. What the model sees fed back is a
+runtime-policy denial, not shell output and not a "tool not available"
+dispatch error:
+
+```text
+Tool call not executed: 'shell' requires approval and no operator decision was
+available, so the runtime denied it by policy. This was not a user's decision.
+```
+
+Operators debugging a live case that expected `shell` should therefore look for
+the approval-gate denial (a WARN record with `denied_by_runtime`), not for a
+tool-registry lookup failure.
+
+This is the ship-safe interim posture. An
+earlier version of this harness wrapped `shell`'s subprocesses in a real OS
+sandbox backend (Landlock, Firejail, or `sandbox-exec`) instead of excluding
+it outright, but every accepted backend still permitted host *reads* wide
+enough to leak host data back into the conversation sent to a real provider:
+
+- Linux, Landlock (`sandbox-landlock` feature): the child process's filesystem
+  access was confined to the case workspace plus a blanket `/tmp` allowance,
+  with `/usr` and `/bin` readable. Network was NOT restricted (no `AccessNet`
+  rule); a sandboxed shell command could still reach the network freely.
+- macOS, `sandbox-exec` (Seatbelt): deny-by-default for writes, but reads were
+  allowed broadly: system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
+  `/System`, `/etc`, `/opt`, and others) and the invoking user's dotfile
+  directories under `$HOME`.
+- Firejail (Linux, no `sandbox-landlock` feature): `--private=home` with
+  `--noprofile` added no workspace whitelist, read-only host-root rule, or
+  network restriction beyond that.
+
+Confining the *writes* (which those backends do well; see
+`crates/zeroclaw-eval/tests/live_shell_sandbox.rs`'s history for the escape
+tests this proved) was not sufficient, because live-mode tool output becomes
+part of the conversation sent to the configured provider, making it a
+confidentiality boundary and not just an integrity one. Re-admitting `shell` needs an
+eval-specific sandbox contract that also denies sensitive host reads on every
+accepted backend; that is a deliberate, tracked follow-up, not implemented
+here. `live_shell_sandbox`/`ensure_real_sandbox` (the OS-sandbox construction
+`shell` used to run under) remain in `live.rs` as building blocks for it.
+
+Because live output is non-deterministic and can embed workspace content, live runs
+belong in the planned `evals/live/` suite, not the gating regression suite.
+
+## Exit-code contract
+
+`zeroclaw eval run` exits `0` iff every case passed, and `1` otherwise (any
+failed check or run error). This is the CI gate: the process exit code is the
+signal. The same decision is exposed as the pure function
+`SuiteReport::exit_code()` so it can be tested at its real boundary.
+
+## Case format
+
+Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`
+(each with a `user_input` and scripted response `steps`), and declarative
+`expects`. A case is either **positive** (a behavior that must happen) or
+**negative** (a behavior that must NOT happen, e.g. `tools_not_used`,
+`response_not_contains`, `max_tool_calls: 0`). See `evals/README.md` for the
+authoring rules, including the two-experts test and the privacy requirement that
+fixtures use placeholder identities only.
