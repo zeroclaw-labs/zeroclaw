@@ -16,6 +16,7 @@ use zeroclaw_runtime::rpc::types::{
 
 use super::AppState;
 use super::api::require_auth;
+use super::api_config::{compute_drift, persist_and_swap};
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
@@ -771,18 +772,20 @@ fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, ali
     }
 }
 
-fn mark_section_completed(cfg: &mut zeroclaw_config::schema::Config, section: &str) {
-    if !cfg
+fn mark_section_completed(cfg: &mut zeroclaw_config::schema::Config, section: &str) -> bool {
+    if cfg
         .onboard_state
         .completed_sections
         .iter()
         .any(|completed| completed == section)
     {
-        cfg.onboard_state
-            .completed_sections
-            .push(section.to_string());
-        cfg.mark_dirty("onboard_state.completed_sections");
+        return false;
     }
+    cfg.onboard_state
+        .completed_sections
+        .push(section.to_string());
+    cfg.mark_dirty("onboard_state.completed_sections");
+    true
 }
 
 fn first_alias<'a>(aliases: impl Iterator<Item = &'a String>) -> Option<String> {
@@ -1019,7 +1022,9 @@ pub async fn handle_section_select(
             // Set memory.backend to the picked key. Fields_prefix points at
             // `memory` so the form renders the whole memory section
             // (the active backend's specific fields show up there).
-            if let Err(e) = working.set_prop_persistent("memory.backend", &key) {
+            let selection_changed = working.memory.backend != key;
+            if selection_changed && let Err(e) = working.set_prop_persistent("memory.backend", &key)
+            {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
@@ -1028,11 +1033,17 @@ pub async fn handle_section_select(
                     .with_path("memory.backend"),
                 );
             }
-            mark_section_completed(&mut working, "memory");
-            ("memory".to_string(), true)
+            let completion_changed = mark_section_completed(&mut working, "memory");
+            (
+                "memory".to_string(),
+                selection_changed || completion_changed,
+            )
         }
         Section::Tunnel => {
-            if let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key) {
+            let selection_changed = working.tunnel.tunnel_provider != key;
+            if selection_changed
+                && let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key)
+            {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
@@ -1041,14 +1052,14 @@ pub async fn handle_section_select(
                     .with_path("tunnel.tunnel_provider"),
                 );
             }
-            let prefix = if key == "none" {
-                "tunnel".to_string()
+            let (prefix, defaults_changed) = if key == "none" {
+                ("tunnel".to_string(), false)
             } else {
                 let p = format!("tunnel.{key}");
-                working.init_defaults(Some(&p));
-                p
+                let initialized = working.init_defaults(Some(&p));
+                (p, !initialized.is_empty())
             };
-            (prefix, true)
+            (prefix, selection_changed || defaults_changed)
         }
         Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
             return error_response(
@@ -1069,13 +1080,47 @@ pub async fn handle_section_select(
         working.mark_dirty(&fields_prefix);
     }
 
-    if let Err(e) = working.save_dirty().await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save after select failed: {e}"),
-        ));
+    if working.dirty_paths.is_empty() {
+        let drifted = match section_enum {
+            Section::Memory | Section::Tunnel => compute_drift(&working).await,
+            _ => Vec::new(),
+        };
+        let tunnel_prefix =
+            (section_enum == Section::Tunnel && key != "none").then(|| format!("tunnel.{key}."));
+        let conflict_paths: Vec<String> = drifted
+            .into_iter()
+            .filter(|drift| match section_enum {
+                Section::Memory => drift.path == "memory.backend",
+                Section::Tunnel => {
+                    drift.path == "tunnel.tunnel_provider"
+                        || tunnel_prefix
+                            .as_deref()
+                            .is_some_and(|prefix| drift.path.starts_with(prefix))
+                }
+                _ => false,
+            })
+            .map(|drift| drift.path)
+            .collect();
+        if !conflict_paths.is_empty() {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ConfigChangedExternally,
+                format!(
+                    "on-disk config has drifted from in-memory state on {} path(s) required by this selection: {}. Reload the config or GET /api/config/drift to inspect first.",
+                    conflict_paths.len(),
+                    conflict_paths.join(", "),
+                ),
+            ));
+        }
+        return axum::Json(SelectItemResponse {
+            fields_prefix,
+            created,
+        })
+        .into_response();
     }
-    *state.config.write() = working;
+
+    if let Err(e) = persist_and_swap(&state, working, &_cfg_guard).await {
+        return error_response(e);
+    }
 
     axum::Json(SelectItemResponse {
         fields_prefix,
@@ -1754,12 +1799,354 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let cfg = state.config.read().clone();
         assert_eq!(cfg.tunnel.tunnel_provider, "cloudflare");
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let raw = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
+        let disk_value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            disk_value
+                .get("tunnel")
+                .and_then(|value| value.get("tunnel_provider"))
+                .and_then(toml::Value::as_str),
+            Some(cfg.tunnel.tunnel_provider.as_str()),
+            "section selection must persist and publish the selected provider"
+        );
         let items = tunnel_provider_picker(&cfg);
         let cloudflare = items
             .iter()
             .find(|item| item.key == "cloudflare")
             .expect("cloudflare should appear in the picker");
         assert_eq!(cloudflare.badge.as_deref(), Some("active"));
+    }
+
+    #[tokio::test]
+    async fn existing_section_selection_without_changes_skips_reload() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("seed model provider alias");
+        cfg.save().await.expect("seed disk config");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read seed config");
+        let state = section_test_state(cfg);
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "providers.models".to_string(),
+                key: "anthropic".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(json["fields_prefix"], "providers.models.anthropic.default");
+        assert_eq!(json["created"], false);
+
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        let live_after = state.config.read().clone();
+        let live_before_value = toml::Value::try_from(&live_before).unwrap();
+        let live_after_value = toml::Value::try_from(&live_after).unwrap();
+        assert_eq!(
+            live_after_value, live_before_value,
+            "an existing selection must not replace the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_and_tunnel_selections_skip_reload() {
+        use http_body_util::BodyExt;
+
+        let memory_tmp = tempfile::tempdir().expect("memory tempdir");
+        let memory_path = memory_tmp.path().join("config.toml");
+        let mut memory_cfg = zeroclaw_config::schema::Config {
+            config_path: memory_path.clone(),
+            ..Default::default()
+        };
+        memory_cfg.memory.backend = "sqlite".to_string();
+        memory_cfg
+            .onboard_state
+            .completed_sections
+            .push("memory".to_string());
+        memory_cfg.save().await.expect("seed memory config");
+        let memory_disk_before = tokio::fs::read(&memory_path)
+            .await
+            .expect("read seed memory config");
+        let memory_state = section_test_state(memory_cfg);
+        let memory_live_before = memory_state.config.read().clone();
+
+        let memory_response = handle_section_select(
+            State(memory_state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "memory".to_string(),
+                key: "sqlite".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(memory_response.status(), axum::http::StatusCode::OK);
+        let memory_body = memory_response
+            .into_body()
+            .collect()
+            .await
+            .expect("memory response body")
+            .to_bytes();
+        let memory_json: serde_json::Value =
+            serde_json::from_slice(&memory_body).expect("memory json response");
+        assert_eq!(memory_json["fields_prefix"], "memory");
+        assert_eq!(memory_json["created"], false);
+        assert_eq!(
+            tokio::fs::read(&memory_path).await.unwrap(),
+            memory_disk_before
+        );
+        assert_eq!(
+            toml::Value::try_from(&*memory_state.config.read()).unwrap(),
+            toml::Value::try_from(&memory_live_before).unwrap(),
+            "an unchanged memory selection must not replace the live snapshot"
+        );
+        assert!(
+            !memory_state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let tunnel_tmp = tempfile::tempdir().expect("tunnel tempdir");
+        let tunnel_path = tunnel_tmp.path().join("config.toml");
+        let mut tunnel_cfg = zeroclaw_config::schema::Config {
+            config_path: tunnel_path.clone(),
+            ..Default::default()
+        };
+        tunnel_cfg.tunnel.tunnel_provider = "cloudflare".to_string();
+        tunnel_cfg.tunnel.cloudflare = Some(Default::default());
+        tunnel_cfg.save().await.expect("seed tunnel config");
+        let tunnel_disk_before = tokio::fs::read(&tunnel_path)
+            .await
+            .expect("read seed tunnel config");
+        let tunnel_state = section_test_state(tunnel_cfg);
+        let tunnel_live_before = tunnel_state.config.read().clone();
+
+        let tunnel_response = handle_section_select(
+            State(tunnel_state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(tunnel_response.status(), axum::http::StatusCode::OK);
+        let tunnel_body = tunnel_response
+            .into_body()
+            .collect()
+            .await
+            .expect("tunnel response body")
+            .to_bytes();
+        let tunnel_json: serde_json::Value =
+            serde_json::from_slice(&tunnel_body).expect("tunnel json response");
+        assert_eq!(tunnel_json["fields_prefix"], "tunnel.cloudflare");
+        assert_eq!(tunnel_json["created"], false);
+        assert_eq!(
+            tokio::fs::read(&tunnel_path).await.unwrap(),
+            tunnel_disk_before
+        );
+        assert_eq!(
+            toml::Value::try_from(&*tunnel_state.config.read()).unwrap(),
+            toml::Value::try_from(&tunnel_live_before).unwrap(),
+            "an unchanged tunnel selection must not replace the live snapshot"
+        );
+        assert!(
+            !tunnel_state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_selection_rejects_disk_drift() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("memory tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut live_cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        live_cfg.memory.backend = "sqlite".to_string();
+        live_cfg
+            .onboard_state
+            .completed_sections
+            .push("memory".to_string());
+        live_cfg.save().await.expect("seed live memory config");
+        let state = section_test_state(live_cfg);
+
+        let mut disk_cfg = state.config.read().clone();
+        disk_cfg.memory.backend = "postgres".to_string();
+        disk_cfg.save().await.expect("write external memory drift");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read drifted memory config");
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "memory".to_string(),
+                key: "sqlite".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("memory response body")
+            .to_bytes();
+        let error: ConfigApiError = serde_json::from_slice(&body).expect("memory error response");
+        assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "a rejected memory selection must preserve the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_tunnel_selection_rejects_default_disk_drift() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("tunnel tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut live_cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        live_cfg.tunnel.tunnel_provider = "tailscale".to_string();
+        live_cfg.tunnel.tailscale = Some(Default::default());
+        live_cfg.save().await.expect("seed live tunnel config");
+        let state = section_test_state(live_cfg);
+
+        let mut disk_cfg = state.config.read().clone();
+        disk_cfg
+            .tunnel
+            .tailscale
+            .as_mut()
+            .expect("tailscale defaults")
+            .funnel = true;
+        disk_cfg.save().await.expect("write external tunnel drift");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read drifted tunnel config");
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "tailscale".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("tunnel response body")
+            .to_bytes();
+        let error: ConfigApiError = serde_json::from_slice(&body).expect("tunnel error response");
+        assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "a rejected tunnel selection must preserve the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn section_select_failed_save_retains_prior_live_and_disk_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::create_dir_all(&config_path).unwrap();
+        let state = section_test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        });
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            config_path.is_dir(),
+            "failed save must retain the prior disk state"
+        );
+        let live_after = state.config.read().clone();
+        assert_eq!(
+            live_after.tunnel.tunnel_provider, live_before.tunnel.tunnel_provider,
+            "failed save must not publish the working snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]
