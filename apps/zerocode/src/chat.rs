@@ -1301,6 +1301,23 @@ impl Chat {
                     }
                 }
             }
+            ChatContextMenuRequest::OpenUrl(url) => {
+                let result = crate::url_open::open(&url).await;
+                if let ChatPhase::Active(ref mut state) = self.phase
+                    && let Err(error) = result
+                {
+                    state.set_info_notice(crate::i18n::t_args(
+                        "zc-chat-open-link-failed",
+                        &[("error", &error.to_string())],
+                    ));
+                }
+            }
+            ChatContextMenuRequest::CopyUrl(url) => {
+                crate::mouse::copy_osc52(&url);
+                if let ChatPhase::Active(ref mut state) = self.phase {
+                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                }
+            }
             ChatContextMenuRequest::Queue { id, action } => match action {
                 ChatContextMenuAction::SendNow => {
                     let promoted = match self.phase {
@@ -1344,6 +1361,7 @@ impl Chat {
                         state.delete_queued_by_id(id);
                     }
                 }
+                ChatContextMenuAction::OpenLink | ChatContextMenuAction::CopyLink => {}
             },
         }
     }
@@ -2943,6 +2961,7 @@ impl Chat {
             let cleanup_report = state.input_bar.take_cleanup_report();
             state.surface_cleanup_report(cleanup_report);
             if input_bar_consumed {
+                state.cancel_url_activation();
                 state.clear_mouse_highlight();
                 return;
             }
@@ -3055,6 +3074,23 @@ impl Chat {
                 return;
             }
 
+            if state.in_browse_mode() {
+                match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                    UrlPointerAction::Open(url) => {
+                        match crate::url_open::open(&url).await {
+                            Ok(()) => {}
+                            Err(error) => state.set_info_notice(crate::i18n::t_args(
+                                "zc-chat-open-link-failed",
+                                &[("error", &error.to_string())],
+                            )),
+                        }
+                        return;
+                    }
+                    UrlPointerAction::Consumed => return,
+                    UrlPointerAction::Ignore => {}
+                }
+            }
+
             if !state.in_browse_mode() {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
@@ -3082,21 +3118,49 @@ impl Chat {
                                     CopyHitKind::Message => {}
                                 }
                             }
-                        } else if (mouse.modifiers.contains(KM::SHIFT)
-                            || mouse.modifiers.contains(KM::ALT))
-                            && state.transcript_selection.is_some()
-                        {
-                            state.update_transcript_drag(col, row);
                         } else {
-                            state.clear_mouse_highlight();
-                            state.begin_transcript_drag(col, row);
+                            match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                                UrlPointerAction::Consumed => {}
+                                UrlPointerAction::Open(_) => unreachable!("down cannot open URL"),
+                                UrlPointerAction::Ignore
+                                    if (mouse.modifiers.contains(KM::SHIFT)
+                                        || mouse.modifiers.contains(KM::ALT))
+                                        && state.transcript_selection.is_some() =>
+                                {
+                                    state.cancel_url_activation();
+                                    state.update_transcript_drag(col, row);
+                                }
+                                UrlPointerAction::Ignore => {
+                                    state.cancel_url_activation();
+                                    state.clear_mouse_highlight();
+                                    state.begin_transcript_drag(col, row);
+                                }
+                            }
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        state.update_transcript_drag(col, row);
+                        match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                            UrlPointerAction::Consumed => {}
+                            UrlPointerAction::Open(_) => unreachable!("drag cannot open URL"),
+                            UrlPointerAction::Ignore => {
+                                state.update_transcript_drag(col, row);
+                            }
+                        }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        state.finish_transcript_drag();
+                        match state.handle_url_pointer(&mouse.kind, mouse.modifiers, col, row) {
+                            UrlPointerAction::Open(url) => {
+                                match crate::url_open::open(&url).await {
+                                    Ok(()) => {}
+                                    Err(error) => state.set_info_notice(crate::i18n::t_args(
+                                        "zc-chat-open-link-failed",
+                                        &[("error", &error.to_string())],
+                                    )),
+                                }
+                            }
+                            UrlPointerAction::Consumed => {}
+                            UrlPointerAction::Ignore => state.finish_transcript_drag(),
+                        }
                     }
                     _ => {}
                 }
@@ -3539,6 +3603,7 @@ impl crate::widgets::HelpContext for Chat {
                         "Shift+↑/↓",
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
                     ),
+                    E::key("Mouse", crate::i18n::t("zc-chat-help-open-link")),
                     E::key("t", crate::i18n::t("zc-chat-help-toggle-thoughts")),
                     E::spacer(),
                     E::key(
@@ -4240,7 +4305,9 @@ fn render_entry_into(
                     spans.push(label_span.clone());
                 }
                 spans.push(Span::styled((*line_text).to_string(), body_style));
-                lines.push(Line::from(spans));
+                let mut line = Line::from(spans);
+                style_recognized_urls(std::slice::from_mut(&mut line));
+                lines.push(line);
             }
             if !attachments.is_empty() {
                 let label = attachments
@@ -4334,14 +4401,22 @@ fn message_copied_label() -> String {
 }
 
 #[cfg(test)]
-fn context_menu_copy_label() -> String {
-    crate::i18n::t("zc-chat-context-menu-copy")
+fn context_menu_copy_selection_label() -> String {
+    crate::i18n::t("zc-chat-context-menu-copy-selection")
 }
 
-fn context_menu_action_label(action: ChatContextMenuAction) -> String {
+fn context_menu_action_label(
+    action: ChatContextMenuAction,
+    copy_kind: Option<CopyHitKind>,
+) -> String {
     let key = match action {
         ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy if copy_kind == Some(CopyHitKind::Transcript) => {
+            "zc-chat-context-menu-copy-selection"
+        }
         ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
+        ChatContextMenuAction::OpenLink => "zc-chat-context-menu-open-link",
+        ChatContextMenuAction::CopyLink => "zc-chat-context-menu-copy-link",
         ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
         ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
     };
@@ -4376,19 +4451,23 @@ fn context_menu_rect(
     row: u16,
     bounds: Rect,
     actions: &[ChatContextMenuAction],
+    copy_kind: Option<CopyHitKind>,
 ) -> Option<Rect> {
     use unicode_width::UnicodeWidthStr;
 
-    if bounds.width < 3 || bounds.height < 3 || actions.is_empty() {
+    let required_height = actions.len() as u16 + 2;
+    if bounds.width < 3 || bounds.height < required_height || actions.is_empty() {
         return None;
     }
     let label_width = actions
         .iter()
-        .map(|action| UnicodeWidthStr::width(context_menu_action_label(*action).as_str()) as u16)
+        .map(|action| {
+            UnicodeWidthStr::width(context_menu_action_label(*action, copy_kind).as_str()) as u16
+        })
         .max()
         .unwrap_or(0);
     let width = (label_width + 4).min(bounds.width).max(3);
-    let height = (actions.len() as u16 + 2).min(bounds.height);
+    let height = required_height;
     let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
     let max_y = bounds
         .y
@@ -4421,6 +4500,132 @@ fn header_fence_lang(line: &Line<'static>) -> Option<String> {
 /// Users pasting into a terminal expect raw commands, not fenced blocks.
 fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
+}
+
+fn url_line_regions_for_lines(lines: &[Line<'static>], width: u16) -> Vec<UrlLineRegion> {
+    use ratatui::style::Color;
+
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut regions = Vec::new();
+    let mut screen_row = 0u16;
+    for line in lines {
+        let rows = wrapped_rows(line, width);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let urls = recognized_url_ranges(&text);
+        if !urls.is_empty() {
+            // Private color tags carry occurrence identity through Paragraph's
+            // actual wrapping and alignment; these colors are never displayed.
+            let mut spans = Vec::new();
+            let mut offset = 0;
+            for (idx, (start, end, _)) in urls.iter().enumerate() {
+                spans.push(Span::raw(text[offset..*start].to_owned()));
+                let tag = u32::try_from(idx).ok().filter(|tag| *tag <= 0x00ff_ffff);
+                let style = tag.map_or_else(Style::default, |tag| {
+                    Style::default().fg(Color::Rgb((tag >> 16) as u8, (tag >> 8) as u8, tag as u8))
+                });
+                spans.push(Span::styled(text[*start..*end].to_owned(), style));
+                offset = *end;
+            }
+            spans.push(Span::raw(text[offset..].to_owned()));
+            let mut tagged = Line::from(spans);
+            tagged.alignment = line.alignment;
+
+            regions.push(UrlLineRegion {
+                row: screen_row,
+                rows,
+                tagged,
+                urls,
+            });
+        }
+        screen_row = screen_row.saturating_add(rows);
+    }
+    regions
+}
+
+fn offset_url_line_regions(regions: &mut [UrlLineRegion], row_offset: u16) {
+    for region in regions {
+        region.row = region.row.saturating_add(row_offset);
+    }
+}
+
+fn project_url_hit_regions(
+    regions: &[UrlLineRegion],
+    scroll: u16,
+    body: Rect,
+) -> Vec<UrlHitRegion> {
+    use ratatui::{buffer::Buffer, style::Color, widgets::Widget};
+    use unicode_width::UnicodeWidthStr;
+
+    if body.width == 0 || body.height == 0 {
+        return Vec::new();
+    }
+    let viewport_end = u32::from(scroll) + u32::from(body.height);
+    let first_visible = regions.partition_point(|region| {
+        u32::from(region.row) + u32::from(region.rows) <= u32::from(scroll)
+    });
+    let mut hits: Vec<UrlHitRegion> = Vec::new();
+    for region in regions[first_visible..]
+        .iter()
+        .take_while(|region| u32::from(region.row) < viewport_end)
+    {
+        let start = u32::from(region.row).max(u32::from(scroll));
+        let end = (u32::from(region.row) + u32::from(region.rows)).min(viewport_end);
+        let Some(height) = end.checked_sub(start).filter(|height| *height > 0) else {
+            continue;
+        };
+        // Only a visible line is reflowed, once, into viewport-sized storage.
+        // Never render a tall line in repeated strips from its beginning.
+        let area = Rect::new(0, 0, body.width, height as u16);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(borrow_line(&region.tagged))
+            .wrap(Wrap { trim: false })
+            .scroll(((start - u32::from(region.row)) as u16, 0))
+            .render(area, &mut buffer);
+        for y in 0..area.height {
+            let screen_y = body
+                .y
+                .saturating_add((start - u32::from(scroll)) as u16)
+                .saturating_add(y);
+            let mut col = 0;
+            while col < body.width {
+                let cell = &buffer[(col, y)];
+                let cells = (UnicodeWidthStr::width(cell.symbol()) as u16)
+                    .max(1)
+                    .min(body.width - col);
+                if let Color::Rgb(r, g, b) = cell.fg {
+                    let idx = (usize::from(r) << 16) | (usize::from(g) << 8) | usize::from(b);
+                    if let Some((start, _, url)) = region.urls.get(idx) {
+                        let occurrence = UrlOccurrenceId {
+                            row: region.row,
+                            byte_start: *start,
+                        };
+                        let screen_x = body.x.saturating_add(col);
+                        if let Some(previous) = hits.last_mut()
+                            && previous.rect.y == screen_y
+                            && previous.rect.right() == screen_x
+                            && previous.occurrence == occurrence
+                        {
+                            previous.rect.width += cells;
+                        } else {
+                            hits.push(UrlHitRegion {
+                                rect: Rect::new(screen_x, screen_y, cells, 1),
+                                url: url.clone(),
+                                occurrence,
+                            });
+                        }
+                    }
+                }
+                col += cells;
+            }
+        }
+    }
+    hits
 }
 
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
@@ -4583,6 +4788,14 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     } else {
         Vec::new()
     };
+    let transient_url_regions = if transient {
+        let mut regions =
+            url_line_regions_for_lines(&transient_lines[state.cached_lines.len()..], inner_width);
+        offset_url_line_regions(&mut regions, state.cached_total_rows);
+        regions
+    } else {
+        Vec::new()
+    };
 
     let total_rows = if transient {
         Paragraph::new(transient_lines.clone())
@@ -4624,6 +4837,14 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         .scroll((render_scroll, 0));
     f.render_widget(p, body_area);
     capture_transcript_snapshot(f, state, body_area, row_breaks);
+    state.url_hit_regions = project_url_hit_regions(&state.cached_url_regions, scroll, body_area);
+    if transient {
+        state.url_hit_regions.extend(project_url_hit_regions(
+            &transient_url_regions,
+            scroll,
+            body_area,
+        ));
+    }
     render_transcript_selection(f, state);
 
     state.last_total_rows = total_rows;
@@ -4800,7 +5021,10 @@ fn render_context_menu(f: &mut Frame, state: &ChatState) {
             } else {
                 theme::body_style()
             };
-            Line::from(Span::styled(context_menu_action_label(*action), style))
+            Line::from(Span::styled(
+                context_menu_action_label(*action, menu.target.copy_kind()),
+                style,
+            ))
         })
         .collect::<Vec<_>>();
     f.render_widget(
@@ -5425,7 +5649,127 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         )));
     }
 
+    style_recognized_urls(&mut lines);
     lines
+}
+
+/// Find complete HTTP(S) tokens in the final rendered text. This deliberately
+/// runs after Markdown rendering so bare URLs and rendered destinations share
+/// one hit-test source and no second Markdown semantic tree is retained.
+fn recognized_url_ranges(text: &str) -> Vec<(usize, usize, String)> {
+    let mut ranges = Vec::new();
+    let mut starts = text
+        .match_indices("http://")
+        .chain(text.match_indices("https://"))
+        .collect::<Vec<_>>();
+    starts.sort_by_key(|(start, _)| *start);
+    for (start, _) in starts {
+        let has_left_boundary = start == 0
+            || text[..start].chars().next_back().is_some_and(|ch| {
+                ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '<' | '\'' | '"')
+            });
+        if !has_left_boundary {
+            continue;
+        }
+        if ranges.last().is_some_and(|(_, end, _)| start < *end) {
+            continue;
+        }
+        let end = text[start..]
+            .char_indices()
+            .find_map(|(offset, ch)| ch.is_whitespace().then_some(start + offset))
+            .unwrap_or(text.len());
+        let mut candidate_end = end;
+        while let Some((offset, ch)) = text[start..candidate_end].char_indices().last() {
+            let trim = match ch {
+                '.' | ',' | ';' | ':' | '\'' | '"' | '>' => true,
+                '!' | '?' => {
+                    let before = text[start..start + offset].trim_end_matches(['!', '?']);
+                    match before.chars().next_back() {
+                        Some('>' | '\'' | '"') => true,
+                        Some(')') => before.matches('(').count() < before.matches(')').count(),
+                        Some(']') => before.matches('[').count() < before.matches(']').count(),
+                        Some('}') => before.matches('{').count() < before.matches('}').count(),
+                        _ => false,
+                    }
+                }
+                ')' => {
+                    text[start..candidate_end].matches('(').count()
+                        < text[start..candidate_end].matches(')').count()
+                }
+                ']' => {
+                    text[start..candidate_end].matches('[').count()
+                        < text[start..candidate_end].matches(']').count()
+                }
+                '}' => {
+                    text[start..candidate_end].matches('{').count()
+                        < text[start..candidate_end].matches('}').count()
+                }
+                _ => false,
+            };
+            if !trim {
+                break;
+            }
+            candidate_end = start + offset;
+        }
+        let candidate = &text[start..candidate_end];
+        if !candidate.is_empty()
+            && !candidate.contains('\u{2026}')
+            && crate::url_open::validate_url(candidate).is_ok()
+        {
+            ranges.push((start, candidate_end, candidate.to_string()));
+        }
+    }
+    ranges
+}
+
+fn style_recognized_urls(lines: &mut [Line<'static>]) {
+    for line in lines {
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let ranges = recognized_url_ranges(&text);
+        if ranges.is_empty() {
+            continue;
+        }
+
+        let mut styled = Vec::new();
+        let mut line_offset = 0usize;
+        for span in std::mem::take(&mut line.spans) {
+            let content = span.content.as_ref();
+            let span_start = line_offset;
+            let span_end = span_start + content.len();
+            let mut cursor = 0;
+            for (start, end, _) in &ranges {
+                let overlap_start = (*start).max(span_start);
+                let overlap_end = (*end).min(span_end);
+                if overlap_end <= overlap_start {
+                    continue;
+                }
+                let local_start = overlap_start - span_start;
+                let local_end = overlap_end - span_start;
+                if local_start > cursor {
+                    styled.push(Span::styled(
+                        content[cursor..local_start].to_string(),
+                        span.style,
+                    ));
+                }
+                styled.push(Span::styled(
+                    content[local_start..local_end].to_string(),
+                    span.style
+                        .fg(theme::active().accent)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                cursor = local_end;
+            }
+            if cursor < content.len() {
+                styled.push(Span::styled(content[cursor..].to_string(), span.style));
+            }
+            line_offset = span_end;
+        }
+        line.spans = styled;
+    }
 }
 
 fn render_table(
@@ -5758,15 +6102,60 @@ struct CopyHitRegion {
     group: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlLineRegion {
+    row: u16,
+    rows: u16,
+    tagged: Line<'static>,
+    urls: Vec<(usize, usize, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlHitRegion {
+    rect: Rect,
+    url: String,
+    occurrence: UrlOccurrenceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UrlOccurrenceId {
+    row: u16,
+    byte_start: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUrlActivation {
+    url: String,
+    occurrence: UrlOccurrenceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UrlPointerAction {
+    Ignore,
+    Consumed,
+    Open(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatContextMenuAction {
     SendNow,
     Copy,
+    OpenLink,
+    CopyLink,
     Edit,
     Delete,
 }
 
 const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
+const URL_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::OpenLink,
+    ChatContextMenuAction::CopyLink,
+];
+const URL_WITH_COPY_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::OpenLink,
+    ChatContextMenuAction::CopyLink,
+    ChatContextMenuAction::Copy,
+];
 const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
     ChatContextMenuAction::SendNow,
     ChatContextMenuAction::Copy,
@@ -5777,6 +6166,11 @@ const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatContextMenuTarget {
     Transcript(CopyHitRegion),
+    Url(UrlHitRegion),
+    UrlWithCopy {
+        url: UrlHitRegion,
+        copy: CopyHitRegion,
+    },
     Queue(u64),
 }
 
@@ -5784,8 +6178,21 @@ impl ChatContextMenuTarget {
     fn actions(&self) -> &'static [ChatContextMenuAction] {
         match self {
             Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
+            Self::Url(_) => URL_CONTEXT_ACTIONS,
+            Self::UrlWithCopy { .. } => URL_WITH_COPY_CONTEXT_ACTIONS,
             Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
         }
+    }
+
+    fn copy_kind(&self) -> Option<CopyHitKind> {
+        match self {
+            Self::Transcript(copy) | Self::UrlWithCopy { copy, .. } => Some(copy.kind),
+            Self::Url(_) | Self::Queue(_) => None,
+        }
+    }
+
+    fn is_url(&self) -> bool {
+        matches!(self, Self::Url(_) | Self::UrlWithCopy { .. })
     }
 }
 
@@ -5829,6 +6236,8 @@ impl ChatContextMenu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatContextMenuRequest {
     CopyTranscript(CopyHitRegion),
+    OpenUrl(String),
+    CopyUrl(String),
     Queue {
         id: u64,
         action: ChatContextMenuAction,
@@ -5935,6 +6344,14 @@ pub struct ChatState {
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
+    /// URL hit segments projected from the complete wrapped transcript into
+    /// the visible body viewport.
+    url_hit_regions: Vec<UrlHitRegion>,
+    /// Tagged URL-bearing logical lines with transcript-relative row extents.
+    /// Rebuilt with `cached_lines` so idle frames do not repeat recognition.
+    cached_url_regions: Vec<UrlLineRegion>,
+    /// A normal-mode left press that may become a link activation on release.
+    pending_url_activation: Option<PendingUrlActivation>,
     /// Full code-block targets used by right-click context-menu resolution.
     context_copy_regions: Vec<CopyHitRegion>,
     /// Active transcript or queue context menu.
@@ -6066,6 +6483,9 @@ impl ChatState {
             transcript_selection: None,
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
+            url_hit_regions: Vec::new(),
+            cached_url_regions: Vec::new(),
+            pending_url_activation: None,
             context_copy_regions: Vec::new(),
             context_menu: None,
             copy_feedback: None,
@@ -6106,6 +6526,7 @@ impl ChatState {
     }
 
     fn mark_dirty_append(&mut self) {
+        self.invalidate_url_interactions();
         if self.dirty == LinesDirty::Clean {
             self.dirty = LinesDirty::Appended;
         }
@@ -6150,11 +6571,13 @@ impl ChatState {
     }
 
     fn mark_dirty_full(&mut self) {
+        self.invalidate_url_interactions();
         self.dirty = LinesDirty::Full;
     }
 
     fn clear_transcript_selection(&mut self) {
         self.transcript_selection = None;
+        self.pending_url_activation = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -6234,6 +6657,76 @@ impl ChatState {
         self.clear_transcript_selection();
     }
 
+    fn url_hit_at(&self, column: u16, row: u16) -> Option<UrlHitRegion> {
+        self.url_hit_regions
+            .iter()
+            .find(|region| mouse::in_rect(column, row, region.rect))
+            .cloned()
+    }
+
+    fn begin_url_activation(&mut self, hit: UrlHitRegion) {
+        // Browser-like link ownership: a drag that starts on a URL must not
+        // extend a character selection that happened to predate the click.
+        self.transcript_selection = None;
+        self.pending_url_activation = Some(PendingUrlActivation {
+            url: hit.url,
+            occurrence: hit.occurrence,
+        });
+    }
+
+    fn cancel_url_activation(&mut self) {
+        self.pending_url_activation = None;
+    }
+
+    fn invalidate_url_interactions(&mut self) {
+        self.pending_url_activation = None;
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.target.is_url())
+        {
+            self.context_menu = None;
+        }
+    }
+
+    fn take_url_activation(&mut self, column: u16, row: u16) -> Option<String> {
+        let pending = self.pending_url_activation.take()?;
+        let hit = self.url_hit_at(column, row)?;
+        (hit.occurrence == pending.occurrence && hit.url == pending.url).then_some(hit.url)
+    }
+
+    fn handle_url_pointer(
+        &mut self,
+        kind: &MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        column: u16,
+        row: u16,
+    ) -> UrlPointerAction {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) if modifiers.is_empty() => {
+                let Some(hit) = self.url_hit_at(column, row) else {
+                    return UrlPointerAction::Ignore;
+                };
+                self.begin_url_activation(hit);
+                UrlPointerAction::Consumed
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.pending_url_activation.is_some() => {
+                self.cancel_url_activation();
+                UrlPointerAction::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.pending_url_activation.is_some() => {
+                if modifiers.is_empty() {
+                    self.take_url_activation(column, row)
+                        .map_or(UrlPointerAction::Consumed, UrlPointerAction::Open)
+                } else {
+                    self.cancel_url_activation();
+                    UrlPointerAction::Consumed
+                }
+            }
+            _ => UrlPointerAction::Ignore,
+        }
+    }
+
     fn clear_browse_selection(&mut self) {
         let lines_changed = self.mouse_down_entry.is_some()
             || self.browse_cursor.is_some()
@@ -6303,6 +6796,7 @@ impl ChatState {
     }
 
     fn open_transcript_context_menu(&mut self, column: u16, row: u16) -> bool {
+        self.cancel_url_activation();
         let Some(bounds) = self
             .transcript_snapshot
             .as_ref()
@@ -6337,7 +6831,7 @@ impl ChatState {
 
         // Code blocks are nested inside message rows, so resolve their more
         // specific target before falling back to the containing message.
-        let target = selected_target.or_else(|| {
+        let copy_target = selected_target.or_else(|| {
             self.context_copy_regions
                 .iter()
                 .find(|region| mouse::in_rect(column, row, region.rect))
@@ -6357,11 +6851,20 @@ impl ChatState {
                         })
                 })
         });
-        let Some(target) = target else {
-            return false;
+        let target = if let Some(url) = self.url_hit_at(column, row) {
+            match copy_target {
+                Some(copy) => ChatContextMenuTarget::UrlWithCopy { url, copy },
+                None => ChatContextMenuTarget::Url(url),
+            }
+        } else {
+            let Some(copy) = copy_target else {
+                return false;
+            };
+            ChatContextMenuTarget::Transcript(copy)
         };
-        let target = ChatContextMenuTarget::Transcript(target);
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        let Some(rect) =
+            context_menu_rect(column, row, bounds, target.actions(), target.copy_kind())
+        else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -6383,7 +6886,9 @@ impl ChatState {
         };
         self.select_queued_by_id(id);
         let target = ChatContextMenuTarget::Queue(id);
-        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
+        let Some(rect) =
+            context_menu_rect(column, row, bounds, target.actions(), target.copy_kind())
+        else {
             return false;
         };
         self.context_menu = Some(ChatContextMenu {
@@ -6398,7 +6903,7 @@ impl ChatState {
     fn context_menu_select_step(&mut self, delta: isize) {
         if let Some(menu) = self.context_menu.as_mut() {
             menu.select_step(delta);
-            self.mark_dirty_full();
+            self.dirty = LinesDirty::Full;
         }
     }
 
@@ -6420,10 +6925,23 @@ impl ChatState {
             (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
                 Some(ChatContextMenuRequest::CopyTranscript(target))
             }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::OpenLink)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::OpenLink) => {
+                Some(ChatContextMenuRequest::OpenUrl(url.url))
+            }
+            (ChatContextMenuTarget::Url(url), ChatContextMenuAction::CopyLink)
+            | (ChatContextMenuTarget::UrlWithCopy { url, .. }, ChatContextMenuAction::CopyLink) => {
+                Some(ChatContextMenuRequest::CopyUrl(url.url))
+            }
+            (ChatContextMenuTarget::UrlWithCopy { copy, .. }, ChatContextMenuAction::Copy) => {
+                Some(ChatContextMenuRequest::CopyTranscript(copy))
+            }
             (ChatContextMenuTarget::Queue(id), action) => {
                 Some(ChatContextMenuRequest::Queue { id, action })
             }
-            (ChatContextMenuTarget::Transcript(_), _) => None,
+            (ChatContextMenuTarget::Transcript(_), _)
+            | (ChatContextMenuTarget::Url(_), _)
+            | (ChatContextMenuTarget::UrlWithCopy { .. }, _) => None,
         }
     }
 
@@ -6586,6 +7104,7 @@ impl ChatState {
 
     fn rebuild_lines(&mut self, width: u16) {
         if self.cached_render_width != width {
+            self.pending_url_activation = None;
             self.dirty = LinesDirty::Full;
             self.cached_render_width = width;
         }
@@ -6636,6 +7155,9 @@ impl ChatState {
                     .line_count(width) as u16;
             self.cached_row_breaks
                 .extend(row_breaks_for_lines(&new_lines, width));
+            let mut appended_url_regions = url_line_regions_for_lines(&new_lines, width);
+            offset_url_line_regions(&mut appended_url_regions, self.cached_total_rows);
+            self.cached_url_regions.extend(appended_url_regions);
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = end - start;
@@ -6665,6 +7187,7 @@ impl ChatState {
             }
         }
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
+        self.cached_url_regions = url_line_regions_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
         self.cached_entry_count = end - start;
@@ -7115,6 +7638,7 @@ impl ChatState {
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
+                self.invalidate_url_interactions();
                 // Flush any accumulated thought before the response text begins
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
@@ -7130,6 +7654,7 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                self.invalidate_url_interactions();
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::Thinking;
@@ -7878,6 +8403,9 @@ impl ChatState {
         self.cached_row_breaks.clear();
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
+        self.url_hit_regions.clear();
+        self.cached_url_regions.clear();
+        self.pending_url_activation = None;
         self.context_copy_regions.clear();
         self.context_menu = None;
         self.copy_feedback = None;
@@ -8059,6 +8587,562 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    fn url_hit(rect: Rect, url: &str, row: u16, byte_start: usize) -> UrlHitRegion {
+        UrlHitRegion {
+            rect,
+            url: url.to_string(),
+            occurrence: UrlOccurrenceId { row, byte_start },
+        }
+    }
+
+    #[test]
+    fn recognized_urls_accept_bare_and_markdown_destinations_without_punctuation() {
+        let bare = recognized_url_ranges("See https://example.com/path, then stop.");
+        assert_eq!(bare, vec![(4, 28, "https://example.com/path".to_string())]);
+        let balanced = recognized_url_ranges("(https://example.com/a_(b)),");
+        assert_eq!(balanced.len(), 1);
+        assert_eq!(balanced[0].2, "https://example.com/a_(b)");
+        let markdown = markdown_to_lines("[docs](https://example.com/docs).", 80);
+        let rendered = markdown
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, "docs (https://example.com/docs).");
+        assert_eq!(recognized_url_ranges(&rendered).len(), 1);
+
+        let mut split = vec![Line::from(vec![
+            Span::raw("https://"),
+            Span::styled("example.com", theme::dim_style()),
+        ])];
+        style_recognized_urls(&mut split);
+        assert!(
+            split[0]
+                .spans
+                .iter()
+                .all(|span| span.style.add_modifier(Modifier::UNDERLINED) == span.style)
+        );
+        assert!(
+            split[0]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(theme::active().accent))
+        );
+    }
+
+    #[test]
+    fn recognized_urls_preserve_valid_terminal_punctuation() {
+        let ranges = recognized_url_ranges(
+            "https://example.com/foo! https://example.com/? https://example.com/end, See <https://example.com/docs>?!",
+        );
+        let urls = ranges
+            .into_iter()
+            .map(|(_, _, url)| url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/foo!",
+                "https://example.com/?",
+                "https://example.com/end",
+                "https://example.com/docs",
+            ]
+        );
+    }
+
+    #[test]
+    fn recognized_urls_reject_other_schemes_and_malformed_hosts() {
+        for text in [
+            "javascript:alert(1)",
+            "ftp://example.com",
+            "prefixhttps://example.com",
+            "wordhttp://example.com",
+            "https://",
+            "https:///",
+        ] {
+            assert!(
+                recognized_url_ranges(text).is_empty(),
+                "recognized {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_message_urls_receive_the_same_link_style() {
+        let mut lines = Vec::new();
+        render_entry_into(
+            &ChatEntry::UserMessage {
+                text: Some(Arc::from("visit https://example.com")),
+                attachments: Vec::new(),
+            },
+            false,
+            false,
+            80,
+            &mut lines,
+        );
+        let url_span = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("https://example.com"))
+            .expect("styled URL span");
+        assert_eq!(url_span.style.fg, Some(theme::active().accent));
+        assert!(url_span.style.add_modifier(Modifier::UNDERLINED) == url_span.style);
+    }
+
+    #[test]
+    fn url_hit_map_wrapping_matches_rendered_cells_while_scrolling() {
+        use ratatui::{buffer::Buffer, widgets::Widget};
+
+        let reproducer = vec![
+            Line::from("https://a.co x https://b.co x https://c.co x https://d.co"),
+            Line::from("https://e.co"),
+        ];
+        let regions = url_line_regions_for_lines(&reproducer, 10);
+        let visible = project_url_hit_regions(&regions, 9, Rect::new(0, 0, 10, 2));
+        assert!(visible.iter().all(|hit| hit.rect.y < 2));
+
+        let lines = vec![
+            Line::from("https://one.example/aaaaa x https://two.example/bbbbbb"),
+            Line::from("https://three.example/end"),
+            Line::from("https://wide.example/\u{754c}e\u{301}").centered(),
+            Line::from("https://right.example/end").right_aligned(),
+        ];
+        for width in [10, 16, 24, 40] {
+            let regions = url_line_regions_for_lines(&lines, width);
+            assert!(
+                regions.windows(2).all(|pair| pair[0].row <= pair[1].row),
+                "URL rows must remain ordered at width {width}: {regions:?}"
+            );
+            let total = Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u16;
+            let full_body = Rect::new(0, 0, width, total);
+            let mut full_buffer = Buffer::empty(full_body);
+            Paragraph::new(lines.clone())
+                .wrap(Wrap { trim: false })
+                .render(full_body, &mut full_buffer);
+            let all = project_url_hit_regions(&regions, 0, full_body);
+            for region in &regions {
+                for (start, _, url) in &region.urls {
+                    let occurrence = UrlOccurrenceId {
+                        row: region.row,
+                        byte_start: *start,
+                    };
+                    let mut visible = String::new();
+                    for hit in all.iter().filter(|hit| hit.occurrence == occurrence) {
+                        let mut x = hit.rect.x;
+                        while x < hit.rect.right() {
+                            use unicode_width::UnicodeWidthStr;
+                            let symbol = full_buffer[(x, hit.rect.y)].symbol();
+                            visible.push_str(symbol);
+                            x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                        }
+                    }
+                    assert_eq!(
+                        &visible, url,
+                        "all URL cells remain reachable at width {width}"
+                    );
+                }
+            }
+            for scroll in 0..total {
+                let body = Rect::new(2, 3, width, 2);
+                let mut buffer = Buffer::empty(body);
+                Paragraph::new(lines.clone())
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .render(body, &mut buffer);
+                for hit in project_url_hit_regions(&regions, scroll, body) {
+                    use unicode_width::UnicodeWidthStr;
+                    let mut visible = String::new();
+                    let mut x = hit.rect.x;
+                    while x < hit.rect.right() {
+                        let symbol = buffer[(x, hit.rect.y)].symbol();
+                        visible.push_str(symbol);
+                        x += (UnicodeWidthStr::width(symbol) as u16).max(1);
+                    }
+                    assert!(
+                        !visible.is_empty() && hit.url.contains(&visible),
+                        "phantom URL cells at width {width}, scroll {scroll}: {visible:?}, {hit:?}"
+                    );
+                }
+            }
+
+            let mut appended = url_line_regions_for_lines(&lines[..1], width);
+            let mut tail = url_line_regions_for_lines(&lines[1..], width);
+            offset_url_line_regions(&mut tail, wrapped_rows(&lines[0], width));
+            appended.extend(tail);
+            assert_eq!(appended.len(), regions.len());
+            for (incremental, full) in appended.iter().zip(&regions) {
+                assert_eq!(incremental, full);
+            }
+        }
+    }
+
+    #[test]
+    fn url_hit_map_tall_line_retains_only_visible_cell_regions() {
+        let url = format!("https://example.com/{}", "a".repeat(6_000));
+        let lines = vec![Line::from(url.clone())];
+        let cached = url_line_regions_for_lines(&lines, 10);
+        assert_eq!(
+            cached.len(),
+            1,
+            "cache logical lines, not every wrapped cell"
+        );
+        assert!(cached[0].rows > 256);
+        let body = Rect::new(4, 5, 10, 3);
+        let hits = project_url_hit_regions(&cached, 400, body);
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|hit| hit.url == url));
+        assert_eq!(hits[0].rect, Rect::new(4, 5, 10, 1));
+        assert_eq!(hits[2].rect, Rect::new(4, 7, 10, 1));
+        assert!(project_url_hit_regions(&cached, cached[0].rows, body).is_empty());
+    }
+
+    #[test]
+    fn url_hit_map_projects_wrapped_wide_cells_and_viewport_rows() {
+        let lines = vec![Line::from("界 https://example.com/path")];
+        let logical = url_line_regions_for_lines(&lines, 10);
+        let all = project_url_hit_regions(&logical, 0, Rect::new(5, 3, 10, 4));
+        assert!(
+            all.len() >= 2,
+            "URL should be split by soft wrapping: {all:?}"
+        );
+        assert!(all.iter().all(|hit| hit.url == "https://example.com/path"));
+        assert!(
+            all.iter().all(|hit| hit.occurrence == all[0].occurrence),
+            "wrapped URL segments must retain one occurrence identity"
+        );
+        assert!(all.iter().all(|hit| hit.rect.x >= 5 && hit.rect.width > 0));
+        let clipped = project_url_hit_regions(&logical, 1, Rect::new(5, 3, 10, 1));
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].rect.y, 3);
+
+        let mut offset = logical.clone();
+        offset_url_line_regions(&mut offset, 7);
+        assert_eq!(offset[0].row, logical[0].row + 7);
+        let shifted = project_url_hit_regions(&offset, 7, Rect::new(5, 3, 10, 4));
+        assert_eq!(shifted[0].occurrence.row, all[0].occurrence.row + 7);
+    }
+
+    #[test]
+    fn link_origin_drag_cannot_extend_a_preexisting_selection() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 30, 1),
+            &["old https://example.com text"],
+        ));
+        assert!(state.begin_transcript_drag(0, 0));
+        assert!(state.update_transcript_drag(2, 0));
+        state.finish_transcript_drag();
+        assert!(state.transcript_selection.is_some());
+
+        state.begin_url_activation(url_hit(Rect::new(4, 0, 19, 1), "https://example.com", 0, 4));
+        state.cancel_url_activation();
+        assert!(!state.update_transcript_drag(20, 0));
+        assert_eq!(state.transcript_selection, None);
+    }
+
+    #[test]
+    fn url_context_menu_remains_actionable_in_browse_mode() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut state = state();
+        state.entries.push(ChatEntry::AgentMessage(Arc::from(
+            "| Link |\n| --- |\n| https://example.com/this/is/a/very/long/path/that/must/be/truncated |\n\nhttps://example.complete",
+        )));
+        state.browse_cursor = Some(0);
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 140, 40);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw browse-mode transcript");
+
+        let snapshot = state
+            .transcript_snapshot
+            .as_ref()
+            .expect("render captures transcript cells");
+        let (row, column) = snapshot
+            .cells
+            .chunks(usize::from(snapshot.area.width))
+            .enumerate()
+            .find_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .find("https://example.complete")
+                    .map(|column| {
+                        (
+                            snapshot.area.y + row as u16,
+                            snapshot.area.x + column as u16,
+                        )
+                    })
+            })
+            .expect("complete URL remains visible after the table");
+
+        assert!(state.open_transcript_context_menu(column, row));
+        let menu = state.context_menu.as_ref().expect("URL menu");
+        assert_eq!(menu.target.actions(), URL_WITH_COPY_CONTEXT_ACTIONS);
+        assert_eq!(
+            menu.selected_action(),
+            Some(ChatContextMenuAction::OpenLink)
+        );
+        assert_eq!(menu.target.copy_kind(), Some(CopyHitKind::Message));
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, menu.target.copy_kind()),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_mode_plain_url_click_owns_the_link_gesture() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("first")));
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "https://example.com",
+        )));
+        state.browse_cursor = Some(0);
+        state.entry_rects = vec![(0, Rect::new(2, 3, 20, 1)), (1, Rect::new(2, 4, 20, 1))];
+        state
+            .url_hit_regions
+            .push(url_hit(Rect::new(2, 4, 19, 1), "https://example.com", 1, 0));
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 80, 20),
+        )
+        .await;
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(state.browse_cursor, Some(0));
+        assert_eq!(
+            state
+                .pending_url_activation
+                .as_ref()
+                .map(|pending| pending.url.as_str()),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn context_menu_names_only_transcript_selection_copy_explicitly() {
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Transcript)),
+            crate::i18n::t("zc-chat-context-menu-copy-selection")
+        );
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, Some(CopyHitKind::Code)),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+        assert_eq!(
+            context_menu_action_label(ChatContextMenuAction::Copy, None),
+            crate::i18n::t("zc-chat-context-menu-copy")
+        );
+    }
+
+    #[test]
+    fn url_pointer_lifecycle_requires_same_occurrence() {
+        let mut state = state();
+        let first = url_hit(Rect::new(4, 2, 8, 1), "https://example.com", 2, 4);
+        let second = url_hit(Rect::new(20, 2, 8, 1), "https://example.com", 2, 20);
+        state.url_hit_regions = vec![first, second];
+
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Up(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Open("https://example.com".to_string())
+        );
+
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Up(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                22,
+                2,
+            ),
+            UrlPointerAction::Consumed,
+            "same URL text at a different occurrence must not open"
+        );
+
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { row: 0, column: 0 },
+            head: CellPoint { row: 0, column: 1 },
+            dragged: true,
+        });
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Down(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                6,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert_eq!(state.transcript_selection, None);
+        assert_eq!(
+            state.handle_url_pointer(
+                &MouseEventKind::Drag(MouseButton::Left),
+                crossterm::event::KeyModifiers::NONE,
+                10,
+                2,
+            ),
+            UrlPointerAction::Consumed
+        );
+        assert!(state.pending_url_activation.is_none());
+    }
+
+    #[test]
+    fn transcript_reflow_cancels_pending_url_activation() {
+        let mut state = state();
+        state.cached_render_width = 80;
+        state.begin_url_activation(url_hit(Rect::new(4, 2, 8, 1), "https://example.com", 2, 4));
+
+        state.rebuild_lines(40);
+
+        assert!(state.pending_url_activation.is_none());
+    }
+
+    #[test]
+    fn streaming_updates_invalidate_pending_url_actions() {
+        let updates = [
+            SessionUpdate::AgentMessageChunk {
+                session_id: "sess-1".to_string(),
+                text: "/private".to_string(),
+            },
+            SessionUpdate::AgentThoughtChunk {
+                session_id: "sess-1".to_string(),
+                text: "/thinking".to_string(),
+            },
+        ];
+
+        for update in updates {
+            let mut state = state();
+            let hit = url_hit(Rect::new(0, 0, 19, 1), "https://example.com", 0, 0);
+            state.url_hit_regions = vec![hit.clone()];
+            assert_eq!(
+                state.handle_url_pointer(
+                    &MouseEventKind::Down(MouseButton::Left),
+                    crossterm::event::KeyModifiers::NONE,
+                    2,
+                    0,
+                ),
+                UrlPointerAction::Consumed
+            );
+            state.context_menu = Some(ChatContextMenu {
+                rect: Rect::new(0, 1, 20, 4),
+                target: ChatContextMenuTarget::Url(hit),
+                selected: 0,
+            });
+
+            state.apply_update(update);
+
+            assert!(state.pending_url_activation.is_none());
+            assert!(state.context_menu.is_none());
+            assert_eq!(
+                state.handle_url_pointer(
+                    &MouseEventKind::Up(MouseButton::Left),
+                    crossterm::event::KeyModifiers::NONE,
+                    2,
+                    0,
+                ),
+                UrlPointerAction::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_transitions_preserve_non_url_context_menus() {
+        let transcript = ChatContextMenuTarget::Transcript(CopyHitRegion {
+            rect: Rect::new(0, 0, 1, 1),
+            text: "message".to_string(),
+            kind: CopyHitKind::Message,
+            group: 0,
+        });
+        let queue = ChatContextMenuTarget::Queue(7);
+
+        for (index, target) in [transcript, queue].into_iter().enumerate() {
+            let mut state = state();
+            state.context_menu = Some(ChatContextMenu {
+                rect: Rect::new(0, 1, 20, 4),
+                target: target.clone(),
+                selected: 0,
+            });
+
+            if index == 0 {
+                state.mark_dirty_append();
+            } else {
+                state.mark_dirty_full();
+            }
+
+            assert_eq!(
+                state.context_menu.as_ref().map(|menu| &menu.target),
+                Some(&target)
+            );
+        }
+    }
+
+    #[test]
+    fn url_context_menu_keyboard_selection_remains_actionable() {
+        let mut state = state();
+        state.context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 1, 20, 4),
+            target: ChatContextMenuTarget::Url(url_hit(
+                Rect::new(0, 0, 19, 1),
+                "https://example.com",
+                0,
+                0,
+            )),
+            selected: 0,
+        });
+
+        state.context_menu_select_step(1);
+
+        assert_eq!(
+            state.take_context_menu_request(),
+            Some(ChatContextMenuRequest::CopyUrl(
+                "https://example.com".to_string()
+            ))
+        );
     }
 
     fn active_chat() -> Chat {
@@ -8505,12 +9589,19 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
 
         let bounds = Rect::new(10, 5, 20, 8);
-        let menu_width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
-            .min(bounds.width)
-            .max(3);
+        let menu_width =
+            (UnicodeWidthStr::width(context_menu_copy_selection_label().as_str()) as u16 + 4)
+                .min(bounds.width)
+                .max(3);
 
         assert_eq!(
-            context_menu_rect(29, 12, bounds, TRANSCRIPT_CONTEXT_ACTIONS),
+            context_menu_rect(
+                29,
+                12,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            ),
             Some(Rect::new(
                 bounds.x + bounds.width - menu_width,
                 bounds.y + bounds.height - 3,
@@ -8519,16 +9610,56 @@ mod tests {
             ))
         );
         assert_eq!(
-            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
-                .unwrap()
-                .x,
+            context_menu_rect(
+                0,
+                0,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .unwrap()
+            .x,
             bounds.x
         );
         assert_eq!(
-            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
-                .unwrap()
-                .y,
+            context_menu_rect(
+                0,
+                0,
+                bounds,
+                TRANSCRIPT_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .unwrap()
+            .y,
             bounds.y
+        );
+    }
+
+    #[test]
+    fn url_context_menu_requires_room_for_every_action() {
+        let too_short = Rect::new(0, 0, 30, 4);
+        assert_eq!(
+            context_menu_rect(
+                2,
+                1,
+                too_short,
+                URL_WITH_COPY_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            ),
+            None
+        );
+
+        let enough_room = Rect::new(0, 0, 30, 5);
+        assert_eq!(
+            context_menu_rect(
+                2,
+                1,
+                enough_room,
+                URL_WITH_COPY_CONTEXT_ACTIONS,
+                Some(CopyHitKind::Transcript),
+            )
+            .map(|rect| rect.height),
+            Some(5)
         );
     }
 
@@ -13176,6 +14307,28 @@ mod tests {
             20,
         );
         assert!(out.contains('\u{2026}'), "expected ellipsis: {out}");
+    }
+
+    #[test]
+    fn md_table_truncated_url_is_not_actionable() {
+        let lines = markdown_to_lines(
+            "| col |\n|-----|\n| https://example.com/a/very/long/path |\n\nhttps://example.org/ok\n",
+            24,
+        );
+        let truncated = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("https://") && span.content.contains('\u{2026}'))
+            .expect("truncated table URL");
+        assert_ne!(truncated.style.fg, Some(theme::active().accent));
+        assert_ne!(
+            truncated.style.add_modifier(Modifier::UNDERLINED),
+            truncated.style
+        );
+
+        let regions = url_line_regions_for_lines(&lines, 24);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].urls[0].2, "https://example.org/ok");
     }
 
     #[test]
