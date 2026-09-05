@@ -2,6 +2,7 @@ use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
     build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
 };
+use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -1156,6 +1157,37 @@ impl OpenAiResponsesModelProvider {
         headers
     }
 
+    /// OpenCode affinity header value for the calling conversation, or `None`
+    /// when this provider does not target OpenCode.
+    ///
+    /// `responses_url` is the full endpoint rather than a base URL; the target
+    /// test parses its host, so it matches either shape. Returns `None` when
+    /// the operator already pinned the header through `extra_headers`, which
+    /// `build_default_headers` puts on every request — a second value here
+    /// would send the header twice.
+    fn opencode_session_value(&self) -> Option<String> {
+        if self
+            .extra_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case(OPENCODE_SESSION_HEADER))
+        {
+            return None;
+        }
+        crate::opencode_session::session_token(&self.responses_url)
+    }
+
+    /// Attach the OpenCode affinity header, for request paths that build in the
+    /// caller's task. The streaming path resolves the value before its spawn.
+    fn apply_opencode_session_header(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match self.opencode_session_value() {
+            Some(session) => req.header(OPENCODE_SESSION_HEADER, session),
+            None => req,
+        }
+    }
+
     fn http_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1244,9 +1276,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1294,9 +1328,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             );
         }
         let response = self
-            .http_client()
-            .post(&self.responses_url)
-            .header("Authorization", format!("Bearer {credential}"))
+            .apply_opencode_session_header(
+                self.http_client()
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {credential}")),
+            )
             .json(&req)
             .send()
             .await?;
@@ -1335,6 +1371,9 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
         let responses_url = self.responses_url.clone();
+        // Resolved before the spawn: `spawn!` propagates the tracing span but
+        // not task-locals, so the conversation scope is unreadable inside.
+        let opencode_session = self.opencode_session_value();
         let count_tokens = options.count_tokens;
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
@@ -1387,11 +1426,14 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 );
             }
 
-            let request_builder = client
+            let mut request_builder = client
                 .post(&responses_url)
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("Accept", "text/event-stream")
-                .json(&req);
+                .header("Accept", "text/event-stream");
+            if let Some(session) = opencode_session.as_deref() {
+                request_builder = request_builder.header(OPENCODE_SESSION_HEADER, session);
+            }
+            let request_builder = request_builder.json(&req);
 
             run_responses_sse(request_builder, &tx, count_tokens).await;
         });

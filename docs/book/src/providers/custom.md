@@ -93,6 +93,24 @@ wire_api = "responses"
 
 The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
 
+### OpenCode session affinity
+
+Every request to an `opencode.ai` host carries an `x-opencode-session` header on both wires, streaming and non-streaming. OpenCode uses it to pin one conversation's turns to the same upstream backend, which keeps that backend's prompt cache warm across turns; upstream also lists it under the guidance for keeping an account from being flagged, and some OpenCode Go models reject header-less requests outright.
+
+The value is an opaque 128-bit hex token derived from the active conversation scope, so each conversation pins to its own backend and the same conversation keeps its backend across a daemon restart. The conversation's session key is **hashed, never sent**: session keys embed channel and user identifiers, and forwarding one verbatim would hand a third-party relay a per-user identifier. Requests made outside any conversation, such as warmup probes, share one process-stable token instead.
+
+Nothing needs configuring. To pin the value yourself, for instance to share one affinity scope across replicas, set it explicitly and ZeroClaw leaves it alone:
+
+```toml
+[providers.models.opencode.default]
+model = "big-pickle"
+
+[providers.models.opencode.default.extra_headers]
+x-opencode-session = "my-fixed-scope"
+```
+
+Hosts other than `opencode.ai` and its subdomains never receive the header.
+
 ## Validation
 
 Regardless of approach:
