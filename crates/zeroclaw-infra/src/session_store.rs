@@ -230,6 +230,9 @@ impl SessionStore {
 
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
+    /// Also removes the breadcrumb sidecar: a reset session has no synthetic
+    /// marker, so a stale recorded `true` must not survive into the next
+    /// first message and be mistaken for a real trim.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let _guard = self.mutation_guard()?;
         if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
@@ -239,6 +242,7 @@ impl SessionStore {
         if count > 0 {
             self.rewrite(session_key, &[])?;
         }
+        let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
         Ok(count)
     }
 
@@ -995,6 +999,41 @@ mod tests {
         let messages = store.load(key);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "new");
+    }
+
+    #[test]
+    fn clear_messages_removes_trim_breadcrumb_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "crumb_reset_test";
+
+        store.append(key, &ChatMessage::user("hello")).unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), Some(true));
+
+        store.clear_messages(key).unwrap();
+
+        // A reset session has no synthetic marker; the recorded flag must
+        // not survive as a stale `true` for the next first message.
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_removes_stale_sidecar_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "already_empty_crumb_test";
+
+        store.append(key, &ChatMessage::user("hello")).unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        store.clear_messages(key).unwrap();
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+
+        // Clearing an already-empty session must not leave a stale flag
+        // behind either.
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert_eq!(store.clear_messages(key).unwrap(), 0);
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
     }
 
     #[test]

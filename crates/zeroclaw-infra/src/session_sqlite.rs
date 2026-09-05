@@ -669,11 +669,26 @@ impl SqliteSessionBackend {
                 if inserted == 0 && has_non_whitespace_source {
                     bail!("JSONL session {name} contains no valid messages to import");
                 }
+                // Carry the JSONL sidecar's explicit breadcrumb provenance
+                // into the same transaction as the messages it describes,
+                // so a backend switch cannot drop a recorded `true`/`false`
+                // and let a later restore fall back to inferring ownership
+                // from message text.
+                let trim_breadcrumb =
+                    match std::fs::read(sessions_dir.join(format!("{key}.trim_breadcrumb"))) {
+                        Ok(bytes) => Some(bytes.first() == Some(&b'1')),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "Failed to read trim breadcrumb sidecar for JSONL session {name}"
+                            )));
+                        }
+                    };
                 tx.execute(
                     "INSERT INTO session_metadata \
-                     (session_key, created_at, last_activity, message_count) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![key, now, now, inserted],
+                     (session_key, created_at, last_activity, message_count, trim_breadcrumb) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key, now, now, inserted, trim_breadcrumb.map(i64::from)],
                 )
                 .with_context(|| format!("Failed to record metadata for JSONL session {name}"))?;
                 tx.execute(
@@ -1017,13 +1032,15 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = conn.changes() as usize;
 
-        if count > 0 {
-            conn.execute(
-                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
-                params![Utc::now().to_rfc3339(), session_key],
-            )
-            .map_err(std::io::Error::other)?;
-        }
+        // Reset trim_breadcrumb to NULL (unrecorded) regardless of whether
+        // any rows were deleted: a reset transcript has no synthetic marker,
+        // and a stale recorded `true` on an already-empty session must not
+        // survive to misclassify the next first message.
+        conn.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            params![Utc::now().to_rfc3339(), session_key],
+        )
+        .map_err(std::io::Error::other)?;
 
         Ok(count)
     }
@@ -1698,6 +1715,42 @@ mod tests {
     }
 
     #[test]
+    fn clear_messages_resets_trim_breadcrumb() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(true)
+        );
+
+        backend.clear_messages("s1").unwrap();
+
+        // A reset session has no synthetic marker; the recorded flag must
+        // not survive as a stale `true` for the next first message.
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_resets_trim_breadcrumb_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        backend.clear_messages("s1").unwrap();
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+
+        // Clearing an already-empty session must not leave a stale flag
+        // behind either.
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        assert_eq!(backend.clear_messages("s1").unwrap(), 0);
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+    }
+
+    #[test]
     fn delete_session_removes_all_data() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -1761,6 +1814,57 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_explicit_trim_breadcrumb() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // A genuine user message that happens to equal the canonical
+        // breadcrumb text, but was explicitly recorded as `false` in JSONL —
+        // the case where an inferring migration would misclassify it.
+        std::fs::write(
+            sessions_dir.join("false_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"[earlier turns omitted to fit the context window]\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("false_case.trim_breadcrumb"), b"0").unwrap();
+
+        std::fs::write(
+            sessions_dir.join("true_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("true_case.trim_breadcrumb"), b"1").unwrap();
+
+        std::fs::write(
+            sessions_dir.join("unrecorded_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(migrated, 3);
+
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("false_case").unwrap(),
+            Some(false),
+            "an explicit false must survive the backend switch despite the text collision"
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("true_case").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            backend
+                .get_session_trim_breadcrumb("unrecorded_case")
+                .unwrap(),
+            None,
+            "genuinely unrecorded legacy state must stay NULL, not become an inferred value"
+        );
     }
 
     #[test]
