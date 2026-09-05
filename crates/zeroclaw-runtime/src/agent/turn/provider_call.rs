@@ -231,7 +231,29 @@ pub(crate) async fn call_provider(
                             (Err(stream_err), false, false, String::new())
                         }
                         Err(stream_err) => {
-                            if let Some(usage) = stream_err
+                            let streamed_refusal = stream_err
+                                .downcast_ref::<StreamErrorWithUsage>()
+                                .and_then(|error| match &error.source {
+                                    zeroclaw_api::model_provider::StreamError::ModelRefusal(
+                                        refusal,
+                                    ) => Some((**refusal).clone()),
+                                    _ => None,
+                                })
+                                .or_else(|| {
+                                    stream_err.chain().find_map(|cause| {
+                                        cause
+                                            .downcast_ref::<
+                                                zeroclaw_api::model_provider::ModelRefusalError,
+                                            >()
+                                            .cloned()
+                                    })
+                                });
+                            if let Some(usage) = streamed_refusal
+                                .as_ref()
+                                .and_then(|refusal| refusal.usage.as_deref().cloned())
+                            {
+                                scope.record_stream_interruption_usage(usage);
+                            } else if let Some(usage) = stream_err
                                 .downcast_ref::<StreamSemanticEmptyCompletion>()
                                 .and_then(|error| error.usage.clone())
                             {
@@ -264,21 +286,36 @@ pub(crate) async fn call_provider(
                             );
                             scope.clear_provisional_provider_route();
                             let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                            let request = ChatRequest {
+                                messages: prepared_messages,
+                                tools: request_tools,
+                                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                    .try_with(Clone::clone)
+                                    .ok()
+                                    .flatten(),
+                            };
                             let recovery = with_exact_dispatch_route(
                                 ctx.provider_name.to_string(),
                                 active_model.to_string(),
-                                dispatcher.chat(
-                                ChatRequest {
-                                    messages: prepared_messages,
-                                    tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
+                                async {
+                                    match streamed_refusal {
+                                        Some(refusal) => {
+                                            dispatcher
+                                                .chat_after_stream_refusal(
+                                                    request,
+                                                    active_model,
+                                                    ctx.temperature,
+                                                    refusal,
+                                                )
+                                                .await
+                                        }
+                                        None => {
+                                            dispatcher
+                                                .chat(request, active_model, ctx.temperature)
+                                                .await
+                                        }
+                                    }
                                 },
-                                active_model,
-                                ctx.temperature,
-                                ),
                             );
                             let result = if let Some(token) = ctx.cancellation_token {
                                 tokio::select! {
@@ -631,7 +668,7 @@ mod streaming_fallback_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::StreamEvent;
+    use zeroclaw_api::model_provider::{ModelRefusalError, StreamError, StreamEvent};
     use zeroclaw_config::schema::PacingConfig;
     use zeroclaw_providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
     use zeroclaw_providers::reliable::ReliableModelProvider;
@@ -652,6 +689,15 @@ mod streaming_fallback_tests {
 
     struct EmptyThenPendingProvider {
         calls: AtomicUsize,
+    }
+
+    struct StreamRefusalProvider {
+        stream_calls: std::sync::Arc<AtomicUsize>,
+        non_stream_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    struct RefusalRescueProvider {
+        non_stream_calls: std::sync::Arc<AtomicUsize>,
     }
 
     struct StreamFailureNoReplayProvider {
@@ -689,6 +735,26 @@ mod streaming_fallback_tests {
 
         fn alias(&self) -> &str {
             "EmptyThenPendingProvider"
+        }
+    }
+
+    impl Attributable for StreamRefusalProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "StreamRefusalProvider"
+        }
+    }
+
+    impl Attributable for RefusalRescueProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "RefusalRescueProvider"
         }
     }
 
@@ -862,6 +928,94 @@ mod streaming_fallback_tests {
                 });
             }
             std::future::pending::<Result<ChatResponse>>().await
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StreamRefusalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok("must not replay".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                StreamError::ModelRefusal(Box::new(ModelRefusalError {
+                    requested_model: model.to_string(),
+                    category: Some("private-safety-category".to_string()),
+                    usage: Some(Box::new(TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: Some(1),
+                    })),
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                })),
+            )]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusalRescueProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("rescued".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("rescued".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(4),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
         }
     }
 
@@ -1332,6 +1486,125 @@ mod streaming_fallback_tests {
             assert_eq!(request_count.load(Ordering::Relaxed), 1, "{status}");
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_refusal_recovers_without_replay_and_preserves_attempt_usage() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let refused_non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let rescue_non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "refusing".to_string(),
+                    Box::new(StreamRefusalProvider {
+                        stream_calls: Arc::clone(&stream_calls),
+                        non_stream_calls: Arc::clone(&refused_non_stream_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "rescue".to_string(),
+                    Box::new(RefusalRescueProvider {
+                        non_stream_calls: Arc::clone(&rescue_non_stream_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "requested-provider",
+            model: "requested-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {
+            let outcome = call_provider(
+                &ctx,
+                &provider,
+                "requested-model",
+                &[ChatMessage::user("go")],
+                None,
+                true,
+                0,
+            )
+            .await
+            .expect("pre-output refusal is recovered by the next candidate");
+            (outcome, zeroclaw_providers::take_last_safeguard_fallback())
+        })
+        .await;
+
+        assert_eq!(
+            outcome.chat_result.unwrap().text.as_deref(),
+            Some("rescued")
+        );
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            refused_non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "the refusing candidate must not receive a replay"
+        );
+        assert_eq!(rescue_non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert!(
+            matches!(
+                outcome.attempts[0].outcome(),
+                zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                    observed: Some(usage),
+                } if usage.input_tokens == Some(7)
+                    && usage.output_tokens == Some(3)
+                    && usage.cached_input_tokens == Some(1)
+            ),
+            "attempts: {:#?}",
+            outcome.attempts
+        );
+        assert!(matches!(
+            outcome.attempts[1].outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(11) && usage.output_tokens == Some(4)
+        ));
+        assert_eq!(
+            outcome
+                .attempts
+                .iter()
+                .filter(|attempt| matches!(
+                    attempt.outcome(),
+                    zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                        observed: Some(usage),
+                    } if usage.input_tokens == Some(7) && usage.output_tokens == Some(3)
+                ))
+                .count(),
+            1,
+            "refusal usage must be attached to exactly one physical attempt"
+        );
+
+        let notice = notice.expect("successful refusal recovery notice");
+        assert_eq!(
+            notice.kind,
+            zeroclaw_providers::SafeguardFallbackKind::ClientSide
+        );
+        assert_eq!(notice.requested_model, "requested-model");
+        assert_eq!(notice.served_model, "requested-model");
+        assert_eq!(notice.category.as_deref(), Some("private-safety-category"));
     }
 
     #[tokio::test]

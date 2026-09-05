@@ -67,6 +67,7 @@ impl std::error::Error for StreamInterruptedAfterOutput {
 pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) source: zeroclaw_api::model_provider::StreamError,
 }
 
 impl std::fmt::Display for StreamErrorWithUsage {
@@ -75,7 +76,11 @@ impl std::fmt::Display for StreamErrorWithUsage {
     }
 }
 
-impl std::error::Error for StreamErrorWithUsage {}
+impl std::error::Error for StreamErrorWithUsage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
@@ -255,6 +260,39 @@ fn terminal_completion_error_message_in_english(
         agent_name,
         crate::i18n::get_english_cli_string_with_args,
     )
+}
+
+/// Render a safeguard fallback as display-only text at a runtime delivery
+/// boundary. The provider-owned notice is the canonical accepted-route fact;
+/// this helper only resolves its localized presentation when a caller needs a
+/// text surface (direct Agent, CLI, RPC, or ACP).
+pub fn append_safeguard_fallback_notice(
+    mut response: String,
+    notice: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
+) -> String {
+    let Some(notice) = notice else {
+        return response;
+    };
+    let key = match notice.kind {
+        zeroclaw_providers::SafeguardFallbackKind::ServerSide => {
+            "channel-runtime-safeguard-footer-server"
+        }
+        zeroclaw_providers::SafeguardFallbackKind::ClientSide => {
+            "channel-runtime-safeguard-footer-client"
+        }
+        zeroclaw_providers::SafeguardFallbackKind::ClientAndServer => {
+            "channel-runtime-safeguard-footer-client-server"
+        }
+    };
+    response.push_str("\n\n---\n");
+    response.push_str(&crate::i18n::get_required_cli_string_with_args(
+        key,
+        &[
+            ("requested", notice.requested_model.as_str()),
+            ("served", notice.served_model.as_str()),
+        ],
+    ));
+    response
 }
 
 #[derive(Debug)]

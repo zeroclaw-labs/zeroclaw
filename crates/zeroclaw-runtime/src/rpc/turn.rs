@@ -12,6 +12,7 @@ pub enum TurnOutcome {
     Completed {
         text: String,
         messages: Vec<ConversationMessage>,
+        safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
     },
     Cancelled {
         partial_text: String,
@@ -160,9 +161,11 @@ fn outcome_from_task_result(
         Ok(StreamedTurnSuccess {
             response,
             new_messages,
+            safeguard_fallback,
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
+            safeguard_fallback,
         }),
         Err(StreamedTurnError {
             error,
@@ -374,6 +377,46 @@ mod tests {
                 panic!("a tool-loop cancel must not map to Completed")
             }
         }
+    }
+
+    #[test]
+    fn completed_rpc_outcome_carries_display_only_safeguard_once() {
+        let messages = vec![ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::assistant("accepted response"),
+        )];
+        let safeguard = zeroclaw_providers::SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+            requested_model: "requested-model".into(),
+            served_model: "served-model".into(),
+            category: Some("private-category".into()),
+        };
+        let outcome = outcome_from_task_result(
+            Ok(StreamedTurnSuccess {
+                response: "accepted response".into(),
+                new_messages: messages.clone(),
+                safeguard_fallback: Some(safeguard),
+            }),
+            "accepted response".into(),
+        )
+        .expect("successful turn maps to RPC completion");
+
+        let TurnOutcome::Completed {
+            text,
+            messages: outcome_messages,
+            safeguard_fallback,
+        } = outcome
+        else {
+            panic!("successful turn must complete");
+        };
+        let display =
+            crate::agent::append_safeguard_fallback_notice(text, safeguard_fallback.as_ref());
+        assert_eq!(display.matches("Safety safeguards").count(), 1);
+        assert!(!display.contains("private-category"));
+        assert_eq!(
+            serde_json::to_value(outcome_messages).unwrap(),
+            serde_json::to_value(messages).unwrap(),
+            "RPC persistence payload must remain undecorated"
+        );
     }
 
     #[test]

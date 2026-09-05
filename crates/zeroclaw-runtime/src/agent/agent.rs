@@ -443,6 +443,9 @@ impl Drop for Agent {
 pub struct StreamedTurnSuccess {
     pub response: String,
     pub new_messages: Vec<ConversationMessage>,
+    /// Display-only accepted safeguard attribution. Callers choose the
+    /// transport presentation; `new_messages` remains undecorated.
+    pub safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
 }
 
 #[derive(Debug)]
@@ -2010,8 +2013,12 @@ impl Agent {
     async fn append_model_fallback_notice(
         response: String,
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+        safeguard: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> String {
+        if safeguard.is_some() {
+            return response;
+        }
         let with_notice = Self::format_model_fallback_notice(response.clone(), fallback);
         if with_notice == response {
             return response;
@@ -2631,20 +2638,34 @@ impl Agent {
         // entering either task-local scope: boxing inside a nested async block
         // still captures the large turn-loop future on the worker stack.
         let turn_loop = Box::pin(turn_loop);
-        let (loop_result, turn_provider_recovery, turn_provider_context_truncated) =
-            zeroclaw_providers::reliable::scope_provider_fallback(async {
-                let result = crate::agent::turn::scope_tool_protocol_prompts(
-                    Arc::clone(&tool_protocol_prompts),
-                    turn_loop,
-                )
+        let (
+            loop_result,
+            turn_provider_recovery,
+            turn_provider_context_truncated,
+            turn_safeguard_fallback,
+        ) = zeroclaw_providers::scope_safeguard_fallback(async {
+            let (result, recovery, context_truncated) =
+                zeroclaw_providers::reliable::scope_provider_fallback(async {
+                    let result = crate::agent::turn::scope_tool_protocol_prompts(
+                        Arc::clone(&tool_protocol_prompts),
+                        turn_loop,
+                    )
+                    .await;
+                    (
+                        result,
+                        zeroclaw_providers::reliable::take_last_provider_fallback(),
+                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                    )
+                })
                 .await;
-                (
-                    result,
-                    zeroclaw_providers::reliable::take_last_provider_fallback(),
-                    zeroclaw_providers::reliable::take_last_provider_context_truncation(),
-                )
-            })
-            .await;
+            (
+                result,
+                recovery,
+                context_truncated,
+                zeroclaw_providers::take_last_safeguard_fallback(),
+            )
+        })
+        .await;
 
         // Feed the accumulated per-call usage into the AgentEnd guard before
         // any return below drops it — including the error path, which must
@@ -2674,14 +2695,21 @@ impl Agent {
         };
 
         let response = self.append_receipts_block(response, receipt_scope.as_ref());
-        let response =
-            Self::format_model_fallback_notice(response, turn_provider_recovery.as_ref());
+        let response = if turn_safeguard_fallback.is_some() {
+            crate::agent::append_safeguard_fallback_notice(
+                response,
+                turn_safeguard_fallback.as_ref(),
+            )
+        } else {
+            Self::format_model_fallback_notice(response, turn_provider_recovery.as_ref())
+        };
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
             && turn_provider_recovery.is_none()
+            && turn_safeguard_fallback.is_none()
             && !turn_provider_context_truncated
             && loop_new_messages.len() == 2
             && loop_new_messages
@@ -2724,10 +2752,29 @@ impl Agent {
             ));
         }
 
-        self.turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
+        let display_event_tx = event_tx.clone();
+        let StreamedTurnSuccess {
+            response: raw_response,
+            new_messages,
+            safeguard_fallback,
+        } = self
+            .turn_streamed_with_steering_state(user_message, event_tx, cancel_token, None)
             .await
-            .map(|outcome| (outcome.response, outcome.new_messages))
-            .map_err(|err| err.error)
+            .map_err(|err| err.error)?;
+        let response = crate::agent::append_safeguard_fallback_notice(
+            raw_response.clone(),
+            safeguard_fallback.as_ref(),
+        );
+        if safeguard_fallback.is_some()
+            && let Some(delta) = response.strip_prefix(&raw_response)
+        {
+            let _ = display_event_tx
+                .send(TurnEvent::Chunk {
+                    delta: delta.to_string(),
+                })
+                .await;
+        }
+        Ok((response, new_messages))
     }
 
     pub async fn turn_streamed_with_steering_state(
@@ -2787,6 +2834,7 @@ impl Agent {
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
         let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo>;
+        let mut turn_safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>;
         let mut turn_provider_context_truncated = false;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
@@ -2871,6 +2919,7 @@ impl Agent {
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
                     new_messages: new_msgs,
+                    safeguard_fallback: None,
                 });
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -3074,17 +3123,28 @@ impl Agent {
             // the nested task-locals do not capture the full round future on
             // the worker stack in debug builds.
             let round_loop = Box::pin(round_loop);
-            let (loop_result, round_fallback, round_context_truncated) =
-                zeroclaw_providers::reliable::scope_provider_fallback(async {
-                    let result = crate::agent::turn::scope_tool_protocol_prompts(
-                        Arc::clone(&tool_protocol_prompts),
-                        round_loop,
-                    )
-                    .await;
+            let (loop_result, round_fallback, round_context_truncated, round_safeguard) =
+                zeroclaw_providers::scope_safeguard_fallback(async {
+                    let (result, fallback, context_truncated) =
+                        zeroclaw_providers::reliable::scope_provider_fallback(async {
+                            let result = crate::agent::turn::scope_tool_protocol_prompts(
+                                Arc::clone(&tool_protocol_prompts),
+                                round_loop,
+                            )
+                            .await;
+                            (
+                                result,
+                                zeroclaw_providers::reliable::take_last_provider_fallback(),
+                                zeroclaw_providers::reliable::take_last_provider_context_truncation(
+                                ),
+                            )
+                        })
+                        .await;
                     (
                         result,
-                        zeroclaw_providers::reliable::take_last_provider_fallback(),
-                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
+                        fallback,
+                        context_truncated,
+                        zeroclaw_providers::take_last_safeguard_fallback(),
                     )
                 })
                 .await;
@@ -3092,6 +3152,7 @@ impl Agent {
             // later primary/direct response must clear an earlier fallback,
             // rather than leaving its notice attached to the final answer.
             turn_provider_recovery = round_fallback;
+            turn_safeguard_fallback = round_safeguard;
             turn_provider_context_truncated |= round_context_truncated;
 
             // Feed cumulative usage into the AgentEnd guard before any return
@@ -3143,6 +3204,7 @@ impl Agent {
                     // exchange, mirroring the old "no tool calls" condition.
                     if single_text_exchange
                         && turn_provider_recovery.is_none()
+                        && turn_safeguard_fallback.is_none()
                         && !turn_provider_context_truncated
                         && let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
                     {
@@ -3157,12 +3219,14 @@ impl Agent {
                     let committed_response = Self::append_model_fallback_notice(
                         committed_response,
                         turn_provider_recovery.as_ref(),
+                        turn_safeguard_fallback.as_ref(),
                         &event_tx,
                     )
                     .await;
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
+                        safeguard_fallback: turn_safeguard_fallback,
                     });
                 }
                 Err(error) => {
@@ -3491,6 +3555,182 @@ mod tests {
         }
     }
 
+    struct SafeguardNoticeProvider;
+
+    #[async_trait]
+    impl ModelProvider for SafeguardNoticeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+                    requested_model: "requested-model".into(),
+                    served_model: "served-model".into(),
+                    category: Some("private-category".into()),
+                },
+            ));
+            Ok("accepted response".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+                    requested_model: "requested-model".into(),
+                    served_model: "served-model".into(),
+                    category: Some("private-category".into()),
+                },
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("accepted response".into()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SafeguardNoticeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "SafeguardNoticeProvider"
+        }
+    }
+
+    struct RefusingCandidateProvider;
+
+    #[async_trait]
+    impl ModelProvider for RefusingCandidateProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Err(anyhow::Error::new(
+                zeroclaw_providers::AnthropicRefusalError {
+                    requested_model: model.into(),
+                    category: Some("private-category".into()),
+                    usage: None,
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                },
+            ))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            Err(anyhow::Error::new(
+                zeroclaw_providers::AnthropicRefusalError {
+                    requested_model: model.into(),
+                    category: Some("private-category".into()),
+                    usage: None,
+                    attempted_candidate: None,
+                    attempted_candidate_index: None,
+                },
+            ))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for RefusingCandidateProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "RefusingCandidateProvider"
+        }
+    }
+
+    /// Keep the real Anthropic non-streaming implementation while making the
+    /// runtime test enter the non-streaming turn path deterministically.
+    struct NonStreamingAnthropicProvider {
+        inner: zeroclaw_providers::anthropic::AnthropicModelProvider,
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingAnthropicProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<String> {
+            self.inner
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NonStreamingAnthropicProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "NonStreamingAnthropicProvider"
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequencedAnthropicResponder {
+        calls: Arc<AtomicUsize>,
+        bodies: Arc<Vec<serde_json::Value>>,
+    }
+
+    impl wiremock::Respond for SequencedAnthropicResponder {
+        fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let body = self
+                .bodies
+                .get(index)
+                .or_else(|| self.bodies.last())
+                .expect("sequence must contain a response")
+                .clone();
+            wiremock::ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
+
     const BLANK_TURN_ERROR: &str = "empty user message: refusing to dispatch a blank turn";
 
     fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
@@ -3562,7 +3802,8 @@ mod tests {
         // orchestrator's family check suppresses; direct-turn surfaces must
         // still see it.
         let info = fallback_info("anthropic", "model-requested", "anthropic", "model-served");
-        let out = Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+        let out =
+            Agent::append_model_fallback_notice("hello".to_string(), Some(&info), None, &tx).await;
         assert!(
             out.starts_with("hello\n\n"),
             "reply text must be preserved ahead of the notice: {out}"
@@ -3589,7 +3830,8 @@ mod tests {
         // primary entry); an identical requested/served pair is not a
         // downgrade and must stay silent.
         let info = fallback_info("anthropic", "same-model", "anthropic", "same-model");
-        let out = Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+        let out =
+            Agent::append_model_fallback_notice("hello".to_string(), Some(&info), None, &tx).await;
         assert_eq!(out, "hello");
         assert!(rx.try_recv().is_err(), "no chunk for a retry");
     }
@@ -3597,9 +3839,254 @@ mod tests {
     #[tokio::test]
     async fn model_fallback_notice_absent_without_fallback_info() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let out = Agent::append_model_fallback_notice("hello".to_string(), None, &tx).await;
+        let out = Agent::append_model_fallback_notice("hello".to_string(), None, None, &tx).await;
         assert_eq!(out, "hello");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn safeguard_notice_suppresses_generic_model_fallback_notice() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let info = fallback_info("anthropic", "requested-model", "openai", "served-model");
+        let safeguard = zeroclaw_providers::SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ClientSide,
+            requested_model: "requested-model".into(),
+            served_model: "served-model".into(),
+            category: None,
+        };
+        let out = Agent::append_model_fallback_notice(
+            "hello".to_string(),
+            Some(&info),
+            Some(&safeguard),
+            &tx,
+        )
+        .await;
+        assert_eq!(out, "hello");
+        assert!(rx.try_recv().is_err(), "no generic fallback chunk");
+    }
+
+    #[tokio::test]
+    async fn direct_agent_turn_presents_one_safeguard_without_persisting_it() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        let response = agent.turn("hello").await.expect("direct turn succeeds");
+
+        assert_eq!(response.matches("Safety safeguards").count(), 1);
+        assert!(response.contains("requested-model"));
+        assert!(response.contains("served-model"));
+        assert!(!response.contains("private-category"));
+        let persisted = agent
+            .history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ConversationMessage::Chat(message) if message.role == "assistant" => {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .expect("assistant response persisted");
+        assert_eq!(persisted, "accepted response");
+    }
+
+    #[tokio::test]
+    async fn direct_streamed_turn_returns_typed_safeguard_and_raw_transcript() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("streamed turn succeeds");
+
+        assert_eq!(outcome.response, "accepted response");
+        let notice = outcome
+            .safeguard_fallback
+            .expect("accepted safeguard attribution");
+        assert_eq!(notice.requested_model, "requested-model");
+        assert_eq!(notice.served_model, "served-model");
+        assert!(outcome.new_messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn direct_streaming_api_emits_one_display_notice_for_cli_and_acp() {
+        let mut agent = blank_input_agent(Box::new(SafeguardNoticeProvider));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (response, messages) = agent
+            .turn_streamed("hello", tx, None)
+            .await
+            .expect("streamed API succeeds");
+
+        assert_eq!(response.matches("Safety safeguards").count(), 1);
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert_eq!(streamed.matches("Safety safeguards").count(), 1);
+        assert!(messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn refusal_then_real_anthropic_server_fallback_reaches_publisher_once() {
+        use wiremock::{Mock, MockServer, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "served-c",
+                    "content": [{"type": "text", "text": "accepted from c"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "iterations": [
+                            {"type": "message"},
+                            {"type": "fallback_message"}
+                        ]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let anthropic =
+            zeroclaw_providers::anthropic::AnthropicModelProvider::builder("candidate-b")
+                .credential(Some("synthetic-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["served-c".into()])
+                .build();
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "candidate-a".into(),
+                    Box::new(RefusingCandidateProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "candidate-b".into(),
+                    Box::new(NonStreamingAnthropicProvider { inner: anthropic })
+                        as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.model_name = "requested-a".into();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("candidate B and Anthropic server fallback C recover the turn");
+
+        assert_eq!(outcome.response, "accepted from c");
+        let notice = outcome
+            .safeguard_fallback
+            .as_ref()
+            .expect("composed accepted-route attribution");
+        assert_eq!(
+            notice.kind,
+            zeroclaw_providers::SafeguardFallbackKind::ClientAndServer
+        );
+        assert_eq!(notice.requested_model, "requested-a");
+        assert_eq!(notice.served_model, "served-c");
+        assert_eq!(notice.category.as_deref(), Some("private-category"));
+
+        let display =
+            crate::agent::append_safeguard_fallback_notice(outcome.response.clone(), Some(notice));
+        assert_eq!(display.matches("Safety safeguards").count(), 1);
+        assert!(display.contains("requested-a"));
+        assert!(display.contains("served-c"));
+        assert!(!display.contains("private-category"));
+        assert!(outcome.new_messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+        assert!(agent.history.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("Safety safeguards"),
+            _ => true,
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejected_empty_server_fallback_does_not_leak_into_normal_retry() {
+        use wiremock::{Mock, MockServer, matchers::method};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(vec![
+            serde_json::json!({
+                "model": "served-c",
+                "content": [],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 0,
+                    "iterations": [{"type": "fallback_message"}]
+                }
+            }),
+            serde_json::json!({
+                "model": "requested-a",
+                "content": [{"type": "text", "text": "normal retry"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 11,
+                    "output_tokens": 2,
+                    "iterations": [{"type": "message"}]
+                }
+            }),
+        ]);
+        Mock::given(method("POST"))
+            .respond_with(SequencedAnthropicResponder {
+                calls: Arc::clone(&calls),
+                bodies,
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let anthropic =
+            zeroclaw_providers::anthropic::AnthropicModelProvider::builder("candidate-b")
+                .credential(Some("synthetic-key"))
+                .base_url(&server.uri())
+                .server_fallback_models(vec!["served-c".into()])
+                .build();
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![(
+                "candidate-b".into(),
+                Box::new(NonStreamingAnthropicProvider { inner: anthropic })
+                    as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.model_name = "requested-a".into();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("normal retry is accepted");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(outcome.response, "normal retry");
+        assert!(
+            outcome.safeguard_fallback.is_none(),
+            "rejected server-fallback attribution must be cleared before retry"
+        );
+        assert!(outcome.new_messages.iter().all(|message| match message {
+            ConversationMessage::Chat(message) => !message.content.contains("served-c"),
+            _ => true,
+        }));
     }
 
     #[test]
@@ -4373,6 +4860,102 @@ mod tests {
 
         fn alias(&self) -> &str {
             "counting-answer"
+        }
+    }
+
+    struct CountingSafeguardModelProvider {
+        calls: Arc<AtomicUsize>,
+        answer: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingSafeguardModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            Ok(self.answer.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(self.answer.clone()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+                    requested_model: "claude-sonnet-4-6".to_string(),
+                    served_model: "server-fallback-model".to_string(),
+                    category: None,
+                },
+            ));
+            let delta = self.answer.clone();
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta(delta),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingSafeguardModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Anthropic,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "counting-safeguard"
         }
     }
 
@@ -9127,6 +9710,145 @@ mod tests {
         assert!(second_response.contains("fallback-b"));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_non_streaming_safeguard_fallback() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(CountingSafeguardModelProvider {
+                    calls: calls.clone(),
+                    answer: answer.into(),
+                }))
+                .model_provider_name("anthropic".into())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("claude-sonnet-4-6".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("first-answer");
+        let mut second = build("second-answer");
+
+        let first_resp = first.turn("hello").await.unwrap();
+        assert!(first_resp.contains("first-answer"));
+        assert!(
+            first_resp.contains("server-fallback-model"),
+            "non-streaming safeguard fallback turn must append fallback notice"
+        );
+        let history_text = match first.history.last() {
+            Some(ConversationMessage::Chat(chat)) => chat.content.clone(),
+            _ => String::new(),
+        };
+        assert!(
+            !history_text.contains("server-fallback-model"),
+            "canonical history must not contain appended safeguard notice: {history_text}"
+        );
+
+        let second_resp = second.turn("hello").await.unwrap();
+        assert!(second_resp.contains("second-answer"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "safeguard fallback turn must bypass cache and reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_cache_bypasses_streamed_safeguard_fallback() {
+        let tmp = tempfile::tempdir().expect("temp response cache dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache should initialize"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory = || -> Arc<dyn Memory> {
+            Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                    .expect("memory creation should succeed"),
+            )
+        };
+        let build = |answer: &str| {
+            Agent::builder()
+                .model_provider(Box::new(CountingSafeguardModelProvider {
+                    calls: calls.clone(),
+                    answer: answer.into(),
+                }))
+                .model_provider_name("anthropic".into())
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(memory())
+                .observer(Arc::from(crate::observability::NoopObserver {}))
+                .response_cache(Some(cache.clone()))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .model_name("claude-sonnet-4-6".into())
+                .temperature(Some(0.0))
+                .turn_datetime(fixed_response_cache_turn_datetime)
+                .build()
+                .expect("agent should build")
+        };
+
+        let mut first = build("first-stream");
+        let mut second = build("second-stream");
+
+        let (event_tx_a, _event_rx_a) = tokio::sync::mpsc::channel(32);
+        let (event_tx_b, _event_rx_b) = tokio::sync::mpsc::channel(32);
+
+        let (first_resp, _) = first
+            .turn_streamed("hello", event_tx_a, None)
+            .await
+            .unwrap();
+        assert!(first_resp.contains("first-stream"));
+        assert!(
+            first_resp.contains("server-fallback-model"),
+            "streamed turn must append safeguard fallback notice"
+        );
+
+        let (second_resp, _) = second
+            .turn_streamed("hello", event_tx_b, None)
+            .await
+            .unwrap();
+        assert!(second_resp.contains("second-stream"));
+        assert!(
+            second_resp.contains("server-fallback-model"),
+            "streamed turn must append safeguard fallback notice"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "streamed safeguard fallback turn must bypass cache and reach the provider"
+        );
     }
 
     #[tokio::test]

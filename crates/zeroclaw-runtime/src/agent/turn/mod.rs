@@ -46,11 +46,11 @@ pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
 };
-pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 pub use outcome::{
-    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
-    terminal_completion_error_message,
+    append_safeguard_fallback_notice, is_semantic_empty_terminal_completion,
+    semantic_empty_terminal_completion_message, terminal_completion_error_message,
 };
+pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
