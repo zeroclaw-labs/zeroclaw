@@ -509,6 +509,7 @@ pub fn record_event(event: LogEvent) {
     };
 
     observer_bridge::forward(&event);
+    crate::export_bridge::forward(&event);
 
     if let Some(hook) = current_broadcast_hook() {
         let mut broadcast_value = value.clone();
@@ -996,6 +997,34 @@ mod tests {
         shutdown_current_writer(SHUTDOWN_WARN_AFTER);
 
         flush_for_test().unwrap();
+    }
+
+    /// `runtime_trace_path` reports the configured path whatever the storage
+    /// mode; `active_log_path` reports only what the installed writer actually
+    /// persists to. The gateway's `/api/logs` response gates
+    /// `persistence_enabled` on this, so reading the configured path there let
+    /// a daemon with persistence disabled advertise it as enabled and serve
+    /// whatever stale file sat at the configured path.
+    #[test]
+    fn active_log_path_is_none_while_the_configured_path_survives() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "none".into(),
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+
+        assert!(
+            runtime_trace_path().is_some(),
+            "the configured path is still reported, which is exactly why it cannot gate persistence"
+        );
+        assert!(
+            active_log_path().is_none(),
+            "a writer that persists nothing must not report an active log path"
+        );
+
+        shutdown_current_writer(SHUTDOWN_WARN_AFTER);
     }
 
     #[test]

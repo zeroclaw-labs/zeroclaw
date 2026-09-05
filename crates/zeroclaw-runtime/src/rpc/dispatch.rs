@@ -4494,6 +4494,10 @@ impl RpcDispatcher {
         let path = zeroclaw_log::current_log_path()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
 
+        let field_eq = p
+            .sop_run_id
+            .map(|run_id| std::collections::BTreeMap::from([("sop_run_id".into(), run_id)]))
+            .unwrap_or_default();
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
             until_ts: p.until_ts,
@@ -4506,7 +4510,7 @@ impl RpcDispatcher {
             trace_id: p.trace_id,
             q: p.q,
             hide_internal: p.hide_internal,
-            field_eq: std::collections::BTreeMap::new(),
+            field_eq,
         };
 
         let limit = p.limit.unwrap_or(200);
@@ -4723,6 +4727,21 @@ impl RpcDispatcher {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let dedup_key = req
+            .dedup_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "dedup_key exceeds {} bytes",
+                    crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                ),
+            ));
+        }
 
         let event = crate::sop::SopEvent {
             source: crate::sop::SopTriggerSource::Manual,
@@ -4731,13 +4750,39 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results =
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        let results = if let Some(dedup_key) = dedup_key {
+            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
+                engine, audit, event, &req.name, dedup_key,
+            )
+            .await
+        } else {
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        };
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {
             match result {
-                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                crate::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
+                    // This surface starts the run but hands off no driver, so
+                    // a first action that needs one leaves the run sitting in
+                    // `active_runs` with nothing to advance it. Leaving the producer key pointing at it would
+                    // make the next Git or reconciliation producer coalesce onto
+                    // that stalled run instead of doing the work — the key would
+                    // suppress real work rather than deduplicate it. Withdraw the
+                    // key here; the run itself is left alone, because a caller
+                    // that cannot drive it is not the one to decide its fate.
+                    let needs_driver = matches!(
+                        action.as_ref(),
+                        crate::sop::SopRunAction::ExecuteStep { .. }
+                            | crate::sop::SopRunAction::DeterministicStep { .. }
+                    );
+                    if needs_driver && dedup_key.is_some() {
+                        let mut guard = match engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        guard.forget_active_dispatch_dedup_for_run(run_id);
+                    }
                     return to_result(SopRunResponse {
                         run_id: run_id.clone(),
                     });
@@ -6428,6 +6473,87 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
         dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
         (dispatcher, engine, run_id, temp)
+    }
+
+    /// This surface starts a run and hands off no driver, so a first action
+    /// needing one leaves the run active with nothing advancing it. If
+    /// the producer key kept pointing at it, the next Git or reconciliation
+    /// producer would coalesce onto that stalled run and skip its own work — the
+    /// key would suppress real work rather than deduplicate it.
+    #[tokio::test]
+    async fn sops_run_withdraws_the_producer_key_it_cannot_drive() {
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        let sop_name = "undriven";
+        engine.set_sops_for_test(vec![crate::sop::types::Sop {
+            name: sop_name.to_string(),
+            description: "starts but is not driven here".to_string(),
+            version: "0.1.0".to_string(),
+            priority: crate::sop::types::SopPriority::Normal,
+            execution_mode: crate::sop::types::SopExecutionMode::Auto,
+            triggers: vec![crate::sop::types::SopTrigger::Manual],
+            steps: vec![crate::sop::types::SopStep {
+                number: 1,
+                title: "Step one".to_string(),
+                body: "Do the work".to_string(),
+                ..crate::sop::types::SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 4,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            16,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, temp.path(), None).unwrap());
+        let audit = Arc::new(crate::sop::SopAuditLogger::new(memory));
+        let ctx = RpcContext::minimal_with_sop_engine_and_audit(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+            audit,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "local:test".into());
+
+        let dedup_key = "ghpr_octocat/example#42";
+        let started = dispatcher
+            .handle_sops_run(&serde_json::json!({
+                "name": sop_name,
+                "dedup_key": dedup_key,
+            }))
+            .await
+            .expect("the run starts");
+        let run_id = started
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("a run id comes back")
+            .to_string();
+
+        let guard = engine.lock().unwrap();
+        assert!(
+            guard.active_runs().contains_key(&run_id),
+            "the run really is left active and undriven, which is the premise"
+        );
+        assert_eq!(
+            guard.active_dispatch_dedup_lookup(sop_name, dedup_key),
+            None,
+            "the producer key must not still point at a run this surface cannot drive"
+        );
     }
 
     #[tokio::test]

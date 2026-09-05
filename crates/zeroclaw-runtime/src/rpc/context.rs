@@ -326,6 +326,35 @@ impl RpcContext {
         })
     }
 
+    /// Like [`Self::minimal_with_sop_engine`] but with the audit logger too.
+    /// `sops/run` refuses without both, so the start path needs this one.
+    #[cfg(test)]
+    pub fn minimal_with_sop_engine_and_audit(
+        config: Config,
+        sessions: Arc<SessionStore>,
+        sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
+        sop_audit: Arc<crate::sop::SopAuditLogger>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: Some(sop_engine),
+            sop_audit: Some(sop_audit),
+            hooks: None,
+            cert_audit: None,
+        })
+    }
+
     #[cfg(test)]
     pub fn minimal_with_memory(
         config: Config,

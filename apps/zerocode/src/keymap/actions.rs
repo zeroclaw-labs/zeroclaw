@@ -224,6 +224,8 @@ keyactions! {
         ToggleFollow     [Chord::char('f')] => "toggle follow",
         BeginSearch      [Chord::char('/')] => "search",
         ClearSearch      [Chord::char('c')] => "clear search",
+        BeginRunFilter   [Chord::char('r')] => "filter by SOP run",
+        ClearRunFilter   [Chord::char('R')] => "clear SOP run filter",
         CopyDetail       [Chord::char('y')] => "copy detail",
         CopySelection    [
             Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),

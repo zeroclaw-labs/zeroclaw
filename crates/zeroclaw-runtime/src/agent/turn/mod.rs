@@ -2126,9 +2126,12 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
-                                step_call_sink.clone(),
-                                Box::pin(run_tool_call_loop(ToolLoop {
+                            let step_result = ::zeroclaw_log::scope!(
+                                sop_run_id: run_id.as_str(),
+                                =>
+                                crate::sop::executor::scope_step_call_sink(
+                                    step_call_sink.clone(),
+                                    Box::pin(run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -2222,7 +2225,8 @@ async fn drive_live_sop_actions(
                                     },
                                     turn_id: &nested_turn_id,
                                     sop_reassembly,
-                                })),
+                                    })),
+                                )
                             )
                             .await;
                             // Replay child loop's new messages to the parent's
