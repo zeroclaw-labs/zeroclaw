@@ -14941,6 +14941,15 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Notice sent to a sender this channel has not authorized. `{identity}`
+    /// expands to the sender's Telegram user ID (or username when no ID is
+    /// available) and `{bind_command}` to the `zeroclaw channel bind-telegram`
+    /// invocation for this alias, so a deployment that authorizes from
+    /// configuration can drop the operator-terminal instruction the built-in
+    /// notice carries. Unset or blank keeps the built-in notice.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub unauthorized_message: Option<String>,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -14986,6 +14995,7 @@ impl Default for TelegramConfig {
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            unauthorized_message: None,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -28271,6 +28281,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        unauthorized_message: None,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -29805,6 +29816,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            unauthorized_message: None,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -35240,6 +35252,7 @@ high_entropy_tokens = false
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),

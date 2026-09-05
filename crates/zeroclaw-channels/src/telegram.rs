@@ -1224,6 +1224,20 @@ impl TelegramChannel {
             .is_some()
     }
 
+    /// Whether first-user pairing is still the live authorization path: a
+    /// one-time code is outstanding and no peer resolves yet.
+    ///
+    /// Resolved on every call, never from the guard's mere existence. The
+    /// guard outlives the code it issued — `try_pair` clears the code, not
+    /// the guard — and peers can start resolving at any time, so a channel
+    /// that began empty is not still pairing once either happens. The
+    /// unauthorized notice, the `/bind` hint, and the `/bind` redemption
+    /// branch all read this one predicate, so what the channel says about
+    /// the authorization path and what it accepts cannot disagree.
+    fn startup_pairing_available(&self) -> bool {
+        self.pairing_code_active() && (self.peer_resolver)().is_empty()
+    }
+
     /// Build the operator-facing `zeroclaw channel bind-telegram` command for
     /// this channel's alias. The CLI defaults to the `default` alias, so only
     /// non-default aliases need the explicit `--alias` flag — emitting it for
@@ -1233,6 +1247,60 @@ impl TelegramChannel {
             format!("zeroclaw channel bind-telegram {identity}")
         } else {
             format!("zeroclaw channel bind-telegram {identity} --alias {alias}")
+        }
+    }
+
+    /// `channels.telegram.<alias>.unauthorized_message` for this alias, read
+    /// from the shared config handle at send time rather than copied into
+    /// this struct, so nothing here can go stale against that handle.
+    ///
+    /// The handle is the one the channel was assembled with, which is what
+    /// the runtime's own writers (the `/bind` persist path) mutate. An edit
+    /// made outside it — `config set`, a hand-edited `config.toml`, the
+    /// gateway's own config state — reaches this channel only after a daemon
+    /// reload or restart, exactly like every other channel field. `None`
+    /// whenever the handle is unwired (one-shot senders, tests) or the alias
+    /// leaves the field unset.
+    fn configured_unauthorized_message(&self) -> Option<String> {
+        self.persist
+            .as_ref()?
+            .read()
+            .channels
+            .telegram
+            .get(&self.alias)?
+            .unauthorized_message
+            .clone()
+    }
+
+    /// Compose the notice an unauthorized sender receives.
+    ///
+    /// A blank `custom` falls back to the built-in copy, which has two
+    /// forms. While startup pairing is still available the deployment is
+    /// being onboarded by whoever holds the terminal, so the bind command is
+    /// the actionable next step. Once the code is redeemed or peers resolve,
+    /// authorization comes from configuration — possibly written by a
+    /// control plane the sender and the operator never touch by hand — and a
+    /// terminal command is noise; naming the identity to authorize is what
+    /// the operator needs. `startup_pairing_available` is the caller's live
+    /// reading of [`Self::startup_pairing_available`].
+    fn unauthorized_notice(
+        custom: Option<&str>,
+        startup_pairing_available: bool,
+        bind_command: &str,
+        identity: &str,
+    ) -> String {
+        match custom.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => text
+                .replace("{bind_command}", bind_command)
+                .replace("{identity}", identity),
+            None if startup_pairing_available => i18n::get_required_cli_string_with_args(
+                "channel-telegram-unauthorized-bind",
+                &[("bindCommand", bind_command)],
+            ),
+            None => i18n::get_required_cli_string_with_args(
+                "channel-telegram-unauthorized-allowlist",
+                &[("identity", identity)],
+            ),
         }
     }
 
@@ -2028,7 +2096,19 @@ impl TelegramChannel {
         }
 
         if let Some(code) = Self::extract_bind_code(text) {
-            if let Some(pairing) = self.pairing.as_ref() {
+            // Redemption reads the same live predicate the notice and the
+            // `/bind` hint read. The guard's existence is not proof that
+            // startup pairing is still the authorization path: `try_pair`
+            // clears the code and leaves the guard, and a peer set can fill
+            // in while the channel runs. Without this the channel would tell
+            // a sender that pairing is inactive and still accept the
+            // outstanding code from them, writing the peer group that
+            // configuration — possibly a control plane — already owns.
+            if let Some(pairing) = self
+                .pairing
+                .as_ref()
+                .filter(|_| self.startup_pairing_available())
+            {
                 match pairing.try_pair(code, &chat_id).await {
                     Ok(Some(_token)) => {
                         let bind_identity = normalized_sender_id.clone().or_else(|| {
@@ -2152,20 +2232,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // and the bot would keep demanding approval.
         let bind_command = Self::suggested_bind_command(&self.alias, &suggested_identity);
 
-        let _ = self
-            .send(&SendMessage::new(
-                format!(
-                    "🔐 This bot requires operator approval.\n\nCopy this command to the operator terminal:\n`{bind_command}`\n\nAfter the operator runs it, send your message again."
-                ),
-                &chat_id,
-            ))
-            .await;
+        // One resolution of the pairing predicate for both messages below:
+        // the notice and the `/bind` hint must describe the same
+        // authorization path, and re-resolving would let peers appear
+        // between the two sends.
+        let startup_pairing_available = self.startup_pairing_available();
+
+        let notice = Self::unauthorized_notice(
+            self.configured_unauthorized_message().as_deref(),
+            startup_pairing_available,
+            &bind_command,
+            &suggested_identity,
+        );
+
+        let _ = self.send(&SendMessage::new(notice, &chat_id)).await;
 
         // Only offer the `/bind <code>` path while the channel is genuinely
         // unpaired. Once peers exist (resolved live), the one-time code is
         // moot and the hint just confuses an operator who already authorized
         // someone — the "already assigned but still asks" complaint.
-        if self.pairing_code_active() && (self.peer_resolver)().is_empty() {
+        if startup_pairing_available {
             let _ = self
                 .send(&SendMessage::new(
                     "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
@@ -6122,6 +6208,412 @@ mod tests {
         assert_eq!(
             TelegramChannel::suggested_bind_command("alerts", "123456789"),
             "zeroclaw channel bind-telegram 123456789 --alias alerts"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_expands_placeholders_in_configured_message() {
+        // The operator's copy replaces the built-in text wholesale. Both
+        // placeholders stay available so a deployment can keep the bind
+        // command, name the identity to authorize, or carry neither.
+        assert_eq!(
+            TelegramChannel::unauthorized_notice(
+                Some("Ask support to authorize {identity}. Operator: {bind_command}"),
+                true,
+                "zeroclaw channel bind-telegram 42",
+                "42",
+            ),
+            "Ask support to authorize 42. Operator: zeroclaw channel bind-telegram 42"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_ignores_blank_configured_message() {
+        // A blank value is an unfinished config, not a request for silence:
+        // the sender still gets the built-in notice instead of whitespace.
+        let notice = TelegramChannel::unauthorized_notice(
+            Some("   \n  "),
+            true,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            notice.contains("zeroclaw channel bind-telegram 42"),
+            "expected the built-in bind notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_carries_bind_command_while_startup_pairing_is_available() {
+        // Startup pairing means nobody is authorized yet and whoever set the
+        // bot up holds the terminal, so the bind command is the actionable
+        // next step — the copy existing deployments already see.
+        let notice = TelegramChannel::unauthorized_notice(
+            None,
+            true,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            notice.contains("zeroclaw channel bind-telegram 42"),
+            "expected the bind command in the built-in notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_names_identity_once_peers_resolve() {
+        // Peers resolving means authorization already comes from
+        // configuration, possibly written by a control plane no one edits by
+        // hand. A terminal command the sender cannot run is noise; the
+        // identity the operator has to authorize is the useful part.
+        let notice = TelegramChannel::unauthorized_notice(
+            None,
+            false,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            !notice.contains("bind-telegram"),
+            "config-managed authorization must not instruct a terminal bind, got: {notice}"
+        );
+        assert!(
+            notice.contains("42"),
+            "expected the sender identity in the notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn configured_unauthorized_message_reads_the_shared_config_handle() {
+        // Read through the shared handle on every call, not copied into the
+        // channel at construction: a write on that handle, which is what the
+        // runtime's own `/bind` persist path performs, is visible to the next
+        // notice. An edit made outside the handle still needs the usual
+        // reload; this pins the no-stale-copy property, not a live reload.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some("Ask support for access.".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(RwLock::new(config));
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_persistence(config.clone());
+        assert_eq!(
+            ch.configured_unauthorized_message().as_deref(),
+            Some("Ask support for access.")
+        );
+
+        config
+            .write()
+            .channels
+            .telegram
+            .get_mut("telegram_test_alias")
+            .expect("alias configured above")
+            .unauthorized_message = Some("Now say this instead.".to_string());
+        assert_eq!(
+            ch.configured_unauthorized_message().as_deref(),
+            Some("Now say this instead.")
+        );
+    }
+
+    /// The configured notice must reach the sender through the real
+    /// unauthorized path, not just the composer: config resolution,
+    /// placeholder expansion, and delivery in one pass.
+    #[tokio::test]
+    async fn handle_unauthorized_message_sends_configured_notice() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(
+            &mock_server,
+            1,
+            &[r#""chat_id":"3030""#, "Ask support to authorize 100050"],
+        )
+        .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some("Ask support to authorize {identity}.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["zeroclaw_user".to_string()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_persistence(Arc::new(RwLock::new(config)));
+
+        let update = telegram_text_update(7_000, 50, 3_030, "zeroclaw_unauthorized", "hello");
+        ch.handle_unauthorized_message(&update).await;
+
+        let sent: Vec<serde_json::Value> = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .filter_map(|r| serde_json::from_slice(&r.body).ok())
+            .collect();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected exactly one sendMessage request, got: {sent:?}"
+        );
+        let sent_text = sent[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(sent_text, "Ask support to authorize 100050.");
+    }
+
+    /// Every `sendMessage` body the mock server received, in order, reduced
+    /// to its `text` field.
+    async fn telegram_sent_message_texts(mock_server: &wiremock::MockServer) -> Vec<String> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .map(|body| {
+                body.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Pairing state is a live reading, not the guard's lifetime. `try_pair`
+    /// clears the code, never the guard, so a channel that keeps its guard
+    /// after the first user redeemed the code must stop advertising the
+    /// operator bind command to the next unauthorized sender.
+    #[tokio::test]
+    async fn unauthorized_notice_drops_bind_form_once_the_code_is_redeemed() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 3, &[]).await;
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let code = ch
+            .pairing
+            .as_ref()
+            .expect("an empty peer set provisions a pairing guard")
+            .pairing_code()
+            .expect("a fresh guard issues a one-time code");
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_100,
+            51,
+            3_031,
+            "zeroclaw_unauthorized",
+            "hello",
+        ))
+        .await;
+
+        // Redeem it the way `/bind` does, minus the persistence path this
+        // test deliberately leaves out: the peer resolver stays empty, so
+        // only the consumed code can flip the notice.
+        let paired = ch
+            .pairing
+            .as_ref()
+            .expect("guard asserted above")
+            .try_pair(&code, "3031")
+            .await
+            .expect("a valid code is not rate limited");
+        assert!(paired.is_some(), "the generated code must redeem");
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_101,
+            52,
+            3_031,
+            "zeroclaw_unauthorized",
+            "hello again",
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            3,
+            "expected notice plus hint, then a single notice, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("zeroclaw channel bind-telegram"),
+            "an outstanding code must still carry the bind command, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[2].contains("bind-telegram"),
+            "a redeemed code must not keep advertising the operator bind, got: {}",
+            texts[2]
+        );
+        assert!(
+            texts[2].contains("100052"),
+            "the allowlist form must name the sender identity, got: {}",
+            texts[2]
+        );
+    }
+
+    /// The notice follows the live peer set, not the set the channel was
+    /// built with. A control plane that adds the first peer to a channel
+    /// which started empty must stop the terminal instruction, and the
+    /// `/bind` hint must disappear with it.
+    #[tokio::test]
+    async fn unauthorized_notice_follows_live_peer_resolution() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 3, &[]).await;
+
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let peers = peers.clone();
+            Arc::new(move || peers.lock().clone())
+        };
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            peer_resolver,
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_200,
+            61,
+            3_032,
+            "zeroclaw_unauthorized",
+            "hello",
+        ))
+        .await;
+
+        peers.lock().push("zeroclaw_operator".to_string());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_201,
+            62,
+            3_032,
+            "zeroclaw_unauthorized",
+            "hello again",
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            3,
+            "expected notice plus hint, then a single notice, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("zeroclaw channel bind-telegram"),
+            "an unpaired channel must still carry the bind command, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[2].contains("bind-telegram"),
+            "a resolved peer set must not instruct a terminal bind, got: {}",
+            texts[2]
+        );
+    }
+
+    /// What the channel says and what it accepts must agree. A channel that
+    /// starts empty issues a one-time code, then gains a configured peer
+    /// while it runs; from that point the notice says pairing is inactive,
+    /// so the outstanding code must stop being redeemable too. Otherwise a
+    /// sender holding the code writes themselves into the peer group that
+    /// configuration — possibly a control plane — already owns.
+    #[tokio::test]
+    async fn bind_code_stops_redeeming_once_peers_resolve() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(&mock_server, 1, &[]).await;
+
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let peers = peers.clone();
+            Arc::new(move || peers.lock().clone())
+        };
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            peer_resolver,
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let code = ch
+            .pairing
+            .as_ref()
+            .expect("an empty peer set provisions a pairing guard")
+            .pairing_code()
+            .expect("a fresh guard issues a one-time code");
+
+        // The peer arrives from configuration, not from a redemption: the
+        // code stays outstanding and the guard stays in place.
+        peers.lock().push("zeroclaw_operator".to_string());
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_300,
+            71,
+            3_033,
+            "zeroclaw_unauthorized",
+            &format!("/bind {code}"),
+        ))
+        .await;
+
+        let texts = telegram_sent_message_texts(&mock_server).await;
+        assert_eq!(
+            texts.len(),
+            1,
+            "expected a single reply to the rejected bind, got: {texts:?}"
+        );
+        assert!(
+            texts[0].contains("pairing is not active"),
+            "a resolved peer set must route the code to the inactive-pairing reply, got: {}",
+            texts[0]
+        );
+        assert!(
+            !texts[0].contains("bound successfully"),
+            "a valid code must not bind once peers resolve, got: {}",
+            texts[0]
+        );
+        assert_eq!(
+            ch.pairing
+                .as_ref()
+                .expect("guard asserted above")
+                .pairing_code()
+                .as_deref(),
+            Some(code.as_str()),
+            "the rejected attempt must not consume the outstanding code"
         );
     }
 

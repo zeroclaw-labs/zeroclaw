@@ -433,6 +433,26 @@ channel-telegram-cmd-model-desc = Show or switch the current model
 channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
 channel-telegram-cmd-config-desc = Show current configuration
 
+# ── Telegram: unauthorized-sender notice ──
+# Sent to a sender who is not on this channel's allowlist. Two variants: the
+# bind form while startup pairing is active, and the allowlist form when the
+# allowlist already resolves peers — that deployment authorizes from
+# configuration, so the sender has no operator terminal to reach.
+# `channels.telegram.<alias>.unauthorized_message` overrides both.
+channel-telegram-unauthorized-bind =
+    🔐 This bot requires operator approval.
+
+    Copy this command to the operator terminal:
+    `{ $bindCommand }`
+
+    After the operator runs it, send your message again.
+channel-telegram-unauthorized-allowlist =
+    🔐 This bot requires operator approval.
+
+    Ask the operator to authorize this Telegram account: { $identity }
+
+    After the operator authorizes it, send your message again.
+
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
     OpenAI authentication:
