@@ -23319,6 +23319,18 @@ impl Config {
         Ok(())
     }
 
+    /// Apply and validate a persistent property update atomically.
+    ///
+    /// Validation runs on a working copy so a rejected value cannot mutate the
+    /// live config or leave a dirty path behind.
+    pub fn set_prop_persistent_validated(&mut self, name: &str, value_str: &str) -> Result<()> {
+        let mut candidate = self.clone();
+        candidate.set_prop_persistent(name, value_str)?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
         self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
@@ -26700,6 +26712,24 @@ enabled = true
                 .contains("gateway.websocket_ping_interval_secs"),
             "error must name the offending path; got: {err}"
         );
+    }
+
+    #[test]
+    async fn persistent_set_validation_is_atomic() {
+        let mut config = Config::default();
+        let original = config.gateway.websocket_ping_interval_secs;
+        let path = "gateway.websocket_ping_interval_secs";
+
+        let err = config
+            .set_prop_persistent_validated(
+                path,
+                &(GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1).to_string(),
+            )
+            .expect_err("out-of-range persistent update must be rejected");
+
+        assert!(err.to_string().contains(path));
+        assert_eq!(config.gateway.websocket_ping_interval_secs, original);
+        assert!(!config.dirty_paths.contains(path));
     }
 
     #[test]

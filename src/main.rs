@@ -7157,7 +7157,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Value required in --no-interactive mode. Usage: zeroclaw config set --no-interactive {path} <value>"
                         ))
                     })?;
-                    config.set_prop_persistent(&path, &val)?;
+                    config.set_prop_persistent_validated(&path, &val)?;
                 } else if Config::prop_is_secret(&path) {
                     if value.is_some() {
                         eprintln!(
@@ -7173,9 +7173,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
-                    config.set_prop_persistent(&path, &secret_value)?;
+                    config.set_prop_persistent_validated(&path, &secret_value)?;
                 } else if let Some(val) = value {
-                    config.set_prop_persistent(&path, &val)?;
+                    config.set_prop_persistent_validated(&path, &val)?;
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
                     let provider_ref = path
@@ -7201,7 +7201,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         else {
                             anyhow::bail!("cancelled");
                         };
-                        config.set_prop_persistent(&path, &models[idx])?;
+                        config.set_prop_persistent_validated(&path, &models[idx])?;
                     } else {
                         eprintln!(
                             "  no live catalog for `{provider_type}` — \
@@ -7211,7 +7211,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .with_prompt(format!("Model id for {provider_type}"))
                             .allow_empty(false)
                             .interact_text()?;
-                        config.set_prop_persistent(&path, &m)?;
+                        config.set_prop_persistent_validated(&path, &m)?;
                     }
                 } else {
                     let field_info = config.prop_fields().into_iter().find(|f| f.name == path);
@@ -7230,7 +7230,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .items(&variants)
                             .default(current_index)
                             .interact()?;
-                        config.set_prop_persistent(&path, &variants[selected])?;
+                        config.set_prop_persistent_validated(&path, &variants[selected])?;
                     } else if field_info
                         .as_ref()
                         .is_some_and(|f| f.kind == crate::config::PropKind::StringArray)
@@ -7266,7 +7266,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             .filter(|l| !l.is_empty())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        config.set_prop_persistent(&path, &val)?;
+                        config.set_prop_persistent_validated(&path, &val)?;
                     } else {
                         anyhow::bail!("Value required. Usage: zeroclaw config set {path} <value>");
                     }
@@ -7374,7 +7374,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         let strict_error = std::fs::read_to_string(&config.config_path)
                             .ok()
                             .and_then(|raw| {
-                                crate::config::migration::migrate_to_current(&raw)
+                                crate::config::migration::migrate_to_current_validated(&raw)
                                     .err()
                                     .map(|e| format!("{e:#}"))
                             });

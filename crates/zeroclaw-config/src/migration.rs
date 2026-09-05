@@ -215,7 +215,7 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
     Ok(())
 }
 
-/// Versioned TOML → validated V3 `Config`, strict: any defect errors.
+/// Versioned TOML → V3 `Config`, strict: any parse or schema defect errors.
 /// Used by repair tooling (`zeroclaw config migrate`, `model_routing_config`)
 /// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
@@ -224,6 +224,18 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
     final_value
         .try_into()
         .context("migrated config failed to deserialize as current schema")
+}
+
+/// Versioned TOML → validated V3 `Config`, strict: any defect errors.
+///
+/// Persistence boundaries use this helper so a config that deserializes but
+/// violates the current validation contract is never reported or saved as valid.
+pub fn migrate_to_current_validated(input: &str) -> Result<Config> {
+    let config = migrate_to_current(input)?;
+    config
+        .validate()
+        .context("migrated config failed validation")?;
+    Ok(config)
 }
 
 /// Daemon load path: versioned TOML → usable `Config`, never failing.
@@ -603,6 +615,7 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         Some(s) => s,
         None => return Ok(None),
     };
+    migrate_to_current_validated(&migrated)?;
     let parent = path.parent().with_context(|| {
         format!(
             "config path {} has no parent directory",
@@ -2974,6 +2987,29 @@ enabled = "not-a-bool"
     }
 
     #[test]
+    fn strict_migration_rejects_deserializable_but_invalid_config() {
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n\
+             [gateway]\n\
+             websocket_ping_interval_secs = {}\n",
+            crate::schema::GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1
+        );
+
+        let err = migrate_to_current_validated(&raw)
+            .expect_err("strict migration must run the current config validation contract");
+
+        assert!(
+            err.to_string()
+                .contains("migrated config failed validation"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("gateway.websocket_ping_interval_secs"),
+            "validation chain must name the invalid field: {err:#}"
+        );
+    }
+
+    #[test]
     fn future_schema_version_falls_back_to_defaults() {
         // A schema newer than this binary can't be migrated, but the daemon
         // must still start rather than refuse to boot.
@@ -3199,6 +3235,34 @@ enabled = "not-a-bool"
         assert!(
             leftovers.is_empty(),
             "no temp files must remain after a successful migration; got {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_file_in_place_rejects_invalid_result_without_touching_disk() {
+        let dir = setup_temp_config_dir();
+        let path = dir.path().join("config.toml");
+        let original = format!(
+            "[gateway]\nwebsocket_ping_interval_secs = {}\n",
+            crate::schema::GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let err = migrate_file_in_place(&path)
+            .expect_err("an invalid migrated config must not reach the write boundary");
+
+        assert!(
+            format!("{err:#}").contains("gateway.websocket_ping_interval_secs"),
+            "validation chain must name the invalid field: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "validation failure must leave the source bytes unchanged"
+        );
+        assert!(
+            !path.with_file_name("config.toml.backup").exists(),
+            "validation failure must happen before creating a backup"
         );
     }
 
