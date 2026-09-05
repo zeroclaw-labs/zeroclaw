@@ -891,7 +891,7 @@ channel-runtime-thinking-cleared = Sobrescritura de thinking borrada. Usando el 
 channel-runtime-thinking-default =
     Thinking ya está usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
     Usa `/thinking high`, `/thinking max` o `/thinking off` para sobrescribirlo.
-channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/thinking off|minimal|low|medium|high|max`, `/thinking on` o `/thinking reset`.
+channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/effort off|minimal|low|medium|high|xhigh|max`, `/effort on` o `/effort reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Error al inicializar model_provider `{ $provider }`. Ejecuta `/models` para elegir otro model_provider.
     Detalles: { $error }

@@ -12,12 +12,15 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
 /// How much reasoning a model should spend on a request, for model families
-/// that take a depth setting rather than a token budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// that take a depth setting rather than a token budget. Variants are declared
+/// in ascending depth, so they compare by depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingEffort {
     Low,
     High,
+    /// Between `high` and `max`; the 4.7 generation and later take it.
+    XHigh,
     Max,
 }
 
@@ -28,48 +31,75 @@ impl ThinkingEffort {
         match self {
             Self::Low => "low",
             Self::High => "high",
+            Self::XHigh => "xhigh",
             Self::Max => "max",
         }
     }
 }
 
+/// How much of the model's reasoning comes back inside thinking blocks, for
+/// the model families whose requests can choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    /// Blocks arrive signed with their text withheld, which is the API's own
+    /// default on the families that read this field.
+    Omitted,
+    /// Blocks carry a readable summary of the reasoning.
+    Summarized,
+    /// Blocks carry the short progress notes the model writes between tool
+    /// calls. Newer families only.
+    Updates,
+}
+
+impl ThinkingDisplay {
+    /// Stable token for config, RPC and logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Omitted => "omitted",
+            Self::Summarized => "summarized",
+            Self::Updates => "updates",
+        }
+    }
+
+    /// Parse the stable token, ignoring case and surrounding whitespace.
+    #[must_use]
+    pub fn from_str_insensitive(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "omitted" => Some(Self::Omitted),
+            "summarized" => Some(Self::Summarized),
+            "updates" => Some(Self::Updates),
+            _ => None,
+        }
+    }
+
+    /// Wire value, or `None` to let the API apply its own default.
+    #[must_use]
+    pub fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::Omitted => None,
+            Self::Summarized => Some("summarized"),
+            Self::Updates => Some("updates"),
+        }
+    }
+}
+
 /// Parameters for native extended thinking support. A model family reads
-/// whichever of the two it accepts; both are absent when the caller asked for
-/// the provider's own default depth.
+/// whichever of the depth settings it accepts; both are absent when the caller
+/// asked for the provider's own default depth. The display travels alongside
+/// so one request can choose how much of the reasoning comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ThinkingEffort>,
-    /// Requests Anthropic's `thinking.display` beta
-    /// (`thinking-display-updates-2026-08-18`), which controls whether
-    /// thinking blocks come back omitted, as progress updates, or
-    /// summarized. `None` leaves the field out of the request entirely,
-    /// matching pre-beta behavior.
+    /// How much of the reasoning comes back. `None` leaves the choice to the
+    /// runtime profile, then the provider alias, and past that to the API
+    /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<ThinkingDisplay>,
-}
-
-/// Anthropic's `thinking.display` request field (beta
-/// `thinking-display-updates-2026-08-18`), controlling whether thinking
-/// blocks come back omitted, as progress updates, or summarized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThinkingDisplay {
-    Omitted,
-    Updates,
-    Summarized,
-}
-
-impl ThinkingDisplay {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Omitted => "omitted",
-            Self::Updates => "updates",
-            Self::Summarized => "summarized",
-        }
-    }
 }
 
 /// A single message in a conversation.
@@ -1314,6 +1344,48 @@ mod thinking_display_tests {
     use super::{NativeThinkingParams, ThinkingDisplay};
 
     #[test]
+    fn tokens_round_trip_ignoring_case() {
+        for display in [
+            ThinkingDisplay::Omitted,
+            ThinkingDisplay::Summarized,
+            ThinkingDisplay::Updates,
+        ] {
+            assert_eq!(
+                ThinkingDisplay::from_str_insensitive(display.as_str()),
+                Some(display)
+            );
+            assert_eq!(
+                ThinkingDisplay::from_str_insensitive(&format!(
+                    " {} ",
+                    display.as_str().to_uppercase()
+                )),
+                Some(display)
+            );
+        }
+        assert_eq!(ThinkingDisplay::from_str_insensitive("verbose"), None);
+        assert_eq!(ThinkingDisplay::from_str_insensitive(""), None);
+    }
+
+    #[test]
+    fn omitted_is_the_api_default_and_needs_no_wire_value() {
+        assert_eq!(ThinkingDisplay::Omitted.wire_value(), None);
+        assert_eq!(ThinkingDisplay::Summarized.wire_value(), Some("summarized"));
+        assert_eq!(ThinkingDisplay::Updates.wire_value(), Some("updates"));
+    }
+
+    #[test]
+    fn serializes_as_the_lowercase_token() {
+        assert_eq!(
+            serde_json::to_string(&ThinkingDisplay::Summarized).unwrap(),
+            "\"summarized\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ThinkingDisplay>("\"updates\"").unwrap(),
+            ThinkingDisplay::Updates
+        );
+    }
+
+    #[test]
     fn as_str_maps_updates_variant() {
         assert_eq!(ThinkingDisplay::Updates.as_str(), "updates");
     }
@@ -1321,7 +1393,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_includes_display_when_present() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
@@ -1334,7 +1407,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_omits_display_when_absent() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: None,
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");

@@ -1534,7 +1534,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 None
             }
         }
-        "/thinking" => {
+        "/effort" | "/thinking" | "/think" => {
             let arg = parts.next();
             if parts.next().is_some() {
                 Some(ChannelRuntimeCommand::InvalidThinking(
@@ -27276,6 +27276,21 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(ChannelRuntimeCommand::SetThinking(Some(
                 ThinkingLevel::High
             )))
+        );
+        // The shared command is named `effort`; both older spellings stay.
+        assert_eq!(
+            parse_runtime_command("telegram", "/effort xhigh"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(
+                ThinkingLevel::XHigh
+            )))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/think max"),
+            Some(ChannelRuntimeCommand::SetThinking(Some(ThinkingLevel::Max)))
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/effort@zeroclaw_bot reset"),
+            Some(ChannelRuntimeCommand::SetThinking(None))
         );
     }
 

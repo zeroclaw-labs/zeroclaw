@@ -89,6 +89,7 @@ pub enum Method {
     SessionDelete,
     SessionApprove,
     SessionKill,
+    SessionThinkingOptions,
 
     // Memory
     MemoryList,
@@ -212,6 +213,7 @@ impl Method {
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
         (Method::SessionKill, "session/kill"),
+        (Method::SessionThinkingOptions, "session/thinking-options"),
         // Memory
         (Method::MemoryList, "memory/list"),
         (Method::MemorySearch, "memory/search"),
@@ -832,6 +834,9 @@ impl RpcDispatcher {
             Method::SessionDelete => self.handle_session_delete(&req.params).await,
             Method::SessionApprove => self.handle_session_approve(&req.params),
             Method::SessionKill => self.handle_session_kill(&req.params).await,
+            Method::SessionThinkingOptions => {
+                self.handle_session_thinking_options(&req.params).await
+            }
 
             // Memory
             Method::MemoryList => self.handle_memory_list(&req.params).await,
@@ -2097,7 +2102,15 @@ impl RpcDispatcher {
         let req: SessionPromptParams = parse_params(params)?;
         let sid = &req.session_id;
 
-        if req.prompt.trim().is_empty() && req.attachments.is_empty() {
+        // A leading `/effort:<level>` (or the older `/think:<level>`) names
+        // the depth for this turn only and never reaches the model.
+        let (inline_level, prompt_body) =
+            match crate::agent::thinking::parse_thinking_directive(&req.prompt) {
+                Some((level, remaining)) => (Some(level), remaining),
+                None => (None, req.prompt.clone()),
+            };
+
+        if prompt_body.trim().is_empty() && req.attachments.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
                 "session/prompt requires a non-empty `prompt` or at least one attachment",
@@ -2154,8 +2167,58 @@ impl RpcDispatcher {
             },
         };
 
+        // Resolve the turn's thinking request before any side effect. An
+        // inline level the model does not take fails here, with the same
+        // completion notice the absent-session branch sends so the client
+        // leaves its working state.
+        let thinking = {
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(sid)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+            let overrides = self
+                .ctx
+                .sessions
+                .get_overrides(sid)
+                .await
+                .unwrap_or_default();
+            let resolved = {
+                let config = self.ctx.config.read();
+                resolve_turn_thinking(&config, &agent_alias, &overrides, inline_level)
+            };
+            match resolved {
+                Ok(thinking) => thinking,
+                Err(err) => {
+                    self.emit_turn_complete(
+                        sid,
+                        crate::rpc::types::TurnCompletionOutcome::Failed,
+                        "turn cancelled by daemon: thinking_level_unsupported".to_string(),
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+        };
+        if let Some(params) = thinking {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_attrs(::serde_json::json!({
+                        "session_id": sid,
+                        "inline": inline_level.is_some(),
+                        "effort": params.effort.map(|effort| effort.as_str()),
+                        "budget_tokens": params.budget_tokens,
+                        "display": params.display.map(|display| display.as_str()),
+                    })),
+                "thinking request resolved for the turn"
+            );
+        }
+
         // Process inline attachments: upload each, append markers to prompt.
-        let mut prompt = req.prompt.clone();
+        let mut prompt = prompt_body;
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
@@ -2289,6 +2352,7 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
+            thinking,
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();
@@ -2580,64 +2644,84 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .preview_overrides(&req.session_id, &req.overrides)
+            .preview_overrides(&req.session_id, &req.overrides, &req.reset)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // A thinking choice must be one the merged model takes. Checked
+        // before anything is committed, against the model the same patch
+        // may be switching to. The options echoed back describe that same
+        // merged model, so they are computed here, before the commit, and a
+        // session whose identity no longer resolves fails before changing.
+        let thinking_options = {
+            let config = self.ctx.config.read();
+            if req.overrides.thinking_level.is_some() || req.overrides.thinking_display.is_some() {
+                validate_thinking_overrides(&config, &agent_alias, &merged, &req.overrides)?;
+            }
+            session_thinking_options(&config, &agent_alias, &merged)?
+        };
 
         // Model/model_provider overrides need a live provider-box rebuild,
         // which requires Config — held here, not in the session store. Resolve
         // the provider from the prospective merged override or configured
-        // agent, build the box, and only then commit the override.
-        let built_model_provider = if merged.model_provider.is_some() || merged.model.is_some() {
-            let agent_alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(&req.session_id)
-                .await
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            let built = {
-                let config = self.ctx.config.read();
-                let agent_cfg = config
-                    .resolved_agent_config(&agent_alias)
-                    .or_else(|| config.agent(&agent_alias).cloned())
-                    .ok_or_else(|| {
-                        rpc_err(
-                            INVALID_PARAMS,
-                            format!("Agent `{agent_alias}` is not configured"),
+        // agent, build the box, and only then commit the override. Thinking
+        // fields are read at turn time and need no rebuild.
+        let built_model_provider =
+            if req.overrides.model_provider.is_some() || req.overrides.model.is_some() {
+                let built = {
+                    let config = self.ctx.config.read();
+                    let agent_cfg = config
+                        .resolved_agent_config(&agent_alias)
+                        .or_else(|| config.agent(&agent_alias).cloned())
+                        .ok_or_else(|| {
+                            rpc_err(
+                                INVALID_PARAMS,
+                                format!("Agent `{agent_alias}` is not configured"),
+                            )
+                        })?;
+                    let model_provider_ref = merged
+                        .model_provider
+                        .as_deref()
+                        .unwrap_or_else(|| agent_cfg.model_provider.as_str());
+                    let (model_provider, model_provider_name, model_name) =
+                        crate::agent::agent::build_session_model_provider(
+                            &config,
+                            model_provider_ref,
+                            merged.model.as_deref(),
                         )
-                    })?;
-                let model_provider_ref = merged
-                    .model_provider
-                    .as_deref()
-                    .unwrap_or_else(|| agent_cfg.model_provider.as_str());
-                let (model_provider, model_provider_name, model_name) =
-                    crate::agent::agent::build_session_model_provider(
-                        &config,
-                        model_provider_ref,
-                        merged.model.as_deref(),
+                        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                    let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                        &agent_cfg,
+                        model_provider.as_ref(),
+                        &model_name,
+                    );
+                    (
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        tool_dispatcher,
                     )
-                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
-                let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
-                    &agent_cfg,
-                    model_provider.as_ref(),
-                    &model_name,
-                );
-                (
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    tool_dispatcher,
-                )
+                };
+                Some(built)
+            } else {
+                None
             };
-            Some(built)
-        } else {
-            None
-        };
 
         let merged = self
             .ctx
             .sessions
-            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
+            .set_overrides_gated(
+                &req.session_id,
+                session_generation,
+                req.overrides,
+                &req.reset,
+            )
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
@@ -2663,6 +2747,36 @@ impl RpcDispatcher {
         to_result(SessionConfigureResult {
             session_id: req.session_id,
             overrides: merged,
+            thinking_options,
+        })
+    }
+
+    /// `session/thinking-options`: what the session's model lets it adjust
+    /// about the reasoning, and what it currently has. Reads the session's
+    /// alias and overrides and resolves the identity from config, so it
+    /// never waits on a turn that holds the agent.
+    async fn handle_session_thinking_options(&self, params: &Value) -> RpcResult {
+        let req: SessionIdParams = parse_params(params)?;
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let overrides = self
+            .ctx
+            .sessions
+            .get_overrides(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        let thinking_options = {
+            let config = self.ctx.config.read();
+            session_thinking_options(&config, &agent_alias, &overrides)?
+        };
+        to_result(SessionThinkingOptionsResult {
+            session_id: req.session_id,
+            overrides,
+            thinking_options,
         })
     }
 
@@ -5283,6 +5397,180 @@ fn validate_session_configure_overrides(overrides: &SessionOverrides) -> Result<
         return Err(rpc_err(INVALID_PARAMS, "model_provider must not be blank"));
     }
     Ok(())
+}
+
+/// The runtime profile's thinking settings for an agent. An agent without a
+/// profile gets the defaults, which is what its turns use.
+fn session_thinking_profile(
+    config: &Config,
+    agent_alias: &str,
+) -> zeroclaw_config::scattered_types::ThinkingConfig {
+    config
+        .resolved_agent_config(agent_alias)
+        .map(|agent| agent.resolved.thinking)
+        .unwrap_or_default()
+}
+
+/// Reject a thinking choice the session's model does not take, naming what
+/// it does take. `merged` carries the model the choice is checked against,
+/// which may be one the same patch switches to.
+fn validate_thinking_overrides(
+    config: &Config,
+    agent_alias: &str,
+    merged: &SessionOverrides,
+    patch: &SessionOverrides,
+) -> Result<(), JsonRpcError> {
+    use super::thinking_options::{accepted_levels, capabilities_for, join_displays, join_levels};
+
+    let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+        config,
+        agent_alias,
+        merged.model_provider.as_deref(),
+        merged.model.as_deref(),
+    )
+    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+    let capabilities = capabilities_for(&model_provider, &model);
+    if let Some(level) = patch.thinking_level {
+        let accepted = accepted_levels(
+            &capabilities,
+            &session_thinking_profile(config, agent_alias),
+        );
+        if !accepted.contains(&level) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                unsupported_thinking_message(
+                    "thinking_level",
+                    level.as_str(),
+                    &model,
+                    &model_provider,
+                    &join_levels(&accepted),
+                ),
+            ));
+        }
+    }
+    if let Some(display) = patch.thinking_display
+        && !capabilities.supports_display(display)
+    {
+        return Err(rpc_err(
+            INVALID_PARAMS,
+            unsupported_thinking_message(
+                "thinking_display",
+                display.as_str(),
+                &model,
+                &model_provider,
+                &join_displays(capabilities.displays),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// What a session can adjust about the reasoning, for the model its
+/// overrides resolve to.
+fn session_thinking_options(
+    config: &Config,
+    agent_alias: &str,
+    overrides: &SessionOverrides,
+) -> Result<ThinkingOptions, JsonRpcError> {
+    use super::thinking_options::{ThinkingContext, thinking_options};
+
+    let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+        config,
+        agent_alias,
+        overrides.model_provider.as_deref(),
+        overrides.model.as_deref(),
+    )
+    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+    let profile = session_thinking_profile(config, agent_alias);
+    Ok(thinking_options(&ThinkingContext {
+        model_provider: &model_provider,
+        model: &model,
+        profile: &profile,
+        alias_display: alias_thinking_display(config, &model_provider),
+        session_level: overrides.thinking_level,
+        session_display: overrides.thinking_display,
+    }))
+}
+
+/// The display the provider alias configured. Only the Anthropic slot has
+/// the knob.
+fn alias_thinking_display(
+    config: &Config,
+    model_provider_ref: &str,
+) -> Option<zeroclaw_api::model_provider::ThinkingDisplay> {
+    let (provider_type, alias) = model_provider_ref.split_once('.')?;
+    if provider_type != "anthropic" {
+        return None;
+    }
+    config
+        .providers
+        .models
+        .anthropic
+        .get(alias)
+        .and_then(|slot| slot.thinking_display)
+        .map(Into::into)
+}
+
+/// The thinking request for one RPC turn. An inline level the model does not
+/// take is rejected, naming what it does take; the session override was
+/// checked when it was set.
+fn resolve_turn_thinking(
+    config: &Config,
+    agent_alias: &str,
+    overrides: &SessionOverrides,
+    inline_level: Option<zeroclaw_config::scattered_types::ThinkingLevel>,
+) -> Result<Option<zeroclaw_api::model_provider::NativeThinkingParams>, JsonRpcError> {
+    use super::thinking_options::{
+        accepted_levels, capabilities_for, join_levels, resolve_session_thinking,
+    };
+
+    let profile = session_thinking_profile(config, agent_alias);
+    if let Some(level) = inline_level {
+        let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+            config,
+            agent_alias,
+            overrides.model_provider.as_deref(),
+            overrides.model.as_deref(),
+        )
+        .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+        let accepted = accepted_levels(&capabilities_for(&model_provider, &model), &profile);
+        if !accepted.contains(&level) {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                unsupported_thinking_message(
+                    "thinking_level",
+                    level.as_str(),
+                    &model,
+                    &model_provider,
+                    &join_levels(&accepted),
+                ),
+            ));
+        }
+    }
+    Ok(resolve_session_thinking(
+        inline_level,
+        overrides.thinking_level,
+        overrides.thinking_display,
+        &profile,
+    ))
+}
+
+fn unsupported_thinking_message(
+    field: &str,
+    value: &str,
+    model: &str,
+    model_provider: &str,
+    accepted: &str,
+) -> String {
+    if accepted.is_empty() {
+        format!(
+            "{field} `{value}` is not supported by `{model}` ({model_provider}); this model takes no {field}"
+        )
+    } else {
+        format!(
+            "{field} `{value}` is not supported by `{model}` ({model_provider}); accepted: {accepted}"
+        )
+    }
 }
 
 fn to_result<T: Serialize>(val: T) -> RpcResult {
@@ -8412,7 +8700,8 @@ mod tests {
             serde_json::json!([
                 {"id": "help", "name": "help"},
                 {"id": "new", "name": "new", "aliases": ["new-session"]},
-                {"id": "model", "name": "model"}
+                {"id": "model", "name": "model"},
+                {"id": "thinking", "name": "effort", "aliases": ["thinking", "think"]}
             ])
         );
     }
@@ -11714,6 +12003,729 @@ mod tests {
             model_name_for_session(&dispatcher, &session_id).await,
             "old-model",
             "failed live refresh must leave the existing session provider intact"
+        );
+    }
+
+    /// One agent on a Fable alias, a second Anthropic alias on an older
+    /// model, and an OpenAI alias, so tests can switch between them.
+    fn make_thinking_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let fable = config
+            .providers
+            .models
+            .ensure("anthropic", "default")
+            .expect("anthropic provider slot exists");
+        fable.api_key = Some("test-key".into());
+        fable.model = Some("claude-fable-5-1".into());
+        let legacy = config
+            .providers
+            .models
+            .ensure("anthropic", "legacy")
+            .expect("anthropic provider slot exists");
+        legacy.api_key = Some("test-key".into());
+        legacy.model = Some("claude-haiku-4-5".into());
+        let other = config
+            .providers
+            .models
+            .ensure("openai", "other")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("gpt-4o".into());
+
+        config.agents = HashMap::from([(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "anthropic.default".into(),
+                risk_profile: "test-profile".into(),
+                runtime_profile: "default".into(),
+                ..Default::default()
+            },
+        )]);
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        let mut profile = zeroclaw_config::schema::RuntimeProfileConfig::default();
+        profile.thinking.default_level = zeroclaw_config::scattered_types::ThinkingLevel::High;
+        config.runtime_profiles.insert("default".into(), profile);
+        config
+    }
+
+    async fn thinking_overrides_for_session(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+    ) -> SessionOverrides {
+        dispatcher
+            .ctx
+            .sessions
+            .get_overrides(session_id)
+            .await
+            .expect("session still exists")
+    }
+
+    #[tokio::test]
+    async fn session_configure_rejects_a_level_the_model_lacks_without_committing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model": "claude-opus-4-6"}
+            }))
+            .await
+            .expect("the model switch succeeds");
+
+        let err = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "xhigh"}
+            }))
+            .await
+            .expect_err("xhigh is not a depth this generation takes");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "thinking_level `xhigh` is not supported by `claude-opus-4-6` (anthropic.default); accepted: low, medium, high, max"
+        );
+        let overrides = thinking_overrides_for_session(&dispatcher, &session_id).await;
+        assert_eq!(overrides.thinking_level, None, "nothing is committed");
+        assert_eq!(overrides.model.as_deref(), Some("claude-opus-4-6"));
+
+        let err = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_display": "summarized"}
+            }))
+            .await
+            .expect_err("this generation takes no display");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "thinking_display `summarized` is not supported by `claude-opus-4-6` (anthropic.default); this model takes no thinking_display"
+        );
+        assert_eq!(
+            thinking_overrides_for_session(&dispatcher, &session_id)
+                .await
+                .thinking_display,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_rejects_thinking_where_nothing_is_adjustable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // A provider switch and a level in one patch: the level is checked
+        // against the incoming model.
+        let err = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model_provider": "openai.other", "thinking_level": "high"}
+            }))
+            .await
+            .expect_err("no level is adjustable on a non-Claude provider");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "thinking_level `high` is not supported by `gpt-4o` (openai.other); this model takes no thinking_level"
+        );
+        let overrides = thinking_overrides_for_session(&dispatcher, &session_id).await;
+        assert_eq!(
+            overrides.model_provider, None,
+            "a rejected patch commits none of its fields"
+        );
+        assert_eq!(overrides.thinking_level, None);
+    }
+
+    #[tokio::test]
+    async fn session_configure_accepts_a_level_and_display_on_a_fable_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let result = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "xhigh", "thinking_display": "summarized"}
+            }))
+            .await
+            .expect("both choices are ones this model takes");
+        assert_eq!(result["overrides"]["thinking_level"], "xhigh");
+        assert_eq!(result["overrides"]["thinking_display"], "summarized");
+        let overrides = thinking_overrides_for_session(&dispatcher, &session_id).await;
+        assert_eq!(
+            overrides.thinking_level,
+            Some(zeroclaw_config::scattered_types::ThinkingLevel::XHigh)
+        );
+        assert_eq!(
+            overrides.thinking_display,
+            Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized)
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "claude-fable-5-1",
+            "thinking fields do not rebuild the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_model_switch_in_the_same_patch_clears_then_applies() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "xhigh", "thinking_display": "summarized"}
+            }))
+            .await
+            .expect("both choices are ones this model takes");
+        let result = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model": "claude-opus-4-6", "thinking_level": "max"}
+            }))
+            .await
+            .expect("max is a depth the 4.6 generation takes");
+        assert_eq!(result["overrides"]["model"], "claude-opus-4-6");
+        assert_eq!(result["overrides"]["thinking_level"], "max");
+        assert!(
+            result["overrides"].get("thinking_display").is_none(),
+            "the switch clears the display the new model does not take"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "claude-opus-4-6"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_reset_clears_one_thinking_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "low", "thinking_display": "summarized"}
+            }))
+            .await
+            .expect("both choices are ones this model takes");
+        let result = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "reset": ["thinking_level"]
+            }))
+            .await
+            .expect("a reset needs no overrides");
+        assert!(result["overrides"].get("thinking_level").is_none());
+        assert_eq!(result["overrides"]["thinking_display"], "summarized");
+
+        let err = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "reset": ["temperature"]
+            }))
+            .await
+            .expect_err("only the thinking fields can be reset by name");
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn session_model_identity_matches_attribution_after_new_and_after_a_switch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let identity_matches =
+            |overrides: SessionOverrides, attribution: (String, String, String)| {
+                let config = dispatcher.ctx.config.read();
+                let (model_provider, model) = crate::agent::agent::resolve_session_model_identity(
+                    &config,
+                    "test-agent",
+                    overrides.model_provider.as_deref(),
+                    overrides.model.as_deref(),
+                )
+                .expect("identity resolves");
+                assert_eq!(model_provider, attribution.1);
+                assert_eq!(model, attribution.2);
+            };
+
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("session agent exists");
+        let attribution = agent.lock().await.attribution_fields();
+        identity_matches(
+            thinking_overrides_for_session(&dispatcher, &session_id).await,
+            attribution,
+        );
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model_provider": "anthropic.legacy"}
+            }))
+            .await
+            .expect("the provider switch succeeds");
+        let attribution = agent.lock().await.attribution_fields();
+        assert_eq!(attribution.2, "claude-haiku-4-5");
+        identity_matches(
+            thinking_overrides_for_session(&dispatcher, &session_id).await,
+            attribution,
+        );
+    }
+
+    /// Records the thinking request and the newest user message of each call.
+    #[derive(Default)]
+    struct TurnRecordingProvider {
+        calls: std::sync::Mutex<
+            Vec<(
+                Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+                Option<String>,
+            )>,
+        >,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for TurnRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let user = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone());
+            self.calls.lock().unwrap().push((request.thinking, user));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for TurnRecordingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "recording"
+        }
+    }
+
+    /// A shared handle so the test keeps reading what the agent's box saw.
+    struct SharedRecordingProvider(Arc<TurnRecordingProvider>);
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for SharedRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.0
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.0.chat(request, model, temperature).await
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for SharedRecordingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            self.0.role()
+        }
+        fn alias(&self) -> &str {
+            self.0.alias()
+        }
+    }
+
+    /// A dispatcher on the thinking test config whose one session runs a
+    /// recording provider instead of a real one.
+    async fn recording_thinking_session(
+        tmp: &tempfile::TempDir,
+    ) -> (RpcDispatcher, Arc<TurnRecordingProvider>, String) {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let provider = Arc::new(TurnRecordingProvider::default());
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(SharedRecordingProvider(Arc::clone(&provider))))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .model_name("claude-fable-5-1".into())
+            .model_provider_name("anthropic.default".into())
+            .agent_alias("test-agent".into())
+            .build()
+            .expect("minimal Agent should build");
+        let session_id = "thinking-session".to_string();
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            tmp.path().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions
+            .insert(session_id.clone(), rpc_session)
+            .await
+            .unwrap();
+        let dispatcher = make_shared_sessions_dispatcher(make_thinking_test_config(tmp), sessions);
+        (dispatcher, provider, session_id)
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_an_inline_level_the_model_lacks_before_the_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, mut rx, _sessions) =
+            make_dispatcher_with_capture(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model": "claude-opus-4-6"}
+            }))
+            .await
+            .expect("the model switch succeeds");
+
+        let err = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "/effort:xhigh explain the classifier",
+            }))
+            .await
+            .expect_err("xhigh is not a depth this generation takes");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "thinking_level `xhigh` is not supported by `claude-opus-4-6` (anthropic.default); accepted: low, medium, high, max"
+        );
+
+        let raw = rx
+            .try_recv()
+            .expect("a rejected turn still tells the client the turn is over");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("notification must be JSON");
+        assert_eq!(v["method"], notification::SESSION_UPDATE);
+        assert_eq!(v["params"]["session_id"], session_id);
+        assert_eq!(v["params"]["outcome"], "failed");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing else is emitted: the turn never started"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_applies_the_session_level_and_strips_the_inline_prefix() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, provider, session_id) = recording_thinking_session(&tmp).await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "high", "thinking_display": "summarized"}
+            }))
+            .await
+            .expect("both choices are ones this model takes");
+
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "/effort:max hello",
+            }))
+            .await
+            .expect("the turn runs on the recording provider");
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "/think:low again",
+            }))
+            .await
+            .expect("the older spelling is still accepted");
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "and once more",
+            }))
+            .await
+            .expect("a plain prompt uses the session level");
+
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "one provider call per turn");
+        let thinking: Vec<_> = calls.iter().map(|(thinking, _)| *thinking).collect();
+        assert_eq!(
+            thinking,
+            vec![
+                Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::Max),
+                    display: Some(ThinkingDisplay::Summarized),
+                }),
+                Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::Low),
+                    display: Some(ThinkingDisplay::Summarized),
+                }),
+                Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::High),
+                    display: Some(ThinkingDisplay::Summarized),
+                }),
+            ],
+            "the inline level applies to its own turn only; the session level and display carry over"
+        );
+        // The runtime prepends its own preamble to the user message, so only
+        // the last line is the prompt as the client sent it.
+        let prompts: Vec<_> = calls
+            .iter()
+            .map(|(_, user)| user.as_deref().and_then(|user| user.lines().last()))
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![Some("hello"), Some("again"), Some("and once more")],
+            "the prefix never reaches the model"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_uses_the_profile_default_without_overrides() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, provider, session_id) = recording_thinking_session(&tmp).await;
+
+        dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": session_id,
+                "prompt": "hello",
+            }))
+            .await
+            .expect("the turn runs on the recording provider");
+        let calls = provider.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls[0].0,
+            Some(NativeThinkingParams {
+                budget_tokens: None,
+                effort: Some(ThinkingEffort::High),
+                display: None,
+            }),
+            "the profile's default level reaches RPC turns natively"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_thinking_options_describe_the_fable_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let result = dispatcher
+            .handle_session_thinking_options(&json!({"session_id": session_id}))
+            .await
+            .expect("options resolve for a live session");
+        assert_eq!(result["session_id"], session_id);
+        assert_eq!(
+            result["thinking_options"],
+            json!({
+                "model_provider": "anthropic.default",
+                "model": "claude-fable-5-1",
+                "levels": ["low", "medium", "high", "xhigh", "max"],
+                "displays": ["omitted", "summarized"],
+                "current_level": "high",
+                "level_source": "profile",
+                "current_display": "omitted",
+                "display_source": "model_default"
+            })
+        );
+
+        // The alias's own display shows as the current one until the
+        // session chooses.
+        {
+            let mut config = dispatcher.ctx.config.write();
+            config
+                .providers
+                .models
+                .anthropic
+                .get_mut("default")
+                .expect("alias exists")
+                .thinking_display =
+                Some(zeroclaw_config::schema::AnthropicThinkingDisplay::Summarized);
+        }
+        let result = dispatcher
+            .handle_session_thinking_options(&json!({"session_id": session_id}))
+            .await
+            .expect("options resolve for a live session");
+        assert_eq!(result["thinking_options"]["current_display"], "summarized");
+        assert_eq!(result["thinking_options"]["display_source"], "alias");
+    }
+
+    #[tokio::test]
+    async fn session_thinking_options_follow_a_switch_to_an_older_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let result = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model_provider": "anthropic.legacy"}
+            }))
+            .await
+            .expect("the provider switch succeeds");
+        assert_eq!(
+            result["thinking_options"],
+            json!({
+                "model_provider": "anthropic.legacy",
+                "model": "claude-haiku-4-5",
+                "levels": [],
+                "displays": []
+            }),
+            "without a budget opt-in an older generation offers nothing"
+        );
+
+        {
+            let mut config = dispatcher.ctx.config.write();
+            config
+                .runtime_profiles
+                .get_mut("default")
+                .expect("profile exists")
+                .thinking
+                .native_thinking = true;
+        }
+        let result = dispatcher
+            .handle_session_thinking_options(&json!({"session_id": session_id}))
+            .await
+            .expect("options resolve for a live session");
+        assert_eq!(
+            result["thinking_options"]["levels"],
+            json!(["medium", "high", "max"]),
+            "with the budget opt-in the budget levels are offered"
+        );
+        assert_eq!(result["thinking_options"]["current_level"], "high");
+        assert_eq!(result["thinking_options"]["level_source"], "profile");
+        assert_eq!(result["thinking_options"]["displays"], json!([]));
+        assert!(result["thinking_options"].get("current_display").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_thinking_options_are_empty_on_a_non_claude_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"model_provider": "openai.other"}
+            }))
+            .await
+            .expect("the provider switch succeeds");
+        let result = dispatcher
+            .handle_session_thinking_options(&json!({"session_id": session_id}))
+            .await
+            .expect("options resolve for a live session");
+        assert_eq!(
+            result["thinking_options"],
+            json!({
+                "model_provider": "openai.other",
+                "model": "gpt-4o",
+                "levels": [],
+                "displays": []
+            })
+        );
+
+        let err = dispatcher
+            .handle_session_thinking_options(&json!({"session_id": "ghost"}))
+            .await
+            .expect_err("an unknown session has no options");
+        assert_eq!(err.code, SESSION_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn session_configure_echoes_options_and_reset_reports_the_profile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        let result = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "xhigh", "thinking_display": "summarized"}
+            }))
+            .await
+            .expect("both choices are ones this model takes");
+        assert_eq!(result["thinking_options"]["current_level"], "xhigh");
+        assert_eq!(result["thinking_options"]["level_source"], "session");
+        assert_eq!(result["thinking_options"]["current_display"], "summarized");
+        assert_eq!(result["thinking_options"]["display_source"], "session");
+
+        let result = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "reset": ["thinking_level", "thinking_display"]
+            }))
+            .await
+            .expect("a reset needs no overrides");
+        assert_eq!(result["overrides"], json!({}));
+        assert_eq!(result["thinking_options"]["current_level"], "high");
+        assert_eq!(result["thinking_options"]["level_source"], "profile");
+        assert_eq!(result["thinking_options"]["current_display"], "omitted");
+        assert_eq!(
+            result["thinking_options"]["display_source"],
+            "model_default"
         );
     }
 

@@ -294,10 +294,16 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+/// Cells between a row label and its `current` suffix.
+const CURRENT_SUFFIX_GAP: usize = 2;
+
 pub struct PickerModal<'a> {
     title: &'a str,
     items: &'a [String],
     cursor: usize,
+    /// Row whose value is currently in force, with the localized suffix it
+    /// is drawn with.
+    current: Option<(usize, &'a str)>,
 }
 
 impl<'a> PickerModal<'a> {
@@ -306,34 +312,76 @@ impl<'a> PickerModal<'a> {
             title,
             items,
             cursor,
+            current: None,
         }
     }
 
+    /// Tag `row` as the value currently in force by appending a dim `label`
+    /// suffix. A word rather than a glyph: East Asian labels already mix
+    /// single- and double-width cells, and a marker glyph would misalign the
+    /// column. `None` draws every row plain.
+    pub fn with_current(mut self, row: Option<usize>, label: &'a str) -> Self {
+        self.current = row.map(|row| (row, label));
+        self
+    }
+
+    /// Modal rect for a picker without a current-row suffix.
     pub fn area_for(title: &str, items: &[String], area: Rect) -> Option<Rect> {
-        if items.is_empty() {
+        PickerModal::new(title, items, 0).area(area)
+    }
+
+    /// The rect this modal renders into, centered within `area`; `None` when
+    /// there are no rows. Keep this geometry in sync with `render` so mouse
+    /// hit-testing lands on the same rows the user sees.
+    pub fn area(&self, area: Rect) -> Option<Rect> {
+        if self.items.is_empty() {
             return None;
         }
 
-        // Keep this geometry in sync with `render` so mouse hit-testing lands
-        // on the same rows the user sees.
-        let longest = items
+        let longest = self
+            .items
             .iter()
-            .map(|s| UnicodeWidthStr::width(s.as_str()))
+            .enumerate()
+            .map(|(row, label)| self.row_width(row, label))
             .max()
             .unwrap_or(0)
-            .max(UnicodeWidthStr::width(title));
+            .max(UnicodeWidthStr::width(self.title));
         let inner_w = longest + 2; // 1 col padding each side
         let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
-        let box_h = (items.len() + 2).clamp(3, area.height as usize) as u16;
+        let box_h = (self.items.len() + 2).clamp(3, area.height as usize) as u16;
 
         let x = area.x + area.width.saturating_sub(box_w) / 2;
         let y = area.y + area.height.saturating_sub(box_h) / 2;
         Some(Rect::new(x, y, box_w, box_h))
     }
 
+    fn current_suffix(&self, row: usize) -> Option<&'a str> {
+        self.current
+            .and_then(|(current, label)| (current == row).then_some(label))
+    }
+
+    fn row_width(&self, row: usize, label: &str) -> usize {
+        let base = UnicodeWidthStr::width(label);
+        match self.current_suffix(row) {
+            Some(suffix) => base + CURRENT_SUFFIX_GAP + UnicodeWidthStr::width(suffix),
+            None => base,
+        }
+    }
+
+    fn row_line(&self, row: usize, label: &str, style: ratatui::style::Style) -> Line<'static> {
+        let mut spans = vec![Span::styled(label.to_string(), style)];
+        if let Some(suffix) = self.current_suffix(row) {
+            spans.push(Span::styled(
+                format!("{}{suffix}", " ".repeat(CURRENT_SUFFIX_GAP)),
+                crate::theme::dim_style(),
+            ));
+        }
+        Line::from(spans)
+    }
+
     /// Render the modal centered within `area`. No-op when there are no items.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        let Some(modal_rect) = Self::area_for(self.title, self.items, area) else {
+        let Some(modal_rect) = self.area(area) else {
             return;
         };
 
@@ -358,7 +406,7 @@ impl<'a> PickerModal<'a> {
                 } else {
                     crate::theme::body_style()
                 };
-                ListItem::new(Span::styled(label.clone(), style))
+                ListItem::new(self.row_line(i, label, style))
             })
             .collect();
 
@@ -380,16 +428,22 @@ impl<'a> PickerModal<'a> {
 pub struct PickerState {
     pub items: Vec<String>,
     pub cursor: usize,
+    /// Row holding the value currently in force, drawn with the `current`
+    /// suffix. `None` when that value is not among the rows.
+    pub current: Option<usize>,
 }
 
 impl PickerState {
-    /// Build a picker over `items`, pre-selecting `default` when present (else
-    /// the first row).
+    /// Build a picker over `items`. `default` is the value currently in
+    /// force: when present it is pre-selected and marked as the current row,
+    /// else the cursor starts on the first row and no row is marked.
     pub fn new(items: Vec<String>, default: Option<&str>) -> Self {
-        let cursor = default
-            .and_then(|d| items.iter().position(|i| i == d))
-            .unwrap_or(0);
-        Self { items, cursor }
+        let current = default.and_then(|d| items.iter().position(|i| i == d));
+        Self {
+            items,
+            cursor: current.unwrap_or(0),
+            current,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -529,5 +583,88 @@ mod picker_tests {
         let p = PickerState::default();
         assert!(p.is_empty());
         assert_eq!(p.selected(), None);
+    }
+
+    #[test]
+    fn new_marks_the_default_as_the_current_row() {
+        let p = PickerState::new(vec!["a".into(), "b".into()], Some("b"));
+        assert_eq!(p.current, Some(1));
+
+        let p = PickerState::new(vec!["a".into(), "b".into()], None);
+        assert_eq!(p.current, None);
+
+        let p = PickerState::new(vec!["a".into(), "b".into()], Some("zzz"));
+        assert_eq!(p.current, None);
+        assert_eq!(p.cursor, 0);
+    }
+
+    #[test]
+    fn area_widens_for_the_current_row_suffix() {
+        let items = vec!["low".to_string(), "high".to_string()];
+        let area = Rect::new(0, 0, 80, 24);
+
+        let plain = PickerModal::area_for("Pick", &items, area).unwrap();
+        assert_eq!(plain.width, 12, "short rows sit at the minimum width");
+
+        let marked = PickerModal::new("Pick", &items, 0)
+            .with_current(Some(1), "current")
+            .area(area)
+            .unwrap();
+        // "high" + two cells + "current" is the longest row (13), plus one
+        // cell of padding and one border on each side.
+        assert_eq!(marked.width, 17);
+        assert_eq!(marked.height, plain.height);
+
+        let unmarked = PickerModal::new("Pick", &items, 0)
+            .with_current(None, "current")
+            .area(area)
+            .unwrap();
+        assert_eq!(unmarked, plain, "no current row leaves the geometry alone");
+    }
+
+    #[test]
+    fn current_suffix_geometry_uses_display_width() {
+        let items = vec!["界界界界界界".to_string()];
+
+        let marked = PickerModal::new("P", &items, 0)
+            .with_current(Some(0), "現在")
+            .area(Rect::new(0, 0, 80, 24))
+            .unwrap();
+
+        // 12 cells of label + 2 gap + 4 cells of suffix, then padding and border.
+        assert_eq!(marked.width, 22);
+    }
+
+    #[test]
+    fn current_row_renders_the_suffix_only_on_that_row() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let items = vec!["low".to_string(), "high".to_string()];
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                PickerModal::new("Pick", &items, 0)
+                    .with_current(Some(1), "current")
+                    .render(frame, frame.area());
+            })
+            .expect("draw picker");
+
+        let buffer = terminal.backend().buffer();
+        let width = usize::from(buffer.area.width);
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter().any(|row| row.contains("high  current")),
+            "the current row carries the suffix: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("low  current")),
+            "other rows stay plain: {rows:?}"
+        );
     }
 }

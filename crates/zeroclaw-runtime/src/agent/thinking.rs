@@ -17,14 +17,19 @@ pub struct ThinkingParams {
     pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
 }
 
+/// Prefixes that name a reasoning depth for one message. `/effort:` matches
+/// the shared `/effort` command; `/think:` is the older spelling and stays
+/// accepted.
+const THINKING_DIRECTIVE_PREFIXES: &[&str] = &["/effort:", "/think:"];
+
 pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)> {
     let trimmed = message.trim_start();
-    if !trimmed.starts_with("/think:") {
-        return None;
-    }
+    let prefix = THINKING_DIRECTIVE_PREFIXES
+        .iter()
+        .find(|prefix| trimmed.starts_with(*prefix))?;
 
-    // Extract the level token (everything between `/think:` and the next whitespace or end).
-    let after_prefix = &trimmed["/think:".len()..];
+    // Extract the level token (everything between the prefix and the next whitespace or end).
+    let after_prefix = &trimmed[prefix.len()..];
     let level_end = after_prefix
         .find(|c: char| c.is_whitespace())
         .unwrap_or(after_prefix.len());
@@ -78,7 +83,9 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
             system_prompt_prefix: None,
             native_thinking: None,
         },
-        ThinkingLevel::High => ThinkingParams {
+        // `xhigh` is a native depth setting; where only the prompt can carry
+        // the level it reads as `high`.
+        ThinkingLevel::High | ThinkingLevel::XHigh => ThinkingParams {
             temperature_adjustment: 0.05,
             max_tokens_adjustment: 1000,
             system_prompt_prefix: Some(
@@ -294,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_directive_accepts_the_effort_spelling() {
+        let (level, remaining) =
+            parse_thinking_directive("/effort:xhigh plan the migration").expect("directive");
+        assert_eq!(level, ThinkingLevel::XHigh);
+        assert_eq!(remaining, "plan the migration");
+        assert_eq!(
+            strip_thinking_directive("  /effort:low  body"),
+            "body",
+            "the older and newer spellings strip the same way"
+        );
+        assert!(parse_thinking_directive("/effort high").is_none());
+        assert!(parse_thinking_directive("/effort:turbo hi").is_none());
+    }
+
+    #[test]
     fn parse_directive_handles_directive_only() {
         let result = parse_thinking_directive("/think:off");
         assert!(result.is_some());
@@ -426,6 +448,13 @@ mod tests {
     }
 
     #[test]
+    fn apply_thinking_level_xhigh_reads_as_high_outside_native_depth() {
+        let xhigh = apply_thinking_level(ThinkingLevel::XHigh);
+        let high = apply_thinking_level(ThinkingLevel::High);
+        assert_eq!(xhigh, high);
+    }
+
+    #[test]
     fn apply_thinking_level_max_is_most_thorough() {
         let params = apply_thinking_level(ThinkingLevel::Max);
         assert!(params.temperature_adjustment > 0.0);
@@ -528,6 +557,7 @@ mod tests {
             (ThinkingLevel::Minimal, Some(ThinkingEffort::Low)),
             (ThinkingLevel::Low, Some(ThinkingEffort::Low)),
             (ThinkingLevel::High, Some(ThinkingEffort::High)),
+            (ThinkingLevel::XHigh, Some(ThinkingEffort::XHigh)),
             (ThinkingLevel::Max, Some(ThinkingEffort::Max)),
         ] {
             let params = apply_thinking_level_with_config(level, &config);
@@ -687,11 +717,11 @@ display = "updates"
 
     #[tokio::test]
     async fn native_thinking_override_round_trips_through_scope() {
-        use zeroclaw_config::scattered_types::NativeThinkingParams;
+        use zeroclaw_config::scattered_types::{NativeThinkingParams, ThinkingDisplay};
         let installed = Some(NativeThinkingParams {
             budget_tokens: Some(32_000),
             effort: None,
-            display: None,
+            display: Some(ThinkingDisplay::Summarized),
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {
@@ -734,7 +764,7 @@ display = "updates"
         validate_thinking_config(&cfg_default);
 
         let mut cfg_all_valid = ThinkingConfig::default();
-        for level in ["off", "minimal", "low", "medium", "high", "max"] {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             cfg_all_valid
                 .budget_tokens
                 .insert(level.to_string(), 10_000);

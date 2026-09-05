@@ -369,6 +369,58 @@ mod tests {
     }
 
     #[test]
+    fn picker_and_thinking_control_keys_present_in_all_builtin_catalogues() {
+        // The picker modals and the session thinking controls read these
+        // keys; every shipped catalogue must define them so a picker row or an
+        // info-bar note never falls back to a bare `{key}` placeholder.
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        const PLAIN_KEYS: &[&str] = &[
+            "zc-picker-current",
+            "zc-effort-picker-title",
+            "zc-display-picker-title",
+            "zc-thinking-switch-applying",
+            "zc-effort-none-for-model",
+            "zc-display-none-for-model",
+        ];
+        // Keys that embed a value: (key, argument name).
+        const ARG_KEYS: &[(&str, &str)] = &[
+            ("zc-effort-ok", "level"),
+            ("zc-effort-reset", "level"),
+            ("zc-display-ok", "display"),
+            ("zc-display-reset", "display"),
+            ("zc-thinking-switch-failed", "error"),
+            ("zc-thinking-options-failed", "error"),
+            ("zc-thinking-remembered-skipped", "value"),
+        ];
+
+        for (locale, source) in catalogues {
+            for key in PLAIN_KEYS {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} must be defined for {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be blank for {locale}"
+                );
+            }
+            for (key, arg) in ARG_KEYS {
+                let value = format_ftl_message(source, locale, key, &[(arg, "xhigh-marker")])
+                    .unwrap_or_else(|| panic!("{key} must format for {locale}"));
+                assert!(
+                    value.contains("xhigh-marker"),
+                    "{key} must embed ${arg} for {locale}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn doctor_persistence_keys_present_in_all_builtin_catalogues() {
         // The Doctor view surfaces four persistence keys in the detail panel.
         // Every shipped catalogue must define them so the operator-facing

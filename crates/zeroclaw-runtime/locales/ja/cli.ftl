@@ -891,7 +891,7 @@ channel-runtime-thinking-cleared = thinking の上書きをクリアしました
 channel-runtime-thinking-default =
     thinking はすでにこの送信者セッションで agent デフォルト `{ $default }` を使用しています。
     上書きするには `/thinking high`、`/thinking max`、または `/thinking off` を使用してください。
-channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` です。`/thinking off|minimal|low|medium|high|max`、`/thinking on`、または `/thinking reset` を使用してください。
+channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` です。`/effort off|minimal|low|medium|high|xhigh|max`、`/effort on`、または `/effort reset` を使用してください。
 channel-runtime-provider-turn-init-failed =
     ⚠️ model_provider `{ $provider }` の初期化に失敗しました。`/models` を実行して別の model_provider を選択してください。
     詳細: { $error }

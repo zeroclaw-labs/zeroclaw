@@ -9,6 +9,7 @@ pub mod git;
 pub mod local;
 pub mod locales;
 pub mod session;
+pub mod thinking_options;
 pub mod transport;
 pub mod tui_identity;
 pub mod turn;

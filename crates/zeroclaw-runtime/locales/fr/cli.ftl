@@ -894,7 +894,7 @@ channel-runtime-thinking-cleared = Surcharge de thinking effacée. Utilisation d
 channel-runtime-thinking-default =
     Thinking utilise déjà la valeur par défaut de l'agent `{ $default }` pour cette session d'expéditeur.
     Utilisez `/thinking high`, `/thinking max` ou `/thinking off` pour le surcharger.
-channel-runtime-thinking-invalid = Niveau de thinking inconnu `{ $raw }`. Utilisez `/thinking off|minimal|low|medium|high|max`, `/thinking on` ou `/thinking reset`.
+channel-runtime-thinking-invalid = Niveau de thinking inconnu `{ $raw }`. Utilisez `/effort off|minimal|low|medium|high|xhigh|max`, `/effort on` ou `/effort reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Échec de l'initialisation de model_provider `{ $provider }`. Exécutez `/models` pour choisir un autre model_provider.
     Détails : { $error }

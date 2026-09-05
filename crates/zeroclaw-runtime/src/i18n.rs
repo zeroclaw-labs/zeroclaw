@@ -1189,9 +1189,9 @@ mod tests {
                 &[("raw", "banana")][..],
                 [
                     "banana",
-                    "/thinking off|minimal|low|medium|high|max",
-                    "/thinking on",
-                    "/thinking reset",
+                    "/effort off|minimal|low|medium|high|xhigh|max",
+                    "/effort on",
+                    "/effort reset",
                 ]
                 .as_slice(),
             ),
