@@ -50,7 +50,7 @@
             rustc = rustToolchain;
           }).buildRustPackage {
             inherit pname;
-            version = "0.8.4";
+            version = "0.8.5";
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
