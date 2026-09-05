@@ -86,6 +86,9 @@ libc = "0.2"
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
+# Enables the runtime's deterministic clock seam for production-shaped cache
+# fixtures; this feature is dev-only and is not part of the shipped gateway.
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 # Real WebSocket client used to drive the `/acp` route end-to-end in
 # acp::tests (front-door proof for the gateway ACP surface). A plain
