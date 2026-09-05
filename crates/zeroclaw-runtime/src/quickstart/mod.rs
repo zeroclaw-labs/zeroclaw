@@ -1057,7 +1057,7 @@ fn apply_model_provider(
                     return None;
                 }
             };
-            if !section_has_alias(config, "providers.models", family, alias) {
+            if config.providers.models.find(family, alias).is_none() {
                 let path = format!("providers.models.{family}.{alias}");
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -1146,7 +1146,12 @@ fn apply_model_provider(
                 ));
                 return None;
             }
-            if section_has_alias(config, "providers.models", provider_type, &choice.alias) {
+            if config
+                .providers
+                .models
+                .find(provider_type, &choice.alias)
+                .is_some()
+            {
                 let alias_ref = format!("{}.{}", provider_type, choice.alias);
                 errors.push(QuickstartError::for_surface(
                     ctx,
@@ -2133,16 +2138,6 @@ fn split_ref(reference: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -> bool {
-    for probe_field in ["enabled", "model", "uri"] {
-        let probe = format!("{prefix}.{family}.{alias}.{probe_field}");
-        if config.get_prop(&probe).is_ok() {
-            return true;
-        }
-    }
-    false
-}
-
 fn storage_has_ref(config: &Config, reference: &str) -> bool {
     collect_aliased_refs(&config.storage)
         .iter()
@@ -2364,6 +2359,46 @@ mod tests {
                 "anthropic.omega".to_string(),
                 "openai.zeta".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn model_provider_alias_checks_preserve_existing_and_duplicate_behavior() {
+        let mut cfg = Config::default();
+        cfg.providers
+            .models
+            .openrouter
+            .insert("default".into(), Default::default());
+
+        let mut errors = Vec::new();
+        let existing = apply_model_provider(
+            &mut cfg,
+            &SelectorChoice::Existing("openrouter.default".into()),
+            &mut errors,
+            None,
+        );
+        assert_eq!(existing.as_deref(), Some("openrouter.default"));
+        assert!(errors.is_empty(), "existing alias errors: {errors:?}");
+
+        let duplicate = ModelProviderChoice {
+            provider_type: "openrouter".into(),
+            alias: "default".into(),
+            model: "openai/gpt-5.4".into(),
+            fields: std::collections::HashMap::new(),
+        };
+        let mut errors = Vec::new();
+        let fresh = apply_model_provider(
+            &mut cfg,
+            &SelectorChoice::Fresh(duplicate),
+            &mut errors,
+            None,
+        );
+        assert!(fresh.is_none());
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("already exists")),
+            "duplicate alias errors: {errors:?}"
         );
     }
 

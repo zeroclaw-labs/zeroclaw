@@ -138,6 +138,8 @@ pub struct SessionStore {
     /// prompt owns admission but before any fallible setup or provider work.
     #[cfg(test)]
     test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    #[cfg(test)]
+    test_prompt_admission_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -188,6 +190,8 @@ impl SessionStore {
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_prompt_registration_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_admission_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -644,31 +648,67 @@ impl SessionStore {
         id: &str,
         token: tokio_util::sync::CancellationToken,
     ) -> u64 {
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        self.register_cancel_token_locked(&mut tokens, id, token)
+    }
+
+    fn register_cancel_token_locked(
+        &self,
+        tokens: &mut HashMap<String, (u64, tokio_util::sync::CancellationToken)>,
+        id: &str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> u64 {
         let generation = self
             .cancel_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
-        if let Some((_, stale)) = self
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_string(), (generation, token))
-        {
+        if let Some((_, stale)) = tokens.insert(id.to_string(), (generation, token)) {
             stale.cancel();
         }
         generation
     }
 
-    pub(crate) fn register_cancel_token_guard<'a>(
+    /// Complete admission and register its cancellation generation atomically
+    /// with respect to cancellation signals. Each poll releases the token lock
+    /// before yielding, so queued prompts neither block signals nor replace the
+    /// active prompt's token.
+    pub(crate) async fn acquire_prompt<'a>(
         &'a self,
         id: &'a str,
         token: tokio_util::sync::CancellationToken,
-    ) -> CancelTokenRegistration<'a> {
-        CancelTokenRegistration {
-            store: self,
-            session_id: id,
-            generation: Some(self.register_cancel_token(id, token)),
-        }
+    ) -> Result<
+        (
+            zeroclaw_infra::session_queue::SessionGuard,
+            CancelTokenRegistration<'a>,
+        ),
+        zeroclaw_infra::session_queue::SessionQueueError,
+    > {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let mut admission = std::pin::pin!(self.session_queue.acquire(id));
+        poll_fn(|cx| {
+            let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = match admission.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(guard)) => guard,
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.test_prompt_admission_hook.lock().unwrap().as_ref() {
+                hook();
+            }
+            let generation = self.register_cancel_token_locked(&mut tokens, id, token.clone());
+            Poll::Ready(Ok((
+                guard,
+                CancelTokenRegistration {
+                    store: self,
+                    session_id: id,
+                    generation: Some(generation),
+                },
+            )))
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -804,6 +844,131 @@ mod tests {
 
     fn make_store(max: usize) -> SessionStore {
         SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_admission_registers_before_concurrent_cancellation() {
+        const DEADLOCK_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+        for cause in [
+            CancelCause::ClientRpc,
+            CancelCause::SessionRemoved,
+            CancelCause::AdminKill,
+        ] {
+            let store = Arc::new(make_store(4));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = std::sync::Mutex::new(release_rx);
+            let weak_store = Arc::downgrade(&store);
+            let hook_entered = Arc::clone(&entered);
+            *store.test_prompt_admission_hook.lock().unwrap() = Some(Arc::new(move || {
+                // This is the formerly unprotected interval: the queue has
+                // granted admission but the token has not been inserted yet.
+                let store = weak_store.upgrade().unwrap();
+                assert!(matches!(
+                    store.cancel_tokens.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                hook_entered.notify_one();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(DEADLOCK_BOUND)
+                    .unwrap();
+            }));
+            let token = tokio_util::sync::CancellationToken::new();
+            let prompt_store = Arc::clone(&store);
+            let prompt_token = token.clone();
+            let prompt = zeroclaw_spawn::spawn!(async move {
+                let (_admission, registration) = prompt_store
+                    .acquire_prompt("s", prompt_token.clone())
+                    .await
+                    .unwrap();
+                prompt_token.cancelled().await;
+                registration.finish()
+            });
+            tokio::time::timeout(DEADLOCK_BOUND, entered.notified())
+                .await
+                .unwrap();
+            let signal_started = Arc::new(tokio::sync::Notify::new());
+            let signal_entered = Arc::clone(&signal_started);
+            let signal_store = Arc::clone(&store);
+            let signal = tokio::task::spawn_blocking(move || {
+                signal_entered.notify_one();
+                match cause {
+                    CancelCause::ClientRpc => signal_store.cancel_session("s"),
+                    CancelCause::SessionRemoved => signal_store.signal_session_removal("s"),
+                    CancelCause::AdminKill => signal_store.signal_session_kill("s"),
+                }
+            });
+            tokio::time::timeout(DEADLOCK_BOUND, signal_started.notified())
+                .await
+                .unwrap();
+            release_tx.send(()).unwrap();
+            assert!(
+                tokio::time::timeout(DEADLOCK_BOUND, signal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+            assert_eq!(
+                tokio::time::timeout(DEADLOCK_BOUND, prompt)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Some(cause)
+            );
+            assert!(token.is_cancelled());
+            assert!(!store.has_inflight_turn("s"));
+            assert_eq!(store.take_cancel_cause("s"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_admission_keeps_waiters_out_of_active_cancellation() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let store = make_store(4);
+        let active = tokio_util::sync::CancellationToken::new();
+        let (guard, registration) = store.acquire_prompt("s", active.clone()).await.unwrap();
+        let next = tokio_util::sync::CancellationToken::new();
+        let mut waiter = std::pin::pin!(store.acquire_prompt("s", next.clone()));
+        assert!(poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx).is_pending())).await);
+        assert!(store.cancel_session("s"));
+        assert!(active.is_cancelled());
+        assert!(!next.is_cancelled());
+        assert_eq!(registration.finish(), Some(CancelCause::ClientRpc));
+        drop(guard);
+        let (_guard, registration) = waiter.await.unwrap();
+        assert!(
+            !next.is_cancelled(),
+            "a queued generation must not inherit cancellation"
+        );
+        assert_eq!(registration.finish(), None);
+    }
+
+    #[tokio::test]
+    async fn prompt_admission_dropped_waiter_leaves_no_registration() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let store = make_store(4);
+        let guard = store.session_queue.acquire("s").await.unwrap();
+        {
+            let mut waiter = std::pin::pin!(
+                store.acquire_prompt("s", tokio_util::sync::CancellationToken::new())
+            );
+            assert!(poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx).is_pending())).await);
+            assert!(!store.has_inflight_turn("s"));
+            assert!(!store.cancel_session("s"));
+        }
+        assert_eq!(store.session_queue.queue_depth("s").await, 1);
+        drop(guard);
+        let token = tokio_util::sync::CancellationToken::new();
+        let (_guard, registration) = store.acquire_prompt("s", token.clone()).await.unwrap();
+        assert!(!token.is_cancelled());
+        drop(registration);
+        assert!(!store.has_inflight_turn("s"));
     }
 
     fn make_agent() -> Agent {
