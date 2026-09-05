@@ -3,29 +3,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Public WebSocket voice events retained for gateway API compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum VoiceEvent {
-    /// Client signals that speech has started.
     #[serde(rename = "speech_start")]
     SpeechStart,
-
-    /// Client signals that speech has ended, with optional transcript.
     #[serde(rename = "speech_end")]
     SpeechEnd {
         #[serde(default)]
         transcript: Option<String>,
     },
-
-    /// Client requests cancellation of in-progress TTS.
     #[serde(rename = "barge_in")]
     BargeIn,
-
-    /// Server cancels in-progress TTS.
     #[serde(rename = "tts_cancel")]
     TtsCancel,
-
-    /// Server sends a chunk of base64-encoded audio.
     #[serde(rename = "tts_chunk")]
     TtsChunk {
         audio_b64: String,

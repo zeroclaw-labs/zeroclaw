@@ -301,6 +301,7 @@ impl DiscordChannel {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) async fn process_attachments_for_test(
         &self,
         attachments: &[serde_json::Value],

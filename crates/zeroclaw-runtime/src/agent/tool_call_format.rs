@@ -111,6 +111,41 @@ mod tests {
         }
     }
 
+    /// The production default registry begins with `shell`, whose schema
+    /// requires a command. Keep the shared text protocol availability-neutral
+    /// so it never demonstrates a concrete, schema-invalid shell invocation.
+    #[test]
+    fn default_shell_tool_does_not_get_an_empty_arguments_example() {
+        let tools = probe_tools();
+        assert_eq!(
+            tools.first().map(|tool| tool.name()),
+            Some("shell"),
+            "the regression must exercise the production-default first tool"
+        );
+        assert!(
+            tools[0].parameters_schema().to_string().contains("command"),
+            "shell must still require command for this regression to be meaningful"
+        );
+
+        for (builder, prompt) in [
+            (
+                "XmlToolDispatcher::prompt_instructions",
+                XmlToolDispatcher.prompt_instructions(&tools),
+            ),
+            ("build_tool_instructions", build_tool_instructions(&tools)),
+        ] {
+            assert!(
+                prompt.contains(r#"{"name": "tool_name", "arguments": {"param": "value"}}"#),
+                "{builder} must retain the schema-neutral protocol example"
+            );
+            assert!(
+                !prompt.contains(r#"{"name":"shell","arguments":{}}"#)
+                    && !prompt.contains(r#"{"name": "shell", "arguments": {}}"#),
+                "{builder} must not demonstrate a shell call the runtime rejects: {prompt}"
+            );
+        }
+    }
+
     /// Anti-drift guard. Both text-protocol prompt builders must embed the
     /// shared block byte-for-byte; a builder that re-types the wording (or
     /// keeps a stale copy) fails here.

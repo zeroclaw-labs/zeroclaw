@@ -539,6 +539,40 @@ mod tests {
         sent: Arc<parking_lot::RwLock<Vec<SendMessage>>>,
     }
 
+    struct TextRejectingChannel;
+
+    impl Attributable for TextRejectingChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::VoiceHost)
+        }
+
+        fn alias(&self) -> &str {
+            "office"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for TextRejectingChannel {
+        fn name(&self) -> &str {
+            "voicehost"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !message.suppress_voice,
+                "voice host does not support text-only delivery"
+            );
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     impl StubChannel {
         fn new(name: &str) -> Self {
             Self {
@@ -908,6 +942,39 @@ mod tests {
             "immediate send must deliver to the resolved external_peers recipient"
         );
         // routing state untouched
+        assert!(routing.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn immediate_text_send_reports_channel_delivery_failure() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            "office".to_string(),
+            pg_with_peers("voicehost", &["elisa"], &["voice-user"]),
+        );
+        let (tool, routing) = make_tool(
+            vec![("voicehost.office", Arc::new(TextRejectingChannel))],
+            groups,
+        );
+
+        let result = tool
+            .execute(json!({
+                "target": "voicehost.office",
+                "modality": "text",
+                "body": "text-only fanout"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["status"], "failed");
+        assert!(
+            out["reason"]
+                .as_str()
+                .unwrap()
+                .contains("text-only delivery")
+        );
         assert!(routing.lock().unwrap().is_empty());
     }
 

@@ -316,6 +316,41 @@ pub enum GateChoiceEmphasis {
     Neutral,
 }
 
+/// JSON events shared by voice-capable gateways and channel adapters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum VoiceEvent {
+    /// The voice host detected the start of user speech.
+    #[serde(rename = "speech_start")]
+    SpeechStart,
+    /// The voice host detected the end of user speech.
+    #[serde(rename = "speech_end")]
+    SpeechEnd {
+        #[serde(default)]
+        transcript: Option<String>,
+    },
+    /// The user interrupted an in-progress response.
+    #[serde(rename = "barge_in")]
+    BargeIn,
+    /// Cancel in-progress text-to-speech output.
+    #[serde(rename = "tts_cancel")]
+    TtsCancel,
+    /// A base64-encoded text-to-speech audio chunk.
+    #[serde(rename = "tts_chunk")]
+    TtsChunk {
+        audio_b64: String,
+        #[serde(default)]
+        format: Option<String>,
+    },
+    /// Ask the voice host to synthesize and play a text response.
+    #[serde(rename = "say")]
+    Say {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+    },
+}
+
 /// Conversation history scope for an inbound channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChannelConversationScope {
@@ -681,6 +716,11 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
+    /// Tools that must not be exposed while handling turns from this channel.
+    fn excluded_tools(&self) -> &[String] {
+        &[]
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
@@ -696,6 +736,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+
+    /// Start listening with a priority path for transport control events.
+    ///
+    /// Existing channels use [`Channel::listen`]. Voice transports can override
+    /// this method so interruption controls never wait behind ordinary inbound
+    /// messages. Control messages carry routing metadata only and never become
+    /// model input.
+    async fn listen_with_control(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        _control_tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        self.listen(tx).await
+    }
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -1239,6 +1293,25 @@ mod tests {
         assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
         assert!(msg.references.is_empty());
+    }
+
+    #[test]
+    fn voice_event_say_roundtrip() {
+        let event = VoiceEvent::Say {
+            text: "Hello from ZeroClaw".into(),
+            voice: Some("en-US".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"say","text":"Hello from ZeroClaw","voice":"en-US"}"#
+        );
+        let decoded: VoiceEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            VoiceEvent::Say { text, voice }
+                if text == "Hello from ZeroClaw" && voice.as_deref() == Some("en-US")
+        ));
     }
 
     #[test]

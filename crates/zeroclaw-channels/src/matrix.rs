@@ -2913,6 +2913,7 @@ mod inbound {
 /// When the owning agent states no preference, a lone registered provider is
 /// bound so single-provider deployments keep working without an explicit
 /// `transcription_provider`.
+#[cfg(test)]
 pub(crate) fn build_transcription_manager(
     config: &zeroclaw_config::schema::Config,
     agent_provider: &str,

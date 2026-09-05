@@ -73,6 +73,20 @@ impl MessageDebouncer {
         self.debounce_inner(sender_key, message, window).await
     }
 
+    /// Cancel a pending debounced delivery for `sender_key`.
+    ///
+    /// Dropping the result sender wakes the waiting dispatch task with an
+    /// error, so cancelled content cannot fire after the control event.
+    pub async fn cancel(&self, sender_key: &str) -> bool {
+        let entry = self.entries.lock().await.remove(sender_key);
+        if let Some(entry) = entry {
+            entry.timer_handle.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     async fn debounce_inner(
         &self,
         sender_key: &str,
@@ -222,5 +236,18 @@ mod tests {
         };
         let combined = rx.await.unwrap();
         assert_eq!(combined, "fast");
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_pending_delivery_and_drops_receiver() {
+        let debouncer = MessageDebouncer::new(Duration::from_millis(100));
+        let receiver = match debouncer.debounce("voice-user", "hello").await {
+            DebounceResult::Pending(receiver) => receiver,
+            DebounceResult::Passthrough(_) => panic!("expected Pending"),
+        };
+
+        assert!(debouncer.cancel("voice-user").await);
+        assert!(receiver.await.is_err());
+        assert!(!debouncer.cancel("voice-user").await);
     }
 }

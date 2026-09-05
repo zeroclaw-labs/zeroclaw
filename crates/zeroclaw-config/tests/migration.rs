@@ -1982,6 +1982,36 @@ fn v3_channel_types_covers_every_typed_channel_slot() {
     );
 }
 
+#[test]
+fn v2_voicehost_channel_is_alias_wrapped() {
+    let v3 = migrate_v2(
+        r#"
+schema_version = 2
+
+[channels.voicehost]
+enabled = true
+backend = "wyoming-events-ws"
+url = "ws://127.0.0.1:8765"
+"#,
+    );
+    let voicehost = lookup_dotted(&v3, "channels.voicehost.default")
+        .and_then(toml::Value::as_table)
+        .expect("V2 voicehost config must be wrapped under the default alias");
+
+    assert_eq!(
+        voicehost.get("enabled").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        voicehost.get("backend").and_then(toml::Value::as_str),
+        Some("wyoming-events-ws")
+    );
+    assert_eq!(
+        voicehost.get("url").and_then(toml::Value::as_str),
+        Some("ws://127.0.0.1:8765")
+    );
+}
+
 // ─────────────────────────────────────────────────────────────
 // V2 [heartbeat] enabled → V3 heartbeat.agent backfill
 // ─────────────────────────────────────────────────────────────

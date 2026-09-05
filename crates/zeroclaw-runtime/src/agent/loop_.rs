@@ -600,8 +600,64 @@ pub(crate) fn capture_llm_messages(
     })
 }
 
+fn filter_deferred_tools_for_turn(
+    deferred_section: &str,
+    excluded_tool_names: &HashSet<&str>,
+) -> String {
+    const OPEN: &str = "<available-deferred-tools>\n";
+    const CLOSE: &str = "</available-deferred-tools>";
+
+    let Some(open_start) = deferred_section.find(OPEN) else {
+        return deferred_section.to_string();
+    };
+    let body_start = open_start + OPEN.len();
+    let Some(close_offset) = deferred_section[body_start..].find(CLOSE) else {
+        return deferred_section.to_string();
+    };
+    let close_start = body_start + close_offset;
+    let kept_lines: Vec<&str> = if excluded_tool_names.contains("tool_search") {
+        Vec::new()
+    } else {
+        deferred_section[body_start..close_start]
+            .lines()
+            .filter(|line| {
+                let name = line
+                    .split_once(" - ")
+                    .map_or_else(|| line.trim(), |(name, _)| name.trim());
+                name.is_empty() || !excluded_tool_names.contains(name)
+            })
+            .collect()
+    };
+
+    if kept_lines.iter().all(|line| line.trim().is_empty()) {
+        let deferred_start = deferred_section[..open_start]
+            .rfind("## Deferred Tools")
+            .unwrap_or(open_start);
+        let suffix_start = close_start + CLOSE.len();
+        let prefix = deferred_section[..deferred_start].trim_end_matches('\n');
+        let suffix = deferred_section[suffix_start..].trim_start_matches('\n');
+        return match (prefix.is_empty(), suffix.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => suffix.to_string(),
+            (false, true) => prefix.to_string(),
+            (false, false) => format!("{prefix}\n\n{suffix}"),
+        };
+    }
+
+    let mut filtered = String::with_capacity(deferred_section.len());
+    filtered.push_str(&deferred_section[..body_start]);
+    for line in kept_lines {
+        filtered.push_str(line);
+        filtered.push('\n');
+    }
+    filtered.push_str(&deferred_section[close_start..]);
+    filtered
+}
+
+/// Build the model-visible system prompt for one turn from the same effective
+/// tool exclusion set used by native specs and runtime execution.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_system_prompt_for_turn(
+pub fn build_system_prompt_for_turn(
     agent_workspace: &std::path::Path,
     model_name: &str,
     tool_descs: &[(&str, &str)],
@@ -641,7 +697,8 @@ pub(crate) fn build_system_prompt_for_turn(
         .collect();
     let mut turn_tool_descs = tool_descs.to_vec();
     turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
-    let mut turn_deferred_section = deferred_section.to_string();
+    let mut turn_deferred_section =
+        filter_deferred_tools_for_turn(deferred_section, &excluded_tool_names);
     let expose_text_tool_protocol = apply_text_tool_prompt_policy(
         native_tools,
         strict_tool_parsing,
@@ -12664,6 +12721,7 @@ This is an example, not an invocation."#;
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
+        assert_eq!(tools[0].name(), "shell");
         let instructions = build_tool_instructions(&tools);
 
         assert!(instructions.contains("## Tool Use Protocol"));
@@ -12671,6 +12729,11 @@ This is an example, not an invocation."#;
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+        assert!(
+            !instructions.contains("Example tool call:"),
+            "the prompt must not synthesize a concrete call without schema-valid arguments"
+        );
+        assert!(!instructions.contains(r#"{"name":"shell","arguments":{}}"#));
     }
 
     /// The tool-call guidance lives in `agent::tool_call_format` and
@@ -13907,6 +13970,114 @@ Let me check the result."#;
             system_prompt.contains("**read_skill**"),
             "non-native compact text protocol must advertise read_skill"
         );
+    }
+
+    #[test]
+    fn turn_prompt_excludes_deferred_tools_and_preserves_pinned_resources() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "tool_search",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+        let tool_descs = [("tool_search", "Load deferred tool schemas")];
+        let mcp_prompt = "## Deferred Tools\n\n\
+<available-deferred-tools>\n\
+server__secret - Must stay hidden\n\
+server__allowed - May remain visible\n\
+</available-deferred-tools>\n\n\
+## Pinned MCP Resources\n\nPinned handbook body";
+        let excluded_tools = vec!["server__secret".to_string()];
+
+        let system_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            mcp_prompt,
+            &[],
+            None,
+            None,
+            &RiskProfileConfig::default(),
+            &provider,
+            &tools_registry,
+            &excluded_tools,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("turn prompt should build");
+
+        assert!(
+            !system_prompt.contains("server__secret"),
+            "excluded deferred tools must be absent from the final prompt: {system_prompt}"
+        );
+        assert!(system_prompt.contains("server__allowed - May remain visible"));
+        assert!(system_prompt.contains("## Pinned MCP Resources"));
+        assert!(system_prompt.contains("Pinned handbook body"));
+    }
+
+    #[test]
+    fn excluding_tool_search_removes_deferred_section_for_all_provider_modes() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().unwrap();
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "tool_search",
+            Arc::new(AtomicUsize::new(0)),
+        ))];
+        let tool_descs = [("tool_search", "Load deferred tool schemas")];
+        let mcp_prompt = "## Deferred Tools\n\n\
+Call `tool_search` before using a deferred tool.\n\n\
+<available-deferred-tools>\n\
+server__allowed - Must disappear with its loader\n\
+</available-deferred-tools>\n\n\
+## Pinned MCP Resources\n\nPinned handbook body";
+        let excluded_tools = vec!["tool_search".to_string()];
+
+        for native_tools in [false, true] {
+            let provider = if native_tools {
+                ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support()
+            } else {
+                ScriptedModelProvider::from_text_responses(vec!["ok"])
+            };
+            let system_prompt = super::build_system_prompt_for_turn(
+                workspace.path(),
+                "test-model",
+                &tool_descs,
+                mcp_prompt,
+                &[],
+                None,
+                None,
+                &RiskProfileConfig::default(),
+                &provider,
+                &tools_registry,
+                &excluded_tools,
+                None,
+                false,
+                SkillsPromptInjectionMode::Full,
+                false,
+                usize::MAX,
+                true,
+                false,
+                None,
+                None,
+            )
+            .expect("turn prompt should build");
+
+            assert!(!system_prompt.contains("## Deferred Tools"));
+            assert!(!system_prompt.contains("server__allowed"));
+            assert!(!system_prompt.contains("Call `tool_search`"));
+            assert!(system_prompt.contains("## Pinned MCP Resources"));
+            assert!(system_prompt.contains("Pinned handbook body"));
+        }
     }
 
     #[test]
