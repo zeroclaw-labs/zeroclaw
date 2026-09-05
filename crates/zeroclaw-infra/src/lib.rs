@@ -201,4 +201,46 @@ mod tests {
         assert!(message.contains("Failed to open session DB"));
         assert!(message.contains("unable to open database file"));
     }
+
+    /// The ownership contract is single-sourced: `supports_atomic_claim()`
+    /// must agree with what `claim_session_agent_alias` actually does on every
+    /// built-in backend, so a capability probe can never gate a claim path on
+    /// a probe that disagrees with the behaviour it claims to predict.
+    #[test]
+    fn supports_atomic_claim_agrees_with_claim_behavior_across_backends() {
+        use crate::session_backend::ClaimOutcome;
+
+        let tmp = TempDir::new().unwrap();
+
+        // SQLite implements the atomic claim: probe says yes, claim on an
+        // unowned id is `Claimed`, and a same-alias re-claim stays `Claimed`.
+        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
+        assert!(
+            sqlite.supports_atomic_claim(),
+            "sqlite must support atomic claim"
+        );
+        match sqlite.claim_session_agent_alias("k", "alice") {
+            Ok(ClaimOutcome::Claimed) => {}
+            other => panic!("sqlite claim of unowned id must be Claimed, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                sqlite.claim_session_agent_alias("k", "alice"),
+                Ok(ClaimOutcome::Claimed)
+            ),
+            "sqlite same-alias re-claim must stay Claimed"
+        );
+
+        // JSONL does not track ownership: probe says no, and the claim fails
+        // closed with `Err(Unsupported)`. The probe must agree with that.
+        let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
+        assert!(
+            !jsonl.supports_atomic_claim(),
+            "jsonl must not support atomic claim"
+        );
+        let err = jsonl
+            .claim_session_agent_alias("k", "alice")
+            .expect_err("jsonl claim must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
 }

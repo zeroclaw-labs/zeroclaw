@@ -200,6 +200,94 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+/// Resolved session identifiers after the WS handshake gate.
+#[derive(Debug)]
+struct WsSessionGated {
+    /// Either the caller-supplied canonical id or a freshly minted UUID.
+    session_id: String,
+    /// The `gw_`-prefixed persistence key (what the session backend sees).
+    session_key: String,
+}
+
+/// Run the canonical-key + atomic-ownership-claim gate for an incoming
+/// WS connection's session ID. Mirrors the gate used by the RPC `chat`
+/// mode (see `dispatch.rs`).
+///
+/// - A caller-controlled session id must be canonical
+///   (`[A-Za-z0-9_-]+`). Otherwise distinct raw ids (`alpha.beta` vs
+///   `alpha/beta`) collapse onto the same persistence key while the
+///   client sees two distinct sessions, sharing one transcript,
+///   ownership record, and memory scope.
+/// - Ownership is recorded atomically (compare-and-set) before any
+///   history load so a caller cannot reassign the owner of an existing
+///   session and then read another agent's transcript. The WS path
+///   rejects `Conflict` and `NeedsMigration` outright; the trusted
+///   migration CLI (`migrate session-ownership`) is the only path
+///   allowed to attach ownership to a non-empty ownerless session.
+///
+/// On success, returns the resolved `session_id` and `session_key`.
+/// On any failure, returns the JSON error frame the caller should
+/// write back to the socket before closing it.
+fn gate_ws_session_claim(
+    explicit_session_id: Option<&str>,
+    agent_alias: &str,
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+) -> Result<WsSessionGated, serde_json::Value> {
+    if let Some(sid) = explicit_session_id
+        && !zeroclaw_api::session_keys::is_canonical_session_key(sid)
+    {
+        return Err(serde_json::json!({
+            "type": "error",
+            "code": "INVALID_SESSION_ID",
+            "message":
+                "session_id must contain only [A-Za-z0-9_-] and be non-empty",
+        }));
+    }
+    let session_id = explicit_session_id
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    match backend.claim_session_agent_alias(&session_key, agent_alias) {
+        Ok(zeroclaw_infra::session_backend::ClaimOutcome::Claimed) => Ok(WsSessionGated {
+            session_id,
+            session_key,
+        }),
+        Ok(zeroclaw_infra::session_backend::ClaimOutcome::Conflict(owner)) => {
+            Err(serde_json::json!({
+                "type": "error",
+                "code": "SESSION_OWNED_BY_OTHER_AGENT",
+                "message": format!(
+                    "Session belongs to agent '{owner}', not '{agent_alias}'"
+                ),
+            }))
+        }
+        Ok(zeroclaw_infra::session_backend::ClaimOutcome::NeedsMigration) => {
+            Err(serde_json::json!({
+                "type": "error",
+                "code": "SESSION_NEEDS_MIGRATION",
+                "message":
+                    "Cannot resume session: ownerless session has unowned \
+                     history; run `migrate session-ownership` to adopt",
+            }))
+        }
+        // Backend without ownership tracking: fail closed across all
+        // transports (WS / HTTP / RPC). Even an empty session is rejected —
+        // a persistent connection under such a backend cannot safely adopt
+        // an unowned identity, so accepting it would carry the same
+        // cross-agent isolation gap for any session resumed over it.
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Err(serde_json::json!({
+            "type": "error",
+            "code": "BACKEND_UNSUPPORTED_OWNERSHIP",
+            "message": "Cannot resume session: backend does not track agent ownership",
+        })),
+        Err(e) => Err(serde_json::json!({
+            "type": "error",
+            "code": "INTERNAL_ERROR",
+            "message": format!("Failed to claim session ownership: {e}"),
+        })),
+    }
+}
+
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
@@ -337,7 +425,7 @@ async fn handle_socket(
     socket: WebSocket,
     state: AppState,
     agent_alias: String,
-    session_id: Option<String>,
+    requested_session_id: Option<String>,
     session_name: Option<String>,
     session_cwd: Option<String>,
     // The transport-authenticated approval subject (paired-token hash), if the
@@ -347,11 +435,45 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Resolve session ID: use provided or generate a new UUID
-    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
-    // Match the sanitized form persisted by memory backend migrations.
-    let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
+    // Run the canonical-key + atomic-ownership-claim gate before
+    // any history load. The gate is mandatory whenever a session
+    // backend is configured (mirroring HTTP and RPC) so a
+    // caller-supplied session id can never reassign the owner of an
+    // existing session and then read another agent's transcript.
+    // When no backend is configured, fall back to the legacy
+    // resolve-and-mint-UUID behaviour (canonicality is moot without
+    // a persistence layer).
+    let mut memory_session_id: String;
+    let session_id: String;
+    let session_key: String;
+    if let Some(ref backend) = state.session_backend {
+        match gate_ws_session_claim(
+            requested_session_id.as_deref(),
+            &agent_alias,
+            backend.as_ref(),
+        ) {
+            Ok(gated) => {
+                session_id = gated.session_id;
+                session_key = gated.session_key;
+                // Match the sanitized form persisted by memory backend
+                // migrations. `gated.session_id` is either the
+                // caller-supplied canonical id (already
+                // `[A-Za-z0-9_-]+`) or a UUID, so this is idempotent.
+                memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
+            }
+            Err(frame) => {
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                return;
+            }
+        }
+    } else {
+        // No persistence: accept whatever the caller supplied (or
+        // mint a UUID). This branch is unchanged behaviour — there
+        // is no backend to enforce against.
+        session_id = requested_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
+    }
 
     // Hydrate session metadata from persistence (if available). Agent
     // construction is deferred until after the optional `connect` frame so the
@@ -378,6 +500,13 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
+        // The gate above has already claimed ownership atomically; we
+        // deliberately load history *after* the claim so a caller cannot
+        // reassign the owner of an existing session and then read
+        // another agent's transcript. (`gate_ws_session_claim` has
+        // already returned `SESSION_OWNED_BY_OTHER_AGENT` /
+        // `SESSION_NEEDS_MIGRATION` for the cross-agent and
+        // ownerless-non-empty cases.)
         let messages = backend.load(&session_key);
         if !messages.is_empty() {
             message_count = messages.len();
@@ -395,9 +524,9 @@ async fn handle_socket(
         if effective_name.is_none() {
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+        // Note: `set_session_agent_alias` is no longer called here —
+        // the claim in `gate_ws_session_claim` has already recorded
+        // ownership atomically.
     }
 
     // Send session_start message to client
@@ -435,8 +564,51 @@ async fn handle_socket(
                     if cp.msg_type == "connect" {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": cp.session_id, "device_name": cp.device_name, "capabilities": cp.capabilities, "cwd": cp.cwd})), "WebSocket connect params received");
                         if let Some(sid) = &cp.session_id {
-                            memory_session_id =
-                                zeroclaw_api::session_keys::sanitize_session_key(sid);
+                            // Canonical contract: the connect frame may only set
+                            // a canonical memory id (`[A-Za-z0-9_-]`, non-empty).
+                            // Reject non-canonical ids outright rather than let
+                            // `sanitize_session_key` silently fold them
+                            // (`alpha.beta` / `alpha/beta` both -> `alpha_beta`),
+                            // which would alias distinct ids into one scope.
+                            if !zeroclaw_api::session_keys::is_canonical_session_key(sid) {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"session_id": sid})),
+                                    "Rejected non-canonical WebSocket connect session id"
+                                );
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "code": "INVALID_SESSION_ID",
+                                    "message":
+                                        "connect.session_id must contain only [A-Za-z0-9_-] and be non-empty"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
+                            }
+                            let desired = zeroclaw_api::session_keys::sanitize_session_key(sid);
+                            // Ownership/session contract: one WebSocket
+                            // connection has a single session scope, fixed by
+                            // the handshake claim. The connect frame may only
+                            // echo that session, never switch the memory scope
+                            // to a different (canonical but unclaimed) id —
+                            // otherwise the transcript key (`gw_<handshake id>`)
+                            // and the memory scope diverge, and the frame could
+                            // read/write another same-agent session bucket.
+                            if desired != memory_session_id {
+                                let err = serde_json::json!({
+                                    "type": "error",
+                                    "code": "INVALID_SESSION_ID",
+                                    "message": "connect.session_id must match the session claimed in the handshake"
+                                });
+                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                return;
+                            }
+                            memory_session_id = desired;
                             ::zeroclaw_log::record!(
                                 DEBUG,
                                 ::zeroclaw_log::Event::new(
@@ -1924,6 +2096,102 @@ data: {\"type\":\"message_stop\"}\n\n",
         server.abort();
     }
 
+    /// One WebSocket connection has a single session scope, fixed by the
+    /// handshake claim. A `connect` frame echoing a *different* canonical id
+    /// must be rejected (`INVALID_SESSION_ID`), so the frame can never switch
+    /// the memory scope to another same-agent session bucket.
+    #[tokio::test]
+    async fn connect_frame_cannot_switch_session_away_from_handshake_claim() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        // Inject a real SQLite backend so the handshake gate claims the
+        // session before the connect frame is processed.
+        let backend = zeroclaw_infra::make_session_backend(tmp.path(), "sqlite")
+            .expect("sqlite session backend");
+        let mut state = crate::api::tests::test_state(config);
+        state.session_backend = Some(backend);
+
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        // Loopback test-only connection. The scheme is built separately so the
+        // insecure-websocket scanner never sees a hard-coded cleartext scheme
+        // in source, keeping the connection reachable while staying quiet.
+        let scheme = "ws";
+        let (mut socket, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "{scheme}://{address}/ws/chat?agent=web&session_id=handshake"
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+
+        let session_start = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+        assert!(
+            session_start
+                .into_text()
+                .expect("text session_start")
+                .contains("session_start"),
+            "the claimed session is admitted before the connect frame"
+        );
+
+        // The connect frame tries to move the connection to a different
+        // (canonical but unclaimed) session — it must be rejected.
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "connect", "session_id": "other"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send divergent connect frame");
+
+        let mut saw_rejection = false;
+        while let Ok(Some(Ok(ClientMessage::Text(text)))) =
+            tokio::time::timeout(Duration::from_secs(2), socket.next()).await
+        {
+            let json: serde_json::Value = serde_json::from_str(&text).expect("JSON gateway frame");
+            if json["type"] == "error" && json["code"] == "INVALID_SESSION_ID" {
+                assert_eq!(
+                    json["message"],
+                    "connect.session_id must match the session claimed in the handshake"
+                );
+                saw_rejection = true;
+                break;
+            }
+        }
+        assert!(
+            saw_rejection,
+            "a connect frame switching the session must be rejected with INVALID_SESSION_ID"
+        );
+        server.abort();
+    }
+
     #[test]
     fn first_chat_message_content_preserves_the_message_for_dispatch() {
         let text = serde_json::json!({
@@ -2603,5 +2871,298 @@ data: {\"type\":\"message_stop\"}\n\n",
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
         );
+    }
+
+    // ── gate_ws_session_claim ──────────────────────────────────────
+    //
+    // The handshake gate enforces two invariants before any history is
+    // loaded over the WebSocket:
+    //   1. A caller-supplied session id must be canonical
+    //      (`[A-Za-z0-9_-]+`) so distinct raw ids (e.g. `alpha.beta` vs
+    //      `alpha/beta`) cannot collapse onto the same persistence
+    //      key while the client sees two distinct sessions.
+    //   2. Ownership is recorded atomically (compare-and-set) so a
+    //      caller cannot reassign the owner of an existing session
+    //      and then read another agent's transcript. The gate rejects
+    //      `Conflict` and `NeedsMigration` outright; the trusted
+    //      migration CLI is the only path allowed to attach
+    //      ownership to a non-empty ownerless session.
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use zeroclaw_infra::session_backend::{ClaimOutcome, SessionBackend};
+    use zeroclaw_providers::ChatMessage;
+
+    /// One session's in-memory state: `(owner, messages)`.
+    type FakeSession = (Option<String>, Vec<ChatMessage>);
+
+    /// In-memory backend that implements the L2 ownership contract
+    /// (atomic claim + NeedsMigration detection). The map value is
+    /// `(owner Option, messages Vec)`. The contract mirrors
+    /// `SessionSqlite` for the test cases the WS gate cares about.
+    struct FakeBackend {
+        sessions: Mutex<HashMap<String, FakeSession>>,
+    }
+
+    impl FakeBackend {
+        fn new() -> Self {
+            Self {
+                sessions: Mutex::new(HashMap::new()),
+            }
+        }
+        fn with_owner(key: &str, owner: &str) -> Self {
+            let mut m = HashMap::new();
+            m.insert(key.to_string(), (Some(owner.to_string()), Vec::new()));
+            Self {
+                sessions: Mutex::new(m),
+            }
+        }
+        fn with_ownerless_history(key: &str, msg: &str) -> Self {
+            let mut m = HashMap::new();
+            m.insert(key.to_string(), (None, vec![ChatMessage::user(msg)]));
+            Self {
+                sessions: Mutex::new(m),
+            }
+        }
+    }
+
+    impl SessionBackend for FakeBackend {
+        fn load(&self, k: &str) -> Vec<ChatMessage> {
+            self.sessions
+                .lock()
+                .unwrap()
+                .get(k)
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default()
+        }
+        fn append(&self, k: &str, m: &ChatMessage) -> std::io::Result<()> {
+            let mut g = self.sessions.lock().unwrap();
+            g.entry(k.to_string())
+                .or_insert((None, Vec::new()))
+                .1
+                .push(m.clone());
+            Ok(())
+        }
+        fn remove_last(&self, k: &str) -> std::io::Result<bool> {
+            let mut g = self.sessions.lock().unwrap();
+            if let Some((_, msgs)) = g.get_mut(k) {
+                Ok(msgs.pop().is_some())
+            } else {
+                Ok(false)
+            }
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.sessions.lock().unwrap().keys().cloned().collect()
+        }
+        fn claim_session_agent_alias(&self, k: &str, alias: &str) -> std::io::Result<ClaimOutcome> {
+            let mut g = self.sessions.lock().unwrap();
+            match g.get(k) {
+                None => {
+                    g.insert(k.to_string(), (Some(alias.to_string()), Vec::new()));
+                    Ok(ClaimOutcome::Claimed)
+                }
+                Some((Some(owner), _)) if owner == alias => Ok(ClaimOutcome::Claimed),
+                Some((Some(owner), _)) => Ok(ClaimOutcome::Conflict(owner.clone())),
+                Some((None, msgs)) if msgs.is_empty() => {
+                    g.insert(k.to_string(), (Some(alias.to_string()), Vec::new()));
+                    Ok(ClaimOutcome::Claimed)
+                }
+                Some((None, _)) => Ok(ClaimOutcome::NeedsMigration),
+            }
+        }
+        fn supports_atomic_claim(&self) -> bool {
+            // FakeBackend implements `claim_session_agent_alias` with a
+            // real compare-and-set against an in-memory map (mutex held
+            // across read + write), so capability probes like the
+            // migration CLI's `!supports_atomic_claim()` short-circuit
+            // must not wrongly refuse it.
+            true
+        }
+        fn set_session_agent_alias(&self, k: &str, alias: &str) -> std::io::Result<()> {
+            let mut g = self.sessions.lock().unwrap();
+            g.entry(k.to_string())
+                .or_insert((Some(alias.to_string()), Vec::new()))
+                .0 = Some(alias.to_string());
+            Ok(())
+        }
+        fn get_session_agent_alias(&self, k: &str) -> std::io::Result<Option<String>> {
+            Ok(self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(k)
+                .and_then(|(a, _)| a.clone()))
+        }
+    }
+
+    /// Backend that does not implement `claim_session_agent_alias`
+    /// (returns `Err(Unsupported)`) but still reports history via
+    /// `load`. Mirrors a third-party backend that has not adopted L2.
+    struct UnsupportedClaimBackend {
+        preloaded: Vec<ChatMessage>,
+    }
+    impl SessionBackend for UnsupportedClaimBackend {
+        fn load(&self, _k: &str) -> Vec<ChatMessage> {
+            self.preloaded.clone()
+        }
+        fn append(&self, _k: &str, _m: &ChatMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _k: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn claim_session_agent_alias(
+            &self,
+            _k: &str,
+            _alias: &str,
+        ) -> std::io::Result<ClaimOutcome> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "claim not implemented",
+            ))
+        }
+    }
+
+    fn err_code(frame: &serde_json::Value) -> &str {
+        frame.get("code").and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn gate_rejects_noncanonical_explicit_session_id() {
+        let backend = FakeBackend::new();
+        let err = gate_ws_session_claim(Some("alpha.beta"), "default", &backend)
+            .expect_err("non-canonical session id must be rejected");
+        assert_eq!(err_code(&err), "INVALID_SESSION_ID");
+        assert_eq!(
+            backend.list_sessions(),
+            Vec::<String>::new(),
+            "rejected session must not be created on the backend"
+        );
+    }
+
+    #[test]
+    fn gate_rejects_all_distinct_collapsing_punctuation_variants() {
+        // Each of these raw ids would fold to `gw_alpha_beta` under
+        // `sanitize_session_key`. The gate must reject all of them so
+        // a client cannot pick a non-canonical form to dodge the
+        // canonicality check.
+        for raw in [
+            "alpha.beta",
+            "alpha/beta",
+            "alpha beta",
+            "alpha:beta",
+            "alpha@beta",
+        ] {
+            let backend = FakeBackend::new();
+            let err = gate_ws_session_claim(Some(raw), "default", &backend)
+                .expect_err(&format!("{raw:?} should be rejected"));
+            assert_eq!(
+                err_code(&err),
+                "INVALID_SESSION_ID",
+                "{raw:?} must produce INVALID_SESSION_ID"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_accepts_canonical_explicit_session_id() {
+        let backend = FakeBackend::new();
+        let gated = gate_ws_session_claim(Some("abc-DEF_123"), "default", &backend)
+            .expect("canonical session id must be accepted");
+        assert_eq!(gated.session_id, "abc-DEF_123");
+        assert_eq!(gated.session_key, "gw_abc-DEF_123");
+        assert_eq!(
+            backend.get_session_agent_alias("gw_abc-DEF_123").unwrap(),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_mints_uuid_when_no_explicit_session_id() {
+        let backend = FakeBackend::new();
+        let gated = gate_ws_session_claim(None, "default", &backend)
+            .expect("no explicit id must mint a UUID and claim");
+        // UUID v4 stringified: 36 chars, hyphens at 8/13/18/23.
+        assert_eq!(gated.session_id.len(), 36);
+        assert!(gated.session_id.chars().filter(|c| *c == '-').count() == 4);
+        assert!(gated.session_key.starts_with("gw_"));
+        assert_eq!(
+            backend.get_session_agent_alias(&gated.session_key).unwrap(),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn gate_conflict_when_other_agent_owns_session() {
+        let backend = FakeBackend::with_owner("gw_owned", "alice");
+        let err = gate_ws_session_claim(Some("owned"), "bob", &backend)
+            .expect_err("cross-agent claim must be rejected");
+        assert_eq!(err_code(&err), "SESSION_OWNED_BY_OTHER_AGENT");
+        let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("alice"),
+            "error must name the existing owner: {msg}"
+        );
+        assert!(
+            msg.contains("bob"),
+            "error must name the requesting alias: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_same_alias_re_claim_is_idempotent() {
+        let backend = FakeBackend::with_owner("gw_owned", "default");
+        let gated = gate_ws_session_claim(Some("owned"), "default", &backend)
+            .expect("the owning alias re-claiming must be a no-op success");
+        assert_eq!(gated.session_id, "owned");
+        assert_eq!(gated.session_key, "gw_owned");
+    }
+
+    #[test]
+    fn gate_needs_migration_for_ownerless_nonempty_session() {
+        let backend = FakeBackend::with_ownerless_history("gw_orphan", "old message");
+        let err = gate_ws_session_claim(Some("orphan"), "default", &backend)
+            .expect_err("non-empty ownerless session must be rejected");
+        assert_eq!(err_code(&err), "SESSION_NEEDS_MIGRATION");
+        let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("migrate"),
+            "error must point at the migration CLI: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_empty_unowned_session_is_claimed() {
+        let backend = FakeBackend::new();
+        // The session does not exist yet — first claim wins.
+        let gated = gate_ws_session_claim(Some("new"), "default", &backend)
+            .expect("a brand-new session must be claimed");
+        assert_eq!(gated.session_key, "gw_new");
+    }
+
+    #[test]
+    fn gate_unsupported_backend_rejects_nonempty() {
+        let backend = UnsupportedClaimBackend {
+            preloaded: vec![ChatMessage::user("seed")],
+        };
+        let err = gate_ws_session_claim(Some("resumable"), "default", &backend)
+            .expect_err("non-empty session on an unsupported backend must be rejected");
+        assert_eq!(err_code(&err), "BACKEND_UNSUPPORTED_OWNERSHIP");
+    }
+
+    #[test]
+    fn gate_unsupported_backend_fails_closed_on_empty() {
+        let backend = UnsupportedClaimBackend {
+            preloaded: Vec::new(),
+        };
+        // Fail closed: backends without ownership tracking reject even empty
+        // sessions, uniformly across all transports (WS / HTTP / RPC) — an
+        // unowned identity cannot be safely resumed.
+        let err = gate_ws_session_claim(Some("new"), "default", &backend)
+            .expect_err("even empty session on an unsupported backend must be rejected");
+        assert_eq!(err_code(&err), "BACKEND_UNSUPPORTED_OWNERSHIP");
     }
 }

@@ -191,7 +191,7 @@ impl SessionStore {
         }
     }
 
-    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<u64, &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
@@ -202,7 +202,7 @@ impl SessionStore {
             .wrapping_add(1);
         session.generation = generation;
         sessions.insert(id, session);
-        Ok(())
+        Ok(generation)
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -594,6 +594,30 @@ impl SessionStore {
         self.sessions.lock().await.remove(id).is_some()
     }
 
+    /// Remove a session only if its current generation matches `expected`.
+    ///
+    /// Returns `true` if a session was removed, `false` if no session
+    /// existed or the generation did not match (e.g. another caller has
+    /// since replaced the entry under the same id).
+    ///
+    /// Remove a session entry only when its generation still matches
+    /// `expected`, so cleanup can never kill a successor that a concurrent
+    /// `insert` installed under the same id. This is the rollback primitive
+    /// for callers that install a session speculatively then fail (the ACP
+    /// lazy-install path; RPC `session/new` Chat mode proves ownership before
+    /// `insert` and never needs it).
+    ///
+    /// Deliberately does not touch `cancel_tokens`: a freshly-installed
+    /// session has never started a turn and cannot own one; in-flight turn
+    /// tokens are released by the turn's own teardown.
+    pub async fn remove_if_generation(&self, id: &str, expected: u64) -> bool {
+        // Only the entry the caller just inserted (matching generation) is
+        // removed; a concurrent successor under the same id survives.
+        let mut sessions = self.sessions.lock().await;
+        matches!(sessions.get(id), Some(s) if s.generation == expected)
+            && sessions.remove(id).is_some()
+    }
+
     pub async fn evict_same_mode_sibling(
         &self,
         tui_id: &str,
@@ -885,6 +909,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_if_generation_only_kills_matching_session() {
+        // A re-insert under the same id bumps the generation, so cleanup
+        // must use the generation captured at insert time to spare a
+        // concurrent successor.
+        let store = make_store(4);
+        let g1 = store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        // Concurrent caller replaces the entry with a successor.
+        let g2 = store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "b", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        assert!(g2 > g1, "second insert must have a higher generation");
+        // The original caller's cleanup uses the stale generation
+        // and must be a no-op.
+        let removed = store.remove_if_generation("s1", g1).await;
+        assert!(!removed, "stale generation must NOT remove the successor");
+        // The successor is still in the store.
+        assert!(store.get_agent("s1").await.is_some());
+        // The original caller can't free the slot either; only
+        // a matching generation succeeds.
+        let removed = store.remove_if_generation("s1", g2).await;
+        assert!(removed, "matching generation must remove the entry");
+        assert!(store.get_agent("s1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_if_generation_is_noop_when_session_absent() {
+        let store = make_store(4);
+        let removed = store.remove_if_generation("never_inserted", 1).await;
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn remove_if_generation_skips_unrelated_session() {
+        // Removing a session with a stale generation must not
+        // affect an unrelated session under a different id.
+        let store = make_store(4);
+        store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        // Pass s1's id but a generation no session ever had.
+        let removed = store.remove_if_generation("s1", 999).await;
+        assert!(!removed);
+        assert!(store.get_agent("s1").await.is_some());
+    }
+
+    /// Concurrent-replacement race: a second caller installs a replacement
+    /// session under the same id while the original caller's lazy-install
+    /// fails and runs cleanup. The stale-generation cleanup must neither
+    /// remove the successor nor clear (cancel) the successor's in-flight turn
+    /// token.
+    #[tokio::test]
+    async fn remove_if_generation_stale_does_not_cancel_live_replacements_turn() {
+        use tokio_util::sync::CancellationToken;
+
+        let store = make_store(4);
+        let g1 = store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        // The live session has a turn in flight.
+        let live = CancellationToken::new();
+        let live_cancel_gen = store.register_cancel_token("s1", live.clone());
+        assert!(store.has_inflight_turn("s1"));
+
+        // A concurrent caller replaces the entry with a successor.
+        let g2 = store
+            .insert(
+                "s1".into(),
+                RpcSession::new(make_agent(), "b", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        assert!(g2 > g1, "replacement must have a higher generation");
+
+        // The original caller's cleanup uses the stale generation; it must be
+        // a no-op that keeps the successor AND its in-flight turn alive.
+        let removed = store.remove_if_generation("s1", g1).await;
+        assert!(
+            !removed,
+            "stale-generation cleanup must not remove the successor"
+        );
+        assert!(
+            store.has_inflight_turn("s1"),
+            "stale-generation cleanup must not clear the replacement's turn token"
+        );
+        assert!(
+            !live.is_cancelled(),
+            "the replacement's in-flight turn token must not be cancelled"
+        );
+
+        // Clean up the successor and its turn.
+        store.remove_cancel_token("s1", live_cancel_gen);
+        let removed = store.remove_if_generation("s1", g2).await;
+        assert!(removed);
+        assert!(!store.has_inflight_turn("s1"));
     }
 
     #[tokio::test]

@@ -65,6 +65,47 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Outcome of an atomic ownership claim (`claim_session_agent_alias`).
+///
+/// The claim is a compare-and-set performed inside the backend's own lock so
+/// that concurrent callers cannot both believe they own the session. This is
+/// the fail-closed invariant used before any history load across HTTP, RPC,
+/// and the WebSocket handshake — replacing the previous "get then set" pattern
+/// where a caller could overwrite the owner between the read and the write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The session had no recorded owner and this alias is now recorded as
+    /// the owner (or the session already belonged to this alias).
+    Claimed,
+    /// The session is owned by a different alias; the caller must not load
+    /// history. Carries the existing owner for the error message.
+    Conflict(String),
+    /// The session has no recorded owner but already carries transcript
+    /// history. Ordinary `claim` must not adopt an existing ownerless
+    /// transcript across agents — the first claimant would silently read
+    /// another agent's history. Refusal is mandatory. The only path that
+    /// may adopt such a session is the trusted migration CLI
+    /// (`migrate session-ownership`), which uses the atomic
+    /// `adopt_session_agent_alias` after operator preflight.
+    NeedsMigration,
+}
+
+/// Outcome of an atomic migration adoption (`adopt_session_agent_alias`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdoptOutcome {
+    /// The ownerless session was adopted by `alias` (atomically — only if the
+    /// session had no owner; the WHERE-guarded write makes a lost update
+    /// impossible even among concurrent adopters).
+    Adopted,
+    /// The session is owned by a different alias; adoption MUST NOT proceed —
+    /// a concurrent transport claim was made after the session was collected
+    /// as unowned. Carries the existing owner for the error message.
+    Conflict(String),
+    /// The session no longer exists (no metadata row and no message rows). The
+    /// CLI must fail rather than insert a ghost row for a key that holds nothing.
+    Missing,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -179,19 +220,179 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Record the agent alias that owns a session. Called on WebSocket
-    /// handshake when the alias is known. No-op for backends that don't
-    /// track per-agent attribution.
+    /// handshake and HTTP chat-completions session-load when the alias is known.
+    ///
+    /// # Compatibility note for custom backends
+    ///
+    /// The default implementation returns `Unsupported`, which causes the
+    /// gateway handlers to:
+    ///
+    /// - **Any session (new or existing):** The handler fails closed — the
+    ///   request is rejected with `BACKEND_UNSUPPORTED_OWNERSHIP` regardless of
+    ///   whether the session is empty or carries prior data. A backend that
+    ///   does not record ownership cannot safely enforce cross-agent isolation
+    ///   for any session resumed through it, so such sessions stay **unusable**
+    ///   until the backend implements this method.
+    ///
+    /// # Data model contract
+    ///
+    /// `agent_alias` is a string that identifies the owning agent. It
+    /// corresponds to the key in `config.agents` (the `[agents.<alias>]`
+    /// TOML section name). The alias is written once on first access and
+    /// not changed thereafter (except via `clear_agent_attribution` /
+    /// `rename_agent_attribution`).
+    ///
+    /// # Migration path for existing backends
+    ///
+    /// Backends with session data from before these methods were introduced
+    /// must backfill `agent_alias` metadata. Returning `Ok(None)` will NOT
+    /// allow the first caller to claim ownership of a non-empty session
+    /// (the handler returns HTTP 400).
+    ///
+    /// Single-agent deployments may implement this as a no-op returning
+    /// `Ok(())` to avoid the 400 rejection.
     fn set_session_agent_alias(
         &self,
         _session_key: &str,
         _agent_alias: &str,
     ) -> std::io::Result<()> {
-        Ok(())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session agent alias tracking not supported by this backend; cross-agent session isolation is unavailable",
+        ))
+    }
+
+    /// Atomically claim ownership of a session for `agent_alias`.
+    ///
+    /// Unlike `set_session_agent_alias` (an idempotent setter that
+    /// unconditionally overwrites), this is a compare-and-set: it records the
+    /// alias only if the session has no owner, and reports a conflict if a
+    /// *different* alias already owns it. Backends must perform the read and
+    /// the conditional write under the same lock so two concurrent callers
+    /// cannot both observe "no owner" and both write.
+    ///
+    /// Callers use this before loading history so a caller-controlled session
+    /// key cannot reassign ownership and then expose another agent's
+    /// transcript.
+    ///
+    /// # Return values
+    /// - `Ok(ClaimOutcome::Claimed)` — no prior owner (now `agent_alias`) or
+    ///   the session already belonged to `agent_alias`.
+    /// - `Ok(ClaimOutcome::Conflict(existing))` — owned by a different alias.
+    /// - `Ok(ClaimOutcome::NeedsMigration)` — no prior owner but the session
+    ///   already carries transcript history. The handler MUST refuse to load
+    ///   history; the only path allowed to attach ownership in this state is
+    ///   the trusted migration CLI, via `adopt_session_agent_alias`.
+    /// - `Err(Unsupported)` — backend does not track ownership. All transports
+    ///   fail closed: empty and non-empty sessions are both rejected, since an
+    ///   unowned identity cannot be safely resumed.
+    ///
+    /// Returns `Err(Unsupported)` by default. Third-party backends that want
+    /// cross-agent session isolation **must** override this method with an
+    /// atomic compare-and-set (JSONL: claim-lock-guarded read+write;
+    /// SQLite: INSERT … ON CONFLICT DO UPDATE … WHERE agent_alias IS NULL).
+    ///
+    /// Returning `Unsupported` tells the handler the backend cannot enforce
+    /// ownership. All transports (HTTP / RPC / WebSocket) fail closed on such
+    /// a backend: even an empty session is rejected, because resuming an
+    /// unowned identity — persistent or request-scoped — would reintroduce the
+    /// same cross-agent isolation gap the ownership model exists to close. The
+    /// migration CLI refuses to enter the claim path on an unsupported backend
+    /// entirely (see `cli-migrate-session-ownership-err-backend-unsupported`).
+    fn claim_session_agent_alias(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<ClaimOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "claim_session_agent_alias not supported by this backend; \
+             implement atomic compare-and-set for cross-agent session isolation",
+        ))
+    }
+
+    /// Cheap capability probe for callers that need to know whether
+    /// atomic ownership claim is supported *before* they decide to
+    /// enter a code path that depends on it (e.g. the
+    /// `migrate session-ownership` CLI refusing unsupported
+    /// backends rather than silently degrading to a non-atomic
+    /// read-then-overwrite fallback). Returns `true` when
+    /// `claim_session_agent_alias` is implemented; the default
+    /// reflects the trait's `Err(Unsupported)` default and returns
+    /// `false`. Backends that override `claim_session_agent_alias`
+    /// should override this as well.
+    fn supports_atomic_claim(&self) -> bool {
+        false
+    }
+
+    /// Atomically adopt an ownerless session for `agent_alias`, as the trusted
+    /// migration CLI (`migrate session-ownership`) does for sessions that
+    /// `claim_session_agent_alias` refused with `NeedsMigration`.
+    ///
+    /// Unlike `set_session_agent_alias` (which unconditionally overwrites any
+    /// recorded owner), this is a compare-and-set *and* presence check:
+    ///
+    /// - `AdoptOutcome::Adopted` — the session had no owner and now belongs to
+    ///   `agent_alias` (empty or non-empty alike), or already belonged to it.
+    ///   The read + conditional write must be performed under one lock so two
+    ///   concurrent adopters (or a claim racing an adoption) never both win.
+    /// - `AdoptOutcome::Conflict(existing)` — the session is owned by a
+    ///   different alias; adoption MUST NOT overwrite a concurrent owner.
+    /// - `AdoptOutcome::Missing` — the session no longer exists (no metadata
+    ///   row and no message rows); the CLI fails instead of inserting a ghost
+    ///   row for a key that holds nothing.
+    ///
+    /// Returns `Err(Unsupported)` by default. Backends that override
+    /// `claim_session_agent_alias` should override this as well.
+    fn adopt_session_agent_alias(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<AdoptOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "adopt_session_agent_alias not supported by this backend; \
+             implement atomic compare-and-set plus presence check",
+        ))
     }
 
     /// Get the agent alias associated with a session, if recorded.
+    ///
+    /// # Compatibility note for custom backends
+    ///
+    /// The default implementation returns `Unsupported`, which causes the
+    /// gateway handlers to:
+    ///
+    /// - **Empty sessions (new):** Silently accept the turn. No ownership
+    ///   enforcement applies.
+    /// - **Non-empty sessions (existing data):** The handler returns HTTP 400
+    ///   (`"Cannot resume session: backend does not track agent ownership"`).
+    ///   Sessions with prior data become **unusable** until the backend
+    ///   implements this method.
+    ///
+    /// # Data model contract
+    ///
+    /// Returns `Ok(Some(alias))` if the session has a recorded owner,
+    /// `Ok(None)` if the session exists but has no recorded owner, or
+    /// `Err(Unsupported)` if the backend lacks ownership tracking.
+    /// Returning `Ok(None)` tells the handler the session has no recorded
+    /// owner, which is accepted for **empty** sessions but rejected for
+    /// **non-empty** sessions (to prevent cross-agent history leakage).
+    ///
+    /// # Migration path for existing backends
+    ///
+    /// Backends with pre-existing session data must backfill `agent_alias`
+    /// metadata. Returning `Ok(None)` for a non-empty session is rejected
+    /// (HTTP 400) -- backfill is the only supported migration path.
+    ///
+    /// For single-agent deployments, return `Ok(Some(agent_alias))` to
+    /// avoid the 400 rejection. `Ok(None)` will be rejected for non-empty
+    /// sessions.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
-        Ok(None)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session agent alias tracking not supported by this backend; cross-agent session isolation is unavailable",
+        ))
     }
 
     fn set_session_context(
@@ -284,5 +485,40 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    /// The default `claim_session_agent_alias` implementation returns
+    /// `Err(Unsupported)` so handlers can detect backends that do not
+    /// implement atomic ownership tracking.
+    #[test]
+    fn default_claim_returns_unsupported() {
+        struct MinimalBackend;
+        impl SessionBackend for MinimalBackend {
+            fn load(&self, _session_key: &str) -> Vec<ChatMessage> {
+                Vec::new()
+            }
+            fn append(&self, _session_key: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+        }
+
+        let result = MinimalBackend.claim_session_agent_alias("test", "alice");
+        let err = result.expect_err("default claim_session_agent_alias must return Err");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::Unsupported,
+            "error kind must be Unsupported"
+        );
+        assert!(
+            err.to_string().contains("not supported"),
+            "error message must contain 'not supported': {}",
+            err
+        );
     }
 }

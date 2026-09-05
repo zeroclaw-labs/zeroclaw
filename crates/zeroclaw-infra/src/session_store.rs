@@ -31,6 +31,16 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
+        let guard = self.mutation_lock.lock();
+        if guard.migrated || guard.receipt_state_uncertain {
+            return Err(std::io::Error::other(
+                "JSONL session store is inactive after SQLite migration",
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Create a new session store, ensuring the sessions directory exists.
     pub fn new(workspace_dir: &Path) -> std::io::Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
@@ -95,16 +105,6 @@ impl SessionStore {
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
-    }
-
-    fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
-        let guard = self.mutation_lock.lock();
-        if guard.migrated || guard.receipt_state_uncertain {
-            return Err(std::io::Error::other(
-                "JSONL session store is inactive after SQLite migration",
-            ));
-        }
-        Ok(guard)
     }
 
     fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
@@ -794,7 +794,6 @@ mod tests {
         writeln!(file, r#"{{"role":"user","content":"ok"}}"#).unwrap();
         writeln!(file, "corrupt line").unwrap();
         writeln!(file, r#"{{"role":"assistant","content":"hi"}}"#).unwrap();
-        drop(file);
 
         store.compact(key).unwrap();
 
