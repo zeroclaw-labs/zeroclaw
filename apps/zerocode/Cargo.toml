@@ -8,12 +8,7 @@ repository.workspace = true
 publish = true
 
 [features]
-# The SOP pane is unconditionally reachable from mode-bar navigation as a
-# read-only status surface; mutating run, authoring, delete, and checkpoint
-# actions stay disabled there. This flag gates no exposure today and is
-# reserved as the seam for future authoring and run-control work.
 default = []
-sop-authoring = []
 
 [[bin]]
 name = "zerocode"
