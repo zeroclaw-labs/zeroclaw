@@ -345,13 +345,15 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 ),
                 None => section_has_picker_for_key(&key),
             };
+            let group = zeroclaw_config::sections::section_group_for_key(&key);
             ConfigSectionEntry {
                 completed: completed.contains(&key),
                 ready: section_ready(&cfg, &key, completed.contains(&key)),
                 label: zeroclaw_config::sections::humanize_section_key(&key),
                 help: section_help(&key).to_string(),
                 has_picker,
-                group: section_group(&key).to_string(),
+                group: group.label().to_string(),
+                group_key: group.key().to_string(),
                 is_quickstart: wizard.is_some(),
                 shape: wizard.map(zeroclaw_config::sections::Section::shape),
                 cost_category: zeroclaw_config::schema::cost_category_for_provider_section(&key)
@@ -394,10 +396,6 @@ const HIDDEN_TOP_LEVEL: &[&str] = &[
     "env_overridden_paths",
     "pre_override_snapshots",
 ];
-
-fn section_group(key: &str) -> &'static str {
-    zeroclaw_config::sections::section_group_for_key(key).label()
-}
 
 /// Help text for a section. Delegates to `zeroclaw_config::sections::section_help`
 /// so gateway, CLI, and TUI all read from one source — wizard variants
@@ -1493,6 +1491,28 @@ mod tests {
                 "onboarding bookkeeping root `{hidden}` must not appear",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn handle_sections_emits_stable_group_key_with_english_fallback() {
+        use http_body_util::BodyExt;
+
+        let response = handle_sections(
+            State(section_test_state(empty_cfg())),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: ConfigSectionsResult = serde_json::from_slice(&body).unwrap();
+        let cron = result
+            .sections
+            .iter()
+            .find(|section| section.key == "cron")
+            .expect("schema-derived response should include cron");
+        assert_eq!(cron.group, "Agent");
+        assert_eq!(cron.group_key, "agent");
     }
 
     #[test]

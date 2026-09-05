@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use unic_langid::LanguageIdentifier;
 
 static STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static LOCALE_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -24,8 +25,9 @@ struct FtlSources {
 pub fn init(locale: &str, config_dir: &std::path::Path) {
     let _ = CONFIG_DIR.set(config_dir.to_path_buf());
     let locale = LOCALE.get_or_init(|| normalize_locale(locale));
-    STRINGS.get_or_init(|| load_strings(locale));
     FTL_SOURCES.get_or_init(|| load_ftl_sources(locale));
+    locale_strings(locale);
+    STRINGS.get_or_init(|| load_strings(locale));
 }
 
 pub fn t(key: &str) -> String {
@@ -43,6 +45,17 @@ pub fn t(key: &str) -> String {
 pub fn try_t(key: &str) -> Option<String> {
     let map = STRINGS.get_or_init(|| load_strings(active_locale()));
     map.get(key).cloned()
+}
+
+/// Look up a key only in the active non-English catalogue. Config metadata's
+/// canonical English fallback arrives from the daemon, so the embedded or
+/// downloaded English catalogue must not replace newer wire text.
+pub fn try_t_locale(key: &str) -> Option<String> {
+    let locale = active_locale();
+    if locale == "en" || locale.starts_with("en-") {
+        return None;
+    }
+    locale_strings(locale).get(key).cloned()
 }
 
 pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
@@ -73,12 +86,19 @@ fn active_locale() -> &'static str {
 
 fn load_strings(locale: &str) -> HashMap<String, String> {
     let mut map = format_ftl_messages(EN_FTL, "en");
-    if locale != "en"
-        && let Some(disk_ftl) = load_ftl_from_disk(locale)
-    {
-        map.extend(format_ftl_messages(&disk_ftl, locale));
-    }
+    map.extend(locale_strings(locale).clone());
     map
+}
+
+fn locale_strings(locale: &str) -> &'static HashMap<String, String> {
+    LOCALE_STRINGS.get_or_init(|| {
+        let sources = FTL_SOURCES.get_or_init(|| load_ftl_sources(locale));
+        sources
+            .disk
+            .as_deref()
+            .map(|source| format_ftl_messages(source, &sources.locale))
+            .unwrap_or_default()
+    })
 }
 
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
@@ -235,6 +255,84 @@ mod tests {
         .unwrap();
         assert!(mismatch.contains("0.8.1"));
         assert!(mismatch.contains("0.8.0"));
+    }
+
+    #[test]
+    fn config_metadata_catalogues_have_stable_keys_and_translations() {
+        let english = format_ftl_messages(EN_FTL, "en");
+        let metadata_keys: HashSet<String> = english
+            .keys()
+            .filter(|key| {
+                key.starts_with("zc-config-group-")
+                    || (key.starts_with("zc-config-section-")
+                        && (key.ends_with("-label") || key.ends_with("-help")))
+            })
+            .cloned()
+            .collect();
+        assert_eq!(metadata_keys.len(), 72);
+
+        let catalogues = [
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+        for (locale, source) in catalogues {
+            let map = format_ftl_messages(source, locale);
+            for key in &metadata_keys {
+                let value = map
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{locale} catalogue missing metadata key `{key}`"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{locale} metadata key `{key}` resolved to an empty value"
+                );
+            }
+        }
+
+        let representatives = [
+            (
+                "es",
+                include_str!("../locales/es/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "Fundamentos",
+                "zc-config-section-providers-models-label",
+                "Proveedores de modelos",
+            ),
+            (
+                "fr",
+                include_str!("../locales/fr/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "Fondations",
+                "zc-config-section-providers-models-label",
+                "Fournisseurs de modèles",
+            ),
+            (
+                "ja",
+                include_str!("../locales/ja/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "基盤",
+                "zc-config-section-providers-models-label",
+                "モデルプロバイダー",
+            ),
+            (
+                "zh-CN",
+                include_str!("../locales/zh-CN/zerocode.ftl"),
+                "zc-config-group-foundation",
+                "基础",
+                "zc-config-section-providers-models-label",
+                "模型提供商",
+            ),
+        ];
+        for (locale, source, group_key, group_value, section_key, section_value) in representatives
+        {
+            let map = format_ftl_messages(source, locale);
+            assert_eq!(map.get(group_key).map(String::as_str), Some(group_value));
+            assert_eq!(
+                map.get(section_key).map(String::as_str),
+                Some(section_value)
+            );
+        }
     }
 
     // Every Config-pane key the zerocode UI section renders must resolve

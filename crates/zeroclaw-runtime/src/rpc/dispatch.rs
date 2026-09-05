@@ -4363,14 +4363,14 @@ impl RpcDispatcher {
                     .map(|w| zeroclaw_config::sections::section_has_signal(&config, w))
                     .unwrap_or(false);
                 let label = zeroclaw_config::sections::humanize_section_key(&key);
+                let group = zeroclaw_config::sections::section_group_for_key(&key);
                 ConfigSectionEntry {
                     help: section_help(&key).to_string(),
                     has_picker,
                     completed,
                     ready: false,
-                    group: zeroclaw_config::sections::section_group_for_key(&key)
-                        .label()
-                        .to_string(),
+                    group: group.label().to_string(),
+                    group_key: group.key().to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
                     cost_category: zeroclaw_config::schema::cost_category_for_provider_section(

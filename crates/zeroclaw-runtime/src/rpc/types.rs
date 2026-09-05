@@ -1138,6 +1138,9 @@ rpc_type! {
         /// Display group for the dashboard sidebar.
         #[serde(default)]
         pub group: String,
+        /// Stable locale-independent group identifier.
+        #[serde(default)]
+        pub group_key: String,
         /// `true` when this section is part of the canonical Quickstart list.
         #[serde(default)]
         pub is_quickstart: bool,
@@ -1749,6 +1752,37 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn config_section_group_key_is_additive_on_the_wire() {
+        let legacy: ConfigSectionEntry = serde_json::from_value(json!({
+            "key": "cron",
+            "label": "Cron",
+            "help": "Scheduled tasks",
+            "has_picker": true,
+            "completed": false,
+            "group": "Agent"
+        }))
+        .unwrap();
+        assert!(legacy.group_key.is_empty());
+
+        let current = ConfigSectionEntry {
+            key: "cron".into(),
+            label: "Cron".into(),
+            help: "Scheduled tasks".into(),
+            has_picker: true,
+            completed: false,
+            ready: false,
+            group: "Agent".into(),
+            group_key: "agent".into(),
+            is_quickstart: true,
+            shape: None,
+            cost_category: String::new(),
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["group"], json!("Agent"));
+        assert_eq!(value["group_key"], json!("agent"));
     }
 
     #[test]

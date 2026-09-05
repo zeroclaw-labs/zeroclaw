@@ -2900,6 +2900,10 @@ pub struct ConfigSectionEntry {
     /// back to the flat ungrouped list.
     #[serde(default)]
     pub group: String,
+    /// Stable locale-independent group key. Empty when connected to an older
+    /// daemon; the Config pane then derives it from the legacy English label.
+    #[serde(default)]
+    pub group_key: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
     #[serde(default)]

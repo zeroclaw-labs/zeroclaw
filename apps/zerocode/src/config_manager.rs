@@ -215,6 +215,105 @@ fn scalar_validation_status(kind: PropKind, value: &str, prop: &str) -> Option<S
     scalar_validation_status_key(kind, value).map(|key| crate::i18n::t_args(key, &[("prop", prop)]))
 }
 
+fn config_i18n_key(kind: &str, stable_key: &str, suffix: Option<&str>) -> String {
+    let normalized = stable_key.replace(['.', '_'], "-");
+    match suffix {
+        Some(suffix) => format!("zc-config-{kind}-{normalized}-{suffix}"),
+        None => format!("zc-config-{kind}-{normalized}"),
+    }
+}
+
+fn translated_config_value(
+    key: String,
+    fallback: &str,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    translate(&key).unwrap_or_else(|| fallback.to_string())
+}
+
+const LEGACY_GROUPS: &[(&str, &str)] = &[
+    ("Foundation", "foundation"),
+    ("Agent", "agent"),
+    ("Multi-agent", "multi_agent"),
+    ("Tools", "tools"),
+    ("Integrations", "integrations"),
+    ("Network", "network"),
+    ("Storage", "storage"),
+    ("Operations", "operations"),
+    ("Other", "other"),
+];
+
+fn legacy_group_key(label: &str) -> Option<&'static str> {
+    LEGACY_GROUPS
+        .iter()
+        .find_map(|(legacy, key)| (*legacy == label).then_some(*key))
+}
+
+fn section_group_key(section: &ConfigSectionEntry) -> Option<&str> {
+    if section.group_key.is_empty() {
+        legacy_group_key(&section.group)
+    } else {
+        Some(&section.group_key)
+    }
+}
+
+fn localized_group_label(
+    section: &ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    let fallback = if section.group.is_empty() {
+        "Other"
+    } else {
+        &section.group
+    };
+    section_group_key(section).map_or_else(
+        || fallback.to_string(),
+        |key| translated_config_value(config_i18n_key("group", key, None), fallback, translate),
+    )
+}
+
+fn localized_section_label(
+    section: &ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    translated_config_value(
+        config_i18n_key("section", &section.key, Some("label")),
+        &section.label,
+        translate,
+    )
+}
+
+fn localized_section_help(
+    section: &ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    translated_config_value(
+        config_i18n_key("section", &section.key, Some("help")),
+        &section.help,
+        translate,
+    )
+}
+
+fn localize_section_metadata_with(
+    section: &mut ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) {
+    if section.group_key.is_empty()
+        && let Some(key) = legacy_group_key(&section.group)
+    {
+        section.group_key = key.to_string();
+    }
+    if !section.group.is_empty() || !section.group_key.is_empty() {
+        section.group = localized_group_label(section, translate);
+    }
+    section.label = localized_section_label(section, translate);
+    section.help = localized_section_help(section, translate);
+}
+
+fn localize_section_metadata(section: &mut ConfigSectionEntry) {
+    localize_section_metadata_with(section, &crate::i18n::try_t_locale);
+}
+
 /// Joined up/down display chords for list navigation footers.
 fn nav_keys() -> String {
     use crate::keymap::ConfigTabAction as A;
@@ -415,7 +514,10 @@ impl App {
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
-        self.sections.sort_by_key(|s| Self::group_rank(&s.group));
+        for section in &mut self.sections {
+            localize_section_metadata(section);
+        }
+        self.sections.sort_by_key(Self::group_rank);
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
         // first paint, matching the zerocode Config tab.
@@ -3417,22 +3519,11 @@ impl App {
         Ok(())
     }
 
-    fn group_rank(label: &str) -> usize {
-        const ORDER: &[&str] = &[
-            "Foundation",
-            "Agent",
-            "Multi-agent",
-            "Tools",
-            "Integrations",
-            "Network",
-            "Storage",
-            "Operations",
-            "Other",
-        ];
-        ORDER
+    fn group_rank(section: &ConfigSectionEntry) -> usize {
+        LEGACY_GROUPS
             .iter()
-            .position(|g| *g == label)
-            .unwrap_or(ORDER.len() - 1)
+            .position(|(_, key)| section_group_key(section) == Some(*key))
+            .unwrap_or(LEGACY_GROUPS.len() - 1)
     }
 
     fn draw_sections_pane(&mut self, frame: &mut Frame, area: Rect, active: bool) {
@@ -3458,7 +3549,11 @@ impl App {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
 
-        let grouped = self.filter.is_none() && self.sections.iter().any(|s| !s.group.is_empty());
+        let grouped = self.filter.is_none()
+            && self
+                .sections
+                .iter()
+                .any(|s| !s.group_key.is_empty() || !s.group.is_empty());
         let mut row_map: Vec<Option<usize>> = Vec::with_capacity(visible.len());
         let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
         let mut last_group: Option<&str> = None;
@@ -4987,9 +5082,75 @@ mod tests {
             help: String::new(),
             completed: false,
             group: String::new(),
+            group_key: String::new(),
             shape: None,
             cost_category: cost_category.to_string(),
         }
+    }
+
+    #[test]
+    fn config_metadata_keys_use_locale_independent_identifiers() {
+        assert_eq!(
+            config_i18n_key("group", "multi_agent", None),
+            "zc-config-group-multi-agent"
+        );
+        assert_eq!(
+            config_i18n_key("section", "providers.models", Some("label")),
+            "zc-config-section-providers-models-label"
+        );
+        assert_eq!(
+            config_i18n_key("section", "query_classification", Some("help")),
+            "zc-config-section-query-classification-help"
+        );
+    }
+
+    #[test]
+    fn group_order_uses_new_keys_and_legacy_labels() {
+        let mut stable = entry_with_cost("providers.models", "");
+        stable.group = "Localized display text".to_string();
+        stable.group_key = "foundation".to_string();
+        assert_eq!(App::group_rank(&stable), 0);
+
+        let mut legacy = entry_with_cost("cron", "");
+        legacy.group = "Agent".to_string();
+        assert_eq!(App::group_rank(&legacy), 1);
+    }
+
+    #[test]
+    fn config_metadata_localization_preserves_wire_fallbacks_and_legacy_groups() {
+        let translate = |key: &str| match key {
+            "zc-config-group-foundation" => Some("基盤".to_string()),
+            "zc-config-section-providers-models-label" => Some("モデルプロバイダー".to_string()),
+            _ => None,
+        };
+
+        let mut current = entry_with_cost("providers.models", "");
+        current.label = "Model providers".to_string();
+        current.help = "Server-owned help".to_string();
+        current.group = "Foundation".to_string();
+        current.group_key = "foundation".to_string();
+        localize_section_metadata_with(&mut current, &translate);
+        assert_eq!(current.group, "基盤");
+        assert_eq!(current.label, "モデルプロバイダー");
+        assert_eq!(current.help, "Server-owned help");
+
+        let mut legacy = entry_with_cost("cron", "");
+        legacy.group = "Agent".to_string();
+        localize_section_metadata_with(&mut legacy, &|_| None);
+        assert_eq!(legacy.group_key, "agent");
+        assert_eq!(legacy.group, "Agent");
+
+        let mut unknown = entry_with_cost("extension", "");
+        unknown.group = "Extension group".to_string();
+        localize_section_metadata_with(&mut unknown, &|_| None);
+        assert!(unknown.group_key.is_empty());
+        assert_eq!(unknown.group, "Extension group");
+        assert_eq!(App::group_rank(&unknown), 8);
+
+        let mut ungrouped = entry_with_cost("legacy-flat", "");
+        localize_section_metadata_with(&mut ungrouped, &|_| None);
+        assert!(ungrouped.group.is_empty());
+        assert!(ungrouped.group_key.is_empty());
     }
 
     fn typed_section(key: &str) -> ConfigSectionEntry {
@@ -4999,6 +5160,7 @@ mod tests {
             help: String::new(),
             completed: false,
             group: String::new(),
+            group_key: String::new(),
             shape: Some(SectionShape::TypedFamilyMap),
             cost_category: String::new(),
         }
