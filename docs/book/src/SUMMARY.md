@@ -185,6 +185,7 @@
   - [Multi-agent setup](./contributing/multi-agent-setup.md)
   - [Contributor License Agreement](./contributing/cla.md)
 - [Maintainers](./maintainers/index.md)
+  - [Maintainer dashboard](./maintainers/dashboard.md)
   - [Docs & Translations](./maintainers/docs-and-translations.md)
   - [CI & Actions](./maintainers/ci-and-actions.md)
   - [Claude Code Skills](./maintainers/skills.md)

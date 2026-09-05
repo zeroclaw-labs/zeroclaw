@@ -1597,3 +1597,99 @@ html.js #mdbook-content main {
 .provider-entry > .cfg-fields table {
   margin-top: 0;
 }
+
+/* ── Public maintainer dashboard ────────────────────────────────────────── */
+.maintainer-dashboard {
+  --dashboard-card-min: 15rem;
+}
+
+.maintainer-dashboard-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 1rem 0;
+  padding: 0.8rem;
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  background: var(--pc-bg-surface);
+}
+
+.maintainer-dashboard-controls label {
+  font-weight: 600;
+}
+
+.maintainer-dashboard-controls input {
+  min-width: 13rem;
+  flex: 1 1 13rem;
+  padding: 0.55rem 0.7rem;
+  color: var(--pc-text-primary);
+  background: var(--pc-bg-input);
+  border: 1px solid var(--pc-border-strong);
+  border-radius: 0.5rem;
+}
+
+.maintainer-dashboard-controls button {
+  padding: 0.55rem 0.8rem;
+  color: var(--pc-text-primary);
+  background: var(--pc-bg-elevated);
+  border: 1px solid var(--pc-border-strong);
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.maintainer-dashboard-controls button:hover,
+.maintainer-dashboard-controls button:focus-visible {
+  border-color: var(--pc-accent);
+}
+
+.maintainer-dashboard-note,
+.maintainer-dashboard-detail,
+.maintainer-dashboard-status {
+  color: var(--pc-text-secondary);
+}
+
+.maintainer-dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--dashboard-card-min)), 1fr));
+  gap: 0.8rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.maintainer-dashboard-card {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  background: var(--pc-bg-surface);
+}
+
+.maintainer-dashboard-card h3 {
+  margin-top: 0;
+}
+
+.maintainer-dashboard-count {
+  margin: 0.35rem 0;
+  color: var(--pc-accent-light);
+  font-size: 1.45rem;
+  font-weight: 700;
+}
+
+.maintainer-dashboard-count-error {
+  color: var(--pc-status-warning);
+  font-size: 1rem;
+}
+
+.maintainer-dashboard-items {
+  margin: 0.75rem 0;
+  padding-left: 1.2rem;
+}
+
+.maintainer-dashboard-items li {
+  margin: 0.35rem 0;
+  overflow-wrap: anywhere;
+}
+
+.maintainer-dashboard-links {
+  margin-bottom: 0;
+}

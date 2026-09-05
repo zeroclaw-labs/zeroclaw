@@ -840,6 +840,8 @@ jobs:
           PY
       - name: Validate project dashboard planner
         run: python3 scripts/github/project_dashboard_plan_test.py
+      - name: Validate maintainer dashboard
+        run: python3 scripts/github/maintainer_dashboard_test.py
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \

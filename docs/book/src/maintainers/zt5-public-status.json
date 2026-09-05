@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-08-30",
+  "disclosure": "Curated public snapshot. Detailed evidence, unpublished gaps, and security-sensitive analysis are intentionally excluded.",
+  "capabilities": [
+    {
+      "name": "Persistent memory",
+      "status": "Public implementation slices landed",
+      "score": null,
+      "target": 5,
+      "summary": "Public work includes the durable store seam, unified memory-context injection, and content scanning.",
+      "links": [
+        {"label": "Store seam", "url": "https://github.com/zeroclaw-labs/zeroclaw/pull/8570"},
+        {"label": "Context injection", "url": "https://github.com/zeroclaw-labs/zeroclaw/pull/8619"},
+        {"label": "Memory safety scan", "url": "https://github.com/zeroclaw-labs/zeroclaw/pull/8984"}
+      ]
+    },
+    {
+      "name": "Authentication",
+      "status": "Public foundation landed",
+      "score": null,
+      "target": 5,
+      "summary": "The public foundation introduces principal identity and the authentication-provider seam without publishing private gap analysis.",
+      "links": [
+        {"label": "Principal and AuthProvider seam", "url": "https://github.com/zeroclaw-labs/zeroclaw/pull/8063"}
+      ]
+    },
+    {
+      "name": "Agent-to-agent interoperability",
+      "status": "Public discovery slice landed",
+      "score": null,
+      "target": 5,
+      "summary": "The public surface includes A2A agent discovery. Further maturity claims remain unpublished until they are reviewed for disclosure.",
+      "links": [
+        {"label": "A2A discovery", "url": "https://github.com/zeroclaw-labs/zeroclaw/pull/7763"}
+      ]
+    }
+  ]
+}

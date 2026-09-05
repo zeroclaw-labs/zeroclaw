@@ -15,6 +15,7 @@ additional-js = [
   "theme/version-selector.js",
   "theme/lang-switcher.js",
   "theme/pc-enhance.js",
+  "theme/maintainer-dashboard.js",
   "mermaid.min.js",
   "mermaid-init.js",
 ]
