@@ -50,14 +50,8 @@ impl ModelRates {
     }
 }
 
-/// Upper bound on a sane per-1M-token rate. At `$1`/token this sits orders of
-/// magnitude above any real model price, so a genuine rate never trips it; it
-/// only catches a parsing artifact or a hostile/buggy gateway reporting an
-/// absurd value (which would otherwise bill a fortune).
-const MAX_SANE_PER_MTOK: f64 = 1_000_000.0;
-
 pub(crate) fn sane_mtok(rate: f64) -> Option<f64> {
-    (0.0..=MAX_SANE_PER_MTOK).contains(&rate).then_some(rate)
+    zeroclaw_config::cost::is_sane_usd_rate(rate).then_some(rate)
 }
 
 fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
@@ -680,12 +674,15 @@ mod tests {
     fn sane_mtok_rejects_nonfinite_negative_and_absurd() {
         assert_eq!(sane_mtok(3.0), Some(3.0));
         assert_eq!(sane_mtok(0.0), Some(0.0));
-        assert_eq!(sane_mtok(MAX_SANE_PER_MTOK), Some(MAX_SANE_PER_MTOK));
+        assert_eq!(
+            sane_mtok(zeroclaw_config::cost::MAX_SANE_USD_RATE),
+            Some(zeroclaw_config::cost::MAX_SANE_USD_RATE)
+        );
         assert!(sane_mtok(-1.0).is_none());
         assert!(sane_mtok(f64::INFINITY).is_none());
         assert!(sane_mtok(f64::NAN).is_none());
         // Above the ceiling ($1/token) -> rejected (parsing artifact / hostile gateway).
-        assert!(sane_mtok(MAX_SANE_PER_MTOK * 2.0).is_none());
+        assert!(sane_mtok(zeroclaw_config::cost::MAX_SANE_USD_RATE * 2.0).is_none());
     }
 
     // Alias-boundary regression test 1: when one alias opts in and another does

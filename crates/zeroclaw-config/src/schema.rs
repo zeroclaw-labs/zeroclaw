@@ -6837,6 +6837,64 @@ impl CostRatesConfig {
     pub fn tool_rates(&self, tool_name: &str) -> Option<&ToolCostRates> {
         self.tools.get(tool_name)
     }
+
+    /// Reject rate-sheet values that cannot represent a real USD price.
+    /// Deliberate zero-cost entries remain valid and distinguish a configured
+    /// free resource from one whose pricing is unavailable.
+    pub fn validate(&self) -> Result<()> {
+        fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
+            if let Some(value) = value
+                && !crate::cost::is_sane_usd_rate(value)
+            {
+                let max = crate::cost::MAX_SANE_USD_RATE;
+                validation_bail!(
+                    InvalidNumericRange,
+                    path.clone(),
+                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
+                );
+            }
+            Ok(())
+        }
+
+        let mut model_rates: Vec<_> = self.providers.models.iter_entries().collect();
+        model_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in model_rates {
+            let prefix = format!("cost.rates.providers.models.{provider}.{model}");
+            validate_rate(format!("{prefix}.input_per_mtok"), rates.input_per_mtok)?;
+            validate_rate(format!("{prefix}.output_per_mtok"), rates.output_per_mtok)?;
+            validate_rate(
+                format!("{prefix}.cached_input_per_mtok"),
+                rates.cached_input_per_mtok,
+            )?;
+        }
+
+        let mut tts_rates: Vec<_> = self.providers.tts.iter_entries().collect();
+        tts_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, voice, rates) in tts_rates {
+            validate_rate(
+                format!("cost.rates.providers.tts.{provider}.{voice}.per_mchar"),
+                rates.per_mchar,
+            )?;
+        }
+
+        let mut transcription_rates: Vec<_> = self.providers.transcription.iter_entries().collect();
+        transcription_rates
+            .sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in transcription_rates {
+            validate_rate(
+                format!("cost.rates.providers.transcription.{provider}.{model}.per_minute"),
+                rates.per_minute,
+            )?;
+        }
+
+        let mut tool_rates: Vec<_> = self.tools.iter().collect();
+        tool_rates.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (tool, rates) in tool_rates {
+            validate_rate(format!("cost.rates.tools.{tool}.per_call"), rates.per_call)?;
+        }
+
+        Ok(())
+    }
 }
 
 /// `[cost.rates.providers.*]` — provider-shaped rate sheets. Each field
@@ -21413,6 +21471,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        self.cost.rates.validate()?;
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -33776,6 +33835,129 @@ group_policy = "disabled"
             written.contains("name = \"fs\""),
             "natural-key `name` must survive the incremental save; got:\n{written}"
         );
+    }
+
+    fn validate_config_with_cost_rates(rates: CostRatesConfig) -> Result<()> {
+        let mut config = Config::default();
+        config.cost.rates = rates;
+        config.validate()
+    }
+
+    #[test]
+    async fn cost_rate_validation_rejects_out_of_range_typed_rates() {
+        for (field, value) in [
+            ("input_per_mtok", -0.01),
+            ("output_per_mtok", f64::NAN),
+            ("cached_input_per_mtok", f64::INFINITY),
+            ("input_per_mtok", f64::MAX),
+        ] {
+            let mut rates = CostRatesConfig::default();
+            rates.providers.models.openai.insert(
+                "gpt-test".to_string(),
+                ModelCostRates {
+                    input_per_mtok: (field == "input_per_mtok").then_some(value),
+                    output_per_mtok: (field == "output_per_mtok").then_some(value),
+                    cached_input_per_mtok: (field == "cached_input_per_mtok").then_some(value),
+                },
+            );
+            let error = validate_config_with_cost_rates(rates)
+                .expect_err("invalid model rate must fail canonical config validation");
+            let message = format!("{error:#}");
+            assert!(message.contains("invalid_numeric_range"), "{message}");
+            assert!(message.contains(field), "{message}");
+        }
+
+        let mut rates = CostRatesConfig::default();
+        rates.providers.tts.openai.insert(
+            "voice-test".to_string(),
+            TtsCostRates {
+                per_mchar: Some(f64::NEG_INFINITY),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("non-finite TTS rate must fail canonical config validation")
+        );
+        assert!(message.contains("providers.tts.openai.voice-test.per_mchar"));
+
+        let mut rates = CostRatesConfig::default();
+        rates.providers.transcription.openai.insert(
+            "transcriber-test".to_string(),
+            TranscriptionCostRates {
+                per_minute: Some(-1.0),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("negative transcription rate must fail canonical config validation")
+        );
+        assert!(message.contains("providers.transcription.openai.transcriber-test.per_minute"));
+
+        let mut rates = CostRatesConfig::default();
+        rates.tools.insert(
+            "web_search".to_string(),
+            ToolCostRates {
+                per_call: Some(f64::NAN),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("non-finite tool rate must fail canonical config validation")
+        );
+        assert!(message.contains("cost.rates.tools.web_search.per_call"));
+    }
+
+    #[test]
+    async fn cost_rate_validation_preserves_deliberate_zero_cost_entries() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "free-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+        );
+        rates.providers.tts.openai.insert(
+            "free-voice".to_string(),
+            TtsCostRates {
+                per_mchar: Some(0.0),
+            },
+        );
+        rates.providers.transcription.openai.insert(
+            "free-transcriber".to_string(),
+            TranscriptionCostRates {
+                per_minute: Some(0.0),
+            },
+        );
+        rates.tools.insert(
+            "free-tool".to_string(),
+            ToolCostRates {
+                per_call: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("0.0 is a deliberate free rate, not missing or invalid pricing");
+    }
+
+    #[test]
+    async fn cost_rate_validation_accepts_the_shared_safety_boundary() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "boundary-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("the canonical maximum cost rate must remain valid");
     }
 
     /// `cost.rates.providers.models.<type>` is a

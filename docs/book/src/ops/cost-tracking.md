@@ -1,10 +1,10 @@
 # Cost tracking
 
-ZeroClaw records every priced API call to an append-only ledger,
-attributes spend to the originating agent, enforces daily / monthly
-budgets, and surfaces the rollup on the dashboard `Cost` tab. The
-pricing rules live in config so operators can edit them without a
-rebuild.
+ZeroClaw records every token-bearing model call to an append-only ledger,
+including calls whose pricing is only partially available. It attributes spend
+to the originating agent, enforces daily / monthly budgets over the priced
+portion, and surfaces both spend and missing-pricing exposure to operators. The
+pricing rules live in config so operators can edit them without a rebuild.
 
 This page describes the schema, the lookup pipeline, and the operator
 surfaces. The code lives in `crates/zeroclaw-config/src/cost/` and
@@ -76,15 +76,20 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    model)`, multiplies by token counts, and stores a `CostRecord` via
    the global `CostTracker`.
 
-3. **resolve_rates_opt** tries the model id first, then the path-suffix
+3. **Per-dimension resolution and validation.** `resolve_rates_opt` tries the model id first, then the path-suffix
    form for `provider/model` strings (so `anthropic/claude-opus-4-7`
    degrades to `claude-opus-4-7` if the operator stored only the
-   short form). It returns one `Option` per dimension so any dimension
-   the operator left unconfigured can be filled from the live-pricing
-   fallback (see below) before billing. Only when *both* config and the
-   live fallback leave input and output at `0.0` does the one-shot
-   `missing_pricing` warn fire, so genuine "we couldn't price this"
-   records still surface in logs.
+   short form). It retains one `Option` per dimension so live pricing and the
+   global catalog fill only gaps. Deliberate `0.0` values remain configured and
+   free. Negative, non-finite, or implausibly large rates (above the shared
+   `$1,000,000` per configured unit safety bound) are treated as unavailable at
+   the recording boundary even if an older or permissive config-load path let
+   them through.
+
+   Missing input, cached-input, and output dimensions are evaluated only when
+   that dimension carries tokens. The one-shot runtime warning identifies the
+   incomplete dimensions. A partially priced call therefore records its known
+   cost and separately records only the token subset that could not be priced.
 
 4. **CostTracker is a process-global singleton** (`OnceLock` in
    `crates/zeroclaw-config/src/cost/tracker.rs`). Reload applies the
@@ -143,7 +148,23 @@ is populated; there's no retroactive repricing of past records.
 
 ## Persistence
 
-`CostTracker::record_usage_with_agent` appends one `CostRecord` per priced response to `<workspace>/state/costs.jsonl`, one JSON object per line. The ledger is read on startup so the dashboard's current-month per-agent rollup survives restarts.
+`CostTracker::record_usage_with_agent` appends one `CostRecord` per
+token-bearing response to `<workspace>/state/costs.jsonl`, one JSON object
+per line. The ledger is read on startup so the dashboard's current-month
+per-agent rollup survives restarts.
+
+Each `TokenUsage` record carries two pricing-provenance fields:
+
+- `unpriced_tokens`: the input, cached-input, or output token subset whose
+  effective rate was unavailable. It is `0` for fully priced calls and for
+  deliberately free rates configured as `0.0`.
+- `pricing_available`: compatibility summary of that provenance. New records
+  set it to `false` when `unpriced_tokens > 0`.
+
+Ledger rows written before these fields existed deserialize with
+`pricing_available = true` and `unpriced_tokens = 0`. Zero spend on a legacy
+row therefore does **not** prove that historical pricing was available; the
+missing provenance cannot be reconstructed safely after the fact.
 
 `cost_usd` is computed at record time from the rate sheet in effect
 **at that moment**. Records are immutable: if the operator adds
@@ -173,6 +194,12 @@ override token on the CLI (`zeroclaw --override`). Defaults to
 `false`. `warn_at_percent` controls when the gateway surfaces a
 warning banner ahead of the hard limit; defaults to 80%.
 
+Budget comparisons use recorded `cost_usd`, so they cannot account for the
+`unpriced_tokens` subset. A daily or monthly total below its cap is not a safety
+assurance while the current month contains unpriced tokens. Configure the
+missing rate dimensions and generate a new request before relying on cap
+enforcement; existing ledger rows are never retroactively repriced.
+
 ## Per-agent attribution
 
 When `cost.track_per_agent` is true (default) every recorded
@@ -183,6 +210,19 @@ high-volume installs where the extra HashMap aggregation shows up in
 profiles; the trade-off is losing the per-agent dimension everywhere.
 
 ## Operator surfaces
+
+### CLI status
+
+`zeroclaw status` prints today's and the current month's spend from the ledger.
+When any current-month model rollup has `unpriced_tokens > 0`, it also prints a
+pricing-unavailable warning naming each model and its uncosted token count. The
+warning is intentionally independent of the aggregate dollar total: mixed
+priced/unpriced rows remain visible, while a fully configured free model stays
+quiet.
+
+This warning means the displayed spend and cap headroom are lower bounds, not
+complete accounting. Legacy rows cannot trigger it because their historical
+pricing provenance is unknown.
 
 ### Config UI
 
@@ -231,6 +271,12 @@ because no rate was set when they happened. Make a new chat request
 after the daemon reload and check **Cost overview > Session** plus
 **Spend by model**; both should populate for the new request.
 
+**`zeroclaw status` says pricing is unavailable even though some rates are configured.**
+Pricing is resolved per token-bearing dimension. For example, an input rate
+does not price output tokens, and a cached-input rate does not price uncached
+input. Add the dimensions named by the runtime warning. A configured `0.0` is a
+valid free rate and does not trigger the status warning.
+
 **Drift detected against `cost.rates.*` paths after save.** A pre
 v0.8.0 daemon mangled hyphenated HashMap keys in the dirty-save path,
 silently dropping every write to the rate sheet. If you see this on
@@ -238,11 +284,13 @@ v0.8.0+ it's a real bug: the dirty-path resolution lives in
 `crates/zeroclaw-config/src/schema.rs::apply_dirty_path`; file an
 issue with the daemon version and the path that drifted.
 
-**`missing_pricing` warns spam the log.** Emitted once per
-`(provider_type, model)` pair when `resolve_rates` returns `(0.0,
-0.0)`. Either the rate isn't configured for that model, or the
-upstream returned a different model id than what's in the rate
-sheet (some providers return versioned ids like
-`claude-3-5-sonnet-20241022` even when you configured
-`claude-3-5-sonnet`). Add the exact id the warn names, or set the
-unversioned id and rely on `resolve_rates`'s suffix-match path.
+**`missing_pricing` warns spam the log.** The runtime emits this once per
+`(provider_type, model)` pair when a token-bearing input, cached-input, or
+output dimension remains unpriced after `resolve_rates_opt` merges configured,
+live, and global-catalog rates. The warning names the incomplete dimensions; a
+partially configured model can therefore warn even though another dimension is
+already priced. Add only the missing dimensions for the exact model id named by
+the warning. Some providers return versioned ids such as
+`claude-3-5-sonnet-20241022` even when the configured id is
+`claude-3-5-sonnet`; the resolver also tries its documented path-suffix
+candidate before reporting the gap.

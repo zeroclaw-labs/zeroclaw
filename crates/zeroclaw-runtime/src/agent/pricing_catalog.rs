@@ -98,6 +98,10 @@ fn cell() -> &'static RwLock<Arc<GlobalPricingCatalog>> {
     GLOBAL.get_or_init(|| RwLock::new(Arc::new(GlobalPricingCatalog::default())))
 }
 
+#[cfg(test)]
+pub(crate) static GLOBAL_PRICING_CATALOG_TEST_LOCK: std::sync::LazyLock<parking_lot::Mutex<()>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
+
 /// Replace the process-global catalog (used by startup load and config reload
 /// to hot-swap rates without a restart). The catalog file itself is refreshed
 /// out-of-band by the CLI + launchd, not by this daemon.
@@ -181,6 +185,7 @@ mod tests {
 
     #[test]
     fn missing_file_clears_global_catalog_on_same_process_reload() {
+        let _catalog_lock = GLOBAL_PRICING_CATALOG_TEST_LOCK.lock();
         // Rollback contract: deleting <data_dir>/pricing.json must revert unmatched
         // models to $0 on the next reload, even in the same PID (the global catalog is
         // process-global across config reloads).
