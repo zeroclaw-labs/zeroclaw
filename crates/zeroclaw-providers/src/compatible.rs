@@ -44,6 +44,9 @@ pub struct OpenAiCompatibleModelProvider {
     pub auth_header: AuthStyle,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
+    /// Operator `[multimodal]` policy for this provider's image-marker
+    /// expansion pass. Resolved once at build time.
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
@@ -407,6 +410,7 @@ pub struct OpenAiCompatibleBuilder {
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user`] — the
     /// combined "merge + drop native tool calling" preset. Distinct from
@@ -488,6 +492,14 @@ impl OpenAiCompatibleBuilder {
     /// Set the policy for image markers in native role=`tool` results.
     pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
         self.tool_result_image_policy = policy;
+        self
+    }
+
+    /// Set the root `[multimodal]` policy used when expanding `[IMAGE:...]`
+    /// markers into inline data URIs. Without this the provider falls back to
+    /// library defaults and operator limits never reach the outbound request.
+    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
         self
     }
 
@@ -684,6 +696,7 @@ impl OpenAiCompatibleBuilder {
             auth_header: auth_style,
             supports_vision: self.supports_vision,
             tool_result_image_policy: self.tool_result_image_policy,
+            multimodal: self.multimodal,
             user_agent: self.user_agent,
             native_tool_calling,
             merge_system_into_user,
@@ -722,6 +735,7 @@ impl OpenAiCompatibleModelProvider {
             auth_style: None,
             supports_vision: false,
             tool_result_image_policy: ToolResultImagePolicy::default(),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             user_agent: None,
             merge_system_into_user: false,
             merge_system_into_user_preserve_native: false,
@@ -2325,7 +2339,7 @@ impl OpenAiCompatibleModelProvider {
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let config = self.multimodal.clone();
         let sanitized;
         let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
             sanitized = messages
@@ -6281,6 +6295,77 @@ mod tests {
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
+    }
+
+    #[tokio::test]
+    async fn operator_max_images_bounds_the_outbound_request() {
+        // Behaviour boundary: the number of images that survive into the
+        // messages this provider is about to send upstream. Asserting the
+        // config field alone would still pass if the expansion pass kept
+        // using library defaults.
+        let temp = tempfile::tempdir().unwrap();
+        // Minimal PNG signature bytes are enough for MIME detection.
+        let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        std::fs::write(&first, png).unwrap();
+        std::fs::write(&second, png).unwrap();
+
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both in a single message would exercise that eviction
+        // granularity rather than whether the operator's cap is honoured.
+        let messages = vec![
+            ChatMessage::user(format!("first [IMAGE:{}]", first.display())),
+            ChatMessage::user(format!("second [IMAGE:{}]", second.display())),
+        ];
+
+        let build = |multimodal| {
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url("https://example.com")
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .multimodal(multimodal)
+                .build()
+        };
+
+        let permissive = build(zeroclaw_config::schema::MultimodalConfig::default());
+        let prepared = permissive
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("default policy prepares both images");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            2,
+            "default policy admits both images"
+        );
+
+        let capped = build(zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        });
+        let prepared = capped
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("capped policy still prepares the message");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            1,
+            "an operator capping max_images must bound the outbound request"
+        );
+    }
+
+    #[test]
+    fn builder_without_multimodal_falls_back_to_library_defaults() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let defaults = zeroclaw_config::schema::MultimodalConfig::default();
+        assert_eq!(provider.multimodal.max_images, defaults.max_images);
     }
 
     #[test]
