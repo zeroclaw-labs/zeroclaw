@@ -201,6 +201,9 @@ pub struct SlackChannel {
     thread_context_max_messages_resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     /// Use the newer `markdown` block type (richer formatting, 12k char limit).
     use_markdown_blocks: bool,
+    /// Accept `subtype = "bot_message"` posts from other Slack apps.
+    /// Off by default; see `SlackConfig::allow_bot_messages`.
+    allow_bot_messages: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     #[cfg(test)]
@@ -230,6 +233,9 @@ pub struct SlackChannel {
     /// `Channel::self_handle` override reads it without an HTTP call so
     /// the guard runs on every inbound after the first.
     cached_bot_user_id: Mutex<Option<String>>,
+    /// This app's own `bot_id` from `auth.test`, used to drop the echoes of
+    /// our own posts once `allow_bot_messages` lets bot posts through.
+    cached_bot_id: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -470,6 +476,7 @@ impl SlackChannel {
                 zeroclaw_config::schema::DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES
             }),
             use_markdown_blocks: false,
+            allow_bot_messages: false,
             proxy_url: None,
             #[cfg(test)]
             api_base_url: None,
@@ -483,6 +490,7 @@ impl SlackChannel {
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             cached_bot_user_id: Mutex::new(None),
+            cached_bot_id: Mutex::new(None),
         }
     }
 
@@ -558,6 +566,14 @@ impl SlackChannel {
     /// Only use this if your Slack workspace supports it.
     pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
         self.use_markdown_blocks = enabled;
+        self
+    }
+
+    /// Accept `subtype = "bot_message"` posts from other Slack apps (for
+    /// example Workflow Builder). Authorization still applies to the posting
+    /// app's bot ID.
+    pub fn with_allow_bot_messages(mut self, enabled: bool) -> Self {
+        self.allow_bot_messages = enabled;
         self
     }
 
@@ -1365,9 +1381,23 @@ impl SlackChannel {
             .await
             .ok()?;
 
+        // `auth.test` returns the app's `bot_id` alongside the bot user id.
+        // Cache it so `inbound_sender_identity` can recognise our own posts
+        // when they echo back as `subtype = "bot_message"`.
+        if let Some(bot_id) = resp.get("bot_id").and_then(|v| v.as_str())
+            && let Ok(mut guard) = self.cached_bot_id.lock()
+        {
+            *guard = Some(bot_id.to_string());
+        }
+
         resp.get("user_id")
             .and_then(|u| u.as_str())
             .map(String::from)
+    }
+
+    /// This app's cached `bot_id`, populated by `get_bot_user_id`.
+    fn own_bot_id(&self) -> Option<String> {
+        self.cached_bot_id.lock().ok().and_then(|g| g.clone())
     }
 
     /// Resolve the thread identifier for inbound Slack messages.
@@ -1629,6 +1659,58 @@ impl SlackChannel {
 
     fn is_supported_message_subtype(subtype: Option<&str>) -> bool {
         matches!(subtype, None | Some("file_share" | "thread_broadcast"))
+    }
+
+    /// Subtype gate for a channel that may also accept other apps' posts.
+    ///
+    /// Slack delivers Workflow Builder steps and app posts as
+    /// `subtype = "bot_message"` with no `user` field, so they fail both the
+    /// base subtype gate and the human-sender checks that follow it. Operators
+    /// opt in per channel with `allow_bot_messages`.
+    fn is_supported_message_subtype_with_bots(subtype: Option<&str>, allow_bots: bool) -> bool {
+        Self::is_supported_message_subtype(subtype)
+            || (allow_bots && subtype == Some("bot_message"))
+    }
+
+    /// Identity to authorize an inbound message under.
+    ///
+    /// Human posts carry `user`. A `bot_message` carries `bot_id` instead, so
+    /// that becomes the identity the peer allowlist is matched against —
+    /// enabling `allow_bot_messages` widens *which senders are considered*, it
+    /// does not skip authorization.
+    ///
+    /// Returns `None` when the message is one of our own posts (either the bot
+    /// user or this app's `bot_id`), which is what stops the agent replying to
+    /// itself once its own `chat.postMessage` echoes back as a bot post.
+    fn inbound_sender_identity<'a>(
+        message: &'a serde_json::Value,
+        bot_user_id: &str,
+        own_bot_id: Option<&str>,
+        allow_bots: bool,
+    ) -> Option<&'a str> {
+        let user = message
+            .get("user")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if !user.is_empty() {
+            return (user != bot_user_id).then_some(user);
+        }
+
+        if !allow_bots {
+            return None;
+        }
+
+        let bot_id = message
+            .get("bot_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())?;
+        // Our own `bot_id` echo: never re-enter the agent on its own output.
+        if own_bot_id.is_some_and(|own| own == bot_id) {
+            return None;
+        }
+        Some(bot_id)
     }
 
     fn compose_incoming_content(text: String, attachment_blocks: Vec<String>) -> Option<String> {
@@ -4357,7 +4439,7 @@ impl SlackChannel {
                     continue;
                 }
                 let subtype = event.get("subtype").and_then(|v| v.as_str());
-                if !Self::is_supported_message_subtype(subtype) {
+                if !Self::is_supported_message_subtype_with_bots(subtype, self.allow_bot_messages) {
                     continue;
                 }
 
@@ -4375,13 +4457,15 @@ impl SlackChannel {
                     continue;
                 }
 
-                let user = event
-                    .get("user")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if user.is_empty() || user == bot_user_id {
+                let own_bot_id = self.own_bot_id();
+                let Some(user) = Self::inbound_sender_identity(
+                    event,
+                    bot_user_id,
+                    own_bot_id.as_deref(),
+                    self.allow_bot_messages,
+                ) else {
                     continue;
-                }
+                };
                 let allowed_peers = (self.peer_resolver)();
                 if !crate::allowlist::is_user_allowed(
                     &allowed_peers,
@@ -5745,23 +5829,28 @@ impl Channel for SlackChannel {
                     // Messages come newest-first, reverse to process oldest first
                     for msg in messages.iter().rev() {
                         let subtype = msg.get("subtype").and_then(|value| value.as_str());
-                        if !Self::is_supported_message_subtype(subtype) {
+                        if !Self::is_supported_message_subtype_with_bots(
+                            subtype,
+                            self.allow_bot_messages,
+                        ) {
                             continue;
                         }
                         let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-                        let user = msg
-                            .get("user")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("unknown");
+                        // Resolves `bot_id` for app posts and drops our own
+                        // messages, including their `bot_message` echoes.
+                        let own_bot_id = self.own_bot_id();
+                        let Some(user) = Self::inbound_sender_identity(
+                            msg,
+                            &bot_user_id,
+                            own_bot_id.as_deref(),
+                            self.allow_bot_messages,
+                        ) else {
+                            continue;
+                        };
                         let last_ts = last_ts_by_channel
                             .get(&channel_id)
                             .map(String::as_str)
                             .unwrap_or("");
-
-                        // Skip bot's own messages
-                        if user == bot_user_id {
-                            continue;
-                        }
 
                         // Sender validation
                         let allowed_peers = (self.peer_resolver)();
@@ -5886,17 +5975,22 @@ impl Channel for SlackChannel {
                     Self::advance_active_thread_cursor(&mut active_threads, &thread_ts, reply_ts);
 
                     let subtype = reply.get("subtype").and_then(|v| v.as_str());
-                    if !Self::is_supported_message_subtype(subtype) {
+                    if !Self::is_supported_message_subtype_with_bots(
+                        subtype,
+                        self.allow_bot_messages,
+                    ) {
                         continue;
                     }
 
-                    let user = reply
-                        .get("user")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or_default();
-                    if user.is_empty() || user == bot_user_id {
+                    let own_bot_id = self.own_bot_id();
+                    let Some(user) = Self::inbound_sender_identity(
+                        reply,
+                        &bot_user_id,
+                        own_bot_id.as_deref(),
+                        self.allow_bot_messages,
+                    ) else {
                         continue;
-                    }
+                    };
                     if !self.is_user_allowed(user) {
                         continue;
                     }
@@ -6634,6 +6728,125 @@ mod tests {
         );
 
         assert_eq!(permalinks.len(), 1);
+    }
+
+    #[test]
+    fn bot_message_subtype_requires_opt_in() {
+        // Workflow Builder steps and app posts arrive as `bot_message`; they
+        // stay out unless the operator enables them for the channel.
+        assert!(!SlackChannel::is_supported_message_subtype_with_bots(
+            Some("bot_message"),
+            false
+        ));
+        assert!(SlackChannel::is_supported_message_subtype_with_bots(
+            Some("bot_message"),
+            true
+        ));
+    }
+
+    #[test]
+    fn allowing_bots_does_not_widen_other_subtypes() {
+        // Only `bot_message` is added; unrelated subtypes stay rejected.
+        for subtype in ["channel_join", "message_changed", "message_deleted"] {
+            assert!(
+                !SlackChannel::is_supported_message_subtype_with_bots(Some(subtype), true),
+                "{subtype} must stay filtered even with bots allowed"
+            );
+        }
+        assert!(SlackChannel::is_supported_message_subtype_with_bots(
+            None, true
+        ));
+        assert!(SlackChannel::is_supported_message_subtype_with_bots(
+            Some("file_share"),
+            true
+        ));
+    }
+
+    #[test]
+    fn inbound_identity_prefers_user_and_skips_our_bot_user() {
+        let human = serde_json::json!({"user": "U_HUMAN", "text": "hi"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&human, "U_SELF", Some("B_SELF"), true),
+            Some("U_HUMAN")
+        );
+
+        let own = serde_json::json!({"user": "U_SELF", "text": "mine"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&own, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_uses_bot_id_only_when_bots_are_allowed() {
+        let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "deploy done"});
+
+        // Disabled: a userless bot post has no identity, so it never reaches
+        // the allowlist and cannot trigger a turn.
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some("B_SELF"), false),
+            None
+        );
+
+        // Enabled: the posting app's bot ID becomes the authorization subject.
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", Some("B_SELF"), true),
+            Some("B_WORKFLOW")
+        );
+    }
+
+    #[test]
+    fn inbound_identity_drops_our_own_bot_echo() {
+        // Our own `chat.postMessage` echoes back as a bot post. Without this
+        // the agent would answer itself in a loop once bots are allowed.
+        let echo = serde_json::json!({"bot_id": "B_SELF", "text": "my own reply"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&echo, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_ignores_blank_and_missing_bot_ids() {
+        let blank = serde_json::json!({"bot_id": "   ", "text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&blank, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+
+        let neither = serde_json::json!({"text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&neither, "U_SELF", Some("B_SELF"), true),
+            None
+        );
+    }
+
+    #[test]
+    fn inbound_identity_keeps_foreign_bots_when_own_bot_id_is_unknown() {
+        // `auth.test` may not have been called yet. A foreign bot still
+        // resolves; our own echo is additionally guarded by the bot-user check
+        // and by the allowlist.
+        let workflow = serde_json::json!({"bot_id": "B_WORKFLOW", "text": "x"});
+        assert_eq!(
+            SlackChannel::inbound_sender_identity(&workflow, "U_SELF", None, true),
+            Some("B_WORKFLOW")
+        );
+    }
+
+    #[test]
+    fn allow_bot_messages_defaults_off_and_builder_sets_it() {
+        let channel = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        );
+        assert!(
+            !channel.allow_bot_messages,
+            "accepting other apps' posts must be opt-in"
+        );
+        assert!(channel.with_allow_bot_messages(true).allow_bot_messages);
     }
 
     #[test]
