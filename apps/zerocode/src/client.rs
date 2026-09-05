@@ -3813,6 +3813,13 @@ pub struct LogsQueryParams {
     /// older than the previous one. Independent of id ordering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until_line_offset: Option<u64>,
+    /// Segment-aware cursor passed back from the previous page's
+    /// `next_segment_cursor`. Identifies both the segment file and the
+    /// byte offset within it, so pagination continues across rotated
+    /// archives. Takes precedence over `until_line_offset` when both
+    /// are supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until_segment_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity_min: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3847,9 +3854,26 @@ pub struct LogsQueryResult {
     /// Byte offset past the OLDEST event on the current page. Pass back
     /// as [`LogsQueryParams::until_line_offset`] on the next request to
     /// walk older pages deterministically regardless of id ordering.
-    /// `None` when the page is empty.
+    /// `None` when the page is empty, and also `None` when the oldest
+    /// event on the page lives in a rotated archive rather than the
+    /// active file — use [`Self::next_segment_cursor`] in that case.
     pub next_cursor_line_offset: Option<u64>,
+    /// Segment-aware cursor for the oldest event on this page. Pass
+    /// back as [`LogsQueryParams::until_segment_cursor`] to walk older
+    /// pages across segment boundaries. Supersedes
+    /// `next_cursor_line_offset` for `rotating`-mode deployments with
+    /// multiple retained segments. Absent (deserialized as `None`) on
+    /// daemons predating multi-segment reads.
+    #[serde(default)]
+    pub next_segment_cursor: Option<String>,
     pub at_end: bool,
+    /// True when a retained segment could not be read and was left out of
+    /// this page. `at_end` is then only "no older events among the segments
+    /// that could be read", so the pane must not present the buffer as the
+    /// complete history. Absent (deserialized as `false`) on daemons that
+    /// predate the field.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 /// Mirror of `zeroclaw_runtime::rpc::types::LogsGetResult`. Full log

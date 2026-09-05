@@ -20,20 +20,31 @@ Persistence is best-effort rather than a transactional audit guarantee. The Obse
 
 ### Archive rotation (`log_persistence = "rotating"`)
 
-`rotating` applies no entry-count trim to events accepted by the background writer, like `full`, but ZeroClaw manages the active file: it is rotated to a timestamped archive on a size and/or daily boundary, and old archives are pruned by count and age. This differs from `rolling`, which trims old entries out of the active file; rotated events are preserved in archive files for later diagnostics.
+`rotating` retains every event by rotating the active file rather than trimming it. The active file is renamed to a timestamped archive on a size, daily-boundary, or entry-count trigger. Old archives are pruned by count and age after each rotation.
 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `log_persistence_max_bytes` | `0` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
 | `log_persistence_rotate_daily` | `true` | Before the first event of a new UTC day, archive a file whose last write fell on an earlier day. |
+| `log_persistence_max_entries_per_segment` | `0` | Rotate once the segment's non-empty line count reaches this cap. In steady state each archive holds exactly this many entries. When first enabled on an existing log, the file is archived whole (one over-cap transition); steady state resumes on the next rotation. `0` disables entry-count rotation. |
 | `log_persistence_retention_max_files` | `7` | Keep at most this many archives; after a rotation the oldest beyond the cap are deleted. `0` keeps all. |
 | `log_persistence_retention_max_age_days` | `0` | Delete archives older than this many days after a rotation. `0` disables age-based cleanup. |
 
 Archives sit next to the active file and keep its extension, with a sortable
 UTC stamp inserted before that extension. For example, `runtime-trace.jsonl`
-rotates to `runtime-trace.20260624-031500.jsonl`. The dashboard and the
-`/api/logs` endpoint read the active file only, so archives are an on-disk
-record for offline inspection rather than a live query surface.
+rotates to `runtime-trace.0000000001-20260624-031500.jsonl`. The sequence
+prefix (`0000000001`) is written at rotation time and determines reader-side
+ordering; it never repeats across restarts. Archives written before sequence
+numbering existed keep their old shape (`runtime-trace.20260624-031500.jsonl`)
+and sort before every numbered archive.
+
+The dashboard and `GET /api/logs` now read the active file **and** all retained
+archives as one logical event stream, merging them oldest-archive-first and
+returning events newest-first. The API exposes a segment-aware cursor
+(`next_segment_cursor`) alongside the existing byte-offset cursor
+(`next_cursor_line_offset`); pass `?until_segment_cursor=` on subsequent
+requests to paginate across segment boundaries. Old byte-offset cursors remain
+valid and are interpreted as an offset into the active file.
 
 Daily rotation keys off the UTC calendar, so its boundary may not line up with
 local midnight in other time zones. These keys are ignored unless
@@ -196,7 +207,7 @@ The dashboard's Logs page is the primary surface. Underneath:
 GET /api/logs
 ```
 
-Top-level filters (query params): `since_ts`, `until_ts`, `until_line_offset`, `action`, `category`, `outcome`, `severity_min`, `trace_id`, `q` (substring across `message` + `attributes`), `hide_internal` (drops `event.category = "internal"`), `limit`. The legacy `until_id` field remains available for timestamp/ID cursor compatibility.
+Top-level filters (query params): `since_ts`, `until_ts`, `until_line_offset`, `until_segment_cursor`, `action`, `category`, `outcome`, `severity_min`, `trace_id`, `q` (substring across `message` + `attributes`), `hide_internal` (drops `event.category = "internal"`), `limit`. The legacy `until_id` field remains available for timestamp/ID cursor compatibility.
 
 Every other `?<key>=<value>` is treated as a per-attribution equality
 filter, the gateway validates the key against `is_attribution_field`
@@ -225,9 +236,23 @@ curl "$ZEROCLAW_GATEWAY/api/logs?trace_id=<value-from-a-prior-event>"
 
 </div>
 
-Log pagination walks backward with a byte-offset cursor. While `at_end` is false, pass a non-null `next_cursor_line_offset` back as `until_line_offset` with the same non-cursor filters to load older events without re-reading newer bytes. Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that pagination walk. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; using its timestamp/ID pair as `until_ts` and `until_id` for pagination is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
+Log pagination walks backward with a segment-aware cursor. While `at_end` is false:
+1. Prefer `next_segment_cursor`, passed back unchanged as `until_segment_cursor`. Treat it as an **opaque token**: its internal shape depends on which segment the page ended in and may change between releases. Clients must round-trip the returned string verbatim rather than constructing or parsing one. This is the only cursor that can advance once the oldest event in a page is in a rotated archive.
+2. Fall back to `next_cursor_line_offset` passed back as `until_line_offset` when the segment cursor is absent. This is a plain byte offset into the active file and resolves to `null` when the oldest event is in an archive.
+3. The legacy `next_cursor: [timestamp, id] | null` response remains for compatibility; passing it back as `until_ts` + `until_id` is deprecated because the lexicographic ID tie-break can silently skip events with the same timestamp.
 
-`until_line_offset` is a position in the current active file, not a durable event checkpoint. Pure appends preserve it, but rolling trim, archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to. Restart from the newest page after those boundaries rather than reusing an older offset. `/api/logs` reads only the active file; inspect timestamped archives directly when older rotated history is required.
+Restart from the newest page after changing filters. Treat `at_end: true` as the signal to stop requesting older pages for that walk.
+
+`at_end` is scoped to the segments the daemon could actually read. When a retained segment cannot be opened, it is logged, left out of the merged view, and the response sets `incomplete: true`. The page is still returned, but `at_end` then means "no older events among the segments that could be read" rather than "no older events exist". Present such a walk as partial rather than complete. The same applies to a single-event lookup: rather than reporting a miss as `not found`, the daemon says the event was not found *and* that part of the retained history was unreadable, so it may still exist. Older daemons omit the field; treat its absence as `false`.
+
+`until_line_offset` is a position in the current active file. Archive rotation, startup migration, and a configured path change replace the bytes or active file it refers to; restart from the newest page after those boundaries.
+
+`until_segment_cursor` is resilient across those boundaries, by different means depending on where the page ended:
+
+- **A page ending in an archive** is addressed by the archive's own identity, which is fixed when the archive is written and never reassigned to different content. Subsequent rotations therefore cannot invalidate it. If retention has since deleted that archive, the reader reports the history as finished rather than silently resuming at an unrelated position.
+- **A page ending in the active file** carries an anchor event id alongside the offset, because the active file's path is stable while its content is replaced on each rotation. On resume the reader checks that the event at the cursor boundary still matches the anchor; on a mismatch it searches the retained segments for that event and resumes from wherever it now lives, so pagination crosses a rotation without duplicating or skipping events. If the anchored event is gone entirely, the reader reports the history as finished.
+
+A cursor issued by an older daemon, which named a segment by filename without an anchor, is still accepted. That form cannot say whether it means a rotated archive or the active file, so the reader tries the archives first, where a name is never reassigned, and falls back to the active file.
 
 The `/api/status` response includes `daemon_started_at: string` (RFC
 3339), so a dashboard can default to "since daemon start" without an

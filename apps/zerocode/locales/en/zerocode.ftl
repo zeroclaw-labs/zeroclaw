@@ -185,6 +185,7 @@ zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click rows, drag to select text, scroll wheel, double-click detail
 zc-logs-copy = Copy
 zc-logs-copied = [Copied]
+zc-logs-status-partial = [partial]
 
 zc-doctor-title = Doctor
 zc-doctor-loading = Loading diagnostics...

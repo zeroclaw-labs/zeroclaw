@@ -320,6 +320,11 @@ mod tests {
 
     #[test]
     fn event_semantics_foreground_label_prefers_agent_across_nested_spans() {
+        // This subscriber stacks `LogCaptureLayer`, which forwards every event
+        // to `writer::record_event`. Without the writer lock those events land
+        // in whatever tempdir a concurrent `writer::tests` case has installed,
+        // and that test then counts a line it never wrote.
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
         let buf = BufMakeWriter::default();
         let fmt_layer = fmt::layer()
             .fmt_fields(RedactEphemeralFields)

@@ -2263,7 +2263,25 @@ export interface LogsResponse {
    *  walk older pages deterministically regardless of id ordering.
    *  `null` when the page is empty. */
   next_cursor_line_offset: number | null;
+  /** Segment-aware cursor for the oldest event on the current page. Treat
+   *  it as an OPAQUE token: it identifies a segment and a byte offset within
+   *  it, and for the active file also carries an anchor event id so the
+   *  cursor survives a rotation. Its shape may change. Pass the returned
+   *  string back verbatim as [`LogsQueryParams::until_segment_cursor`] —
+   *  never construct or parse one, since a hand-built cursor loses whatever
+   *  the daemon encoded to keep it stable.
+   *  Supersedes `next_cursor_line_offset` for `rotating`-mode deployments:
+   *  when the oldest event on a page lives in an archive rather than the
+   *  active file, `next_cursor_line_offset` is `null` and only this cursor
+   *  can advance. `null` when the page is empty, or omitted entirely by
+   *  daemons predating multi-segment reads. */
+  next_segment_cursor?: string | null;
   at_end: boolean;
+  /** True when a retained segment could not be read and was left out of this
+   *  page. `at_end` then only means "no older events among the segments that
+   *  could be read", so the UI must not present the buffer as the complete
+   *  history. Omitted (treat as `false`) by daemons predating the field. */
+  incomplete?: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
    *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so
@@ -2282,6 +2300,11 @@ export interface LogsQueryParams {
    *  this offset so the follow-up page only sees lines strictly older
    *  than the previous one. Independent of id ordering. */
   until_line_offset?: number;
+  /** Segment-aware cursor passed back from the previous page's
+   *  `next_segment_cursor`. Identifies both the segment file and the byte
+   *  offset within it, so pagination continues across rotated archives.
+   *  Takes precedence over `until_line_offset` when both are set. */
+  until_segment_cursor?: string;
   action?: string;
   category?: string;
   outcome?: string;

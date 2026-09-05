@@ -1305,6 +1305,11 @@ rpc_type! {
         /// pagination regardless of id ordering.
         #[serde(default)]
         pub until_line_offset: Option<u64>,
+        /// Segment-aware cursor. Set from `LogsQueryResult::next_segment_cursor`
+        /// to paginate across rotated archive files. Takes precedence over
+        /// `until_line_offset` when both are supplied.
+        #[serde(default)]
+        pub until_segment_cursor: Option<String>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1342,8 +1347,22 @@ rpc_type! {
         /// Byte offset past the last event on this page. Callers should
         /// pass this back as `until_line_offset` on the next request to
         /// resume without re-scanning already-read bytes.
+        ///
+        /// For multi-segment deployments, this is `None` when the oldest event
+        /// on the page is in an archive file — use `next_segment_cursor` instead.
         pub next_cursor_line_offset: Option<u64>,
+        /// Segment-aware cursor for the oldest event on this page. Pass back
+        /// as `until_segment_cursor` to walk older pages across segment
+        /// boundaries. Supersedes `next_cursor_line_offset` for `rotating`-mode
+        /// deployments with multiple retained segments.
+        pub next_segment_cursor: Option<String>,
         pub at_end: bool,
+        /// True when a retained segment could not be read and was left out of
+        /// this page. `at_end` then means "no older events among the segments
+        /// that could be read", which is weaker than "no older events exist",
+        /// so a client that stops paging on `at_end` should say the history is
+        /// partial rather than present it as complete.
+        pub incomplete: bool,
     }
 }
 
