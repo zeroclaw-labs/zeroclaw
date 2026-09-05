@@ -402,6 +402,8 @@ mod plugin_registry;
 mod plugins;
 mod providers;
 #[cfg(feature = "agent-runtime")]
+mod relay_cli;
+#[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
 mod security_status;
@@ -763,6 +765,13 @@ Examples:
     Security {
         #[command(subcommand)]
         security_command: SecurityCommands,
+    },
+
+    /// Bind this daemon to a ZeroRelay account (self-serve enrollment)
+    #[cfg(feature = "agent-runtime")]
+    Relay {
+        #[command(subcommand)]
+        relay_command: RelayCommands,
     },
 
     Estop {
@@ -3066,6 +3075,42 @@ enum SecurityCommands {
     /// retires the old id; the new id reaches clients in-band on their next
     /// certificate renewal. Only applies when `[relay].node_id` is auto-minted.
     RelayRotateNodeId,
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum RelayCommands {
+    /// Claim this daemon into your ZeroRelay account with a one-time token.
+    ///
+    /// Derives the daemon's relay-registration identity, proves control of it
+    /// with an Ed25519 signature over the claim token, and POSTs the proof to the
+    /// control plane's `/v1/claim` endpoint. On success it writes `[relay]`
+    /// (enabled, url, node-id) so the daemon registers against the now-allowlisted
+    /// relay on its next start. The signing key is the same one the daemon
+    /// registers with, so the fingerprint proven here is the one the relay admits.
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Claim this daemon into your ZeroRelay account with a one-time token.
+
+Derives the daemon's relay-registration identity, signs the claim token with it, \
+and POSTs the proof to the control plane. On success, writes [relay] so the daemon \
+registers against the relay on next start.
+
+Examples:
+  zeroclaw relay claim clm_XXXX --control https://control.zerorelay.net")]
+    Claim {
+        /// One-time claim token issued by your ZeroRelay account.
+        token: String,
+
+        /// Control-plane base URL, e.g. https://control.zerorelay.net.
+        #[arg(long)]
+        control: String,
+
+        /// Data dir holding the relay registration key. Defaults to the
+        /// daemon's configured data dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
@@ -6494,6 +6539,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                 );
                 Ok(())
+            }
+        },
+
+        #[cfg(feature = "agent-runtime")]
+        Commands::Relay { relay_command } => match relay_command {
+            RelayCommands::Claim {
+                token,
+                control,
+                data_dir,
+            } => {
+                Box::pin(relay_cli::handle_claim(
+                    &mut config,
+                    &token,
+                    &control,
+                    data_dir,
+                ))
+                .await
             }
         },
 

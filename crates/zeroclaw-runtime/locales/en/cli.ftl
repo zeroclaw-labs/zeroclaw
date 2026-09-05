@@ -1108,6 +1108,7 @@ cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
 # ── daemon mTLS and enrollment operator output ──
 cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-relay-claim-ok = Daemon claimed as node-id {$node_id} on relay {$relay}. Wrote [relay] to your config; start (or restart) the daemon to register against the relay.
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}

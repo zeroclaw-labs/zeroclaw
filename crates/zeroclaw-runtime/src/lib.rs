@@ -36,6 +36,7 @@ pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
 pub mod relay;
+pub mod relay_claim;
 pub mod restart;
 pub mod routines;
 pub mod rpc;
