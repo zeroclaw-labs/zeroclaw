@@ -159,6 +159,7 @@ loop_ignore_tools = []
 loop_detection_enabled = true
 loop_detection_window_size = 20
 loop_detection_max_repeats = 3
+loop_detection_no_progress_min_calls = 5
 
 [skills]
 open_skills_enabled = false

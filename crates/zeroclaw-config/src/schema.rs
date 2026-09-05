@@ -6153,6 +6153,12 @@ pub struct PacingConfig {
     /// escalation (Warning). Defaults to 3.
     #[serde(default = "default_loop_detection_max_repeats")]
     pub loop_detection_max_repeats: usize,
+
+    /// Number of same-tool calls with differing arguments but byte-identical
+    /// results before the first no-progress escalation (Warning). This pattern
+    /// caps at Block — it never terminates the turn. Defaults to 5.
+    #[serde(default = "default_loop_detection_no_progress_min_calls")]
+    pub loop_detection_no_progress_min_calls: usize,
 }
 
 fn default_loop_detection_enabled() -> bool {
@@ -6167,6 +6173,10 @@ fn default_loop_detection_max_repeats() -> usize {
     3
 }
 
+fn default_loop_detection_no_progress_min_calls() -> usize {
+    5
+}
+
 impl Default for PacingConfig {
     fn default() -> Self {
         Self {
@@ -6177,6 +6187,7 @@ impl Default for PacingConfig {
             loop_detection_enabled: default_loop_detection_enabled(),
             loop_detection_window_size: default_loop_detection_window_size(),
             loop_detection_max_repeats: default_loop_detection_max_repeats(),
+            loop_detection_no_progress_min_calls: default_loop_detection_no_progress_min_calls(),
         }
     }
 }
@@ -36265,11 +36276,16 @@ url = "http://localhost:8080/mcp"
             from_toml.loop_detection_max_repeats,
             manual.loop_detection_max_repeats
         );
+        assert_eq!(
+            from_toml.loop_detection_no_progress_min_calls,
+            manual.loop_detection_no_progress_min_calls
+        );
 
         // Verify concrete values so a silent change to the defaults is caught.
         assert!(from_toml.loop_detection_enabled, "default should be true");
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
+        assert_eq!(from_toml.loop_detection_no_progress_min_calls, 5);
     }
 
     // ── Docker baked config template ────────────────────────────
