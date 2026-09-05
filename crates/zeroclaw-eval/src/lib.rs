@@ -9,7 +9,8 @@ pub mod report;
 pub mod runner;
 pub mod tools;
 
-pub use case::{LlmTrace, TraceExpects};
+pub use case::{LlmTrace, ToolPayloadExpect, TraceExpects};
+pub use observer::RecordedCall;
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
 pub use runner::{run_case, run_suite};

@@ -123,11 +123,11 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
+    let tool_calls = observer.calls();
     Ok(RunRecord {
         final_response,
         history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
+        tool_calls,
         input_tokens,
         output_tokens,
     })
@@ -163,7 +163,7 @@ mod tests {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
         let record = run_case(&trace).await.unwrap();
         assert!(record.final_response.contains("Hello"));
-        assert!(record.tools_called.is_empty());
+        assert!(record.tool_calls.is_empty());
         let grades = evaluate_expects(&trace.expects, &record);
         assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
     }
@@ -172,10 +172,45 @@ mod tests {
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
         let record = run_case(&trace).await.unwrap();
-        assert_eq!(record.tools_called, vec!["echo".to_string()]);
-        assert!(record.all_tools_succeeded);
+        assert_eq!(record.tool_names(), vec!["echo"]);
+        assert!(record.all_tools_succeeded());
         let grades = evaluate_expects(&trace.expects, &record);
         assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
+    }
+
+    #[tokio::test]
+    async fn run_record_carries_dispatched_arguments_and_tool_results() {
+        // End-to-end proof that the boundary payloads survive a real agent run:
+        // the Unicode argument reaches the tool and the tool's own output comes
+        // back, independent of whatever text the replay provider scripted.
+        const UNICODE: &str = r#"{
+            "model_name": "test-unicode-roundtrip",
+            "turns": [{
+                "user_input": "Répète: naïve café 日本語 ✓",
+                "steps": [
+                    { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "naïve café 日本語 ✓"} }] } },
+                    { "response": { "type": "text", "content": "done" } }
+                ]
+            }],
+            "expects": {}
+        }"#;
+        let trace: LlmTrace = serde_json::from_str(UNICODE).unwrap();
+        let record = run_case(&trace).await.unwrap();
+        assert_eq!(record.tool_calls.len(), 1, "calls: {:?}", record.tool_calls);
+        let call = &record.tool_calls[0];
+        assert_eq!(call.name, "echo");
+        assert!(
+            call.arguments.contains("naïve café 日本語 ✓"),
+            "dispatched arguments did not carry the Unicode message: {:?}",
+            call.arguments
+        );
+        assert_eq!(
+            call.result, "naïve café 日本語 ✓",
+            "tool result did not round-trip the Unicode message"
+        );
+        // The final response is scripted text and deliberately does NOT contain the
+        // Unicode string, so this assertion can only be satisfied by the boundary.
+        assert_eq!(record.final_response, "done");
     }
 
     #[tokio::test]
