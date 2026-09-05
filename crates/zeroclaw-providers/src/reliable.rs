@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode, tag, turn_stop};
 
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
@@ -427,6 +428,33 @@ fn record_accepted_route(route: AcceptedRoute) {
         .try_with(|accounting| accounting.lock().accepted_route = Some(route));
 }
 
+/// Classify a chat call that exhausted every provider/model in the chain.
+/// The kind comes from the typed terminal failure the exhaustion path already
+/// built, so the auth case is classified where it was identified rather than
+/// re-sniffed from the aggregate text.
+fn provider_exhausted_stop(err: &anyhow::Error) -> TurnStop {
+    let kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+        .map(ReliableProviderTerminalFailure::kind);
+    let detail = err.to_string();
+    match kind {
+        Some(
+            ReliableProviderTerminalFailureKind::Authentication
+            | ReliableProviderTerminalFailureKind::CredentialsMissing,
+        ) => TurnStop::fatal(TurnStopCode::ProviderAuth, detail),
+        _ => TurnStop::recoverable(TurnStopCode::ProviderUnavailable, detail),
+    }
+}
+
+/// Attach the exhaustion stop without disturbing the error itself: `tag` keeps
+/// the cause's `Display` and source chain, so every existing `chain()` walk
+/// (rejected usage, semantic-empty, terminal failure) still finds what it did.
+fn provider_exhausted(err: anyhow::Error) -> anyhow::Error {
+    let stop = provider_exhausted_stop(&err);
+    tag(err, stop)
+}
+
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     let msg = err.to_string();
     // 503 / service unavailable / high demand (Gemini, OpenAI, etc.)
@@ -451,6 +479,17 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // Typed first; the string heuristics below stay as the fallback for errors
+    // that came from outside our code.
+    if let Some(stop) = turn_stop(err) {
+        match stop.code {
+            // Recoverable by trimming history — same carve-out as the string path.
+            TurnStopCode::ContextOverflow => return false,
+            TurnStopCode::ProviderAuth => return true,
+            _ => {}
+        }
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -514,6 +553,12 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
 /// Used by channels to evict cached model_providers whose OAuth tokens may have
 /// expired so the next request triggers a fresh credential resolution.
 pub fn is_auth_error(err: &anyhow::Error) -> bool {
+    if let Some(stop) = turn_stop(err)
+        && stop.code == TurnStopCode::ProviderAuth
+    {
+        return true;
+    }
+
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
         && let Some(status) = reqwest_err.status()
     {
@@ -564,6 +609,11 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    if let Some(stop) = turn_stop(err)
+        && stop.code == TurnStopCode::ContextOverflow
+    {
+        return true;
+    }
     let hints = [
         "exceeds the context window",
         "exceeds the available context size",
@@ -2214,7 +2264,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -2222,7 +2272,7 @@ impl ModelProvider for ReliableModelProvider {
             None,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     async fn chat_with_history(
@@ -2501,7 +2551,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -2509,7 +2559,7 @@ impl ModelProvider for ReliableModelProvider {
             None,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
@@ -2898,7 +2948,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -2906,7 +2956,7 @@ impl ModelProvider for ReliableModelProvider {
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     async fn chat(
@@ -3207,7 +3257,7 @@ impl ModelProvider for ReliableModelProvider {
             }
         }
 
-        Err(reliable_terminal_error_with_cause(
+        Err(provider_exhausted(reliable_terminal_error_with_cause(
             final_cause_provider
                 .as_deref()
                 .or_else(|| self.configured_provider_identity()),
@@ -3215,7 +3265,7 @@ impl ModelProvider for ReliableModelProvider {
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
             final_cause,
-        ))
+        )))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -6178,6 +6228,63 @@ mod tests {
         assert!(!msg.contains("p1 error"));
         assert!(!msg.contains("p2 error"));
         assert!(msg.contains("retryable"));
+        assert_eq!(
+            turn_stop(&err).expect("exhaustion must be typed").code,
+            TurnStopCode::ProviderUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_after_an_auth_failure_is_typed_as_auth() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "p1".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "401 Unauthorized: invalid api key",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let err = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("the only model_provider fails");
+        let stop = turn_stop(&err).expect("exhaustion must be typed");
+        assert_eq!(stop.code, TurnStopCode::ProviderAuth);
+        assert!(is_auth_error(&err), "typed auth must reach is_auth_error");
+        // Tagging is invisible: the aggregate still says what it always said,
+        // and still redacts the raw provider body.
+        assert!(
+            err.to_string()
+                .contains("All model providers/models failed"),
+            "got: {err}"
+        );
+        assert!(!err.to_string().contains("invalid api key"), "got: {err}");
+    }
+
+    #[test]
+    fn a_typed_context_overflow_classifies_without_its_message() {
+        let err = zeroclaw_api::turn_stop::tag(
+            anyhow::Error::msg("upstream said something unhelpful"),
+            TurnStop::fatal(TurnStopCode::ContextOverflow, "context overflow"),
+        );
+        assert!(is_context_window_exceeded(&err));
+        assert!(!is_non_retryable(&err), "overflow stays retryable");
+    }
+
+    #[test]
+    fn an_untyped_string_error_still_classifies_through_the_fallback() {
+        let err = anyhow::Error::msg("prompt is too long for this model");
+        assert!(turn_stop(&err).is_none(), "external errors stay untyped");
+        assert!(is_context_window_exceeded(&err));
+        assert!(!is_non_retryable(&err));
+        assert!(is_auth_error(&anyhow::Error::msg("401 Unauthorized")));
     }
 
     #[tokio::test]

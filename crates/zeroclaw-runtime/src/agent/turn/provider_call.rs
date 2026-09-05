@@ -16,6 +16,7 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::dispatch::{AcceptedRoute, AccountedAttempt, with_exact_dispatch_route};
 use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
@@ -115,6 +116,14 @@ pub(crate) async fn announce_llm_request(
     llm_started_at
 }
 
+/// The per-step timeout stop, shared by both `step_timeout_secs` arms.
+fn step_timeout_stop(step_secs: u64) -> TurnStop {
+    TurnStop::close_out(
+        TurnStopCode::StepTimeout,
+        format!("LLM inference step timed out after {step_secs}s (step_timeout_secs)"),
+    )
+}
+
 /// Budget enforcement — block if limit exceeded (no-op when not scoped).
 pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
     if let Some(BudgetCheck::Exceeded {
@@ -135,12 +144,13 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
                 })),
             "tool-call loop budget exceeded"
         );
-        anyhow::bail!(
-            "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
-            current_usd,
-            limit_usd,
-            period
-        );
+        return Err(TurnStop::fatal(
+            TurnStopCode::BudgetExhausted,
+            format!(
+                "Budget exceeded: ${current_usd:.4} of ${limit_usd:.2} {period:?} limit. Cannot make further API calls until the budget resets."
+            ),
+        )
+        .into());
     }
     Ok(())
 }
@@ -333,7 +343,7 @@ pub(crate) async fn call_provider(
                         result = tokio::time::timeout(step_timeout, chat_future) => {
                             match result {
                                 Ok(inner) => inner,
-                                Err(_) => Err(anyhow::Error::msg(format!("LLM inference step timed out after {step_secs}s (step_timeout_secs)"))),
+                                Err(_) => Err(step_timeout_stop(step_secs).into()),
                             }
                         },
                         () = token.cancelled() => Err(ToolLoopCancelled.into()),
@@ -341,9 +351,7 @@ pub(crate) async fn call_provider(
                 } else {
                     match tokio::time::timeout(step_timeout, chat_future).await {
                         Ok(inner) => inner,
-                        Err(_) => Err(anyhow::Error::msg(format!(
-                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                        ))),
+                        Err(_) => Err(step_timeout_stop(step_secs).into()),
                     }
                 }
             }
@@ -1522,5 +1530,36 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_api::turn_stop::turn_stop;
+
+    #[test]
+    fn the_step_timeout_stop_is_typed_and_says_what_it_always_said() {
+        let stop = step_timeout_stop(30);
+        assert_eq!(stop.code, TurnStopCode::StepTimeout);
+        assert_eq!(
+            stop.to_string(),
+            "LLM inference step timed out after 30s (step_timeout_secs)"
+        );
+        let err: anyhow::Error = stop.into();
+        assert_eq!(
+            turn_stop(&err)
+                .expect("stop must survive the anyhow hop")
+                .code,
+            TurnStopCode::StepTimeout
+        );
+    }
+
+    #[test]
+    fn an_unscoped_turn_has_no_budget_to_exceed() {
+        // The budget gate is a no-op outside a cost-tracking scope, so the
+        // BudgetExhausted stop is unreachable here — pinned so a future change
+        // that makes it fire closed is caught.
+        assert!(enforce_tool_loop_budget().is_ok());
     }
 }

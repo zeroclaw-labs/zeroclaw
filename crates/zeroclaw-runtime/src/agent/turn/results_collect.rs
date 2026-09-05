@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
@@ -117,7 +118,11 @@ pub(crate) fn collect_tool_results(
                             })),
                         "loop_detector_circuit_breaker"
                     );
-                    anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    return Err(TurnStop::close_out(
+                        TurnStopCode::LoopDetector,
+                        format!("Agent loop aborted by loop detector: {msg}"),
+                    )
+                    .into());
                 }
             }
         }
@@ -202,10 +207,14 @@ pub(crate) fn check_identical_output_abort(
                     })),
                 "tool_loop_identical_output_abort"
             );
-            anyhow::bail!(
-                "Agent loop aborted: identical tool output detected {} consecutive times",
-                *consecutive_identical_outputs
-            );
+            return Err(TurnStop::close_out(
+                TurnStopCode::IdenticalOutput,
+                format!(
+                    "Agent loop aborted: identical tool output detected {} consecutive times",
+                    *consecutive_identical_outputs
+                ),
+            )
+            .into());
         }
     }
     Ok(())
@@ -216,6 +225,7 @@ mod tests {
     use super::*;
     use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
     use crate::agent::tool_execution::ToolExecutionOutcome;
+    use zeroclaw_api::turn_stop::turn_stop;
     use zeroclaw_tool_call_parser::ParsedToolCall;
 
     const RATE_LIMIT_ERR: &str = "Rate limit exceeded: too many actions in the last hour";
@@ -342,5 +352,70 @@ mod tests {
     #[test]
     fn failed_identical_outputs_do_not_trip_hash_based_abort() {
         assert!(run_hash_path(8, RATE_LIMIT_ERR, false).is_ok());
+    }
+
+    #[test]
+    fn loop_detector_break_carries_a_typed_stop() {
+        // Identical tool + identical args is the unambiguous pattern; it still
+        // breaks, and the bail now carries its code.
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let ignore: HashSet<&str> = HashSet::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut ordered: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> = Vec::new();
+        for _ in 0..6 {
+            tool_calls.push(ParsedToolCall {
+                name: "shell".to_string(),
+                arguments: serde_json::json!({ "command": "ls" }),
+                tool_call_id: None,
+            });
+            ordered.push(Some(("shell".to_string(), None, outcome("same", true))));
+        }
+        let err = collect_tool_results(
+            ordered,
+            &tool_calls,
+            &mut history,
+            &mut detector,
+            &ignore,
+            10_000,
+            None,
+            "test-model",
+            0,
+            "turn-test",
+        );
+        let err = match err {
+            Ok(_) => panic!("identical tool+args must break the turn"),
+            Err(e) => e,
+        };
+
+        assert_eq!(
+            turn_stop(&err).expect("break must be typed").code,
+            TurnStopCode::LoopDetector
+        );
+        assert!(
+            err.to_string()
+                .starts_with("Agent loop aborted by loop detector:"),
+            "the message must not change: {err}"
+        );
+    }
+
+    #[test]
+    fn identical_output_abort_carries_a_typed_stop() {
+        let err = run_hash_path(8, "byte-identical successful output", true)
+            .expect_err("identical successful output must abort");
+        assert_eq!(
+            turn_stop(&err).expect("abort must be typed").code,
+            TurnStopCode::IdenticalOutput
+        );
+        assert!(
+            err.to_string()
+                .starts_with("Agent loop aborted: identical tool output detected"),
+            "the message must not change: {err}"
+        );
+    }
+
+    #[test]
+    fn a_plain_error_stays_untyped_for_the_string_fallback() {
+        assert!(turn_stop(&anyhow::Error::msg("upstream returned 500")).is_none());
     }
 }

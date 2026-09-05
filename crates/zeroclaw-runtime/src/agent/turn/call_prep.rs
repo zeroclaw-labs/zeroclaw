@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::attribution::ToolProvenance;
+use zeroclaw_api::turn_stop::{TurnStop, TurnStopCode};
 use zeroclaw_tool_call_parser::{ParsedToolCall, canonicalize_json_for_tool_signature};
 
 pub(crate) struct PreparedToolCalls {
@@ -216,7 +217,9 @@ pub(crate) async fn prepare_tool_calls(
                         )))
                         .await;
                 }
-                anyhow::bail!("{repeated}");
+                return Err(
+                    TurnStop::close_out(TurnStopCode::PromptRequiredRepeat, repeated).into(),
+                );
             }
         }
 
