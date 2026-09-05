@@ -21483,6 +21483,44 @@ impl Config {
             }
         }
 
+        // Eval harness provider refs are global dotted `providers.models`
+        // references. Empty values opt out of the corresponding evaluator.
+        let eval_provider_refs = [
+            ("eval.live_provider", self.eval.live_provider.trim()),
+            ("eval.judge_provider", self.eval.judge_provider.trim()),
+        ];
+        for (field, provider_ref) in eval_provider_refs {
+            if provider_ref.is_empty() {
+                continue;
+            }
+            match provider_ref.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            field,
+                            "{field} = {provider_ref:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    field,
+                    "{field} must be dotted form `<type>.<alias>` (got {provider_ref:?})",
+                ),
+            }
+        }
+        if self.eval.case_timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "eval.case_timeout_secs",
+                "eval.case_timeout_secs must be greater than 0",
+            );
+        }
+
         // Reply-pacing bounds — both `reply_min_interval_secs` and
         // `reply_queue_depth_max` walk through one entry list so adding
         // a new paced channel only requires extending `reply_pacing_entries`.
@@ -41177,6 +41215,229 @@ allowed_users = []
             msg.contains("runtime_profiles.fast.context_compression.summary_provider")
                 && msg.contains("providers.models.custom.nope is not configured"),
             "expected DanglingReference for profile summary_provider, got: {msg}"
+        );
+    }
+
+    fn eval_live_provider_config(live_provider: &str) -> Config {
+        let toml = format!(
+            r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "{live_provider}"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_live_provider_bad_format() {
+        let cfg = eval_live_provider_config("notdotted");
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("non-dotted live_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.live_provider") && msg.contains("dotted form"),
+            "expected InvalidFormat for eval.live_provider, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_live_provider_dangling_alias() {
+        let cfg = eval_live_provider_config("custom.does-not-exist");
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("dangling live_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.live_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for eval.live_provider, got: {msg}"
+        );
+    }
+
+    /// The regression that actually bricks a config: rename the provider alias the
+    /// eval harness points at, serialize, reload, and validate. Before the alias
+    /// walkers knew about `eval.*_provider`, the saved TOML kept the old alias and
+    /// the next startup refused to load it — with no in-product recovery.
+    #[tokio::test]
+    async fn save_reload_after_alias_rename_keeps_eval_refs_valid() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "custom.default"
+            judge_provider = "custom.default"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = crate::alias_refs::AliasKind::Provider {
+            category: crate::alias_refs::ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        crate::alias_refs::rename_with_cascade(&mut cfg, &kind, "default", "prod")
+            .expect("provider rename succeeds");
+
+        // Round-trip through the serialized form, exactly as a save + next startup would.
+        let saved = toml::to_string(&cfg).expect("serialize renamed config");
+        let reloaded: Config = toml::from_str(&saved).expect("reloaded config must parse");
+        assert_eq!(reloaded.eval.live_provider.as_str(), "custom.prod");
+        assert_eq!(reloaded.eval.judge_provider.as_str(), "custom.prod");
+        reloaded
+            .validate()
+            .expect("a saved config must still validate after a provider alias rename");
+    }
+
+    /// Deleting the alias must cascade into both eval refs, so the saved config
+    /// does not carry a dangling reference that validation rejects on reload.
+    #[tokio::test]
+    async fn save_reload_after_alias_delete_keeps_eval_refs_valid() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [providers.models.custom.spare]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "custom.spare"
+            judge_provider = "custom.spare"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = crate::alias_refs::AliasKind::Provider {
+            category: crate::alias_refs::ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        crate::alias_refs::delete_with_cascade(
+            &mut cfg,
+            &kind,
+            "spare",
+            crate::alias_refs::CascadePolicy::RefuseOnHard,
+        )
+        .expect("soft eval refs must not block the delete");
+
+        let saved = toml::to_string(&cfg).expect("serialize config after delete");
+        let reloaded: Config = toml::from_str(&saved).expect("reloaded config must parse");
+        assert!(reloaded.eval.live_provider.is_empty());
+        assert!(reloaded.eval.judge_provider.is_empty());
+        reloaded
+            .validate()
+            .expect("a saved config must still validate after a provider alias delete");
+    }
+
+    #[tokio::test]
+    async fn renaming_a_provider_keeps_eval_live_provider_valid() {
+        // The corruption path B1 names: renaming a provider alias used to leave
+        // eval.live_provider pointing at the old name, so the config failed its
+        // own validation on the next load.
+        use crate::alias_refs::{AliasKind, ProviderCategory, rename_with_cascade};
+        let mut cfg = eval_live_provider_config("custom.default");
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = AliasKind::Provider {
+            category: ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        rename_with_cascade(&mut cfg, &kind, "default", "renamed").expect("rename must succeed");
+
+        assert_eq!(cfg.eval.live_provider.as_str(), "custom.renamed");
+        cfg.validate()
+            .expect("config must still validate after the rename");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_provider_keeps_eval_live_provider_valid() {
+        // The delete half of B1: deleting an otherwise-unreferenced provider
+        // used to report success while leaving eval.live_provider dangling.
+        use crate::alias_refs::{AliasKind, CascadePolicy, ProviderCategory, delete_with_cascade};
+        let mut cfg = eval_live_provider_config("custom.spare");
+        cfg.providers
+            .models
+            .ensure("custom", "spare")
+            .expect("ensure the spare provider");
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = AliasKind::Provider {
+            category: ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        delete_with_cascade(&mut cfg, &kind, "spare", CascadePolicy::RefuseOnHard)
+            .expect("a soft eval ref must not block the delete");
+
+        assert!(
+            cfg.eval.live_provider.is_empty(),
+            "the dangling ref must be cleared, got {:?}",
+            cfg.eval.live_provider
+        );
+        cfg.validate()
+            .expect("config must still validate after the delete");
+    }
+
+    #[tokio::test]
+    async fn config_validate_accepts_empty_eval_live_provider() {
+        // Empty is the opt-out; it must validate.
+        let cfg = eval_live_provider_config("");
+        cfg.validate()
+            .expect("empty eval.live_provider must validate");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_zero_eval_case_timeout() {
+        let mut cfg = eval_live_provider_config("");
+        cfg.eval.case_timeout_secs = 0;
+
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("a zero-second live timeout must fail validation")
+        );
+        assert!(
+            msg.contains("eval.case_timeout_secs") && msg.contains("greater than 0"),
+            "expected InvalidNumericRange for eval.case_timeout_secs, got: {msg}"
         );
     }
 

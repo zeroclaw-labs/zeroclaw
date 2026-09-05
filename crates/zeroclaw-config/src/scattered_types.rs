@@ -248,10 +248,13 @@ impl Default for EvalConfig {
 }
 
 fn default_eval_suite_dir() -> String {
-    "evals".to_string()
+    "evals/regression".to_string()
 }
 fn default_eval_mode() -> String {
     "replay".to_string()
+}
+fn default_eval_case_timeout_secs() -> u64 {
+    120
 }
 
 /// Configuration for the agent evaluation harness (`[eval]`), surfaced via the
@@ -262,11 +265,43 @@ fn default_eval_mode() -> String {
 #[prefix = "eval"]
 pub struct EvalHarnessConfig {
     /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    /// Defaults to `evals/regression`, the CI-gating suite. Planned sibling suites
+    /// `evals/capability/` (tracked, non-gating) and `evals/live/` (real-provider,
+    /// never in CI) live alongside it.
     #[serde(default = "default_eval_suite_dir")]
     pub suite_dir: String,
     /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
     #[serde(default = "default_eval_mode")]
     pub mode: String,
+    /// Provider used for `--mode live`, as a dotted `providers.models` reference
+    /// (`"<type>.<alias>"`), e.g. `"anthropic.sonnet"`. Empty disables live mode.
+    #[serde(default)]
+    pub live_provider: crate::providers::ModelProviderRef,
+    /// Tool names live-mode cases may use. A case's requested tools are
+    /// intersected with this list; the default (empty) allows no real tools.
+    /// `shell` can never actually be admitted this way: `zeroclaw-eval`'s
+    /// live tool surface hard-denies it (see
+    /// `zeroclaw_eval::live::LIVE_TOOL_DENYLIST`) regardless of what this
+    /// list contains, because live output reaches a real provider and no
+    /// accepted OS sandbox backend confines what `shell` can read.
+    #[serde(default)]
+    pub live_allowed_tools: Vec<String>,
+    /// Wall-clock timeout per conversation turn in live mode, seconds.
+    #[serde(default = "default_eval_case_timeout_secs")]
+    pub case_timeout_secs: u64,
+    /// Judge provider for diagnostic `expects.judge` rubrics, as a dotted
+    /// `providers.models` reference. Empty disables judge grading. Prefer a
+    /// different provider reference than the one under test (self-judging is
+    /// biased).
+    #[serde(default)]
+    pub judge_provider: crate::providers::ModelProviderRef,
+    /// Directory receiving one append-only run-history receipt per `eval run`
+    /// (schema `zeroclaw-eval/history/v1`): verdicts, scores, per-check results,
+    /// token/duration stats, and comparability keys — never transcripts or
+    /// workspace content. Files accumulate under `<history_dir>/<suite>/`.
+    /// Empty (the default) disables history recording.
+    #[serde(default)]
+    pub history_dir: String,
 }
 
 impl Default for EvalHarnessConfig {
@@ -274,6 +309,11 @@ impl Default for EvalHarnessConfig {
         Self {
             suite_dir: default_eval_suite_dir(),
             mode: default_eval_mode(),
+            live_provider: crate::providers::ModelProviderRef::default(),
+            live_allowed_tools: Vec::new(),
+            case_timeout_secs: default_eval_case_timeout_secs(),
+            judge_provider: crate::providers::ModelProviderRef::default(),
+            history_dir: String::new(),
         }
     }
 }
