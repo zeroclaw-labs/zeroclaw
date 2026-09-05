@@ -13,6 +13,7 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
@@ -31,6 +32,8 @@ pub(crate) fn endpoint_url(path: &str) -> String {
     format!("{BASE_URL}/{}", path.trim_start_matches('/'))
 }
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Maximum silence between body reads for OpenRouter SSE streams.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -540,6 +543,21 @@ impl OpenRouterModelProvider {
             OPENROUTER_CONNECT_TIMEOUT_SECS,
         )
     }
+
+    /// HTTP client for streaming SSE connections. Streaming responses can
+    /// legitimately outlive the normal request timeout while still making
+    /// progress, so bound only connection setup and idle body reads here.
+    fn streaming_http_client(&self) -> Client {
+        self.streaming_http_client_with_idle_timeout(STREAM_IDLE_TIMEOUT)
+    }
+
+    fn streaming_http_client_with_idle_timeout(&self, idle_timeout: Duration) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
+            "model_provider.openrouter",
+            idle_timeout.as_secs(),
+            OPENROUTER_CONNECT_TIMEOUT_SECS,
+        )
+    }
 }
 
 #[async_trait]
@@ -883,7 +901,7 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         };
 
-        let client = self.http_client();
+        let client = self.streaming_http_client();
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1183,6 +1201,69 @@ mod tests {
             .await
             .expect("stream should yield Final immediately");
         assert!(matches!(first, Ok(StreamEvent::Final)));
+    }
+
+    #[tokio::test]
+    async fn streaming_client_allows_active_stream_past_request_timeout() {
+        use axum::{Router, body::Body, response::IntoResponse, routing::get};
+        use futures_util::StreamExt as _;
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, Infallible>(axum::body::Bytes::from_static(b"first"))
+                });
+                let second = futures_util::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                    Ok::<_, Infallible>(axum::body::Bytes::from_static(b"second"))
+                });
+                Body::from_stream(first.chain(second)).into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind OpenRouter streaming test server");
+        let addr = listener
+            .local_addr()
+            .expect("OpenRouter streaming test address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve OpenRouter streaming test");
+        });
+
+        let provider = OpenRouterModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .timeout_secs(1)
+            .build();
+        let response = provider
+            .streaming_http_client_with_idle_timeout(Duration::from_secs(2))
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("streaming request should succeed");
+        let mut body = response.bytes_stream();
+        assert_eq!(
+            body.next()
+                .await
+                .expect("first stream chunk")
+                .expect("first stream chunk should be readable"),
+            axum::body::Bytes::from_static(b"first")
+        );
+        let second = tokio::time::timeout(Duration::from_secs(3), body.next())
+            .await
+            .expect("stream should remain open past the request timeout")
+            .expect("second stream chunk");
+        assert_eq!(
+            second.expect("second stream chunk should be readable"),
+            axum::body::Bytes::from_static(b"second")
+        );
+
+        server.abort();
     }
 
     #[test]
