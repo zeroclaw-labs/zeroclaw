@@ -5043,36 +5043,46 @@ impl Channel for MatrixChannel {
                 tool_name: request.tool_name.clone(),
             },
         );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         let send_msg = SendMessage::new(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(e);
         }
 
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
         let result = tokio::time::timeout(timeout, rx).await;
-        if result.is_err() {
-            self.pending_approvals.lock().await.remove(&token);
-        }
         // Only the first arm is an operator decision; the other two are the
         // runtime denying because nobody replied, and must say so.
         match result {
-            Ok(Ok(resp)) => Ok(Some(
-                zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
-            )),
-            Ok(Err(_)) => Ok(Some(
-                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::Unreachable,
-                ),
-            )),
-            Err(_) => Ok(Some(
-                zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
-                    ChannelApprovalResponse::Deny,
-                    zeroclaw_api::channel::ApprovalSource::TimedOut,
-                ),
-            )),
+            Ok(Ok(resp)) => {
+                guard.disarm();
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                ))
+            }
+            Ok(Err(_)) => {
+                guard.remove().await;
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ),
+                ))
+            }
+            Err(_) => {
+                guard.remove().await;
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
+                ))
+            }
         }
     }
 }

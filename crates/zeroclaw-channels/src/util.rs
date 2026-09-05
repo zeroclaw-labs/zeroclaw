@@ -1,3 +1,95 @@
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
+use std::{collections::HashMap, sync::Arc};
+
+/// Removes a pending approval if its requesting future is cancelled.
+///
+/// The guard is armed immediately after registration. Normal cleanup removes
+/// the entry before disarming so cancellation while waiting for the map lock
+/// cannot leave a stale token behind.
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
+pub(crate) struct PendingApprovalGuard<V: Send + 'static> {
+    pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>,
+    token: Option<String>,
+}
+
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
+impl<V: Send + 'static> PendingApprovalGuard<V> {
+    pub(crate) fn new(pending: Arc<tokio::sync::Mutex<HashMap<String, V>>>, token: String) -> Self {
+        Self {
+            pending,
+            token: Some(token),
+        }
+    }
+
+    /// The inbound handler removed the entry, or cleanup removed it normally.
+    pub(crate) fn disarm(&mut self) {
+        self.token = None;
+    }
+
+    /// Remove the pending entry before disarming the cancellation guard.
+    pub(crate) async fn remove(&mut self) {
+        let Some(token) = self.token.as_deref() else {
+            return;
+        };
+        self.pending.lock().await.remove(token);
+        self.token = None;
+    }
+}
+
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-lark",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-telegram"
+))]
+impl<V: Send + 'static> Drop for PendingApprovalGuard<V> {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        let pending = Arc::clone(&self.pending);
+        let removed = if let Ok(mut entries) = pending.try_lock() {
+            entries.remove(&token);
+            true
+        } else {
+            false
+        };
+        if removed {
+            return;
+        }
+        zeroclaw_spawn::spawn!(async move {
+            pending.lock().await.remove(&token);
+        });
+    }
+}
+
 #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 use zeroclaw_api::channel::ProgressEvent;
 
@@ -513,7 +605,9 @@ pub(crate) fn build_approve_deny_approval_prompt(
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -525,7 +619,9 @@ pub(crate) struct PendingApproval {
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -539,7 +635,9 @@ pub(crate) enum PendingApprovalResolution {
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -551,7 +649,13 @@ impl PendingApprovalResolution {
     }
 }
 
-#[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-matrix",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    test
+))]
 pub(crate) async fn resolve_pending_approval(
     pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
     token: &str,
@@ -571,7 +675,9 @@ pub(crate) async fn resolve_pending_approval(
 }
 
 #[cfg(any(
+    feature = "channel-discord",
     feature = "channel-matrix",
+    feature = "channel-signal",
     feature = "channel-slack",
     feature = "channel-telegram",
     test
@@ -918,6 +1024,24 @@ mod tests {
         let token = super::new_approval_token();
         assert_eq!(token.len(), 6);
         assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[tokio::test]
+    async fn pending_approval_guard_removes_entry_after_cancellation() {
+        let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        pending.lock().await.insert("cancelled".to_string(), ());
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let task_pending = Arc::clone(&pending);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let _guard = PendingApprovalGuard::new(task_pending, "cancelled".to_string());
+            let _ = armed_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        armed_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(!pending.lock().await.contains_key("cancelled"));
     }
 
     #[test]

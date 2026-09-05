@@ -5014,6 +5014,10 @@ Ensure only one `zeroclaw` process is using this bot token."
                 tool_name: request.tool_name.clone(),
             },
         );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            approval_id.clone(),
+        );
 
         let resp = self
             .http_client()
@@ -5063,23 +5067,23 @@ Ensure only one `zeroclaw` process is using this bot token."
                     Ok(r) => {
                         let status = r.status();
                         let err = r.text().await.unwrap_or_default();
-                        self.pending_approvals.lock().await.remove(&approval_id);
+                        guard.remove().await;
                         anyhow::bail!("Telegram sendMessage (approval) failed ({status}): {err}");
                     }
                     Err(e) => {
-                        self.pending_approvals.lock().await.remove(&approval_id);
+                        guard.remove().await;
                         return Err(e.into());
                     }
                 }
             }
             Err(e) => {
-                self.pending_approvals.lock().await.remove(&approval_id);
+                guard.remove().await;
                 return Err(e.into());
             }
         };
 
         if !send_ok {
-            self.pending_approvals.lock().await.remove(&approval_id);
+            guard.remove().await;
             anyhow::bail!("Telegram sendMessage (approval) failed after fallback");
         }
 
@@ -5095,12 +5099,15 @@ Ensure only one `zeroclaw` process is using this bot token."
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), &mut rx)
                 .await
             {
-                Ok(Ok(response)) => Some(
-                    zeroclaw_api::channel::AttributedApprovalResponse::operator(response),
-                ),
+                Ok(Ok(response)) => {
+                    guard.disarm();
+                    Some(zeroclaw_api::channel::AttributedApprovalResponse::operator(
+                        response,
+                    ))
+                }
                 Ok(Err(_)) => {
                     // Sender dropped — clean up and deny. Nobody tapped.
-                    self.pending_approvals.lock().await.remove(&approval_id);
+                    guard.remove().await;
                     Some(
                         zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                             ChannelApprovalResponse::Deny,
@@ -5108,7 +5115,11 @@ Ensure only one `zeroclaw` process is using this bot token."
                         ),
                     )
                 }
-                Err(_) => Some(self.resolve_after_deadline(&approval_id, &mut rx).await),
+                Err(_) => {
+                    let response = self.resolve_after_deadline(&approval_id, &mut rx).await;
+                    guard.disarm();
+                    Some(response)
+                }
             };
 
         Ok(result)
@@ -12730,6 +12741,70 @@ mod tests {
             ch.pending_approvals.lock().await.is_empty(),
             "the winning claim removes the entry"
         );
+    }
+
+    #[tokio::test]
+    async fn request_approval_cancellation_removes_pending_entry() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let sent_by_mock = Arc::clone(&sent);
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(move |_: &wiremock::Request| {
+                sent_by_mock.notify_one();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "message_id": 1 }
+                }))
+            })
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(120);
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+        };
+        let mut waiter = Box::pin(ch.request_approval_attributed("12345", &request));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = sent.notified() => {}
+                result = &mut waiter => panic!("approval completed before cancellation: {result:?}"),
+            }
+        })
+        .await
+        .expect("approval prompt must reach the mock server");
+
+        // Hold the map lock across cancellation to exercise deferred cleanup
+        // of the destination-bearing entry used by the real request path.
+        let pending = ch.pending_approvals.lock().await;
+        assert_eq!(pending.len(), 1);
+        let entry = pending.values().next().unwrap();
+        assert_eq!(entry.destination, "12345");
+        assert_eq!(entry.tool_name, "shell");
+        drop(waiter);
+        assert!(entry.sender.is_closed(), "cancellation drops the receiver");
+        drop(pending);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ch.pending_approvals.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled approval must not leave a live pending token");
     }
 
     #[tokio::test]

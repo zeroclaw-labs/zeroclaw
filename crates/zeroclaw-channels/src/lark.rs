@@ -3190,6 +3190,10 @@ impl Channel for LarkChannel {
                 arguments_summary: request.arguments_summary.clone(),
             },
         );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            approval_id.clone(),
+        );
 
         let send_result = async {
             let token = self.get_tenant_access_token().await?;
@@ -3244,12 +3248,12 @@ impl Channel for LarkChannel {
                 }
             }
             Err(err) => {
-                self.pending_approvals.lock().await.remove(&approval_id);
+                guard.remove().await;
                 return Err(err);
             }
         }
 
-        Ok(Some(self.wait_for_decision(rx, &approval_id).await))
+        Ok(Some(self.wait_for_decision(rx, &mut guard).await))
     }
 
     fn supports_draft_updates(&self) -> bool {
@@ -3518,22 +3522,25 @@ impl LarkChannel {
     async fn wait_for_decision(
         &self,
         rx: tokio::sync::oneshot::Receiver<zeroclaw_api::channel::ChannelApprovalResponse>,
-        approval_id: &str,
+        guard: &mut crate::util::PendingApprovalGuard<PendingApproval>,
     ) -> zeroclaw_api::channel::AttributedApprovalResponse {
         use zeroclaw_api::channel::{
             ApprovalSource, AttributedApprovalResponse, ChannelApprovalResponse,
         };
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-            Ok(Ok(response)) => AttributedApprovalResponse::operator(response),
+            Ok(Ok(response)) => {
+                guard.disarm();
+                AttributedApprovalResponse::operator(response)
+            }
             Ok(Err(_)) => {
-                self.pending_approvals.lock().await.remove(approval_id);
+                guard.remove().await;
                 AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::Unreachable,
                 )
             }
             Err(_) => {
-                self.pending_approvals.lock().await.remove(approval_id);
+                guard.remove().await;
                 AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::TimedOut,
