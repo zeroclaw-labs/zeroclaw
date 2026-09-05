@@ -14,7 +14,8 @@ pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 /// How much reasoning a model should spend on a request, for model families
 /// that take a depth setting rather than a token budget. Variants are declared
 /// in ascending depth, so they compare by depth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ThinkingEffort {
     Low,
     High,
@@ -88,12 +89,16 @@ impl ThinkingDisplay {
 /// whichever of the depth settings it accepts; both are absent when the caller
 /// asked for the provider's own default depth. The display travels alongside
 /// so one request can choose how much of the reasoning comes back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ThinkingEffort>,
     /// How much of the reasoning comes back. `None` leaves the choice to the
-    /// provider alias, and past that to the API default.
+    /// runtime profile, then the provider alias, and past that to the API
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<ThinkingDisplay>,
 }
 
@@ -487,6 +492,15 @@ impl StreamChunk {
 pub enum StreamEvent {
     /// Text delta from the assistant.
     TextDelta(StreamChunk),
+    /// Transient, human-readable thinking progress. Surfaced to the user
+    /// (gated by the runtime visibility policy) and never persisted into
+    /// reasoning_content.
+    ThinkingDelta(String),
+    /// Durable, replay-only finalized reasoning payload (signed thinking
+    /// blocks in the provider's history-replay representation). Appended to
+    /// `ChatResponse::reasoning_content` for the next provider request and
+    /// never surfaced as user-visible progress.
+    ReasoningFinalized(String),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
     /// A tool call that was already executed by the model_provider (e.g. Claude Code proxy).
@@ -687,6 +701,15 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities.native_tool_calling = self.supports_native_tools();
         capabilities.vision = self.supports_vision();
         capabilities
+    }
+
+    /// Name the entry that forced `vision` to `false` on this provider's
+    /// [`Self::capabilities_for_model`], for providers that aggregate several
+    /// named entries (e.g. a primary plus configured fallbacks) into one
+    /// capability set. Returns `None` when this provider is not such an
+    /// aggregate, or when nothing about it limits vision for `model`.
+    fn vision_limited_by(&self, _model: &str) -> Option<String> {
+        None
     }
 
     /// Whether the selected request can reach both native-tool and text-only
@@ -971,6 +994,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
         self.as_ref().capabilities_for_model(model)
+    }
+
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        self.as_ref().vision_limited_by(model)
     }
 
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
@@ -1314,7 +1341,7 @@ mod turn_order_tests {
 
 #[cfg(test)]
 mod thinking_display_tests {
-    use super::ThinkingDisplay;
+    use super::{NativeThinkingParams, ThinkingDisplay};
 
     #[test]
     fn tokens_round_trip_ignoring_case() {
@@ -1355,6 +1382,39 @@ mod thinking_display_tests {
         assert_eq!(
             serde_json::from_str::<ThinkingDisplay>("\"updates\"").unwrap(),
             ThinkingDisplay::Updates
+        );
+    }
+
+    #[test]
+    fn as_str_maps_updates_variant() {
+        assert_eq!(ThinkingDisplay::Updates.as_str(), "updates");
+    }
+
+    #[test]
+    fn serialization_includes_display_when_present() {
+        let params = NativeThinkingParams {
+            budget_tokens: Some(1_024),
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let json = serde_json::to_string(&params).expect("serialization should succeed");
+        assert!(
+            json.contains("\"display\":\"updates\""),
+            "expected display field in serialized params, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialization_omits_display_when_absent() {
+        let params = NativeThinkingParams {
+            budget_tokens: Some(1_024),
+            effort: None,
+            display: None,
+        };
+        let json = serde_json::to_string(&params).expect("serialization should succeed");
+        assert!(
+            !json.contains("display"),
+            "expected display field to be omitted, got: {json}"
         );
     }
 }

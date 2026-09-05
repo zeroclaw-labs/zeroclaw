@@ -109,6 +109,40 @@ When `[multimodal] vision_model_provider` names a dotted provider alias, its
 precedence over the alias model; if neither is set, the primary turn model is
 used for backward compatibility.
 
+## Native thinking display (Anthropic)
+
+`agent.thinking.display` controls how Anthropic extended thinking is
+delivered when native thinking is enabled (`agent.thinking.native_thinking
+= true`). Accepted values:
+
+- `off` (default): no `display` field is sent; requests are byte-identical
+  to earlier ZeroClaw versions and thinking requests use the non-streaming
+  fallback.
+- `omitted`: the API's own default on the current generations, so nothing is
+  sent; thinking text stays withheld, and on the models that think only when
+  asked this does not switch reasoning on by itself.
+- `updates`: the request carries the
+  `thinking-display-updates-2026-08-18` beta and uses the streaming
+  response path. Readable thinking progress is surfaced live while the
+  model works; the signed reasoning payload is retained separately for
+  history replay and never shown.
+- `summarized`: same streaming behavior, requesting summarized thinking.
+
+```toml
+[agent.thinking]
+native_thinking = true
+display = "updates"
+```
+
+`updates` requires an Anthropic account enrolled in the
+`thinking-display-updates` beta; without enrollment the API rejects the
+request. Set `display = "off"` (or remove the field) to return to the
+previous wire behavior. The field reaches generation 4.7 and later only, and
+progress notes reach the Fable and Mythos families only; a value the model
+does not take is dropped with a log line. A zerocode session may choose a
+different display for itself, which beats this setting; the Anthropic slot's
+`thinking_display` fills in behind both (see [Anthropic](#anthropic)).
+
 ## Per-family knobs: worked examples
 
 ### Anthropic

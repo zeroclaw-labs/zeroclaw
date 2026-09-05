@@ -163,8 +163,9 @@ older Claude model without `native_thinking`, a display on Claude 4.6 or on
 Bedrock). `current_level` and `current_display` are present exactly when the
 matching list is non-empty. `level_source` is `session`, `profile` (the
 runtime profile's `default_level`) or `model_default` (the profile names no
-depth); `display_source` is `session`, `alias` (the provider slot's
-`thinking_display`) or `model_default`. Session overrides are read at turn
+depth); `display_source` is `session`, `profile` (the runtime profile's
+`agent.thinking.display`), `alias` (the provider slot's `thinking_display`)
+or `model_default`. Session overrides are read at turn
 time and rebuild no provider; the daemon resolves the turn's depth as the
 inline prefix, then the session override, then the profile default, and
 applies native request parameters only.

@@ -196,6 +196,11 @@ enum ApprovalRefusal {
     /// The token belongs to a group that the live channel policy no longer
     /// admits.
     GroupNoLongerAllowed,
+    /// The token belongs to a direct message that the live channel policy no
+    /// longer admits. Separate from the group variant because this name is
+    /// what the refusal log prints, and an operator reading `Group` on a DM
+    /// refusal would be told something untrue about their own configuration.
+    DmNoLongerAllowed,
 }
 
 /// Decide whether an approval reply may resolve `token`, and resolve it if so.
@@ -269,8 +274,51 @@ async fn resolve_approval_reply_with_group_admission(
     is_group: bool,
     responder_is_allowlisted: bool,
     allowed_groups_resolver: &(dyn Fn() -> Vec<String> + Send + Sync),
+    group_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+    dm_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+    self_chat: SelfChatVerdict,
 ) -> std::result::Result<(), ApprovalRefusal> {
-    if is_group && !is_group_chat_allowed(from_chat, &allowed_groups_resolver()) {
+    // The policies are re-read here, not captured when the approval was issued:
+    // an operator who closes access while a prompt is outstanding must not have
+    // that reply honoured.
+    //
+    // A reply executes the pending tool, so it clears the same two gates an
+    // ordinary message clears. The chat-type gate decides whether this KIND of
+    // chat is answered at all; the identity gate decides whether THIS group is
+    // listed. `is_group_chat_allowed` is only the second, and a non-empty list
+    // matching this chat satisfies it under every policy, `ignore` included, so
+    // the identity gate alone would honour a reply in a chat the operator told
+    // this channel to ignore.
+    //
+    // Only the two ignore verdicts are consulted. Responder authorization stays
+    // with `resolve_approval_reply`, which reports it as `UnauthorizedResponder`
+    // rather than collapsing it into a chat refusal.
+    match self_chat {
+        // The channel ignores this thread entirely, so a reply in it cannot
+        // resolve a pending tool either.
+        SelfChatVerdict::Disabled => return Err(ApprovalRefusal::DmNoLongerAllowed),
+        // The documented personal-mode exception: the operator's own thread is
+        // admitted whatever `dm_policy` says, and a reply must be admitted on
+        // the same terms or the prompt it answers can never be answered.
+        SelfChatVerdict::Admitted => {}
+        SelfChatVerdict::NotSelfChat => {
+            match chat_type_policy_decision(
+                is_group,
+                group_policy,
+                dm_policy,
+                responder_is_allowlisted,
+            ) {
+                ChatPolicyDecision::DropGroupIgnored => {
+                    return Err(ApprovalRefusal::GroupNoLongerAllowed);
+                }
+                ChatPolicyDecision::DropDmIgnored => {
+                    return Err(ApprovalRefusal::DmNoLongerAllowed);
+                }
+                ChatPolicyDecision::Admit | ChatPolicyDecision::DropUnrecognizedSender => {}
+            }
+        }
+    }
+    if is_group && !is_group_chat_allowed(from_chat, &allowed_groups_resolver(), group_policy) {
         return Err(ApprovalRefusal::GroupNoLongerAllowed);
     }
 
@@ -382,7 +430,8 @@ pub struct WhatsAppWebChannel {
     /// runtime trust boundary for file delivery.
     workspace_dir: Option<PathBuf>,
     /// Resolves allowed group chats from canonical config at message-time.
-    /// Empty = all groups permitted. Direct messages bypass.
+    /// Empty admits no group unless `group_policy` is `all`, which admits
+    /// every group. Direct messages bypass.
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Optional pairing-persist handle to the canonical shared `Config`.
     /// `None` in tests; `Some` in the long-running daemon, wired via
@@ -451,6 +500,35 @@ impl WhatsAppWebChannel {
             .as_ref()
             .map(|p| p.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
             .filter(|digits| !digits.is_empty());
+
+        // Only the NEWLY-closed case warns. Personal mode with `group_policy =
+        // "ignore"` was already closed, and `group_policy = "all"` explicitly
+        // preserves open access, so neither is reported: an operator whose
+        // behaviour did not change should not be told that it did. The predicate
+        // is shared with `config validate` so the two cannot disagree about which
+        // configurations changed.
+        if zeroclaw_config::schema::whatsapp_empty_group_list_is_newly_closed(&mode, &group_policy)
+            && allowed_groups_resolver().is_empty()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "group_policy": format!("{group_policy:?}"),
+                        "mode": format!("{mode:?}"),
+                    })),
+                format!(
+                    "allowed_groups is empty and group_policy is \"allowlist\", \
+                     so this channel will answer no group. An empty list used \
+                     to admit every group at the identity gate; that gate is \
+                     now decided by group_policy. To restore group access, {}.",
+                    // Shared with the `config validate` warning, so the two
+                    // surfaces cannot offer different remedies for one config.
+                    zeroclaw_config::schema::whatsapp_empty_group_list_remedy(&group_policy)
+                )
+            );
+        }
 
         if mention_only && bot_phone.is_none() {
             ::zeroclaw_log::record!(
@@ -781,6 +859,18 @@ impl WhatsAppWebChannel {
         let is_group = info.source.is_group;
         let reply_target = Self::compute_reply_target(&chat);
 
+        // Computed HERE rather than further down, because the approval-reply
+        // interception below needs the same verdict the conversation path uses
+        // and sits ahead of where that path derives it.
+        let self_chat = self_chat_verdict(
+            &context.mode,
+            context.self_chat_mode,
+            is_group,
+            sender_jid.user(),
+            &chat,
+            info.source.is_from_me,
+        );
+
         // ── Approval-reply interception ──
         //
         // Must live here rather than in the gateway: the generic resolver at
@@ -806,6 +896,9 @@ impl WhatsAppWebChannel {
                 is_group,
                 normalized.is_some(),
                 context.allowed_groups_resolver.as_ref(),
+                &context.group_policy,
+                &context.dm_policy,
+                self_chat,
             )
             .await
             {
@@ -840,7 +933,7 @@ impl WhatsAppWebChannel {
         }
 
         let allowed_groups = (context.allowed_groups_resolver)();
-        if is_group && !is_group_chat_allowed(&chat, &allowed_groups) {
+        if is_group && !is_group_chat_allowed(&chat, &allowed_groups, &context.group_policy) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -856,25 +949,18 @@ impl WhatsAppWebChannel {
         // operator's own linked device talking to itself, and the self-chat
         // exception is a personal-mode affordance. The chat-type policies
         // further down are NOT personal-only and run under both modes.
-        let mut operator_self_chat = false;
+        let operator_self_chat = self_chat == SelfChatVerdict::Admitted;
         if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
-            let sender_user = sender_jid.user();
-            let chat_user = chat.split_once('@').map(|(u, _)| u).unwrap_or(&chat);
-            let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
-
-            if is_self_chat {
-                if !context.self_chat_mode {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "ignoring self-chat message (self_chat_mode=false)"
-                    );
-                    return;
-                }
-                // self_chat_mode=true: the operator is talking to their own
-                // agent, so the chat-type policies below do not apply here.
-                operator_self_chat = true;
-            } else if info.source.is_from_me
+            if self_chat == SelfChatVerdict::Disabled {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "ignoring self-chat message (self_chat_mode=false)"
+                );
+                return;
+            }
+            if self_chat == SelfChatVerdict::NotSelfChat
+                && info.source.is_from_me
                 && !fromme_outside_self_chat_is_operator_trigger(
                     is_group,
                     &context.dm_mention_patterns,
@@ -2056,9 +2142,26 @@ fn fromme_outside_self_chat_is_operator_trigger(
 }
 
 #[cfg(feature = "whatsapp-web")]
-fn is_group_chat_allowed(chat_jid: &str, allowed_groups: &[String]) -> bool {
+/// Whether a group chat may be processed.
+///
+/// An empty `allowed_groups` is NOT permission. A list that admits everything is
+/// indistinguishable from a list nobody configured, so open group access has to
+/// be asked for by name: `group_policy = "all"`. Under `"allowlist"` an empty
+/// list admits nothing, which is what an allowlist means everywhere else in this
+/// codebase; `"ignore"` also admits nothing.
+///
+/// A non-empty list still filters under every policy, so `"all"` widens the
+/// default rather than overriding an explicit list.
+fn is_group_chat_allowed(
+    chat_jid: &str,
+    allowed_groups: &[String],
+    group_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+) -> bool {
     if allowed_groups.is_empty() {
-        return true;
+        return matches!(
+            group_policy,
+            zeroclaw_config::schema::WhatsAppChatPolicy::All
+        );
     }
     let chat_user = chat_jid
         .split_once('@')
@@ -2116,6 +2219,52 @@ fn chat_type_policy_decision(
                 ChatPolicyDecision::DropUnrecognizedSender
             }
         }
+    }
+}
+
+/// What Personal-mode self-chat handling decides, before the chat-type
+/// policies run.
+///
+/// Extracted so the conversation path and the approval-reply path reach the
+/// same verdict from one place. An approval reply resolves a pending tool, so
+/// it has to be admitted on the same terms as the message that requested it:
+/// admitting it more narrowly strands a prompt the operator can never answer,
+/// and admitting it more widely honours a reply in a thread the channel drops.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfChatVerdict {
+    /// Not the operator's own thread, or not personal mode. The chat-type
+    /// policies decide.
+    NotSelfChat,
+    /// The operator's own thread with the affordance on. Admitted whatever
+    /// `dm_policy` says, which is what `self_chat_mode = true` means.
+    Admitted,
+    /// The operator's own thread with `self_chat_mode = false`. The channel
+    /// ignores it, so a reply here must not resolve an approval either.
+    Disabled,
+}
+
+/// Classify one inbound message against the personal-mode self-chat rules.
+#[cfg(feature = "whatsapp-web")]
+fn self_chat_verdict(
+    mode: &zeroclaw_config::schema::WhatsAppWebMode,
+    self_chat_mode: bool,
+    is_group: bool,
+    sender_user: &str,
+    chat: &str,
+    is_from_me: bool,
+) -> SelfChatVerdict {
+    if *mode != zeroclaw_config::schema::WhatsAppWebMode::Personal {
+        return SelfChatVerdict::NotSelfChat;
+    }
+    let chat_user = chat.split_once('@').map(|(u, _)| u).unwrap_or(chat);
+    if is_group || sender_user != chat_user || !is_from_me {
+        return SelfChatVerdict::NotSelfChat;
+    }
+    if self_chat_mode {
+        SelfChatVerdict::Admitted
+    } else {
+        SelfChatVerdict::Disabled
     }
 }
 
@@ -3461,9 +3610,44 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
-    fn allowed_groups_empty_permits_all() {
-        // Empty list is the default: every group passes (no behavior change).
-        assert!(super::is_group_chat_allowed("123456789012345@g.us", &[]));
+    fn allowed_groups_empty_admits_only_under_policy_all() {
+        // An empty list is NOT permission. It admits only when the operator
+        // asked for open groups by name.
+        let jid = "123456789012345@g.us";
+        assert!(super::is_group_chat_allowed(
+            jid,
+            &[],
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All
+        ));
+        assert!(!super::is_group_chat_allowed(
+            jid,
+            &[],
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
+        ));
+        assert!(!super::is_group_chat_allowed(
+            jid,
+            &[],
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Ignore
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn allowed_groups_non_empty_still_filters_under_policy_all() {
+        // CONTROL for the test above: `all` widens the empty-list default, it does
+        // not override an explicit list. Without this, a change making `all` bypass
+        // filtering entirely would still pass every other case here.
+        let groups = vec!["123456789012345".to_string()];
+        assert!(super::is_group_chat_allowed(
+            "123456789012345@g.us",
+            &groups,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All
+        ));
+        assert!(!super::is_group_chat_allowed(
+            "999999999999999@g.us",
+            &groups,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All
+        ));
     }
 
     #[test]
@@ -3617,7 +3801,8 @@ mod tests {
         let groups = vec!["123456789012345@g.us".to_string()];
         assert!(super::is_group_chat_allowed(
             "123456789012345@g.us",
-            &groups
+            &groups,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
         ));
     }
 
@@ -3642,7 +3827,8 @@ mod tests {
         let groups = vec!["123456789012345".to_string()];
         assert!(super::is_group_chat_allowed(
             "123456789012345@g.us",
-            &groups
+            &groups,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
         ));
     }
 
@@ -3661,22 +3847,26 @@ mod tests {
         let groups = vec!["123456789012345".to_string()];
         assert!(!super::is_group_chat_allowed(
             "999999999999999@g.us",
-            &groups
+            &groups,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
         ));
         // Blank / whitespace-only entries never match.
         assert!(!super::is_group_chat_allowed(
             "123@g.us",
-            &["   ".to_string()]
+            &["   ".to_string()],
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
         ));
         // Prefix entries match the user part EXACTLY, not as a string prefix:
         // "123" must admit "123@g.us" but never "123999@g.us".
         assert!(super::is_group_chat_allowed(
             "123@g.us",
-            &["123".to_string()]
+            &["123".to_string()],
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
         ));
         assert!(!super::is_group_chat_allowed(
             "123999@g.us",
-            &["123".to_string()]
+            &["123".to_string()],
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist
         ));
     }
 
@@ -3734,7 +3924,12 @@ mod tests {
         let groups = vec!["123456789012345".to_string()];
         let is_group = false;
         let dm_jid = "987654321098765@s.whatsapp.net";
-        let admitted = !is_group || super::is_group_chat_allowed(dm_jid, &groups);
+        let admitted = !is_group
+            || super::is_group_chat_allowed(
+                dm_jid,
+                &groups,
+                &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            );
         assert!(admitted);
     }
 
@@ -4364,9 +4559,11 @@ mod tests {
         let client = bot.client();
 
         // Plain phone JIDs, so admission is decided from the JID itself and no
-        // LID mapping is in play. `allowed_groups` stays empty, which
-        // `is_group_chat_allowed` admits, so each group row reaches the
-        // chat-type policy instead of stopping at the group gate above it.
+        // LID mapping is in play. `allowed_groups` lists GROUP_JID explicitly,
+        // so each group row passes the group-identity gate and reaches the
+        // chat-type policy this test is about. An empty list would stop every
+        // group row at the identity gate under any policy but `all`, which is
+        // the empty-list contract exercised by the dedicated tests above.
         let event = |sender: &str, is_group: bool| {
             let sender_jid: Jid = format!("{sender}@s.whatsapp.net")
                 .parse()
@@ -4404,7 +4601,7 @@ mod tests {
                     tx,
                     alias: Arc::new("both-modes-policy".to_string()),
                     peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
-                    allowed_groups_resolver: Arc::new(Vec::new),
+                    allowed_groups_resolver: Arc::new(|| vec![GROUP_JID.to_string()]),
                     mode: mode.clone(),
                     dm_policy: policy.clone(),
                     group_policy: policy.clone(),
@@ -6179,6 +6376,9 @@ mod tests {
             true,
             true,
             &resolver,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All,
+            SelfChatVerdict::NotSelfChat,
         )
         .await;
         assert_eq!(refused, Err(ApprovalRefusal::GroupNoLongerAllowed));
@@ -6194,10 +6394,429 @@ mod tests {
             true,
             true,
             &resolver,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All,
+            SelfChatVerdict::NotSelfChat,
         )
         .await;
         assert_eq!(accepted, Ok(()));
         assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    /// Emptying `allowed_groups` entirely is a revocation too, not a reset to
+    /// open. An operator who clears the list while an approval is outstanding
+    /// must not have that reply honoured.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn clearing_allowed_groups_refuses_an_outstanding_approval() {
+        const GROUP: &str = "124@g.us";
+        let mut receiver = park_token("aaa014", GROUP, true).await;
+        let allowed_groups = Arc::new(parking_lot::RwLock::new(vec![GROUP.to_string()]));
+        let live_groups = Arc::clone(&allowed_groups);
+        let resolver = move || live_groups.read().clone();
+
+        allowed_groups.write().clear();
+        let refused = resolve_approval_reply_with_group_admission(
+            "aaa014",
+            ChannelApprovalResponse::Approve,
+            "default",
+            GROUP,
+            true,
+            true,
+            &resolver,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All,
+            SelfChatVerdict::NotSelfChat,
+        )
+        .await;
+        assert_eq!(refused, Err(ApprovalRefusal::GroupNoLongerAllowed));
+        assert!(receiver.try_recv().is_err());
+
+        // CONTROL: the same cleared list under `all` still admits, so the refusal
+        // above is the policy deciding rather than the clear() alone.
+        let accepted = resolve_approval_reply_with_group_admission(
+            "aaa014",
+            ChannelApprovalResponse::Approve,
+            "default",
+            GROUP,
+            true,
+            true,
+            &resolver,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All,
+            &zeroclaw_config::schema::WhatsAppChatPolicy::All,
+            SelfChatVerdict::NotSelfChat,
+        )
+        .await;
+        assert_eq!(accepted, Ok(()));
+        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    /// An approval reply executes a pending tool, so it has to clear the same
+    /// gates an ordinary message clears. A matching non-empty `allowed_groups`
+    /// satisfies the identity gate under every policy, `ignore` included, so
+    /// the identity gate alone would let a control reply act in a chat the
+    /// operator told ZeroClaw to ignore.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn an_ignored_group_refuses_an_approval_its_own_messages_cannot_reach() {
+        use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+        const GROUP: &str = "125@g.us";
+        let mut receiver = park_token("aaa015", GROUP, true).await;
+        let allowed_groups = Arc::new(parking_lot::RwLock::new(vec![GROUP.to_string()]));
+        let live_groups = Arc::clone(&allowed_groups);
+        let resolver = move || live_groups.read().clone();
+
+        // The list MATCHES this group, so the identity gate admits and only the
+        // chat-type policy can refuse.
+        let refused = resolve_approval_reply_with_group_admission(
+            "aaa015",
+            ChannelApprovalResponse::Approve,
+            "default",
+            GROUP,
+            true,
+            true,
+            &resolver,
+            &Policy::Ignore,
+            &Policy::All,
+            SelfChatVerdict::NotSelfChat,
+        )
+        .await;
+        assert_eq!(
+            refused,
+            Err(ApprovalRefusal::GroupNoLongerAllowed),
+            "an approval reply must not resolve in a group the policy ignores"
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(PENDING_APPROVALS.lock().await.contains_key("aaa015"));
+
+        // CONTROLS: the identical call under the two policies that DO answer
+        // groups must still resolve, so the refusal above is policy selection
+        // rather than a gate that now rejects every group approval.
+        for policy in [Policy::Allowlist, Policy::All] {
+            let accepted = resolve_approval_reply_with_group_admission(
+                "aaa015",
+                ChannelApprovalResponse::Approve,
+                "default",
+                GROUP,
+                true,
+                true,
+                &resolver,
+                &policy,
+                &Policy::All,
+                SelfChatVerdict::NotSelfChat,
+            )
+            .await;
+            assert_eq!(
+                accepted,
+                Ok(()),
+                "{policy:?} answers groups and must resolve"
+            );
+            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+            receiver = park_token("aaa015", GROUP, true).await;
+        }
+        PENDING_APPROVALS.lock().await.remove("aaa015");
+    }
+
+    /// The DM half of the same gap. `dm_policy` was not a parameter at all, so
+    /// an approval reply in a direct message skipped the chat-type gate outright
+    /// while an ordinary message in that same chat was dropped.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn an_ignored_dm_refuses_an_approval_its_own_messages_cannot_reach() {
+        use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+        const DM: &str = "15550001@s.whatsapp.net";
+        let mut receiver = park_token("aaa016", DM, false).await;
+        let resolver = || Vec::new();
+
+        let refused = resolve_approval_reply_with_group_admission(
+            "aaa016",
+            ChannelApprovalResponse::Approve,
+            "default",
+            DM,
+            false,
+            true,
+            &resolver,
+            &Policy::All,
+            &Policy::Ignore,
+            SelfChatVerdict::NotSelfChat,
+        )
+        .await;
+        assert_eq!(
+            refused,
+            Err(ApprovalRefusal::DmNoLongerAllowed),
+            "an approval reply must not resolve in a DM the policy ignores"
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(PENDING_APPROVALS.lock().await.contains_key("aaa016"));
+
+        // CONTROL: the identical call under the two policies that DO answer DMs
+        // must still resolve, so the refusal above is policy selection rather
+        // than a gate that now rejects every DM approval.
+        for policy in [Policy::Allowlist, Policy::All] {
+            let accepted = resolve_approval_reply_with_group_admission(
+                "aaa016",
+                ChannelApprovalResponse::Approve,
+                "default",
+                DM,
+                false,
+                true,
+                &resolver,
+                &Policy::All,
+                &policy,
+                SelfChatVerdict::NotSelfChat,
+            )
+            .await;
+            assert_eq!(accepted, Ok(()), "{policy:?} answers DMs and must resolve");
+            assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+            receiver = park_token("aaa016", DM, false).await;
+        }
+        PENDING_APPROVALS.lock().await.remove("aaa016");
+    }
+
+    /// The personal-mode self-chat exception reaches the approval path too.
+    /// The conversation path admits the operator's own thread whatever
+    /// `dm_policy` says, so a reply there has to be admitted on the same terms;
+    /// gating it on `dm_policy` alone strands a prompt the operator requested
+    /// and can never answer.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn a_personal_self_chat_resolves_an_approval_an_ignored_dm_could_not() {
+        use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+        const SELF: &str = "15550002@s.whatsapp.net";
+        let receiver = park_token("aaa017", SELF, false).await;
+        let resolver = || Vec::new();
+
+        // `dm_policy = ignore` throughout: the ONLY difference between the two
+        // calls below is the self-chat verdict, so it is the exception being
+        // exercised rather than a permissive policy.
+        let accepted = resolve_approval_reply_with_group_admission(
+            "aaa017",
+            ChannelApprovalResponse::Approve,
+            "default",
+            SELF,
+            false,
+            true,
+            &resolver,
+            &Policy::All,
+            &Policy::Ignore,
+            SelfChatVerdict::Admitted,
+        )
+        .await;
+        assert_eq!(
+            accepted,
+            Ok(()),
+            "an enabled personal self-chat must resolve its own approval"
+        );
+        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+
+        // CONTROL: the identical call, same policy, differing only in the
+        // verdict, must still refuse. Without this the acceptance above would
+        // also pass a gate that admitted every DM.
+        let mut receiver = park_token("aaa017", SELF, false).await;
+        let refused = resolve_approval_reply_with_group_admission(
+            "aaa017",
+            ChannelApprovalResponse::Approve,
+            "default",
+            SELF,
+            false,
+            true,
+            &resolver,
+            &Policy::All,
+            &Policy::Ignore,
+            SelfChatVerdict::NotSelfChat,
+        )
+        .await;
+        assert_eq!(refused, Err(ApprovalRefusal::DmNoLongerAllowed));
+        assert!(receiver.try_recv().is_err());
+
+        // And a self-chat the operator has switched OFF is dropped by the
+        // conversation path, so a reply in it must not resolve either.
+        let refused = resolve_approval_reply_with_group_admission(
+            "aaa017",
+            ChannelApprovalResponse::Approve,
+            "default",
+            SELF,
+            false,
+            true,
+            &resolver,
+            &Policy::All,
+            &Policy::All,
+            SelfChatVerdict::Disabled,
+        )
+        .await;
+        assert_eq!(
+            refused,
+            Err(ApprovalRefusal::DmNoLongerAllowed),
+            "self_chat_mode=false is ignored by the channel, so a reply cannot resolve"
+        );
+        assert!(receiver.try_recv().is_err());
+        PENDING_APPROVALS.lock().await.remove("aaa017");
+    }
+
+    /// The predicate itself, so the two call sites cannot disagree about what
+    /// counts as a self-chat.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn self_chat_verdict_matrix() {
+        use zeroclaw_config::schema::WhatsAppWebMode as Mode;
+        let v = super::self_chat_verdict;
+        const U: &str = "15550002";
+        const C: &str = "15550002@s.whatsapp.net";
+
+        assert_eq!(
+            v(&Mode::Personal, true, false, U, C, true),
+            SelfChatVerdict::Admitted
+        );
+        assert_eq!(
+            v(&Mode::Personal, false, false, U, C, true),
+            SelfChatVerdict::Disabled
+        );
+        // Business mode has no self-chat affordance at all.
+        assert_eq!(
+            v(&Mode::Business, true, false, U, C, true),
+            SelfChatVerdict::NotSelfChat
+        );
+        // Each remaining leg alone is enough to make it not a self-chat.
+        assert_eq!(
+            v(&Mode::Personal, true, true, U, C, true),
+            SelfChatVerdict::NotSelfChat,
+            "a group is never the operator self-chat"
+        );
+        assert_eq!(
+            v(&Mode::Personal, true, false, "15550003", C, true),
+            SelfChatVerdict::NotSelfChat,
+            "a different sender is not the operator talking to themselves"
+        );
+        assert_eq!(
+            v(&Mode::Personal, true, false, U, C, false),
+            SelfChatVerdict::NotSelfChat,
+            "not fromMe is not the operator talking to themselves"
+        );
+    }
+
+    /// The same exception, driven through `handle_inbound_message_event`
+    /// rather than through the helper.
+    ///
+    /// The helper-level tests cannot see this: they are handed a verdict, so
+    /// they stay green even if the handler computes the wrong one or passes it
+    /// to the wrong parameter. This exercises the hoisted call site itself.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_admits_a_personal_self_chat_approval_reply() {
+        use wacore::types::events::Event;
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const OPERATOR: &str = "15551230001";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        // A self-chat is the operator's own thread: chat == sender, and the
+        // message is fromMe. That is what `self_chat_verdict` keys on.
+        let self_chat_reply = |token: &str| {
+            let jid: Jid = format!("{OPERATOR}@s.whatsapp.net")
+                .parse()
+                .expect("jid parses");
+            Event::Message(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some(format!("{token} yes")),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: jid.clone(),
+                        sender: jid,
+                        is_from_me: true,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("selfchat-approval-{token}"),
+                    r#type: "text".to_string(),
+                    push_name: "Operator".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        // `dm_policy = ignore` in BOTH contexts below. The only difference is
+        // `self_chat_mode`, so what is being exercised is the exception rather
+        // than a permissive policy.
+        let context_for = |self_chat_mode: bool, tx: tokio::sync::mpsc::Sender<ChannelMessage>| {
+            WhatsAppInboundContext {
+                tx,
+                alias: Arc::new("default".to_string()),
+                peer_resolver: Arc::new(|| vec![format!("+{OPERATOR}")]),
+                allowed_groups_resolver: Arc::new(Vec::new),
+                mode: Mode::Personal,
+                dm_policy: Policy::Ignore,
+                group_policy: Policy::Ignore,
+                self_chat_mode,
+                mention_only: false,
+                passive_group_context: false,
+                bot_phone: Arc::new(Mutex::new(None)),
+                bot_lid: Arc::new(Mutex::new(None)),
+                dm_mention_patterns: Arc::new(Vec::new()),
+                group_mention_patterns: Arc::new(Vec::new()),
+                transcription_config: None,
+                transcription_manager: None,
+                voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            }
+        };
+
+        // self_chat_mode = true: the documented exception. The reply must
+        // resolve the pending tool even though dm_policy ignores DMs.
+        let chat = format!("{OPERATOR}@s.whatsapp.net");
+        let receiver = park_token("aaa018", &chat, false).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let context = context_for(true, tx);
+        WhatsAppWebChannel::handle_inbound_message_event(
+            &self_chat_reply("aaa018"),
+            &client,
+            &context,
+        )
+        .await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+                .await
+                .expect("the self-chat approval must resolve, not time out")
+                .expect("the responder must still be open"),
+            ChannelApprovalResponse::Approve,
+            "an enabled personal self-chat must resolve its own approval"
+        );
+
+        // CONTROL: identical event and identical dm_policy, differing only in
+        // self_chat_mode. The channel ignores that thread, so the reply must
+        // NOT resolve. Without this the acceptance above would also pass a
+        // handler that ignored the policy entirely.
+        let mut receiver = park_token("aaa019", &chat, false).await;
+        let (tx, _rx2) = tokio::sync::mpsc::channel(4);
+        let context = context_for(false, tx);
+        WhatsAppWebChannel::handle_inbound_message_event(
+            &self_chat_reply("aaa019"),
+            &client,
+            &context,
+        )
+        .await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "self_chat_mode=false is ignored by the channel, so the reply must not resolve"
+        );
+        PENDING_APPROVALS.lock().await.remove("aaa019");
     }
 
     /// `PENDING_APPROVALS` is process-wide, so before the alias was part of the

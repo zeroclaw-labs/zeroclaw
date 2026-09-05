@@ -138,6 +138,7 @@ zc-logs-section-trace = トレース
 zc-logs-section-attribution = 属性情報
 zc-logs-section-attributes = 属性
 zc-logs-preview-only = 完全なペイロードは利用できません — プレビューフィールドのみ表示しています。
+zc-logs-persisted-path = 永続ログ: { $path }
 zc-logs-no-event-selected = イベントが選択されていません
 zc-logs-loading = 読み込み中…
 zc-logs-search-action-apply = 適用

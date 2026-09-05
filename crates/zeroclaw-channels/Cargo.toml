@@ -215,7 +215,7 @@ channel-email = [
 ]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
-channel-lark = ["dep:axum", "dep:prost"]
+channel-lark = ["dep:aes", "dep:axum", "dep:cbc", "dep:prost"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and
 # `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;

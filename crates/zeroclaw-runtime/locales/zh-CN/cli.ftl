@@ -633,6 +633,18 @@ cli-pairing-use-code = {"  "}使用此一次性代码配对新设备：
 cli-pairing-post = {"    "}POST /pair，附带请求头 X-Pairing-Code: {$code}
 cli-pairing-restart = {"   "}重启 gateway 以生成新的配对码。
 cli-pairing-disabled = ⚠️  配置中已禁用 gateway 配对。
+cli-pairing-fetch-failed = ❌ 无法从 gateway 获取配对码：{$endpoint}
+cli-pairing-no-code = 🔐 gateway 配对已启用，但当前没有可用的活动配对码。
+cli-pairing-requests-accepted = 所有请求都将在没有身份验证的情况下接受。
+cli-pairing-enable-config = 要启用配对，请设置 [gateway] require_pairing = true。
+cli-pairing-show-only = `zeroclaw gateway get-paircode` 只显示现有的活动配对码，不会生成新配对码。
+cli-pairing-pair-another = 要配对另一台设备，请运行：
+cli-pairing-revoke-replace = 要撤销现有配对并生成替换配对码，请运行：
+cli-pairing-new-code-unavailable = gateway 未生成新的配对码。可能已有配对码待处理，或需要重置配对。
+cli-pairing-retry-or-rotate = 请稍后重试，或撤销现有配对并生成替换配对码：
+cli-pairing-rotate-no-code = 轮换请求已完成，但没有返回替换配对码。
+cli-pairing-check-enabled = 请确认配对已启用，然后请求新的设备配对码：
+cli-pairing-inspect = 要检查正在运行的 gateway：
 cli-gateway-running-q = {"   "}gateway 是否正在运行？使用以下命令启动它：
 cli-status-title = 🦀 ZeroClaw 状态
 cli-security-status-title = ZeroClaw 安全状态
@@ -1001,6 +1013,7 @@ channel-approval-group-visibility-warning =
 channel-telegram-approval-ack-approved = 已批准
 channel-telegram-approval-ack-always-approved = 已始终批准
 channel-telegram-approval-ack-denied = 已拒绝
+channel-telegram-approval-ack-not-accepted = 审批未被接受
 channel-telegram-approval-ack-unknown = 未知操作
 channel-telegram-approval-ack-already-resolved = 审批已被处理
 channel-discord-approval-btn-allow-once = 仅本次允许
@@ -1011,6 +1024,9 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
+cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
 cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。
 cli-agent-error-provider-credentials-missing = 所选模型提供商未配置凭据。请添加其 API 密钥或选择其他提供商。
 cli-agent-error-provider-credentials-missing-named = 模型提供商 {$provider} 未配置凭据。请添加其 API 密钥或选择其他提供商。

@@ -217,6 +217,23 @@ impl CostTracker {
         task_id: Option<String>,
         honor_enabled: bool,
     ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_sync(
+            usage,
+            agent_alias,
+            task_id,
+            honor_enabled,
+            File::sync_all,
+        )
+    }
+
+    fn record_usage_with_owned_task_attribution_inner_with_sync(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        honor_enabled: bool,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let (enabled, track_per_agent) = {
             let config = self.config.read();
             (config.enabled, config.track_per_agent)
@@ -246,10 +263,8 @@ impl CostTracker {
         let record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
 
-        {
-            let mut storage = self.lock_storage();
-            storage.add_record(record)?;
-        }
+        let mut storage = self.lock_storage();
+        let append_outcome = storage.add_record_with_sync(record, sync_file)?;
 
         {
             let mut totals = self.lock_session_totals();
@@ -259,7 +274,8 @@ impl CostTracker {
             entry.request_count += 1;
         }
 
-        Ok(())
+        drop(storage);
+        append_outcome.into_result()
     }
 
     /// Get the current cost summary. When `[cost].track_per_agent` is
@@ -692,6 +708,20 @@ struct CostStorage {
     aggregates_current: bool,
 }
 
+enum AppendOutcome {
+    Synced,
+    AppendedButSyncFailed(anyhow::Error),
+}
+
+impl AppendOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Synced => Ok(()),
+            Self::AppendedButSyncFailed(error) => Err(error),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ReportingPeriod {
     day: NaiveDate,
@@ -742,6 +772,19 @@ impl CostStorage {
         })
     }
 
+    fn recover_concatenated_records<F>(
+        input: &str,
+        mut on_record: F,
+    ) -> Result<(), serde_json::Error>
+    where
+        F: FnMut(CostRecord),
+    {
+        for value in serde_json::Deserializer::from_str(input).into_iter::<CostRecord>() {
+            on_record(value?);
+        }
+        Ok(())
+    }
+
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
     where
         F: FnMut(CostRecord),
@@ -774,20 +817,9 @@ impl CostStorage {
 
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
-                Err(error) => {
-                    let mut recovered = 0usize;
-                    let stream =
-                        serde_json::Deserializer::from_str(trimmed).into_iter::<CostRecord>();
-                    for value in stream {
-                        match value {
-                            Ok(record) => {
-                                on_record(record);
-                                recovered += 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if recovered == 0 {
+                Err(_) => {
+                    if let Err(error) = Self::recover_concatenated_records(trimmed, &mut on_record)
+                    {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -852,8 +884,11 @@ impl CostStorage {
         Ok(())
     }
 
-    /// Add a new record.
-    fn add_record(&mut self, record: CostRecord) -> Result<()> {
+    fn add_record_with_sync(
+        &mut self,
+        record: CostRecord,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<AppendOutcome> {
         self.ensure_period_cache_current()?;
 
         let mut file = OpenOptions::new()
@@ -875,12 +910,6 @@ impl CostStorage {
                 self.path.display().to_string()
             )
         })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "Failed to sync cost storage at {}",
-                self.path.display().to_string()
-            )
-        })?;
 
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
@@ -889,7 +918,18 @@ impl CostStorage {
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
-        Ok(())
+
+        let sync_result = sync_file(&file).with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        });
+
+        Ok(match sync_result {
+            Ok(()) => AppendOutcome::Synced,
+            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        })
     }
 
     /// Get aggregated costs for current day and month.
@@ -1084,6 +1124,94 @@ mod tests {
         let mut count = 0usize;
         storage.for_each_record(|_| count += 1).unwrap();
         assert_eq!(count, 2, "both concatenated records should be recovered");
+    }
+
+    #[test]
+    fn recovery_helper_accepts_clean_concatenated_records() {
+        let first = record_at("test/model-a", 1.0, Utc::now(), Some("task-a"));
+        let second = record_at("test/model-b", 2.0, Utc::now(), Some("task-b"));
+        let input = format!(
+            "{}{}",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records(&input, |record| recovered.push(record));
+
+        assert!(result.is_ok());
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].id, first.id);
+        assert_eq!(recovered[1].id, second.id);
+    }
+
+    #[test]
+    fn recovery_helper_returns_error_after_recovering_valid_prefix() {
+        let record = record_at("test/model", 1.0, Utc::now(), Some("task-a"));
+        let input = format!("{}{{malformed", serde_json::to_string(&record).unwrap());
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records(&input, |record| recovered.push(record));
+
+        assert!(result.is_err());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, record.id);
+    }
+
+    #[test]
+    fn recovery_helper_returns_error_without_recovering_wholly_malformed_input() {
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records("not-json", |record| recovered.push(record));
+
+        assert!(result.is_err());
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn sync_failure_keeps_all_process_visible_totals_consistent() {
+        fn fail_sync(_: &File) -> std::io::Result<()> {
+            Err(std::io::Error::other("forced sync failure"))
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let usage = TokenUsage {
+            model: "test/model".to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            total_tokens: 20,
+            cost_usd: 1.0,
+            pricing_available: true,
+            timestamp: Utc::now(),
+        };
+
+        let error = tracker
+            .record_usage_with_owned_task_attribution_inner_with_sync(
+                usage,
+                None,
+                Some("task-a".to_string()),
+                true,
+                fail_sync,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Failed to sync cost storage"));
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.session_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((summary.daily_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((summary.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(summary.total_tokens, 20);
+        assert_eq!(summary.request_count, 1);
+
+        let model = summary.by_model.get("test/model").unwrap();
+        assert!((model.cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(model.total_tokens, 20);
+        assert_eq!(model.request_count, 1);
     }
 
     #[test]

@@ -55,7 +55,7 @@ The options come from the daemon and follow the session's model, so the pickers 
 
 `medium` sends no depth and lets the model choose. `off` and `minimal` are not offered here: on the current models they send the same request as `low`, and the prompt hints that tell them apart on the CLI and on channels are not applied to daemon sessions, because rewriting the prompt on every change would restart the provider's prompt cache and break signed-thinking replay within a tool round.
 
-A choice lives on the daemon session. Switching the model or the provider clears it, because the new model may not accept it, and a new session (Ctrl+N) starts without it. zerocode remembers your last choice per agent in `zerocode-config.toml`:
+A choice lives on the daemon session and beats both the runtime profile's `agent.thinking.display` and the Anthropic slot's `thinking_display`. Switching the model or the provider clears it, because the new model may not accept it, and a new session (Ctrl+N) starts without it. zerocode remembers your last choice per agent in `zerocode-config.toml`:
 
 ```toml
 [thinking.agent_override.coder]
