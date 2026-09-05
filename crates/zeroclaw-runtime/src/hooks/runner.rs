@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{FutureExt, future::join_all};
@@ -5,14 +6,25 @@ use serde_json::Value;
 use std::panic::AssertUnwindSafe;
 
 use zeroclaw_api::channel::ChannelMessage;
+use zeroclaw_api::hook::ToolCallHookContext;
 use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
 
+pub(crate) fn tool_call_hook_context(
+    turn_id: &str,
+    iteration: usize,
+    call_index: usize,
+) -> ToolCallHookContext {
+    ToolCallHookContext::new(format!("{turn_id}:{iteration}:{call_index}"))
+}
+
 pub struct HookRunner {
     handlers: Vec<Box<dyn HookHandler>>,
 }
+
+static LEGACY_TOOL_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl Default for HookRunner {
     fn default() -> Self {
@@ -26,6 +38,11 @@ impl HookRunner {
         Self {
             handlers: Vec::new(),
         }
+    }
+
+    fn next_legacy_tool_call_context() -> ToolCallHookContext {
+        let sequence = LEGACY_TOOL_CALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        ToolCallHookContext::uncorrelated(format!("legacy:{sequence}"))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -119,11 +136,94 @@ impl HookRunner {
     }
 
     pub async fn fire_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
-        let futs: Vec<_> = self
-            .handlers
-            .iter()
-            .map(|h| h.on_after_tool_call(tool, result, duration))
-            .collect();
+        let context = Self::next_legacy_tool_call_context();
+
+        self.fire_after_tool_call_with_context(&context, tool, result, duration)
+            .await;
+    }
+
+    pub async fn fire_after_tool_call_with_context(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        let futs = self.handlers.iter().map(|h| async move {
+            let hook_name = h.name();
+            if AssertUnwindSafe(h.on_after_tool_call_with_context(context, tool, result, duration))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "after_tool_call hook panicked; continuing with remaining handlers"
+                );
+            }
+        });
+        join_all(futs).await;
+    }
+
+    /// Fire the abandonment callback for a tool-call context that will never
+    /// reach its after phase.
+    ///
+    /// Dispatched in parallel with the same per-handler panic isolation as the
+    /// other void hooks: a panicking abandonment handler is caught and logged,
+    /// and the remaining handlers still run, so every handler that retained
+    /// per-invocation state gets the chance to release it.
+    pub async fn fire_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+        let futs = self.handlers.iter().map(|h| async move {
+            let hook_name = h.name();
+            if AssertUnwindSafe(h.on_tool_call_abandoned(context, tool))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "tool_call_abandoned hook panicked; continuing with remaining handlers"
+                );
+            }
+        });
+        join_all(futs).await;
+    }
+
+    /// Fire tool completion with the correlation context and the arguments
+    /// that were actually dispatched. Same parallel, per-handler panic
+    /// isolation as the other void hooks.
+    pub async fn fire_after_tool_call_with_context_and_args(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        args: &Value,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        let futs = self.handlers.iter().map(|h| async move {
+            let hook_name = h.name();
+            if AssertUnwindSafe(
+                h.on_after_tool_call_with_context_and_args(context, tool, args, result, duration),
+            )
+            .catch_unwind()
+            .await
+            .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"hook": hook_name})),
+                    "after_tool_call hook panicked; continuing with remaining handlers"
+                );
+            }
+        });
         join_all(futs).await;
     }
 
@@ -245,14 +345,29 @@ impl HookRunner {
 
     pub async fn run_before_tool_call(
         &self,
+        name: String,
+        args: Value,
+    ) -> HookResult<(String, Value)> {
+        let context = Self::next_legacy_tool_call_context();
+        self.run_before_tool_call_with_context(&context, name, args)
+            .await
+    }
+
+    pub async fn run_before_tool_call_with_context(
+        &self,
+        context: &ToolCallHookContext,
         mut name: String,
         mut args: Value,
     ) -> HookResult<(String, Value)> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_tool_call(name.clone(), args.clone()))
-                .catch_unwind()
-                .await
+            match AssertUnwindSafe(h.before_tool_call_with_context(
+                context,
+                name.clone(),
+                args.clone(),
+            ))
+            .catch_unwind()
+            .await
             {
                 Ok(HookResult::Continue((n, a))) => {
                     name = n;
@@ -349,8 +464,8 @@ impl HookRunner {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// A hook that records how many times void events fire.
     struct CountingHook {
@@ -692,6 +807,455 @@ mod tests {
             }
             HookResult::Cancel(_) => panic!("panicking hook must not cancel"),
         }
+    }
+
+    #[test]
+    fn tool_call_hook_context_distinguishes_turn_positions() {
+        let first = tool_call_hook_context("turn-a", 0, 0);
+        let next_call = tool_call_hook_context("turn-a", 0, 1);
+        let next_iteration = tool_call_hook_context("turn-a", 1, 0);
+        let next_turn = tool_call_hook_context("turn-b", 0, 0);
+
+        assert_ne!(first, next_call);
+        assert_ne!(first, next_iteration);
+        assert_ne!(first, next_turn);
+    }
+
+    #[tokio::test]
+    async fn context_aware_runner_dispatches_legacy_tool_hooks() {
+        struct LegacyToolHook {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for LegacyToolHook {
+            fn name(&self) -> &str {
+                "legacy-tool"
+            }
+
+            async fn before_tool_call(
+                &self,
+                name: String,
+                args: Value,
+            ) -> HookResult<(String, Value)> {
+                self.calls.lock().unwrap().push(format!("before:{name}"));
+                HookResult::Continue((name, args))
+            }
+
+            async fn on_after_tool_call(
+                &self,
+                tool: &str,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.calls.lock().unwrap().push(format!("after:{tool}"));
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(LegacyToolHook {
+            calls: Arc::clone(&calls),
+        }));
+        let context = tool_call_hook_context("turn-a", 0, 0);
+        let result = runner
+            .run_before_tool_call_with_context(&context, "shell".into(), Value::Null)
+            .await;
+        assert!(!result.is_cancel());
+
+        let tool_result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        runner
+            .fire_after_tool_call_with_context(
+                &context,
+                "shell",
+                &tool_result,
+                Duration::from_millis(3),
+            )
+            .await;
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["before:shell".to_string(), "after:shell".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_runner_dispatches_context_only_hooks_without_false_correlation() {
+        struct ContextOnlyHook {
+            calls: Arc<Mutex<Vec<(String, String, bool)>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for ContextOnlyHook {
+            fn name(&self) -> &str {
+                "context-only"
+            }
+
+            async fn before_tool_call_with_context(
+                &self,
+                context: &ToolCallHookContext,
+                name: String,
+                args: Value,
+            ) -> HookResult<(String, Value)> {
+                self.calls.lock().unwrap().push((
+                    "before".to_string(),
+                    context.invocation_id().to_string(),
+                    context.is_correlated(),
+                ));
+                HookResult::Continue((name, args))
+            }
+
+            async fn on_after_tool_call_with_context(
+                &self,
+                context: &ToolCallHookContext,
+                _tool: &str,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.calls.lock().unwrap().push((
+                    "after".to_string(),
+                    context.invocation_id().to_string(),
+                    context.is_correlated(),
+                ));
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(ContextOnlyHook {
+            calls: Arc::clone(&calls),
+        }));
+
+        let before = runner
+            .run_before_tool_call("shell".into(), Value::Null)
+            .await;
+        assert!(!before.is_cancel());
+        runner
+            .fire_after_tool_call(
+                "shell",
+                &ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                },
+                Duration::ZERO,
+            )
+            .await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "before");
+        assert_eq!(calls[1].0, "after");
+        assert!(!calls[0].2);
+        assert!(!calls[1].2);
+        assert_ne!(calls[0].1, calls[1].1);
+    }
+
+    #[tokio::test]
+    async fn legacy_context_ids_are_unique_across_runners() {
+        struct CaptureContext(Arc<Mutex<Vec<String>>>);
+
+        #[async_trait]
+        impl HookHandler for CaptureContext {
+            fn name(&self) -> &str {
+                "capture-context"
+            }
+
+            async fn before_tool_call_with_context(
+                &self,
+                context: &ToolCallHookContext,
+                name: String,
+                args: Value,
+            ) -> HookResult<(String, Value)> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(context.invocation_id().to_string());
+                HookResult::Continue((name, args))
+            }
+        }
+
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let mut first = HookRunner::new();
+        first.register(Box::new(CaptureContext(Arc::clone(&contexts))));
+        let mut second = HookRunner::new();
+        second.register(Box::new(CaptureContext(Arc::clone(&contexts))));
+
+        assert!(
+            !first
+                .run_before_tool_call("shell".into(), Value::Null)
+                .await
+                .is_cancel()
+        );
+        assert!(
+            !second
+                .run_before_tool_call("shell".into(), Value::Null)
+                .await
+                .is_cancel()
+        );
+
+        let contexts = contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert_ne!(contexts[0], contexts[1]);
+    }
+
+    #[tokio::test]
+    async fn context_aware_after_dispatch_continues_after_handler_panic() {
+        struct PanickingAfterHook;
+        #[async_trait]
+        impl HookHandler for PanickingAfterHook {
+            fn name(&self) -> &str {
+                "panicking-after"
+            }
+
+            fn priority(&self) -> i32 {
+                10
+            }
+
+            async fn on_after_tool_call(
+                &self,
+                _tool: &str,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                panic!("simulated after_tool_call panic");
+            }
+        }
+
+        struct CountingAfterHook(Arc<AtomicU32>);
+        #[async_trait]
+        impl HookHandler for CountingAfterHook {
+            fn name(&self) -> &str {
+                "counting-after"
+            }
+
+            async fn on_after_tool_call(
+                &self,
+                _tool: &str,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(PanickingAfterHook));
+        runner.register(Box::new(CountingAfterHook(Arc::clone(&count))));
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+
+        runner
+            .fire_after_tool_call_with_context(
+                &tool_call_hook_context("turn-a", 0, 0),
+                "shell",
+                &result,
+                Duration::ZERO,
+            )
+            .await;
+
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn args_carrying_completion_dispatches_with_final_arguments() {
+        struct ArgsRecorder {
+            name: String,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for ArgsRecorder {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn on_after_tool_call_with_context_and_args(
+                &self,
+                context: &ToolCallHookContext,
+                tool: &str,
+                args: &Value,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.events.lock().unwrap().push(format!(
+                    "{}:{}:{}:{}",
+                    self.name,
+                    tool,
+                    context.invocation_id(),
+                    args
+                ));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(ArgsRecorder {
+            name: "audit".into(),
+            events: Arc::clone(&events),
+        }));
+
+        runner
+            .fire_after_tool_call_with_context_and_args(
+                &tool_call_hook_context("turn-a", 0, 2),
+                "shell",
+                &serde_json::json!({"command": "final"}),
+                &ToolResult {
+                    success: true,
+                    output: "ok".into(),
+                    error: None,
+                },
+                Duration::ZERO,
+            )
+            .await;
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["audit:shell:turn-a:0:2:{\"command\":\"final\"}".to_string()],
+            "the completion dispatch must carry the arguments that were dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandonment_dispatches_to_all_handlers_with_context() {
+        struct AbandonRecorder {
+            name: String,
+            events: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for AbandonRecorder {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+                self.events.lock().unwrap().push(format!(
+                    "{}:{}:{}",
+                    self.name,
+                    tool,
+                    context.invocation_id()
+                ));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(AbandonRecorder {
+            name: "first".into(),
+            events: Arc::clone(&events),
+        }));
+        runner.register(Box::new(AbandonRecorder {
+            name: "second".into(),
+            events: Arc::clone(&events),
+        }));
+
+        let context = tool_call_hook_context("turn-a", 2, 1);
+        runner.fire_tool_call_abandoned(&context, "shell").await;
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            *events,
+            vec![
+                "first:shell:turn-a:2:1".to_string(),
+                "second:shell:turn-a:2:1".to_string(),
+            ],
+            "every handler must observe the abandonment with the shared context"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_abandonment_handler_does_not_break_subsequent_handler() {
+        struct PanickingAbandonHook;
+        #[async_trait]
+        impl HookHandler for PanickingAbandonHook {
+            fn name(&self) -> &str {
+                "panicking-abandon"
+            }
+
+            fn priority(&self) -> i32 {
+                10
+            }
+
+            async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {
+                panic!("simulated on_tool_call_abandoned panic");
+            }
+        }
+
+        struct CountingAbandonHook(Arc<AtomicU32>);
+        #[async_trait]
+        impl HookHandler for CountingAbandonHook {
+            fn name(&self) -> &str {
+                "counting-abandon"
+            }
+
+            async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count = Arc::new(AtomicU32::new(0));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(PanickingAbandonHook));
+        runner.register(Box::new(CountingAbandonHook(Arc::clone(&count))));
+
+        runner
+            .fire_tool_call_abandoned(&tool_call_hook_context("turn-a", 0, 0), "shell")
+            .await;
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "the handler after a panicking abandonment handler must still run"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandonment_on_legacy_only_handler_is_a_noop() {
+        // A pre-existing handler that implements only legacy methods keeps
+        // compiling unchanged and must not observe abandonment events.
+        struct LegacyOnlyHook {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for LegacyOnlyHook {
+            fn name(&self) -> &str {
+                "legacy-only"
+            }
+
+            async fn on_after_tool_call(
+                &self,
+                tool: &str,
+                _result: &ToolResult,
+                _duration: Duration,
+            ) {
+                self.calls.lock().unwrap().push(format!("after:{tool}"));
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(LegacyOnlyHook {
+            calls: Arc::clone(&calls),
+        }));
+
+        runner
+            .fire_tool_call_abandoned(&tool_call_hook_context("turn-a", 0, 0), "shell")
+            .await;
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the default abandonment implementation must be a no-op"
+        );
     }
 
     #[tokio::test]

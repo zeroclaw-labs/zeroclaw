@@ -1246,7 +1246,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             Err(e) if is_tool_loop_cancelled(&e) => {
                 (0..executable_calls.len()).map(|_| None).collect()
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // The batch failed outright: no executable context reached
+                // post-execution handling, so every one is abandoned before
+                // the turn aborts.
+                call_prep::abandon_unexecuted_prepared_contexts(
+                    &ctx,
+                    iteration,
+                    &executable_indices,
+                    &executable_calls,
+                    &[],
+                )
+                .await;
+                return Err(e);
+            }
         };
 
         let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
@@ -1281,6 +1294,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await;
         if cancelled_mid_batch {
+            // Completed calls already received their after hook; every other
+            // executable context of the batch was interrupted before
+            // post-execution handling and gets exactly one abandonment.
+            call_prep::abandon_unexecuted_prepared_contexts(
+                &ctx,
+                iteration,
+                &executable_indices,
+                &executable_calls,
+                &executed_completed_indices,
+            )
+            .await;
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -4070,6 +4094,686 @@ mod sop_step_reassembly_tests {
             crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS,
             "the live driver must execute exactly MAX_HEADLESS_DRIVE_STEPS capabilities, \
              the same bound both headless drivers use"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_lifecycle_abandonment_tests {
+    //! Behavior-level coverage of the tool-call lifecycle invariant at the
+    //! turn-loop boundary: every correlated context whose before hook ran
+    //! reaches exactly one terminal operation — the matching after hook on
+    //! completion, or one abandonment callback when the call cannot reach
+    //! after.
+
+    use super::*;
+    use crate::observability::NoopObserver;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use zeroclaw_api::hook::ToolCallHookContext;
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    struct LifecycleRecorder {
+        events: Arc<Mutex<Vec<String>>>,
+        cancel_before_for: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for LifecycleRecorder {
+        fn name(&self) -> &str {
+            "lifecycle-recorder"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.events
+                .lock()
+                .expect("lifecycle event lock")
+                .push(format!("before:{}:{}", name, context.invocation_id()));
+            if self.cancel_before_for.iter().any(|tool| tool == &name) {
+                return crate::hooks::HookResult::Cancel("blocked by test".to_string());
+            }
+            crate::hooks::HookResult::Continue((name, args))
+        }
+
+        async fn on_after_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            tool: &str,
+            _result: &zeroclaw_api::tool::ToolResult,
+            _duration: Duration,
+        ) {
+            self.events
+                .lock()
+                .expect("lifecycle event lock")
+                .push(format!("after:{}:{}", tool, context.invocation_id()));
+        }
+
+        async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+            self.events
+                .lock()
+                .expect("lifecycle event lock")
+                .push(format!("abandoned:{}:{}", tool, context.invocation_id()));
+        }
+    }
+
+    fn lifecycle_runner(
+        events: Arc<Mutex<Vec<String>>>,
+        cancel_for: Vec<String>,
+    ) -> crate::hooks::HookRunner {
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events,
+            cancel_before_for: cancel_for,
+        }));
+        runner
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            extra_content: None,
+        }
+    }
+
+    fn text_response() -> ChatResponse {
+        ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// Provider that hands out scripted responses in order; falls back to a
+    /// text-only response once the script is exhausted.
+    struct ScriptedProvider {
+        responses: Mutex<Vec<ChatResponse>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ScriptedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ScriptedProvider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut queue = self.responses.lock().expect("script queue lock");
+            if queue.is_empty() {
+                return Ok(text_response());
+            }
+            Ok(queue.remove(0))
+        }
+    }
+
+    struct EchoTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for EchoTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for EchoTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "echoes success"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: args.to_string().into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Succeeds, but first cancels the turn token: the executor's select!
+    /// deterministically reports the cancellation instead of the tool's own
+    /// result, simulating an operator interrupt landing mid-execution.
+    struct InterruptingTool {
+        name: String,
+        token: CancellationToken,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for InterruptingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for InterruptingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "cancels the turn mid-execution"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.token.cancel();
+            // Keep the tool future pending past cancellation so the
+            // executor's cancellation branch wins deterministically.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(crate::tools::ToolResult::ok("never observed"))
+        }
+    }
+
+    /// A tool whose execution FAILS: the failed result is still a completed
+    /// call that reaches its after hook — abandonment is not for it.
+    struct FailingTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FailingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FailingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "always returns a failed result"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: false,
+                output: "failed".into(),
+                error: Some("boom".to_string()),
+            })
+        }
+    }
+
+    async fn run_scripted_loop(
+        provider: &ScriptedProvider,
+        tools_registry: &crate::tools::scoped::ScopedToolRegistry,
+        observer: &NoopObserver,
+        hooks: Option<&crate::hooks::HookRunner>,
+        pacing: &zeroclaw_config::schema::PacingConfig,
+        turn_id: &str,
+        parallel_tools: bool,
+        cancellation_token: Option<CancellationToken>,
+        history: &mut Vec<ChatMessage>,
+    ) -> anyhow::Result<String> {
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry,
+                observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing,
+                strict_tool_parsing: false,
+                parallel_tools,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id,
+        })
+        .await
+    }
+
+    fn registry_with(
+        tools: Vec<Box<dyn crate::tools::Tool>>,
+    ) -> crate::tools::scoped::ScopedToolRegistry {
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools)
+    }
+
+    #[tokio::test]
+    async fn completed_batch_pairs_before_with_after_and_never_abandons() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    tool_call("call-a", "echo_first", serde_json::json!({"n": 1})),
+                    tool_call("call-b", "echo_second", serde_json::json!({"n": 2})),
+                ],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![
+            Box::new(EchoTool {
+                name: "echo_first".to_string(),
+            }),
+            Box::new(EchoTool {
+                name: "echo_second".to_string(),
+            }),
+        ]);
+        let mut history = vec![ChatMessage::user("run the tools".to_string())];
+
+        run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-ok",
+            false,
+            None,
+            &mut history,
+        )
+        .await
+        .expect("the scripted turn completes");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:echo_first:turn-ok:0:0".to_string(),
+                "before:echo_second:turn-ok:0:1".to_string(),
+                "after:echo_first:turn-ok:0:0".to_string(),
+                "after:echo_second:turn-ok:0:1".to_string(),
+            ],
+            "each completed call pairs its before hook with exactly one after hook and is never abandoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_tool_outcome_reaches_after_not_abandonment() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "call-1",
+                    "failing_tool",
+                    serde_json::json!({"n": 1}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![Box::new(FailingTool {
+            name: "failing_tool".to_string(),
+        })]);
+        let mut history = vec![ChatMessage::user("run it".to_string())];
+
+        run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-fail",
+            false,
+            None,
+            &mut history,
+        )
+        .await
+        .expect("a failed tool outcome is a completed call, not a turn error");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:failing_tool:turn-fail:0:0".to_string(),
+                "after:failing_tool:turn-fail:0:0".to_string(),
+            ],
+            "a failed result is still execution completion: after fires, abandonment must not"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_batch_interruption_abandons_every_unexecuted_context() {
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runner = lifecycle_runner(Arc::clone(&events), Vec::new());
+        let token = CancellationToken::new();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![
+                    tool_call("call-a", "interrupt_tool", serde_json::json!({"n": 1})),
+                    tool_call("call-b", "echo_second", serde_json::json!({"n": 2})),
+                ],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![
+            Box::new(InterruptingTool {
+                name: "interrupt_tool".to_string(),
+                token: token.clone(),
+            }),
+            Box::new(EchoTool {
+                name: "echo_second".to_string(),
+            }),
+        ]);
+        let mut history = vec![ChatMessage::user("run then interrupt".to_string())];
+
+        let error = run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-interrupted",
+            false,
+            Some(token),
+            &mut history,
+        )
+        .await
+        .expect_err("an interrupted turn surfaces as cancellation");
+
+        assert!(
+            is_tool_loop_cancelled(&error),
+            "the turn must report tool-loop cancellation, got {error:?}"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:interrupt_tool:turn-interrupted:0:0".to_string(),
+                "before:echo_second:turn-interrupted:0:1".to_string(),
+                "abandoned:interrupt_tool:turn-interrupted:0:0".to_string(),
+                "abandoned:echo_second:turn-interrupted:0:1".to_string(),
+            ],
+            "every executable context of the interrupted batch gets exactly one abandonment; none reaches after"
+        );
+    }
+
+    /// Tool that never completes on its own: the containing wrapper decides
+    /// the turn's fate, not the tool.
+    struct HangingTool {
+        name: String,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for HangingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for HangingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "sleeps far past any test timeout"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(crate::tools::ToolResult::ok("never observed"))
+        }
+    }
+
+    /// Hook that retains per-invocation state in the before phase and releases
+    /// it on after/abandonment — the integrator pattern the abandonment API
+    /// documents as cooperative-path-only. Used to pin what a hard future drop
+    /// does and does not deliver.
+    struct RetainingHook {
+        events: Arc<Mutex<Vec<String>>>,
+        retained: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookHandler for RetainingHook {
+        fn name(&self) -> &str {
+            "retaining-hook"
+        }
+
+        async fn before_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            name: String,
+            args: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("before:{}:{}", name, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .push(context.invocation_id().to_string());
+            crate::hooks::HookResult::Continue((name, args))
+        }
+
+        async fn on_after_tool_call_with_context(
+            &self,
+            context: &ToolCallHookContext,
+            tool: &str,
+            _result: &zeroclaw_api::tool::ToolResult,
+            _duration: Duration,
+        ) {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("after:{}:{}", tool, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .retain(|id| id != context.invocation_id());
+        }
+
+        async fn on_tool_call_abandoned(&self, context: &ToolCallHookContext, tool: &str) {
+            self.events
+                .lock()
+                .expect("retaining event lock")
+                .push(format!("abandoned:{}:{}", tool, context.invocation_id()));
+            self.retained
+                .lock()
+                .expect("retaining state lock")
+                .retain(|id| id != context.invocation_id());
+        }
+    }
+
+    #[tokio::test]
+    async fn outer_turn_drop_fires_no_lifecycle_callbacks() {
+        // Mirrors the channel orchestrator's containing-future race
+        // (orchestrator/mod.rs): the whole turn future is wrapped in a
+        // timeout and raced against the turn's cancellation token. A winning
+        // outer branch DROPS the turn future, so awaited cooperative cleanup
+        // inside the loop never runs. This pins the documented lifecycle
+        // boundary: after and abandonment fire on awaited non-completion
+        // paths only; a hard drop fires neither, and stateful hooks must
+        // design for that (the webhook audit hook retains no arguments at
+        // all, so a drop leaves nothing behind).
+        let observer = NoopObserver;
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let retained = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(RetainingHook {
+            events: Arc::clone(&events),
+            retained: Arc::clone(&retained),
+        }));
+        let token = CancellationToken::new();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(vec![ChatResponse {
+                text: None,
+                tool_calls: vec![tool_call(
+                    "call-a",
+                    "hang_tool",
+                    serde_json::json!({"n": 1}),
+                )],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        };
+        let registry = registry_with(vec![Box::new(HangingTool {
+            name: "hang_tool".to_string(),
+        })]);
+        let mut history = vec![ChatMessage::user("hang forever".to_string())];
+
+        let turn_future = run_scripted_loop(
+            &provider,
+            &registry,
+            &observer,
+            Some(&runner),
+            &pacing,
+            "turn-drop",
+            false,
+            Some(token.clone()),
+            &mut history,
+        );
+        let outcome = tokio::select! {
+            () = token.cancelled() => "cancelled",
+            result = tokio::time::timeout(Duration::from_millis(300), turn_future) => {
+                match result {
+                    Ok(_) => "completed",
+                    Err(_elapsed) => "timeout",
+                }
+            }
+        };
+        assert_eq!(
+            outcome, "timeout",
+            "the outer timeout must win while the tool hangs"
+        );
+
+        // The dropped turn fired exactly its before phase: neither the after
+        // hook nor abandonment can run inside a dropped future.
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["before:hang_tool:turn-drop:0:0".to_string()],
+            "a hard future drop must fire no after or abandonment callback"
+        );
+        // The hook's own retained entry survives the drop — the runtime makes
+        // no callback promise under hard drop, which is why argument-carrying
+        // completion exists: hooks that must not leak retain nothing.
+        assert_eq!(
+            retained.lock().unwrap().len(),
+            1,
+            "the retained entry documents the hard-drop boundary; release is the hook's design obligation"
+        );
+
+        // The runner itself is unharmed by the dropped turn: a direct
+        // cooperative dispatch still reaches the hook and releases the entry.
+        runner
+            .fire_tool_call_abandoned(
+                &zeroclaw_api::hook::ToolCallHookContext::new("turn-drop:0:0"),
+                "hang_tool",
+            )
+            .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:hang_tool:turn-drop:0:0".to_string(),
+                "abandoned:hang_tool:turn-drop:0:0".to_string(),
+            ],
+            "cooperative abandonment still works after a dropped turn"
+        );
+        assert!(
+            retained.lock().unwrap().is_empty(),
+            "the cooperative dispatch releases exactly the retained entry"
         );
     }
 }
