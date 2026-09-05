@@ -4737,7 +4737,21 @@ impl RpcDispatcher {
 
         for result in &results {
             match result {
-                crate::sop::dispatch::DispatchResult::Started { run_id, .. } => {
+                crate::sop::dispatch::DispatchResult::Started { run_id, action, .. } => {
+                    let needs_driver = matches!(
+                        action.as_ref(),
+                        crate::sop::SopRunAction::ExecuteStep { .. }
+                            | crate::sop::SopRunAction::DeterministicStep { .. }
+                    );
+                    if needs_driver {
+                        let config = self.ctx.config.read().clone();
+                        crate::sop::spawn_headless_run_driver(
+                            config,
+                            Arc::clone(engine),
+                            Some(Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        );
+                    }
                     return to_result(SopRunResponse {
                         run_id: run_id.clone(),
                     });
@@ -6270,6 +6284,93 @@ mod tests {
             .await
             .expect_err("missing engine must error");
         assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn sops_run_drives_started_execute_step() {
+        use crate::sop::{
+            Sop, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind, SopTrigger,
+        };
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let mut engine = crate::sop::SopEngine::new(config.sop.clone());
+        engine.set_sops_for_test(vec![Sop {
+            name: "rpc-headless-driver".into(),
+            description: "RPC headless driver regression".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Execute first step".into(),
+                kind: SopStepKind::Execute,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let engine = Arc::new(Mutex::new(engine));
+        let audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::new(
+            zeroclaw_memory::NoneMemory::new("rpc-test"),
+        )));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = Arc::new(crate::rpc::context::RpcContext {
+            config: Arc::new(parking_lot::RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
+            tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: Some(Arc::clone(&engine)),
+            sop_audit: Some(audit),
+            hooks: None,
+            cert_audit: None,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc-sop:pid=1".into());
+
+        let response = dispatcher
+            .handle_sops_run(&json!({ "name": "rpc-headless-driver" }))
+            .await
+            .expect("RPC SOP start should return the run id");
+        let run: SopRunResponse = serde_json::from_value(response).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = engine
+                    .lock()
+                    .expect("engine lock")
+                    .get_run(&run.run_id)
+                    .map(|run| run.status);
+                if status == Some(SopRunStatus::Failed) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RPC SOP start must schedule the executable first step");
     }
 
     #[test]
