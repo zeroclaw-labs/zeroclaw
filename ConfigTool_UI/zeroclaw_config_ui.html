@@ -1,0 +1,1473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zeroclaw · Config Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#F4F1E8; --panel:#FBF9F3; --panel2:#FFFDF7;
+  --ink:#1C1914; --mut:#6E6759; --faint:#9A9280;
+  --line:#E3DCCB; --line2:#D2C9B2;
+  --acc:#A81E3C; --acc2:#7E152C; --accsoft:#F6E3E7;
+  --ok:#1E6B45; --oksoft:#E2EFE6;
+  --warn:#8F6400; --warnsoft:#F6ECD2;
+  --dark:#17140F; --darkline:#2E2A21;
+  --sans:'Space Grotesk','Helvetica Neue',Helvetica,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,'Cascadia Mono',Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+::selection{background:var(--accsoft)}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans)}
+button{font-family:var(--sans)}
+.mono{font-family:var(--mono)}
+.ic{flex:none;display:inline-block;vertical-align:-2px}
+
+/* ── masthead ─────────────────────────── */
+#mast{display:flex;align-items:center;gap:16px;padding:0 22px;height:60px;border-bottom:1px solid var(--line2);background:var(--panel);flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.mark{width:36px;height:36px;border-radius:9px;background:var(--ink);display:flex;align-items:center;justify-content:center;color:var(--acc);flex:none}
+.word{font-weight:700;font-size:16px;letter-spacing:.04em;white-space:nowrap}
+.word span{font-weight:500;color:var(--mut);letter-spacing:0}
+.sub{font-size:10.5px;color:var(--faint);letter-spacing:.06em;white-space:nowrap}
+.mright{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line2);background:var(--panel2);border-radius:8px;padding:5px 10px;font-size:11.5px;color:var(--mut);white-space:nowrap}
+.chip .dot{margin:0}
+.mbtns{display:flex;gap:6px}
+
+#progress{height:3px;background:var(--line)}
+#progress i{display:block;height:100%;background:var(--acc);width:11%;transition:width .35s cubic-bezier(.5,0,.2,1)}
+
+/* ── app grid ─────────────────────────── */
+.app{display:grid;grid-template-columns:232px minmax(0,1fr) 402px;min-height:calc(100vh - 63px)}
+.app.noprev{grid-template-columns:232px minmax(0,1fr) 0}
+.app.noprev #prev{display:none}
+
+/* ── rail ─────────────────────────────── */
+#rail{border-right:1px solid var(--line);padding:16px 0 12px;position:sticky;top:0;height:calc(100vh - 63px);overflow:auto;background:var(--panel)}
+.rstep{display:flex;align-items:center;gap:11px;padding:9px 14px 9px 15px;cursor:pointer;border-left:3px solid transparent;user-select:none}
+.rstep:hover{background:#EFE9D9}
+.rstep.active{border-left-color:var(--acc);background:#EFE9D9}
+.rnum{font-family:var(--mono);font-size:10.5px;color:var(--faint);width:18px}
+.rstep.active .rnum{color:var(--acc);font-weight:600}
+.rt{font-size:13px;font-weight:500}
+.rdot{margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--line2);flex:none}
+.rdot.ok{background:var(--ok)} .rdot.warn{background:#C08A00} .rdot.err{background:var(--acc)}
+#railFoot{margin:14px 15px 0;padding-top:12px;border-top:1px solid var(--line);font-size:11px;color:var(--mut);line-height:1.7}
+#railFoot b{color:var(--ink)}
+
+/* ── stage ────────────────────────────── */
+#stage{padding:34px 40px 80px;max-width:900px}
+.kick{font-family:var(--mono);font-size:11px;letter-spacing:.16em;color:var(--acc);text-transform:uppercase;margin-bottom:10px}
+h2{font-size:29px;font-weight:700;letter-spacing:-.015em;line-height:1.15;margin-bottom:10px}
+.lede{color:var(--mut);font-size:14.5px;max-width:62ch;margin-bottom:30px}
+.blk{border:1px solid var(--line);border-radius:13px;background:var(--panel);padding:20px 22px;margin-bottom:22px}
+.blkt{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+.blkt .tick{width:8px;height:8px;background:var(--acc);border-radius:2px;transform:rotate(45deg);flex:none;align-self:center}
+.blkt h3{font-size:15.5px;font-weight:600}
+.blkt .tag{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.blkd{color:var(--mut);font-size:13px;margin:2px 0 16px;max-width:60ch}
+.blk.off .frow,.blk.off .fhint{display:none}
+.blk .onoff{display:flex;align-items:center;gap:10px;margin-bottom:14px;font-size:13px;font-weight:600}
+.blk .onoff .sw{margin:0}
+.onlab{font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--mut);text-transform:uppercase}
+
+/* field rows */
+.frow{display:grid;grid-template-columns:196px minmax(0,1fr);gap:6px 16px;padding:9px 0;border-top:1px dashed var(--line);align-items:start}
+.frow:first-of-type{border-top:none}
+.flab{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);padding-top:10px}
+.flab .req{color:var(--acc);font-style:normal;margin-left:3px}
+.fctl{min-width:0}
+.fhint{font-size:12px;color:var(--faint);margin-top:5px;line-height:1.45}
+.in{width:100%;padding:9px 11px;border:1px solid var(--line2);border-radius:8px;background:var(--panel2);color:var(--ink);font:500 12.5px var(--mono);transition:border-color .15s, box-shadow .15s}
+.in:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 3px rgba(168,30,60,.13)}
+textarea.in{font-size:12px;line-height:1.6;resize:vertical;min-height:74px}
+select.in{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236E6759' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:30px;cursor:pointer}
+.secret{display:flex;gap:6px}
+.secret .in{flex:1}
+.ib{border:1px solid var(--line2);background:var(--panel2);border-radius:8px;width:37px;flex:none;cursor:pointer;color:var(--mut);display:flex;align-items:center;justify-content:center;transition:.15s}
+.ib:hover{color:var(--ink);border-color:var(--ink)}
+
+/* switch */
+.sw{position:relative;width:37px;height:21px;flex:none;display:inline-block}
+.sw input{position:absolute;opacity:0;inset:0;cursor:pointer;margin:0;z-index:2}
+.sw i{position:absolute;inset:0;background:#D6CDB7;border-radius:99px;transition:.18s}
+.sw i:before{content:'';position:absolute;width:15px;height:15px;border-radius:50%;background:#FFFDF8;top:3px;left:3px;transition:.18s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+.sw input:checked + i{background:var(--acc)}
+.sw input:checked + i:before{left:19px}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 15px;border:1px solid var(--ink);border-radius:9px;background:transparent;color:var(--ink);font:600 13px var(--sans);cursor:pointer;transition:.15s}
+.btn:hover{background:var(--ink);color:var(--bg)}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn.primary:hover{background:var(--acc2);border-color:var(--acc2)}
+.btn.ghost{border-color:var(--line2)}
+.btn.ghost:hover{border-color:var(--ink);background:var(--panel2);color:var(--ink)}
+.btn.small{padding:6px 11px;font-size:12px}
+.btn.danger{border-color:var(--acc);color:var(--acc)}
+.btn.danger:hover{background:var(--acc);color:#fff}
+.btn:disabled{opacity:.4;cursor:not-allowed;pointer-events:none}
+.btn.arm{background:var(--acc);border-color:var(--acc);color:#fff}
+
+/* ledger (providers / channels) */
+.leds{border:1px solid var(--line);border-radius:13px;background:var(--panel);overflow:hidden}
+.led{border-bottom:1px solid var(--line)}
+.led:last-child{border-bottom:none}
+.ledrow{display:flex;align-items:center;gap:14px;padding:13px 18px;cursor:pointer}
+.ledrow:hover{background:#F3EEDF}
+.lname{font-weight:600;font-size:14.5px}
+.lname small{display:block;font-weight:400;font-size:11.5px;color:var(--faint);font-family:var(--mono)}
+.lstat{margin-left:auto;display:flex;align-items:center;gap:14px}
+.ledchev{color:var(--faint);transition:transform .2s;border:none;background:none;cursor:pointer;padding:4px;display:flex}
+.led.open .ledchev{transform:rotate(180deg)}
+.led:not(.on) .lname{color:var(--faint)}
+.ledbody{display:none;padding:4px 18px 18px 69px;border-top:1px dashed var(--line)}
+.led.open.on .ledbody{display:block}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--line2);display:inline-block;flex:none}
+.dot.ok{background:var(--ok)} .dot.warn{background:#C08A00} .dot.err{background:var(--acc)}
+.mchips{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
+.mchips span{font-family:var(--mono);font-size:10.5px;background:#EFE9D7;border:1px solid var(--line);border-radius:6px;padding:2px 7px;color:var(--mut)}
+.mchips .cap{border:none;background:none;padding:2px 0;color:var(--faint);font-size:10.5px}
+
+/* chips editor */
+.chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center;border:1px solid var(--line2);border-radius:8px;background:var(--panel2);padding:6px 8px;min-height:39px}
+.chipx{display:inline-flex;align-items:center;gap:5px;background:#EFE9D7;border:1px solid var(--line);border-radius:6px;padding:3px 4px 3px 8px;font-family:var(--mono);font-size:11.5px}
+.chipx button{border:none;background:none;cursor:pointer;color:var(--faint);display:flex;padding:1px;border-radius:4px}
+.chipx button:hover{color:var(--acc);background:var(--accsoft)}
+.chin{border:none;background:none;flex:1;min-width:110px;font:500 12px var(--mono);color:var(--ink);padding:4px}
+.chin:focus{outline:none}
+.chipadd{border:none;background:var(--ink);color:var(--bg);border-radius:6px;width:24px;height:24px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex:none}
+.chipadd:hover{background:var(--acc)}
+
+/* agent cards */
+.agent{border:1px solid var(--line);border-radius:12px;background:var(--panel2);margin-bottom:14px;overflow:hidden}
+.ahead{display:flex;align-items:center;gap:10px;padding:11px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+.ahead .an{font:600 13px var(--mono);border:1px solid transparent;background:transparent;border-radius:6px;padding:3px 6px;color:var(--ink);width:150px}
+.ahead .an:focus{border-color:var(--acc);outline:none;background:var(--panel2)}
+.ahead .arole{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+.abody{padding:6px 18px 12px}
+
+/* route rows */
+.route{display:flex;gap:8px;align-items:center;padding:7px 0;border-top:1px dashed var(--line)}
+.route:first-of-type{border-top:none}
+.route .in{flex:1}
+.route .match{flex:1.1}
+.wchk{display:flex;align-items:center;gap:10px;padding:7px 2px;border-top:1px dashed var(--line);font-size:13px;cursor:pointer}
+.wchk:first-of-type{border-top:none}
+.wchk .mono{font-size:11px;color:var(--faint);margin-left:auto}
+.wchk input{accent-color:var(--acc);width:15px;height:15px;cursor:pointer}
+
+/* source list (step 1) */
+.src{display:flex;align-items:center;gap:14px;padding:14px 4px;border-top:1px dashed var(--line);flex-wrap:wrap}
+.src:first-of-type{border-top:none}
+.src .ic{color:var(--acc)}
+.src b{font-size:14px;display:block}
+.src small{color:var(--mut);font-size:12px}
+.src .btn{margin-left:auto}
+.tchips{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
+.tchips span{font-family:var(--mono);font-size:11px;background:#EFE9D7;border:1px solid var(--line);border-radius:6px;padding:2px 8px}
+.bignum{font-family:var(--mono);font-size:17px;font-weight:600;background:var(--dark);color:#D9B96C;border-radius:9px;padding:10px 14px;display:inline-block;margin:8px 0 4px}
+
+/* warnings */
+.warnrow{display:flex;gap:10px;align-items:flex-start;padding:9px 2px;border-top:1px dashed var(--line);cursor:pointer}
+.warnrow:first-of-type{border-top:none}
+.warnrow .ic{margin-top:2px}
+.warnrow.err .ic{color:var(--acc)} .warnrow.warn .ic{color:#C08A00} .warnrow.info .ic{color:var(--ok)}
+.warnrow p{font-size:13px}
+.warnrow .stref{font-family:var(--mono);font-size:10px;color:var(--faint);display:block;letter-spacing:.1em;text-transform:uppercase}
+.sumchips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:22px}
+.sumchips span{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--line2);background:var(--panel);border-radius:99px;padding:6px 13px;font-size:12.5px;font-weight:600}
+.shell{background:var(--dark);color:#CDC5B4;border-radius:11px;padding:16px 18px;font:12px/1.75 var(--mono);overflow-x:auto;white-space:pre}
+.shell .c{color:#7A7263}
+
+/* review / raw */
+details.raw{border:1px solid var(--line);border-radius:12px;background:var(--panel);margin-top:22px}
+details.raw summary{cursor:pointer;padding:13px 18px;font-weight:600;font-size:13.5px;list-style:none;display:flex;align-items:center;gap:9px}
+details.raw summary::-webkit-details-marker{display:none}
+details.raw .rbody{padding:0 18px 18px}
+textarea.rawta{width:100%;min-height:300px;font:12px/1.6 var(--mono);border:1px solid var(--line2);border-radius:9px;background:var(--dark);color:#D9D2C0;padding:14px;resize:vertical}
+textarea.rawta:focus{outline:2px solid rgba(168,30,60,.4)}
+
+/* step nav */
+.stepnav{display:flex;align-items:center;gap:14px;margin-top:34px;padding-top:18px;border-top:1px solid var(--line2)}
+#stepPos{margin:0 auto;font-size:11px;letter-spacing:.14em;color:var(--faint)}
+
+/* ── preview panel ────────────────────── */
+#prev{border-left:1px solid var(--line2);background:var(--dark);position:sticky;top:0;height:100vh;display:flex;flex-direction:column;min-width:0}
+.phead{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--darkline);flex-wrap:wrap}
+.pdot{width:8px;height:8px;border-radius:50%;background:#5FA97C;box-shadow:0 0 6px rgba(95,169,124,.7);flex:none}
+.pname{font-size:12px;color:#CDC5B4;font-weight:500}
+.pstats{margin-left:auto;font-size:10.5px;color:#7A7263;display:flex;gap:10px;align-items:center}
+#pDelta{color:#5FA97C;font-weight:600;opacity:0;transition:opacity .3s}
+#pDelta.neg{color:#E06B86}
+#pDelta.show{opacity:1}
+#pCollapse{background:none;border:1px solid var(--darkline);color:#7A7263;border-radius:7px;width:28px;height:26px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+#pCollapse:hover{color:#CDC5B4;border-color:#4A4436}
+#pBody{flex:1;overflow:auto;padding:14px 16px;font:11.5px/1.62 var(--mono);color:#CDC5B4}
+#pBody::-webkit-scrollbar{width:9px}
+#pBody::-webkit-scrollbar-thumb{background:#332E24;border-radius:9px}
+#pBody .ln{white-space:pre;padding:0 6px;border-radius:4px}
+#pBody .ln.flash{background:rgba(224,107,134,.16);transition:background 1.4s}
+.tok-c{color:#7A7263} .tok-t{color:#E06B86} .tok-k{color:#D9B96C} .tok-s{color:#9CCB8A} .tok-n{color:#82B4CC} .tok-p{color:#877F6E}
+.pfoot{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--darkline)}
+.pfoot .btn{flex:1;justify-content:center;border-color:#3A3428;color:#CDC5B4;background:transparent;font-size:12px;padding:8px 10px}
+.pfoot .btn:hover{background:#241F17;border-color:#4A4436;color:#F0EADB}
+#pFab{display:none;position:fixed;right:18px;bottom:18px;z-index:70;background:var(--ink);color:var(--bg);border:none;border-radius:99px;padding:12px 18px;font:600 13px var(--mono);cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.3)}
+
+/* toasts */
+#toasts{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);z-index:100;display:flex;flex-direction:column;gap:8px;align-items:center}
+.toast{display:flex;align-items:center;gap:9px;background:var(--ink);color:var(--bg);border-radius:10px;padding:11px 16px;font-size:13px;font-weight:500;box-shadow:0 8px 26px rgba(0,0,0,.28);animation:tin .25s cubic-bezier(.3,1.4,.5,1);max-width:min(520px,90vw)}
+.toast.ok .ic{color:#5FA97C}.toast.err .ic{color:#E06B86}.toast.warn .ic{color:#E0B84E}.toast.info .ic{color:#82B4CC}
+.toast.out{animation:tout .25s forwards}
+@keyframes tin{from{opacity:0;transform:translateY(14px) scale(.96)}}
+@keyframes tout{to{opacity:0;transform:translateY(10px)}}
+
+/* modal */
+#modal{position:fixed;inset:0;background:rgba(23,20,15,.55);z-index:90;display:flex;align-items:center;justify-content:center;padding:20px}
+#modal.hidden{display:none}
+.mpanel{background:var(--panel);border-radius:15px;border:1px solid var(--line2);width:min(680px,100%);max-height:88vh;overflow:auto;padding:24px 26px;box-shadow:0 24px 60px rgba(0,0,0,.35)}
+.mpanel h3{font-size:19px;margin-bottom:6px}
+.mpanel .msub{color:var(--mut);font-size:13px;margin-bottom:16px}
+.macts{display:flex;gap:9px;justify-content:flex-end;margin-top:18px}
+.merr{color:var(--acc);font-size:12.5px;font-family:var(--mono);margin-top:8px;min-height:16px}
+.plist{margin:6px 0 4px}
+.plist li{display:flex;gap:9px;padding:7px 0;border-top:1px dashed var(--line);font-size:13px;align-items:baseline;list-style:none}
+.plist li:first-child{border-top:none}
+.plist .mono{font-size:11.5px;color:var(--acc)}
+
+.foot{margin-top:26px;font-size:12px;color:var(--faint);line-height:1.7;border-top:1px dashed var(--line2);padding-top:14px}
+.note{background:var(--warnsoft);border:1px solid #E4CE96;border-radius:9px;padding:10px 13px;font-size:12.5px;color:#6E5200;margin-top:12px;display:flex;gap:9px;align-items:flex-start}
+.note .ic{margin-top:1px;flex:none}
+
+/* responsive */
+@media (max-width:1280px){.app{grid-template-columns:210px minmax(0,1fr) 340px}#stage{padding:28px 26px 80px}}
+@media (max-width:1020px){
+  .app{grid-template-columns:1fr}
+  #rail{position:static;height:auto;display:flex;overflow-x:auto;border-right:none;border-bottom:1px solid var(--line);padding:8px}
+  .rstep{border-left:none;border-bottom:3px solid transparent;border-radius:8px;flex:none}
+  .rstep.active{border-bottom-color:var(--acc)}
+  #railFoot{display:none}
+  #prev{position:fixed;left:0;right:0;bottom:0;top:auto;height:56vh;z-index:60;transform:translateY(102%);transition:transform .28s cubic-bezier(.4,0,.2,1);border-top:2px solid var(--ink);border-left:none}
+  #prev.open{transform:none}
+  #pFab{display:block}
+  .app.noprev{grid-template-columns:1fr}
+  .app.noprev #prev{display:flex}
+}
+@media (max-width:700px){.frow{grid-template-columns:1fr}.flab{padding-top:0}.ledbody{padding-left:18px}#stage{padding:22px 16px 90px}.mright{width:100%}}
+</style>
+</head>
+<body>
+
+<header id="mast">
+  <div class="brand">
+    <div class="mark" id="markLogo"></div>
+    <div>
+      <div class="word">ZEROCLAW <span>· Config Console</span></div>
+      <div class="sub mono">single-file editor · nothing leaves this machine</div>
+    </div>
+  </div>
+  <div class="mright">
+    <div class="chip mono" id="modeChip"></div>
+    <div class="chip mono" title="Where zeroclaw reads this file on the Pi">~/.zeroclaw/config.toml</div>
+    <div class="chip mono" id="stampChip" title="Timestamp that will be used for the backup file"></div>
+    <div class="mbtns">
+      <button class="btn small ghost" id="btnDir"></button>
+      <button class="btn small ghost" id="btnFile"></button>
+      <button class="btn small ghost" id="btnPaste"></button>
+    </div>
+  </div>
+</header>
+<div id="progress"><i></i></div>
+
+<div class="app" id="app">
+  <nav id="rail"></nav>
+  <main id="stage">
+    <div id="stepBody"></div>
+    <div class="stepnav">
+      <button class="btn ghost" id="prevBtn"></button>
+      <div class="mono" id="stepPos"></div>
+      <button class="btn primary" id="nextBtn"></button>
+    </div>
+  </main>
+  <aside id="prev">
+    <div class="phead">
+      <span class="pdot"></span><span class="pname mono">config.toml — live output</span>
+      <div class="pstats mono"><span id="pLines"></span><span id="pDelta"></span></div>
+      <button id="pCollapse" title="Collapse preview"></button>
+    </div>
+    <pre id="pBody"></pre>
+    <div class="pfoot">
+      <button class="btn" id="btnCopyT"></button>
+      <button class="btn" id="btnDlT"></button>
+    </div>
+  </aside>
+</div>
+<button id="pFab">TOML ▲</button>
+
+<div id="toasts"></div>
+<div id="modal" class="hidden"><div class="mpanel"></div></div>
+<input type="file" id="fileInput" hidden accept=".toml,.txt">
+
+<datalist id="modelsDL"></datalist>
+
+<script>
+'use strict';
+/* ════════════════════ 1 · tiny utils ════════════════════ */
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+const debounce = (fn,ms)=>{let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}};
+const slug = s => String(s).toLowerCase().replace(/[^a-z0-9-]+/g,'-').replace(/^-+|-+$/g,'') || 'agent';
+const pad = n => String(n).padStart(2,'0');
+const stamp = () => { const d=new Date(); return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`; };
+const prettyStamp = () => { const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+
+/* inline icon set (stroke, 24-grid) */
+const ICONS = {
+  claw:'<path d="M7 3.5 4.5 20.5"/><path d="M12.5 3.5 10 20.5"/><path d="M18 3.5 15.5 20.5"/>',
+  folder:'<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h4l2 2.5h7A2.5 2.5 0 0 1 21 10v7.5A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"/>',
+  file:'<path d="M6.5 3h7L18 7.5V21H6.5z"/><path d="M13.5 3v4.5H18"/>',
+  upload:'<path d="M12 15V4"/><path d="M7 8.5l5-5 5 5"/><path d="M4.5 20h15"/>',
+  download:'<path d="M12 4v11"/><path d="M7 10.5l5 5 5-5"/><path d="M4.5 20h15"/>',
+  copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5.5 14.5V6a2 2 0 0 1 2-2h8.5"/>',
+  check:'<path d="M4.5 12.5l5 5L20 6.5"/>',
+  alert:'<path d="M12 3.5 21.5 20h-19z"/><path d="M12 10v4.5"/><path d="M12 17.5v.01"/>',
+  info:'<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5"/><path d="M12 8v.01"/>',
+  x:'<path d="M6 6l12 12M18 6 6 18"/>',
+  plus:'<path d="M12 5v14M5 12h14"/>',
+  eye:'<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeoff:'<path d="M4 4l16 16"/><path d="M10.6 5.9A9.6 9.6 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a17.7 17.7 0 0 1-3 3.7M6.6 6.9A16.4 16.4 0 0 0 2.5 12S6 18.5 12 18.5a9 9 0 0 0 3.4-.7"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+  chev:'<path d="M8 10l4 4 4-4"/>',
+  left:'<path d="M14 6l-6 6 6 6"/>',
+  right:'<path d="M10 6l6 6-6 6"/>',
+  key:'<circle cx="7.5" cy="16.5" r="4"/><path d="M10.5 13.5 20 4"/><path d="M16 8l2.5 2.5"/>',
+  bot:'<rect x="4.5" y="9" width="15" height="10.5" rx="2"/><path d="M12 9V5.5"/><circle cx="12" cy="4" r="1.2"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/>',
+  users:'<circle cx="9" cy="8" r="3.2"/><path d="M3 19.5c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5"/><circle cx="17" cy="9" r="2.4"/><path d="M16.5 14.2c2.6.4 4.5 2.3 4.5 5.3"/>',
+  hub:'<circle cx="12" cy="12" r="2.2"/><circle cx="5" cy="5" r="1.6"/><circle cx="19" cy="5" r="1.6"/><circle cx="5" cy="19" r="1.6"/><circle cx="19" cy="19" r="1.6"/><path d="M6.4 6.4l3.9 3.9M17.6 6.4l-3.9 3.9M6.4 17.6l3.9-3.9M17.6 17.6l-3.9-3.9"/>',
+  house:'<path d="M4 11l8-7 8 7"/><path d="M6.5 9.5V20h11V9.5"/>',
+  shield:'<path d="M12 3l7.5 2.8V12c0 4.6-3.2 7.6-7.5 9-4.3-1.4-7.5-4.4-7.5-9V5.8z"/>',
+  clock:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  send:'<path d="M21 3.5 10.5 14"/><path d="M21 3.5 14 21l-3.5-7L3.5 10.5z"/>',
+  zap:'<path d="M13 2.5 4.5 14H11l-1 7.5L18.5 10H12z"/>',
+  trash:'<path d="M4.5 7h15"/><path d="M9.5 7V4.5h5V7"/><path d="M6.5 7l1 13.5h9l1-13.5"/>',
+  refresh:'<path d="M20.5 4.5v5h-5"/><path d="M20.2 9.5A8.5 8.5 0 1 0 21 13"/>',
+  term:'<path d="M4 17l5.5-5L4 7"/><path d="M12.5 19h7.5"/>',
+  braces:'<path d="M8.5 3.5c-2 0-2.5 1-2.5 3v2.5c0 1.5-1 2.5-2.5 3 1.5.5 2.5 1.5 2.5 3V17.5c0 2 .5 3 2.5 3"/><path d="M15.5 3.5c2 0 2.5 1 2.5 3v2.5c0 1.5 1 2.5 2.5 3-1.5.5-2.5 1.5-2.5 3V17.5c0 2-.5 3-2.5 3"/>',
+  save:'<path d="M5 3.5h11L19.5 7v13.5h-15z"/><path d="M8 3.5V9h7V3.5"/><rect x="8" y="13" width="8" height="7"/>',
+};
+const ic = (n,s=16) => `<svg class="ic" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[n]||''}</svg>`;
+ $('#markLogo').innerHTML = ic('claw',20);
+
+/* toast */
+function toast(msg, kind='info'){
+  const t = document.createElement('div');
+  t.className = 'toast '+kind;
+  t.innerHTML = ic(kind==='ok'?'check':kind==='err'?'alert':kind==='warn'?'alert':'info',15) + '<span>'+esc(msg)+'</span>';
+  $('#toasts').appendChild(t);
+  setTimeout(()=>{ t.classList.add('out'); setTimeout(()=>t.remove(),260); }, 3600);
+}
+
+/* modal */
+function openModal(html){ $('#modal .mpanel').innerHTML = html; $('#modal').classList.remove('hidden'); }
+function closeModal(){ $('#modal').classList.add('hidden'); }
+ $('#modal').addEventListener('click', e => { if(e.target.id==='modal') closeModal(); });
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
+
+/* clipboard + download */
+async function copyText(text, okMsg){
+  try{ await navigator.clipboard.writeText(text); toast(okMsg||'Copied to clipboard','ok'); }
+  catch(e){
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove(); toast(okMsg||'Copied to clipboard','ok');
+  }
+}
+function download(name, text){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text],{type:'text/plain'}));
+  a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 4000);
+}
+
+/* ════════════════════ 2 · TOML parser (subset, lenient) ════════════════════ */
+function skipWs(s,i){ while(i<s.length && (s[i]===' '||s[i]==='\t')) i++; return i; }
+function findEq(line){
+  let inB=false,inL=false,depth=0;
+  for(let i=0;i<line.length;i++){ const c=line[i];
+    if(inB){ if(c==='\\'){i++;continue;} if(c==='"')inB=false; continue; }
+    if(inL){ if(c==="'")inL=false; continue; }
+    if(c==='"')inB=true; else if(c==="'")inL=true;
+    else if(c==='['||c==='{')depth++;
+    else if(c===']'||c==='}')depth--;
+    else if(c==='='&&depth===0)return i;
+  } return -1;
+}
+function splitDotted(s){
+  const out=[]; let i=0;
+  while(i<s.length){
+    if(s[i]===' '||s[i]==='.'){i++;continue;}
+    if(s[i]==='"'){ const e=s.indexOf('"',i+1); out.push(unescapeBasic(s.slice(i+1,e<0?s.length:e))); i=(e<0?s.length:e)+1; }
+    else if(s[i]==="'"){ const e=s.indexOf("'",i+1); out.push(s.slice(i+1,e<0?s.length:e)); i=(e<0?s.length:e)+1; }
+    else{ let j=i; while(j<s.length&&s[j]!=='.')j++; out.push(s.slice(i,j).trim()); i=j; }
+  } return out;
+}
+function unescapeBasic(s){
+  let out=''; for(let i=0;i<s.length;i++){ const c=s[i];
+    if(c==='\\'){ const n=s[i+1];
+      if(n==='u'){ out+=String.fromCharCode(parseInt(s.slice(i+2,i+6),16)||63); i+=6; continue; }
+      const map={n:'\n',t:'\t',r:'\r','"':'"','\\':'\\',b:'\b',f:'\f','/':'/'};
+      out+=map[n]!==undefined?map[n]:(n||''); i++; continue; }
+    out+=c;
+  } return out;
+}
+function parseBasic(s,i){
+  let out='',j=i+1;
+  while(j<s.length){ const c=s[j];
+    if(c==='\\'){ const n=s[j+1];
+      if(n==='u'){ out+=String.fromCharCode(parseInt(s.slice(j+2,j+6),16)||63); j+=6; continue; }
+      const map={n:'\n',t:'\t',r:'\r','"':'"','\\':'\\',b:'\b',f:'\f','/':'/'};
+      out+=map[n]!==undefined?map[n]:(n||''); j+=2; continue; }
+    if(c==='"')return{v:out,i:j+1};
+    out+=c; j++;
+  } throw new Error('unterminated string');
+}
+function ensurePath(root,path){
+  let cur=root;
+  for(const k of path){ if(typeof cur[k]!=='object'||cur[k]===null||Array.isArray(cur[k]))cur[k]={}; cur=cur[k]; }
+  return cur;
+}
+function setValue(target,path,v){
+  let cur=target;
+  for(let i=0;i<path.length-1;i++){ if(typeof cur[path[i]]!=='object'||cur[path[i]]===null)cur[path[i]]={}; cur=cur[path[i]]; }
+  cur[path[path.length-1]]=v;
+}
+function bracketsBalanced(s){
+  let inB=false,inL=false,depth=0;
+  for(let i=0;i<s.length;i++){ const c=s[i];
+    if(inB){ if(c==='\\'){i++;continue;} if(c==='"')inB=false; continue; }
+    if(inL){ if(c==="'")inL=false; continue; }
+    if(c==='"')inB=true; else if(c==="'")inL=true;
+    else if(c==='['||c==='{')depth++;
+    else if(c===']'||c==='}')depth--;
+  } return depth<=0;
+}
+function parseVal(s,i){
+  i=skipWs(s,i); const c=s[i];
+  if(c==='"'){
+    if(s.startsWith('"""',i)){ const e=s.indexOf('"""',i+3); if(e<0)throw new Error('unterminated string');
+      let b=s.slice(i+3,e); if(b.startsWith('\n'))b=b.slice(1); return{v:unescapeBasic(b),i:e+3}; }
+    return parseBasic(s,i);
+  }
+  if(c==="'"){
+    if(s.startsWith("'''",i)){ const e=s.indexOf("'''",i+3); let b=s.slice(i+3,e<0?s.length:e); if(b.startsWith('\n'))b=b.slice(1); return{v:b,i:e<0?s.length:e+3}; }
+    const e=s.indexOf("'",i+1); return{v:s.slice(i+1,e<0?s.length:e),i:e+1};
+  }
+  if(c==='['){ const arr=[]; i++;
+    for(;;){ i=skipWs(s,i); if(s[i]===']')return{v:arr,i:i+1}; if(i>=s.length)throw new Error('unterminated array');
+      const r=parseVal(s,i); arr.push(r.v); i=skipWs(s,r.i);
+      if(s[i]===','){i++;continue;} if(s[i]===']')return{v:arr,i:i+1}; throw new Error('bad array'); } }
+  if(c==='{'){ const obj={}; i++;
+    for(;;){ i=skipWs(s,i); if(s[i]==='}')return{v:obj,i:i+1}; if(i>=s.length)throw new Error('unterminated inline table');
+      const km=s.slice(i).match(/^[^=:,}\s]+/); if(!km)throw new Error('bad inline table');
+      let key=km[0]; i+=key.length;
+      if(key.startsWith('"'))key=unescapeBasic(key.slice(1,-1));
+      i=skipWs(s,i); if(s[i]!=='=')throw new Error('bad inline table'); i++;
+      const r=parseVal(s,i); obj[key]=r.v; i=skipWs(s,r.i);
+      if(s[i]===','){i++;continue;} if(s[i]==='}')return{v:obj,i:i+1}; throw new Error('bad inline table'); } }
+  let j=i; while(j<s.length&&!',]}\n'.includes(s[j]))j++;
+  const tok=s.slice(i,j).trim(); i=j;
+  if(tok==='true')return{v:true,i}; if(tok==='false')return{v:false,i};
+  if(/^[+-]?\d+(_\d+)*(\.\d+)?([eE][+-]?\d+)?$/.test(tok))return{v:Number(tok.replace(/_/g,'')),i};
+  if(/^(19|20)\d\d-\d\d-\d\d/.test(tok))return{v:{__raw:tok},i};
+  return{v:tok,i};
+}
+function parseTOML(text){
+  const root={}; let cur=root; const lines=text.split(/\r?\n/);
+  for(let i=0;i<lines.length;i++){
+    const t=lines[i].trim();
+    if(!t||t.startsWith('#'))continue;
+    if(t.startsWith('[[')){
+      const m=t.match(/^\[\[([^\]]+)\]\]/); if(!m)throw new Error('bad table header: '+t);
+      const path=splitDotted(m[1]); const parent=ensurePath(root,path.slice(0,-1)); const k=path[path.length-1];
+      if(!Array.isArray(parent[k]))parent[k]=[];
+      const obj={}; parent[k].push(obj); cur=obj; continue;
+    }
+    if(t.startsWith('[')){
+      const m=t.match(/^\[([^\]]+)\]/); if(!m)throw new Error('bad table header: '+t);
+      cur=ensurePath(root,splitDotted(m[1])); continue;
+    }
+    const eq=findEq(lines[i]); if(eq<0)throw new Error('cannot parse line '+(i+1)+': '+t.slice(0,50));
+    const keyPath=splitDotted(lines[i].slice(0,eq).trim());
+    let rest=lines[i].slice(eq+1).trim();
+    if(rest.startsWith('"""')||rest.startsWith("'''")){
+      const delim=rest.slice(0,3); let buf=rest.slice(3), closed=null;
+      const ci=buf.indexOf(delim);
+      if(ci>=0){ closed=buf.slice(0,ci); }
+      else{ let j=i+1;
+        for(;j<lines.length;j++){ const l=lines[j]; const c=l.indexOf(delim);
+          if(c>=0){ buf+='\n'+l.slice(0,c); closed=buf; i=j; break; } buf+='\n'+l; }
+        if(closed===null)throw new Error('unterminated multiline string near line '+(i+1)); }
+      let v=closed; if(v.startsWith('\n'))v=v.slice(1);
+      setValue(cur,keyPath,delim==='"""'?unescapeBasic(v):v);
+      continue;
+    }
+    if(rest.startsWith('[')&&!bracketsBalanced(rest)){
+      let j=i+1;
+      while(j<lines.length){ rest+='\n'+lines[j].trim(); if(bracketsBalanced(rest)){i=j;break;} j++; }
+      if(!bracketsBalanced(rest))throw new Error('unterminated array near line '+(i+1));
+    }
+    const {v}=parseVal(rest,0);
+    setValue(cur,keyPath,v);
+  }
+  return root;
+}
+
+/* ════════════════════ 3 · TOML serializer + highlighter ════════════════════ */
+const SECT_COMMENTS = {
+  gateway:'# local gateway: dashboard + API the agent serves on this Pi',
+  models:'# model routing: default brain + provider credentials',
+  agents:'# personas — one workspace, one prompt each',
+  orchestration:'# multi-agent: keyword router or lead / worker team',
+  channels:'# where humans talk to the agent',
+  homeassistant:'# Home Assistant bridge: voice + device control',
+  tools:'# capability grants for the agent',
+  memory:'# long-term memory store',
+  cron:'# scheduled autonomous runs',
+  security:'# guard rails and audit trail',
+};
+const fmtKey = k => /^[A-Za-z0-9_-]+$/.test(k) ? k : '"'+k.replace(/\\/g,'\\\\').replace(/"/g,'\\"')+'"';
+function fmtStr(v){
+  if(!v.includes('\n')) return '"'+v.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n')+'"';
+  let b=v.replace(/\\/g,'\\\\').replace(/"""/g,'\\"""');
+  if(/"$/.test(b)) b=b.slice(0,-1)+'\\"';
+  return '"""\n'+b+'"""';
+}
+function fmtVal(v,indent){
+  if(v===true)return'true'; if(v===false)return'false';
+  if(typeof v==='number')return String(v);
+  if(v&&v.__raw!==undefined)return String(v.__raw);
+  if(typeof v==='string')return fmtStr(v);
+  if(Array.isArray(v)){
+    const items=v.map(x=>fmtVal(x,indent+1));
+    const inline='['+items.join(', ')+']';
+    if(inline.length<=68&&!items.some(s=>s.includes('\n')))return inline;
+    const pad='  '.repeat(indent+1);
+    return '[\n'+items.map(s=>pad+s).join(',\n')+'\n'+'  '.repeat(indent)+']';
+  }
+  if(v&&typeof v==='object'){
+    const parts=Object.entries(v).map(([k,x])=>fmtKey(k)+' = '+fmtVal(x,indent+1));
+    const inline='{ '+parts.join(', ')+' }';
+    if(inline.length<=68)return inline;
+    const pad='  '.repeat(indent+1);
+    return '{\n'+parts.map(s=>pad+s).join(',\n')+'\n'+'  '.repeat(indent)+'}';
+  }
+  return '""';
+}
+function walkTOML(node,path,out){
+  const scalars=[],tables=[],aots=[];
+  for(const[k,v]of Object.entries(node)){
+    if(v&&typeof v==='object'&&!Array.isArray(v))tables.push([k,v]);
+    else if(Array.isArray(v)&&v.length&&v.every(x=>x&&typeof x==='object'&&!Array.isArray(x)))aots.push([k,v]);
+    else scalars.push([k,v]);
+  }
+  if(path.length){
+    const c=SECT_COMMENTS[path.join('.')]; if(c)out.push(c);
+    out.push('['+path.map(fmtKey).join('.')+']');
+  }
+  for(const[k,v]of scalars)out.push(fmtKey(k)+' = '+fmtVal(v,path.length));
+  for(const[k,v]of tables)walkTOML(v,path.concat(k),out);
+  for(const[k,v]of aots)for(const el of v){
+    out.push(''); out.push('[['+path.concat(k).map(fmtKey).join('.')+']]'); walkTOML(el,[],out);
+  }
+}
+function serializeTOML(doc){ const out=[]; walkTOML(doc,[],out); return out.join('\n')+'\n'; }
+function highlightTOML(src){
+  const lines=src.split('\n'); let ml=false;
+  return lines.map(line=>{
+    if(ml){ const close=((line.match(/"""/g))||[]).length%2===1; const h=`<div class="ln"><span class="tok-s">${esc(line)||' '}</span></div>`; if(close)ml=false; return h; }
+    const t=line.trim();
+    if(!t)return'<div class="ln"> </div>';
+    if(t.startsWith('#'))return`<div class="ln"><span class="tok-c">${esc(line)}</span></div>`;
+    const hm=t.match(/^(\[\[?)([^\]]*)(\]\]?)$/);
+    if(hm)return`<div class="ln"><span class="tok-p">${esc(hm[1])}</span><span class="tok-t">${esc(hm[2])}</span><span class="tok-p">${esc(hm[3])}</span></div>`;
+    if(t.includes('"""')&&((t.match(/"""/g))||[]).length%2===1)ml=true;
+    const km=line.match(/^(\s*)([A-Za-z0-9_.\-"']+)(\s*=\s*)([\s\S]*)$/);
+    if(km){ const[,w,k,eq,rest]=km;
+      const num=/^(true|false)$/.test(rest.trim())||/^[+-]?\d/.test(rest.trim());
+      return`<div class="ln">${w}<span class="tok-k">${esc(k)}</span><span class="tok-p">${esc(eq)}</span><span class="${num?'tok-n':'tok-s'}">${esc(rest)}</span></div>`; }
+    return`<div class="ln">${esc(line)}</div>`;
+  }).join('');
+}
+
+/* ════════════════════ 4 · state ════════════════════ */
+let cfg = {};
+let ui = { on:{}, env:{}, wantBackup:true };
+let originalText = null;
+let meta = null;              // {source, at, size}
+let dirHandle = null;
+let cur = 0;
+let lastGen = '', lastCount = 0, lastTopKeys = [];
+
+const getPath = (o,p)=>p.split('.').reduce((a,k)=>(a==null?a:a[k]),o);
+function setPath(o,p,v){ const ks=p.split('.'); let c=o; for(let i=0;i<ks.length-1;i++){ if(typeof c[ks[i]]!=='object'||c[ks[i]]===null)c[ks[i]]={}; c=c[ks[i]]; } c[ks[ks.length-1]]=v; }
+function delPath(o,p){ const ks=p.split('.'); let c=o; for(let i=0;i<ks.length-1;i++){ if(typeof c[ks[i]]!=='object'||c[ks[i]]===null)return; c=c[ks[i]]; }
+  delete c[ks[ks.length-1]];
+  // prune now-empty ancestors
+  let cur=o; const trail=[];
+  for(let i=0;i<ks.length-1;i++){ trail.push([cur,ks[i]]); cur=cur[ks[i]]; if(!cur)break; }
+  for(let i=trail.length-1;i>=0;i--){ const [obj,k]=trail[i]; const v=obj[k]; if(v&&typeof v==='object'&&!Array.isArray(v)&&!Object.keys(v).length)delete obj[k]; }
+}
+function normalizeCamel(o){
+  if(Array.isArray(o))return o.map(normalizeCamel);
+  if(o&&typeof o==='object'){ const r={}; for(const[k,v]of Object.entries(o))r[k.replace(/([a-z0-9])([A-Z])/g,'$1_$2').toLowerCase()]=normalizeCamel(v); return r; }
+  return o;
+}
+function prune(o){
+  if(Array.isArray(o))return o.map(prune).filter(v=>!(v===''||v==null||(Array.isArray(v)&&!v.length)));
+  if(o&&typeof o==='object'){ const r={};
+    for(const[k,v]of Object.entries(o)){ if(v===''||v==null)continue; const pv=prune(v);
+      if(pv===''||pv==null)continue;
+      if(Array.isArray(pv)&&!pv.length)continue;
+      if(pv&&typeof pv==='object'&&!Array.isArray(pv)&&!Object.keys(pv).length)continue;
+      r[k]=pv; } return r; }
+  return o;
+}
+function generate(){
+  const doc=prune(structuredClone(cfg));
+  lastTopKeys=Object.keys(doc);
+  const head=[
+    '# ────────────────────────────────────────────────────────',
+    '# zeroclaw · config.toml',
+    '# generated by Config Console · '+new Date().toISOString().replace('T',' ').slice(0,19),
+    '# validate with:  zeroclaw doctor',
+    '# ────────────────────────────────────────────────────────',''
+  ].join('\n');
+  lastGen=head+serializeTOML(doc);
+  return lastGen;
+}
+function countKeys(o){ let n=0; const rec=v=>{ if(Array.isArray(v))return v.forEach(rec); if(v&&typeof v==='object')return Object.values(v).forEach(rec); n++; }; rec(o); return n; }
+function agentIds(){ return Object.keys(cfg.agents||{}); }
+
+/* ════════════════════ 5 · descriptors ════════════════════ */
+const PROVIDERS=[
+  {id:'anthropic', name:'Anthropic',            env:'ANTHROPIC_API_KEY', pre:'sk-ant-', models:['claude-opus-4-5','claude-sonnet-4-5','claude-haiku-4-5']},
+  {id:'openai',    name:'OpenAI',               env:'OPENAI_API_KEY',    pre:'sk-',     models:['gpt-5.1','gpt-5','gpt-4.1','gpt-4.1-mini','o4-mini']},
+  {id:'openrouter',name:'OpenRouter',           env:'OPENROUTER_API_KEY',pre:'sk-or-',  models:['anthropic/claude-sonnet-4.5','openai/gpt-4.1','google/gemini-2.5-pro','meta-llama/llama-3.3-70b-instruct']},
+  {id:'google',    name:'Google Gemini',        env:'GEMINI_API_KEY',    pre:'AIza',    models:['gemini-2.5-pro','gemini-2.5-flash','gemini-2.5-flash-lite']},
+  {id:'groq',      name:'Groq',                 env:'GROQ_API_KEY',      pre:'gsk_',    models:['llama-3.3-70b-versatile','moonshotai/kimi-k2-instruct','qwen/qwen3-32b']},
+  {id:'mistral',   name:'Mistral',              env:'MISTRAL_API_KEY',                  models:['mistral-large-latest','mistral-small-latest','codestral-latest']},
+  {id:'deepseek',  name:'DeepSeek',             env:'DEEPSEEK_API_KEY',  pre:'sk-',     models:['deepseek-chat','deepseek-reasoner']},
+  {id:'xai',       name:'xAI · Grok',           env:'XAI_API_KEY',       pre:'xai-',    models:['grok-4','grok-3','grok-3-mini']},
+  {id:'together',  name:'Together AI',          env:'TOGETHER_API_KEY',                 models:['meta-llama/Llama-3.3-70B-Instruct-Turbo','Qwen/Qwen2.5-72B-Instruct-Turbo']},
+  {id:'ollama',    name:'Ollama · local',       local:true, def:'http://127.0.0.1:11434', models:['llama3.1:8b','qwen2.5:7b','phi4','mistral-nemo']},
+  {id:'llamacpp',  name:'llama.cpp server · local', local:true, def:'http://127.0.0.1:8080', models:['local-model']},
+];
+const CHANNELS=[
+  {id:'telegram', name:'Telegram', tag:'bot api · easiest on a headless Pi', fields:[
+    {k:'bot_token', label:'Bot token', type:'secret', req:1, ph:'123456789:AAH…', hint:'Create with @BotFather → /newbot', al:['token']},
+    {k:'allow_from',label:'Allowed users', type:'chips', ph:'@username or 123456789', hint:'Who may talk to the agent', al:['allowed_users','allowlist']},
+    {k:'group_allow',label:'Allowed group ids', type:'chips', ph:'-1001234567890', al:['allowed_groups','groups']},
+    {k:'dm_policy', label:'DM policy', type:'select', options:['allowlist','open','deny'], def:'allowlist'},
+  ]},
+  {id:'whatsapp', name:'WhatsApp', tag:'bridged web session · pair once, runs headless', fields:[
+    {k:'allow_from',label:'Allowed numbers', type:'chips', req:1, ph:'+447700900123', hint:'E.164 format', al:['allowed_numbers','allowlist']},
+    {k:'dm_policy', label:'Policy', type:'select', options:['allowlist','open','deny'], def:'allowlist'},
+    {k:'session_dir',label:'Session directory', type:'text', ph:'~/.zeroclaw/whatsapp'},
+    {k:'send_receipts',label:'Read receipts', type:'toggle'},
+  ]},
+  {id:'discord', name:'Discord', tag:'guilds & channels', fields:[
+    {k:'bot_token', label:'Bot token', type:'secret', req:1, ph:'MTk…', hint:'Developer portal → Bot → Token', al:['token']},
+    {k:'guild_allow',label:'Allowed guild ids', type:'chips', al:['allowed_guilds','guilds']},
+    {k:'channel_allow',label:'Allowed channel ids', type:'chips', al:['allowed_channels','channels']},
+  ]},
+  {id:'slack', name:'Slack', tag:'socket mode', fields:[
+    {k:'bot_token', label:'Bot token (xoxb)', type:'secret', req:1, ph:'xoxb-…', al:['token']},
+    {k:'app_token', label:'App token (xapp)', type:'secret', ph:'xapp-…', hint:'Required for socket mode'},
+    {k:'channel_allow',label:'Allowed channels', type:'chips', ph:'C0123ABCD or #name', al:['allowed_channels','channels']},
+  ]},
+  {id:'signal', name:'Signal', tag:'via signal-cli', fields:[
+    {k:'account', label:'Account number', type:'text', req:1, ph:'+447700900123', hint:'The number the agent sends from', al:['phone_number','phoneNumber']},
+    {k:'allow_from',label:'Allowed senders', type:'chips', al:['allowed_contacts','allowlist']},
+    {k:'signal_cli_path',label:'signal-cli path', type:'text', ph:'/usr/bin/signal-cli'},
+  ]},
+  {id:'matrix', name:'Matrix', tag:'federated rooms', fields:[
+    {k:'homeserver_url',label:'Homeserver', type:'text', req:1, ph:'https://matrix.org', al:['homeserver','url']},
+    {k:'user_id', label:'User id', type:'text', req:1, ph:'@zeroclaw:matrix.org', al:['userId','user']},
+    {k:'access_token',label:'Access token', type:'secret', req:1, ph:'syt_…', hint:'Element → All settings → Help & about', al:['token']},
+    {k:'room_allow',label:'Allowed rooms', type:'chips', ph:'!roomId:server', al:['allowed_rooms','rooms']},
+  ]},
+  {id:'email', name:'Email', tag:'IMAP in · SMTP out', fields:[
+    {k:'imap_host',label:'IMAP host', type:'text', req:1, ph:'imap.gmail.com'},
+    {k:'imap_port',label:'IMAP port', type:'number', def:993},
+    {k:'imap_user',label:'IMAP user', type:'text', req:1},
+    {k:'imap_password',label:'IMAP password', type:'secret', req:1, hint:'Prefer an app-specific password'},
+    {k:'smtp_host',label:'SMTP host', type:'text', req:1, ph:'smtp.gmail.com'},
+    {k:'smtp_port',label:'SMTP port', type:'number', def:587},
+    {k:'smtp_user',label:'SMTP user', type:'text'},
+    {k:'smtp_password',label:'SMTP password', type:'secret'},
+    {k:'allow_from',label:'Allowed senders', type:'chips', hint:'Mail from anyone else is ignored'},
+  ]},
+  {id:'irc', name:'IRC', tag:'classic channels', fields:[
+    {k:'server',label:'Server', type:'text', req:1, ph:'irc.libera.chat'},
+    {k:'port',label:'Port', type:'number', def:6697},
+    {k:'tls',label:'Use TLS', type:'toggle', def:true},
+    {k:'nick',label:'Nick', type:'text', req:1, ph:'zeroclaw'},
+    {k:'password',label:'Nick password', type:'secret', hint:'NickServ password, if registered'},
+    {k:'channels',label:'Channels to join', type:'chips', ph:'#mychannel'},
+  ]},
+];
+const HA_FIELDS=[
+  {k:'base_url',label:'Instance URL', type:'text', req:1, ph:'http://homeassistant.local:8123', al:['url','instance_url']},
+  {k:'token',label:'Long-lived access token', type:'secret', req:1, ph:'ey…', hint:'HA → Profile → Security → Long-lived access tokens', al:['access_token','long_lived_token']},
+  {k:'verify_tls',label:'Verify TLS', type:'toggle', def:true},
+  {k:'conversation_agent',label:'Register as conversation agent', type:'toggle', hint:'Lets Assist voice pipelines route through the agent'},
+  {k:'expose_domains',label:'Exposed domains', type:'chips', hint:'Device domains the agent may touch'},
+  {k:'entity_allow',label:'Entity allow-list', type:'chips', ph:'light.desk_lamp'},
+  {k:'confirm_actions',label:'Confirm before actuating', type:'toggle', def:true},
+  {k:'notify_service',label:'Notify service', type:'text', ph:'notify.persistent_notifications'},
+];
+const AGENT_FIELDS=[
+  {k:'workspace',label:'Workspace', type:'text', ph:'~/.zeroclaw/workspace/main'},
+  {k:'model',label:'Model override', type:'text', list:'modelsDL', ph:'(inherit models.default)', hint:'Empty = use the default model'},
+  {k:'system_prompt',label:'System prompt', type:'textarea', ph:'You are …'},
+  {k:'max_turns',label:'Max turns / reply', type:'number', ph:'e.g. 25', hint:'Guardrail against runaway loops'},
+  {k:'tools_allow',label:'Tool allow-list', type:'chips', hint:'Empty = all tools available'},
+];
+const TOOL_BLOCKS=[
+  {id:'exec', name:'Shell execution', desc:'Let the agent run commands on the Pi. Keep the approval gate on unless you fully trust the setup.', fields:[
+    {k:'require_approval',label:'Require approval', type:'toggle', def:true},
+    {k:'allowlist',label:'Command allow-list', type:'chips', ph:'git, ls, systemctl', hint:'Empty = every command prompts you'},
+    {k:'timeout_sec',label:'Timeout (s)', type:'number', def:30},
+  ]},
+  {id:'web', name:'Web access', desc:'Fetch pages and search. Restrict domains if the agent runs unattended.', fields:[
+    {k:'allowed_domains',label:'Allowed domains', type:'chips', ph:'docs.python.org', hint:'Empty = whole web'},
+  ]},
+  {id:'cron', name:'Cron / heartbeat', desc:'Runs the agent on a timer without any message from you — useful for watchjobs.', fields:[
+    {k:'interval_minutes',label:'Interval (min)', type:'number', def:30},
+    {k:'prompt',label:'Heartbeat prompt', type:'textarea', ph:'Check for new RSS items and summarise anything important.'},
+  ]},
+];
+
+/* ════════════════════ 6 · section logic ════════════════════ */
+const sectionPath = (group,id) =>
+  group==='providers' ? 'models.providers.'+id :
+  group==='channels'  ? 'channels.'+id :
+  group==='tools'     ? (id==='cron'?'cron':'tools.'+id) :
+  group==='ha'        ? 'homeassistant' : id;
+const isOn = (group,id) => !!(ui.on[group]&&ui.on[group][id]);
+
+function ensureSkeleton(group,id){
+  const p=sectionPath(group,id); let o=getPath(cfg,p);
+  if(!o){ o={}; setPath(cfg,p,o); }
+  const feed=(fields)=>{ for(const f of fields){ if(o[f.k]===undefined){
+    o[f.k] = f.type==='chips' ? [] : f.type==='toggle' ? (f.def??false) :
+             f.type==='number' ? (f.def??'') : f.type==='select' ? (f.def??(f.options?f.options[0]:'')) : (f.def??''); } } };
+  if(group==='providers'){ const pr=PROVIDERS.find(x=>x.id===id); if(pr.local){ if(o.base_url===undefined)o.base_url=pr.def; } else { if(o.api_key===undefined&&!o.api_key_env)o.api_key=''; } return; }
+  if(group==='channels'){ const c=CHANNELS.find(x=>x.id===id); feed(c.fields); return; }
+  if(group==='ha'){ feed(HA_FIELDS); return; }
+  if(group==='tools'){ const b=TOOL_BLOCKS.find(x=>x.id===id); feed(b.fields); return; }
+}
+function toggleSection(group,id,on){
+  if(on){ ensureSkeleton(group,id); (ui.on[group]??={})[id]=true; }
+  else{ delPath(cfg,sectionPath(group,id)); if(ui.on[group])delete ui.on[group][id]; }
+  renderStep(); updatePreview(sectionPath(group,id)); updateBadges(); updateDatalist();
+}
+function setEnvMode(id,on){
+  ui.env[id]=on;
+  const base='models.providers.'+id;
+  if(on){ const envName=(PROVIDERS.find(p=>p.id===id)||{}).env||id.toUpperCase()+'_API_KEY'; setPath(cfg,base+'.api_key_env',getPath(cfg,base+'.api_key_env')||envName); delPath(cfg,base+'.api_key'); }
+  else{ delPath(cfg,base+'.api_key_env'); setPath(cfg,base+'.api_key',''); }
+  renderStep(); updatePreview(); updateBadges();
+}
+const provKeyed = id => { const p=getPath(cfg,'models.providers.'+id)||{}; return !!(p.api_key||p.api_key_env); };
+
+function seedFresh(){
+  cfg = {
+    default_agent:'main',
+    models:{ default:'' },
+    agents:{ main:{ workspace:'~/.zeroclaw/workspace', model:'', system_prompt:'' } },
+    gateway:{ host:'127.0.0.1', port:18789 },
+  };
+  ui={on:{},env:{},wantBackup:ui.wantBackup};
+  originalText=null; meta=null;
+}
+function applyAliases(doc){
+  const fix=(sec,fields)=>{ if(!sec)return; for(const f of fields){ if(!(f.al&&f.al.length))continue;
+    if(sec[f.k]===undefined){ for(const a of f.al){ if(sec[a]!==undefined){ sec[f.k]=sec[a]; delete sec[a]; break; } } } } };
+  const chs=doc.channels||{};
+  for(const c of CHANNELS)fix(chs[c.id],c.fields);
+  fix(doc.homeassistant,HA_FIELDS);
+  const prs=(doc.models&&doc.models.providers)||{};
+  for(const pr of PROVIDERS)fix(prs[pr.id], pr.local?[{k:'base_url',al:['url','endpoint']}] : [{k:'api_key',al:['key','token']},{k:'base_url',al:['url','endpoint']}]);
+}
+function adoptConfig(text,sourceLabel){
+  let doc; try{ doc=parseTOML(text); }catch(err){ toast('Parse failed: '+err.message,'err'); return false; }
+  doc=normalizeCamel(doc); applyAliases(doc);
+  cfg=doc; originalText=text;
+  meta={source:sourceLabel, at:new Date(), size:text.length};
+  // derive switches from presence
+  ui.on={}; ui.env={};
+  for(const pr of PROVIDERS){ const p=getPath(cfg,'models.providers.'+pr.id); if(p){ (ui.on.providers??={})[pr.id]=true; if(p.api_key_env)ui.env[pr.id]=true; } }
+  const chs=cfg.channels||{}; for(const c of CHANNELS)if(chs[c.id])(ui.on.channels??={})[c.id]=true;
+  if(cfg.homeassistant)ui.on.ha=true;
+  if(cfg.tools&&cfg.tools.exec)(ui.on.tools??={}).exec=true;
+  if(cfg.tools&&cfg.tools.web)(ui.on.tools??={}).web=true;
+  if(cfg.cron)(ui.on.tools??={}).cron=true;
+  renderAll(); toast('Config loaded — '+countKeys(doc)+' values parsed','ok');
+  return true;
+}
+
+/* ════════════════════ 7 · shared control renderers ════════════════════ */
+let uidSeq=0;
+function controlHTML(f,basePath){
+  const p=basePath+'.'+f.k; const v=getPath(cfg,p);
+  switch(f.type){
+    case 'text': return `<input class="in" data-bind="${p}" data-type="text" value="${esc(v??'')}" placeholder="${esc(f.ph||'')}" ${f.list?`list="${f.list}"`:''} spellcheck="false" autocomplete="off">`;
+    case 'secret':{ const uid='s'+(++uidSeq);
+      return `<div class="secret"><input type="password" class="in" id="${uid}" data-bind="${p}" data-type="secret" value="${esc(v??'')}" placeholder="${esc(f.ph||'')}" spellcheck="false" autocomplete="off"><button type="button" class="ib" data-action="eye" data-eye="${uid}" title="Show / hide">${ic('eye',15)}</button></div>`; }
+    case 'number': return `<input class="in" data-bind="${p}" data-type="number" value="${esc(v??'')}" placeholder="${esc(f.ph||'')}" inputmode="numeric" style="max-width:150px">`;
+    case 'textarea': return `<textarea class="in" rows="3" data-bind="${p}" data-type="textarea" placeholder="${esc(f.ph||'')}">${esc(v??'')}</textarea>`;
+    case 'select': return `<select class="in" data-bind="${p}" data-type="select" style="max-width:240px">${(f.options||[]).map(o=>`<option value="${o}" ${v===o?'selected':''}>${o}</option>`).join('')}</select>`;
+    case 'toggle': return `<label class="sw"><input type="checkbox" data-bind="${p}" data-type="toggle" ${v?'checked':''}><i></i></label>`;
+    case 'chips':{ const arr=Array.isArray(v)?v:[];
+      return `<div class="chips" data-chips="${p}">${arr.map((c,i)=>`<span class="chipx">${esc(c)}<button type="button" data-action="chip-x" data-path="${p}" data-i="${i}" title="Remove">${ic('x',10)}</button></span>`).join('')}<input class="chin" data-chips-in="${p}" placeholder="${esc(f.ph||'add…')}"><button type="button" class="chipadd" data-action="chip-add" data-path="${p}" title="Add">${ic('plus',12)}</button></div>`; }
+  } return '';
+}
+function fieldHTML(f,basePath){
+  return `<div class="frow"><label class="flab">${esc(f.label)}${f.req?'<i class="req">*</i>':''}</label><div class="fctl">${controlHTML(f,basePath)}${f.hint?`<div class="fhint">${esc(f.hint)}</div>`:''}</div></div>`;
+}
+function addChip(path,input){
+  const val=input.value.trim(); if(!val)return;
+  const arr=getPath(cfg,path); if(!Array.isArray(arr))setPath(cfg,path,[]);
+  if(!arr.includes(val))arr.push(val);
+  input.value='';
+  refreshChips(path); updatePreview(); updateBadges();
+}
+function refreshChips(path){
+  const box=document.querySelector(`[data-chips="${CSS.escape(path)}"]`); if(!box)return;
+  const arr=Array.isArray(getPath(cfg,path))?getPath(cfg,path):[];
+  const input=box.querySelector('.chin'); const keep=input?input.value:'';
+  box.innerHTML=arr.map((c,i)=>`<span class="chipx">${esc(c)}<button type="button" data-action="chip-x" data-path="${esc(path)}" data-i="${i}" title="Remove">${ic('x',10)}</button></span>`).join('')
+    +`<input class="chin" data-chips-in="${esc(path)}" placeholder="add…">${'<button type="button" class="chipadd" data-action="chip-add" data-path="'+esc(path)+'" title="Add">'+ic('plus',12)+'</button>'}`;
+  const ni=box.querySelector('.chin'); if(ni){ni.value=keep;ni.focus();}
+}
+
+/* ════════════════════ 8 · step renderers ════════════════════ */
+function blockHead(title,tag,desc){
+  return `<div class="blkt"><span class="tick"></span><h3>${title}</h3>${tag?`<span class="tag mono">${tag}</span>`:''}</div>${desc?`<div class="blkd">${desc}</div>`:''}`;
+}
+function renderStart(){
+  const has=!!meta;
+  const tables=lastTopKeys.length?lastTopKeys:Object.keys(cfg);
+  const backupOn=ui.wantBackup;
+  return `
+  <div class="kick">Step 01 — Start &amp; backup</div>
+  <h2>Bring your current config — or start clean</h2>
+  <p class="lede">This console parses your existing <span class="mono">config.toml</span>, lets you edit every subsystem with visual inputs, and on export always writes a timestamped backup of the original next to the new file. Everything runs locally in this browser tab — keys and tokens never leave the Pi.</p>
+
+  <div class="blk">
+    ${blockHead('Load your existing config','source of record')}
+    <div class="src">${ic('folder',20)}<div><b>Link the ~/.zeroclaw folder</b><small>Best option in the Pi\u2019s Chromium: reads config.toml directly and on export writes the backup + new file right back into the folder.</small></div><button class="btn small" data-action="dir">Select folder</button></div>
+    <div class="src">${ic('upload',20)}<div><b>Open a config.toml file</b><small>Reads the file as text; export becomes two downloads.</small></div><button class="btn small" data-action="filepick">Choose file</button></div>
+    <div class="src">${ic('term',20)}<div><b>Paste it over SSH</b><small>Run <span class="mono">cat ~/.zeroclaw/config.toml</span> on the Pi, copy the output, paste here.</small></div><button class="btn small" data-action="paste">Paste TOML</button></div>
+  </div>
+
+  <div class="blk">
+    ${blockHead('Source on record', has?esc(meta.source):'none yet')}
+    ${has?`
+      <p style="font-size:13.5px;color:var(--mut)">Loaded ${esc(meta.source)} · ${esc(meta.at.toLocaleTimeString())} · ${meta.size.toLocaleString()} bytes · ${countKeys(cfg)} values parsed. This exact text is what gets backed up.</p>
+      <div class="tchips">${tables.map(t=>`<span>${esc(t)}</span>`).join('')||'<span>empty file</span>'}</div>
+      <div style="margin-top:14px"><button class="btn small danger" data-action="clear-source">${ic('trash',13)} Forget source</button></div>`
+    :`<p style="font-size:13.5px;color:var(--mut)">No original loaded yet. You can still configure everything from scratch — the backup step will simply be skipped on export.</p>`}
+  </div>
+
+  <div class="blk">
+    ${blockHead('Backup policy','automatic')}
+    <p style="font-size:13.5px;color:var(--mut)">On export, the original file is preserved as:</p>
+    <div class="bignum" id="startStamp">config.backup.${stamp()}.toml</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-top:10px">
+      <label class="sw"><input type="checkbox" id="wantBackup" ${backupOn?'checked':''}><i></i></label>
+      <span style="font-size:13px">Write the backup on export</span>
+    </div>
+    <p style="font-size:12.5px;color:var(--faint);margin-top:10px">With a linked folder the backup is written into the same directory. Without one, you get two downloads: the backup and the new config.</p>
+  </div>
+
+  <div class="blk">
+    ${blockHead('Danger zone','')}
+    <div class="src" style="border-top:none;padding-top:2px">${ic('zap',20)}<div><b>Discard everything &amp; start from the fresh template</b><small>Resets the working document to sensible Raspberry Pi defaults. Your linked folder stays connected.</small></div><button class="btn small danger" data-action="fresh">Start fresh</button></div>
+  </div>`;
+}
+function renderIdentity(){
+  const dlP=PROVIDERS.filter(p=>isOn('providers',p.id)&&(!p.local&&provKeyed(p.id)||p.local));
+  return `
+  <div class="kick">Step 02 — Identity &amp; model</div>
+  <h2>Who the agent is, and which brain it uses</h2>
+  <p class="lede">These keys sit at the top of the file. The default model is written as <span class="mono">provider/model</span> — pick anything the providers in step 03 can serve.</p>
+  <div class="blk">
+    ${blockHead('Defaults','')}
+    <div class="frow"><label class="flab">Default agent</label><div class="fctl"><input class="in" data-bind="default_agent" data-type="text" value="${esc(cfg.default_agent??'main')}" style="max-width:220px"><div class="fhint">Must match an <span class="mono">[agents.*]</span> table (step 04).</div></div></div>
+    <div class="frow"><label class="flab">Default model</label><div class="fctl"><input class="in" data-bind="models.default" data-type="text" list="modelsDL" value="${esc(getPath(cfg,'models.default')??'')}" placeholder="anthropic/claude-sonnet-4-5" style="max-width:360px"><div class="fhint">Suggestions below come from the providers you switched on — type anything, including local models.</div></div></div>
+    <div class="frow"><label class="flab">Fallback models</label><div class="fctl">${controlHTML({k:'fallbacks',type:'chips',ph:'provider/model'},'models')}<div class="fhint">Tried in order when the default is unreachable.</div></div></div>
+  </div>
+  <div class="blk">
+    ${blockHead('Gateway','local dashboard + api')}
+    <div class="frow"><label class="flab">Bind host</label><div class="fctl"><input class="in" data-bind="gateway.host" data-type="text" value="${esc(getPath(cfg,'gateway.host')??'127.0.0.1')}" style="max-width:260px"><div class="fhint">Keep <span class="mono">127.0.0.1</span> unless other devices on your LAN need the dashboard.</div></div></div>
+    <div class="frow"><label class="flab">Port</label><div class="fctl"><input class="in" data-bind="gateway.port" data-type="number" value="${esc(getPath(cfg,'gateway.port')??18789)}" style="max-width:150px"></div></div>
+  </div>
+  <datalist id="modelsDL">${dlP.map(p=>p.models.map(m=>`<option value="${p.id}/${m}">`).join('')).join('')}<datalist>`;
+}
+function renderProviders(){
+  const rows=PROVIDERS.map(pr=>{
+    const on=isOn('providers',pr.id);
+    const keyed=provKeyed(pr.id);
+    const dot= !on?'':(pr.local||keyed?'ok':'warn');
+    const p='models.providers.'+pr.id;
+    const useEnv=!!ui.env[pr.id];
+    const body= pr.local
+      ? `<div class="frow"><label class="flab">Server URL</label><div class="fctl"><input class="in" data-bind="${p}.base_url" data-type="text" value="${esc(getPath(cfg,p+'.base_url')??pr.def)}"><div class="fhint">Runs on the Pi itself — no key needed. Point it at another box on the LAN if you like.</div></div></div>`
+      : `<div class="frow"><label class="flab">API key</label><div class="fctl">
+            ${useEnv
+              ? `<input class="in" data-bind="${p}.api_key_env" data-type="text" value="${esc(getPath(cfg,p+'.api_key_env')??pr.env)}" style="max-width:340px"><div class="fhint">Key is read from this environment variable at runtime — recommended. Export it in <span class="mono">~/.zeroclaw/.env</span> or your service unit.</div>`
+              : `<input type="password" class="in" data-bind="${p}.api_key" data-type="secret" value="${esc(getPath(cfg,p+'.api_key')??'')}" placeholder="${esc(pr.pre||'')}…" spellcheck="false" autocomplete="off" style="max-width:420px">`}
+            <div style="display:flex;align-items:center;gap:9px;margin-top:9px">
+              <label class="sw"><input type="checkbox" data-env="${pr.id}" ${useEnv?'checked':''}><i></i></label>
+              <span style="font-size:12px;color:var(--mut)">Use environment variable (${pr.env}) instead of a literal key</span>
+            </div>
+          </div></div>
+         <div class="frow"><label class="flab">Base URL override</label><div class="fctl"><input class="in" data-bind="${p}.base_url" data-type="text" value="${esc(getPath(cfg,p+'.base_url')??'')}" placeholder="(default endpoint)" style="max-width:420px"></div></div>`
+      + `<div class="mchips"><span class="cap">known ids —</span>${pr.models.map(m=>`<span>${pr.id}/${m}</span>`).join('')}</div>`;
+    return `<div class="led ${on?'on':''} ${on?'open':''}">
+      <div class="ledrow" data-action="led" data-led="providers/${pr.id}">
+        <label class="sw" onclick="event.stopPropagation()"><input type="checkbox" data-on="providers/${pr.id}" ${on?'checked':''}><i></i></label>
+        <div class="lname">${pr.name}<small>${pr.local?'local · no key':pr.env}</small></div>
+        <div class="lstat"><span class="dot ${dot}"></span><span class="ledchev">${ic('chev',16)}</span></div>
+      </div>
+      <div class="ledbody">${body}</div>
+    </div>`;
+  }).join('');
+  return `
+  <div class="kick">Step 03 — Providers &amp; keys</div>
+  <h2>The key cabinet</h2>
+  <p class="lede">Switch on every provider you want available, then paste keys or — better — point at environment variables so secrets stay out of the file. Local runtimes (Ollama, llama.cpp) are ideal for a Pi: no key, no cloud, no cost.</p>
+  <div class="leds">${rows}</div>
+  <div class="note">${ic('alert',15)}<span>Keys typed as plain text will live in <span class="mono">config.toml</span> on the Pi\u2019s SD card. Env-var mode keeps the file safe to back up and share.</span></div>`;
+}
+function agentBlock(id,isMain){
+  const a=(cfg.agents||{})[id]||{};
+  const base='agents.'+id;
+  return `<div class="agent" data-agent="${esc(id)}">
+    <div class="ahead">
+      ${isMain?`<span class="mono" style="font-weight:600;font-size:13px">${esc(id)}</span><span class="mono" style="font-size:10px;color:var(--ok);letter-spacing:.1em">MAIN</span>`
+      :`<input class="an" value="${esc(id)}" data-agent-rename="${esc(id)}" spellcheck="false" title="Agent id — referenced by routes and teams">
+        <button type="button" class="ib" data-action="agent-del" data-id="${esc(id)}" title="Remove agent" style="margin-left:auto">${ic('trash',14)}</button>`}
+      <span class="arole mono">${esc(a.model||(isMain?'default model':'sub-agent'))}</span>
+    </div>
+    <div class="abody">
+      ${(!isMain?`<div class="frow"><label class="flab">Role note</label><div class="fctl"><input class="in" data-bind="${base}.role" data-type="text" value="${esc(a.role??'')}" placeholder="e.g. researcher / coder / ops" style="max-width:340px"></div></div>`:'')}
+      ${AGENT_FIELDS.map(f=>fieldHTML(f,base)).join('')}
+    </div>
+  </div>`;
+}
+function renderAgents(){
+  const ids=agentIds();
+  const main=ids.includes(cfg.default_agent)?cfg.default_agent:(ids[0]||'main');
+  const subs=ids.filter(x=>x!==main);
+  return `
+  <div class="kick">Step 04 — Agents &amp; sub-agents</div>
+  <h2>Personas and their workspaces</h2>
+  <p class="lede">The main agent answers by default. Every extra table under <span class="mono">[agents.*]</span> is a sub-agent — a separate workspace + prompt the orchestrator (step 05) can route to or run in a team. Give each one a narrow job; that\u2019s where multi-agent setups start paying off on a Pi.</p>
+  ${agentBlock(main,true)}
+  ${subs.map(id=>agentBlock(id,false)).join('')}
+  <div class="blk" style="padding:14px 18px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input class="in" id="newAgentName" placeholder="new-sub-agent-name" style="max-width:240px" spellcheck="false">
+      <button class="btn small primary" data-action="agent-add">${ic('plus',13)} Add sub-agent</button>
+      <span style="font-size:12px;color:var(--faint)">Gets its own workspace folder and empty prompt — fill those in above.</span>
+    </div>
+  </div>`;
+}
+function routeRow(r,i){
+  const ids=agentIds(); const opts=ids.includes(r.agent)?ids:[...ids,r.agent].filter(Boolean);
+  return `<div class="route">
+    <input class="in match" data-bind="orchestration.routes.${i}.match" data-type="text" value="${esc(r.match??'')}" placeholder="keyword or regex, e.g. deploy|ship">
+    <span class="mono" style="color:var(--faint);font-size:11px">→</span>
+    <select class="in" data-bind="orchestration.routes.${i}.agent" data-type="select" style="max-width:200px">${opts.map(a=>`<option ${r.agent===a?'selected':''}>${esc(a)}</option>`).join('')}</select>
+    <button type="button" class="ib" data-action="route-del" data-i="${i}" title="Delete route">${ic('x',13)}</button>
+  </div>`;
+}
+function renderOrchestra(){
+  const mode=getPath(cfg,'orchestration.mode')||'single';
+  const routes=(getPath(cfg,'orchestration.routes'))||[];
+  const team=getPath(cfg,'orchestration.team')||{};
+  const ids=agentIds();
+  const workers=Array.isArray(team.workers)?team.workers:[];
+  return `
+  <div class="kick">Step 05 — Orchestration</div>
+  <h2>Solo, router, or team</h2>
+  <p class="lede"><b>Router</b> matches keywords in a message and hands it to a specialist. <b>Team</b> runs a lead agent that delegates to workers — powerful but chatty, so on a Pi keep the worker count small.</p>
+  <div class="blk">
+    ${blockHead('Mode','')}
+    <div class="frow"><label class="flab">Strategy</label><div class="fctl">
+      <select class="in" data-mode="1" style="max-width:240px">
+        <option value="single" ${mode==='single'?'selected':''}>single — one agent does everything</option>
+        <option value="router" ${mode==='router'?'selected':''}>router — keyword dispatch</option>
+        <option value="team" ${mode==='team'?'selected':''}>team — lead + workers</option>
+      </select></div></div>
+  </div>
+  ${mode==='router'?`
+  <div class="blk">
+    ${blockHead('Routes','first match wins')}
+    ${routes.length?routes.map((r,i)=>routeRow(r,i)).join(''):'<p style="font-size:13px;color:var(--mut);padding:6px 0">No routes yet.</p>'}
+    <div style="margin-top:12px"><button class="btn small" data-action="route-add">${ic('plus',13)} Add route</button></div>
+  </div>`:''}
+  ${mode==='team'?`
+  <div class="blk">
+    ${blockHead('Team','')}
+    <div class="frow"><label class="flab">Lead agent</label><div class="fctl"><select class="in" data-bind="orchestration.team.lead" data-type="select" style="max-width:240px">${(ids.includes(team.lead)||!team.lead?ids:[team.lead,...ids]).map(a=>`<option ${team.lead===a?'selected':''}>${esc(a)}</option>`).join('')}</select></div></div>
+    <div class="frow"><label class="flab">Workers</label><div class="fctl">
+      ${ids.map(a=>`<label class="wchk"><input type="checkbox" data-worker="${esc(a)}" ${workers.includes(a)?'checked':''}> <span class="mono" style="font-size:12.5px;color:var(--ink)">agents.${esc(a)}</span><span class="mono">${esc(getPath(cfg,'agents.'+a+'.model')||'default model')}</span></label>`).join('')||'<p style="font-size:13px;color:var(--mut)">Define agents in step 04 first.</p>'}
+    </div></div>
+    <div class="frow"><label class="flab">Share context</label><div class="fctl"><label class="sw"><input type="checkbox" data-bind="orchestration.team.share_context" data-type="toggle" ${team.share_context?'checked':''}><i></i></label><div class="fhint">Workers see the conversation history — more coherent, more RAM.</div></div></div>
+    <div class="frow"><label class="flab">Max parallel</label><div class="fctl"><input class="in" data-bind="orchestration.team.max_parallel" data-type="number" value="${esc(team.max_parallel??2)}" style="max-width:130px"><div class="fhint">The Pi 4 has 4 GB on most builds — 2 is a sensible ceiling.</div></div></div>
+  </div>`:''}`;
+}
+function renderChannels(){
+  const rows=CHANNELS.map(ch=>{
+    const on=isOn('channels',ch.id);
+    const c=(cfg.channels||{})[ch.id]||{};
+    const missing=(ch.fields.filter(f=>f.req).some(f=>{const v=c[f.k];return v===''||v==null||(Array.isArray(v)&&!v.length)}));
+    const dot=!on?'':(missing?'warn':'ok');
+    return `<div class="led ${on?'on open':''}">
+      <div class="ledrow" data-action="led" data-led="channels/${ch.id}">
+        <label class="sw" onclick="event.stopPropagation()"><input type="checkbox" data-on="channels/${ch.id}" ${on?'checked':''}><i></i></label>
+        <div class="lname">${ch.name}<small>${ch.tag}</small></div>
+        <div class="lstat"><span class="dot ${dot}"></span><span class="ledchev">${ic('chev',16)}</span></div>
+      </div>
+      <div class="ledbody">${ch.fields.map(f=>fieldHTML(f,'channels.'+ch.id)).join('')}</div>
+    </div>`;
+  }).join('');
+  const n=Object.values(ui.on.channels||{}).filter(Boolean).length;
+  return `
+  <div class="kick">Step 06 — Channels</div>
+  <h2>Where humans reach the agent</h2>
+  <p class="lede">${n} channel${n===1?'':'s'} currently wired. Each one becomes a <span class="mono">[channels.*]</span> table. Telegram is the lightest on a Pi; WhatsApp runs through a paired web bridge; keep allow-lists tight — these are doors into a machine that can execute commands.</p>
+  <div class="leds">${rows}</div>`;
+}
+function renderHA(){
+  const on=!!ui.on.ha;
+  return `
+  <div class="kick">Step 07 — Home Assistant</div>
+  <h2>Give the agent hands in the house</h2>
+  <p class="lede">One long-lived token turns zeroclaw into an Assist conversation agent: dim lights by chat, trigger scenes from a cron heartbeat, get notified when autonomous runs finish.</p>
+  <div class="blk ${on?'':'off'}">
+    <div class="onoff"><label class="sw"><input type="checkbox" data-on="ha" ${on?'checked':''}><i></i></label><span class="onlab">homeassistant integration ${on?'· on':'· off'}</span></div>
+    ${HA_FIELDS.map(f=>fieldHTML(f,'homeassistant')).join('')}
+    <div class="note">${ic('info',15)}<span>Create the token in Home Assistant under your profile → Security. If HA runs on the same Pi, use <span class="mono">http://localhost:8123</span> for zero network latency.</span></div>
+  </div>`;
+}
+function renderTools(){
+  const always=[
+    {t:'File access',d:'Where the agent may read and write. Keep it inside the workspace.',f:[]},
+  ];
+  return `
+  <div class="kick">Step 08 — Tools &amp; safety</div>
+  <h2>What the agent may do on this machine</h2>
+  <p class="lede">Every grant here is written to <span class="mono">[tools.*]</span>, <span class="mono">[security]</span> and friends. On a Raspberry Pi exposed to channels like Telegram, the approval gate is your best friend.</p>
+  ${TOOL_BLOCKS.map(b=>{
+    const on=isOn('tools',b.id);
+    return `<div class="blk ${on?'':'off'}">
+      <div class="onoff"><label class="sw"><input type="checkbox" data-on="tools/${b.id}" ${on?'checked':''}><i></i></label><span class="onlab">tools.${b.id} ${on?'· on':'· off'}</span></div>
+      ${blockHead(b.name,'',b.desc)}
+      ${b.fields.map(f=>fieldHTML(f,sectionPath('tools',b.id))).join('')}
+    </div>`;
+  }).join('')}
+  <div class="blk">
+    ${blockHead('File access','always on')}
+    <div class="frow"><label class="flab">Files root</label><div class="fctl"><input class="in" data-bind="tools.files.root" data-type="text" value="${esc(getPath(cfg,'tools.files.root')??'~/.zeroclaw/workspace')}" style="max-width:420px"></div></div>
+  </div>
+  <div class="blk">
+    ${blockHead('Memory','always on')}
+    <div class="frow"><label class="flab">Memory path</label><div class="fctl"><input class="in" data-bind="memory.path" data-type="text" value="${esc(getPath(cfg,'memory.path')??'~/.zeroclaw/memory')}" style="max-width:420px"><div class="fhint">Long-term notes the agent keeps between sessions. Lives on the SD card — back it up with the config.</div></div></div>
+  </div>
+  <div class="blk">
+    ${blockHead('Guard rails','[security]')}
+    <div class="frow"><label class="flab">Approval mode</label><div class="fctl"><select class="in" data-bind="security.approval_mode" data-type="select" style="max-width:240px">${['confirm','always','deny'].map(o=>`<option ${getPath(cfg,'security.approval_mode')===o?'selected':''}>${o}</option>`).join('')}</select><div class="fhint"><b>confirm</b> asks you before risky actions · <b>always</b> asks for everything · <b>deny</b> blocks risky actions outright.</div></div></div>
+    <div class="frow"><label class="flab">Sandbox</label><div class="fctl"><label class="sw"><input type="checkbox" data-bind="security.sandbox" data-type="toggle" ${getPath(cfg,'security.sandbox')!==false?'checked':''}><i></i></label></div></div>
+    <div class="frow"><label class="flab">Audit log</label><div class="fctl"><label class="sw"><input type="checkbox" data-bind="security.audit_log" data-type="toggle" ${getPath(cfg,'security.audit_log')!==false?'checked':''}><i></i></label><div class="fhint">Append every tool call to a log file — invaluable after a surprise.</div></div></div>
+  </div>`;
+}
+function warningRow(w){
+  const map=['','Identity & Model','Providers & Keys','Agents','Orchestration','Channels','Home Assistant','Tools & Safety'];
+  return `<div class="warnrow ${w.lvl}" data-action="jump" data-step="${w.step}">
+    ${ic(w.lvl==='err'?'alert':w.lvl==='warn'?'alert':'check',15)}
+    <p>${esc(w.msg)}<span class="stref">step 0${w.step} · ${map[w.step]||''}</span></p>
+  </div>`;
+}
+function renderReview(){
+  const W=computeWarnings();
+  const errs=W.filter(w=>w.lvl==='error').length, warns=W.filter(w=>w.lvl==='warn').length;
+  const nAgents=agentIds().length;
+  const nCh=Object.values(ui.on.channels||{}).filter(Boolean).length;
+  const nProv=PROVIDERS.filter(p=>isOn('providers',p.id)&&provKeyed(p.id)).length;
+  const bname='config.backup.'+stamp()+'.toml';
+  return `
+  <div class="kick">Step 09 — Review &amp; export</div>
+  <h2>Ship it to the Pi</h2>
+  <p class="lede">Final checks, then replace the config. The backup of your current file happens first, automatically, with the timestamp below.</p>
+  <div class="sumchips">
+    <span>${ic('bot',14)} ${nAgents} agent${nAgents===1?'':'s'}</span>
+    <span>${ic('send',14)} ${nCh} channel${nCh===1?'':'s'} on</span>
+    <span>${ic('key',14)} ${nProv} provider${nProv===1?'':'s'} keyed</span>
+    <span style="${errs?'border-color:var(--acc);color:var(--acc)':warns?'border-color:#C08A00;color:#8F6400':'color:var(--ok)'}">${ic(errs?'alert':warns?'alert':'check',14)} ${errs} error${errs===1?'':'s'} · ${warns} warning${warns===1?'':'s'}</span>
+  </div>
+  ${W.length?`<div class="blk">${blockHead('Findings','click to jump')}${W.map(warningRow).join('')}</div>`:`<div class="blk"><div class="warnrow info">${ic('check',15)}<p>All checks pass — clean config.</p></div></div>`}
+
+  <div class="blk">
+    ${blockHead('Export','the safe replace ritual')}
+    <div class="frow"><label class="flab">Backup file</label><div class="fctl"><span class="bignum" id="revBackup" style="font-size:14px">${originalText!=null&&ui.wantBackup?esc(bname):'— skipped (no original on record)'}</span></div></div>
+    <div class="frow"><label class="flab">New config</label><div class="fctl"><span class="mono" style="font-size:12.5px" id="revStats">${lastGen.split('\n').length} lines · ${new Blob([lastGen]).size} bytes</span></div></div>
+    <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:14px">
+      <button class="btn primary" data-action="export-folder" ${dirHandle?'':'disabled'}>${ic('save',15)} Write into linked folder</button>
+      <button class="btn" data-action="export-dl">${ic('download',15)} Download backup + config</button>
+      <button class="btn ghost" data-action="copy-toml">${ic('copy',15)} Copy TOML</button>
+    </div>
+    ${dirHandle?'':`<p style="font-size:12px;color:var(--faint);margin-top:10px">Tip: link the <span class="mono">~/.zeroclaw</span> folder (step 01) and this writes both files in place — no download shuffling.</p>`}
+  </div>
+
+  <div class="blk">
+    ${blockHead('Deploy on the Pi','shell')}
+    <div class="shell" id="shellBox"><span class="c"># 1 · stop the agent so nothing rewrites the file mid-flight</span>
+sudo systemctl stop zeroclaw        <span class="c"># or: pkill -f zeroclaw</span>
+
+<span class="c"># 2 · install the generated config (skip if you used "linked folder")</span>
+cp ~/Downloads/config.toml ~/.zeroclaw/config.toml
+
+<span class="c"># 3 · validate, restart, watch</span>
+zeroclaw doctor
+sudo systemctl start zeroclaw       <span class="c"># or: zeroclaw gateway start</span>
+journalctl -u zeroclaw -f</div>
+    <div style="margin-top:12px"><button class="btn small ghost" data-action="copy-shell">${ic('copy',13)} Copy commands</button></div>
+  </div>
+
+  <details class="raw">
+    <summary>${ic('braces',15)} Advanced — raw TOML (round-trip editor)</summary>
+    <div class="rbody">
+      <p style="font-size:12.5px;color:var(--mut);margin:6px 0 12px">Everything the forms produce — plus any keys zeroclaw adds in future versions that this console doesn\u2019t know yet. Edit freely and apply; parsing is the same engine as the loader.</p>
+      <textarea class="rawta" id="rawTa" spellcheck="false">${esc(lastGen||generate())}</textarea>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn small primary" data-action="apply-raw">${ic('check',13)} Apply raw</button>
+        <button class="btn small ghost" data-action="reset-raw">Revert</button>
+      </div>
+    </div>
+  </details>
+  <p class="foot">zeroclaw\u2019s schema evolves fast — every key written here is plain TOML, so if <span class="mono">zeroclaw doctor</span> flags a name that changed upstream, fix it right in the raw editor above. Original comments are not preserved: the generator rewrites the file in canonical order. Comments in the source you loaded are backed up untouched.</p>`;
+}
+
+const STEPS=[
+  {t:'Start & Backup',   r:renderStart},
+  {t:'Identity & Model', r:renderIdentity},
+  {t:'Providers & Keys', r:renderProviders},
+  {t:'Agents',           r:renderAgents},
+  {t:'Orchestration',    r:renderOrchestra},
+  {t:'Channels',         r:renderChannels},
+  {t:'Home Assistant',   r:renderHA},
+  {t:'Tools & Safety',   r:renderTools},
+  {t:'Review & Export',  r:renderReview},
+];
+
+/* ════════════════════ 9 · warnings / rail / preview ════════════════════ */
+function computeWarnings(){
+  const W=[]; const A=(step,lvl,msg)=>W.push({step,lvl,msg});
+  const onP=id=>isOn('providers',id);
+  const dm=(cfg.models&&cfg.models.default)||'';
+  if(!dm)A(2,'warn','No default model set — the agent has nothing to run on.');
+  else{ const pre=dm.split('/')[0]; const pr=PROVIDERS.find(p=>p.id===pre);
+    if(pr&&!onP(pre))A(2,'warn','Default model uses '+pr.name+', but that provider is switched off.');
+    else if(pr&&!pr.local&&!provKeyed(pre))A(2,'warn',pr.name+' is on but has no API key or env var.'); }
+  for(const pr of PROVIDERS)if(onP(pr.id)&&!pr.local&&!provKeyed(pr.id))A(3,'warn',pr.name+': enabled without a key (literal or env).');
+  const ids=agentIds();
+  const da=cfg.default_agent||'main';
+  if(!ids.length)A(4,'error','No agents defined.');
+  else if(!ids.includes(da))A(4,'error','default_agent "'+da+'" does not match any [agents.*] table.');
+  for(const id of ids){ const a=cfg.agents[id]||{};
+    if(!a.workspace)A(4,'warn','Agent "'+id+'" has no workspace path.');
+    if(!a.system_prompt)A(4,'info','Agent "'+id+'" has an empty system prompt.'); }
+  const orc=cfg.orchestration||{};
+  if(orc.mode==='router'){ const rs=orc.routes||[];
+    if(!rs.length)A(5,'warn','Router mode is on but has no routes.');
+    rs.forEach((r,i)=>{ if(!r.match)A(5,'warn','Route '+(i+1)+': empty match pattern.');
+      if(!r.agent||!ids.includes(r.agent))A(5,'error','Route "'+(r.match||i+1)+'" points at unknown agent "'+(r.agent||'')+'".'); }); }
+  if(orc.mode==='team'){ const t=orc.team||{};
+    if(!t.lead||!ids.includes(t.lead))A(5,'warn','Team lead is unset or unknown.');
+    if(!(t.workers||[]).length)A(5,'warn','Team has no workers.');
+    (t.workers||[]).forEach(w=>{ if(!ids.includes(w))A(5,'error','Team worker "'+w+'" is not a defined agent.'); }); }
+  for(const ch of CHANNELS){ if(!isOn('channels',ch.id))continue;
+    const c=(cfg.channels||{})[ch.id]||{};
+    for(const f of ch.fields)if(f.req){ const v=c[f.k];
+      if(v===''||v==null||(Array.isArray(v)&&!v.length))A(6,'warn',ch.name+': required field "'+f.label+'" is empty.'); }
+    if((c.dm_policy||'allowlist')==='allowlist'&&Array.isArray(c.allow_from)&&!c.allow_from.length)
+      A(6,'info',ch.name+': allowlist policy with an empty list — nobody can talk yet.'); }
+  if(ui.on.ha){ const h=cfg.homeassistant||{};
+    if(!h.base_url)A(7,'warn','Home Assistant: base URL missing.');
+    if(!h.token)A(7,'warn','Home Assistant: access token missing.'); }
+  if(isOn('tools','exec')){ const x=(cfg.tools&&cfg.tools.exec)||{};
+    if(x.require_approval===false)A(8,'warn','Shell execution without approval is risky on a home network.');
+    if(Array.isArray(x.allowlist)&&!x.allowlist.length)A(8,'info','Exec has no command allow-list — every command will prompt.'); }
+  let plain=0; for(const pr of PROVIDERS)if(onP(pr.id)&&!pr.local&&((getPath(cfg,'models.providers.'+pr.id)||{}).api_key))plain++;
+  if(plain)A(3,'info',plain+' API key'+(plain>1?'s':'')+' stored as plain text — consider env-var mode.');
+  return W;
+}
+function renderRail(){
+  const W=computeWarnings();
+  $('#rail').innerHTML=STEPS.map((s,i)=>{
+    const lv=W.filter(w=>w.step===i);
+    const cls=lv.some(w=>w.lvl==='error')?'err':lv.some(w=>w.lvl==='warn')?'warn':lv.length?'ok':i===0&&meta?'ok':'';
+    return `<div class="rstep ${i===cur?'active':''}" data-action="goto" data-step="${i}">
+      <span class="rnum">0${i+1}</span><span class="rt">${s.t}</span><span class="rdot ${cls}"></span></div>`;
+  }).join('')+`<div id="railFoot">Backup <b class="mono">config.backup.<br>${stamp()}.toml</b><br>${meta?esc(meta.source):'no source loaded'}</div>`;
+}
+function updateBadges(){ renderRail(); }
+function updateDatalist(){
+  const dl=$('#modelsDL');
+  const items=[];
+  for(const p of PROVIDERS)if(isOn('providers',p.id)&&(p.local||provKeyed(p.id)))p.models.forEach(m=>items.push(p.id+'/'+m));
+  dl.innerHTML=items.map(m=>`<option value="${esc(m)}">`).join('');
+}
+let flashHint=null;
+function updatePreview(hint){
+  const txt=generate();
+  $('#pBody').innerHTML=highlightTOML(txt);
+  const n=txt.split('\n').length;
+  $('#pLines').textContent=n+' lines · '+(new Blob([txt]).size)+' B';
+  const delta=n-lastCount;
+  if(lastCount&&delta!==0){ const d=$('#pDelta'); d.textContent=(delta>0?'+':'')+delta; d.classList.toggle('neg',delta<0);
+    d.classList.remove('show'); void d.offsetWidth; d.classList.add('show');
+    setTimeout(()=>d.classList.remove('show'),1700); }
+  lastCount=n;
+  if(hint){
+    setTimeout(()=>{
+      const lines=[...$('#pBody').children];
+      const target='['+hint+']';
+      const idx=lines.findIndex(l=>l.textContent.trim()===target);
+      if(idx>=0){
+        for(let j=idx;j<lines.length;j++){ if(j>idx&&lines[j].textContent.trim().startsWith('['))break;
+          lines[j].classList.add('flash'); }
+        $('#pBody').scrollTop=lines[idx].offsetTop-60;
+        setTimeout(()=>lines.forEach(l=>l.classList.remove('flash')),1600);
+      }
+    },30);
+  }
+  if(cur===8){ const rs=$('#revStats'); if(rs)rs.textContent=n+' lines · '+(new Blob([txt]).size)+' bytes'; }
+}
+const schedulePreview=debounce(hint=>updatePreview(hint),110);
+
+/* ════════════════════ 10 · navigation ════════════════════ */
+function renderStep(){ $('#stepBody').innerHTML=STEPS[cur].r(); }
+function go(i){
+  cur=Math.max(0,Math.min(STEPS.length-1,i));
+  renderStep(); renderRail();
+  $('#progress i').style.width=((cur+1)/STEPS.length*100)+'%';
+  $('#stepPos').textContent='STEP '+(cur+1)+' / '+STEPS.length;
+  $('#prevBtn').disabled=cur===0; $('#nextBtn').disabled=cur===STEPS.length-1;
+  window.scrollTo({top:0});
+}
+function renderAll(){ renderStep(); renderRail(); updatePreview(); updateDatalist(); updateMast(); updateStamps(); }
+function updateMast(){
+  $('#modeChip').innerHTML=dirHandle?'<span class="dot ok"></span>Folder linked':'<span class="dot"></span>Downloads mode';
+}
+function updateStamps(){
+  const s='config.backup.'+stamp()+'.toml';
+  $('#stampChip').innerHTML=ic('clock',12)+' '+s;
+  const a=$('#startStamp'); if(a)a.textContent=s;
+  const b=$('#revBackup'); if(b&&originalText!=null&&ui.wantBackup)b.textContent=s;
+}
+setInterval(updateStamps,1000);
+
+/* ════════════════════ 11 · import / export ════════════════════ */
+async function linkFolder(){
+  if(!window.showDirectoryPicker){ toast('This browser can\u2019t link folders — use \u201COpen file\u201D instead','warn'); return; }
+  try{
+    dirHandle=await window.showDirectoryPicker({id:'zeroclaw',mode:'readwrite'});
+    if(dirHandle.queryPermission&&(await dirHandle.queryPermission({mode:'readwrite'}))!=='granted')
+      await dirHandle.requestPermission({mode:'readwrite'});
+    let txt=null;
+    try{ const fh=await dirHandle.getFileHandle('config.toml'); const f=await fh.getFile();
+      if(f.size<2000000)txt=await f.text(); }catch(e){}
+    updateMast();
+    if(txt!=null)adoptConfig(txt,'config.toml (linked folder)');
+    else{ toast('Folder linked — no config.toml found inside yet (fresh install?)','info'); renderStep(); renderRail(); }
+  }catch(e){/* user cancelled */}
+}
+function openPasteModal(){
+  openModal(`<h3>Paste your config.toml</h3>
+    <p class="msub">On the Pi: <span class="mono">cat ~/.zeroclaw/config.toml</span> — copy everything, paste below.</p>
+    <textarea class="rawta" id="pasteTa" style="min-height:260px" spellcheck="false" placeholder="# paste config.toml here…"></textarea>
+    <div class="merr" id="pasteErr"></div>
+    <div class="macts"><button class="btn ghost" data-action="modal-close">Cancel</button>
+    <button class="btn primary" data-action="paste-parse">${ic('check',14)} Parse &amp; load</button></div>`);
+}
+function confirmExportModal(){
+  const s=stamp(); const bname='config.backup.'+s+'.toml';
+  const gen=generate();
+  const newTop=lastTopKeys;
+  const oldTop=originalText!=null?Object.keys(parseTOML(originalText)):[];
+  const added=newTop.filter(k=>!oldTop.includes(k));
+  const removed=oldTop.filter(k=>!newTop.includes(k));
+  openModal(`<h3>Write into linked folder</h3>
+    <p class="msub">${esc(dirHandle.name)} — two files will be written:</p>
+    <ul class="plist">
+      ${originalText!=null&&ui.wantBackup?`<li>${ic('save',14)}<span><b>${esc(bname)}</b> — your current config, untouched</span></li>`:''}
+      <li>${ic('file',14)}<span><b>config.toml</b> — replaced with the new version (${gen.split('\n').length} lines)</span></li>
+      ${added.length?`<li>${ic('plus',14)}<span>tables added: <span class="mono">${esc(added.join(', '))}</span></span></li>`:''}
+      ${removed.length?`<li>${ic('x',14)}<span>tables removed: <span class="mono">${esc(removed.join(', '))}</span></span></li>`:''}
+    </ul>
+    <div class="macts"><button class="btn ghost" data-action="modal-close">Cancel</button>
+    <button class="btn primary" data-action="export-go">${ic('check',14)} Write both files</button></div>`);
+}
+async function writeHandle(h,text){ const w=await h.createWritable(); await w.write(text); await w.close(); }
+async function performFolderWrite(){
+  try{
+    if(dirHandle.queryPermission&&(await dirHandle.queryPermission({mode:'readwrite'}))!=='granted')
+      await dirHandle.requestPermission({mode:'readwrite'});
+    const gen=generate(); const bname='config.backup.'+stamp()+'.toml';
+    if(originalText!=null&&ui.wantBackup){ const bh=await dirHandle.getFileHandle(bname,{create:true}); await writeHandle(bh,originalText); }
+    const ch=await dirHandle.getFileHandle('config.toml',{create:true}); await writeHandle(ch,gen);
+    closeModal(); toast('Written: config.toml'+(originalText!=null&&ui.wantBackup?' + '+bname:''),'ok');
+    if(cur===8)renderStep();
+  }catch(e){ toast('Write failed: '+e.message,'err'); }
+}
+function doDownloadExport(){
+  const gen=generate();
+  if(originalText!=null&&ui.wantBackup){ download('config.backup.'+stamp()+'.toml',originalText); setTimeout(()=>download('config.toml',gen),400); }
+  else download('config.toml',gen);
+  toast('Download started — move to ~/.zeroclaw/ on the Pi','ok');
+}
+
+/* ════════════════════ 12 · events ════════════════════ */
+document.addEventListener('input',e=>{
+  const b=e.target.closest('[data-bind]'); if(!b)return;
+  const p=b.dataset.bind, t=b.dataset.type; let v;
+  if(t==='number'){ const s=e.target.value.trim(); v=s===''?'':(Number.isNaN(Number(s))?s:Number(s)); }
+  else if(t==='toggle')v=e.target.checked;
+  else v=e.target.value;
+  setPath(cfg,p,v);
+  schedulePreview(null); scheduleBadges();
+});
+const scheduleBadges=debounce(()=>{ updateBadges(); },400);
+document.addEventListener('change',e=>{
+  const t=e.target;
+  if(t.matches('[data-on]')){ const[g,id]=t.dataset.on.split('/'); toggleSection(g,id,t.checked); return; }
+  if(t.matches('[data-env]')){ setEnvMode(t.dataset.env,t.checked); return; }
+  if(t.matches('[data-mode]')){ setOrchMode(t.value); return; }
+  if(t.matches('[data-bind]')){
+    const p=t.dataset.bind, ty=t.dataset.type;
+    let v; if(ty==='number'){const s=t.value.trim();v=s===''?'':(Number.isNaN(Number(s))?s:Number(s));}
+    else if(ty==='toggle')v=t.checked; else v=t.value;
+    setPath(cfg,p,v); updatePreview(); updateBadges(); return;
+  }
+  if(t.matches('[data-worker]')){
+    const arr=getPath(cfg,'orchestration.team.workers')||[];
+    const id=t.dataset.worker; const i=arr.indexOf(id);
+    if(t.checked&&i<0)arr.push(id); if(!t.checked&&i>=0)arr.splice(i,1);
+    setPath(cfg,'orchestration.team.workers',arr);
+    updatePreview(); updateBadges(); return;
+  }
+  if(t.id==='wantBackup'){ ui.wantBackup=t.checked; updateStamps(); renderRail(); return; }
+  if(t.matches('[data-agent-rename]')){ renameAgent(t.dataset.agentRename,t.value); return; }
+});
+function setOrchMode(m){
+  if(m==='single'){ delPath(cfg,'orchestration'); }
+  else{
+    setPath(cfg,'orchestration.mode',m);
+    if(m==='router'){ delPath(cfg,'orchestration.team'); if(!Array.isArray(getPath(cfg,'orchestration.routes')))setPath(cfg,'orchestration.routes',[]); }
+    if(m==='team'){ delPath(cfg,'orchestration.routes');
+      if(!getPath(cfg,'orchestration.team'))setPath(cfg,'orchestration.team',{lead:cfg.default_agent||'main',workers:[],share_context:true,max_parallel:2}); }
+  }
+  renderStep(); updatePreview('orchestration'); updateBadges();
+}
+function renameAgent(oldId,newId){
+  newId=slug(newId);
+  if(!newId||newId===oldId||cfg.agents[newId]){ renderStep(); if(cfg.agents[newId])toast('Agent id "'+newId+'" already exists','warn'); return; }
+  const next={}; for(const[k,v]of Object.entries(cfg.agents))next[k===oldId?newId:k]=v;
+  cfg.agents=next;
+  if(cfg.default_agent===oldId)cfg.default_agent=newId;
+  toast('Renamed to agents.'+newId,'ok');
+  renderStep(); updatePreview(); updateBadges();
+}
+document.addEventListener('click',e=>{
+  const el=e.target.closest('[data-action]'); if(!el)return;
+  const act=el.dataset.action;
+  if(act==='goto'){ go(+el.dataset.step); return; }
+  if(act==='led'){ const led=el.closest('.led'); if(led.classList.contains('on'))led.classList.toggle('open'); return; }
+  if(act==='eye'){ const inp=document.getElementById(el.dataset.eye);
+    if(inp){ const show=inp.type==='password'; inp.type=show?'text':'password'; el.innerHTML=ic(show?'eyeoff':'eye',15); } return; }
+  if(act==='chip-add'){ const p=el.dataset.path; const box=document.querySelector('[data-chips="'+CSS.escape(p)+'"]'); if(box)addChip(p,box.querySelector('.chin')); return; }
+  if(act==='chip-x'){ const arr=getPath(cfg,el.dataset.path); if(Array.isArray(arr)){ arr.splice(+el.dataset.i,1); refreshChips(el.dataset.path); updatePreview(); updateBadges(); } return; }
+  if(act==='agent-add'){ const inp=$('#newAgentName'); const id=slug(inp.value||('agent-'+(agentIds().length+1)));
+    if(cfg.agents[id]){ toast('Agent id already exists','warn'); return; }
+    cfg.agents[id]={role:'',workspace:'~/.zeroclaw/workspace/'+id,model:'',system_prompt:'',tools_allow:[]};
+    renderStep(); updatePreview('agents.'+id); updateBadges(); toast('agents.'+id+' created','ok'); return; }
+  if(act==='agent-del'){ delete cfg.agents[el.dataset.id]; renderStep(); updatePreview(); updateBadges(); toast('Agent removed','ok'); return; }
+  if(act==='route-add'){ const arr=getPath(cfg,'orchestration.routes')||[]; arr.push({match:'',agent:cfg.default_agent||agentIds()[0]||'main'});
+    setPath(cfg,'orchestration.routes',arr); renderStep(); updatePreview('orchestration'); return; }
+  if(act==='route-del'){ const arr=getPath(cfg,'orchestration.routes')||[]; arr.splice(+el.dataset.i,1); renderStep(); updatePreview('orchestration'); return; }
+  if(act==='jump'){ go(+el.dataset.step); return; }
+  if(act==='dir'){ linkFolder(); return; }
+  if(act==='filepick'){ $('#fileInput').click(); return; }
+  if(act==='paste'){ openPasteModal(); return; }
+  if(act==='paste-parse'){ const ok=adoptConfig($('#pasteTa').value,'pasted TOML'); if(ok)closeModal(); return; }
+  if(act==='modal-close'){ closeModal(); return; }
+  if(act==='fresh'){
+    if(!el.classList.contains('arm')){ el.classList.add('arm'); el.textContent='Confirm reset?'; setTimeout(()=>{el.classList.remove('arm');el.textContent='Start fresh';},2800); return; }
+    seedFresh(); renderAll(); go(0); toast('Fresh template started','ok'); return; }
+  if(act==='export-folder'){ confirmExportModal(); return; }
+  if(act==='export-go'){ performFolderWrite(); return; }
+  if(act==='export-dl'){ doDownloadExport(); return; }
+  if(act==='copy-toml'){ copyText(generate(),'config.toml copied — paste into ~/.zeroclaw/'); return; }
+  if(act==='copy-shell'){ copyText($('#shellBox').textContent,'Shell commands copied'); return; }
+  if(act==='apply-raw'){
+    try{ const doc=normalizeCamel(parseTOML($('#rawTa').value)); applyAliases(doc); cfg=doc;
+      ui.on={};ui.env={};
+      for(const pr of PROVIDERS){ const p=getPath(cfg,'models.providers.'+pr.id); if(p){(ui.on.providers??={})[pr.id]=true;if(p.api_key_env)ui.env[pr.id]=true;} }
+      const chs=cfg.channels||{}; for(const c of CHANNELS)if(chs[c.id])(ui.on.channels??={})[c.id]=true;
+      if(cfg.homeassistant)ui.on.ha=true;
+      renderAll(); toast('Raw TOML applied','ok');
+    }catch(err){ toast('Parse failed: '+err.message,'err'); }
+    return; }
+  if(act==='reset-raw'){ $('#rawTa').value=generate(); return; }
+});
+document.addEventListener('keydown',e=>{
+  if(e.target.matches('.chin')&&e.key==='Enter'){ e.preventDefault(); addChip(e.target.dataset.chipsIn,e.target); }
+  if(e.target.id==='newAgentName'&&e.key==='Enter'){ document.querySelector('[data-action="agent-add"]').click(); }
+});
+ $('#fileInput').addEventListener('change',async e=>{
+  const f=e.target.files[0]; if(!f)return;
+  const txt=await f.text();
+  adoptConfig(txt,f.name);
+  e.target.value='';
+});
+ $('#prevBtn').addEventListener('click',()=>go(cur-1));
+ $('#nextBtn').addEventListener('click',()=>go(cur+1));
+ $('#pCollapse').addEventListener('click',()=>$('#app').classList.add('noprev'));
+ $('#pFab').addEventListener('click',()=>$('#prev').classList.toggle('open'));
+ $('#btnCopyT').addEventListener('click',()=>copyText(generate(),'config.toml copied'));
+ $('#btnDlT').addEventListener('click',doDownloadExport);
+ $('#btnDir').innerHTML=ic('folder',14)+' Folder';
+ $('#btnFile').innerHTML=ic('upload',14)+' File';
+ $('#btnPaste').innerHTML=ic('term',14)+' Paste';
+ $('#btnDir').addEventListener('click',linkFolder);
+ $('#btnFile').addEventListener('click',()=>$('#fileInput').click());
+ $('#btnPaste').addEventListener('click',openPasteModal);
+ $('#prevBtn').innerHTML=ic('left',14)+' Back';
+ $('#nextBtn').innerHTML='Next '+ic('right',14);
+ $('#pCollapse').innerHTML=ic('x',13);
+
+/* ════════════════════ 13 · init ════════════════════ */
+seedFresh();
+renderAll();
+go(0);
+toast('Fresh template ready — load your existing config in step 01','info');
+</script>
+</body>
+</html>
