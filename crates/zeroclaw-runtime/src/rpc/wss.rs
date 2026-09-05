@@ -3,7 +3,7 @@
 //! WebSocket connections, enabling remote TUI-to-daemon connectivity.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{RpcAccessPolicy, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -922,6 +922,9 @@ pub async fn run_wss_listener(
         "RPC WSS listener started"
     );
 
+    let connections_cancel = cancel.child_token();
+    let mut connections = tokio::task::JoinSet::new();
+    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -931,6 +934,16 @@ pub async fn run_wss_listener(
                     "RPC WSS listener shutting down"
                 );
                 break;
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("RPC WSS connection task failed: {error}")
+                    );
+                }
             }
             accept = listener.accept() => {
                 let (tcp_stream, remote_addr) = match accept {
@@ -950,7 +963,8 @@ pub async fn run_wss_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        return Err(e).context("WSS accept error");
+                        listener_result = Err(e).context("WSS accept error");
+                        break;
                     }
                 };
 
@@ -983,6 +997,7 @@ pub async fn run_wss_listener(
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
+                let connection_cancel = connections_cancel.clone();
                 let handshake_timeout = limits.handshake_timeout;
                 // Consumed only after both handshakes succeed, so an unauthenticated
                 // stall can never occupy an established-session slot.
@@ -994,7 +1009,7 @@ pub async fn run_wss_listener(
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
+                connections.spawn(async move {
                     // Guarantees the `--ephemeral` counter is decremented on
                     // every exit path below, including the new timeout one.
                     let _count_guard = ClientCountGuard(count);
@@ -1060,7 +1075,11 @@ pub async fn run_wss_listener(
                         Some((ws_stream, scanner))
                     };
 
-                    let (mut ws_stream, scanner) = match tokio::time::timeout_at(deadline, setup).await {
+                    let handshake_result = tokio::select! {
+                        _ = connection_cancel.cancelled() => return,
+                        result = tokio::time::timeout_at(deadline, setup) => result,
+                    };
+                    let (mut ws_stream, scanner) = match handshake_result {
                         Ok(Some(ws)) => ws,
                         Ok(None) => return, // logged above
                         Err(_) => {
@@ -1164,9 +1183,20 @@ pub async fn run_wss_listener(
                     );
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
-                        .with_peer_cert_fingerprint(Some(peer_cert_fp));
-                    dispatcher.run(&mut transport).await;
+                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        connection_cancel.child_token(),
+                        RpcAccessPolicy::RemoteSessionOwner,
+                        None,
+                    )
+                    .with_peer_cert_fingerprint(Some(peer_cert_fp));
+                    tokio::select! {
+                        _ = connection_cancel.cancelled() => {}
+                        _ = dispatcher.run(&mut transport) => {}
+                    }
+                    dispatcher.shutdown().await;
 
                     // Epoch-checked: a relay flap can leave this session draining
                     // long after the client has reconnected and re-adopted the
@@ -1197,7 +1227,19 @@ pub async fn run_wss_listener(
         }
     }
 
-    Ok(())
+    connections_cancel.cancel();
+    while let Some(completed) = connections.join_next().await {
+        if let Err(error) = completed {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("RPC WSS connection task failed during shutdown: {error}")
+            );
+        }
+    }
+
+    listener_result
 }
 
 #[cfg(test)]
@@ -1579,5 +1621,99 @@ mod parser_bound_tests {
                 "a message beyond the 32 MiB ceiling must be refused"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::rpc::session::SessionStore;
+    use tokio::io::AsyncReadExt;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    fn test_ctx(tmp: &std::path::Path) -> Arc<RpcContext> {
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.to_path_buf(),
+            config_path: tmp.join("config.toml"),
+            ..Default::default()
+        };
+        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(SessionStore::new(64, session_queue));
+        RpcContext::minimal(config, sessions)
+    }
+
+    fn test_tls_acceptor(tmp: &std::path::Path) -> TlsAcceptor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let materials = zeroclaw_tls::ensure_server_materials(tmp, &[]).unwrap();
+        build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap()
+    }
+
+    async fn wait_for_client_count(count: &Arc<AtomicUsize>, expected: usize) {
+        for _ in 0..250 {
+            if count.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "client count never reached {expected}; last observed {}",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_and_joins_inflight_wss_handshake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let acceptor = test_tls_acceptor(tmp.path());
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_wss_listener(
+                ctx,
+                server_cancel,
+                server_count,
+                acceptor,
+                bind_addr,
+                WssLimits::default(),
+            )
+            .await
+        });
+
+        let mut client = loop {
+            match TcpStream::connect(bind_addr).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        wait_for_client_count(&count, 1).await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("WSS listener should join an in-flight handshake after cancellation")
+            .expect("WSS listener task should not panic")
+            .expect("WSS listener should stop cleanly");
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        let mut byte = [0_u8; 1];
+        let bytes = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("cancelled WSS client should observe EOF")
+            .expect("client read should not fail");
+        assert_eq!(bytes, 0, "cancelled WSS connection should be closed");
     }
 }

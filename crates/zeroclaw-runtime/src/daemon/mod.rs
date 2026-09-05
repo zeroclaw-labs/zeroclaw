@@ -5,6 +5,142 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
 
+use self::registry::ChannelRegistryClearer;
+
+/// A daemon-run-owned channel generation. RPC config mutations prepare an
+/// opaque drain for this exact generation; committing the mutation retires the
+/// generation, clears channel admission, and waits for its channel task.
+#[derive(Clone)]
+pub struct ChannelGenerationControl {
+    state: std::sync::Arc<ChannelGenerationState>,
+    registry_clearer: Option<ChannelRegistryClearer>,
+}
+
+struct ChannelGenerationState {
+    retired: std::sync::atomic::AtomicBool,
+    active: parking_lot::Mutex<Option<ChannelGenerationAttemptState>>,
+}
+
+struct ChannelGenerationAttemptState {
+    cancel: tokio_util::sync::CancellationToken,
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+pub struct PreparedChannelGenerationDrain {
+    control: ChannelGenerationControl,
+}
+
+pub struct ChannelGenerationDrainWait {
+    done: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+pub(crate) struct ChannelGenerationAttempt {
+    cancel: tokio_util::sync::CancellationToken,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl ChannelGenerationControl {
+    pub(crate) fn new(registry_clearer: Option<ChannelRegistryClearer>) -> Self {
+        Self {
+            state: std::sync::Arc::new(ChannelGenerationState {
+                retired: std::sync::atomic::AtomicBool::new(false),
+                active: parking_lot::Mutex::new(None),
+            }),
+            registry_clearer,
+        }
+    }
+
+    pub(crate) fn prepare(&self) -> Option<PreparedChannelGenerationDrain> {
+        self.registry_clearer.as_ref()?;
+        Some(PreparedChannelGenerationDrain {
+            control: self.clone(),
+        })
+    }
+
+    fn begin_attempt(
+        &self,
+        daemon_cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<ChannelGenerationAttempt> {
+        let mut active = self.state.active.lock();
+        if self
+            .state
+            .retired
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let cancel = daemon_cancel.child_token();
+        active.replace(ChannelGenerationAttemptState {
+            cancel: cancel.clone(),
+            done: done_rx,
+        });
+        Some(ChannelGenerationAttempt {
+            cancel,
+            done: Some(done_tx),
+        })
+    }
+
+    fn retire(&self) -> ChannelGenerationDrainWait {
+        let active = {
+            let mut slot = self.state.active.lock();
+            if self
+                .state
+                .retired
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return ChannelGenerationDrainWait { done: None };
+            }
+            slot.take()
+        };
+        if let Some(clear) = &self.registry_clearer {
+            clear();
+        }
+        if let Some(active) = active {
+            active.cancel.cancel();
+            return ChannelGenerationDrainWait {
+                done: Some(active.done),
+            };
+        }
+        ChannelGenerationDrainWait { done: None }
+    }
+
+    #[cfg(test)]
+    fn is_retired(&self) -> bool {
+        self.state
+            .retired
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl ChannelGenerationDrainWait {
+    pub async fn wait(mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.await;
+        }
+    }
+}
+
+impl PreparedChannelGenerationDrain {
+    pub fn begin(&self) -> ChannelGenerationDrainWait {
+        self.control.retire()
+    }
+}
+
+impl ChannelGenerationAttempt {
+    fn cancel(&self) -> tokio_util::sync::CancellationToken {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for ChannelGenerationAttempt {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StartupReadiness {
     gateway_generation: u64,
@@ -481,7 +617,7 @@ pub async fn run(
     mut config: Config,
     host: String,
     port: u16,
-    mut registry: DaemonRegistry,
+    registry: DaemonRegistry,
     ephemeral: bool,
     startup_feedback_enabled: bool,
 ) -> Result<DaemonExit> {
@@ -489,7 +625,28 @@ pub async fn run(
     if port != 0 {
         config.gateway.port = port;
     }
+    let live_config_authority = crate::LiveConfigAuthority::new_owned(config.clone())?;
+    run_with_authority(
+        live_config_authority,
+        host,
+        port,
+        registry,
+        ephemeral,
+        startup_feedback_enabled,
+    )
+    .await
+}
 
+/// Use the authority acquired before constructing producers such as SOP maintenance.
+pub async fn run_with_authority(
+    live_config_authority: crate::LiveConfigAuthority,
+    host: String,
+    port: u16,
+    mut registry: DaemonRegistry,
+    ephemeral: bool,
+    startup_feedback_enabled: bool,
+) -> Result<DaemonExit> {
+    let config = live_config_authority.config().read().clone();
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability
@@ -522,6 +679,9 @@ pub async fn run(
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
+    let channel_generation_control = std::sync::Arc::new(ChannelGenerationControl::new(
+        registry.take_channel_registry_clearer(),
+    ));
     let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
     let (startup_readiness_tx, startup_readiness_rx) = if startup_feedback_enabled {
         let (tx, rx) = tokio::sync::watch::channel(StartupReadiness::default());
@@ -546,10 +706,12 @@ pub async fn run(
         let gateway_reload_controls = GatewayReloadControls {
             shutdown_tx: gateway_shutdown_tx.clone(),
             reload_tx: reload_tx.clone(),
+            channel_generation_control: Some(channel_generation_control.clone()),
         };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         let gateway_readiness_tx = startup_readiness_tx.clone();
+        let gateway_live_config_authority = live_config_authority.clone();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -562,6 +724,7 @@ pub async fn run(
                 let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
+                let live_config_authority = gateway_live_config_authority.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::gateway(gateway_readiness_tx.clone());
                 async move {
@@ -570,6 +733,7 @@ pub async fn run(
                         host,
                         port,
                         cfg,
+                        live_config_authority,
                         Some(tx),
                         Some(reload_controls),
                         Some(tui_reg),
@@ -606,19 +770,33 @@ pub async fn run(
 
     if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
-            let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
             let cancel_for_supervisor = channels_cancel.clone();
+            let generation_control = channel_generation_control.clone();
+            let channels_live_config_authority = live_config_authority.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
                 initial_backoff,
                 max_backoff,
                 channels_cancel.clone(),
                 move || {
-                    let cfg = channels_cfg.clone();
                     let start = channels_start.clone();
                     let cancel = cancel_for_supervisor.clone();
-                    async move { start(cfg, cancel).await }
+                    let generation_control = generation_control.clone();
+                    let live_config_authority = channels_live_config_authority.clone();
+                    async move {
+                        let Some(attempt) = generation_control.begin_attempt(&cancel) else {
+                            // A retired generation must never retry the old
+                            // configuration. Wait for daemon shutdown/reload
+                            // so the generic supervisor cannot hot-loop.
+                            cancel.cancelled().await;
+                            return Ok(());
+                        };
+                        let attempt_cancel = attempt.cancel();
+                        let result = start(live_config_authority, attempt_cancel).await;
+                        drop(attempt);
+                        result
+                    }
                 },
             ));
         } else {
@@ -774,9 +952,14 @@ pub async fn run(
             None
         };
 
+        let (rpc_config, rpc_config_write_lock) =
+            RpcContext::config_handles_for_authority(&live_config_authority);
+
         Some(std::sync::Arc::new(RpcContext {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
-            config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            config: rpc_config,
+            config_write_lock: rpc_config_write_lock,
+            agent_lifecycle: live_config_authority.agent_lifecycle(),
+            channel_generation_control: Some(channel_generation_control.clone()),
             sessions,
             session_backend,
             memory: rpc_memory,
@@ -950,8 +1133,11 @@ pub async fn run(
         crate::health::mark_component_ok("mqtt");
     }
 
+    let daemon_execution_capability = live_config_authority.execution_capability();
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_execution_capability = daemon_execution_capability.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -959,7 +1145,8 @@ pub async fn run(
             channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                let execution_capability = heartbeat_execution_capability.clone();
+                async move { Box::pin(run_heartbeat_worker(cfg, execution_capability)).await }
             },
         ));
     }
@@ -977,7 +1164,16 @@ pub async fn run(
                 let cfg = scheduler_cfg.clone();
                 let tx = scheduler_event_tx.clone();
                 let cancel = scheduler_cancel.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx), cancel)).await }
+                let execution_capability = daemon_execution_capability.clone();
+                async move {
+                    Box::pin(crate::cron::scheduler::run_with_capability(
+                        cfg,
+                        Some(tx),
+                        cancel,
+                        Some(execution_capability),
+                    ))
+                    .await
+                }
             },
         ));
     } else {
@@ -1045,6 +1241,11 @@ pub async fn run(
         Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
     }
 
+    // Freeze lifecycle admission before stopping ingress. Existing ordinary
+    // turns lose their leases when component workers drain or are aborted;
+    // destructive leases remain registered through detached post-commit
+    // cleanup and are drained below before cross-process ownership can drop.
+    live_config_authority.close_agent_lifecycle();
     channels_cancel.cancel();
 
     const GRACE_WINDOW: Duration = Duration::from_millis(500);
@@ -1069,6 +1270,8 @@ pub async fn run(
     for handle in remaining {
         let _ = handle.await;
     }
+
+    live_config_authority.drain_agent_lifecycle().await;
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: glibc's parameter-free process allocator trim may release free
@@ -1787,7 +1990,10 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
+async fn run_heartbeat_worker(
+    config: Config,
+    execution_capability: crate::live_config_authority::AgentExecutionCapability,
+) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
     };
@@ -1949,6 +2155,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    execution_capability: Some(execution_capability.clone()),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));
@@ -2070,6 +2277,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    execution_capability: Some(execution_capability.clone()),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));
@@ -2550,6 +2758,39 @@ mod tests {
     use zeroclaw_config::schema::MattermostListenMode;
 
     const DAEMON_DEADLOCK_GUARD: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn retiring_channel_generation_clears_admission_and_joins_active_attempt() {
+        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clearer_state = std::sync::Arc::clone(&cleared);
+        let control = ChannelGenerationControl::new(Some(std::sync::Arc::new(move || {
+            clearer_state.store(true, std::sync::atomic::Ordering::Release);
+        })));
+        let daemon_cancel = tokio_util::sync::CancellationToken::new();
+        let attempt = control
+            .begin_attempt(&daemon_cancel)
+            .expect("active generation should admit its channel attempt");
+        let attempt_cancel = attempt.cancel();
+        let active = zeroclaw_spawn::spawn!(async move {
+            attempt_cancel.cancelled().await;
+            drop(attempt);
+        });
+
+        let drain = control
+            .prepare()
+            .expect("registry clearer is available")
+            .begin();
+        assert!(control.is_retired());
+        assert!(cleared.load(std::sync::atomic::Ordering::Acquire));
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain.wait())
+            .await
+            .expect("retired generation should join its active channel attempt");
+        active.await.expect("channel attempt task should not panic");
+        assert!(
+            control.begin_attempt(&daemon_cancel).is_none(),
+            "retired generation must not admit a replacement attempt"
+        );
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -3534,7 +3775,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_controls, tui_registry, _ready_tx| {
+            move |host,
+                  port,
+                  config,
+                  _live_config_authority,
+                  event_tx,
+                  reload_controls,
+                  tui_registry,
+                  _ready_tx| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
@@ -3717,7 +3965,14 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+            move |_host,
+                  _port,
+                  _config,
+                  _live_config_authority,
+                  _event_tx,
+                  reload_controls,
+                  _tui_reg,
+                  _ready_tx| {
                 Box::pin(async move {
                     let reload_tx = reload_controls
                         .map(|controls| controls.reload_tx)

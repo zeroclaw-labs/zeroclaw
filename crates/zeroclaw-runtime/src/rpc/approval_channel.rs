@@ -173,7 +173,9 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
-        let mut pending_request = self.pending.register(request_id.clone(), tx);
+        let mut pending_request =
+            self.pending
+                .register(request_id.clone(), self.session_id.clone(), tx);
 
         self.rpc
             .notify(
@@ -362,7 +364,7 @@ mod tests {
         assert_eq!(v["params"]["tool_name"], "shell");
 
         let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
-        pending_for_resolve.resolve(&request_id, ChannelApprovalResponse::Approve);
+        pending_for_resolve.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve);
 
         let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Approve));
@@ -395,7 +397,7 @@ mod tests {
             "timed-out approval request must be removed from the pending map"
         );
         assert!(
-            !pending.resolve(&request_id, ChannelApprovalResponse::Approve),
+            !pending.resolve(&request_id, "sess-1", ChannelApprovalResponse::Approve),
             "late approval after timeout must be a no-op"
         );
     }

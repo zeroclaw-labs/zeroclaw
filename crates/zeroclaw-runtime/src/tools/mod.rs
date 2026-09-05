@@ -119,6 +119,8 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
+use crate::live_config_authority::AgentExecutionCapability;
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, ToolSpec};
@@ -837,6 +839,63 @@ pub fn all_tools_with_runtime(
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 ) -> AllToolsResult {
+    all_tools_with_runtime_and_execution_capability(
+        config,
+        security,
+        risk_profile,
+        agent_alias,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        browser_config,
+        http_config,
+        web_fetch_config,
+        workspace_dir,
+        agents,
+        fallback_api_key,
+        root_config,
+        canvas_store,
+        is_subagent_caller,
+        tui_env,
+        sop_engine,
+        sop_audit,
+        live_config,
+        None,
+    )
+}
+
+/// Create the managed registry while carrying the authority-backed execution
+/// capability into tools that can start work for another target alias.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+pub fn all_tools_with_runtime_and_execution_capability(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
@@ -916,11 +975,12 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunTool::new_with_runtime(
+        Arc::new(CronRunTool::new_with_runtime_and_capability(
             config.clone(),
             security.clone(),
             agent_alias,
             runtime.clone(),
+            execution_capability.clone(),
         )),
         Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
@@ -936,11 +996,13 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(
             SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
-                .with_subagent_caller(is_subagent_caller),
+                .with_subagent_caller(is_subagent_caller)
+                .with_execution_capability(execution_capability.clone()),
         ),
-        Arc::new(SendMessageToPeerTool::new(
+        Arc::new(SendMessageToPeerTool::new_with_capability(
             Arc::new(root_config.clone()),
             agent_alias,
+            execution_capability.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -1786,6 +1848,7 @@ pub fn all_tools_with_runtime(
         // resolve against that snapshot forever. Same contract as the
         // `live_config` argument this function received.
         .with_live_config(live_config.clone())
+        .with_execution_capability(execution_capability.clone())
         .with_caller_alias(agent_alias);
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]

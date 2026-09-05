@@ -742,6 +742,7 @@ cli-desktop-not-installed = La aplicación complementaria de ZeroClaw no está i
 cli-desktop-blurb1 = La aplicación complementaria es una ligera app de la barra de menú que
 cli-desktop-blurb2 = se conecta a la misma puerta de enlace que la CLI.
 cli-config-all-configured = Todas las secciones ya están configuradas.
+cli-config-initialized-sections = Se inicializaron {$count} secciones con valores predeterminados:
 cli-config-schema-current = La configuración ya está en la versión actual del esquema.
 cli-config-applied-ops = Se aplicaron {$count} operación(es):
 cli-plugins-none = No hay complementos instalados.

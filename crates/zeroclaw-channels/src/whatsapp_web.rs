@@ -433,12 +433,12 @@ pub struct WhatsAppWebChannel {
     /// Empty admits no group unless `group_policy` is `all`, which admits
     /// every group. Direct messages bypass.
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    /// Optional pairing-persist handle to the canonical shared `Config`.
+    /// Optional pairing-persist authority for the canonical shared `Config`.
     /// `None` in tests; `Some` in the long-running daemon, wired via
-    /// `.with_persistence(config)`. Same contract as WeChat's handle: on
+    /// `.with_persistence(config)`. Same contract as WeChat's authority: on
     /// connect, the linked account is persisted into `peer_groups` through
     /// `crate::identity_persist` (no channel-local allowlist cache).
-    persist: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     /// See [`ApprovalSendHook`]. `None` outside the tests that need to act
     /// between a token's registration and the cleanup that follows it.
     #[cfg(test)]
@@ -582,17 +582,26 @@ impl WhatsAppWebChannel {
         &self.alias
     }
 
-    /// Wire the shared Config handle so a completed pairing can persist the
-    /// linked account into `peer_groups` and save — the same contract as
-    /// `WeChatChannel::with_persistence`. The long-running daemon sets this
-    /// from the orchestrator; tests and one-shot callers leave it unset
-    /// (pairing works at runtime, doesn't persist).
+    /// Wire a config handle so a completed pairing can persist the linked
+    /// account into `peer_groups` and save. Standalone callers get a local
+    /// mutation witness; supervised callers use
+    /// [`Self::with_persistence_authority`] to share the daemon witness.
     #[cfg(feature = "whatsapp-web")]
     pub fn with_persistence(
         mut self,
         config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
     ) -> Self {
-        self.persist = Some(config);
+        self.persist = Some(zeroclaw_runtime::LiveConfigAuthority::from_config(config));
+        self
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    /// Wire the daemon generation's live-config authority for pairing writes.
+    pub fn with_persistence_authority(
+        mut self,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
+    ) -> Self {
+        self.persist = Some(authority);
         self
     }
 
@@ -3619,6 +3628,27 @@ mod tests {
                 .origin(BatchOrigin::Live)
                 .build(),
         )
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn authority_persistence_preserves_live_handle_identity() {
+        let authority =
+            zeroclaw_runtime::LiveConfigAuthority::new(zeroclaw_config::schema::Config::default());
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            Arc::new(Vec::<String>::new),
+        )
+        .with_persistence_authority(authority.clone());
+        let stored = channel.persist.as_ref().expect("authority is stored");
+
+        assert!(Arc::ptr_eq(&authority.config(), &stored.config()));
+        assert!(Arc::ptr_eq(
+            &authority.config_write_lock(),
+            &stored.config_write_lock()
+        ));
     }
 
     #[test]

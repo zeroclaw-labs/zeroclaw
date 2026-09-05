@@ -626,6 +626,8 @@ rpc_type! {
     pub struct ConfigSetParams {
         pub prop: String,
         pub value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub comment: Option<String>,
     }
 }
 
@@ -746,6 +748,8 @@ rpc_type! {
         pub from: String,
         pub to: String,
         pub renamed: bool,
+        #[serde(default)]
+        pub rewritten: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub warnings: Vec<String>,
     }
@@ -814,6 +818,33 @@ rpc_type! {
 rpc_type! {
     pub struct AgentsStatusResult {
         pub agents: Vec<AgentStatusEntry>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteParams {
+        pub alias: String,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeletePreviewResult {
+        pub alias: String,
+        pub allowed: bool,
+        pub blockers: Vec<String>,
+        pub scrubs: Vec<String>,
+        pub owned_state: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct AgentDeleteResult {
+        pub alias: String,
+        pub deleted: bool,
+        pub scrubbed: usize,
+        pub warnings: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
     }
 }
 

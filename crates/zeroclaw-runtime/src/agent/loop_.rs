@@ -1,4 +1,5 @@
 use crate::approval::ApprovalManager;
+use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 
 /// Format token count with thousands separators.
 fn format_tokens(n: u64) -> String {
@@ -56,35 +57,39 @@ pub async fn load_peripheral_tools(
     }
 }
 
-/// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
-/// Injected by the binary so `zeroclaw-runtime` doesn't depend on
-/// `zeroclaw-channels`.
-type ChannelMapFn = Box<
-    dyn Fn()
-            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
-        + Send
-        + Sync,
->;
+type ChannelMap =
+    std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>;
+type ChannelMapFactory = dyn Fn(&zeroclaw_config::schema::Config, &str) -> ChannelMap + Send + Sync;
+type ChannelMapFn = Box<ChannelMapFactory>;
+type ApprovalChannelMapFactory =
+    dyn Fn(&zeroclaw_config::schema::Config) -> ChannelMap + Send + Sync;
+type ApprovalChannelMapFn = Box<ApprovalChannelMapFactory>;
 
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
+static APPROVAL_CHANNEL_MAP_FN: std::sync::OnceLock<ApprovalChannelMapFn> =
+    std::sync::OnceLock::new();
 
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
 }
 
-pub(crate) fn seed_channel_handles(
+pub fn register_approval_channel_map_fn(f: ApprovalChannelMapFn) {
+    let _ = APPROVAL_CHANNEL_MAP_FN.set(f);
+}
+
+pub(crate) fn seed_channel_handles_with_factory(
+    factory: &ChannelMapFactory,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
     channel_room_handle: &Option<tools::PerToolChannelHandle>,
     reaction_handle: &tools::PerToolChannelHandle,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> usize {
-    let Some(factory) = CHANNEL_MAP_FN.get() else {
-        return 0;
-    };
-    let map = factory();
+    let map = factory(config, agent_alias);
     if map.is_empty() {
         return 0;
     }
@@ -96,22 +101,121 @@ pub(crate) fn seed_channel_handles(
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
     ];
-
-    let mut count = 0;
-    for (name, ch) in &map {
+    for (name, channel) in &map {
         for handle in handles.iter().flatten() {
-            handle
-                .write()
-                .insert(name.clone(), std::sync::Arc::clone(ch));
+            handle.write().insert(name.clone(), Arc::clone(channel));
         }
-        count += 1;
     }
-    count
+    map.len()
 }
 
-pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
+pub(crate) struct ConfiguredChannelMaps {
+    old: ChannelMap,
+    new: ChannelMap,
+}
+
+pub(crate) fn configured_channel_generation_revocation(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<ConfiguredChannelMaps> {
+    let factory = APPROVAL_CHANNEL_MAP_FN.get()?;
+    Some(configured_channel_generation_revocation_with_factory(
+        factory.as_ref(),
+        config,
+    ))
+}
+
+pub(crate) fn configured_channel_generation_revocation_with_factory(
+    factory: &ApprovalChannelMapFactory,
+    config: &zeroclaw_config::schema::Config,
+) -> ConfiguredChannelMaps {
+    ConfiguredChannelMaps {
+        old: factory(config),
+        new: ChannelMap::new(),
+    }
+}
+
+pub(crate) fn configured_channel_maps_with_factory(
+    factory: &ChannelMapFactory,
+    old_config: &zeroclaw_config::schema::Config,
+    new_config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> ConfiguredChannelMaps {
+    ConfiguredChannelMaps {
+        old: factory(old_config, agent_alias),
+        new: factory(new_config, agent_alias),
+    }
+}
+
+pub(crate) fn configured_channel_maps(
+    old_config: &zeroclaw_config::schema::Config,
+    new_config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Option<ConfiguredChannelMaps> {
     let factory = CHANNEL_MAP_FN.get()?;
-    let map = factory();
+    Some(configured_channel_maps_with_factory(
+        factory.as_ref(),
+        old_config,
+        new_config,
+        agent_alias,
+    ))
+}
+
+pub(crate) fn refresh_channel_handles(
+    configured: &ConfiguredChannelMaps,
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let handles = [
+        ask_user_handle.as_ref(),
+        channel_room_handle.as_ref(),
+        Some(reaction_handle),
+        poll_handle.as_ref(),
+        escalate_handle.as_ref(),
+    ];
+    for handle in handles.iter().flatten() {
+        let mut map = handle.write();
+        for name in configured.old.keys() {
+            map.remove(name);
+        }
+        for (name, channel) in &configured.new {
+            map.insert(name.clone(), Arc::clone(channel));
+        }
+    }
+    configured.new.len()
+}
+
+pub(crate) fn seed_channel_handles(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let Some(factory) = CHANNEL_MAP_FN.get() else {
+        return 0;
+    };
+    seed_channel_handles_with_factory(
+        factory.as_ref(),
+        config,
+        agent_alias,
+        ask_user_handle,
+        channel_room_handle,
+        reaction_handle,
+        poll_handle,
+        escalate_handle,
+    )
+}
+
+pub(crate) fn live_approval_channel_registry(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tools::PerToolChannelHandle> {
+    let factory = APPROVAL_CHANNEL_MAP_FN.get()?;
+    let map = factory(config);
     if map.is_empty() {
         return None;
     }
@@ -1084,6 +1188,8 @@ pub struct AgentRunOverrides {
     /// cron job configured with `uses_memory = false`). Default `false`.
     pub suppress_memory_inject: bool,
     pub memory_free: bool,
+    /// Per-run restriction applied after selecting an authoritative config.
+    pub suppress_memory_auto_save: bool,
     /// Pre-built MCP registry supplied by the caller. The daemon heartbeat
     /// worker constructs this once at worker start and shares it across
     /// every tick so that stdio MCP children live for the daemon's
@@ -1094,6 +1200,11 @@ pub struct AgentRunOverrides {
     /// (CLI / one-shot), which is correct for callers that have no
     /// cross-turn reuse contract.
     pub mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
+    /// Shared authority used to admit this run's target before construction.
+    pub execution_capability: Option<AgentExecutionCapability>,
+    /// An already-admitted target lease supplied by a caller that must retain
+    /// it through delivery or persistence after this run returns.
+    pub execution_admission: Option<AgentExecutionAdmission>,
 }
 
 fn agent_provider_composite(
@@ -1183,7 +1294,7 @@ fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error 
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
-    config: Config,
+    mut config: Config,
     agent_alias: &str,
     message: Option<String>,
     provider_override: Option<String>,
@@ -1194,9 +1305,31 @@ pub async fn run(
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
     origin: TurnOrigin,
-    overrides: AgentRunOverrides,
+    mut overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    let execution_admission = if let Some(admission) = overrides.execution_admission.take() {
+        Some(admission)
+    } else if let Some(capability) = overrides.execution_capability.as_ref() {
+        Some(capability.admit(agent_alias)?)
+    } else {
+        None
+    };
+    let execution_capability = execution_admission
+        .as_ref()
+        .map(AgentExecutionAdmission::capability)
+        .or_else(|| overrides.execution_capability.clone());
+    if let Some(admission) = execution_admission.as_ref() {
+        admission.revalidate()?;
+        anyhow::ensure!(
+            admission.alias() == agent_alias,
+            "agent execution admission alias changed during construction"
+        );
+        config = admission.config().as_ref().clone();
+    }
+    if overrides.suppress_memory_auto_save {
+        config.memory.auto_save = false;
+    }
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
@@ -1234,6 +1367,7 @@ pub async fn run(
         memory_namespace = %memory_composite,
     );
     let __zc_body = async move {
+        let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
@@ -1329,19 +1463,20 @@ pub async fn run(
         let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) = crate::sop::build_sop_engine(
+            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
+                execution_capability.clone(),
             );
             (Some(engine), Some(audit))
         } else {
             (None, None)
         };
 
-        let all_tools_result = tools::all_tools_with_runtime(
+        let all_tools_result = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -1362,7 +1497,10 @@ pub async fn run(
             None,
             sop_engine,
             sop_audit,
-            None,
+            execution_capability
+                .as_ref()
+                .map(AgentExecutionCapability::config_handle),
+            execution_capability.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -1416,6 +1554,8 @@ pub async fn run(
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
+            &config,
+            agent_alias,
             &ask_user_handle,
             &channel_room_handle,
             &reaction_handle,
@@ -2841,7 +2981,58 @@ pub async fn process_message(
     session_id: Option<&str>,
     origin: TurnOrigin,
 ) -> Result<String> {
+    process_message_with_capability(config, agent_alias, message, session_id, origin, None).await
+}
+
+/// Process a message after admitting its target through the daemon-owned
+/// authority. The compatibility wrapper above remains for source-only and
+/// test callers that do not participate in managed lifecycle state.
+pub async fn process_message_with_capability(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    execution_capability: Option<AgentExecutionCapability>,
+) -> Result<String> {
+    let execution_admission = execution_capability
+        .as_ref()
+        .map(|capability| capability.admit(agent_alias))
+        .transpose()?;
+    process_message_with_admission(
+        config,
+        agent_alias,
+        message,
+        session_id,
+        origin,
+        execution_admission,
+    )
+    .await
+}
+
+/// Process a message with a lease admitted by the caller. Detached producers
+/// use this form so the original admission remains owned through delivery and
+/// any caller-side persistence instead of being reacquired from a stale input.
+pub async fn process_message_with_admission(
+    mut config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+    execution_admission: Option<AgentExecutionAdmission>,
+) -> Result<String> {
     use ::zeroclaw_log::Instrument;
+    if let Some(admission) = execution_admission.as_ref() {
+        admission.revalidate()?;
+        anyhow::ensure!(
+            admission.alias() == agent_alias,
+            "agent execution admission alias changed during construction"
+        );
+        config = admission.config().as_ref().clone();
+    }
+    let execution_capability = execution_admission
+        .as_ref()
+        .map(AgentExecutionAdmission::capability);
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
@@ -2881,6 +3072,7 @@ pub async fn process_message(
         memory_namespace = %memory_composite,
     );
     let __zc_body = async move {
+        let _execution_admission = execution_admission;
         let agent_alias: &str = __zc_alias.as_str();
         let message: &str = __zc_message.as_str();
         let session_id: Option<&str> = __zc_session_id.as_deref();
@@ -2941,19 +3133,20 @@ pub async fn process_message(
         let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
-            let (engine, audit) = crate::sop::build_sop_engine(
+            let (engine, audit) = crate::sop::build_sop_engine_with_capability(
                 config.sop.clone(),
                 &config.data_dir,
                 &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
+                execution_capability.clone(),
             );
             (Some(engine), Some(audit))
         } else {
             (None, None)
         };
 
-        let all_tools_result_pm = tools::all_tools_with_runtime(
+        let all_tools_result_pm = tools::all_tools_with_runtime_and_execution_capability(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -2976,7 +3169,10 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
-            None,
+            execution_capability
+                .as_ref()
+                .map(AgentExecutionCapability::config_handle),
+            execution_capability.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3024,6 +3220,8 @@ pub async fn process_message(
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
+            &config,
+            agent_alias,
             &ask_user_handle,
             &channel_room_handle,
             &reaction_handle,
@@ -3339,7 +3537,7 @@ pub async fn process_message(
         }
 
         let routed_approval_channel = risk_profile.approval_route.as_ref().and_then(|route| {
-            live_channel_registry().map(|handles| {
+            live_approval_channel_registry(&config).map(|handles| {
                 crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
             })
         });
@@ -3556,7 +3754,7 @@ mod tests {
     #[test]
     fn seed_channel_handles_populates_channel_room_handle() {
         let channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
-        super::register_channel_map_fn(Box::new(move || {
+        super::register_channel_map_fn(Box::new(move |_, _| {
             let mut map = HashMap::new();
             map.insert("matrix.default".to_string(), Arc::clone(&channel));
             map
@@ -3569,6 +3767,8 @@ mod tests {
         let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
 
         let count = seed_channel_handles(
+            &zeroclaw_config::schema::Config::default(),
+            "test-agent",
             &Some(Arc::clone(&ask_user_handle)),
             &Some(Arc::clone(&channel_room_handle)),
             &reaction,

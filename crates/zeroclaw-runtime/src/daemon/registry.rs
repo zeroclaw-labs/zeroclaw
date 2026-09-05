@@ -9,8 +9,11 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{Config, MqttConfig};
 
 use super::{GatewayReadinessReporter, SocketReadinessReporter};
+use crate::LiveConfigAuthority;
 use crate::rpc::context::RpcContext;
 use crate::rpc::tui_identity::TuiRegistry;
+
+pub type ChannelRegistryClearer = Arc<dyn Fn() + Send + Sync>;
 
 pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
@@ -18,6 +21,40 @@ pub type StarterFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 pub struct GatewayReloadControls {
     pub shutdown_tx: watch::Sender<bool>,
     pub reload_tx: watch::Sender<bool>,
+    pub(crate) channel_generation_control: Option<Arc<super::ChannelGenerationControl>>,
+}
+
+impl GatewayReloadControls {
+    pub fn standalone(shutdown_tx: watch::Sender<bool>, reload_tx: watch::Sender<bool>) -> Self {
+        Self {
+            shutdown_tx,
+            reload_tx,
+            channel_generation_control: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_channel_generation(
+        shutdown_tx: watch::Sender<bool>,
+        reload_tx: watch::Sender<bool>,
+        registry_clearer: ChannelRegistryClearer,
+    ) -> Self {
+        Self {
+            shutdown_tx,
+            reload_tx,
+            channel_generation_control: Some(Arc::new(super::ChannelGenerationControl::new(Some(
+                registry_clearer,
+            )))),
+        }
+    }
+
+    pub fn send(&self, value: bool) -> Result<(), watch::error::SendError<bool>> {
+        self.reload_tx.send(value)
+    }
+
+    pub fn prepare_channel_generation(&self) -> Option<super::PreparedChannelGenerationDrain> {
+        self.channel_generation_control.as_ref()?.prepare()
+    }
 }
 
 pub type GatewayStarter = Box<
@@ -25,6 +62,7 @@ pub type GatewayStarter = Box<
             String,
             u16,
             Config,
+            LiveConfigAuthority,
             Option<broadcast::Sender<Value>>,
             Option<GatewayReloadControls>,
             Option<Arc<TuiRegistry>>,
@@ -35,7 +73,8 @@ pub type GatewayStarter = Box<
 >;
 
 /// Starts the supervised channel orchestrator for one daemon run/reload iteration.
-pub type ChannelsStarter = Box<dyn Fn(Config, CancellationToken) -> StarterFuture + Send + Sync>;
+pub type ChannelsStarter =
+    Box<dyn Fn(LiveConfigAuthority, CancellationToken) -> StarterFuture + Send + Sync>;
 
 /// Starts the local IPC transport and optionally reports its secured bind.
 pub type SocketStarter = Box<
@@ -61,6 +100,7 @@ pub type MqttStarter = Box<dyn Fn(MqttConfig) -> StarterFuture + Send + Sync>;
 pub struct DaemonRegistry {
     gateway_start: Option<GatewayStarter>,
     channels_start: Option<ChannelsStarter>,
+    channel_registry_clearer: Option<ChannelRegistryClearer>,
     socket_start: Option<SocketStarter>,
     wss_start: Option<RpcStarter>,
     relay_start: Option<RpcStarter>,
@@ -91,6 +131,14 @@ impl DaemonRegistry {
 
     pub fn register_channels(&mut self, starter: ChannelsStarter) -> &mut Self {
         self.channels_start = Some(starter);
+        self
+    }
+
+    pub fn register_channel_registry_clearer(
+        &mut self,
+        clearer: ChannelRegistryClearer,
+    ) -> &mut Self {
+        self.channel_registry_clearer = Some(clearer);
         self
     }
 
@@ -164,6 +212,10 @@ impl DaemonRegistry {
         self.channels_start.take()
     }
 
+    pub(crate) fn take_channel_registry_clearer(&mut self) -> Option<ChannelRegistryClearer> {
+        self.channel_registry_clearer.take()
+    }
+
     pub(crate) fn take_socket_start(&mut self) -> Option<SocketStarter> {
         self.socket_start.take()
     }
@@ -202,7 +254,7 @@ mod tests {
     use super::*;
 
     fn gateway_starter() -> GatewayStarter {
-        Box::new(|_, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
+        Box::new(|_, _, _, _, _, _, _, _| Box::pin(async { Ok(()) }))
     }
 
     fn channels_starter() -> ChannelsStarter {
@@ -270,5 +322,49 @@ mod tests {
         assert!(!registry.has_socket_start());
         assert!(!registry.has_wss_start());
         assert!(!registry.has_mqtt_start());
+    }
+
+    #[test]
+    fn supervised_starters_receive_one_live_config_authority() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let expected_config = authority.config();
+        let expected_write_lock = authority.config_write_lock();
+
+        let gateway: GatewayStarter = Box::new({
+            let expected_config = expected_config.clone();
+            let expected_write_lock = expected_write_lock.clone();
+            move |_, _, _, received_authority, _, _, _, _| {
+                assert!(Arc::ptr_eq(&expected_config, &received_authority.config()));
+                assert!(Arc::ptr_eq(
+                    &expected_write_lock,
+                    &received_authority.config_write_lock()
+                ));
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let channels: ChannelsStarter = Box::new({
+            let expected_config = expected_config.clone();
+            let expected_write_lock = expected_write_lock.clone();
+            move |received_authority, _| {
+                assert!(Arc::ptr_eq(&expected_config, &received_authority.config()));
+                assert!(Arc::ptr_eq(
+                    &expected_write_lock,
+                    &received_authority.config_write_lock()
+                ));
+                Box::pin(async { Ok(()) })
+            }
+        });
+
+        std::mem::drop(gateway(
+            String::new(),
+            0,
+            Config::default(),
+            authority.clone(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        std::mem::drop(channels(authority, CancellationToken::new()));
     }
 }

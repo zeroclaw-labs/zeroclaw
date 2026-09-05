@@ -741,6 +741,7 @@ cli-desktop-not-installed = 未安装 ZeroClaw 配套应用。
 cli-desktop-blurb1 = 该配套应用是一个轻量级菜单栏应用，
 cli-desktop-blurb2 = 它连接到与 CLI 相同的网关。
 cli-config-all-configured = 所有部分均已配置。
+cli-config-initialized-sections = 已使用默认值初始化 {$count} 个部分：
 cli-config-schema-current = 配置已为当前架构版本。
 cli-config-applied-ops = 已应用 {$count} 个操作：
 cli-plugins-none = 未安装任何插件。

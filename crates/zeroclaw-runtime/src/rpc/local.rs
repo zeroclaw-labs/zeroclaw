@@ -1,7 +1,7 @@
 //! Local IPC transport for the RPC layer.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{LocalRpcSessionChannelFactory, RpcAccessPolicy, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -49,6 +49,144 @@ pub fn socket_path(config: &Config) -> PathBuf {
         return PathBuf::from(p);
     }
     platform::default_endpoint(&config.data_dir)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LocalRpcCallError {
+    #[error("local daemon is unavailable at {path}: {source}")]
+    Unavailable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("local daemon protocol failed: {0}")]
+    Protocol(String),
+    #[error("local daemon rejected the request ({code}): {message}")]
+    Remote { code: i64, message: String },
+}
+
+#[cfg(unix)]
+async fn connect_client(path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+#[cfg(windows)]
+async fn connect_client(
+    path: &std::path::Path,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = path.to_string_lossy();
+    for _ in 0..50 {
+        match ClientOptions::new().open(name.as_ref()) {
+            Ok(client) => return Ok(client),
+            Err(error) if error.raw_os_error() == Some(231) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!("named pipe {name} remained busy"),
+    ))
+}
+
+async fn request_response<S>(
+    stream: &mut BufReader<S>,
+    id: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, LocalRpcCallError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    let mut encoded = serde_json::to_vec(&request)
+        .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+    encoded.push(b'\n');
+    stream
+        .get_mut()
+        .write_all(&encoded)
+        .await
+        .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+
+    loop {
+        let mut line = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read_line(&mut line))
+            .await
+            .map_err(|_| LocalRpcCallError::Protocol(format!("{method} response timed out")))?
+            .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+        if read == 0 {
+            return Err(LocalRpcCallError::Protocol(format!(
+                "daemon closed the connection during {method}"
+            )));
+        }
+        let frame: serde_json::Value = serde_json::from_str(line.trim())
+            .map_err(|error| LocalRpcCallError::Protocol(error.to_string()))?;
+        if frame.get("id") != Some(&serde_json::Value::String(id.to_string())) {
+            continue;
+        }
+        if let Some(error) = frame.get("error") {
+            return Err(LocalRpcCallError::Remote {
+                code: error
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(-1),
+                message: error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown RPC error")
+                    .to_string(),
+            });
+        }
+        return frame.get("result").cloned().ok_or_else(|| {
+            LocalRpcCallError::Protocol(format!("{method} response omitted result"))
+        });
+    }
+}
+
+/// Call one administrative method on the daemon owning `config`.
+pub async fn call_local(
+    config: &Config,
+    method: &str,
+    params: serde_json::Value,
+) -> std::result::Result<serde_json::Value, LocalRpcCallError> {
+    let path = socket_path(config);
+    let stream = connect_client(&path)
+        .await
+        .map_err(|source| LocalRpcCallError::Unavailable {
+            path: path.clone(),
+            source,
+        })?;
+    let mut stream = BufReader::new(stream);
+    let initialize = request_response(
+        &mut stream,
+        "cli-initialize",
+        "initialize",
+        serde_json::json!({
+            "protocol_version": super::dispatch::RPC_PROTOCOL_VERSION,
+            "clientCapabilities": {},
+        }),
+    )
+    .await?;
+    let server_version = initialize
+        .get("server_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LocalRpcCallError::Protocol("initialize response omitted server_version".to_string())
+        })?;
+    if server_version != env!("CARGO_PKG_VERSION") {
+        return Err(LocalRpcCallError::Protocol(format!(
+            "daemon version {server_version} does not match CLI {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+    request_response(&mut stream, "cli-request", method, params).await
 }
 
 // ── Transport ────────────────────────────────────────────────────
@@ -127,6 +265,16 @@ pub async fn run_local_listener(
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
+    run_local_listener_with_factory(ctx, cancel, client_count, readiness, None).await
+}
+
+pub async fn run_local_listener_with_factory(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
+    channel_factory: Option<LocalRpcSessionChannelFactory>,
+) -> Result<()> {
     let path = {
         let config = ctx.config.read();
         socket_path(&config)
@@ -150,6 +298,9 @@ pub async fn run_local_listener(
         "RPC local IPC listening"
     );
 
+    let connections_cancel = cancel.child_token();
+    let mut connections = tokio::task::JoinSet::new();
+    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -159,6 +310,16 @@ pub async fn run_local_listener(
                     "RPC local IPC shutting down"
                 );
                 break;
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("RPC local IPC connection task failed: {error}")
+                    );
+                }
             }
             accept = platform::accept(&mut listener, &path) => {
                 let stream = match accept {
@@ -178,21 +339,35 @@ pub async fn run_local_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        return Err(e).context("local IPC accept error");
+                        listener_result = Err(e).context("local IPC accept error");
+                        break;
                     }
                 };
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
+                let connection_cancel = connections_cancel.clone();
+                let channel_factory = channel_factory.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
+                connections.spawn(async move {
                     let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    dispatcher.run(&mut transport).await;
+                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        connection_cancel.child_token(),
+                        RpcAccessPolicy::TrustedLocal,
+                        channel_factory,
+                    );
+                    tokio::select! {
+                        _ = connection_cancel.cancelled() => {}
+                        _ = dispatcher.run(&mut transport) => {}
+                    }
+                    dispatcher.shutdown().await;
 
                     // Epoch-checked for the same reason as the WSS teardown: a
                     // reconnect adopting this TUI id must not be evicted by the
@@ -224,7 +399,19 @@ pub async fn run_local_listener(
         }
     }
 
-    Ok(())
+    connections_cancel.cancel();
+    while let Some(completed) = connections.join_next().await {
+        if let Err(error) = completed {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("RPC local IPC connection task failed during shutdown: {error}")
+            );
+        }
+    }
+
+    listener_result
 }
 
 // ── Platform shims ───────────────────────────────────────────────
@@ -658,6 +845,72 @@ mod tests {
         Arc::new(AtomicUsize::new(0))
     }
 
+    #[cfg(unix)]
+    struct BlockingModelProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for BlockingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[cfg(unix)]
+    impl zeroclaw_api::attribution::Attributable for BlockingModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "blocking-local-test"
+        }
+    }
+
+    #[cfg(unix)]
+    async fn insert_blocking_session(
+        ctx: &Arc<RpcContext>,
+        session_id: &str,
+        started: Arc<tokio::sync::Notify>,
+    ) {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(BlockingModelProvider { started }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("blocking local test agent should build");
+        ctx.sessions
+            .insert(
+                session_id.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    std::env::temp_dir().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .expect("blocking local test session should insert");
+    }
+
     fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
         let req = JsonRpcRequest::new(
             method.wire_name(),
@@ -808,6 +1061,56 @@ mod tests {
         cancel.cancel();
         drop(writer);
         let _ = handle.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_initializes_and_executes_one_admin_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        ctx.config
+            .write()
+            .create_map_key("agents", "local_client")
+            .unwrap();
+        let config = ctx.config.read().clone();
+        let sock_path = socket_path(&config);
+        let cancel = CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, test_client_count(), None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let value = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect("local administrative call");
+        let result: crate::rpc::types::AgentsListResult =
+            serde_json::from_value(value).expect("agents/list wire shape");
+        assert!(
+            result
+                .agents
+                .iter()
+                .any(|agent| agent.alias == "local_client")
+        );
+
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_local_classifies_absent_endpoint_as_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+
+        let error = call_local(&config, "agents/list", serde_json::json!({}))
+            .await
+            .expect_err("absent endpoint must not look like a protocol failure");
+        assert!(matches!(error, LocalRpcCallError::Unavailable { .. }));
     }
 
     #[cfg(unix)]
@@ -1241,7 +1544,7 @@ mod tests {
         let (pending_tx, mut pending_rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
         ctx.approval_pending
-            .insert("test-req-1".to_string(), pending_tx);
+            .insert("test-req-1".to_string(), "unused".to_string(), pending_tx);
 
         let approve_params = serde_json::json!({
             "session_id": "unused",
@@ -1296,6 +1599,72 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_closes_connection_and_joins_inflight_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let session_id = "inflight-local-prompt";
+        insert_blocking_session(&ctx, session_id, Arc::clone(&started)).await;
+
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&ctx);
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, server_count, None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "prompt": "remain in flight until the connection closes",
+                    }),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("local prompt should reach the blocking provider");
+        assert!(ctx.sessions.has_inflight_turn(session_id));
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("listener should drain the in-flight prompt before returning")
+            .expect("listener task should not panic")
+            .expect("listener should stop cleanly");
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(!ctx.sessions.has_inflight_turn(session_id));
+        assert!(ctx.sessions.get_agent(session_id).await.is_some());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.expect("client read") == 0 {
+                    break;
+                }
+                serde_json::from_str::<serde_json::Value>(line.trim())
+                    .expect("shutdown may emit only complete final RPC frames");
+            }
+        })
+        .await
+        .expect("cancelled client should observe EOF");
     }
 
     #[cfg(windows)]

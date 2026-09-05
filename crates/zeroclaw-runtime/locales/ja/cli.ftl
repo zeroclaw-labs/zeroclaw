@@ -740,6 +740,7 @@ cli-desktop-not-installed = ZeroClaw コンパニオンアプリがインスト�
 cli-desktop-blurb1 = コンパニオンアプリは軽量なメニューバーアプリで、
 cli-desktop-blurb2 = CLI と同じゲートウェイに接続します。
 cli-config-all-configured = すべてのセクションは既に設定済みです。
+cli-config-initialized-sections = {$count} 個のセクションをデフォルト値で初期化しました:
 cli-config-schema-current = 設定は既に現在のスキーマバージョンです。
 cli-config-applied-ops = {$count} 件の操作を適用しました:
 cli-plugins-none = インストールされているプラグインはありません。

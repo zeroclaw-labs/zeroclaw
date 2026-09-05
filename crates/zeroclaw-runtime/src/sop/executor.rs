@@ -9,10 +9,11 @@ use anyhow::{Context, Result};
 use super::approval::{BrokerOutcome, ResolveOutcome};
 use super::audit::SopAuditLogger;
 use super::engine::SopEngine;
-use super::types::{SopRun, SopRunAction, SopStepResult, StepToolCall};
+use super::types::{SopExecutionWitness, SopRun, SopRunAction, SopStepResult, StepToolCall};
 
 use crate::agent::history::truncate_tool_result;
 use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
+use crate::live_config_authority::AgentExecutionCapability;
 
 const MAX_STEP_TOOL_CALLS: usize = 256;
 const MAX_STEP_TOOL_OUTPUT_CHARS: usize = 4096;
@@ -149,6 +150,22 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
     }
 }
 
+fn validate_managed_execution_witness(
+    engine: &Arc<Mutex<SopEngine>>,
+    execution_capability: Option<&AgentExecutionCapability>,
+    execution_witness: Option<&SopExecutionWitness>,
+) -> Result<()> {
+    let managed = execution_capability.is_some()
+        || match engine.lock() {
+            Ok(engine) => engine.has_execution_capability(),
+            Err(poisoned) => poisoned.into_inner().has_execution_capability(),
+        };
+    if managed && execution_witness.is_none() {
+        anyhow::bail!("managed SOP ExecuteStep is missing its authority witness");
+    }
+    Ok(())
+}
+
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
 pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
@@ -234,8 +251,18 @@ pub fn spawn_headless_run_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) {
+    spawn_headless_run_driver_with_capability(config, engine, audit, first_action, None);
+}
+
+pub fn spawn_headless_run_driver_with_capability(
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+    execution_capability: Option<AgentExecutionCapability>,
+) {
     zeroclaw_spawn::spawn!(async move {
-        drive_headless_run(config, engine, audit, first_action).await;
+        drive_headless_run(config, engine, audit, first_action, execution_capability).await;
     });
 }
 
@@ -251,11 +278,27 @@ pub fn drive_resumed_broker_action(
     audit: Option<Arc<SopAuditLogger>>,
     outcome: &BrokerOutcome,
 ) {
+    drive_resumed_broker_action_with_capability(config, engine, audit, outcome, None);
+}
+
+pub fn drive_resumed_broker_action_with_capability(
+    config: &zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    outcome: &BrokerOutcome,
+    execution_capability: Option<AgentExecutionCapability>,
+) {
     let BrokerOutcome::Resolved(ResolveOutcome::Resumed(action)) = outcome else {
         return;
     };
 
-    spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
+    spawn_headless_run_driver_with_capability(
+        config.clone(),
+        engine,
+        audit,
+        action.as_ref().clone(),
+        execution_capability,
+    );
 }
 
 async fn drive_headless_run(
@@ -263,6 +306,7 @@ async fn drive_headless_run(
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
+    execution_capability: Option<AgentExecutionCapability>,
 ) {
     use crate::sop::types::SopStepStatus;
 
@@ -273,7 +317,62 @@ async fn drive_headless_run(
                 run_id,
                 step,
                 context,
+                execution_witness,
             } => {
+                if let Err(error) = validate_managed_execution_witness(
+                    &engine,
+                    execution_capability.as_ref(),
+                    execution_witness.as_ref(),
+                ) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                        "SOP headless driver: managed ExecuteStep witness validation failed"
+                    );
+                    return;
+                }
+                let selected_alias = step
+                    .agent
+                    .clone()
+                    .or_else(|| config.agents.keys().min().cloned())
+                    .unwrap_or_default();
+                let execution_admission = match execution_witness
+                    .as_ref()
+                    .map(|witness| witness.admit(&selected_alias))
+                    .transpose()
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "agent": selected_alias,
+                                "error": error.to_string(),
+                            })),
+                            "SOP headless driver: authority witness rejected before target execution"
+                        );
+                        return;
+                    }
+                };
+                let effective_config = execution_admission
+                    .as_ref()
+                    .map(|admission| admission.config().as_ref().clone())
+                    .unwrap_or_else(|| config.clone());
+                let agent_alias = execution_admission
+                    .as_ref()
+                    .map(|admission| admission.alias().to_string())
+                    .unwrap_or(selected_alias);
                 let cancel_at_boundary = {
                     let mut guard = match engine.lock() {
                         Ok(g) => g,
@@ -295,30 +394,24 @@ async fn drive_headless_run(
                                 ::zeroclaw_log::Action::Fail
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "error": e.to_string(),
-                            })),
+                            .with_attrs(
+                                ::serde_json::json!({"run_id": run_id, "error": e.to_string()})
+                            ),
                             "SOP headless driver: failed to finish requested cancellation"
                         );
                         return;
                     }
                 }
-                let agent_alias = step
-                    .agent
-                    .clone()
-                    .or_else(|| config.agents.keys().min().cloned())
-                    .unwrap_or_default();
                 let started_at = crate::sop::engine::now_iso8601();
                 let session_path =
                     std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
                 let run_result = Box::pin(crate::agent::run(
-                    config.clone(),
+                    effective_config.clone(),
                     &agent_alias,
                     Some(context),
                     None,
                     None,
-                    config
+                    effective_config
                         .model_provider_for_agent(&agent_alias)
                         .and_then(|e| e.temperature),
                     vec![],
@@ -326,7 +419,10 @@ async fn drive_headless_run(
                     Some(session_path),
                     None,
                     zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
+                    crate::agent::loop_::AgentRunOverrides {
+                        execution_admission: execution_admission.clone(),
+                        ..crate::agent::loop_::AgentRunOverrides::default()
+                    },
                 ))
                 .await;
                 let completed_at = crate::sop::engine::now_iso8601();
@@ -360,6 +456,7 @@ async fn drive_headless_run(
                         )
                         .await;
                         action = next;
+                        drop(execution_admission);
                     }
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -555,6 +652,7 @@ pub(crate) async fn audit_sop_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_config_authority::LiveConfigAuthority;
     use crate::sop::metrics::SopMetricsCollector;
     use crate::sop::store::{InMemoryRunStore, SopRunStore};
     use crate::sop::types::{
@@ -601,6 +699,61 @@ mod tests {
         match action {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn managed_sop_consumers_reject_missing_execution_witness() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let authority = LiveConfigAuthority::new(config);
+        let engine = Arc::new(Mutex::new(
+            SopEngine::new(SopConfig::default())
+                .with_execution_capability(authority.execution_capability()),
+        ));
+
+        let error = validate_managed_execution_witness(&engine, None, None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "managed SOP ExecuteStep is missing its authority witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_sop_rejects_stale_or_closed_action_without_advancing() {
+        for closed in [false, true] {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.agents.insert("alpha".into(), Default::default());
+            let authority = LiveConfigAuthority::new(config.clone());
+            let mut engine = SopEngine::new(SopConfig::default())
+                .with_execution_capability(authority.execution_capability());
+            engine.set_sops_for_test(vec![test_sop("queued")]);
+            let action = engine.start_run("queued", manual_event()).unwrap();
+            let run_id = extract_run_id(&action);
+            if closed {
+                authority.close_agent_lifecycle();
+            } else {
+                drop(authority.agent_lifecycle().begin_delete("alpha").unwrap());
+            }
+            let before = serde_json::to_value(engine.get_run(&run_id).unwrap()).unwrap();
+            let engine = Arc::new(Mutex::new(engine));
+            drive_headless_run(
+                config,
+                engine.clone(),
+                None,
+                action,
+                Some(authority.execution_capability()),
+            )
+            .await;
+            let guard = engine.lock().unwrap();
+            assert_eq!(
+                serde_json::to_value(guard.get_run(&run_id).unwrap()).unwrap(),
+                before
+            );
+            assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
         }
     }
 

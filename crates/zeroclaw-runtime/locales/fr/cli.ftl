@@ -745,6 +745,7 @@ cli-desktop-not-installed = L'application compagnon ZeroClaw n'est pas installé
 cli-desktop-blurb1 = L'application compagnon est une application légère de barre de menus qui
 cli-desktop-blurb2 = se connecte à la même passerelle que la CLI.
 cli-config-all-configured = Toutes les sections sont déjà configurées.
+cli-config-initialized-sections = {$count} section(s) initialisée(s) avec les valeurs par défaut :
 cli-config-schema-current = La configuration est déjà à la version actuelle du schéma.
 cli-config-applied-ops = {$count} opération(s) appliquée(s) :
 cli-plugins-none = Aucun plugin installé.
