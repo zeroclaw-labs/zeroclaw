@@ -1586,7 +1586,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's own configured provider temperature — the same source
     /// the headless driver hands `crate::agent::run`.
     temperature: Option<f64>,
-    pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
+    /// The step agent's sealed tool set. A [`crate::tools::scoped::ScopedToolRegistry`]
+    /// so the nested loop's `ResolvedIo.tools_registry` can be fed the scoped
+    /// registry directly (coerces to `&[Box<dyn Tool>]` at leaf sites via `Deref`).
+    pub(crate) tools_registry: crate::tools::scoped::ScopedToolRegistry,
     approval: crate::approval::ApprovalManager,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     /// The step agent's fully-resolved config (identity + every runtime-profile
@@ -1728,7 +1731,8 @@ pub(crate) async fn assemble_owned_execution(
         mcp_tool_names,
         ..
     } = assembled;
-    let tools_registry = registry.into_inner();
+    // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
+    let tools_registry = registry;
 
     let provider_ref = config
         .resolved_model_provider_for_agent(alias)
@@ -1828,7 +1832,7 @@ async fn drive_live_sop_actions(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
-    tools_registry: &[Box<dyn crate::tools::Tool>],
+    tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
@@ -1882,6 +1886,11 @@ async fn drive_live_sop_actions(
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
         let mut action = queued.action.clone();
+        // Per-run budget for deterministic capabilities driven inside this
+        // turn, matching `MAX_HEADLESS_DRIVE_STEPS` in the two headless
+        // drivers. Reset per queued action so one run's routing cycle cannot
+        // consume a later run's allowance.
+        let mut deterministic_steps_driven = 0usize;
         loop {
             match action {
                 crate::sop::SopRunAction::ExecuteStep {
@@ -1995,7 +2004,7 @@ async fn drive_live_sop_actions(
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
                                 o.model.as_str(),
-                                o.tools_registry.as_slice(),
+                                &o.tools_registry,
                                 Some(&o.approval),
                                 o.activated_tools.as_ref(),
                             ),
@@ -2297,17 +2306,33 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
-                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "step": step.number,
-                            })),
-                        "SOP live executor yielded deterministic step"
-                    );
-                    break;
+                crate::sop::SopRunAction::DeterministicStep { ref run_id, .. } => {
+                    let run_id = run_id.clone();
+                    // Bound this action type exactly as both headless drivers
+                    // do. `StepFailure::Goto` takes an arbitrary step number
+                    // and nothing validates that routes are acyclic, so a
+                    // capability that keeps failing and routes backwards would
+                    // otherwise spin the enclosing loop at full speed, taking
+                    // and releasing the engine mutex on every iteration and
+                    // starving every other SOP surface. `yield_now` keeps the
+                    // async runtime responsive but does not end the loop.
+                    if deterministic_steps_driven >= crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS
+                    {
+                        crate::sop::executor::fail_exhausted_step_budget(&queued.engine, &run_id);
+                        break;
+                    }
+                    deterministic_steps_driven += 1;
+                    let next = {
+                        let mut engine = match queued.engine.lock() {
+                            Ok(engine) => engine,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        engine.advance_headless_deterministic_step(&run_id, action)?
+                    };
+                    action = next;
+                    // Let an operator request acquire the engine before the next
+                    // deterministic capability is dispatched.
+                    tokio::task::yield_now().await;
                 }
                 crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
                     ::zeroclaw_log::record!(
@@ -2348,6 +2373,18 @@ async fn drive_live_sop_actions(
                                 "sop_name": sop_name,
                             })),
                         "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Cancelled { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor observed cancelled run"
                     );
                     break;
                 }
@@ -3112,7 +3149,7 @@ mod sop_step_reassembly_tests {
             provider_name: "capture".into(),
             model: "capture-model".into(),
             temperature,
-            tools_registry: tools,
+            tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             approval: crate::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             ),
@@ -3195,7 +3232,7 @@ mod sop_step_reassembly_tests {
         engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         action: crate::sop::types::SopRunAction,
         parent_provider: &dyn ModelProvider,
-        parent_tools: &[Box<dyn crate::tools::Tool>],
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
         observer: &dyn crate::observability::Observer,
         history: &mut Vec<ChatMessage>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
@@ -3305,7 +3342,7 @@ mod sop_step_reassembly_tests {
         );
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("parent system prompt"),
             ChatMessage::user(PARENT_MARKER.to_string()),
@@ -3415,9 +3452,12 @@ mod sop_step_reassembly_tests {
         let parent_provider = TextProvider;
         // Parent scope carries a sensitive tool the child must never be offered.
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3493,7 +3533,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3538,7 +3578,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut exec_cache = std::collections::HashMap::new();
 
@@ -3589,7 +3629,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut capture: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3640,9 +3680,12 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly { config: &config };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3685,9 +3728,12 @@ mod sop_step_reassembly_tests {
         let shell_calls = Arc::new(AtomicUsize::new(0));
         // Parent/delegate scope: a sensitive tool the cross-agent step must never
         // reach.
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3846,7 +3892,9 @@ mod sop_step_reassembly_tests {
                 provider_name: "child-original-provider".into(),
                 model: "child-original-model".into(),
                 temperature: None,
-                tools_registry: vec![Box::new(ChildModelSwitchTool)],
+                tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(ChildModelSwitchTool),
+                ]),
                 approval: crate::approval::ApprovalManager::for_non_interactive(
                     &stepper_risk_profile,
                 ),
@@ -3866,7 +3914,7 @@ mod sop_step_reassembly_tests {
         let parent_switch_state: ModelSwitchCallback = Arc::new(std::sync::Mutex::new(None));
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3911,6 +3959,117 @@ mod sop_step_reassembly_tests {
             step.output.contains("child-provider") && step.output.contains("child-model"),
             "the step failure must name the CHILD's own requested switch: {}",
             step.output
+        );
+    }
+
+    /// Regression for the unbounded live-turn deterministic drive: both
+    /// headless drivers cap at `MAX_HEADLESS_DRIVE_STEPS` because
+    /// `StepFailure::Goto`/`routing.next` take arbitrary step numbers and
+    /// nothing validates that routes are acyclic. `drive_live_sop_actions`
+    /// advanced `DeterministicStep` in place and continued its enclosing
+    /// `loop` with no iteration bound, so a cyclic route reached through an
+    /// agent turn spun forever, taking and releasing the engine mutex on
+    /// every iteration. The live path must agree with the other two drivers:
+    /// terminalize the run as `Failed` and release its admission claim.
+    #[tokio::test]
+    async fn cyclic_deterministic_route_exhausts_the_live_turn_step_budget() {
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind,
+            SopTrigger, SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        // 1 -> 2 -> 1 -> ... : a two-node cycle of always-succeeding
+        // capabilities, so nothing but the budget can end the run.
+        let cap_step = |number: u32, next: u32| {
+            let mut step = SopStep {
+                number,
+                title: format!("Capability {number}"),
+                kind: SopStepKind::Capability,
+                capability: Some("noop".into()),
+                ..SopStep::default()
+            };
+            step.routing.next = Some(next);
+            step
+        };
+        let sop = Sop {
+            name: "cyclic".to_string(),
+            description: "cyclic deterministic route".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![cap_step(1, 2), cap_step(2, 1)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        // A step is revisited every other iteration, so the per-step visit
+        // bound must stay well above the drive budget for this test to prove
+        // the BUDGET is what stops the loop.
+        let mut engine = crate::sop::SopEngine::new(SopConfig {
+            max_step_visits: u32::MAX,
+            ..SopConfig::default()
+        });
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "cyclic",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-08-22T00:00:00Z".to_string(),
+                },
+            )
+            .expect("run starts");
+        let run_id = match &action {
+            crate::sop::types::SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected a DeterministicStep, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let parent_provider = TextProvider;
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+
+        // Without the bound this call never returns.
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            None,
+            None,
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("run retained after budget");
+        assert_eq!(
+            run.status,
+            SopRunStatus::Failed,
+            "an exhausted live-turn budget must terminalize the run"
+        );
+        assert!(
+            !guard.active_runs().contains_key(&run_id),
+            "the failed run must leave the active set so its admission claim is released"
+        );
+        assert_eq!(
+            run.step_results.len(),
+            crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS,
+            "the live driver must execute exactly MAX_HEADLESS_DRIVE_STEPS capabilities, \
+             the same bound both headless drivers use"
         );
     }
 }

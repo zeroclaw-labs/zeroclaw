@@ -6,6 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stable code for the withheld `vi_verify` capability notice.
+///
+/// Named here because two channels report this one fact and an operator has to
+/// be able to tell that they are the same fact: `Config::collect_warnings()`
+/// raises the structured warning, and the runtime traces it at each config
+/// application (`warn_verifiable_intent_withheld` in `src/main.rs`).
+///
+/// The prose deliberately differs per surface — the [`ValidationWarning`]
+/// message is the stable English contract for API consumers, `zeroclaw doctor`
+/// renders a localized line through Fluent, and the trace carries an operator
+/// log sentence. The code is what ties them together, which is why it is shared
+/// and the wording is not.
+pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -15,16 +29,16 @@ use serde::{Deserialize, Serialize};
 ///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
-/// - `whatsapp_chat_policy_inert`: a WhatsApp Web `dm_policy` / `group_policy` /
-///   `self_chat_mode` is set but the transport only consults them under
-///   `mode = "personal"`, so it currently has no effect.
-/// - `whatsapp_empty_group_allowlist_permits_all`: `allowed_groups` is empty in
-///   a configuration where that list is the only group gate, so it permits every
-///   group the linked account belongs to. Raised for `mode = "business"` (which
-///   never consults `group_policy`) and for `mode = "personal"` with
-///   `group_policy = "allowlist"`. Personal mode with `group_policy = "ignore"`
-///   already drops every group message, and `group_policy = "all"` is an explicit
-///   opt-in to open access, so neither is reported.
+/// - `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but
+///   the transport only consults it under `mode = "personal"`, so it currently
+///   has no effect. `dm_policy` and `group_policy` apply under both modes and
+///   are never reported under this code.
+/// - `whatsapp_empty_group_list_serves_no_group`: `allowed_groups` is empty and
+///   `group_policy` is `"allowlist"`, so the channel answers no group where an
+///   empty list used to admit every group at the identity gate. A migration
+///   notice about lost capability, not a fail-open alarm. `"all"` admits every
+///   group before and after, and `"ignore"` rejects every group before and
+///   after under BOTH modes, so neither is reported.
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
@@ -44,6 +58,13 @@ use serde::{Deserialize, Serialize};
 /// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
 ///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
 ///   require direct transport and therefore make the selected tool fail.
+/// - `verifiable_intent_tool_withheld`: `verifiable_intent.enabled` is set, but
+///   the `vi_verify` tool is withheld from the model-visible registry until a
+///   credential chain verifier exists, so enabling the section does not enable
+///   credential verification. The runtime also traces this at config load, and
+///   that trace has no sink under `observability.log_persistence = "none"`;
+///   this warning is the channel that survives, since `zeroclaw doctor` and the
+///   config API read the structured list rather than the log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

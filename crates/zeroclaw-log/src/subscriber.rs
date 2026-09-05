@@ -52,13 +52,26 @@ pub fn install_global_subscriber(
         .with(fmt_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    // Fail loudly: the subscriber above is already installed, so a discarded
+    // error here would leave the daemon looking healthy while every
+    // dependency record stays missing.
+    crate::log_bridge::install_or_panic();
 }
 
+/// Test-only subscriber install. Best-effort by design: a test binary calls
+/// this once per test, and both the `tracing` global default and the `log`
+/// logger slot accept exactly one installation per process, so every call
+/// after the first necessarily fails and is deliberately ignored. Production
+/// daemons go through [`install_global_subscriber`], which panics instead.
+///
+/// Not part of the public API despite the `pub`: it is reachable only so
+/// other workspace crates' `#[cfg(test)]` modules can install the pipeline.
 #[doc(hidden)]
 pub fn try_install_capture_subscriber() {
     use tracing_subscriber::Registry;
     let subscriber = Registry::default().with(LogCaptureLayer);
     let _ = tracing::subscriber::set_global_default(subscriber);
+    crate::log_bridge::install_best_effort_for_tests();
 }
 
 /// Test support: install a process-global subscriber that hands every
@@ -480,6 +493,783 @@ mod tests {
         assert!(
             !out.contains(F_EPHEMERAL_ATTRS),
             "bool-recorded ephemeral field leaked: {out:?}"
+        );
+    }
+
+    /// Message shapes lifted from `whatsapp-rust` at the revision this
+    /// workspace pins (`cbcdd2a`): `src/pair_code.rs` logs the configured
+    /// phone number and the generated pair code at `INFO`, `src/message.rs`
+    /// logs JIDs, and the transport logs a failure with no identifier in it
+    /// at all.
+    const PAIR_PHONE: &str = "972501234567";
+    const PAIR_CODE: &str = "3K7XW2QZ";
+    /// A pair code that drew no digits out of the Crockford alphabet — about
+    /// one code in twenty, and the shape a digits-only rule would leak.
+    const PAIR_CODE_ALL_LETTERS: &str = "ZXKWQTRV";
+    const PEER_JID: &str = "972501234567@s.whatsapp.net";
+    const TRANSPORT_FAILURE: &str = "websocket read failed: connection reset by peer";
+
+    /// Free-text shapes that no message heuristic can classify: an ordinary
+    /// given name, a mixed-case brand, a non-ASCII name, and a secret with no
+    /// digit and no `@` in it. Each is indistinguishable from prose by
+    /// inspection, which is why the boundary does not inspect.
+    const PERSON_NAME: &str = "Alice";
+    const BRAND_NAME: &str = "Acme";
+    const UNICODE_NAME: &str = "Zoë Müller";
+    const NONNUMERIC_SECRET: &str = "sk_live_zzyxwvutsrq";
+
+    /// Every third-party `log` record emitted by the body below. Pins that
+    /// the bridge forwards each one as a record rather than dropping it.
+    const BRIDGED_RECORD_COUNT: usize = 8;
+
+    /// The credential boundary, exercised through the real sinks rather than
+    /// the fmt probe: the global `LogCaptureLayer`, `writer::record_event`'s
+    /// rolling JSONL persistence, and the broadcast hook, wired exactly as
+    /// the daemon wires them.
+    ///
+    /// A bare `LogTracer` would hand every third-party `log` message to those
+    /// sinks as ordinary event text, so `whatsapp-rust`'s `INFO` pair-code and
+    /// phone-number lines would land in `runtime-trace.jsonl` and on the live
+    /// stream — bypassing the `LoginEvent::PairCode` -> `ephemeral_attrs`
+    /// boundary and `record_event`'s guarantee that pairing credentials are
+    /// never persisted.
+    ///
+    /// The bridge instead drops the message body of every third-party record
+    /// and forwards only bounded metadata, so this asserts both halves of
+    /// that bargain: no fragment of any dependency message text reaches
+    /// either sink — not the credentials, not the names and secrets a
+    /// heuristic would have waved through, not even the prose around them —
+    /// while the severity, the dependency's own target and its source line
+    /// all arrive intact, which is what makes the surviving record worth
+    /// persisting. The unbounded `module_path` and `file` channels are gone;
+    /// the `log_bridge` module docs give the reasoning.
+    #[test]
+    fn dependency_records_reach_the_sinks_without_their_message_text() {
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 1000,
+            ..crate::config::LogConfig::default()
+        };
+        crate::writer::init_from_config(&cfg, tmp.path());
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        // Real entry point: installs the capture layer *and* the bridge.
+        crate::try_install_capture_subscriber();
+
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            log::info!(
+                target: "Client/PairCode",
+                "Starting pair code authentication for phone: {PAIR_PHONE}"
+            );
+            log::info!(
+                target: "Client/PairCode",
+                "Stage 1 complete, waiting for phone confirmation. Code: {PAIR_CODE}"
+            );
+            log::info!(
+                target: "Client/PairCode",
+                "Stage 1 complete, waiting for phone confirmation. Code: {PAIR_CODE_ALL_LETTERS}"
+            );
+            log::warn!(
+                target: "whatsapp_rust::message",
+                "Failed to parse message info (from={PEER_JID}): bad MAC"
+            );
+            log::info!(
+                target: "whatsapp_rust::message",
+                "delivering receipt to contact {PERSON_NAME} of {BRAND_NAME}"
+            );
+            log::info!(
+                target: "whatsapp_rust::message",
+                "push name updated to {UNICODE_NAME}"
+            );
+            log::warn!(
+                target: "whatsapp_rust::handshake",
+                "rejected credential {NONNUMERIC_SECRET}"
+            );
+            log::warn!(
+                target: "whatsapp_rust::socket",
+                "{TRANSPORT_FAILURE}"
+            );
+        });
+
+        let mut broadcast = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            broadcast.push(value.to_string());
+        }
+        crate::broadcast::clear_broadcast_hook();
+
+        crate::writer::flush_for_test().unwrap();
+        let persisted =
+            std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
+
+        for (sink, body) in [
+            ("persisted runtime-trace.jsonl", persisted.as_str()),
+            ("live broadcast", broadcast.concat().as_str()),
+        ] {
+            for (what, marker) in [
+                ("phone number", PAIR_PHONE),
+                ("pair code", PAIR_CODE),
+                ("all-letter pair code", PAIR_CODE_ALL_LETTERS),
+                ("peer JID", PEER_JID),
+                // The four shapes a message heuristic cannot rule on. Each
+                // one is plain prose to any classifier, and each one used to
+                // cross verbatim.
+                ("person name", PERSON_NAME),
+                ("brand name", BRAND_NAME),
+                ("non-ASCII name", UNICODE_NAME),
+                ("nonnumeric secret", NONNUMERIC_SECRET),
+                // Not just the payloads: no third-party message text at all,
+                // including the prose that framed them and a failure line
+                // with no identifier in it.
+                ("message prose", "Starting pair code authentication"),
+                ("identifier-free failure text", TRANSPORT_FAILURE),
+            ] {
+                assert!(
+                    !body.contains(marker),
+                    "third-party {what} must not reach the {sink}: {body}"
+                );
+            }
+        }
+
+        // Every emission still arrives as a record: the text is withheld, the
+        // event is not suppressed.
+        let bridged: Vec<serde_json::Value> = persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["attributes"]["log.target"].is_string())
+            .collect();
+        assert_eq!(
+            bridged.len(),
+            BRIDGED_RECORD_COUNT,
+            "every third-party record must still be persisted, message withheld \
+             rather than event dropped: {persisted}"
+        );
+        for record in &bridged {
+            assert_eq!(
+                record["message"],
+                crate::log_bridge::REDACTED_MESSAGE,
+                "every bridged message body must be the fixed marker: {record}"
+            );
+        }
+        assert_eq!(
+            broadcast.len(),
+            BRIDGED_RECORD_COUNT,
+            "every third-party record must also reach the live broadcast: {broadcast:?}"
+        );
+
+        // What the bridge is still worth: severity and provenance. The
+        // transport failure is findable by its crate's reviewed name — a
+        // module-path target reduces to the crate, since everything after
+        // `::` is a runtime string — plus its severity and line. The
+        // hand-written literals (`Client/PairCode` above) keep their full
+        // reviewed spelling.
+        let failure = bridged
+            .iter()
+            .find(|record| {
+                record["attributes"]["log.target"] == "whatsapp_rust"
+                    && record["severity_text"] == "WARN"
+                    && record["attributes"]["log.line"].as_u64().is_some()
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the dependency's transport failure must still be persisted, \
+                     addressable by its crate name: {persisted}"
+                )
+            });
+        assert_eq!(
+            failure["attributes"]["log.target"], "whatsapp_rust",
+            "the failure must carry the crate's reviewed name so RUST_LOG \
+             directives still address it: {failure}"
+        );
+        assert!(
+            failure["attributes"]["log.module_path"].is_null(),
+            "the module path is an unbounded string channel and must not be \
+             forwarded at all: {failure}"
+        );
+        assert!(
+            failure["attributes"]["log.file"].is_null(),
+            "the source file is an unbounded string channel and must not be \
+             forwarded at all: {failure}"
+        );
+        assert!(
+            failure["attributes"]["log.line"].as_u64().is_some(),
+            "the failure must keep its source line: {failure}"
+        );
+
+        // Severities are per-record, not flattened onto the marker.
+        assert_eq!(
+            bridged
+                .iter()
+                .filter(|record| record["severity_text"] == "INFO")
+                .count(),
+            5,
+            "each record must keep its own severity: {persisted}"
+        );
+    }
+
+    /// Markers a dependency could put in a record's metadata at runtime.
+    /// Deliberately identifier-shaped for the two dropped channels: if
+    /// `module_path` and `file` were sanitized rather than dropped, these
+    /// would sail through any charset rule.
+    const DYNAMIC_TARGET_PAYLOAD: &str = "zeroclaw_dynamic_target_marker";
+    const DYNAMIC_MODULE_PAYLOAD: &str = "zeroclaw_dynamic_module_marker";
+    const DYNAMIC_FILE_PAYLOAD: &str = "zeroclaw_dynamic_file_marker";
+    /// Runtime targets that FIT the retired charset rule — bare numeric,
+    /// underscore-separated secret-shaped, identifier-shaped — and must be
+    /// stopped anyway: fitness is provenance against the reviewed tables,
+    /// not shape.
+    const NUMERIC_TARGET_PAYLOAD: &str = "31337000073313370001";
+    const SECRET_TARGET_PAYLOAD: &str = "sk_live_zeroclaw_marker_token";
+    const NAME_TARGET_PAYLOAD: &str = "ZeroclawDynamicNameMarker";
+
+    /// The metadata half of the credential boundary, through the same real
+    /// sinks: the global `LogCaptureLayer`, the rolling JSONL writer and the
+    /// broadcast hook.
+    ///
+    /// `log::RecordBuilder` takes a borrowed `&str` for `target`,
+    /// `module_path` and `file`, and the `log!` macros take a `target:`
+    /// expression rather than a literal, so a dependency can put a runtime
+    /// value in any of the three. Forwarding them as trusted provenance
+    /// therefore reopens the same persistence path the message-body
+    /// redaction closes: `tracing_log` normalizes them into `log.target` /
+    /// `log.module_path` / `log.file`, `LogCaptureLayer` puts unrecognized
+    /// fields into the attributes map, and `writer::record_event` sends that
+    /// map to both broadcast and disk.
+    ///
+    /// So: `module_path` and `file` are dropped outright and must not appear
+    /// even when their content is a plain identifier, and a target outside
+    /// the documented safe representation is replaced whole rather than
+    /// trimmed to its acceptable characters.
+    #[test]
+    fn dynamic_record_metadata_never_reaches_the_sinks() {
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 1000,
+            ..crate::config::LogConfig::default()
+        };
+        crate::writer::init_from_config(&cfg, tmp.path());
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        // Real entry point: installs the capture layer *and* the bridge.
+        crate::try_install_capture_subscriber();
+
+        // Built by hand rather than through `log::warn!`, because the macro
+        // fills `module_path` and `file` from `module_path!()` and
+        // `Location::caller()`. This is the shape a dependency reaches for
+        // when it builds a record itself — which the `log` API permits.
+        let dynamic_target = format!("dependency for {DYNAMIC_TARGET_PAYLOAD}!");
+
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            for target in [
+                dynamic_target.as_str(),
+                NUMERIC_TARGET_PAYLOAD,
+                SECRET_TARGET_PAYLOAD,
+                NAME_TARGET_PAYLOAD,
+            ] {
+                log::logger().log(
+                    &log::Record::builder()
+                        .args(format_args!("third-party wording"))
+                        .level(log::Level::Warn)
+                        .target(target)
+                        .module_path(Some(DYNAMIC_MODULE_PAYLOAD))
+                        .file(Some(DYNAMIC_FILE_PAYLOAD))
+                        .line(Some(4242))
+                        .build(),
+                );
+            }
+        });
+
+        let mut broadcast = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            broadcast.push(value.to_string());
+        }
+        crate::broadcast::clear_broadcast_hook();
+
+        crate::writer::flush_for_test().unwrap();
+        let persisted =
+            std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
+
+        for (sink, body) in [
+            ("persisted runtime-trace.jsonl", persisted.as_str()),
+            ("live broadcast", broadcast.concat().as_str()),
+        ] {
+            for (what, marker) in [
+                ("target", DYNAMIC_TARGET_PAYLOAD),
+                ("module path", DYNAMIC_MODULE_PAYLOAD),
+                ("source file", DYNAMIC_FILE_PAYLOAD),
+                ("phone-shaped numeric target", NUMERIC_TARGET_PAYLOAD),
+                ("secret-shaped target", SECRET_TARGET_PAYLOAD),
+                ("name-shaped target", NAME_TARGET_PAYLOAD),
+                ("message body", "third-party wording"),
+            ] {
+                assert!(
+                    !body.contains(marker),
+                    "a runtime value in a record's {what} must not reach the {sink}: {body}"
+                );
+            }
+        }
+
+        // Not silently dropped: the records still arrive, carrying the two
+        // constants and nothing the caller chose but the severity and line.
+        let bridged: Vec<serde_json::Value> = persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["attributes"]["log.target"].is_string())
+            .collect();
+        assert_eq!(
+            bridged.len(),
+            4,
+            "a record with unsafe metadata must still be recorded, sanitized \
+             rather than suppressed: {persisted}"
+        );
+        for record in &bridged {
+            assert_eq!(
+                record["attributes"]["log.target"],
+                crate::log_bridge::REDACTED_TARGET,
+                "an unsafe target must be replaced whole, not trimmed: {record}"
+            );
+            assert_eq!(
+                record["message"],
+                crate::log_bridge::REDACTED_MESSAGE,
+                "the message body must still be the fixed marker: {record}"
+            );
+            assert!(
+                record["attributes"]["log.module_path"].is_null()
+                    && record["attributes"]["log.file"].is_null(),
+                "the dropped channels must be absent, not sanitized: {record}"
+            );
+            assert_eq!(
+                record["attributes"]["log.line"], 4242,
+                "the numeric line still crosses: {record}"
+            );
+        }
+
+        // That the sanitizer is not simply eating every target is pinned by
+        // `dependency_records_reach_the_sinks_without_their_message_text`,
+        // which sees `Client/PairCode` cross verbatim and
+        // `whatsapp_rust::socket` cross as its crate's reviewed name through
+        // this same wiring.
+    }
+
+    /// The other half of keeping `RUST_LOG` working: a bridged record must be
+    /// selected by an `EnvFilter` directive naming the dependency's own
+    /// target, and a record from another target must not be.
+    #[test]
+    fn env_filter_directives_still_select_bridged_records_by_target() {
+        crate::try_install_capture_subscriber();
+
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new())
+            .with_filter(EnvFilter::new("whatsapp_rust=debug"));
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            log::debug!(target: "whatsapp_rust::socket", "selected");
+            log::debug!(target: "some_other_dependency", "not selected");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("whatsapp_rust"),
+            "`RUST_LOG=whatsapp_rust=debug` must still select the dependency's \
+             records by its crate name: {out:?}"
+        );
+        assert!(
+            !out.contains("whatsapp_rust::socket"),
+            "the module path after `::` is a runtime string and must not \
+             survive into the emitted target: {out:?}"
+        );
+        assert!(
+            !out.contains("some_other_dependency"),
+            "a target the directive does not name must stay filtered out: {out:?}"
+        );
+    }
+
+    /// One default-target call site per activated crate, spelled as the
+    /// module path `log` derives from `module_path!()` when the call passes
+    /// no `target:`. Each is a real site at pin `cbcdd2a`; the expected root
+    /// is what `TARGET_CRATES` must reduce it to.
+    const ACTIVATED_CRATE_SITES: &[(&str, &str)] = &[
+        ("whatsapp_rust::message", "whatsapp_rust"),
+        ("wacore::send", "wacore"),
+        (
+            "wacore_libsignal::protocol::session_cipher",
+            "wacore_libsignal",
+        ),
+        ("wacore_noise::framing", "wacore_noise"),
+        (
+            "whatsapp_rust_tokio_transport",
+            "whatsapp_rust_tokio_transport",
+        ),
+    ];
+
+    /// Whether the fmt layer rendered a record under exactly this target.
+    /// `tracing_log` puts the bridged target back on the normalized metadata,
+    /// so the fmt line reads `DEBUG <target>: <message>`. Matched as a whole
+    /// token because a `contains` would let the `wacore` directive look
+    /// satisfied by a `wacore_libsignal` record, which is the distinction
+    /// these tests exist to make.
+    fn renders_target(out: &str, target: &str) -> bool {
+        let rendered = format!("{target}:");
+        out.split_whitespace().any(|token| token == rendered)
+    }
+
+    /// Every crate the `whatsapp-web` feature activates that logs without an
+    /// explicit `target:` must arrive at the real sinks under its own
+    /// reviewed root, not under the shared redaction marker.
+    ///
+    /// `module_path` and `file` are dropped at the boundary, so the target is
+    /// the only field left that says which component spoke. A crate missing
+    /// from `TARGET_CRATES` still fails closed — its record crosses as
+    /// `[third-party target redacted]` — but that makes an activated part of
+    /// the WhatsApp protocol stack indistinguishable from an unreviewed
+    /// transitive dependency, which is the opposite of what this bridge is
+    /// for. So the coverage is pinned against the locked graph rather than
+    /// left to the two crates that happened to be read first.
+    #[test]
+    fn every_activated_crate_reaches_the_sinks_under_its_own_root() {
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 1000,
+            ..crate::config::LogConfig::default()
+        };
+        crate::writer::init_from_config(&cfg, tmp.path());
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        crate::try_install_capture_subscriber();
+
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            for (site, _) in ACTIVATED_CRATE_SITES {
+                log::warn!(target: *site, "{TRANSPORT_FAILURE}");
+            }
+        });
+
+        let mut broadcast = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            broadcast.push(value.to_string());
+        }
+        crate::broadcast::clear_broadcast_hook();
+
+        crate::writer::flush_for_test().unwrap();
+        let persisted =
+            std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
+
+        let bridged: Vec<serde_json::Value> = persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["attributes"]["log.target"].is_string())
+            .collect();
+        assert_eq!(
+            bridged.len(),
+            ACTIVATED_CRATE_SITES.len(),
+            "every activated crate's record must be persisted: {persisted}"
+        );
+        assert_eq!(
+            broadcast.len(),
+            ACTIVATED_CRATE_SITES.len(),
+            "every activated crate's record must also be broadcast: {broadcast:?}"
+        );
+
+        for ((site, root), record) in ACTIVATED_CRATE_SITES.iter().zip(&bridged) {
+            assert_eq!(
+                record["attributes"]["log.target"], *root,
+                "`{site}` must arrive under its crate's reviewed root, not the \
+                 redaction marker: {record}"
+            );
+            assert_eq!(
+                record["message"],
+                crate::log_bridge::REDACTED_MESSAGE,
+                "the message body is still withheld for every crate: {record}"
+            );
+            assert!(
+                record["attributes"]["log.module_path"].is_null()
+                    && record["attributes"]["log.file"].is_null(),
+                "the dropped channels stay dropped for every crate: {record}"
+            );
+            assert_eq!(
+                record["severity_text"], "WARN",
+                "severity survives for every crate: {record}"
+            );
+        }
+
+        // The other half of the decision: the packages in the same activated
+        // graph that emit nothing on the default target are absent from the
+        // vocabulary, so a record claiming their root is redacted like any
+        // other unreviewed one.
+        assert_eq!(
+            crate::log_bridge::TARGET_CRATES.len(),
+            ACTIVATED_CRATE_SITES.len(),
+            "the vocabulary and the reviewed call-site list must describe the \
+             same set of crates"
+        );
+    }
+
+    /// The filter contract per crate: a directive naming a crate selects that
+    /// crate's bridged records, and `EnvFilter` matches a directive target as
+    /// a prefix, so the family directives documented on `TARGET_CRATES`
+    /// (`wacore=debug`, `whatsapp_rust=debug`) reach the sibling crates whose
+    /// roots extend them. Pinned per directive rather than described, because
+    /// the reduction happens before the filters look and a missing root would
+    /// silently stop being addressable.
+    #[test]
+    fn each_activated_crate_is_selectable_by_its_own_directive() {
+        crate::try_install_capture_subscriber();
+
+        for (directive, expected) in [
+            (
+                "wacore",
+                &["wacore", "wacore_libsignal", "wacore_noise"][..],
+            ),
+            ("wacore_libsignal", &["wacore_libsignal"][..]),
+            ("wacore_noise", &["wacore_noise"][..]),
+            (
+                "whatsapp_rust",
+                &["whatsapp_rust", "whatsapp_rust_tokio_transport"][..],
+            ),
+            (
+                "whatsapp_rust_tokio_transport",
+                &["whatsapp_rust_tokio_transport"][..],
+            ),
+        ] {
+            let buf = BufMakeWriter::default();
+            let fmt_layer = fmt::layer()
+                .fmt_fields(RedactEphemeralFields)
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .event_format(AgentAliasFormatter::new())
+                .with_filter(EnvFilter::new(format!("{directive}=debug")));
+            let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                for (site, _) in ACTIVATED_CRATE_SITES {
+                    log::debug!(target: *site, "{TRANSPORT_FAILURE}");
+                }
+            });
+
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            for (_, root) in ACTIVATED_CRATE_SITES {
+                assert_eq!(
+                    renders_target(&out, root),
+                    expected.contains(root),
+                    "`RUST_LOG={directive}=debug` must {} `{root}`: {out:?}",
+                    if expected.contains(root) {
+                        "select"
+                    } else {
+                        "not select"
+                    }
+                );
+            }
+        }
+    }
+
+    /// `log_enabled!` must answer with the active tracing filter, the way
+    /// `tracing_log::LogTracer` does. The bridge sets `log`'s own max level to
+    /// `Trace`, so an unconditional `enabled` makes every guarded diagnostic
+    /// in the dependency tree look wanted: the caller builds the record and
+    /// evaluates its formatting arguments, and only then does the dispatcher
+    /// throw it away.
+    ///
+    /// The subscriber here filters globally rather than per layer, because
+    /// `Subscriber::enabled` is the only thing `log` can ask and per-layer
+    /// filters deliberately do not answer through it — see the note on
+    /// `RedactingLogBridge::enabled`.
+    #[test]
+    fn log_enabled_agrees_with_the_active_tracing_filter() {
+        crate::try_install_capture_subscriber();
+
+        let off = tracing_subscriber::registry()
+            .with(LogCaptureLayer)
+            .with(EnvFilter::new("off"));
+        tracing::subscriber::with_default(off, || {
+            assert!(
+                !log::log_enabled!(target: "unmatched_dependency_target", log::Level::Info),
+                "`log_enabled!` must be false under an `off` filter"
+            );
+        });
+
+        let selective = tracing_subscriber::registry()
+            .with(LogCaptureLayer)
+            .with(EnvFilter::new("whatsapp_rust=debug"));
+        tracing::subscriber::with_default(selective, || {
+            assert!(
+                log::log_enabled!(target: "whatsapp_rust", log::Level::Debug),
+                "`log_enabled!` must be true for a target the filter selects"
+            );
+            assert!(
+                !log::log_enabled!(target: "unmatched_dependency_target", log::Level::Debug),
+                "`log_enabled!` must be false for a target the filter excludes"
+            );
+        });
+    }
+
+    /// The production wiring is different, and the difference is intentional:
+    /// `install_global_subscriber` attaches its `EnvFilter`s *per layer*, and
+    /// a per-layer filter deliberately answers `Subscriber::enabled` with
+    /// `true`, deferring the real decision to `on_event` so the other layers
+    /// get their say. So under the production shape, `log_enabled!` is gated
+    /// by the process-wide max level but NOT by target-specific directives —
+    /// a dependency's guarded diagnostic may be built and then dropped at the
+    /// layer. Documented on `RedactingLogBridge::enabled`; this pins the
+    /// behavior with the production filter shape so the limitation stays a
+    /// described one rather than a silent one.
+    #[test]
+    fn log_enabled_under_per_layer_filters_is_level_gated_only() {
+        crate::try_install_capture_subscriber();
+
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new())
+            .with_filter(EnvFilter::new("whatsapp_rust=debug"));
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Only the target half is pinnable here: the other gate,
+            // `LevelFilter::current()`, is a process-global hint this scoped
+            // subscriber cannot isolate from the test binary's global one.
+            // The target half answers `true` by design: `Filtered::enabled`
+            // defers, and the layer drops the event later.
+            assert!(
+                log::log_enabled!(target: "unmatched_dependency_target", log::Level::Debug),
+                "a per-layer filter cannot make `log_enabled!` target-aware; \
+                 if this starts failing, the limitation documented on \
+                 `RedactingLogBridge::enabled` has changed"
+            );
+            // And the drop happens where it belongs — the record built after
+            // that `true` still never reaches the layer's output.
+            log::debug!(target: "unmatched_dependency_target", "guarded diagnostic");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.is_empty(),
+            "the unmatched record must be dropped by the per-layer filter \
+             even though `log_enabled!` said yes: {out:?}"
+        );
+    }
+
+    /// Blocker-2 contract: the production install path is loud when the
+    /// process-global `log` slot is already owned, because a discarded error
+    /// there leaves the tracing subscriber installed and the dependency
+    /// records permanently missing. The test-only path stays tolerant so a
+    /// shared test binary can call it once per test.
+    #[test]
+    fn log_bridge_install_is_loud_in_production_and_tolerant_in_tests() {
+        // Guarantee the slot is occupied regardless of test ordering: either
+        // this call wins it, or an earlier test already did.
+        crate::log_bridge::install_best_effort_for_tests();
+
+        let panicked = std::panic::catch_unwind(crate::log_bridge::install_or_panic);
+        let payload = panicked.expect_err(
+            "the production install path must not silently accept a conflicting logger",
+        );
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("another logger already owns the process-global `log` slot"),
+            "the panic must name the conflict so an operator can act on it: {message:?}"
+        );
+
+        // The test-only path swallows the same failure by design.
+        crate::log_bridge::install_best_effort_for_tests();
+    }
+
+    /// Regression for dependency logs vanishing without a trace: transports
+    /// like `whatsapp-rust` emit through the `log` facade, not `tracing`.
+    /// Installing a `tracing` subscriber leaves `log`'s own global logger
+    /// slot empty, and every such record used to be discarded at the macro's
+    /// max-level check — reaching neither stderr nor the JSONL trace at any
+    /// verbosity. Installing this crate's subscriber machinery must be
+    /// enough on its own for a bare `log::warn!` to arrive as a tracing
+    /// event; removing the bridge install makes this test go silent.
+    ///
+    /// It arrives with its text withheld: stderr is a sink like any other, so
+    /// the bridged line shows the redaction marker under the dependency's own
+    /// target and severity, never the dependency's wording.
+    #[test]
+    fn log_facade_records_reach_the_subscriber() {
+        // Real entry point: installs the capture layer *and* the bridge.
+        crate::try_install_capture_subscriber();
+
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new());
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            log::warn!(
+                target: "whatsapp_rust::bridge_probe",
+                "dependency log facade marker"
+            );
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !out.contains("dependency log facade marker"),
+            "the dependency's own message text must not reach stderr either: {out:?}"
+        );
+        let line = out
+            .lines()
+            .find(|line| line.contains(crate::log_bridge::REDACTED_MESSAGE))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a `log` record must reach the tracing subscriber; without the \
+                     bridge it is dropped at the log facade: {out:?}"
+                )
+            });
+        assert!(
+            line.starts_with("[system] "),
+            "bridged record must go through the alias-prefixing formatter: {line:?}"
+        );
+        assert!(
+            line.contains("WARN"),
+            "bridged record must keep its severity: {line:?}"
+        );
+        assert!(
+            line.contains("whatsapp_rust"),
+            "bridged record must carry the crate's reviewed name so RUST_LOG \
+             directives still address it: {line:?}"
+        );
+        assert!(
+            !line.contains("bridge_probe"),
+            "the module path after `::` is a runtime string and must not \
+             survive into the emitted target: {line:?}"
+        );
+        assert!(
+            !line.contains("log.target"),
+            "normalized metadata must replace the raw `log.*` transport fields \
+             rather than printing them alongside: {line:?}"
         );
     }
 }

@@ -1164,6 +1164,10 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
@@ -1175,6 +1179,10 @@ impl OpenAiResponsesModelProvider {
         if !default_headers.is_empty() {
             builder = builder.default_headers(default_headers);
         }
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
         builder.build().unwrap_or_else(|_| Client::new())
     }
 }
@@ -1470,6 +1478,7 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let app = Router::new().route(
             "/responses",
             post(|| async {
@@ -1515,6 +1524,118 @@ mod tests {
         assert_eq!(usage.cached_input_tokens, Some(45));
         assert_eq!(usage.output_tokens, Some(30));
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_provider_honors_runtime_proxy_config() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&format!("http://{direct_addr}"))
+            .credential(Some("test-key"))
+            .build();
+        let client = provider.http_client();
+        let streaming_client = provider.streaming_client();
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response = client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("responses request should succeed through runtime proxy");
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+        let streaming_response = streaming_client
+            .post(&provider.responses_url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("streaming responses request should succeed through runtime proxy");
+        let streaming_body: serde_json::Value = streaming_response
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            body.get("output_text").and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            streaming_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied"),
+            "streaming Responses requests must use the runtime proxy client path for model_provider.openai"
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            2,
+            "runtime proxy server should receive the Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Responses endpoint must not be contacted when the runtime proxy applies"
+        );
     }
 
     #[test]

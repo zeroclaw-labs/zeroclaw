@@ -719,6 +719,18 @@ cli-pairing-use-code = {"  "}Use this one-time code to pair a new device:
 cli-pairing-post = {"    "}POST /pair with header X-Pairing-Code: {$code}
 cli-pairing-restart = {"   "}Restart the gateway to generate a new pairing code.
 cli-pairing-disabled = ⚠️  Gateway pairing is disabled in config.
+cli-pairing-fetch-failed = ❌ Failed to fetch pairing code from gateway at {$endpoint}
+cli-pairing-no-code = 🔐 Gateway pairing is enabled, but no active pairing code is available.
+cli-pairing-requests-accepted = All requests will be accepted without authentication.
+cli-pairing-enable-config = To enable pairing, set [gateway] require_pairing = true.
+cli-pairing-show-only = `zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.
+cli-pairing-pair-another = To pair another device, run:
+cli-pairing-revoke-replace = To revoke existing pairings and mint a replacement code, run:
+cli-pairing-new-code-unavailable = The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.
+cli-pairing-retry-or-rotate = Try again shortly, or revoke existing pairings and mint a replacement code:
+cli-pairing-rotate-no-code = The rotate request completed without returning a replacement code.
+cli-pairing-check-enabled = Check whether pairing is enabled, then request a new device code:
+cli-pairing-inspect = To inspect the running gateway:
 cli-gateway-running-q = {"   "}Is the gateway running? Start it with:
 cli-status-title = 🦀 ZeroClaw Status
 cli-security-status-title = ZeroClaw Security Status
@@ -729,6 +741,7 @@ cli-security-status-risk-profile = Risk profile: {$v}
 cli-security-status-autonomy = Autonomy:   {$v}
 cli-security-status-approvals = Approvals:  medium-risk approval required: {$medium}, high-risk commands blocked: {$high}
 cli-security-status-sandbox = Sandbox:    requested {$requested}, active {$active} ({$description})
+cli-security-status-sandbox-description-docker-runtime = Docker runtime container isolation (runtime.kind = "docker"; no additional sandbox wrapper)
 cli-security-status-workspace = Workspace:  {$dir}; workspace-only: {$workspace_only}; rw roots: {$read_write_roots}; read-only roots: {$read_only_roots}; write-only roots: {$write_only_roots}; env passthrough: {$env_passthrough}
 cli-security-status-credentials = Credentials: encryption: {$encryption}; secrets set: {$secrets_set}/{$secrets_total}; classified fields: {$classified_total}; classes: {$classification_summary}
 cli-security-status-credentials-classes-none = none
@@ -737,6 +750,7 @@ cli-security-status-warnings = Warnings:   {$v}
 cli-security-status-warnings-none = Warnings:   none
 cli-security-status-warning-agent-disabled = agent is disabled
 cli-security-status-warning-sandbox-disabled = sandboxing is disabled for this agent risk profile
+cli-security-status-warning-optional-sandbox-disabled-docker-runtime = additional OS sandboxing is disabled; Docker runtime containment remains active
 cli-security-status-warning-sandbox-none = active sandbox is application-layer only
 cli-security-status-warning-sandbox-fallback = requested sandbox backend `{$requested}` fell back to `{$active}`
 cli-security-status-warning-workspace-not-restricted = workspace-only filesystem policy is disabled
@@ -818,6 +832,7 @@ cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
+cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-not-found = Plugin '{$name}' not found.
 cli-plugin-legacy-detected = Note: plugins in a legacy location ({$path}) are not loaded by the agent — run `zeroclaw plugin migrate` to move them into {$target}.
@@ -1091,11 +1106,52 @@ cli-daemon-started-socket = Socket:   {$path}
 cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for current status)
 cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
+# ── daemon mTLS and enrollment operator output ──
+cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
+cli-mtls-issued-cert-path = {"  "}cert: {$path}
+cli-mtls-issued-key-path = {"  "}key:  {$path}
+cli-mtls-issued-ca-path = {"  "}CA:   {$path}
+cli-mtls-dropin-line-1 = Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and zerocode finds
+cli-mtls-dropin-line-3 = {"  "}the material automatically - no --tls-* flags needed.
+cli-mtls-relay-connect-header = Reach this daemon THROUGH its configured relay:
+cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca is the RELAY's CA - copy it from the relay to the client;
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert is the DAEMON's CA, already in the bundle.)
+cli-mtls-direct-connect-header = Connect with zerocode (direct):
+cli-mtls-revoked-certificate = Revoked certificate {$fingerprint}.
+cli-mtls-revoke-no-active-fingerprint = No active certificate with fingerprint {$fingerprint} (already revoked or never issued).
+cli-mtls-revoked-device-certs = Revoked {$count} active certificate(s) for device '{$device}'.
+cli-mtls-revoked-list-updated = Updated {$path}; the daemon refuses the revoked certificate(s) at the next connection.
+cli-mtls-list-no-active-certs = No active client certificates issued by this daemon's CA.
+cli-mtls-list-active-header = Active client certificates ({$count}):
+cli-enroll-endpoint-ready = Enrollment endpoint ready on {$bind}:{$port}. To enroll a client, give it
+cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short-auth-string (SAS)
+cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
+cli-enroll-pairing-code = {"    "}pairing code : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-agent-vision-unsupported-by-fallback = received {$marker_count} image marker(s), but fallback model_provider={$fallback_name} does not support vision input
+cli-agent-vision-unsupported-by-provider = received {$marker_count} image marker(s), but this model_provider does not support vision input
+cli-agent-error-provider-context-window = The request is too large for the selected model. Reduce the conversation or choose a model with a larger context window.
+cli-agent-error-provider-credentials-missing = The selected model provider has no configured credentials. Add its API key or choose another provider.
+cli-agent-error-provider-credentials-missing-named = The model provider {$provider} has no configured credentials. Add its API key or choose another provider.
+cli-agent-error-provider-authentication = The selected model provider rejected its credentials. Check the configured credentials.
+cli-agent-error-provider-authentication-named = The model provider {$provider} rejected its credentials. Check the configured credentials.
+cli-agent-error-provider-rate-limited = The selected model provider rate-limited the request. Wait, review quota, or choose another provider.
+cli-agent-error-provider-server = The selected model provider returned a server error. Try again or choose another provider.
+cli-agent-error-provider-model-not-found = The selected model is unavailable. Check the configured model name.
+cli-agent-error-provider-client-request = The selected model provider rejected the request. Check the provider configuration and request.
+cli-agent-error-provider-connection-local = The local model server at {$endpoint} is unavailable. Start it or update the endpoint.
+cli-agent-error-provider-connection-remote = Cannot reach the model provider at {$endpoint}. Check network access or choose another provider.
+cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
+cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
+cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
@@ -1120,6 +1176,7 @@ cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalo
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
@@ -1131,6 +1188,11 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Terminal tool approval ──
+# The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
+cli-approval-request = 🔧 Agent wants to execute: {$tool}
+cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
@@ -1155,7 +1217,9 @@ channel-approval-group-visibility-warning =
 channel-telegram-approval-ack-approved = Approved
 channel-telegram-approval-ack-always-approved = Always approved
 channel-telegram-approval-ack-denied = Denied
+channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
+channel-telegram-approval-ack-already-resolved = Approval already resolved
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow

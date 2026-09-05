@@ -138,6 +138,7 @@ zc-input-attachment-manager-hint = { $navigate } select · { $remove } remove ·
 zc-input-help-attachment-remove = Remove attachment
 zc-input-help-attachment-detach = Remove by index
 zc-input-clipboard-error = Clipboard error: { $error }
+zc-input-clipboard-cleanup-error = Clipboard cleanup warning: { $count } temporary file(s) could not be removed and remain on disk.
 
 zc-queue-empty = Nothing to send.
 zc-cancel-timed-out = Cancel timed out; turn settled locally.
@@ -174,13 +175,16 @@ zc-logs-section-trace = Trace
 zc-logs-section-attribution = Attribution
 zc-logs-section-attributes = Attributes
 zc-logs-preview-only = Full payload unavailable — showing preview fields only.
+zc-logs-persisted-path = Persisted log: { $path }
 zc-logs-no-event-selected = No event selected
 zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
 
 zc-logs-help-mouse-label = Mouse
-zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
+zc-logs-help-mouse-desc = Click rows, drag to select text, scroll wheel, double-click detail
+zc-logs-copy = Copy
+zc-logs-copied = [Copied]
 
 zc-doctor-title = Doctor
 zc-doctor-loading = Loading diagnostics...

@@ -271,18 +271,12 @@ impl DiscordChannel {
     }
 
     /// Configure voice transcription for audio attachments.
-    pub fn with_transcription(
-        mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
-    ) -> Self {
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
         if !config.enabled {
             return self;
         }
         match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
+            Ok(manager) => return self.with_transcription_manager(config, manager),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -294,6 +288,31 @@ impl DiscordChannel {
             }
         }
         self
+    }
+
+    pub(crate) fn with_transcription_manager(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: super::transcription::TranscriptionManager,
+    ) -> Self {
+        self.transcription_manager = Some(std::sync::Arc::new(manager));
+        self.transcription = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_attachments_for_test(
+        &self,
+        attachments: &[serde_json::Value],
+        client: &reqwest::Client,
+    ) -> (String, Vec<MediaAttachment>) {
+        process_attachments(
+            attachments,
+            client,
+            self.workspace_dir.as_deref(),
+            self.transcription_manager.as_deref(),
+        )
+        .await
     }
 
     /// Configure streaming mode for progressive draft updates or multi-message delivery.
@@ -1256,17 +1275,15 @@ async fn process_attachments(
             } else {
                 Some(ct.to_string())
             },
-            // Only claim a channel-owned disposition when the rendered target
-            // is a local path the provider can reload. A URL fallback (no
-            // workspace, or a failed save) is not fetched under the default
-            // no-remote-image path, so owning it would make the shared
-            // pipeline defer bytes nothing downstream can recover; leaving the
-            // marker unset instead lets enrichment keep a loadable image in
-            // play. The saved name carries a uniqueness prefix, so `file_name`
-            // alone cannot identify the marker just rendered above — record the
-            // target and disposition so a later stage reads the verdict rather
-            // than re-deciding it from the payload.
-            marker: saved_locally.then(|| RenderedMarker {
+            // Record the exact rendered target for image URL fallbacks too.
+            // They are deliberately not treated as channel-owned by the
+            // shared pipeline: the raw bytes are available and can replace
+            // the URL without relying on remote fetching. The saved name
+            // carries a uniqueness prefix, so `file_name` alone cannot
+            // identify the marker just rendered above — record the target and
+            // disposition so a later stage reads the verdict rather than
+            // re-deciding it from the payload.
+            marker: (saved_locally || marker_kind == MarkerKind::Image).then(|| RenderedMarker {
                 target: marker_target.clone(),
                 kind: marker_kind,
             }),
@@ -4420,10 +4437,9 @@ mod tests {
 
     /// With no workspace configured (or a failed save) the rendered target is
     /// the attachment URL, which the default no-remote-image path will not
-    /// fetch. Owning that marker would make the pipeline defer bytes nothing
-    /// downstream can recover, so a loadable image must instead fall through to
-    /// enrichment and reach the provider as inline data. Before the fix, the
-    /// URL marker was owned and the supported image was silently dropped.
+    /// fetch. The typed envelope records that fallback as non-owned, so the
+    /// pipeline replaces the URL with inline data and provider preparation
+    /// sees one effective image reference without a false partial-load note.
     #[tokio::test]
     async fn image_with_no_workspace_is_enriched_rather_than_dropped() {
         use crate::orchestrator::media_pipeline::MediaPipeline;
@@ -4449,12 +4465,17 @@ mod tests {
 
         assert_eq!(media.len(), 1, "one attachment in, one envelope out");
         assert!(
-            media[0].marker.is_none(),
-            "a URL fallback is not reloadable, so it must not be owned as a marker"
+            media[0].marker_target().is_some(),
+            "a URL fallback must retain its exact channel marker target"
+        );
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            attachments[0]["url"].as_str(),
+            "the URL fallback must be exposed for exact replacement"
         );
         assert!(
             !media[0].channel_rendered_owned_disposition(),
-            "an unowned attachment must not be deferred by the shared pipeline"
+            "a remote URL fallback must not be deferred by the shared pipeline"
         );
 
         let config = zeroclaw_config::schema::MediaPipelineConfig {
@@ -4470,6 +4491,80 @@ mod tests {
             enriched.contains("IMAGE:data:"),
             "the loadable image's bytes must reach the provider as inline data, not be dropped: {enriched}"
         );
+
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &[zeroclaw_api::model_provider::ChatMessage::user(enriched)],
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("provider preparation should accept the inline fallback image");
+        assert!(prepared.contains_images);
+        let provider_content = &prepared.messages[0].content;
+        assert_eq!(
+            provider_content.matches("data:image/jpeg;base64,").count(),
+            1,
+            "provider preparation must receive one effective image: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains("could not be loaded"),
+            "a successful inline fallback must not produce a partial-load note: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains(attachments[0]["url"].as_str().unwrap()),
+            "the unfetchable URL must not survive beside the inline image: {provider_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_with_failed_workspace_save_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/attachments/1/photo.jpg", server.uri());
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": url,
+        })];
+        // A regular file cannot contain the `discord_files` save directory,
+        // so this exercises the same URL fallback after download succeeds.
+        let blocked_workspace = tempfile::NamedTempFile::new().unwrap();
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(blocked_workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(media[0].marker_target(), Some(url.as_str()));
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            Some(url.as_str())
+        );
+        assert!(!media[0].channel_rendered_owned_disposition());
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(enriched.contains("[IMAGE:data:image/jpeg;base64,"));
+        assert!(!enriched.contains(&url));
     }
 
     #[tokio::test]

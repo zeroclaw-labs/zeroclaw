@@ -71,6 +71,18 @@ cli-skills-review-summary = { "  " }💾 Revue de compétence : {$summary}
 cli-skills-install-start = Installation du skill depuis : {$source}
 cli-skills-install-resolving-registry = { "  " }Résolution de '{$source}' depuis le registre de skills...
 cli-skills-install-resolving-extra-registry = { "  " }Résolution de '{$source}' depuis le registre '{$registry}'...
+cli-skills-install-skill-requires-git = --skill <name> nécessite une URL de dépôt Git comme source (valeur reçue : '{$source}')
+cli-skills-install-catalog-failed = échec de l’installation de la compétence '{$skill}' depuis le catalogue {$source}
+cli-skills-install-invalid-skill-name = nom de compétence '{$skill}' invalide pour --skill : utilisez un nom de compétence seul (lettres, chiffres, '-', '_')
+cli-skills-install-catalog-clone-failed = échec du clonage du catalogue de compétences {$url}
+cli-skills-install-skill-not-in-catalog-empty = compétence '{$skill}' introuvable dans {$url} : aucun répertoire skills/, ou celui-ci est vide
+cli-skills-install-skill-not-in-catalog =
+    compétence '{$skill}' introuvable dans {$url}.
+    Compétences disponibles : {$available}
+cli-skills-install-catalog-root-symlink = le catalogue de compétences {$url} contient un répertoire skills/ symbolique ; refus d’inspection
+cli-skills-install-catalog-root-escapes = le catalogue de compétences {$url} contient un répertoire skills/ dont le chemin pointe en dehors du catalogue cloné ; refus d’inspection
+cli-skills-install-catalog-skill-symlink = la compétence '{$skill}' dans {$url} est un lien symbolique ; les compétences du catalogue doivent être de vrais répertoires à l’intérieur du dépôt
+cli-skills-install-catalog-skill-escapes = la compétence '{$skill}' dans {$url} se résout en dehors du catalogue cloné ; refus d’installation
 cli-skills-install-git-failed = échec de l'installation de la source de compétence git : {$source}
 cli-skills-install-registry-failed = échec de l'installation de la compétence depuis le registre : {$source}
 cli-skills-install-extra-registry-failed = échec de l'installation de la compétence depuis le registre supplémentaire : {$source}
@@ -148,6 +160,7 @@ cli-sop-list-about = Lister les SOP (Procédures Opérationnelles Standard) char
 cli-sop-validate-about = Valider les définitions des SOP
 cli-sop-show-about = Afficher les détails d'une SOP
 cli-migrate-openclaw-about = Importer la mémoire d'un espace de travail OpenClaw vers cet espace de travail ZeroClaw
+cli-migrate-openclaw-qdrant-unsupported = Qdrant n’est actuellement pas pris en charge comme cible de migration OpenClaw. Définissez memory.backend sur sqlite, lucid ou markdown, puis réessayez.
 cli-agent-long-about =
     Démarrer la boucle de l'agent IA.
 
@@ -632,11 +645,25 @@ cli-otp-enrollment-uri = URI d'enregistrement : {$uri}
 cli-otp-received = {"  "}✓ OTP reçu
 cli-secret-captured = {"  "}● Valeur capturée — appuyez sur Entrée pour enregistrer
 cli-secret-received = {"  "}✓ Secret reçu
+cli-secret-needs-tty = La saisie du secret nécessite un terminal pour stdin et stderr.
+cli-secret-empty = La valeur ne peut pas être vide.
 cli-pairing-enabled = 🔐 L'appairage de la passerelle est activé.
 cli-pairing-use-code = {"  "}Utilisez ce code à usage unique pour appairer un nouvel appareil :
 cli-pairing-post = {"    "}POST /pair avec l'en-tête X-Pairing-Code: {$code}
 cli-pairing-restart = {"   "}Redémarrez la passerelle pour générer un nouveau code d'appairage.
 cli-pairing-disabled = ⚠️  L'appairage de la passerelle est désactivé dans la configuration.
+cli-pairing-fetch-failed = ❌ Échec de récupération du code d'appairage auprès de la passerelle à {$endpoint}
+cli-pairing-no-code = 🔐 L'appairage de la passerelle est activé, mais aucun code d'appairage actif n'est disponible.
+cli-pairing-requests-accepted = Toutes les requêtes seront acceptées sans authentification.
+cli-pairing-enable-config = Pour activer l'appairage, définissez [gateway] require_pairing = true.
+cli-pairing-show-only = `zeroclaw gateway get-paircode` affiche uniquement un code actif existant ; il n'en génère pas de nouveau.
+cli-pairing-pair-another = Pour appairer un autre appareil, exécutez :
+cli-pairing-revoke-replace = Pour révoquer les appairages existants et générer un code de remplacement, exécutez :
+cli-pairing-new-code-unavailable = La passerelle n'a pas généré de nouveau code d'appairage. Un code est peut-être déjà en attente ou une réinitialisation de l'appairage est nécessaire.
+cli-pairing-retry-or-rotate = Réessayez bientôt, ou révoquez les appairages existants et générez un code de remplacement :
+cli-pairing-rotate-no-code = La demande de rotation s'est terminée sans renvoyer de code de remplacement.
+cli-pairing-check-enabled = Vérifiez que l'appairage est activé, puis demandez un code pour un nouvel appareil :
+cli-pairing-inspect = Pour inspecter la passerelle en cours d'exécution :
 cli-gateway-running-q = {"   "}La passerelle est-elle en cours d'exécution ? Démarrez-la avec :
 cli-status-title = 🦀 État de ZeroClaw
 cli-security-status-title = État de sécurité ZeroClaw
@@ -647,6 +674,7 @@ cli-security-status-risk-profile = Profil de risque : {$v}
 cli-security-status-autonomy = Autonomie :   {$v}
 cli-security-status-approvals = Approbations :  approbation requise pour risque moyen : {$medium}, commandes à haut risque bloquées : {$high}
 cli-security-status-sandbox = Bac à sable :    demandé {$requested}, actif {$active} ({$description})
+cli-security-status-sandbox-description-docker-runtime = Isolation du conteneur du runtime Docker (runtime.kind = "docker"; aucun wrapper de sandbox supplémentaire)
 cli-security-status-workspace = Espace de travail :  {$dir} ; espace de travail uniquement : {$workspace_only} ; racines lecture-écriture : {$read_write_roots} ; racines lecture seule : {$read_only_roots} ; racines écriture seule : {$write_only_roots} ; transmission env : {$env_passthrough}
 cli-security-status-credentials = Identifiants : chiffrement : {$encryption} ; secrets définis : {$secrets_set}/{$secrets_total} ; champs classifiés : {$classified_total} ; classes : {$classification_summary}
 cli-security-status-credentials-classes-none = aucune
@@ -655,6 +683,7 @@ cli-security-status-warnings = Avertissements :   {$v}
 cli-security-status-warnings-none = Avertissements :   aucun
 cli-security-status-warning-agent-disabled = l'agent est désactivé
 cli-security-status-warning-sandbox-disabled = le bac à sable est désactivé pour ce profil de risque d'agent
+cli-security-status-warning-optional-sandbox-disabled-docker-runtime = l’isolation supplémentaire de l’OS est désactivée ; le confinement du runtime Docker reste actif
 cli-security-status-warning-sandbox-none = le bac à sable actif est uniquement au niveau applicatif
 cli-security-status-warning-sandbox-fallback = le backend de bac à sable demandé `{$requested}` a basculé vers `{$active}`
 cli-security-status-warning-workspace-not-restricted = la politique de système de fichiers limitée à l'espace de travail est désactivée
@@ -731,6 +760,8 @@ cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'.
 cli-plugin-config-entry-key = Clé de configuration ({$capability}) : {$key}
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
+cli-config-section-retired-wati = avertissement : la section de configuration de canal WATI obsolète `{$section}` est ignorée, car la prise en charge de WATI a été supprimée. Migrez vers `[channels.whatsapp.<alias>]` à l’aide de Cloud API ou de WhatsApp Web, puis révoquez le jeton d’API WATI inutilisé.
+cli-config-section-retired-node-transport = avertissement : la section de configuration obsolète `[node_transport]` est ignorée, car le transport de nœuds HMAC hérité a été supprimé. Supprimez la section du fichier config.toml.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.
 cli-plugin-legacy-detected = Remarque : les plugins situés à un emplacement hérité ({$path}) ne sont pas chargés par l'agent. Exécutez `zeroclaw plugin migrate` pour les déplacer vers {$target}.
@@ -813,6 +844,7 @@ turn-interrupted-by-user = [interrompu par l'utilisateur]
 turn-cancelled-client-rpc = [tour annulé via le client]
 turn-stream-interrupted = [flux interrompu]
 turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) était indisponible ; cette réponse a été générée par { $actual_model } ({ $actual_provider }).
+turn-max-iterations-reached = *Tour arrêté : nombre maximal d’itérations d’outils atteint ({ $max_iterations }).*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
 history-trim-reason-message-cap = limite de messages de l’historique dépassée
@@ -826,6 +858,7 @@ channel-runtime-progress-waiting-on-model = En attente du modèle
 channel-runtime-progress-running-tool = Exécution d’un outil
 channel-runtime-progress-compacting-context = Compactage du contexte
 channel-runtime-progress-finalizing-response = Finalisation de la réponse
+channel-runtime-matrix-progress-item-too-large = ⚠️ Cette ligne est trop volumineuse pour tenir dans un seul message Matrix. ⚠️
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
@@ -889,6 +922,10 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` indisponible — réponse de **{ $actual }** (`{ $model }`)
     Changer de modèle : /models
+delegate-provider-fallback-warning = Avertissement : l’agent délégué a repris son exécution grâce à un basculement vers un fournisseur de secours. Les détails de la défaillance du fournisseur ont été consignés et omis de ce résultat.
+turn-tool-protocol-strict-mixed-error = L’analyse stricte des outils ne peut pas exécuter une chaîne de repli qui mélange des candidats native-tool et text-only. Configurez chaque candidat accessible pour utiliser le même protocole d’outils, ou définissez strict_tool_parsing sur false.
+delegate-provider-fallback-header = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model })]
+delegate-provider-fallback-header-agentic = [Agent '{ $agent }' (demandé : { $requested_provider }/{ $requested_model } ; fourni : { $actual_provider }/{ $actual_model }, agentique)]
 cli-alias-list-empty = (aucune entrée sous {$section})
 cli-alias-created = {$section}.{$alias} créé
 cli-alias-exists = {$section}.{$alias} existe déjà (aucun changement)
@@ -929,15 +966,11 @@ cli-bundle-warn-archive = avertissement : échec de l'archivage du répertoire d
 cli-bundle-deleted = skill_bundles.{$alias} supprimé (retiré de {$count} agent(s))
 cli-bundle-warn-move = avertissement : échec du déplacement du répertoire de bundle : {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} renommé
-
-# ── Indications de redémarrage du tableau de bord web — RestartInfo.hint (PR #8173) ──
-# Les quatre premières sont des modèles de commande shell affichés tels quels ; non traduits.
 cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
 cli-gateway-restart-hint-container = docker compose restart
 cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
 cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
 cli-gateway-restart-hint-process = redémarrez le processus `zeroclaw daemon`
-
 cli-daemon-gateway-already-running = Une passerelle ZeroClaw est déjà en cours d'exécution sur {$host}:{$port}. Le démon supervise sa propre passerelle et ne démarrera pas une seconde passerelle sur la même adresse. Arrêtez cette passerelle (ou pointez le démon vers un port libre avec `zeroclaw config set gateway.port <port>`), puis relancez le démon.
 cli-daemon-gateway-port-occupied = L'adresse de passerelle {$host}:{$port} est déjà utilisée par un autre processus. Libérez le port ou pointez le démon vers un port libre (`zeroclaw config set gateway.port <port>`), puis relancez le démon.
 cli-daemon-starting-title = 🧠 Le démon ZeroClaw démarre…
@@ -947,6 +980,52 @@ cli-daemon-started-gateway = Passerelle : {$url}
 cli-daemon-started-socket = Socket :     {$path}
 cli-daemon-started-pairing = Appairage : activé (voir ci-dessus l'état actuel de la passerelle)
 cli-daemon-started-stop = Ctrl+C ou SIGTERM pour arrêter
+cli-relay-rotation-requested = Une rotation de l’identifiant du nœud relais a été demandée. Un daemon en cours d’exécution effectuera la rotation dans ~{$secs}s ; le nouvel identifiant sera transmis aux clients en bande lors de leur prochain renouvellement de certificat.
+cli-mtls-issued-client-cert = Certificat client émis pour '{$name}' :
+cli-mtls-issued-cert-path = {"  "}certificat : {$path}
+cli-mtls-issued-key-path = {"  "}clé :  {$path}
+cli-mtls-issued-ca-path = {"  "}CA :   {$path}
+cli-mtls-dropin-line-1 = À intégrer : ce répertoire est un répertoire TLS client prêt à l’emploi (ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key). Copiez-le sur le client sous <config-dir>/tls et zerocode détecte
+cli-mtls-dropin-line-3 = {"  "}automatiquement les fichiers - aucune option --tls-* n’est nécessaire.
+cli-mtls-relay-connect-header = Accédez à ce démon VIA son relais configuré :
+cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca est la CA du RELAY - copiez-la du relais vers le client;
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert est la CA du DAEMON, déjà présente dans le bundle.)
+cli-mtls-direct-connect-header = Connexion directe à zerocode :
+cli-mtls-revoked-certificate = Certificat {$fingerprint} révoqué.
+cli-mtls-revoke-no-active-fingerprint = Aucun certificat actif ne possède l’empreinte {$fingerprint} (déjà révoqué ou jamais émis).
+cli-mtls-revoked-device-certs = Révocation de {$count} certificat(s) actif(s) pour l’appareil '{$device}'.
+cli-mtls-revoked-list-updated = Mise à jour de {$path} ; le démon refusera les certificats révoqués lors de la prochaine connexion.
+cli-mtls-list-no-active-certs = Aucun certificat client actif n’a été émis par la CA de ce démon.
+cli-mtls-list-active-header = Certificats client actifs ({$count}) :
+cli-enroll-endpoint-ready = Point de terminaison d’inscription prêt sur {$bind}:{$port}. Pour inscrire un client, donnez-lui
+cli-enroll-confirm-sas-line-1 = ce code d’association à usage unique et confirmez que la chaîne d’authentification courte (SAS)
+cli-enroll-confirm-sas-line-2 = est identique des deux côtés avant de faire confiance au démon :
+cli-enroll-pairing-code = {"    "}code d’association : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-delegate-error-invalid-semantic-completion = L'agent '{$agent_name}' a échoué : le fournisseur de modèle a renvoyé une réponse sémantique non valide.
+cli-agent-error-invalid-semantic-completion = Le fournisseur de modèle a renvoyé une réponse sémantique non valide.
+cli-delegate-error-incomplete-after-provider-tools = L'agent '{$agent_name}' a échoué : le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
+cli-agent-error-incomplete-after-provider-tools = Le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
+cli-agent-vision-unsupported-by-fallback = {$marker_count} marqueur(s) d’image reçu(s), mais le model_provider de secours={$fallback_name} ne prend pas en charge les entrées visuelles
+cli-agent-vision-unsupported-by-provider = {$marker_count} marqueur(s) d’image reçu(s), mais ce model_provider ne prend pas en charge les entrées visuelles
+cli-agent-error-provider-context-window = La requête est trop volumineuse pour le modèle sélectionné. Réduisez la conversation ou choisissez un modèle avec une fenêtre de contexte plus grande.
+cli-agent-error-provider-credentials-missing = Le fournisseur de modèle sélectionné n'a aucun identifiant configuré. Ajoutez sa clé API ou choisissez un autre fournisseur.
+cli-agent-error-provider-credentials-missing-named = Le fournisseur de modèle {$provider} n'a aucun identifiant configuré. Ajoutez sa clé API ou choisissez un autre fournisseur.
+cli-agent-error-provider-authentication = Le fournisseur de modèle sélectionné a refusé ses identifiants. Vérifiez les identifiants configurés.
+cli-agent-error-provider-authentication-named = Le fournisseur de modèle {$provider} a refusé ses identifiants. Vérifiez les identifiants configurés.
+cli-agent-error-provider-rate-limited = Le fournisseur de modèle sélectionné a limité la requête. Attendez, vérifiez le quota ou choisissez un autre fournisseur.
+cli-agent-error-provider-server = Le fournisseur de modèle sélectionné a renvoyé une erreur serveur. Réessayez ou choisissez un autre fournisseur.
+cli-agent-error-provider-model-not-found = Le modèle sélectionné est indisponible. Vérifiez le nom de modèle configuré.
+cli-agent-error-provider-client-request = Le fournisseur de modèle sélectionné a refusé la requête. Vérifiez la configuration du fournisseur et la requête.
+cli-agent-error-provider-connection-local = Le serveur de modèle local à {$endpoint} est indisponible. Démarrez-le ou mettez à jour le point de terminaison.
+cli-agent-error-provider-connection-remote = Impossible d'atteindre le fournisseur de modèle à {$endpoint}. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-connection = Impossible d'atteindre le fournisseur de modèle sélectionné. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-timeout = Le fournisseur de modèle sélectionné a expiré. Réessayez ou choisissez un autre fournisseur.
+cli-agent-error-provider-generic = Le fournisseur de modèle sélectionné a échoué. Vérifiez la configuration du fournisseur ou choisissez un autre fournisseur.
+cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$context_window} jetons
+cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
+cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: inconnu / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: a déjà context_window = {$ctx}
@@ -959,32 +1038,22 @@ cli-doctor-ctxwin-saved = {$updated} mise(s) à jour enregistrée(s) dans config
 cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
 cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: échec de l'écriture de context_window: {$error}
-cli-doctor-context-window-ok = {$provider_ref} : fenêtre de contexte : {$context_window} jetons
-cli-doctor-context-window-zero = {$provider_ref} : context_window vaut 0 (invalide ; définissez la limite de contexte réelle du modèle)
-cli-doctor-context-window-unset = {$provider_ref} : aucun context_window défini — utilisera la valeur de repli de {$fallback} jetons lorsqu'il sera sélectionné ; probablement bien inférieure à la limite réelle de ce modèle ; définissez context_window sur ce profil
-
-# Doctor probe timeout warning — shown when model probing times out but prior
-# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-cache-write-failed = Échec de l’enregistrement du cache du modèle : {$error}
 cli-doctor-probe-timeout-message = La vérification des modèles a expiré. Certains catalogues de fournisseurs peuvent être inaccessibles. Vous pouvez réexécuter Doctor pour actualiser.
-
-# ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = La section de configuration CRITIQUE POUR LA SÉCURITÉ `{$path}` est invalide et a été réinitialisée à sa valeur par défaut pour permettre au daemon de démarrer ; la posture en cours d'exécution peut être PLUS FAIBLE que prévu. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-doctor-degraded-section = La section de configuration `{$path}` est malformée et a été réinitialisée aux valeurs par défaut ; les valeurs de cette section ne sont PAS en vigueur. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled est défini, mais l’outil vi_verify est exclu du registre visible par le modèle jusqu’à ce qu’un vérificateur de chaîne d’identifiants existe. L’activation de la section n’active pas la vérification des identifiants lors des appels aux outils de commerce. Les chemins des bibliothèques d’émission et de vérification ne sont pas affectés.
 sop-approval-deferred-at-capacity = Impossible de reprendre l’exécution {$run_id} : tous les créneaux d’exécution sont occupés. L’approbation reste en attente ; réessayez lorsqu’un créneau se libère.
 sop-approval-policy-unavailable = L’approbation a échoué car l’étape SOP en attente est indisponible : {$reason}. L’exécution reste en attente.
 sop-rpc-decision-invalid-state = L’exécution {$run_id} ne peut pas être résolue dans son état actuel.
 sop-rpc-decision-unauthorized = L’identité RPC n’est pas autorisée à résoudre cette étape SOP.
 sop-rpc-policy-missing = La politique d’approbation SOP « {$name} » n’est pas configurée.
 sop-rpc-policy-unavailable = La politique du SOP en attente est indisponible : {$reason}.
-
-# ── Tool approval (channels, #9409) ──
-# Human-visible copy for the operator-facing tool-approval prompt, shared
-# across the button adapters (Telegram, Discord, Slack) and the text-reply
-# adapters (Matrix, Signal, WhatsApp, Slack polling fallback). Approval
-# TOKENS, `callback_data`/`custom_id`/`action_id` values, and the reply
-# KEYWORDS parsed by `util::parse_approval_reply` (yes/y/approve, no/n/deny,
-# always) stay hardcoded ASCII in Rust — only the surrounding prose is
-# localized here.
+tool-runtime-command-build-failed = Échec de la construction de la commande d’exécution : {$error}
+tool-runtime-command-docker-workspace-path = Échec de la construction de la commande d’exécution : échec de la canonicalisation du chemin de l’espace de travail Docker {$path} : {$cause}
+tool-runtime-command-docker-allowed-root = Échec de la création de la commande d’exécution : échec de la canonicalisation de la racine de l’espace de travail Docker {$path} : {$cause}
+cli-approval-request = 🔧 L'agent veut exécuter : {$tool}
+cli-approval-prompt = { "   " }[Y] Oui / [N] Non / [A] Toujours pour {$tool} :{ " " }
 channel-approval-heading = Approbation de l'outil requise
 channel-approval-heading-shout = APPROBATION REQUISE
 channel-approval-tool-label = Outil
@@ -995,12 +1064,13 @@ channel-approval-btn-always = Toujours
 channel-approval-tap-instruction = Appuyez sur un bouton ci-dessous :
 channel-approval-reply-instruction-yesno = Répondez : "{ $yes_command }", "{ $no_command }" ou "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Répondez par `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
-channel-approval-group-visibility-warning =
-    Il s'agit d'une discussion de groupe : tout le monde ici peut voir ce code et les arguments de l'outil affichés ci-dessus. Seul un pair autorisé de ce canal peut répondre.
+channel-approval-group-visibility-warning = Il s'agit d'une discussion de groupe : tout le monde ici peut voir ce code et les arguments de l'outil affichés ci-dessus. Seul un pair autorisé de ce canal peut répondre.
 channel-telegram-approval-ack-approved = Approuvé
 channel-telegram-approval-ack-always-approved = Toujours approuvé
 channel-telegram-approval-ack-denied = Refusé
+channel-telegram-approval-ack-not-accepted = Approbation non acceptée
 channel-telegram-approval-ack-unknown = Action inconnue
+channel-telegram-approval-ack-already-resolved = Approbation déjà résolue
 channel-discord-approval-btn-allow-once = Autoriser une fois
 channel-discord-approval-btn-allow-session = Autoriser pour cette session
 channel-discord-approval-btn-allow-always = Toujours autoriser

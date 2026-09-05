@@ -194,8 +194,11 @@ pub async fn run_local_listener(
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
                     dispatcher.run(&mut transport).await;
 
-                    if let Some(tui_id) = dispatcher.tui_id() {
-                        ctx.tui_registry.unregister(tui_id);
+                    // Epoch-checked for the same reason as the WSS teardown: a
+                    // reconnect adopting this TUI id must not be evicted by the
+                    // displaced connection's later cleanup.
+                    if let Some((tui_id, tui_epoch)) = dispatcher.tui_registration() {
+                        ctx.tui_registry.unregister(tui_id, tui_epoch);
                         use ::zeroclaw_log::Instrument as _;
                         let span = ::zeroclaw_log::info_span!(
                             target: "zeroclaw_log_internal_scope",
@@ -928,6 +931,7 @@ mod tests {
         let sock_path = tmp.path().join("daemon.sock");
         let stale_listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
         drop(stale_listener);
+        wait_for_stale_socket(&sock_path).await;
 
         let stale_metadata = std::fs::symlink_metadata(&sock_path).unwrap();
         let stale_identity = (stale_metadata.dev(), stale_metadata.ino());
@@ -959,6 +963,30 @@ mod tests {
 
         drop(listener);
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_stale_socket(path: &std::path::Path) {
+        let started = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+
+        loop {
+            match tokio::net::UnixStream::connect(path).await {
+                Err(error) if error.kind() == ErrorKind::ConnectionRefused => return,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    panic!("synthetic stale endpoint disappeared before cleanup test: {error}");
+                }
+                Err(error) if started.elapsed() >= timeout => {
+                    panic!("synthetic stale endpoint did not settle before cleanup test: {error}");
+                }
+                Ok(_) if started.elapsed() >= timeout => {
+                    panic!("synthetic stale endpoint stayed reachable before cleanup test");
+                }
+                Ok(_) | Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
     }
 
     /// Set on the re-executed child so `endpoint_lock_is_held_through_guard_cleanup`

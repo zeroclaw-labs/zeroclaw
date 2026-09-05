@@ -2,6 +2,7 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
+use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,30 +15,6 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
-
-#[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TEMP",
-    "TMP",
-    "TERM",
-    "LANG",
-    "USERNAME",
-];
 
 const MAX_TOOL_NAME_LEN: usize = 64;
 
@@ -237,7 +214,7 @@ impl Tool for SkillShellTool {
         cmd.env_clear();
 
         // Only pass safe environment variables
-        for var in SAFE_ENV_VARS {
+        for var in SAFE_SHELL_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
@@ -640,6 +617,44 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_shell_tool_executes_powershell_safe_pipeline_with_sanitized_env() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let skill = SkillTool {
+            name: "safe_pipeline".to_string(),
+            description: "Run a safe PowerShell pipeline".to_string(),
+            kind: "shell".to_string(),
+            command: "Write-Output \"quoted safe value\" | Select-Object -First 1".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        };
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = SkillShellTool::new_with_runtime("test", &skill, security, runtime);
+
+        let result = tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result.output.contains("quoted safe value"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
