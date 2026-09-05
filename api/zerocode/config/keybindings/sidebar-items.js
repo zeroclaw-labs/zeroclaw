@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["DEFAULT_PRESET_NAME","KEY_PRESETS"],"fn":["build_override_table","preset_by_name","preset_names"],"struct":["KeyPreset"]};

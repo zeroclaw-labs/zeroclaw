@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["WASM_PLUGIN_SUPPORT_COMPILED"],"fn":["configured_plugin_channels"]};

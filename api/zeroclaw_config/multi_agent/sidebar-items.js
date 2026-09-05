@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AccessMode","MemoryBackendKind","OutputModality"],"struct":["A2aServerConfig","A2aServerSection","AgentA2aConfig","AgentAlias","AgentMemoryConfig","AgentWorkspaceConfig","PeerGroupConfig","PeerGroupName","PeerUsername"]};

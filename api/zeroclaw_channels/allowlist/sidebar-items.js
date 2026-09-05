@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Match"],"fn":["is_user_allowed","is_user_allowed_by"]};

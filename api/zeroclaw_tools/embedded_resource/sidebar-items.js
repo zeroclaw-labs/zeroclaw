@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_EMBEDDED_FILE_BYTES"],"fn":["content_hash_name","decode_embedded_blob","materialize_bytes","materialize_resource_blob","persist_content_addressed"],"struct":["EmbeddedResourceError","MaterializedResource"]};

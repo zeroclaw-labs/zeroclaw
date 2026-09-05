@@ -1,0 +1,697 @@
+<!DOCTYPE HTML>
+<html lang="es" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>FreeBSD - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-4642b369.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="freebsd"><a class="header" href="#freebsd">FreeBSD</a></h1>
+<p>ZeroClaw se ejecuta de forma nativa en FreeBSD (probado en FreeBSD 15.0-RELEASE, <code>amd64</code>). Hay dos diferencias con respecto a las rutas de Linux/macOS/Windows:</p>
+<ol>
+<li><strong>Sin binario precompilado y sin compatibilidad con <code>install.sh</code>.</strong> FreeBSD no es un objetivo del instalador de arranque, por lo que debes compilar desde el código fuente con la cadena de herramientas Rust del sistema.</li>
+<li><strong>Sin backend <code>zeroclaw service</code>.</strong> El comando <code>zeroclaw service install</code> reconoce systemd, OpenRC, launchd y el Programador de tareas de Windows, pero no <code>rc.d</code> de FreeBSD. Debe instalar usted mismo un pequeño script de <code>rc.d</code>. Esta página le proporciona uno completo y probado.</li>
+</ol>
+<p>Todo lo demás, la configuración, los proveedores, los canales, el daemon, el gateway, es idéntico a cualquier otra plataforma.</p>
+<blockquote>
+<p><strong>Cuándo usar FreeBSD.</strong> Las implementaciones de FreeBSD son comunes en alojamiento de dispositivos de red, sistemas embebidos y basado en jails, donde los operadores buscan la estabilidad del sistema base, las primitivas de ZFS + jails, o necesitan FreeBSD por razones de políticas o licencias. Dado que no existe un binario precompilado y la configuración de <code>rc.d</code> es manual, esta vía es adecuada para operadores familiarizados con las convenciones de FreeBSD. Si solo está evaluando plataformas sin un requisito específico de FreeBSD, Linux (systemd) o macOS (launchd) ofrecen una incorporación más rápida mediante <code>install.sh</code> y <code>zeroclaw service install</code>.</p>
+<p><strong>Obtén los archivos en lugar de copiar y pegar.</strong> Cada script de shell y configuración de ejemplo que se muestra a continuación se incluye en <a href="https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd"><code>dist/freebsd/</code></a>: cópialos directamente a tu host. El tutorial explica qué hace cada pieza y por qué.</p>
+</blockquote>
+<h2 id="dependencias-del-sistema"><a class="header" href="#dependencias-del-sistema">Dependencias del sistema</a></h2>
+<p>Instala la cadena de herramientas y el runtime desde <code>pkg</code>:</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">doas pkg install -y rust git
+</code></pre>
+</div>
+
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Paquete</th><th>Por qué</th></tr>
+</thead>
+<tbody>
+<tr><td><code>rust</code></td><td>Proporciona <code>cargo</code> y <code>rustc</code> para compilar el binario. El MSRV del espacio de trabajo de ZeroClaw es Rust 1.96.1; el port <code>rust</code> de FreeBSD sigue una versión estable más reciente, así que <code>pkg install rust</code> lo satisface.</td></tr>
+<tr><td><code>git</code></td><td>Clonar el repositorio, y requerido en tiempo de ejecución si usas herramientas basadas en git.</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong><code>doas</code>, no <code>sudo</code>.</strong> FreeBSD incluye <code>doas</code> como herramienta base de escalada de privilegios; <code>sudo</code> es un port opcional. Los ejemplos aquí usan <code>doas</code>. Un <code>/usr/local/etc/doas.conf</code> mínimo que otorga al grupo <code>wheel</code> escalada sin contraseña es:</p>
+<pre><code>permit nopass keepenv :wheel
+</code></pre>
+</blockquote>
+<h2 id="compilar-desde-el-código-fuente"><a class="header" href="#compilar-desde-el-código-fuente">Compilar desde el código fuente</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+cargo build --release
+</code></pre>
+</div>
+
+<p>El binario de release se genera en <code>target/release/zeroclaw</code>. Una compilación limpia del conjunto de características predeterminado tarda un tiempo en hardware modesto; esto es lo esperado, ya que ZeroClaw es un espacio de trabajo de Rust de gran tamaño.</p>
+<p>Para reducir el tamaño de la compilación, deshabilita las características que no necesites (consulta <code>./install.sh --list-features</code> en una máquina Linux, o <code>Cargo.toml</code>):</p>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">cargo build --release --no-default-features --features agent-runtime
+</code></pre>
+</div>
+
+<h2 id="instalar-el-binario"><a class="header" href="#instalar-el-binario">Instalar el binario</a></h2>
+<p>Colócalo en algún lugar de <code>PATH</code>. <code>/usr/local/bin</code> es la ubicación convencional para los binarios instalados mediante ports en FreeBSD:</p>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">doas install -m 755 target/release/zeroclaw /usr/local/bin/zeroclaw
+zeroclaw --version
+</code></pre>
+</div>
+
+<p>(<code>~/.cargo/bin/zeroclaw</code> funciona igual de bien si prefieres mantenerlo por usuario.)</p>
+<h2 id="configuración-de-primera-ejecución"><a class="header" href="#configuración-de-primera-ejecución">Configuración de primera ejecución</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">zeroclaw quickstart
+</code></pre>
+</div>
+
+<p>Esto crea <code>~/.zeroclaw/</code> con una configuración inicial y te guía a través de la configuración del proveedor. La estructura de configuración y la precedencia son idénticas a las de cualquier otra plataforma: consulta <a href="../reference/config.html">Referencia → Configuración</a>.</p>
+<h2 id="autenticación-del-proveedor"><a class="header" href="#autenticación-del-proveedor">Autenticación del proveedor</a></h2>
+<p>La autenticación de proveedores no es específica de FreeBSD. Los proveedores con clave de API solo necesitan que la clave se configure a través del gateway, zerocode, <code>zeroclaw config set</code> o el entorno. Los proveedores con OAuth y suscripción (p. ej., una suscripción de OpenAI/Codex ChatGPT, Anthropic Claude Pro/Team) obtienen su token desde el panel de control o el flujo de inicio de sesión del propio proveedor, que luego configuras de la misma manera que lo harías con una clave de API.</p>
+<p>Para el modelo completo de credenciales (claves API, tokens de OAuth/suscripción, anulaciones de variables de entorno y el almacén de secretos), consulte <a href="../providers/configuration.html#credentials">Configuración de proveedores → Credenciales</a> y <a href="../providers/configuration.html#oauth-and-subscription-auth">OAuth y autenticación por suscripción</a>. Esa página es la fuente de verdad para todas las plataformas.</p>
+<h2 id="ejecución-como-servicio-rcd"><a class="header" href="#ejecución-como-servicio-rcd">Ejecución como servicio (<code>rc.d</code>)</a></h2>
+<p>Debido a que <code>zeroclaw service install</code> no tiene un backend para FreeBSD, supervise el daemon con el <a href="https://man.freebsd.org/cgi/man.cgi?daemon%288%29"><code>daemon(8)</code></a> nativo de FreeBSD mediante un script de <code>rc.d</code>. Esto le proporciona <code>service zeroclaw start|stop|restart|status</code>, reinicio en caso de fallo, un pidfile y arranque al iniciar el sistema.</p>
+<blockquote>
+<p><strong>Copias listas para instalar de cada script a continuación se encuentran en <a href="https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd"><code>dist/freebsd/</code></a></strong> (<code>zeroclaw-run.sh</code>, el <code>zeroclaw.rc</code> básico y el <code>zeroclaw-hardened.rc</code> reforzado). Los dos scripts <code>rc.d</code> incluyen un marcador de posición <code>@@ZEROCLAW_USER@@</code> que debe sustituir con <code>sed</code> durante la instalación, de modo que puede descargar los archivos en lugar de copiarlos y pegarlos: consulte <code>dist/freebsd/README.md</code>. La guía paso a paso a continuación explica qué hace cada componente.</p>
+</blockquote>
+<h3 id="1-script-de-lanzamiento"><a class="header" href="#1-script-de-lanzamiento">1. Script de lanzamiento</a></h3>
+<p><code>daemon(8)</code> inicia el proceso hijo con un entorno mínimo, así que exporte un <code>PATH</code> completo (FreeBSD coloca <code>git</code>, <code>python3</code>, etc. bajo <code>/usr/local/bin</code>, que <em>no</em> está en el <code>PATH</code> predeterminado del servicio). El script <code>rc.d</code> lo ejecuta a través de <code>daemon -u &lt;user&gt;</code>, que según <code>daemon(8)</code> establece <code>HOME</code>, <code>USER</code> y <code>SHELL</code> a partir de la entrada passwd de esa cuenta antes de exec, por lo que <code>${HOME}</code> ya es el directorio home de la cuenta de servicio (las cuentas cuyo home está en otra ubicación, y las anulaciones de usuario de ejecución en <code>rc.conf</code>, simplemente funcionan). Guárdelo como <code>/usr/local/libexec/zeroclaw-run.sh</code>:</p>
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">#!/bin/sh
+# daemon -u &lt;user&gt; has already set HOME from the accountentrada passwd del usuario.
+export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/bin"
+exec /usr/local/bin/zeroclaw daemon --config-dir "${HOME}/.zeroclaw"
+</code></pre>
+</div>
+
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh">doas install -m 755 zeroclaw-run.sh /usr/local/libexec/zeroclaw-run.sh
+</code></pre>
+</div>
+
+<h3 id="2-script-rcd"><a class="header" href="#2-script-rcd">2. Script <code>rc.d</code></a></h3>
+<p>Guardar como <code>/usr/local/etc/rc.d/zeroclaw</code>:</p>
+<div class="os-tabs-src">
+<h4 id="sh-7"><a class="header" href="#sh-7">sh</a></h4>
+<pre><code class="language-sh">#!/bin/sh
+#
+# PROVIDE: zeroclaw
+# REQUIRE: NETWORKING DAEMON
+# PALABRA CLAVE: shutdown
+
+. /etc/rc.subr
+
+name=zeroclaw
+rcvar="zeroclaw_enable"
+
+load_rc_config $name
+
+: ${zeroclaw_enable:=NO}
+# NO nombrar esto ${name}_user — rc.subr ejecutaría entonces su propio cambio de usuario con su
+# and collide with daemon -u ("no se pudo establecer el entorno del usuario").
+: ${zeroclaw_runas:="youruser"}
+
+rundir="/var/run/zeroclaw"
+pidfile="${rundir}/zeroclaw.pid"
+logfile="/var/log/${name}.log"
+launcher="/usr/local/libexec/zeroclaw-run.sh"
+
+command="/usr/sbin/daemon"
+command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_runas} ${launcher}"
+
+start_precmd="zeroclaw_precmd"
+
+zeroclaw_precmd()
+{
+    # rundir + logfile permanecen con propietario root: rc.d (root) escribe el daemon -P pidfile
+    # aquí y confía en él después, por lo que el usuario sin privilegios del servicio no debe poder
+    # falsificarlo. daemon -o abre el logfile antes de cambiar al usuario ${zeroclaw_runas}.
+    install -d -o root -g wheel -m 755 "${rundir}"
+    install -o root -g wheel -m 640 /dev/null "${logfile}"
+}
+
+run_rc_command $1
+</code></pre>
+</div>
+
+<div class="os-tabs-src">
+<h4 id="sh-8"><a class="header" href="#sh-8">sh</a></h4>
+<pre><code class="language-sh">doas install -m 755 zeroclaw /usr/local/etc/rc.d/zeroclaw
+</code></pre>
+</div>
+
+<p>Qué hacen los flags:</p>
+<ul>
+<li><code>-r</code>: supervisar y reiniciar el proceso hijo si finaliza (recuperación ante fallos).</li>
+<li><code>-P ${pidfile}</code>: escribe el pid del <em>supervisor</em> para que <code>service zeroclaw stop</code> pueda enviarle una señal.</li>
+<li><code>-o ${logfile}</code>: redirige stdout/stderr del proceso hijo a un archivo de registro.</li>
+<li><code>-u ${zeroclaw_runas}</code>: ejecuta zeroclaw como un usuario sin privilegios, no como root.</li>
+</ul>
+<blockquote>
+<p><strong>Por qué <code>daemon -u</code> y no <code>su -m</code>.</strong> Un patrón común es <code>daemon ... su -m user -c launcher</code>. Evítelo: <code>su(1)</code> <strong>no</strong> reenvía <code>SIGTERM</code> a su proceso hijo, por lo que <code>service zeroclaw stop</code> mata al supervisor <code>daemon</code> pero deja atrás un proceso <code>zeroclaw</code> huérfano, y el siguiente <code>start</code> acumula una segunda copia. <code>daemon -u user</code> hace que <code>daemon(8)</code> sea el padre directo de <code>zeroclaw</code>, de modo que reenvía la señal de detención y se cierra limpiamente. (Si está obligado a usar un script basado en <code>su</code> por otras razones, añada un barrido <code>pkill -f "zeroclaw daemon"</code> a su ruta de detención.)</p>
+</blockquote>
+<h3 id="3-habilitar-e-iniciar"><a class="header" href="#3-habilitar-e-iniciar">3. Habilitar e iniciar</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-9"><a class="header" href="#sh-9">sh</a></h4>
+<pre><code class="language-sh">doas sysrc zeroclaw_enable=YES
+doas sysrc zeroclaw_runas=youruser     # la cuenta propietaria de ~/.zeroclaw
+
+doas service zeroclaw start
+doas service zeroclaw status
+</code></pre>
+</div>
+
+<p><code>service zeroclaw stop</code> / <code>restart</code> funcionan como se espera. Como <code>zeroclaw_enable=YES</code> está en <code>/etc/rc.conf</code> (escrito por <code>sysrc</code>), el daemon también se inicia durante el arranque.</p>
+<h3 id="4-refuerzo-de-seguridad-para-operación-desatendida-y-remota"><a class="header" href="#4-refuerzo-de-seguridad-para-operación-desatendida-y-remota">4. Refuerzo de seguridad para operación desatendida y remota</a></h3>
+<p>El script anterior es correcto para una instalación interactiva de una sola instancia. Tres comportamientos de <code>daemon(8)</code> le sorprenderán en el momento en que maneje el servicio de forma remota (a través de <code>ssh</code>) o ejecute más de una copia. Los tres afectaron un despliegue en producción; las correcciones son pequeñas. Un script completo que incorpora todas las correcciones a continuación se distribuye como <a href="https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd"><code>dist/freebsd/zeroclaw-hardened.rc</code></a>: instálelo en lugar del script básico de <code>zeroclaw</code>.</p>
+<p><strong>El comando remoto <code>service ... start</code> se queda colgado.</strong> <code>daemon -r</code> hereda y mantiene abiertos los stdin/stdout/stderr con los que fue lanzado. Si ejecuta <code>ssh host 'service zeroclaw start'</code>, el supervisor mantiene abierto el fd de stdout de su sesión <code>ssh</code> indefinidamente, por lo que <code>ssh</code> nunca recibe EOF y el comando se queda colgado aunque el daemon haya arrancado correctamente. Desacople los descriptores propios del supervisor: <code>-o ${logfile}</code> ya redirige la salida del <em>proceso hijo</em>, así que no se pierde nada:</p>
+<div class="os-tabs-src">
+<h4 id="sh-10"><a class="header" href="#sh-10">sh</a></h4>
+<pre><code class="language-sh">command_args="-r -P ${pidfile} -o ${logfile} -u ${zeroclaw_runas} ${launcher}"
+# ...invocar el daemon con sus propios std{in,out,err} enviados a /dev/null:
+/usr/sbin/daemon ${command_args} &lt;/dev/null &gt;/dev/null 2&gt;&amp;1
+</code></pre>
+</div>
+
+<p>Si usas la forma estándar <code>command</code>/<code>command_args</code>, envuelve el inicio en un <code>start_cmd</code> personalizado para que tú controles la redirección. Este único cambio es lo que hace que <code>service zeroclaw start</code> sea seguro de invocar desde <code>ssh</code>, CI o un push de gestión de configuración.</p>
+<p><strong>Ejecutar <code>start</code> repetidamente acumula supervisores huérfanos.</strong> Un <code>start</code> simple no comprueba si ya hay un supervisor en ejecución, por lo que un segundo <code>start</code> (o un <code>start</code> después de un fallo que dejó un pidfile obsoleto) lanza otro <code>daemon</code> que compite con el primero por el puerto del gateway. Haga que <code>start</code> sea idempotente rechazando la ejecución cuando ya existe un supervisor activo. Identifique el supervisor por la ruta del lanzador, <strong>no</strong> solo por el pidfile (el pidfile puede estar obsoleto). Dos trampas específicas de FreeBSD al hacer esto:</p>
+<ul>
+<li><code>daemon(8)</code> <em>renombra su supervisor</em> a <code>daemon: /usr/local/libexec/zeroclaw-run.sh[&lt;childpid&gt;] (daemon)</code>. Por lo tanto, <code>pgrep -f zeroclaw-run.sh</code> coincide con el supervisor, pero un <code>pgrep -f</code> con el nombre del binario no. Ancle en el prefijo literal <code>daemon:</code>: esto coincide con el supervisor y nunca con el hijo, una ejecución manual del lanzador o el propio shell rc. Ancle también el <code>[</code> final que abre el <code>[&lt;childpid&gt;]</code> de daemon, de modo que un lanzador hermano cuyo nombre simplemente <em>comience con</em> <code>zeroclaw-run.sh</code> no pueda coincidir (esto importa cuando se ejecuta un pool, consulte <a href="#4-hardening-for-unattended-and-remote-operation">Ejecución de un pool de instancias</a> más adelante).</li>
+<li>FreeBSD <code>pgrep -f</code> <strong>no</strong> respeta un ancla <code>^</code> inicial frente a esa cadena de retitulación: <code>pgrep -f '^daemon: ...'</code> no encuentra coincidencias. Elimine el <code>^</code>; confíe en el prefijo <code>daemon:</code> para la especificidad y escape el punto en <code>.sh</code> como <code>[.]</code> (y el corchete como <code>[[]</code>) para que sean literales.</li>
+</ul>
+<div class="os-tabs-src">
+<h4 id="sh-11"><a class="header" href="#sh-11">sh</a></h4>
+<pre><code class="language-sh">launcher_pat="daemon: /usr/local/libexec/zeroclaw-run[.]sh[[]"
+
+zeroclaw_running()
+{
+    pgrep -f "${launcher_pat}" &gt;/dev/null 2&gt;&amp;1
+}
+</code></pre>
+</div>
+
+<p><strong><code>read</code> desde un pidfile de <code>daemon -P</code> reporta un falso negativo.</strong> <code>daemon -P</code> escribe el pid <strong>sin salto de línea final</strong>, por lo que <code>IFS= read -r pid &lt; "${pidfile}"</code> devuelve un estado <em>distinto de cero</em> (EOF antes del salto de línea) aunque haya asignado <code>pid</code> correctamente. Si lo proteges con <code>read -r pid &lt; "$pf" || return 1</code>, cada instancia en ejecución parecerá detenida y tu <code>start</code> idempotente lanzará alegremente un duplicado. No bases la ruta de éxito en el estado de salida de <code>read</code>: valida el valor en su lugar:</p>
+<div class="os-tabs-src">
+<h4 id="sh-12"><a class="header" href="#sh-12">sh</a></h4>
+<pre><code class="language-sh">pid=""
+IFS= read -r pid &lt; "${pidfile}"     # NO usar `|| return 1` aquí
+case "${pid}" in
+    ''|*[!0-9]*) return 1 ;;        # vacío o no numérico → tratar como no en ejecución
+esac
+</code></pre>
+</div>
+
+<p><strong>Ejecución de un pool de instancias.</strong> Para ejecutar N daemons (p. ej., un pool de workers), asigne a cada uno su propio pidfile y logfile (<code>worker.$i.pid</code>, <code>worker.$i.log</code>) y ejecute el inicio/parada en un bucle sobre <code>$i</code>. Dado que el retitulado del supervisor es idéntico para cada instancia y no incluye argumentos por instancia, el <strong>pidfile es el único identificador por instancia</strong>: gestione la parada/estado a partir del pidfile y, en una parada completa, elimine cualquier supervisor sobrante al que no apunte ningún pidfile activo (iniciado manualmente, o cuyo pidfile haya quedado obsoleto).</p>
+<h2 id="ejecución-en-un-jail"><a class="header" href="#ejecución-en-un-jail">Ejecución en un jail</a></h2>
+<p><a href="https://docs.freebsd.org/en/books/handbook/jails/">Las jails</a> le proporcionan a ZeroClaw una raíz aislada con sus propios paquetes, usuario de servicio y, opcionalmente, su propia IP, lo cual es útil si el host ejecuta otros servicios o si desea restringir el agente. <strong>La configuración del servicio es idéntica a la del caso del host; simplemente se ejecuta <em>dentro</em> de la jail.</strong> Esta guía describe paso a paso una thick jail clásica con las herramientas del sistema base (no se requiere un gestor de jails).</p>
+<blockquote>
+<p><strong>Opción de un solo paso.</strong> <a href="https://github.com/zeroclaw-labs/zeroclaw/tree/master/dist/freebsd"><code>dist/freebsd/zeroclaw-jail-setup.sh</code></a> automatiza los pasos 1–3 a continuación: crea el jail, extrae una base compatible, añade la entrada en <code>/etc/jail.conf</code>, inicia el jail e instala el lanzador + el script <code>rc.d</code> reforzado dentro de él (<code>doas sh zeroclaw-jail-setup.sh</code>, con <code>JAIL_NAME</code> / <code>JAIL_PATH</code> / <code>ZPOOL</code> / <code>ZEROCLAW_USER</code> sobrescribibles mediante variables de entorno). El recorrido manual a continuación explica lo que hace.</p>
+</blockquote>
+<h3 id="1-crea-la-jail"><a class="header" href="#1-crea-la-jail">1. Crea la jail</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-13"><a class="header" href="#sh-13">sh</a></h4>
+<pre><code class="language-sh"># Dataset de ZFS para el jail (use un directorio normal si está en UFS).
+doas zfs create -o mountpoint=/jails/zeroclaw zroot/jails/zeroclaw   # ajustar el pool
+
+# Extraer en él una base que coincida con la versión del HOST.
+doas fetch -o /tmp/base.txz \
+    "https://download.freebsd.org/releases/$(uname -m)/$(freebsd-version -u)/base.txz"
+doas tar -xpf /tmp/base.txz -C /jails/zeroclaw
+doas cp /etc/resolv.conf /jails/zeroclaw/etc/
+</code></pre>
+</div>
+
+<h3 id="2-configura-e-inicia"><a class="header" href="#2-configura-e-inicia">2. Configura e inicia</a></h3>
+<p>Añade una entrada de jail a <code>/etc/jail.conf</code> (en el lado del host). Este ejemplo comparte la red del host; configura <code>ip4.addr</code> en su lugar si le asignas al jail una dirección dedicada.</p>
+<pre><code>zeroclaw {
+    host.hostname = "zeroclaw";
+    path = "/jails/zeroclaw";
+    exec.start = "/bin/sh /etc/rc";
+    exec.stop  = "/bin/sh /etc/rc.shutdown";
+    exec.clean;
+    mount.devfs;
+    persist;
+}
+</code></pre>
+<div class="os-tabs-src">
+<h4 id="sh-14"><a class="header" href="#sh-14">sh</a></h4>
+<pre><code class="language-sh">doas sysrc jail_enable=YES
+doas sysrc jail_list+=zeroclaw
+doas service jail start zeroclaw
+</code></pre>
+</div>
+
+<h3 id="3-instalar-zeroclaw-dentro-del-jail"><a class="header" href="#3-instalar-zeroclaw-dentro-del-jail">3. Instalar ZeroClaw dentro del jail</a></h3>
+<p>Todo lo de las secciones anteriores se ejecuta <em>dentro</em> del jail: anteponga <code>doas jexec zeroclaw …</code> a los comandos, o abra un shell con <code>doas jexec zeroclaw /bin/sh</code>:</p>
+<div class="os-tabs-src">
+<h4 id="sh-15"><a class="header" href="#sh-15">sh</a></h4>
+<pre><code class="language-sh">doas jexec zeroclaw pkg install -y rust git     # o copiar un binario compilado en el host
+# build + install zeroclaw to /usr/local/bin/zeroclaw exactly as above, then:
+doas jexec zeroclaw pw useradd zeroclaw -m -s /usr/sbin/nologin
+</code></pre>
+</div>
+
+<p>Instala el launcher y el script <code>rc.d</code> en el sistema de archivos de la <strong>jail</strong> (desde el host, la raíz de la jail tiene el prefijo: <code>/jails/zeroclaw/usr/local/libexec/…</code> y <code>/jails/zeroclaw/usr/local/etc/rc.d/…</code>). Luego habilita e inicia el servicio <em>dentro</em> de la jail:</p>
+<div class="os-tabs-src">
+<h4 id="sh-16"><a class="header" href="#sh-16">sh</a></h4>
+<pre><code class="language-sh">doas jexec zeroclaw sysrc zeroclaw_enable=YES
+doas jexec zeroclaw service zeroclaw start
+doas jexec zeroclaw service zeroclaw status
+</code></pre>
+</div>
+
+<h3 id="notas-específicas-de-jail"><a class="header" href="#notas-específicas-de-jail">Notas específicas de jail</a></h3>
+<ul>
+<li><strong>Edite los archivos del jail desde el host con <code>tee</code>, no con <code>cp /dev/stdin</code>.</strong> Canalice mediante <code>… | doas tee /jails/zeroclaw/usr/local/etc/rc.d/zeroclaw &gt;/dev/null</code>; <code>doas cp /dev/stdin …</code> puede fallar a mitad de la copia con <code>cp: /dev/stdin: File changed</code>.</li>
+<li><strong>El gateway se enlaza dentro del jail.</strong> El daemon escucha en loopback de forma predeterminada: para acceder a él desde el host o la LAN, inicia zeroclaw con <code>--host 0.0.0.0</code> (edita <code>zeroclaw-run.sh</code>) y asigna al jail una dirección accesible, o usa un proxy desde el host.</li>
+<li><strong>Prefiere el script <code>rc.d</code> reforzado en un jail.</strong> Normalmente ejecutarás <code>service</code> de forma no interactiva mediante <code>jexec</code>/<code>ssh</code>, que es exactamente donde el bloqueo de <code>start</code> y la acumulación de procesos huérfanos del script básico causan problemas: consulta <a href="#4-hardening-for-unattended-and-remote-operation">Hardening</a>. También mantiene <code>/var/run/zeroclaw</code> con propiedad de root dentro del jail para que el usuario de servicio sin privilegios no pueda falsificar el pidfile del supervisor.</li>
+<li><strong>Ejecutar varios demonios en un mismo jail</strong> (p. ej., un pool de workers) sigue la nota sobre pools de la sección de hardening: un pidfile/logfile por instancia y un <code>pgrep</code> vinculado al retitulado del lanzador, dado que el jail comparte una única tabla de procesos.</li>
+</ul>
+<h2 id="ejecución-de-la-imagen-de-linux-bajo-podman--linuxulator"><a class="header" href="#ejecución-de-la-imagen-de-linux-bajo-podman--linuxulator">Ejecución de la imagen de Linux bajo Podman + Linuxulator</a></h2>
+<p>La compilación nativa anterior es el camino correcto para ZeroClaw en sí. Pero algunas herramientas y skills respaldadas por Python dependen de <strong>wheels exclusivos de manylinux</strong>: <code>polars</code>, <code>pyarrow</code> y <code>oracledb</code>, por ejemplo, no publican wheels para FreeBSD, por lo que una herramienta que los importe no puede ejecutarse bajo el <code>python3</code> nativo de FreeBSD. El <a href="https://docs.freebsd.org/en/books/handbook/linuxemu/">Linuxulator</a> de FreeBSD (capa de compatibilidad binaria con Linux) junto con Podman le permite ejecutar la <strong>imagen de contenedor oficial de Linux</strong> en un host FreeBSD, brindando a esas herramientas la ABI de Linux que esperan. Esto complementa el daemon nativo de <code>rc.d</code>: puede ejecutar cualquiera de los dos, o ambos en paralelo.</p>
+<h3 id="1-requisitos-previos"><a class="header" href="#1-requisitos-previos">1. Requisitos previos</a></h3>
+<p>Habilite la ABI de Linux y confirme que reporta una versión de Linux:</p>
+<div class="os-tabs-src">
+<h4 id="sh-17"><a class="header" href="#sh-17">sh</a></h4>
+<pre><code class="language-sh">doas sysrc linux_enable="SÍ"
+doas service linux start              # carga los módulos y monta /compat/linux
+sysctl compat.linux.osrelease         # p. ej. compat.linux.osrelease: 5.15.0
+</code></pre>
+</div>
+
+<p><code>linux_enable="YES"</code> en <code>/etc/rc.conf</code> también carga la ABI al arrancar. Luego instala Podman:</p>
+<div class="os-tabs-src">
+<h4 id="sh-18"><a class="header" href="#sh-18">sh</a></h4>
+<pre><code class="language-sh">doas pkg install -y podman
+</code></pre>
+</div>
+
+<h3 id="2-descargar-la-imagen-forzar-la-plataforma-linux"><a class="header" href="#2-descargar-la-imagen-forzar-la-plataforma-linux">2. Descargar la imagen: forzar la plataforma Linux</a></h3>
+<p>FreeBSD Podman usa por defecto <code>os=freebsd</code> al resolver una lista de manifiestos. Las imágenes de ZeroClaw se publican solo para <code>linux/amd64</code> y <code>linux/arm64</code>, por lo que un <code>podman pull</code> simple falla con <code>no image found in manifest list for architecture ..., OS freebsd</code>. Fuerza la plataforma Linux explícitamente:</p>
+<div class="os-tabs-src">
+<h4 id="sh-19"><a class="header" href="#sh-19">sh</a></h4>
+<pre><code class="language-sh">doas podman pull --os linux --arch amd64 ghcr.io/zeroclaw-labs/zeroclaw:debian
+</code></pre>
+</div>
+
+<blockquote>
+<p>Use la etiqueta <code>debian</code> en lugar de <code>latest</code>: la imagen distroless <code>latest</code> no tiene shell, lo que dificulta la depuración bajo emulación. Consulte <a href="./container.html">Docker &amp; Containers</a> para ver la lista completa de imágenes.</p>
+</blockquote>
+<h3 id="3-ejecuta-el-contenedor"><a class="header" href="#3-ejecuta-el-contenedor">3. Ejecuta el contenedor</a></h3>
+<p>La imagen de Linux se comporta exactamente como se documenta en <a href="./container.html">Docker &amp; Containers</a>, espera el estado persistente en <code>/zeroclaw-data</code> y genera automáticamente una configuración en la primera ejecución:</p>
+<div class="os-tabs-src">
+<h4 id="sh-20"><a class="header" href="#sh-20">sh</a></h4>
+<pre><code class="language-sh">doas podman run -d --name zeroclaw --restart=always \
+    --os linux --arch amd64 \
+    -p 42617:42617 \
+    -v /var/db/zeroclaw:/zeroclaw-data \
+    ghcr.io/zeroclaw-labs/zeroclaw:debian
+
+doas podman exec -it zeroclaw zeroclaw quickstart
+</code></pre>
+</div>
+
+<p>Mantén las banderas <code>--os linux --arch amd64</code> en cada <code>run</code> (no solo en <code>pull</code>) para que Podman no vuelva a resolver al valor predeterminado de FreeBSD.</p>
+<h3 id="notas-sobre-linuxulator"><a class="header" href="#notas-sobre-linuxulator">Notas sobre Linuxulator</a></h3>
+<ul>
+<li><strong>Persistencia tras el arranque.</strong> El <code>--restart=always</code> propio de Podman solo reinicia el contenedor dentro de un Podman en ejecución; no sobrevivirá por sí solo a un reinicio del host. Supervise el <code>podman start</code> desde un script <code>rc.d</code> (el mismo patrón que el <a href="#running-as-a-service-rcd">servicio nativo</a>) o una entrada cron <code>@reboot</code> para que el contenedor vuelva a iniciarse después de que el host se reinicie.</li>
+<li><strong>Redes.</strong> <code>-p 42617:42617</code> publica la puerta de enlace a través del bridge de Podman. Si la configuración de bridge/CNI no está configurada en tu host, <code>--network host</code> es la alternativa más sencilla: el contenedor comparte entonces directamente la pila de red del host.</li>
+<li><strong>No todo se emula sin problemas.</strong> Linuxulator cubre la superficie de syscalls comunes, pero los binarios exóticos pueden encontrarse con llamadas no implementadas. Si una herramienta se comporta mal, revisa <code>dmesg</code> en busca de advertencias <code>linux:</code> antes de asumir que es un error de ZeroClaw.</li>
+</ul>
+<h2 id="registros"><a class="header" href="#registros">Registros</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-21"><a class="header" href="#sh-21">sh</a></h4>
+<pre><code class="language-sh">tail -f /var/log/zeroclaw.log
+</code></pre>
+</div>
+
+<p>Configure el nivel de registro mediante las opciones estándar de configuración / variables de entorno: consulte <a href="../ops/observability.html">Operations → Logs &amp; observability</a>.</p>
+<h2 id="verificar"><a class="header" href="#verificar">Verificar</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-22"><a class="header" href="#sh-22">sh</a></h4>
+<pre><code class="language-sh">zeroclaw --version
+service zeroclaw status
+# si el daemon expone el gateway local (predeterminado 127.0.0.1:42617):
+fetch -qo - http://127.0.0.1:42617/health
+</code></pre>
+</div>
+
+<p>Una carga útil de estado <code>"status":"ok"</code> significa que el gateway está activo; el campo <code>runtime</code> de la respuesta contiene el estado de salud por componente (canales, proveedores, etc.).</p>
+<h2 id="desinstalar"><a class="header" href="#desinstalar">Desinstalar</a></h2>
+<div class="os-tabs-src">
+<h4 id="sh-23"><a class="header" href="#sh-23">sh</a></h4>
+<pre><code class="language-sh">doas service zeroclaw stop
+doas sysrc -x zeroclaw_enable
+doas rm /usr/local/etc/rc.d/zeroclaw /usr/local/libexec/zeroclaw-run.sh
+doas rm /usr/local/bin/zeroclaw
+rm -rf ~/.zeroclaw        # opcional — elimina la configuración + el historial
+</code></pre>
+</div>
+
+<h2 id="siguiente"><a class="header" href="#siguiente">Siguiente</a></h2>
+<ul>
+<li><a href="./service.html">Gestión de servicios</a>: cómo funcionan los backends propios en otras plataformas</li>
+<li><a href="../reference/config.html">Referencia → Config</a>: estructura del archivo de configuración</li>
+<li><a href="../getting-started/quickstart.html">Quickstart</a>: primera conversación</li>
+<li><a href="../ops/overview.html">Operaciones → Visión general</a>: ejecución en producción</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../setup/windows.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../setup/nixos.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../setup/windows.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../setup/nixos.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

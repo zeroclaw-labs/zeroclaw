@@ -1,0 +1,1015 @@
+<!DOCTYPE HTML>
+<html lang="en" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Secure transport (end-to-end config) - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+            window.path_to_searchindex_js = "../searchindex-a0f23def.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-42260f39.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="secure-transport-end-to-end-configuration"><a class="header" href="#secure-transport-end-to-end-configuration">Secure transport: end-to-end configuration</a></h1>
+<p>This page is the full configuration reference for connecting a client to a daemon
+securely, in three topologies:</p>
+<ol>
+<li><strong>Client direct to daemon</strong> - mutual-TLS WSS, no relay.</li>
+<li><strong>Daemon to relay</strong> - the daemon keeps an outbound bridge to a nominated relay
+so it is reachable from behind NAT/CGNAT.</li>
+<li><strong>Client to relay to daemon</strong> - the client reaches the daemon <em>through</em> that
+relay, while the real client&lt;-&gt;daemon mTLS still terminates at the daemon.</li>
+</ol>
+<p>For the 60-second quickstart see <a href="./remote.html">Remote setup (WSS)</a>; this page is
+the deeper, knob-by-knob guide.</p>
+<h2 id="mental-model-two-envelopes-one-trust-boundary"><a class="header" href="#mental-model-two-envelopes-one-trust-boundary">Mental model: two envelopes, one trust boundary</a></h2>
+<p>There are two TLS layers, and only one of them is the security boundary:</p>
+<ul>
+<li><strong>Inner mTLS (the real boundary).</strong> TLS 1.3 only, mutually authenticated. The
+client presents a daemon-issued certificate; the daemon presents its server
+leaf. This is the RPC plane. There is <strong>no</strong> server-only / unauthenticated path
+on it - a client certificate is always required.</li>
+<li><strong>Outer TLS (a metadata boundary).</strong> When a relay is in the path, the relay
+terminates an outer TLS + WebSocket session and forwards opaque ciphertext. It
+never holds a key that can read the inner RPC. On the direct topology there is
+no outer layer.</li>
+</ul>
+<p>Default ports (all configurable):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Plane</th><th>Default</th><th>Config</th></tr>
+</thead>
+<tbody>
+<tr><td>Daemon WSS (inner mTLS RPC)</td><td><code>9781</code></td><td><code>[wss].port</code></td></tr>
+<tr><td>Daemon enrollment endpoint</td><td><code>9782</code></td><td><code>[enroll].port</code></td></tr>
+<tr><td>Relay (outer TLS + WS)</td><td><code>8443</code></td><td>relay <code>--bind</code> / <code>[bind]</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Throughout, <code>&lt;data_dir&gt;</code> is the daemon’s data directory (typically <code>~/.zeroclaw</code>)
+and <code>&lt;config-dir&gt;</code> is the client’s zerocode config directory (<code>--config-dir</code>,
+typically <code>~/.zeroclaw</code>). Config files do not expand <code>~</code>; use absolute paths.</p>
+<hr>
+<h2 id="topology-1-client-direct-to-daemon"><a class="header" href="#topology-1-client-direct-to-daemon">Topology 1: client direct to daemon</a></h2>
+<pre><code>zerocode  ===== mutual-TLS WSS (TLS 1.3) =====&gt;  daemon  [wss] :9781
+</code></pre>
+<h3 id="1a-daemon-side"><a class="header" href="#1a-daemon-side">1a. Daemon side</a></h3>
+<p>Enable the WSS listener. The secure default is to let the daemon <strong>auto-generate
+its own CA and server certificate</strong> on first boot, so you do not hand-manage any
+TLS material:</p>
+<pre><code class="language-toml">[wss]
+enabled = true
+# bind = "0.0.0.0"   # default
+# port = 9781        # default
+# Leave cert_path/key_path empty to auto-generate a server cert under
+# &lt;data_dir&gt;/tls/ on first boot. Set them only to bring your own server cert.
+</code></pre>
+<p>On first start with <code>[wss].enabled = true</code> the daemon writes, under
+<code>&lt;data_dir&gt;/tls/</code> (directory mode <code>0700</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th><th>Mode</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ca.crt</code></td><td>Per-daemon CA certificate (public)</td><td>default umask</td></tr>
+<tr><td><code>ca.key</code></td><td>CA private key (signs client certs)</td><td><code>0600</code></td></tr>
+<tr><td><code>server.crt</code></td><td>WSS server leaf (SANs <code>localhost</code>, <code>127.0.0.1</code>)</td><td>default umask</td></tr>
+<tr><td><code>server.key</code></td><td>WSS server private key</td><td><code>0600</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Private keys are written <code>0600</code>; the public certificates use the process umask.
+The <code>tls/</code> directory itself is <code>0700</code>.</p>
+<p>The CA is <strong>never silently rotated</strong>: if <code>ca.crt</code> and <code>ca.key</code> exist they are
+reused. Auto-generated CA lifetime is 10 years; the server leaf is ~27 months;
+issued client certs are 30 days.</p>
+<p>Open the port (<code>sudo ufw allow 9781/tcp</code>) and start the daemon. You should see a
+log line that the WSS listener is up on <code>0.0.0.0:9781</code>.</p>
+<p>The client now needs a certificate. There are two ways to get one.</p>
+<h3 id="1b-client-side---option-a-enrollment-recommended"><a class="header" href="#1b-client-side---option-a-enrollment-recommended">1b. Client side - option A: enrollment (recommended)</a></h3>
+<p>Enrollment gives a certless client its first certificate over a pairing-gated,
+server-authenticated endpoint, with no manual cert handling. Turn it on:</p>
+<pre><code class="language-toml">[enroll]
+enabled = true
+# bind = "0.0.0.0"   # default
+# port = 9782        # default
+# Requires [wss] enabled and a daemon CA key (auto-generated above, or BYO+key).
+# If the CA key is absent the endpoint fails closed and certs must be provisioned
+# out of band.
+</code></pre>
+<p>The daemon prints a one-time <strong>pairing code</strong> and a <strong>short-auth-string (SAS)</strong> to
+its console/log on start. The code is <strong>single-use and expires 10 minutes after
+it is minted</strong> - it is the only bearer credential for certificate issuance, and
+it lands in consoles and logs, so a copied code must stop working shortly after
+the operator has used it. An expired code is refused and cleared; mint a
+replacement from the gateway’s pairing API when you need a fresh one. Then, on
+the workstation:</p>
+<pre><code class="language-sh"># Interactive: a certless client auto-enrolls on first connect.
+zerocode --connect wss://&lt;remote-host&gt;:9781
+
+# Or explicitly / non-interactively:
+zerocode --enroll --connect wss://&lt;remote-host&gt;:9781
+</code></pre>
+<p>zerocode prompts for the pairing code, generates a P-256 key and CSR <strong>locally
+(the private key never leaves the device)</strong>, and shows the SAS. Confirm the SAS
+matches the one the daemon printed (this catches a man-in-the-middle CA), and it
+caches, under <code>&lt;config-dir&gt;/tls/</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>File</th><th>Purpose</th><th>Mode</th></tr>
+</thead>
+<tbody>
+<tr><td><code>client.crt</code></td><td>Issued client certificate</td><td>default umask</td></tr>
+<tr><td><code>client.key</code></td><td>Client private key (generated locally)</td><td><code>0600</code></td></tr>
+<tr><td><code>ca.crt</code></td><td>Daemon CA chain, pinned for the RPC plane</td><td>default umask</td></tr>
+<tr><td><code>profile.json</code></td><td>Cached <code>device_id</code>, <code>not_after</code>, relay profile</td><td>default umask</td></tr>
+</tbody>
+</table>
+</div>
+<p>Every later run is zero-config (<code>zerocode --connect wss://&lt;remote-host&gt;:9781</code>,
+or just <code>zerocode</code> if <code>uri</code> is in config). The cert auto-renews at ~50% of its
+lifetime (~15 days) over the live mTLS session; a revoked cert cannot self-renew.</p>
+<p>Enrollment endpoint defaults: <code>--enroll-host</code> defaults to <code>--connect</code>’s host;
+<code>--enroll-port</code> defaults to <code>9782</code>.</p>
+<p>The first release intentionally requires a pairing code for every enrollment.
+The reserved <code>allow_unpaired_enrollment</code> knob is rejected at daemon startup until
+the client has an explicit no-code trust anchor such as a pinned daemon CA
+fingerprint. This keeps the provisional enrollment TLS path from turning into
+blind trust-on-first-use.</p>
+<h3 id="1c-client-side---option-b-operator-issued-certificate"><a class="header" href="#1c-client-side---option-b-operator-issued-certificate">1c. Client side - option B: operator-issued certificate</a></h3>
+<p>If you would rather mint a cert on the daemon and copy it out:</p>
+<pre><code class="language-sh"># On the daemon host. --out-dir also writes a drop-in ca.crt/client.crt/client.key.
+zeroclaw security issue-client-cert --name my-laptop --out-dir /tmp/my-laptop-tls
+# add --force to overwrite an existing cert for this name
+</code></pre>
+<p>Copy the three files to the client’s <code>&lt;config-dir&gt;/tls/</code> as <code>ca.crt</code>,
+<code>client.crt</code>, <code>client.key</code> (then <code>zerocode --connect wss://host:9781</code> finds them
+automatically), or point at them explicitly:</p>
+<pre><code class="language-sh">zerocode --connect wss://&lt;remote-host&gt;:9781 \
+  --tls-ca-cert  /path/ca.crt \
+  --tls-client-cert /path/client.crt \
+  --tls-client-key  /path/client.key
+</code></pre>
+<p>Equivalent config (so plain <code>zerocode</code> works):</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://&lt;remote-host&gt;:9781"
+
+[connection.wss.tls]
+ca_cert_path     = "/abs/path/ca.crt"
+client_cert_path = "/abs/path/client.crt"
+client_key_path  = "/abs/path/client.key"
+</code></pre>
+<blockquote>
+<p>A certless client that reaches the WSS plane without enrolling gets an
+actionable “enroll first” message (and the daemon logs the rejected
+un-migrated client) - never a silent hang. <code>--tls-skip-verify</code> only relaxes
+<em>server</em> verification for a self-signed dev daemon; the client certificate is
+still required.</p>
+</blockquote>
+<hr>
+<h2 id="topology-2-daemon-to-relay"><a class="header" href="#topology-2-daemon-to-relay">Topology 2: daemon to relay</a></h2>
+<pre><code>daemon  ====== outbound: register + bridge ======&gt;  relay  :8443
+[relay]                                             (blind forwarder)
+</code></pre>
+<p>The daemon dials the relay, proves a stable Ed25519 identity, and registers a
+<strong>node-id</strong>. Clients later dial that node-id (Topology 3). The relay only ever
+forwards ciphertext.</p>
+<h3 id="2a-run-the-relay-zerorelay"><a class="header" href="#2a-run-the-relay-zerorelay">2a. Run the relay (zerorelay)</a></h3>
+<p>Configure with <code>relay.toml</code> (see <code>apps/zerorelay/relay.example.toml</code>); every CLI
+flag overrides the matching file value. The <code>[admission]</code> section hot-reloads on
+<code>SIGHUP</code>; a reload that would turn a public relay into open, tokenless admission
+without the explicit opt-in is refused, and the previous policy stays live.</p>
+<pre><code class="language-toml"># relay.toml
+bind = "0.0.0.0:8443"
+
+[tls]
+# Omit cert/key to SELF-PROVISION an outer TLS cert into dir on first run (no
+# openssl). Set sans to the relay's public hostname(s)/IP(s).
+dir  = "/data/tls"
+sans = ["relay.example.com"]
+# Or bring your own (e.g. a public-CA cert):
+# cert = "/etc/zerorelay/fullchain.pem"
+# key  = "/etc/zerorelay/privkey.pem"
+
+[admission]
+# "open" admits any signed daemon (subject to the deny list); "allowlist" admits
+# only listed daemon pubkey fingerprints. Deny always wins.
+mode = "open"
+allow = []
+deny  = []
+# A public (non-loopback) relay MUST gate registration: set a shared secret here
+# (each daemon presents it via [relay] relay_token) or use mode = "allowlist".
+# Otherwise an OPEN, tokenless relay on a public bind refuses to start, because
+# any daemon on the internet could register and squat unclaimed node-ids. (A
+# loopback bind for local development is exempt; a deliberate open public relay
+# can override with allow_public_open = true.)
+relay_token = "change-me-to-a-long-random-secret"
+
+[limits]
+max_conns_per_node     = 256
+idle_timeout_secs      = 300
+lease_ttl_secs         = 300
+accept_burst_per_ip    = 30
+accept_rate_per_ip     = 10.0
+connect_burst_per_node = 60
+connect_rate_per_node  = 20.0
+</code></pre>
+<p>Run it:</p>
+<pre><code class="language-sh">zerorelay --config /etc/zerorelay/relay.toml
+# equivalently, flags only (a public bind needs a token or an allowlist, else the
+# relay refuses to start):
+zerorelay --bind 0.0.0.0:8443 --tls-san relay.example.com \
+  --relay-token change-me-to-a-long-random-secret
+</code></pre>
+<p>When <code>--tls-cert</code>/<code>--tls-key</code> are omitted the relay self-provisions a CA + server
+cert under the TLS dir (resolution order: <code>$ZERORELAY_DATA_DIR/tls</code>, else
+<code>$HOME/.zerorelay/tls</code>, else <code>./zerorelay/tls</code>); <code>localhost</code> and <code>127.0.0.1</code> are
+always in the SANs. The self-provisioned <code>ca.crt</code> is what a daemon/client trusts
+for the relay’s outer TLS.</p>
+<p><strong>Admission.</strong> <code>open</code> mode plus an optional <code>relay_token</code> is the simplest access
+control. <code>allowlist</code> mode keys on the daemon’s registration pubkey fingerprint
+(SHA-256 hex of the Ed25519 key at the daemon’s <code>&lt;data_dir&gt;/relay/registration.key</code>);
+add fingerprints to <code>allow</code> (and reload with <code>kill -HUP &lt;pid&gt;</code>). A node-id is
+bound to its first registrant’s pubkey, so a different key cannot hijack a live
+node-id (it gets <code>node_taken</code>).</p>
+<p><strong>Docker.</strong> <code>apps/zerorelay/Dockerfile</code> runs distroless with
+<code>CMD ["--config", "/etc/zerorelay/relay.toml"]</code> and a shell-less
+<code>zerorelay healthcheck --addr</code> HEALTHCHECK; <code>compose.yaml</code> mounts a volume at
+<code>/data</code> so the self-provisioned TLS persists. Expose <code>8443</code>.</p>
+<h3 id="2b-point-the-daemon-at-the-relay"><a class="header" href="#2b-point-the-daemon-at-the-relay">2b. Point the daemon at the relay</a></h3>
+<pre><code class="language-toml">[wss]
+enabled = true          # REQUIRED: the relay forwards to the local WSS listener
+
+[relay]
+enabled = true
+url = "relay.example.com:8443"
+# node_id: leave EMPTY (recommended) to auto-mint + persist a random 128-bit
+# capability at &lt;data_dir&gt;/relay/node_id. Set it only to pin a specific id.
+# token = "change-me"   # must match the relay's [admission].relay_token, if set
+
+# Trust for the relay's OUTER certificate - pick ONE:
+relay_ca_path = "/path/to/relay/ca.crt"   # trust the relay's (self-signed) CA
+# tofu = true                              # OR pin the relay leaf on first use
+# relay_insecure = true                    # OR skip outer verification (dev only)
+# (leave all three unset to use built-in public roots, for a public-CA relay)
+</code></pre>
+<p><code>[relay]</code> requires <code>[wss]</code> enabled (the relay bridges to <code>127.0.0.1:&lt;wss.port&gt;</code>),
+and fails closed if <code>url</code> is empty. On start the daemon logs the node-id with the
+hint <em>“give clients this as –relay-node”</em>; you can also read it from
+<code>&lt;data_dir&gt;/relay/node_id</code>. The daemon’s stable registration key is created at
+<code>&lt;data_dir&gt;/relay/registration.key</code> (<code>0600</code>).</p>
+<p>Outer-cert trust precedence (highest first): <code>relay_insecure</code> &gt;
+<code>relay_ca_path</code> &gt; a stored pin at <code>&lt;data_dir&gt;/relay/relay_pin</code> (explicit or
+TOFU) &gt; <code>tofu</code> &gt; public roots. Configuring a CA therefore replaces a stale pin
+without deleting it. With <code>tofu = true</code> the observed relay leaf fingerprint is
+pinned to <code>&lt;data_dir&gt;/relay/relay_pin</code>, and enrollment hands that same pin to
+clients so they pin the identical leaf.</p>
+<h3 id="2c-optional-node-id-rotation-and-outer-mtls"><a class="header" href="#2c-optional-node-id-rotation-and-outer-mtls">2c. (optional) node-id rotation and outer mTLS</a></h3>
+<pre><code class="language-toml">[relay]
+node_id_rotation_days = 30   # auto-rotate the auto-minted id every N days (0 = never)
+</code></pre>
+<p>Rotation mints a fresh id, runs it alongside the old one for a 10-minute grace
+window so in-flight clients are not cut off, then retires the old id; the new id
+reaches clients in-band on their next certificate renewal. Force one now with
+<code>zeroclaw security relay-rotate-node-id</code> (auto-mint mode only; a pinned <code>node_id</code>
+is never rotated).</p>
+<p>For a relay that authenticates daemons on the outer layer too, set the
+relay’s <code>[admission].outer_client_auth = "required"</code> + <code>outer_client_ca</code>, and on
+the daemon <code>[relay].outer_client_cert</code> / <code>outer_client_key</code>. This is additive on
+the outer TLS and never touches the inner mTLS.</p>
+<hr>
+<h2 id="topology-3-client-to-relay-to-daemon"><a class="header" href="#topology-3-client-to-relay-to-daemon">Topology 3: client to relay to daemon</a></h2>
+<pre><code>zerocode  ==outer TLS+WS==&gt;  relay  ==forwards ciphertext==&gt;  daemon
+   \________________ inner mutual-TLS (TLS 1.3) terminates here _______________/
+</code></pre>
+<p>This composes Topologies 1 and 2: the client needs an inner client certificate
+(enroll, as in 1b) <strong>and</strong> the relay coordinates (address, node-id, and trust for
+the relay’s outer cert).</p>
+<h3 id="3a-the-easy-path-enrollment-carries-the-relay-profile"><a class="header" href="#3a-the-easy-path-enrollment-carries-the-relay-profile">3a. The easy path: enrollment carries the relay profile</a></h3>
+<p>When the daemon has <code>[relay]</code> configured, its enrollment response includes a
+<strong>relay profile</strong> (<code>relay_url</code>, <code>node_id</code>, and the relay’s leaf <code>relay_cert_pin</code>).
+So a single enrollment provisions everything:</p>
+<pre><code class="language-sh">zerocode --enroll --connect wss://&lt;daemon-host&gt;:9781
+</code></pre>
+<p>zerocode caches the inner cert <strong>and</strong> the relay profile in
+<code>&lt;config-dir&gt;/tls/profile.json</code>. Later, plain <code>zerocode</code> reaches the daemon
+through the relay with no flags - it already knows the relay address, the
+node-id, and the pin.</p>
+<h3 id="3b-the-manual-path"><a class="header" href="#3b-the-manual-path">3b. The manual path</a></h3>
+<p>Give the client the relay coordinates explicitly. The inner cert still comes from
+enrollment or <code>--tls-*</code> (Topology 1):</p>
+<pre><code class="language-sh">zerocode \
+  --relay      relay.example.com:8443 \
+  --relay-node &lt;node-id-from-daemon-log&gt; \
+  --relay-ca   /path/to/relay/ca.crt
+# inner mTLS material: from &lt;config-dir&gt;/tls (after enrolling), or pass --tls-* flags
+</code></pre>
+<p>Choose exactly one trust mode for the relay’s outer cert, mirroring the daemon:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--relay-ca &lt;pem&gt;</code></td><td>Trust the relay’s (self-signed) CA</td></tr>
+<tr><td><code>--relay-pin &lt;sha256&gt;</code></td><td>Pin the relay’s outer leaf (usually delivered at enrollment)</td></tr>
+<tr><td><code>--relay-tofu</code></td><td>Trust on first use; persist the pin to <code>&lt;config-dir&gt;/relay/relay_pin</code></td></tr>
+<tr><td><code>--relay-insecure</code></td><td>Skip outer verification (dev/self-signed only)</td></tr>
+<tr><td>(none)</td><td>Use built-in public roots (public-CA relay)</td></tr>
+<tr><td><code>--relay-host &lt;name&gt;</code></td><td>Override the expected outer-cert SAN (defaults to the <code>--relay</code> host)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Config equivalent (so plain <code>zerocode</code> works):</p>
+<pre><code class="language-toml">[connection.wss]
+relay_url  = "relay.example.com:8443"
+relay_node = "&lt;node-id&gt;"
+</code></pre>
+<blockquote>
+<p>The relay’s outer trust (<code>--relay-ca</code> / <code>--relay-pin</code> / <code>--relay-tofu</code> /
+<code>--relay-insecure</code>) is supplied by <strong>flags or the cached enrollment pin</strong>, not
+by <code>[connection.wss]</code> keys.</p>
+</blockquote>
+<h3 id="3c-direct-first-with-relay-fallback"><a class="header" href="#3c-direct-first-with-relay-fallback">3c. Direct-first with relay fallback</a></h3>
+<p>If you give the client <strong>both</strong> a direct address and a relay, it prefers the
+direct path and falls back to the relay, then re-probes and migrates back:</p>
+<pre><code class="language-sh">zerocode --connect wss://&lt;daemon-host&gt;:9781 \
+         --relay relay.example.com:8443 --relay-node &lt;node-id&gt;
+</code></pre>
+<p>Tuning (in <code>[connection.wss]</code>):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>direct_attempts</code></td><td><code>2</code></td><td>Direct attempts before falling back to the relay</td></tr>
+<tr><td><code>direct_timeout_secs</code></td><td><code>3</code></td><td>Per-attempt direct-connect timeout</td></tr>
+<tr><td><code>reprobe_secs</code></td><td><code>30</code></td><td>Re-probe cadence to migrate back to direct (<code>0</code> disables)</td></tr>
+</tbody>
+</table>
+</div>
+<p>In relay-only mode (no <code>--connect</code>/<code>uri</code>), the inner WSS URL defaults to
+<code>wss://127.0.0.1:9781</code> because the inner mTLS terminates at the daemon’s loopback
+listener; the relay address is only the TCP dial target.</p>
+<hr>
+<h2 id="configuration-reference"><a class="header" href="#configuration-reference">Configuration reference</a></h2>
+<h3 id="daemon-wss"><a class="header" href="#daemon-wss">Daemon <code>[wss]</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Enable the mutual-TLS WSS listener</td></tr>
+<tr><td><code>bind</code></td><td><code>0.0.0.0</code></td><td>Bind address</td></tr>
+<tr><td><code>port</code></td><td><code>9781</code></td><td>Listen port</td></tr>
+<tr><td><code>cert_path</code></td><td>(empty)</td><td>BYO server cert; empty auto-generates under <code>&lt;data_dir&gt;/tls/</code></td></tr>
+<tr><td><code>key_path</code></td><td>(empty)</td><td>BYO server key; empty auto-generates</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="daemon-wssclient_auth-optional-mtls-is-always-on-either-way"><a class="header" href="#daemon-wssclient_auth-optional-mtls-is-always-on-either-way">Daemon <code>[wss.client_auth]</code> (optional; mTLS is always on either way)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Use a BYO CA; when false the daemon uses its auto-generated CA</td></tr>
+<tr><td><code>ca_cert_path</code></td><td>(empty)</td><td>PEM CA used to verify client certs (BYO mode)</td></tr>
+<tr><td><code>pinned_certs</code></td><td><code>[]</code></td><td>If non-empty, only client certs matching these SHA-256 fingerprints are accepted</td></tr>
+<tr><td><code>crl_path</code></td><td>(empty)</td><td>Revoked-fingerprint file; empty uses the ledger-materialized <code>&lt;data_dir&gt;/tls/revoked</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="daemon-enroll"><a class="header" href="#daemon-enroll">Daemon <code>[enroll]</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Enable the enrollment endpoint (requires <code>[wss]</code> + a CA key)</td></tr>
+<tr><td><code>bind</code></td><td><code>0.0.0.0</code></td><td>Bind address</td></tr>
+<tr><td><code>port</code></td><td><code>9782</code></td><td>Listen port</td></tr>
+<tr><td><code>allow_unpaired_enrollment</code></td><td>(empty)</td><td>Reserved; non-empty values are rejected until a no-code client trust anchor exists</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="daemon-relay"><a class="header" href="#daemon-relay">Daemon <code>[relay]</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>Enable the relay bridge (requires <code>[wss]</code>)</td></tr>
+<tr><td><code>url</code></td><td>(empty)</td><td>Relay address <code>host:port</code>; required when enabled</td></tr>
+<tr><td><code>node_id</code></td><td>(empty)</td><td>Empty auto-mints + persists a 128-bit id; set to pin one</td></tr>
+<tr><td><code>token</code></td><td>(empty, secret)</td><td>Shared-secret presented at registration</td></tr>
+<tr><td><code>relay_ca_path</code></td><td>(empty)</td><td>PEM CA for the relay’s outer cert; empty uses public roots</td></tr>
+<tr><td><code>relay_host</code></td><td>(empty)</td><td>Expected outer-cert SAN; empty derives from <code>url</code></td></tr>
+<tr><td><code>relay_insecure</code></td><td><code>false</code></td><td>Skip outer-cert verification (dev only)</td></tr>
+<tr><td><code>tofu</code></td><td><code>false</code></td><td>Pin the relay leaf on first use to <code>&lt;data_dir&gt;/relay/relay_pin</code></td></tr>
+<tr><td><code>outer_client_cert</code></td><td>(empty)</td><td>Daemon’s outer-mTLS client cert for relay admission</td></tr>
+<tr><td><code>outer_client_key</code></td><td>(empty)</td><td>Key for <code>outer_client_cert</code></td></tr>
+<tr><td><code>node_id_rotation_days</code></td><td><code>0</code></td><td>Auto-rotate the auto-minted node-id every N days (0 = never)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="relay-relaytoml"><a class="header" href="#relay-relaytoml">Relay <code>relay.toml</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Section.key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bind</code></td><td><code>0.0.0.0:8443</code></td><td>Listen address (daemon + client)</td></tr>
+<tr><td><code>[tls].cert</code> / <code>.key</code></td><td>(self-provision)</td><td>Outer TLS identity; omit both to self-provision</td></tr>
+<tr><td><code>[tls].dir</code></td><td>data dir <code>/tls</code></td><td>Where the self-provisioned cert is written</td></tr>
+<tr><td><code>[tls].sans</code></td><td><code>[]</code></td><td>Extra SANs (<code>localhost</code>, <code>127.0.0.1</code> always included)</td></tr>
+<tr><td><code>[admission].mode</code></td><td><code>open</code></td><td><code>open</code> or <code>allowlist</code></td></tr>
+<tr><td><code>[admission].allow</code> / <code>.deny</code></td><td><code>[]</code></td><td>Daemon pubkey fingerprints (deny wins)</td></tr>
+<tr><td><code>[admission].relay_token</code></td><td>(none)</td><td>Optional shared-secret gate</td></tr>
+<tr><td><code>[admission].outer_client_auth</code></td><td><code>off</code></td><td><code>off</code> / <code>optional</code> / <code>required</code> (outer mTLS)</td></tr>
+<tr><td><code>[admission].outer_client_ca</code></td><td>(none)</td><td>PEM CA for outer client certs</td></tr>
+<tr><td><code>[admission].route_by_client_cert</code></td><td><code>false</code></td><td>Route by the outer cert CN’s node-id</td></tr>
+<tr><td><code>[limits].max_conns_per_node</code></td><td><code>256</code></td><td>Simultaneous client conns per node-id</td></tr>
+<tr><td><code>[limits].idle_timeout_secs</code></td><td><code>300</code></td><td>Drop idle client conns after N seconds</td></tr>
+<tr><td><code>[limits].lease_ttl_secs</code></td><td><code>300</code></td><td>Lease TTL advertised at registration (advisory in v1: WebSocket liveness is the real cleanup rule)</td></tr>
+<tr><td><code>[limits].accept_burst_per_ip</code> / <code>accept_rate_per_ip</code></td><td><code>30</code> / <code>10.0</code></td><td>Per-IP handshake token bucket</td></tr>
+<tr><td><code>[limits].connect_burst_per_node</code> / <code>connect_rate_per_node</code></td><td><code>60</code> / <code>20.0</code></td><td>Per-node connect token bucket</td></tr>
+<tr><td><code>[limits].max_pending_handshakes</code></td><td><code>256</code></td><td>Sockets past accept but not yet classified</td></tr>
+<tr><td><code>[limits].handshake_timeout_secs</code></td><td><code>10</code></td><td>One deadline over TLS, WS upgrade and signed registration</td></tr>
+<tr><td><code>[limits].max_registered_nodes</code></td><td><code>1024</code></td><td>Simultaneously registered daemons (N+1 gets <code>registry_full</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="zerorelay-cli-overrides-relaytoml"><a class="header" href="#zerorelay-cli-overrides-relaytoml">zerorelay CLI (overrides <code>relay.toml</code>)</a></h3>
+<p><code>--config</code> <code>--bind</code> <code>--tls-cert</code> <code>--tls-key</code> <code>--tls-dir</code> <code>--tls-san</code> (repeatable)
+<code>--registration-mode</code> <code>--allow</code> (repeatable) <code>--deny</code> (repeatable) <code>--relay-token</code>
+<code>--max-conns-per-node</code> <code>--idle-timeout-secs</code> <code>--lease-ttl-secs</code> <code>--status-file</code>.
+Subcommands: <code>healthcheck [--addr 127.0.0.1:8443]</code>, <code>status --file &lt;path&gt;</code>.</p>
+<h3 id="zerocode-connectionwss-and-cli"><a class="header" href="#zerocode-connectionwss-and-cli">zerocode <code>[connection.wss]</code> and CLI</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[connection.wss]</code> key</th><th>Default</th><th>CLI override</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uri</code></td><td>(none)</td><td><code>--connect</code></td></tr>
+<tr><td><code>relay_url</code></td><td>(none)</td><td><code>--relay</code> (requires <code>--relay-node</code>)</td></tr>
+<tr><td><code>relay_node</code></td><td>(none)</td><td><code>--relay-node</code> (requires <code>--relay</code>)</td></tr>
+<tr><td><code>direct_attempts</code></td><td><code>2</code></td><td>-</td></tr>
+<tr><td><code>direct_timeout_secs</code></td><td><code>3</code></td><td>-</td></tr>
+<tr><td><code>reprobe_secs</code></td><td><code>30</code></td><td>-</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[connection.wss.tls]</code> key</th><th>Default</th><th>CLI override</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ca_cert_path</code></td><td><code>&lt;config-dir&gt;/tls/ca.crt</code></td><td><code>--tls-ca-cert</code></td></tr>
+<tr><td><code>client_cert_path</code></td><td><code>&lt;config-dir&gt;/tls/client.crt</code></td><td><code>--tls-client-cert</code> (requires key)</td></tr>
+<tr><td><code>client_key_path</code></td><td><code>&lt;config-dir&gt;/tls/client.key</code></td><td><code>--tls-client-key</code> (requires cert)</td></tr>
+<tr><td><code>skip_verify</code></td><td><code>false</code></td><td><code>--tls-skip-verify</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Relay outer-trust and enrollment are CLI/cache only: <code>--relay-ca</code> <code>--relay-host</code>
+<code>--relay-insecure</code> <code>--relay-pin</code> <code>--relay-tofu</code> <code>--relay-client-cert</code>
+<code>--relay-client-key</code> <code>--enroll</code> <code>--enroll-host</code> <code>--enroll-port</code>.</p>
+<h2 id="file-layout"><a class="header" href="#file-layout">File layout</a></h2>
+<p><strong>Daemon <code>&lt;data_dir&gt;/</code>:</strong></p>
+<pre><code>tls/ca.crt  tls/ca.key            per-daemon CA (key 0600)
+tls/server.crt  tls/server.key    WSS server leaf (key 0600)
+tls/ledger.db                     issued-cert ledger (SQLite)
+tls/revoked                       revoked fingerprints (handshake-checked)
+relay/registration.key            Ed25519 relay identity (0600)
+relay/node_id                     auto-minted node-id
+relay/relay_pin                   pinned relay outer-leaf fingerprint (TOFU)
+</code></pre>
+<p><strong>Client <code>&lt;config-dir&gt;/</code>:</strong></p>
+<pre><code>tls/client.crt  tls/client.key    client identity (key 0600)
+tls/ca.crt                         pinned daemon CA
+tls/profile.json                   device_id, not_after, cached relay profile
+relay/relay_pin                    relay outer-leaf pin (--relay-tofu)
+</code></pre>
+<p><strong>Relay <code>&lt;tls-dir&gt;/</code>:</strong> <code>ca.crt</code>, <code>server.crt</code>, <code>server.key</code> (self-provisioned).</p>
+<h3 id="upgrading-an-existing-issued-cert-ledger"><a class="header" href="#upgrading-an-existing-issued-cert-ledger">Upgrading an existing issued-cert ledger</a></h3>
+<p><code>tls/ledger.db</code> carries a schema version. A ledger written by an earlier
+revision is rebuilt in place the first time the new daemon opens it, preserving
+every issued and revoked certificate along with its device id, validity and
+audit actor. The rebuild runs in a single transaction: if it cannot complete,
+the daemon refuses to start and leaves the original ledger untouched rather than
+half-migrated, and the error names the file. No operator action is required, and
+enrolled devices do not need to re-enroll.</p>
+<h3 id="undelivered-certificates"><a class="header" href="#undelivered-certificates">Undelivered certificates</a></h3>
+<p>The daemon records an issuance in the ledger <em>before</em> it hands the certificate
+over - to the enrolling client, to a renewing client, or to the operator’s
+<code>issue-client-cert</code> files. That order is deliberate: the alternative can leave a
+live CA-signed certificate in someone’s hands with no ledger row, and a
+certificate the ledger has never heard of cannot be listed or revoked.</p>
+<p>The cost is that a failure in between - a client that disconnects mid-response,
+a failed rename - leaves an <code>active</code> row for a certificate nobody received. Such
+a row is tracked separately as <em>undelivered</em> and is <strong>revoked once it is older
+than one hour</strong>, at the first of:</p>
+<ul>
+<li>any new certificate issuance or renewal,</li>
+<li>any enrollment connection,</li>
+<li>any daemon restart or other ledger open.</li>
+</ul>
+<p>It is not a background timer. A daemon doing no certificate work at all defers
+the sweep until its next such activity; until then the certificate stays out of
+<code>tls/revoked</code> and would still pass a WSS handshake, though it cannot renew. Any
+enrollment or renewal traffic - including a connection that fails to
+authenticate - is enough to reconcile it.</p>
+<p>Reconciled certificates are revoked, never deleted: the row stays in the
+ledger and the fingerprint lands in <code>tls/revoked</code> exactly like an operator
+revocation, with the audit actor <code>reconcile:undelivered</code> so the trail
+distinguishes them. <code>security list-client-certs</code> shows ACTIVE certificates
+only, so a reconciled certificate disappears from that listing - during
+incident response, read <code>tls/revoked</code> or the audit log for revocation history. If a device reports that a certificate it <em>did</em> receive
+stopped working, look for that actor - it means the delivery record was lost,
+and the fix is to re-enroll or re-issue.</p>
+<h2 id="verifying-and-troubleshooting"><a class="header" href="#verifying-and-troubleshooting">Verifying and troubleshooting</a></h2>
+<ul>
+<li><strong>Daemon up:</strong> look for the WSS listener log on <code>0.0.0.0:9781</code> and, with a relay,
+the <code>node_id</code> log line.</li>
+<li><strong>Certless connect refused:</strong> expected on the mTLS plane - enroll first
+(Topology 1b). The message is actionable, not a hang.</li>
+<li><strong>Relay reachable:</strong> <code>zerorelay healthcheck --addr &lt;host&gt;:8443</code> exits 0.</li>
+<li><strong>Relay metrics:</strong> run with <code>--status-file &lt;path&gt;</code>, then
+<code>zerorelay status --file &lt;path&gt;</code> (counts only, never payloads).</li>
+<li><strong>Revoke a lost device:</strong> revoking in the daemon ledger materializes
+<code>&lt;data_dir&gt;/tls/revoked</code>; the cert is refused at its next handshake and cannot
+self-renew.</li>
+<li><strong>SAS mismatch at enrollment:</strong> the client refuses to persist the cert and
+aborts. A mismatch means the CA you received is not the daemon’s - investigate a
+possible man-in-the-middle before retrying.</li>
+</ul>
+<p>There is a self-contained end-to-end harness at <code>scripts/dev/mtls-relay-testbed.sh</code>
+that boots a daemon + relay, issues a cert, enrolls over the wire, and exercises
+all three topologies; read it as a worked example.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../zerocode/remote.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../zerocode/environment.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../zerocode/remote.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../zerocode/environment.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script>
+        (function () {
+            var root = typeof window !== 'undefined' ? window : this;
+            var elasticlunr = root.elasticlunr ||
+                (typeof globalThis !== 'undefined' && globalThis.elasticlunr);
+
+            if (!elasticlunr || !elasticlunr.Index) {
+                return;
+            }
+
+            var CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+            var originalLoad = elasticlunr.Index.load;
+
+            function lower(value) {
+                return String(value || '').toLowerCase();
+            }
+
+            function queryTerms(query) {
+                return lower(query).split(/\s+/).filter(Boolean);
+            }
+
+            function fieldScore(text, terms, weight, requireAll) {
+                var haystack = lower(text);
+                var matched = 0;
+                var score = 0;
+
+                if (!haystack) {
+                    return 0;
+                }
+
+                terms.forEach(function (term) {
+                    var index = haystack.indexOf(term);
+                    if (index !== -1) {
+                        matched += 1;
+                        score += weight;
+                        if (index === 0) {
+                            score += weight / 2;
+                        }
+                    }
+                });
+
+                if (requireAll && matched !== terms.length) {
+                    return 0;
+                }
+
+                return score;
+            }
+
+            function fallbackResults(docs, query, options, existingRefs) {
+                var terms = queryTerms(query);
+                var requireAll = !options || options.bool !== 'OR';
+                var results = [];
+
+                if (!CJK_RE.test(query) || terms.length === 0) {
+                    return results;
+                }
+
+                Object.keys(docs).forEach(function (ref) {
+                    var doc = docs[ref];
+                    var score = 0;
+
+                    if (existingRefs[ref]) {
+                        return;
+                    }
+
+                    score += fieldScore(doc.title, terms, 12, requireAll);
+                    score += fieldScore(doc.breadcrumbs, terms, 6, requireAll);
+                    score += fieldScore(doc.body, terms, 2, requireAll);
+
+                    if (score > 0) {
+                        results.push({ ref: ref, doc: doc, score: score });
+                    }
+                });
+
+                results.sort(function (a, b) {
+                    if (b.score !== a.score) {
+                        return b.score - a.score;
+                    }
+
+                    return Number(a.ref) - Number(b.ref);
+                });
+
+                return results;
+            }
+
+            elasticlunr.Index.load = function (serialized) {
+                var index = originalLoad.call(this, serialized);
+                var originalSearch = index.search.bind(index);
+                var docs = serialized &&
+                    serialized.documentStore &&
+                    serialized.documentStore.docs ||
+                    {};
+
+                index.search = function (query, options) {
+                    var results = originalSearch(query, options);
+                    var existingRefs = {};
+
+                    results.forEach(function (result) {
+                        existingRefs[String(result.ref)] = true;
+                    });
+
+                    return results.concat(fallbackResults(docs, query, options, existingRefs));
+                };
+
+                return index;
+            };
+        }());
+        </script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

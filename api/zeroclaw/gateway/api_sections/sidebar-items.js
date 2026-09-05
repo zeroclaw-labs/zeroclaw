@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["build_agent_options","derive_section_status","handle_agent_options","handle_catalog","handle_catalog_models","handle_section_picker","handle_section_select","handle_section_status","handle_sections"],"struct":["AgentOptionsResponse","ModelsQuery","SectionItemPath","SectionPath","SectionSelectBody"]};

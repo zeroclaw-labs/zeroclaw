@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ApplyResult","ValidateResult"],"fn":["handle_apply","handle_dismiss","handle_fields","handle_state","handle_validate"],"struct":["DismissRequest","FieldsRequest","FieldsResult"]};

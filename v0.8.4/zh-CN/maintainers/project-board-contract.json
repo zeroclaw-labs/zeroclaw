@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "contract_name": "project-board-planning-contract",
+  "status": "dry_run_planner",
+  "description": "GitHub Project board fields are planning signals. The current automation produces a report-only plan from live issue metadata; fast PR review and mergeability state is derived from native GitHub PR state.",
+  "canonical_sources": {
+    "prose": [
+      "../foundations/fnd-003-governance.md#31-the-pipeline-stages",
+      "labels.md#ownership-boundaries",
+      "pr-workflow.md#project-board-contract"
+    ],
+    "automation": {
+      "dry_run_workflow": ".github/workflows/project-dashboard-plan.yml",
+      "dry_run_script": "scripts/github/project_dashboard_plan.py",
+      "live_project_writes": "disabled_until_project_scoped_credential_and_field_mapping_are_approved"
+    }
+  },
+  "dry_run_issue_conflicts": [
+    {
+      "labels_all": ["status:blocked", "status:in-progress"],
+      "message": "Both `status:blocked` and `status:in-progress` are present."
+    },
+    {
+      "labels_all": ["status:accepted"],
+      "labels_any": ["r:needs-repro", "r:support"],
+      "message": "Accepted work also carries support/reproduction triage labels."
+    },
+    {
+      "labels_all": ["type:tracker"],
+      "labels_any": ["good first issue", "help wanted"],
+      "message": "A parent tracker also carries contributor-pickup labels."
+    },
+    {
+      "labels_all": ["status:no-stale", "status:in-progress"],
+      "message": "`status:no-stale` is present on work already protected by `status:in-progress`."
+    },
+    {
+      "labels_all": ["status:no-stale", "status:blocked"],
+      "message": "`status:no-stale` is present on blocked work; verify a separate stale exemption is still needed."
+    },
+    {
+      "labels_all": ["status:blocked"],
+      "labels_any": ["good first issue", "help wanted"],
+      "message": "Blocked work also carries contributor-pickup labels."
+    }
+  ],
+  "dry_run_issue_warning_rules": [
+    {
+      "labels_all": ["status:blocked"],
+      "message": "`status:blocked` is present; keep the blocker reason visible before relying on stale protection."
+    },
+    {
+      "labels_all": ["status:no-stale"],
+      "message": "`status:no-stale` is present; verify the issue has a visible reason and next decision surface."
+    }
+  ],
+  "dry_run_issue_status_rules": [
+    {
+      "name": "closed_not_planned",
+      "state": "closed",
+      "state_reason": "not_planned",
+      "status": "Won't Do",
+      "reason": "Issue is closed as not planned.",
+      "confidence": "high"
+    },
+    {
+      "name": "closed_terminal_resolution_label",
+      "state": "closed",
+      "labels_any": ["wontfix", "invalid", "duplicate"],
+      "status": "Won't Do",
+      "reason": "Issue is closed with a terminal resolution label.",
+      "confidence": "high"
+    },
+    {
+      "name": "closed_default",
+      "state": "closed",
+      "status": "Done",
+      "reason": "Issue is closed without a terminal no-pursue signal.",
+      "confidence": "high"
+    },
+    {
+      "name": "open_conflicting_routing",
+      "state": "open",
+      "has_conflicts": true,
+      "status": "Backlog",
+      "reason": "Issue has conflicting routing signals and needs maintainer review before board movement.",
+      "confidence": "low",
+      "use_conflict_warnings": true
+    },
+    {
+      "name": "open_blocked",
+      "state": "open",
+      "labels_all": ["status:blocked"],
+      "status": "Backlog",
+      "reason": "Blocked work stays visible in backlog planning until the blocker clears or an implementer is active.",
+      "confidence": "medium",
+      "use_label_warnings": true
+    },
+    {
+      "name": "open_in_progress",
+      "state": "open",
+      "labels_all": ["status:in-progress"],
+      "status": "In Review",
+      "reason": "`status:in-progress` means an open PR is actively targeting this issue.",
+      "confidence": "medium",
+      "use_label_warnings": true
+    },
+    {
+      "name": "open_tracker_or_rfc",
+      "state": "open",
+      "labels_any": ["type:tracker", "type:rfc"],
+      "status": "Backlog",
+      "reason": "Tracker and RFC issues are accepted coordination surfaces, not ordinary pickup-ready implementation tasks.",
+      "confidence": "medium",
+      "use_label_warnings": true
+    },
+    {
+      "name": "open_needs_reproduction_or_support",
+      "state": "open",
+      "labels_any": ["r:needs-repro", "r:support"],
+      "status": "Idea",
+      "reason": "Support/reproduction labels mean the issue is not implementation-ready yet.",
+      "confidence": "high",
+      "use_label_warnings": true
+    },
+    {
+      "name": "open_contributor_ready",
+      "state": "open",
+      "labels_any": ["good first issue", "help wanted"],
+      "status": "Defined",
+      "reason": "Contributor-pickup labels indicate the scope is ready enough for external help.",
+      "confidence": "medium",
+      "use_label_warnings": true
+    },
+    {
+      "name": "open_accepted_backlog",
+      "state": "open",
+      "labels_all": ["status:accepted"],
+      "status": "Backlog",
+      "reason": "`status:accepted` keeps the issue as valid backlog without an active implementation signal.",
+      "confidence": "medium",
+      "use_label_warnings": true
+    },
+    {
+      "name": "open_default_intake",
+      "state": "open",
+      "status": "Idea",
+      "reason": "No deterministic routing label was found.",
+      "confidence": "medium",
+      "use_label_warnings": true
+    }
+  ],
+  "non_goals": [
+    "live GitHub Project mutation",
+    "automatic issue-event planning",
+    "CI enforcement of Project field state",
+    "manual mirror of native PR state"
+  ]
+}

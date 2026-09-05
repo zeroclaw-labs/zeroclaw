@@ -1,0 +1,685 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ACP（代理客户端协议） - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a22b4832.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="acpagent-client-protocol"><a class="header" href="#acpagent-client-protocol">ACP：Agent Client Protocol</a></h1>
+<p><strong>ACP</strong> 是一个基于 stdio 的 JSON-RPC 2.0 协议，让编辑器和 IDE 能够将正在运行的 ZeroClaw 代理作为会话主机来驱动。它采用换行符分隔的 JSON，轻量、可流式传输，易于连接到子进程。</p>
+<p>可以将其理解为“面向智能体的 LSP”：编辑器启动 <code>zeroclaw acp</code>，通过 stdin 发送提示词，并在 stdout 上接收会话更新。</p>
+<h2 id="你打算用它做什么"><a class="header" href="#你打算用它做什么">你打算用它做什么</a></h2>
+<ul>
+<li>一个提供“向代理询问此文件”命令的编辑器扩展</li>
+<li>集成终端复用器，打开带有代理会话的侧边窗格</li>
+<li>一个通过编程方式驱动代理的 CI 运行器，无需完整的网关设置</li>
+<li>任何希望在不使用 HTTP 且无需绑定端口的情况下使用代理会话的功能</li>
+</ul>
+<h2 id="协议形态v1"><a class="header" href="#协议形态v1">协议形态：v1</a></h2>
+<p>所有消息均为 JSON-RPC 2.0 格式（以换行符分隔）。ZeroClaw 实现的是<strong>协议版本 1</strong>。</p>
+<h3 id="initialize"><a class="header" href="#initialize"><code>initialize</code></a></h3>
+<p>握手。返回服务器能力。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":1,方法:初始化}
+← {`jsonrpc`:"2.0","id":1,"结果":{
+    protocolVersion: 1,
+    agentCapabilities: {
+      loadSession: true,
+      promptCapabilities: {image: false, 音频: false, embeddedContext: false},
+      mcpCapabilities: {"http": false, sse: false},
+      sessionCapabilities: {resume: {}, 关闭: {}}
+    },
+    agentInfo: {
+      "name": zeroclaw-acp,
+      "title": ZeroClaw ACP,
+      version: 0.7.x
+    },
+    authMethods: [],
+    "_meta": {
+      zeroclaw: {
+        "默认模型": anthropic/claude-sonnet-4.6,
+        "maxSessions": 10,
+        "sessionTimeoutSecs": 3600
+      }
+    }
+  }}
+</code></pre>
+<p><code>loadSession: true</code> 和 <code>sessionCapabilities: {"resume": {}, "close": {}}</code> 表示会话持久化已激活。如果在启动时无法打开 SQLite 存储，这三项都将缺失或为 false，并且 <code>session/load</code>、<code>session/resume</code> 和 <code>session/close</code> 将返回 <code>SESSION_NOT_FOUND</code> 错误。</p>
+<p><code>_meta.zeroclaw</code> 携带基础 ACP 规范中未包含的 ZeroClaw 专属扩展字段。仅实现基础规范的客户端可以忽略此对象。</p>
+<p>服务器始终返回 <code>protocolVersion: 1</code>。如果你在客户端发送 <code>protocolVersion: 0</code>，仍会收到 <code>1</code> 的响应，v0 客户端在处理新的消息结构时会遇到解析错误；详见下方的<a href="#version-compatibility">版本兼容性</a>。</p>
+<h3 id="sessionnew"><a class="header" href="#sessionnew"><code>session/new</code></a></h3>
+<p>打开一个隔离的代理会话。</p>
+<p><strong><code>agentAlias</code></strong> 用于指定要使用的 <code>[agents.&lt;alias&gt;]</code> 配置项。当配置了多个 agent 时，此字段为必填项；当仅存在一个 agent 时，会自动选中该 agent，此字段可省略。该别名支持驼峰式 <code>agentAlias</code>、蛇形式 <code>agent_alias</code> 或简写形式 <code>agent</code>。</p>
+<p>可选的 <strong><code>cwd</code></strong> 参数（别名：<code>workspaceDir</code>、<code>workspace_dir</code>）用于固定每个会话的文件访问边界，它会成为所有文件工具强制执行的 <code>SecurityPolicy</code> 中的 <code>workspace_dir</code>。代理的持久化数据目录（memory、identity、cron）仍然使用配置中守护进程级别的 <code>workspace_dir</code>。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":2,方法:"session/new","参数":{
+    "agentAlias": myagent,
+    当前工作目录: "/path/to/project"
+  }}
+← {`jsonrpc`:"2.0","id":2,"结果":{
+    "会话ID": "s-ab12cd",
+    workspaceDir: "/path/to/project"
+  }}
+</code></pre>
+<p><code>cwd</code> 在接收时会进行规范化处理，<code>../</code> 遍历无法逃逸出预期的根目录。如果省略 <code>cwd</code>，服务器将使用守护进程的启动目录。</p>
+<h3 id="sessionprompt"><a class="header" href="#sessionprompt"><code>session/prompt</code></a></h3>
+<p>发送提示。响应是一系列流式返回的 <code>session/update</code> 通知，以 <code>session/prompt</code> 结果作为结束。</p>
+<p><code>prompt</code> 参数接受纯字符串或内容片段数组：</p>
+<ul>
+<li>“prompt”: “Summarise the changes in the last commit.”</li>
+<li><strong>数组：</strong> 每个元素都是一个文本部分 <code>{"text": "..."}</code> 或一个 ACP 资源块 <code>{"type": "resource", "resource": {"uri": "file:///path/to/file.rs", "text": "&lt;file contents&gt;"}}</code>。资源块携带来自编辑器的 <code>@</code> 标记文件附件。各部分按出现顺序用双换行符连接。</li>
+</ul>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":3,方法:"会话/提示","参数":{
+    "会话ID": "s-ab12cd",
+    "提示": 总结最后一次提交中的更改。
+  }}
+← {`jsonrpc`:"2.0",方法:"session/update","参数":{
+    "会话ID": "s-ab12cd",
+    更新: {sessionUpdate: agent_message_chunk, "内容": {类型:"文本","文本":“最后一次提交...”}}
+  }}
+← {`jsonrpc`:"2.0",方法:"session/update","参数":{
+    "会话ID": "s-ab12cd",
+    更新: {sessionUpdate: "tool_call", toolCallId: tc-1, "title": "shell",
+               类型: 执行, 状态: pending, rawInput: {...}}
+  }}
+← {`jsonrpc`:"2.0",方法:"session/update","参数":{
+    "会话ID": "s-ab12cd",
+    更新: {sessionUpdate: tool_call_update, toolCallId: tc-1,
+               状态: 已完成, rawOutput: "..."}
+  }}
+← {`jsonrpc`:"2.0","id":3,"结果":{
+    "会话ID": "s-ab12cd",
+    "stopReason": "end_turn",
+    "内容": 上次提交引入了……
+  }}
+</code></pre>
+<p>正常完成时 <code>stopReason</code> 为 <code>"end_turn"</code>，当回合被 <code>session/cancel</code> 中断时为 <code>"cancelled"</code>。ACP 的完成信号是 <code>stopReason</code>；ZeroClaw 还为现有客户端包含当前最终的 <code>content</code> 字符串。</p>
+<p>错误：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>代码</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-32000</code> <code>SESSION_NOT_FOUND</code></td><td>给定的 <code>sessionId</code> 没有活动会话</td></tr>
+<tr><td><code>-32002</code> <code>SESSION_BUSY</code></td><td>当前会话已有一个提示词请求正在处理中，请等待其完成或先取消该请求</td></tr>
+<tr><td><code>-32602</code> <code>INVALID_PARAMS</code></td><td>缺少或格式错误的 <code>sessionId</code> / <code>prompt</code></td></tr>
+<tr><td><code>-32603</code> <code>INTERNAL_ERROR</code></td><td>代理任务崩溃或回合失败</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="sessionupdate-通知agent--client"><a class="header" href="#sessionupdate-通知agent--client"><code>session/update</code> 通知（agent → client）</a></h3>
+<p>ZeroClaw 在一次提示交互期间会发送四种 <code>session/update</code> 通知。判别字段是 <code>update</code> 内的 <code>sessionUpdate</code> 字段：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>sessionUpdate</code> 值</th><th>发出时</th><th>关键字段</th></tr>
+</thead>
+<tbody>
+<tr><td><code>agent_message_chunk</code></td><td>每个流式文本令牌</td><td><code>content.type = "text"</code>、<code>content.text</code></td></tr>
+<tr><td><code>agent_thought_chunk</code></td><td>内部推理 token（启用时）</td><td><code>content.type = "text"</code>、<code>content.text</code></td></tr>
+<tr><td><code>tool_call</code></td><td>工具调用已发起</td><td><code>toolCallId</code>、<code>title</code>、<code>kind</code>、<code>status: "pending"</code>、<code>rawInput</code></td></tr>
+<tr><td><code>tool_call_update</code></td><td>工具调用完成</td><td><code>toolCallId</code>、<code>status: "completed"</code>、<code>rawOutput</code>、<code>content[]</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>tool_call</code> 和 <code>tool_call_update</code> 上的 <code>toolCallId</code> 是稳定且相互关联的，完成某个调用的更新所携带的 <code>toolCallId</code> 与发起该调用时的 <code>toolCallId</code> 相同。</p>
+<p><code>tool_call_update</code> 上的 <code>name</code> 字段是 ZeroClaw 的扩展（基础 ACP 规范并不要求）。客户端可将其用于显示；忽略它也是安全的。</p>
+<h3 id="sessionrequest_permissionagent--client出站请求"><a class="header" href="#sessionrequest_permissionagent--client出站请求"><code>session/request_permission</code>（agent → client，出站请求）</a></h3>
+<p>当某个工具需要用户审批时（通过 autonomy 配置中的 <code>always_ask</code>，或 <code>ask_user</code>/<code>escalate_to_human</code> 工具），ZeroClaw 会从 agent 向 client 发出一个 <strong>JSON-RPC 请求</strong>。client 必须先返回结果，工具调用才会继续执行。</p>
+<pre><code class="language-json">← {`jsonrpc`:"2.0","id":zc-out-0,方法:"session/request_permission","参数":{
+    "会话ID": "s-ab12cd",
+    options: [
+      {optionId: allow-once,  "name": 允许一次,  类型: allow_once},
+      {optionId: allow-always,"name": 始终允许,类型: allow_always},
+      {optionId: "reject-once", "name": 拒绝,      类型: reject_once}
+    ],
+    toolCall: {
+      toolCallId: approval-...,
+      "title": “批准 shell 操作？”,
+      类型: 执行,
+      状态: pending,
+      rawInput: {tool: "shell", 摘要: git status --short},
+      "内容": [{类型: "内容", "内容": {类型: "文本", "文本": git status --short}}]
+    }
+  }}
+→ {`jsonrpc`:"2.0","id":zc-out-0,"结果":{
+    结果: {结果: 已选择, optionId: allow-once}
+  }}
+</code></pre>
+<p>服务器签发的 id（<code>"zc-out-N"</code>）始终是以 <code>zc-out-</code> 为前缀的字符串，与客户端为自身请求使用的任何整数或字符串 id 互不相交。</p>
+<p>响应结构：</p>
+<ul>
+<li><code>{"outcome": {"outcome": "selected", "optionId": "&lt;id&gt;"}}</code>，用户选择了某个选项</li>
+<li><code>{"outcome": {"outcome": "cancelled"}}</code>，用户关闭了提示</li>
+</ul>
+<p>如果客户端始终未响应（崩溃、网络中断、用户关闭 IDE），请求将在 <code>sessionTimeoutSecs</code> 后超时，工具调用将被拒绝。</p>
+<p><code>ask_user</code> 使用相同的 <code>session/request_permission</code> 机制，将问题的 <code>choices</code> 映射为权限选项。在 <a href="https://github.com/zed-industries/agent-client-protocol/blob/main/docs/rfds/elicitation.mdx">ACP elicitation RFD</a> 落地之前，不支持自由格式（无 choices）的 <code>ask_user</code>。在 ACP 会话中调用不带 <code>choices</code> 的 <code>ask_user</code> 会快速失败并返回明确的错误。</p>
+<h3 id="sessioncancel-zeroclaw-扩展"><a class="header" href="#sessioncancel-zeroclaw-扩展"><code>session/cancel</code> <em>(ZeroClaw 扩展)</em></a></h3>
+<p>中止正在进行的 <code>session/prompt</code> 回合。此方法是 ZeroClaw 的扩展，并非基础 ACP 规范的一部分。如果 ACP 后续标准化了一个有冲突的 <code>session/cancel</code>，ZeroClaw 会将其扩展迁移到 <code>_meta/session/cancel</code>。</p>
+<p><strong>取消与停止的区别：</strong> <code>session/cancel</code> 会中止正在进行的提示轮次，并返回 <code>stopReason: "cancelled"</code>，同时附带截至中断点为止累积的所有流式文本。<code>session/stop</code> 会在当前轮次完成后正常结束会话，它会等待该轮次完成，而不是中断它。</p>
+<p>规范的参数名为 <code>sessionId</code>；<code>session_id</code> 作为兼容性别名也可接受。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0",方法:session/cancel,"参数":{"会话ID":"s-ab12cd"}}
+← {`jsonrpc`:"2.0",方法:"session/update","参数":{
+    "会话ID": "s-ab12cd",
+    更新: {sessionUpdate: agent_message_chunk, "内容": {类型:"文本","文本":部分……}}
+  }}
+← {`jsonrpc`:"2.0","id":3,"结果":{
+    "会话ID": "s-ab12cd",
+    "stopReason": 已取消,
+    "内容": partial...\n\n[已通过客户端取消此轮对话]
+  }}
+</code></pre>
+<p>如果会话没有活动的轮次，则取消操作为空操作（noop），会静默成功而不报错。这遵循 ACP 通知语义：通知不得产生错误。</p>
+<h3 id="sessionstop-zeroclaw-扩展"><a class="header" href="#sessionstop-zeroclaw-扩展"><code>session/stop</code> <em>(ZeroClaw 扩展)</em></a></h3>
+<p>干净地结束一个会话。不属于基础 ACP 规范：这是 ZeroClaw 特有的。如果未来 ACP 规范修订版添加了语义不同的 <code>session/stop</code>，此项将被重命名为 <code>_meta/session/stop</code>。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":4,方法:"session/stop","参数":{"会话ID":"s-ab12cd"}}
+← {`jsonrpc`:"2.0","id":4,"结果":{"会话ID": "s-ab12cd", 已停止:true}}
+</code></pre>
+<h3 id="sessionupdate客户端--服务器zeroclaw-扩展"><a class="header" href="#sessionupdate客户端--服务器zeroclaw-扩展"><code>session/update</code>（客户端 → 服务器）<em>(ZeroClaw 扩展)</em></a></h3>
+<p>ZeroClaw 还接受来自客户端的入站 <code>session/update</code>（以及旧版别名 <code>session/event</code>）通知，用于注入自定义事件。这不在基础 ACP 规范中：属于 ZeroClaw 特有功能。如果 ACP 规范后续定义了语义不同的入站 <code>session/update</code>，此功能将重命名为 <code>_meta/session/update</code>。</p>
+<h2 id="会话持久化"><a class="header" href="#会话持久化">会话持久化</a></h2>
+<p>ZeroClaw 会自动将 ACP 会话持久化到 SQLite。无需任何配置，每当 <code>zeroclaw acp</code> 启动或网关接受 WebSocket ACP 连接时，存储就会在 <code>&lt;workspace_dir&gt;/sessions/acp-sessions.db</code> 打开。如果该文件无法创建（只读文件系统、权限错误），服务器将回退到仅内存会话，并在 <code>initialize</code> 响应中将 <code>loadSession</code> 报告为 <code>false</code>。</p>
+<p>持久化的内容：</p>
+<ul>
+<li>会话元数据：<code>sessionId</code>、<code>workspaceDir</code>、<code>created_at</code>、<code>last_activity</code></li>
+<li>完整对话历史记录：每个已完成的 <code>session/prompt</code> 回合之后写入的所有 <code>ConversationMessage</code>，每个回合作为一个原子事务。</li>
+</ul>
+<p>会话可在进程重启后保留。在某次 <code>zeroclaw acp</code> 调用中创建的会话，可以在之后的调用中加载或恢复，只要使用的是相同的 <code>workspace_dir</code>（因而使用的是相同的 <code>acp-sessions.db</code> 文件）。</p>
+<p>会话不会被自动删除。使用 <code>session/close</code> 可以停用会话而不删除它，之后可通过 <code>session/load</code> 或 <code>session/resume</code> 将其恢复。</p>
+<h3 id="sessionload-zeroclaw-扩展"><a class="header" href="#sessionload-zeroclaw-扩展"><code>session/load</code> <em>(ZeroClaw 扩展)</em></a></h3>
+<p>使用<strong>完整历史回放</strong>恢复先前持久化的会话。服务器会用存储的对话历史初始化 agent，然后在返回之前将该历史以一系列 <code>session/update</code> 通知的形式流式回传给客户端。客户端接收到的更新流与会话从未结束时所看到的完全一致。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":5,方法:session/load,"参数":{"会话ID":"s-ab12cd"}}
+← {`jsonrpc`:"2.0",方法:"session/update","参数":{
+    "会话ID": "s-ab12cd",
+    更新: {sessionUpdate: agent_message_chunk, "内容": {类型:"文本","文本":“最后一次提交...”}}
+  }}
+← ... (remaining stored messages replayed as session/update notifications)
+← {`jsonrpc`:"2.0","id":5,"结果":{}}
+</code></pre>
+<p><code>session/load</code> 返回后，会话即处于活动状态，可以接受 <code>session/prompt</code> 调用。</p>
+<p><code>session_id</code> 作为 <code>sessionId</code> 的 snake_case 别名被接受。</p>
+<p>错误：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>代码</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-32000</code> <code>SESSION_NOT_FOUND</code></td><td>存储中不存在给定 <code>sessionId</code> 对应的记录</td></tr>
+<tr><td><code>-32001</code> <code>SESSION_LIMIT_REACHED</code></td><td>当前活动会话数已达到 <code>max_sessions</code> 上限</td></tr>
+<tr><td><code>-32602</code> <code>INVALID_PARAMS</code></td><td>会话已处于活动状态，请先调用 <code>session/close</code></td></tr>
+<tr><td><code>-32603</code> <code>INTERNAL_ERROR</code></td><td>SQLite 读取失败</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="sessionresume-zeroclaw-扩展"><a class="header" href="#sessionresume-zeroclaw-扩展"><code>session/resume</code> <em>(ZeroClaw 扩展)</em></a></h3>
+<p>在<strong>不重放历史记录</strong>的情况下恢复先前持久化的会话。代理会被植入已存储的对话历史，因此在下一轮对话时拥有完整的上下文，但不会发出任何 <code>session/update</code> 通知。当客户端已从先前连接获取到历史记录、仅需恢复代理状态时，请使用此选项。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":5,方法:session/resume,"参数":{"会话ID":"s-ab12cd"}}
+← {`jsonrpc`:"2.0","id":5,"结果":{}}
+</code></pre>
+<p><code>session/resume</code> 返回后，会话即处于活动状态，可以接受 <code>session/prompt</code> 调用。错误情况与 <code>session/load</code> 相同。</p>
+<p><strong>加载与恢复对比：</strong> 当意外断开连接后重新连接，且客户端需要根据存储的历史记录重建其 UI 时，使用 <code>session/load</code>。当客户端已经拥有历史记录（例如，已将其存储在本地），仅需恢复服务端的 agent 状态时，使用 <code>session/resume</code>。</p>
+<h3 id="sessionclose-zeroclaw-扩展"><a class="header" href="#sessionclose-zeroclaw-扩展"><code>session/close</code> <em>(ZeroClaw 扩展)</em></a></h3>
+<p>停用活动会话：取消所有进行中的轮次，将该会话从内存中的活动集合移除，并注销 ACP 反向通道。SQLite 存储中的会话记录<strong>不会被删除</strong>，之后仍可通过 <code>session/load</code> 或 <code>session/resume</code> 恢复该会话。</p>
+<pre><code class="language-json">→ {`jsonrpc`:"2.0","id":6,方法:session/close,"参数":{"会话ID":"s-ab12cd"}}
+← {`jsonrpc`:"2.0","id":6,"结果":{}}
+</code></pre>
+<p><code>session_id</code> 作为 <code>sessionId</code> 的 snake_case 别名被接受。</p>
+<p>如果会话当前未处于活动状态（它可能仍存在于存储中），则返回 <code>SESSION_NOT_FOUND</code>（<code>-32000</code>）。</p>
+<p><strong>Close 与 stop 的区别：</strong> <code>session/close</code> 会停用会话，同时保留其持久化记录以供日后重新加载。<code>session/stop</code> 同样会将会话从内存中移除，但对存储的影响是相同的。两者都不会删除 SQLite 记录。</p>
+<h2 id="配置"><a class="header" href="#配置">配置</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>default_agent</code> <span class="cfg-field-meta"><code>string?</code> · default <code>—</code></span></summary>
+<p>当 <code>session/new</code> 省略 <code>agentAlias</code> 且配置了多个 agent 时所使用的 agent 别名。当恰好只有一个 agent 存在时，无论此字段如何，都会自动选择该 agent。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/acp"><code>/config/acp</code></a> 并设置 <code>acp.default_agent</code> 字段。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>acp.default_agent</code> 字段。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set acp.default_agent &lt;value&gt;
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_acp__default_agent=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>max_sessions</code> <span class="cfg-field-meta"><code>integer</code> · default <code>10</code></span></summary>
+<p>并发 ACP 会话的最大数量。默认值：<code>10</code>。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/acp"><code>/config/acp</code></a> 并设置 <code>acp.max_sessions</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>acp.max_sessions</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set acp.max_sessions &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_acp__max_sessions=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>session_timeout_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>3600</code></span></summary>
+<p>空闲会话超时时间（以秒为单位）。在此时长内没有任何活动的会话将被回收。默认值：<code>3600</code>（1 小时）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/acp"><code>/config/acp</code></a> 并设置 <code>acp.session_timeout_secs</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>acp.session_timeout_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set acp.session_timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_acp__session_timeout_secs=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>当 <code>session/new</code> 省略 <code>agentAlias</code> 且配置了多个 agent 时，会参考 <code>default_agent</code>；如果它不存在且恰好只有一个 <code>[agents.&lt;alias&gt;]</code> 条目，则会自动选择该 agent。</p>
+<p>当作为子进程运行 <code>zeroclaw acp</code> 时，该命令会无条件启动服务器。当作为守护进程运行时，网关会在 <code>/acp</code> 上通过 WebSocket 暴露 ACP，无需额外配置。</p>
+<h2 id="运行中"><a class="header" href="#运行中">运行中</a></h2>
+<p><strong>作为子进程（典型的 IDE 集成）：</strong></p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">zeroclaw acp
+</code></pre>
+</div>
+
+<p>该二进制文件读取标准输入，写入标准输出，在遇到文件末尾（EOF）时退出。</p>
+<p><strong>通过守护进程网关（远程或同主机）：</strong></p>
+<p>正常启动守护进程。网关始终在 <code>/acp</code> 上通过 WebSocket 暴露 ACP，无需额外的配置标志。客户端可以直接连接，或者通过 <code>zeroclaw-acp-bridge</code> 连接，它将 stdio ACP 协议桥接到网关 WebSocket：</p>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">zeroclaw-acp-bridge
+</code></pre>
+</div>
+
+<p>网桥从与守护进程相同的配置中读取网关地址和认证令牌。当守护进程使用非默认配置目录运行时（例如 <code>--config-dir /tmp/zeroclaw</code>），请将网桥指向同一目录：</p>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">zeroclaw-acp-bridge --config-dir /tmp/zeroclaw
+# 或者等效地：
+zeroclaw-acp-bridge --config-dir=/tmp/zeroclaw
+</code></pre>
+</div>
+
+<p>如果您不希望依赖缓存的令牌文件，也可以直接通过 <code>ZEROCLAW_ACP_BRIDGE_TOKEN</code> 提供 bearer 令牌。</p>
+<h2 id="版本兼容性"><a class="header" href="#版本兼容性">版本兼容性</a></h2>
+<p>ACP v0 客户端（使用扁平的 <code>{streaming, maxSessions, ...}</code> 初始化响应以及 <code>kind: "text"|"tool_call"</code> 的 session/update 结构）在连接到 v1 服务器时会遇到反序列化错误。判别字段和封装结构发生了破坏性变更。升级步骤：</p>
+<ul>
+<li>使用 <code>sessionUpdate</code>（而非 <code>kind</code>）来区分 <code>session/update</code> 通知。</li>
+<li>将 <code>session/prompt</code> 结果解析为 <code>{sessionId, stopReason, content}</code>（而非 <code>{finished, usage}</code>）。</li>
+<li>实现 <code>session/request_permission</code> 响应处理：审批机制已从服务器通知改为由客户端应答的 RPC。</li>
+<li>从 <code>session/new</code> 中移除 <code>systemPrompt</code> 参数，该参数未被读取。</li>
+</ul>
+<h2 id="安全"><a class="header" href="#安全">安全</a></h2>
+<p>ACP 继承运行配置的自治级别。当 <code>[autonomy] level = "supervised"</code> 时，中等风险的工具调用会通过 ACP 反向通道触发审批，即一个 <code>session/request_permission</code> 出站请求，客户端必须对其进行确认。在 <code>full</code> 模式下，工具调用无需审批即可执行，且 <code>workspace_only</code> 会被隐式禁用（agent 可以访问会话 cwd 之外的路径）；<code>forbidden_paths</code> 仍然生效。</p>
+<p>来自 <code>session/new</code> 的 <code>cwd</code> 会成为该会话中所有文件和 shell 工具所使用的 <code>SecurityPolicy</code> 工作区边界。注意：代理的系统提示当前反映的是守护进程的全局 <code>workspace_dir</code>，而非会话的 <code>cwd</code>，这不会影响策略的强制执行，仅会影响模型认为自己正在其中工作的目录。</p>
+<h2 id="内存"><a class="header" href="#内存">内存</a></h2>
+<p>ACP 会话不会与智能体的持久化记忆系统交互。这是一个有意为之的设计决策：ACP 适用于 IDE 驱动的编码任务，而非长期的关系构建。</p>
+<p><strong>ACP 会话从代理配置中继承的内容</strong>：个性、技能、风险配置、运行时配置、模型提供商以及所有非内存工具。</p>
+<p><strong>ACP 会话不包含的内容：</strong></p>
+<ul>
+<li>记忆工具（<code>memory_recall</code>、<code>memory_store</code>、<code>memory_forget</code>、<code>memory_export</code>、<code>memory_purge</code>）不可用</li>
+<li>自动记忆调用（每轮对话基于长期记忆构建的上下文前导）已禁用</li>
+<li>会话自动保存到智能体记忆存储的功能已禁用</li>
+</ul>
+<p><strong>会话上下文</strong>来自 <code>acp-sessions.db</code> 中持久化的对话历史。会话是持久化的、可恢复的、可删除的，会话历史用作工作上下文，而非智能体的长期记忆。</p>
+<p>这种分离确保临时的编码辅助对话不会污染智能体的长期记忆，同时来自聊天频道的无关知识也不会渗入 ACP 会话中。</p>
+<h2 id="代码参考"><a class="header" href="#代码参考">代码参考</a></h2>
+<ul>
+<li>ACP 服务器：<code>crates/zeroclaw-channels/src/orchestrator/acp_server.rs</code></li>
+<li>ACP 反向通道：<code>crates/zeroclaw-channels/src/acp_channel.rs</code></li>
+<li>会话存储（SQLite）：<code>crates/zeroclaw-infra/src/acp_session_store.rs</code></li>
+<li>网关 ACP-over-WebSocket 端点：<code>crates/zeroclaw-gateway/src/acp.rs</code></li>
+<li>按会话路径强制执行：<code>crates/zeroclaw-config/src/policy.rs</code>（<code>SecurityPolicy::from_config</code>）、<code>crates/zeroclaw-runtime/src/agent/agent.rs</code>（<code>from_config_with_session_cwd_and_mcp</code>）</li>
+<li>操作系统级沙箱检测/后端：<code>crates/zeroclaw-runtime/src/security/detect.rs</code>、<code>landlock.rs</code>、<code>bubblewrap.rs</code>、<code>seatbelt.rs</code></li>
+</ul>
+<h2 id="另见"><a class="header" href="#另见">另见</a></h2>
+<ul>
+<li><a href="./overview.html">通道 → 概述</a></li>
+<li><a href="../tools/mcp.html">工具 → MCP</a>：为代理提供工具的客户端；ACP 则相反</li>
+<li><a href="../security/autonomy.html">安全性 → 自主性</a></li>
+<li><a href="../security/overview.html">安全 → 概述</a></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../channels/git-gitea-forgejo.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../tools/overview.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../channels/git-gitea-forgejo.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../tools/overview.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

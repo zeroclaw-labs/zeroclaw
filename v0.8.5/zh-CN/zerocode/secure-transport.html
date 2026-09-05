@@ -1,0 +1,757 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>安全传输（端到端配置） - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-12c48721.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="安全传输端到端配置"><a class="header" href="#安全传输端到端配置">安全传输：端到端配置</a></h1>
+<p>此页面是用于在三种拓扑结构中安全地将客户端连接到守护进程的完整配置参考：</p>
+<ol>
+<li><strong>客户端直接连接守护进程</strong> - 双向 TLS WSS，无中继。</li>
+<li><strong>守护进程到中继</strong> - 守护进程与指定的中继保持出站桥接，因此即使位于 NAT/CGNAT 后也可访问。</li>
+<li><strong>客户端到中继再到守护进程</strong> - 客户端_通过_该中继连接到守护进程，而真正的客户端&lt;-&gt;守护进程 mTLS 仍在守护进程处终止。</li>
+</ol>
+<p>如需查看 60 秒快速入门，请参阅<a href="./remote.html">远程设置 (WSS)</a>；本页将深入介绍每个选项的调节方法。</p>
+<h2 id="心智模型两个信封一个信任边界"><a class="header" href="#心智模型两个信封一个信任边界">心智模型：两个信封，一个信任边界</a></h2>
+<p>存在两层 TLS，但其中只有一层是安全边界：</p>
+<ul>
+<li><strong>内部 mTLS（真正的边界）。<strong>仅支持 TLS 1.3，双向认证。客户端出示由守护进程签发的证书；守护进程出示其服务器叶证书。这是 RPC 平面。其上</strong>不存在</strong>仅服务器端 / 未认证路径 - 始终要求客户端证书。</li>
+<li><strong>外层 TLS（元数据边界）。</strong> 当中继位于路径中时，中继会终止外层 TLS + WebSocket 会话，并转发无法解读的密文。它从不持有能够读取内部 RPC 的密钥。在直连拓扑中不存在外层。</li>
+</ul>
+<p>默认端口（均可配置）：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Plane</th><th>默认</th><th>配置</th></tr>
+</thead>
+<tbody>
+<tr><td>守护进程 WSS（内部 mTLS RPC）</td><td><code>9781</code></td><td><code>[wss].port</code></td></tr>
+<tr><td>守护进程注册端点</td><td><code>9782</code></td><td><code>[enroll].port</code></td></tr>
+<tr><td>中继（外层 TLS + WS）</td><td><code>8443</code></td><td>中继 <code>--bind</code> / <code>[bind]</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>在全文中，<code>&lt;data_dir&gt;</code> 表示守护进程的数据目录（通常为 <code>~/.zeroclaw</code>），而 <code>&lt;config-dir&gt;</code> 表示客户端的 zerocode 配置目录（<code>--config-dir</code>，通常为 <code>~/.zeroclaw</code>）。配置文件不会展开 <code>~</code>；请使用绝对路径。</p>
+<hr>
+<h2 id="拓扑-1客户端直接连接到守护进程"><a class="header" href="#拓扑-1客户端直接连接到守护进程">拓扑 1：客户端直接连接到守护进程</a></h2>
+<pre><code>zerocode  ===== mutual-TLS WSS (TLS 1.3) =====&gt;  daemon  [wss] :9781
+</code></pre>
+<h3 id="1a-守护进程端"><a class="header" href="#1a-守护进程端">1a. 守护进程端</a></h3>
+<p>启用 WSS 监听器。安全的默认设置是在首次启动时让守护进程<strong>自动生成自己的 CA 和服务器证书</strong>，这样您无需手动管理任何 TLS 材料：</p>
+<pre><code class="language-toml">[wss]
+enabled = true
+# bind = "0.0.0.0"   # 默认值
+# port = 9781        # 默认值
+# 将 cert_path/key_path 留空，以便在首次启动时自动在
+# &lt;data_dir&gt;/tls/ 下生成服务器证书。仅在需要使用自己的服务器证书时设置它们。
+</code></pre>
+<p>首次启动且 <code>[wss].enabled = true</code> 时，守护进程会在 <code>&lt;data_dir&gt;/tls/</code>（目录模式 <code>0700</code>）下写入：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>文件</th><th>目的</th><th>模式</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ca.crt</code></td><td>每个守护进程的 CA 证书（公开）</td><td>默认 umask</td></tr>
+<tr><td><code>ca.key</code></td><td>CA 私钥（用于签署客户端证书）</td><td><code>0600</code></td></tr>
+<tr><td><code>server.crt</code></td><td>WSS 服务器叶证书（SAN：<code>localhost</code>、<code>127.0.0.1</code>）</td><td>默认 umask</td></tr>
+<tr><td><code>server.key</code></td><td>WSS 服务器私钥</td><td><code>0600</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>私钥会以 <code>0600</code> 权限写入；公有证书使用进程的 umask。<code>tls/</code> 目录本身为 <code>0700</code>。</p>
+<p>CA <strong>绝不会静默轮换</strong>：如果 <code>ca.crt</code> 和 <code>ca.key</code> 存在，就会重复使用。自动生成的 CA 有效期为 10 年；服务器叶证书有效期约为 27 个月；签发的客户端证书有效期为 30 天。</p>
+<p>开放端口（<code>sudo ufw allow 9781/tcp</code>）并启动守护进程。您应该会看到一条日志，显示 WSS 监听器已在 <code>0.0.0.0:9781</code> 上启动。</p>
+<p>客户端现在需要证书。有两种获取方式。</p>
+<h3 id="1b-客户端---选项-a注册推荐"><a class="header" href="#1b-客户端---选项-a注册推荐">1b. 客户端 - 选项 A：注册（推荐）</a></h3>
+<p>注册功能会通过一个受配对控制且经服务器身份验证的端点，在无需手动处理证书的情况下为无证书客户端提供其首个证书。启用它：</p>
+<pre><code class="language-toml">[enroll]
+enabled = true
+# bind = "0.0.0.0"   # 默认
+# port = 9782        # 默认
+# 需要启用 [wss]，并提供守护进程 CA 密钥（使用上方自动生成的密钥，或 BYO+key）。
+# 如果缺少 CA 密钥，端点将默认拒绝连接，并且必须通过带外方式配置证书。
+</code></pre>
+<p>守护进程启动时，会将一次性 <strong>配对码</strong> 和 <strong>短认证字符串（SAS）</strong> 输出到其控制台/日志中。该代码<strong>只能使用一次，并在生成 10 分钟后过期</strong>——它是签发证书的唯一持有者凭据，而且会出现在控制台和日志中，因此复制的代码必须在操作员使用后不久停止工作。过期的代码会被拒绝并清除；需要新的代码时，请通过网关的配对 API 生成替代代码。然后，在工作站上：</p>
+<pre><code class="language-sh"># 交互式：无证书客户端在首次连接时自动注册。
+zerocode --connect wss://&lt;remote-host&gt;:9781
+
+# 或明确地/以非交互方式：
+zerocode --enroll --connect wss://&lt;remote-host&gt;:9781
+</code></pre>
+<p>zerocode 会提示输入配对码，在本地生成 P-256 密钥和 CSR <strong>（私钥永远不会离开设备）</strong>，并显示 SAS。请确认 SAS 与守护进程打印的 SAS 匹配（这可以检测出中间人 CA），然后它会在 <code>&lt;config-dir&gt;/tls/</code> 下缓存：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>文件</th><th>目的</th><th>模式</th></tr>
+</thead>
+<tbody>
+<tr><td><code>client.crt</code></td><td>已签发的客户端证书</td><td>默认 umask</td></tr>
+<tr><td><code>client.key</code></td><td>客户端私钥（在本地生成）</td><td><code>0600</code></td></tr>
+<tr><td><code>ca.crt</code></td><td>为 RPC 平面固定的守护进程 CA 证书链</td><td>默认 umask</td></tr>
+<tr><td><code>profile.json</code></td><td>已缓存的 <code>device_id</code>、<code>not_after</code>、中继配置文件</td><td>默认 umask</td></tr>
+</tbody>
+</table>
+</div>
+<p>后续每次运行都无需配置（<code>zerocode --connect wss://&lt;remote-host&gt;:9781</code>；如果配置中包含 <code>uri</code>，也可以直接运行 <code>zerocode</code>）。证书会在其生命周期的约 50%（约 15 天）时，通过活动的 mTLS 会话自动续期；已撤销的证书无法自行续期。</p>
+<p>注册端点默认值：<code>--enroll-host</code> 默认为 <code>--connect</code> 的主机；<code>--enroll-port</code> 默认为 <code>9782</code>。</p>
+<p>首个版本有意要求每次注册都使用配对码。在客户端拥有明确的无代码信任锚（例如固定的守护进程 CA 指纹）之前，保留的 <code>allow_unpaired_enrollment</code> 配置项会在守护进程启动时被拒绝。这样可以避免临时注册 TLS 路径变成盲目的首次使用时信任。</p>
+<h3 id="客户端---选项-b由操作员签发的证书"><a class="header" href="#客户端---选项-b由操作员签发的证书">客户端 - 选项 B：由操作员签发的证书</a></h3>
+<p>如果您更愿意在守护进程上生成证书并将其复制出来：</p>
+<pre><code class="language-sh"># 在守护进程主机上。--out-dir 还会写入可直接使用的 ca.crt/client.crt/client.key。
+zeroclaw security issue-client-cert --name my-laptop --out-dir /tmp/my-laptop-tls
+添加 --force 以覆盖此名称的现有证书
+</code></pre>
+<p>将这三个文件复制到客户端的 <code>&lt;config-dir&gt;/tls/</code>，并分别命名为 <code>ca.crt</code>、<code>client.crt</code>、<code>client.key</code>（这样 <code>zerocode --connect wss://host:9781</code> 就会自动找到它们），或者显式指定它们的位置：</p>
+<pre><code class="language-sh">zerocode --connect wss://&lt;remote-host&gt;:9781 \
+  --tls-ca-cert  /path/ca.crt \
+  --tls-client-cert /path/client.crt \
+  --tls-client-key  /path/client.key
+</code></pre>
+<p>等效配置（因此直接使用 <code>zerocode</code> 即可）：</p>
+<pre><code class="language-toml">[connection.wss]
+uri = "wss://&lt;remote-host&gt;:9781"
+
+[connection.wss.tls]
+ca_cert_path     = "/abs/path/ca.crt"
+client_cert_path = "/abs/path/client.crt"
+client_key_path  = "/abs/path/client.key"
+</code></pre>
+<blockquote>
+<p>未注册证书的客户端在未完成注册的情况下访问 WSS 平面时，会收到明确的“请先注册”消息（同时，守护进程会记录被拒绝的未迁移客户端）——绝不会静默挂起。<code>--tls-skip-verify</code> 仅放宽针对自签名开发守护进程的 <em>服务端</em> 验证；客户端证书仍然是必需的。</p>
+</blockquote>
+<hr>
+<h2 id="拓扑-2守护进程到中继"><a class="header" href="#拓扑-2守护进程到中继">拓扑 2：守护进程到中继</a></h2>
+<pre><code>daemon  ====== outbound: register + bridge ======&gt;  relay  :8443
+[relay]                                             (blind forwarder)
+</code></pre>
+<p>守护进程连接到中继，证明一个稳定的 Ed25519 身份，并注册一个 <strong>node-id</strong>。客户端随后连接到该 node-id（拓扑 3）。中继始终只转发密文。</p>
+<h3 id="2a-运行中继zerorelay"><a class="header" href="#2a-运行中继zerorelay">2a. 运行中继（zerorelay）</a></h3>
+<p>使用 <code>relay.toml</code> 进行配置（参见 <code>apps/zerorelay/relay.example.toml</code>）；每个命令行标志都会覆盖文件中的对应值。<code>[admission]</code> 部分会在 <code>SIGHUP</code> 时热重载；如果重载会在未显式启用的情况下将公共中继变为开放且无需令牌的准入，则会被拒绝，并继续使用之前的策略。</p>
+<pre><code class="language-toml"># relay.toml
+bind = "0.0.0.0:8443"
+
+[tls]
+# 首次运行时省略 cert/key 可将外层 TLS 证书自动配置到 dir（无需
+# openssl）。将 sans 设置为 relay 的公共主机名/IP 地址。
+dir  = "/data/tls"
+sans = ["relay.example.com"]
+# 或者使用你自己的证书（例如公共 CA 证书）：
+# cert = "/etc/zerorelay/fullchain.pem"
+# key  = "/etc/zerorelay/privkey.pem"
+
+[admission]
+# "open" 允许任何已签名的守护进程接入（受 deny 列表约束）；"allowlist" 仅允许
+# 列出的守护进程公钥指纹接入。deny 始终优先。
+mode = "open"
+allow = []
+deny  = []
+# 公共（非回环）relay 必须限制注册：在此设置共享密钥
+# （每个守护进程通过 [relay] relay_token 提供该密钥），或使用 mode = "allowlist"。
+# 否则，使用公共 bind 的 OPEN、无令牌 relay 将拒绝启动，因为
+# 互联网上的任何守护进程都可能注册并抢占无人认领的 node-ids。（本地开发时使用的
+# 回环 bind 不受此限制；有意运行的开放公共 relay 可通过 allow_public_open = true
+# 覆盖此限制。）
+relay_token = "change-me-to-a-long-random-secret"
+
+[limits]
+max_conns_per_node     = 256
+idle_timeout_secs      = 300
+lease_ttl_secs         = 300
+accept_burst_per_ip    = 30
+accept_rate_per_ip     = 10.0
+connect_burst_per_node = 60
+connect_rate_per_node  = 20.0
+</code></pre>
+<p>运行它：</p>
+<pre><code class="language-sh">zerorelay --config /etc/zerorelay/relay.toml
+# 同样，仅使用标志（公开绑定需要令牌或允许列表，否则 the
+# relay refuses to start):
+zerorelay --bind 0.0.0.0:8443 --tls-san relay.example.com \
+  --relay-token change-me-to-a-long-random-secret
+</code></pre>
+<p>省略 <code>--tls-cert</code>/<code>--tls-key</code> 时，中继会在 TLS 目录下自行生成 CA 和服务器证书（解析顺序：<code>$ZERORELAY_DATA_DIR/tls</code>，否则为 <code>$HOME/.zerorelay/tls</code>，再否则为 <code>./zerorelay/tls</code>）；SAN 中始终包含 <code>localhost</code> 和 <code>127.0.0.1</code>。自行生成的 <code>ca.crt</code> 是守护进程/客户端用于信任中继外层 TLS 的证书。</p>
+<p><strong>准入。</strong> <code>open</code> 模式加上可选的 <code>relay_token</code> 是最简单的访问控制方式。<code>allowlist</code> 模式根据守护进程注册公钥的指纹进行匹配（守护进程 <code>&lt;data_dir&gt;/relay/registration.key</code> 中 Ed25519 密钥的 SHA-256 十六进制值）；将指纹添加到 <code>allow</code> 中（并使用 <code>kill -HUP &lt;pid&gt;</code> 重新加载）。节点 ID 会与其首个注册者的公钥绑定，因此不同的密钥无法劫持正在运行的节点 ID（会收到 <code>node_taken</code>）。</p>
+<p><strong>Docker.</strong> <code>apps/zerorelay/Dockerfile</code> 采用 distroless 运行，并使用 <code>CMD ["--config", "/etc/zerorelay/relay.toml"]</code> 和无 shell 的 <code>zerorelay healthcheck --addr</code> HEALTHCHECK；<code>compose.yaml</code> 将卷挂载到 <code>/data</code>，从而使自行配置的 TLS 得以持久化。暴露 <code>8443</code> 端口。</p>
+<h3 id="2b-将守护进程指向中继服务器"><a class="header" href="#2b-将守护进程指向中继服务器">2b. 将守护进程指向中继服务器</a></h3>
+<pre><code class="language-toml">[wss]
+enabled = true          # 必需：中继转发到本地 WSS 监听器
+
+[relay]
+enabled = true
+url = "relay.example.com:8443"
+# node_id：留空（推荐），以自动生成并持久化一个随机的 128 位
+# 能力凭证，存储于 &lt;data_dir&gt;/relay/node_id。仅在需要固定特定 ID 时设置。
+# token = "change-me"   # 如果已设置，则必须与中继的 [admission].relay_token 匹配
+
+# 对中继外部证书的信任——选择一个：
+relay_ca_path = "/path/to/relay/ca.crt"   # 信任中继的（自签名）CA
+# tofu = true                              # 或在首次使用时固定中继叶证书
+# relay_insecure = true                    # 或跳过外部验证（仅限开发环境）
+# （对于使用公共 CA 的中继，将这三个选项全部留空，以使用内置公共根证书）
+</code></pre>
+<p><code>[relay]</code> 要求启用 <code>[wss]</code>（中继会桥接到 <code>127.0.0.1:&lt;wss.port&gt;</code>），如果 <code>url</code> 为空则默认拒绝。守护进程启动时会记录节点 ID，并附带提示 <em>“将此作为 –relay-node 提供给客户端”</em>；你也可以从 <code>&lt;data_dir&gt;/relay/node_id</code> 中读取该 ID。守护进程的稳定注册密钥会创建于 <code>&lt;data_dir&gt;/relay/registration.key</code>（<code>0600</code>）。</p>
+<p>外层证书信任优先级（从高到低）：<code>relay_insecure</code> &gt; <code>relay_ca_path</code> &gt; <code>&lt;data_dir&gt;/relay/relay_pin</code> 中存储的 pin（显式配置或 TOFU）&gt; <code>tofu</code> &gt; 公共根证书。因此，配置 CA 会替换过时的 pin，但不会将其删除。使用 <code>tofu = true</code> 时，观测到的 relay 叶证书指纹会被固定到 <code>&lt;data_dir&gt;/relay/relay_pin</code>，注册过程会将同一个 pin 传递给客户端，以便它们固定同一个叶证书。</p>
+<h3 id="2c可选node-id-轮换和外部-mtls"><a class="header" href="#2c可选node-id-轮换和外部-mtls">2c.（可选）node-id 轮换和外部 mTLS</a></h3>
+<pre><code class="language-toml">[relay]
+node_id_rotation_days = 30   # auto-rotate the auto-minted id every N days (0 = never)
+</code></pre>
+<p>轮换会生成一个新的 ID，并让它与旧 ID 并行运行 10 分钟的宽限期，以免正在进行中的客户端连接被中断，随后停用旧 ID；客户端会在下一次证书续期时通过带内方式获取新 ID。现在可使用 <code>zeroclaw security relay-rotate-node-id</code> 强制执行一次（仅限 auto-mint 模式；固定的 <code>node_id</code> 永不轮换）。</p>
+<p>对于也在外层对守护进程进行身份验证的中继，请在中继上设置 <code>[admission].outer_client_auth = "required"</code> + <code>outer_client_ca</code>，并在守护进程上设置 <code>[relay].outer_client_cert</code> / <code>outer_client_key</code>。这会在外层 TLS 上添加额外配置，且不会触及内部 mTLS。</p>
+<hr>
+<h2 id="拓扑-3客户端到中继再到守护进程"><a class="header" href="#拓扑-3客户端到中继再到守护进程">拓扑 3：客户端到中继再到守护进程</a></h2>
+<pre><code>zerocode  ==outer TLS+WS==&gt;  relay  ==forwards ciphertext==&gt;  daemon
+   \________________ inner mutual-TLS (TLS 1.3) terminates here _______________/
+</code></pre>
+<p>这结合了拓扑 1 和 2：客户端需要一个内部客户端证书（按照 1b 进行注册）<strong>以及</strong>中继协调信息（地址、node-id，以及对中继外部证书的信任）。</p>
+<h3 id="3a-简便路径注册携带中继配置文件"><a class="header" href="#3a-简便路径注册携带中继配置文件">3a. 简便路径：注册携带中继配置文件</a></h3>
+<p>当守护进程配置了 <code>[relay]</code> 时，其注册响应会包含一个<strong>中继配置</strong>（<code>relay_url</code>、<code>node_id</code> 和中继的叶证书 <code>relay_cert_pin</code>）。因此，一次注册即可配置所有内容：</p>
+<pre><code class="language-sh">zerocode --enroll --connect wss://&lt;daemon-host&gt;:9781
+</code></pre>
+<p>zerocode 会将内部证书 <strong>和</strong> 中继配置缓存到 <code>&lt;config-dir&gt;/tls/profile.json</code>。之后，不带任何选项的普通 <code>zerocode</code> 会通过中继访问守护进程——它已经知道中继地址、节点 ID 和 PIN。</p>
+<h3 id="3b-手动路径"><a class="header" href="#3b-手动路径">3b. 手动路径</a></h3>
+<p>显式向客户端提供中继坐标。内部证书仍来自注册或 <code>--tls-*</code>（拓扑 1）：</p>
+<pre><code class="language-sh">zerocode \
+  --relay      relay.example.com:8443 \
+  --relay-node &lt;node-id-from-daemon-log&gt; \
+  --relay-ca   /path/to/relay/ca.crt
+# inner mTLS material: from &lt;config-dir&gt;/tls (after enrolling), or pass --tls-* flags
+</code></pre>
+<p>为中继的外部证书准确选择一种信任模式，与守护进程保持一致：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>标志</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--relay-ca &lt;pem&gt;</code></td><td>信任中继的（自签名）CA</td></tr>
+<tr><td><code>--relay-pin &lt;sha256&gt;</code></td><td>固定中继的外层叶证书（通常在注册时提供）</td></tr>
+<tr><td><code>--relay-tofu</code></td><td>首次使用时信任；将 pin 持久化到 <code>&lt;config-dir&gt;/relay/relay_pin</code></td></tr>
+<tr><td><code>--relay-insecure</code></td><td>跳过外部验证（仅限开发/自签名）</td></tr>
+<tr><td>(none)</td><td>使用内置的公共根证书（public-CA 中继）</td></tr>
+<tr><td><code>--relay-host &lt;name&gt;</code></td><td>覆盖预期的外部证书 SAN（默认为 <code>--relay</code> 主机）</td></tr>
+</tbody>
+</table>
+</div>
+<p>配置等效项（因此直接使用 <code>zerocode</code> 即可）：</p>
+<pre><code class="language-toml">[connection.wss]
+relay_url  = "relay.example.com:8443"
+relay_node = "&lt;node-id&gt;"
+</code></pre>
+<blockquote>
+<p>中继的外层信任（–relay-ca / –relay-pin / –relay-tofu / –relay-insecure）由<strong>标志或缓存的注册 PIN</strong>提供，而不是由[connection.wss]键提供。</p>
+</blockquote>
+<h3 id="优先直连失败时回退到中继"><a class="header" href="#优先直连失败时回退到中继">优先直连，失败时回退到中继</a></h3>
+<p>如果同时为客户端提供<strong>直接地址</strong>和中继，它会优先使用直接路径，回退到中继，然后重新探测并迁移回直接路径：</p>
+<pre><code class="language-sh">zerocode --connect wss://&lt;daemon-host&gt;:9781 \
+         --relay relay.example.com:8443 --relay-node &lt;node-id&gt;
+</code></pre>
+<p>调优（位于 <code>[connection.wss]</code> 中）：</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>默认</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>direct_attempts</code></td><td><code>2</code></td><td>在回退到中继之前尝试直接连接</td></tr>
+<tr><td><code>direct_timeout_secs</code></td><td><code>3</code></td><td>每次尝试直接连接的超时时间</td></tr>
+<tr><td><code>reprobe_secs</code></td><td><code>30</code></td><td>重新探测频率，以迁移回直接模式（<code>0</code> 禁用）</td></tr>
+</tbody>
+</table>
+</div>
+<p>在仅中继模式下（不使用 <code>--connect</code>/<code>uri</code>），内部 WSS URL 默认为 <code>wss://127.0.0.1:9781</code>，因为内部 mTLS 在守护进程的回环监听器处终止；中继地址仅是 TCP 拨号目标。</p>
+<hr>
+<h2 id="配置参考"><a class="header" href="#配置参考">配置参考</a></h2>
+<h3 id="守护进程-wss"><a class="header" href="#守护进程-wss">守护进程 <code>[wss]</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>启用双向 TLS WSS 监听器</td></tr>
+<tr><td><code>bind</code></td><td><code>0.0.0.0</code></td><td>绑定地址</td></tr>
+<tr><td><code>port</code></td><td><code>9781</code></td><td>监听端口</td></tr>
+<tr><td><code>cert_path</code></td><td>（空）</td><td>自带服务器证书；留空则在 <code>&lt;data_dir&gt;/tls/</code> 下自动生成</td></tr>
+<tr><td><code>key_path</code></td><td>（空）</td><td>自行提供服务器密钥；留空则自动生成</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="守护进程-wssclient_auth可选无论如何mtls-始终启用"><a class="header" href="#守护进程-wssclient_auth可选无论如何mtls-始终启用">守护进程 <code>[wss.client_auth]</code>（可选；无论如何，mTLS 始终启用）</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>使用自带的 CA；为 false 时，守护进程使用其自动生成的 CA</td></tr>
+<tr><td><code>ca_cert_path</code></td><td>（空）</td><td>用于验证客户端证书的 PEM CA（BYO 模式）</td></tr>
+<tr><td><code>pinned_certs</code></td><td><code>[]</code></td><td>如果不为空，则仅接受与这些 SHA-256 指纹匹配的客户端证书</td></tr>
+<tr><td><code>crl_path</code></td><td>（空）</td><td>已吊销指纹文件；为空时使用由账本生成的 <code>&lt;data_dir&gt;/tls/revoked</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="守护进程-enroll"><a class="header" href="#守护进程-enroll">守护进程 <code>[enroll]</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>启用注册端点（需要 <code>[wss]</code> + CA 密钥）</td></tr>
+<tr><td><code>bind</code></td><td><code>0.0.0.0</code></td><td>绑定地址</td></tr>
+<tr><td><code>port</code></td><td><code>9782</code></td><td>监听端口</td></tr>
+<tr><td><code>allow_unpaired_enrollment</code></td><td>（空）</td><td>保留；在无代码客户端信任锚存在之前，将拒绝非空值</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="守护进程-relay"><a class="header" href="#守护进程-relay">守护进程 <code>[relay]</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>键</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td><code>false</code></td><td>启用中继桥接（需要 <code>[wss]</code>）</td></tr>
+<tr><td><code>url</code></td><td>（空）</td><td>中继地址 <code>host:port</code>；启用时必填</td></tr>
+<tr><td><code>node_id</code></td><td>（空）</td><td>留空时自动生成并持久化一个 128 位 ID；设置后固定使用一个</td></tr>
+<tr><td><code>token</code></td><td>(空，机密)</td><td>注册时提供的共享密钥</td></tr>
+<tr><td><code>relay_ca_path</code></td><td>（空）</td><td>中继外部证书的 PEM CA；为空时使用公共根证书</td></tr>
+<tr><td><code>relay_host</code></td><td>（空）</td><td>预期的外部证书 SAN；留空时从 <code>url</code> 派生</td></tr>
+<tr><td><code>relay_insecure</code></td><td><code>false</code></td><td>跳过外部证书验证（仅限开发环境）</td></tr>
+<tr><td><code>tofu</code></td><td><code>false</code></td><td>首次使用时，将 relay 叶节点固定到 <code>&lt;data_dir&gt;/relay/relay_pin</code></td></tr>
+<tr><td><code>outer_client_cert</code></td><td>（空）</td><td>用于中继准入的 Daemon 外层 mTLS 客户端证书</td></tr>
+<tr><td><code>outer_client_key</code></td><td>（空）</td><td><code>outer_client_cert</code> 的密钥</td></tr>
+<tr><td><code>node_id_rotation_days</code></td><td><code>0</code></td><td>每 N 天自动轮换自动生成的 node-id（0 = 从不）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="relay-relaytoml"><a class="header" href="#relay-relaytoml">Relay <code>relay.toml</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Section.key</th><th>默认</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bind</code></td><td><code>0.0.0.0:8443</code></td><td>监听地址（守护进程 + 客户端）</td></tr>
+<tr><td><code>[tls].cert</code> / <code>.key</code></td><td>(自助预配)</td><td>外部 TLS 身份；两者均省略以自行配置</td></tr>
+<tr><td><code>[tls].dir</code></td><td>数据目录 <code>/tls</code></td><td>自配置证书的写入位置</td></tr>
+<tr><td><code>[tls].sans</code></td><td><code>[]</code></td><td>额外 SAN（始终包含 <code>localhost</code>、<code>127.0.0.1</code>）</td></tr>
+<tr><td><code>[admission].mode</code></td><td><code>open</code></td><td><code>open</code> 或 <code>allowlist</code></td></tr>
+<tr><td><code>[admission].allow</code> / <code>.deny</code></td><td><code>[]</code></td><td>守护进程公钥指纹（拒绝优先）</td></tr>
+<tr><td><code>[admission].relay_token</code></td><td>(none)</td><td>可选的共享密钥门控</td></tr>
+<tr><td><code>[admission].outer_client_auth</code></td><td><code>off</code></td><td><code>off</code> / <code>optional</code> / <code>required</code>（外层 mTLS）</td></tr>
+<tr><td><code>[admission].outer_client_ca</code></td><td>(none)</td><td>外部客户端证书的 PEM CA</td></tr>
+<tr><td><code>[admission].route_by_client_cert</code></td><td><code>false</code></td><td>根据外层证书 CN 的 node-id 进行路由</td></tr>
+<tr><td><code>[limits].max_conns_per_node</code></td><td><code>256</code></td><td>每个 node-id 的并发客户端连接数</td></tr>
+<tr><td><code>[limits].idle_timeout_secs</code></td><td><code>300</code></td><td>在 N 秒后丢弃空闲客户端连接</td></tr>
+<tr><td><code>[limits].lease_ttl_secs</code></td><td><code>300</code></td><td>注册时公布的租约 TTL（v1 中仅供参考：WebSocket 存活状态才是真正的清理规则）</td></tr>
+<tr><td><code>[limits].accept_burst_per_ip</code> / <code>accept_rate_per_ip</code></td><td><code>30</code> / <code>10.0</code></td><td>每个 IP 的握手令牌桶</td></tr>
+<tr><td><code>[limits].connect_burst_per_node</code> / <code>connect_rate_per_node</code></td><td><code>60</code> / <code>20.0</code></td><td>每节点连接令牌桶</td></tr>
+<tr><td><code>[limits].max_pending_handshakes</code></td><td><code>256</code></td><td>已通过 accept 但尚未分类的套接字</td></tr>
+<tr><td><code>[limits].handshake_timeout_secs</code></td><td><code>10</code></td><td>TLS、WS 升级和签名注册共用一个截止时间</td></tr>
+<tr><td><code>[limits].max_registered_nodes</code></td><td><code>1024</code></td><td>同时注册的守护进程（N+1 获得 <code>registry_full</code>）</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="zerorelay-cli会覆盖-relaytoml"><a class="header" href="#zerorelay-cli会覆盖-relaytoml">zerorelay CLI（会覆盖 <code>relay.toml</code>）</a></h3>
+<p><code>--config</code> <code>--bind</code> <code>--tls-cert</code> <code>--tls-key</code> <code>--tls-dir</code> <code>--tls-san</code>（可重复指定）<code>--registration-mode</code> <code>--allow</code>（可重复指定）<code>--deny</code>（可重复指定）<code>--relay-token</code> <code>--max-conns-per-node</code> <code>--idle-timeout-secs</code> <code>--lease-ttl-secs</code> <code>--status-file</code>。子命令：<code>healthcheck [--addr 127.0.0.1:8443]</code>、<code>status --file &lt;path&gt;</code>。</p>
+<h3 id="zerocode-connectionwss-和-cli"><a class="header" href="#zerocode-connectionwss-和-cli">zerocode <code>[connection.wss]</code> 和 CLI</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[connection.wss]</code> 键</th><th>默认</th><th>CLI 覆盖</th></tr>
+</thead>
+<tbody>
+<tr><td><code>uri</code></td><td>(none)</td><td><code>--connect</code></td></tr>
+<tr><td><code>relay_url</code></td><td>(none)</td><td><code>--relay</code>（需要 <code>--relay-node</code>）</td></tr>
+<tr><td><code>relay_node</code></td><td>(none)</td><td><code>--relay-node</code>（需要 <code>--relay</code>）</td></tr>
+<tr><td><code>direct_attempts</code></td><td><code>2</code></td><td>-</td></tr>
+<tr><td><code>direct_timeout_secs</code></td><td><code>3</code></td><td>-</td></tr>
+<tr><td><code>reprobe_secs</code></td><td><code>30</code></td><td>-</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>[connection.wss.tls]</code> 键</th><th>默认</th><th>CLI 覆盖</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ca_cert_path</code></td><td><code>&lt;config-dir&gt;/tls/ca.crt</code></td><td><code>--tls-ca-cert</code></td></tr>
+<tr><td><code>client_cert_path</code></td><td><code>&lt;config-dir&gt;/tls/client.crt</code></td><td><code>--tls-client-cert</code>（需要密钥）</td></tr>
+<tr><td><code>client_key_path</code></td><td><code>&lt;config-dir&gt;/tls/client.key</code></td><td><code>--tls-client-key</code>（需要证书）</td></tr>
+<tr><td><code>skip_verify</code></td><td><code>false</code></td><td><code>--tls-skip-verify</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Relay 的外部信任和注册仅限于 CLI/缓存：<code>--relay-ca</code> <code>--relay-host</code> <code>--relay-insecure</code> <code>--relay-pin</code> <code>--relay-tofu</code> <code>--relay-client-cert</code> <code>--relay-client-key</code> <code>--enroll</code> <code>--enroll-host</code> <code>--enroll-port</code>。</p>
+<h2 id="文件布局"><a class="header" href="#文件布局">文件布局</a></h2>
+<p><strong>守护进程 <code>&lt;data_dir&gt;/</code>：</strong></p>
+<pre><code>tls/ca.crt  tls/ca.key            per-daemon CA (key 0600)
+tls/server.crt  tls/server.key    WSS server leaf (key 0600)
+tls/ledger.db                     issued-cert ledger (SQLite)
+tls/revoked                       revoked fingerprints (handshake-checked)
+relay/registration.key            Ed25519 relay identity (0600)
+relay/node_id                     auto-minted node-id
+relay/relay_pin                   pinned relay outer-leaf fingerprint (TOFU)
+</code></pre>
+<p><strong>客户端 <code>&lt;config-dir&gt;/</code>：</strong></p>
+<pre><code>tls/client.crt  tls/client.key    client identity (key 0600)
+tls/ca.crt                         pinned daemon CA
+tls/profile.json                   device_id, not_after, cached relay profile
+relay/relay_pin                    relay outer-leaf pin (--relay-tofu)
+</code></pre>
+<p><strong>Relay <code>&lt;tls-dir&gt;/</code>：</strong> <code>ca.crt</code>、<code>server.crt</code>、<code>server.key</code>（自行配置）。</p>
+<h3 id="升级现有的-issued-cert-账本"><a class="header" href="#升级现有的-issued-cert-账本">升级现有的 issued-cert 账本</a></h3>
+<p><code>tls/ledger.db</code> 中记录了架构版本。新守护进程首次打开由早期版本写入的账本时，会在原位置重建该账本，同时保留每个已签发和已吊销的证书，以及其设备 ID、有效期和审计操作者。重建在单个事务中运行：如果无法完成，守护进程将拒绝启动，并保留原始账本不变，而不会留下迁移了一半的状态；错误信息会指明该文件。无需操作员执行任何操作，已注册设备也无需重新注册。</p>
+<h3 id="未交付的证书"><a class="header" href="#未交付的证书">未交付的证书</a></h3>
+<p>守护进程会先将签发记录写入台账，然后才把证书交给注册客户端、续期客户端，或写入操作员的 <code>issue-client-cert</code> 文件。这个顺序是有意为之：如果顺序相反，某人手中可能会有一张由 CA 签名的有效证书，却没有对应的台账记录；而台账从未记录过的证书无法列出或撤销。</p>
+<p>代价是，中间发生的故障——例如客户端在响应过程中断开连接或重命名失败——会留下一条针对无人收到的证书的 <code>active</code> 记录。此类记录会单独作为_未交付_记录进行跟踪，并且<strong>在其存在时间超过一小时后撤销</strong>，时间点取以下各项中最早者：</p>
+<ul>
+<li>任何新证书的签发或续期，</li>
+<li>任何注册连接，</li>
+<li>任何守护进程重启或其他账本打开操作。</li>
+</ul>
+<p>这不是后台计时器。完全不执行证书操作的守护进程会将扫描推迟到下一次执行此类操作时；在此之前，证书不会出现在 <code>tls/revoked</code> 中，仍可通过 WSS 握手，但无法续期。任何注册或续期流量——包括身份验证失败的连接——都足以对其进行同步.</p>
+<p>经对账的证书会被撤销，而不会删除：该行会保留在账本中，其指纹会像操作员撤销的证书一样写入 <code>tls/revoked</code>，审计主体记录为 <code>reconcile:undelivered</code>，以便在审计轨迹中将两者区分开来。<code>security list-client-certs</code> 只显示 ACTIVE 证书，因此经过对账的证书会从该列表中消失——在事件响应期间，请读取 <code>tls/revoked</code> 或审计日志来查看撤销历史。如果设备报告称它 <em>did</em> 接收到的证书已停止工作，请查找该审计主体——这意味着证书交付记录已丢失，解决方法是重新注册或重新签发。</p>
+<h2 id="验证和故障排除"><a class="header" href="#验证和故障排除">验证和故障排除</a></h2>
+<ul>
+<li>**守护进程已启动：**查找 <code>0.0.0.0:9781</code> 上的 WSS 监听日志，以及使用中继时的 <code>node_id</code> 日志行。</li>
+<li>**无证书连接被拒绝：**这是 mTLS 平面上的预期行为——请先完成注册（拓扑 1b）。该消息需要采取相应操作，并非卡住。</li>
+<li><strong>Relay 可访问：</strong> <code>zerorelay healthcheck --addr &lt;host&gt;:8443</code> 退出码为 0。</li>
+<li>**中继指标：**使用 <code>--status-file &lt;path&gt;</code> 运行，然后执行 <code>zerorelay status --file &lt;path&gt;</code>（仅计数，绝不包含有效载荷）。</li>
+<li>**撤销丢失的设备：**在守护进程账本中执行撤销会生成 <code>&lt;data_dir&gt;/tls/revoked</code>；证书会在下一次握手时被拒绝，且无法自行续期。</li>
+<li>**注册时 SAS 不匹配：**客户端拒绝持久化证书并中止。不匹配意味着你收到的 CA 不是守护进程的 CA——在重试前调查可能存在的中间人攻击。</li>
+</ul>
+<p><code>scripts/dev/mtls-relay-testbed.sh</code> 中提供了一个自包含的端到端测试工具，它会启动守护进程和中继、签发证书、通过网络完成注册，并测试全部三种拓扑；请将其作为一个完整示例来阅读。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../zerocode/remote.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../zerocode/environment.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../zerocode/remote.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../zerocode/environment.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

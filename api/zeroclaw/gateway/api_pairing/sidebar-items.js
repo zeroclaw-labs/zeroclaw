@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["initiate_pairing","list_devices","revoke_device","rotate_token","submit_pairing_enhanced","update_my_capabilities"],"struct":["DeviceInfo","DeviceRegistry","PairingStore"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RestartMode","UpgradeStatusState"],"fn":["detect_restart","handle_version_check","handle_version_upgrade","handle_version_upgrade_status"],"struct":["CheckQuery","RestartInfo","UpgradeAcceptedResponse","UpgradeRequest","UpgradeStatusQuery","UpgradeStatusResponse","VersionCheckResponse","VersionErrorResponse"]};

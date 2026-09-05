@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["record_launch","request_respawn","request_shutdown","respawn_if_requested","respawn_requested","shutdown_notify"]};

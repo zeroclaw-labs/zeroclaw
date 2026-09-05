@@ -1,0 +1,1063 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Matrix - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a22b4832.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="matrix"><a class="header" href="#matrix">Matrix</a></h1>
+<p>在 Matrix 房间中运行 ZeroClaw，包括端到端加密（E2EE）房间。</p>
+<h2 id="谁可以与代理通信"><a class="header" href="#谁可以与代理通信">谁可以与代理通信</a></h2>
+<p>入站发送方会根据为绑定代理解析出的<strong>对等集合</strong>进行限制，该集合来自代理所属的 <code>peer_groups</code> 配置。匹配时会去除开头的 <code>@</code>，并对通道的原生发送方标识符执行不区分大小写的比对。<strong>空</strong>集合会拒绝所有人；包含 <code>"*"</code> 的集合会接受所有人；否则仅接受列出的外部对等方（以及对等代理）。这与网关配对（<code>gateway.require_pairing</code>）不同，后者验证的是 HTTP/WebSocket 客户端，而非聊天通道的发送方。</p>
+<p>matrix 的对等组将 <code>channel</code> 设置为 <code>matrix</code>，在 <code>external_peers</code> 中列出允许的发送者（对于 matrix，使用完整的 Matrix 用户 ID，<code>@user:server.tld</code>；<code>["*"]</code> 接受任何人），可选地命名对等 <code>agents</code> 以实现跨代理分发、一个 <code>ignore</code> 屏蔽列表，以及一个 <code>output_modality</code>（<code>mirror</code>、<code>voice</code> 或 <code>text</code>）。字段参考请参见 <a href="peer-groups.html">Peer Groups</a>。</p>
+<p>在何处设置：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板"><a class="header" href="#网关仪表板">网关仪表板</a></h4>
+<p>在 Web 仪表板中打开 <a href="http://127.0.0.1:42617/config/peer_groups"><code>/config/peer_groups</code></a>。</p>
+<h4 id="zerocode"><a class="header" href="#zerocode">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中的 <strong>Peer groups</strong> 下。</p>
+</div>
+
+<p>本指南针对的常见故障模式：</p>
+<blockquote>
+<p>“Matrix 配置正确，检查通过，但机器人未响应。”</p>
+</blockquote>
+<h2 id="快速常见问题解答"><a class="header" href="#快速常见问题解答">快速常见问题解答</a></h2>
+<p>如果 Matrix 显示已连接但没有回复，请先验证以下内容：</p>
+<ol>
+<li>发送方在代理的对等集合中（用于测试：<code>external_peers = ["*"]</code>）。</li>
+<li>机器人账号已加入目标房间。</li>
+<li>凭据归属于机器人账户（在令牌路径上执行 <code>whoami</code> 检查，参见 <a href="#c-token-and-identity">§5C</a>）。</li>
+<li>已加密房间可解密：已设置 <code>recovery_key</code>（推荐）或密钥已共享至机器人设备。</li>
+<li>守护进程已在配置更改后重启。</li>
+</ol>
+<h2 id="1-需求"><a class="header" href="#1-需求">1. 需求</a></h2>
+<p>在测试消息流之前：</p>
+<ol>
+<li>机器人账号已加入目标房间。</li>
+<li>凭据用于对机器人账户进行身份验证：可使用 <code>user_id</code> + <code>password</code>（推荐，参见 <a href="#2-configuration">§2</a>），或使用 <code>access_token</code>（令牌方式，<a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>）。</li>
+<li><code>allowed_rooms</code> 包含目标房间（或留空以允许机器人已加入的所有房间）。条目会与每条传入消息的规范房间 ID（<code>!room:server</code>）进行字面匹配，因此请在此列出规范房间 ID：ZeroClaw <strong>不会</strong>为此允许列表解析 <code>#alias:server</code> 条目。（仅会为出站投递目标解析别名，例如 cron 的 <code>delivery.to</code>。）可在客户端中查找房间的规范 ID（在 Element 中：房间设置 → 高级 → 内部房间 ID）。</li>
+<li>对等组授权发送方（<code>external_peers = ["*"]</code> 用于开放测试，参见 <a href="#b-sender-allowlist-peer-groups">§6</a>）。</li>
+<li>对于 E2EE 房间，机器人可以解密：<code>recovery_key</code>（推荐）会自动恢复密钥，或者手动将密钥共享到机器人设备。</li>
+</ol>
+<h2 id="2-配置"><a class="header" href="#2-配置">2. 配置</a></h2>
+<div class="cfg-fields">
+<details class="cfg-field">
+<summary><code>access_token</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>机器人账户的 Matrix 访问令牌。未设置时，该通道将回退为使用 <code>user_id</code> + <code>password</code> 进行密码登录。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-1"><a class="header" href="#网关仪表板-1">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.access_token</code> 字段。</p>
+<h4 id="zerocode-1"><a class="header" href="#zerocode-1">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.access_token</code> 字段。</p>
+<h4 id="zeroclaw-config"><a class="header" href="#zeroclaw-config">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.access_token    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量"><a class="header" href="#环境变量">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__access_token=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>ack_reactions</code> <span class="cfg-field-meta"><code>bool?</code> · default <code>null</code></span></summary>
+<p>顶层 <code>[channels].ack_reactions</code> 的覆盖项。当为 <code>None</code> 时，回退到全频道范围的默认值。当显式设置（<code>true</code>/<code>false</code>）时，仅对此 Matrix 实例优先生效。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-2"><a class="header" href="#网关仪表板-2">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.ack_reactions</code> 字段。</p>
+<h4 id="zerocode-2"><a class="header" href="#zerocode-2">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.ack_reactions</code> 字段。</p>
+<h4 id="zeroclaw-config-1"><a class="header" href="#zeroclaw-config-1">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.ack_reactions &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-1"><a class="header" href="#环境变量-1">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__ack_reactions=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>allowed_rooms</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>允许的 Matrix 房间 ID。留空 = 允许机器人已加入的所有房间。每个条目会与每条传入消息的规范房间 ID（<code>!abc:server</code>）进行精确匹配；<code>#room:server</code> 别名不会被解析用于此允许列表（它们仅在用于出站投递目标时才会被解析，例如 cron <code>delivery.to</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-3"><a class="header" href="#网关仪表板-3">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.allowed_rooms</code> 字段。</p>
+<h4 id="zerocode-3"><a class="header" href="#zerocode-3">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.allowed_rooms</code> 字段。</p>
+<h4 id="zeroclaw-config-2"><a class="header" href="#zeroclaw-config-2">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.allowed_rooms &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-2"><a class="header" href="#环境变量-2">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__allowed_rooms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>approval_timeout_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>300</code></span></summary>
+<p>对 <code>always_ask</code> 工具等待操作员批准的秒数，超时后自动拒绝。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-4"><a class="header" href="#网关仪表板-4">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.approval_timeout_secs</code> 字段。</p>
+<h4 id="zerocode-4"><a class="header" href="#zerocode-4">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.approval_timeout_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-3"><a class="header" href="#zeroclaw-config-3">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.approval_timeout_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-3"><a class="header" href="#环境变量-3">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__approval_timeout_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>device_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>可选的 Matrix 设备 ID。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-5"><a class="header" href="#网关仪表板-5">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.device_id</code> 字段。</p>
+<h4 id="zerocode-5"><a class="header" href="#zerocode-5">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.device_id</code> 字段。</p>
+<h4 id="zeroclaw-config-4"><a class="header" href="#zeroclaw-config-4">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.device_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-4"><a class="header" href="#环境变量-4">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__device_id=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>draft_update_interval_ms</code> <span class="cfg-field-meta"><code>integer</code> · default <code>1500</code></span></summary>
+<p>Partial 模式下草稿消息编辑之间的最小间隔（毫秒）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-6"><a class="header" href="#网关仪表板-6">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.draft_update_interval_ms</code> 字段。</p>
+<h4 id="zerocode-6"><a class="header" href="#zerocode-6">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.draft_update_interval_ms</code> 字段。</p>
+<h4 id="zeroclaw-config-5"><a class="header" href="#zeroclaw-config-5">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.draft_update_interval_ms &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-5"><a class="header" href="#环境变量-5">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__draft_update_interval_ms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>excluded_tools</code> <span class="cfg-field-meta"><code>string[]</code> · default <code>[]</code></span></summary>
+<p>从此通道的工具规范中排除的工具。设置后，通过此通道响应时不会向模型公开这些工具。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-7"><a class="header" href="#网关仪表板-7">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.excluded_tools</code> 字段。</p>
+<h4 id="zerocode-7"><a class="header" href="#zerocode-7">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.excluded_tools</code> 字段。</p>
+<h4 id="zeroclaw-config-6"><a class="header" href="#zeroclaw-config-6">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.excluded_tools &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-6"><a class="header" href="#环境变量-6">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__excluded_tools=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>homeserver</code>* <span class="cfg-field-meta"><code>string</code> · default <code>—</code></span></summary>
+<p>Matrix 主服务器 URL（例如 <code>"https://matrix.org"</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-8"><a class="header" href="#网关仪表板-8">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.homeserver</code> 字段。</p>
+<h4 id="zerocode-8"><a class="header" href="#zerocode-8">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.homeserver</code> 字段。</p>
+<h4 id="zeroclaw-config-7"><a class="header" href="#zeroclaw-config-7">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.homeserver &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-7"><a class="header" href="#环境变量-7">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__homeserver=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>interrupt_on_new_message</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>在新消息到达时是否中断正在进行的代理响应。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-9"><a class="header" href="#网关仪表板-9">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.interrupt_on_new_message</code> 字段。</p>
+<h4 id="zerocode-9"><a class="header" href="#zerocode-9">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.interrupt_on_new_message</code> 字段。</p>
+<h4 id="zeroclaw-config-8"><a class="header" href="#zeroclaw-config-8">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.interrupt_on_new_message &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-8"><a class="header" href="#环境变量-8">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__interrupt_on_new_message=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>mention_only</code> <span class="cfg-field-meta"><code>bool</code> · default <code>false</code></span></summary>
+<p>为 true 时，在群组中仅响应 @ 提及该机器人的消息。私信始终会被处理。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-10"><a class="header" href="#网关仪表板-10">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.mention_only</code> 字段。</p>
+<h4 id="zerocode-10"><a class="header" href="#zerocode-10">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.mention_only</code> 字段。</p>
+<h4 id="zeroclaw-config-9"><a class="header" href="#zeroclaw-config-9">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.mention_only &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-9"><a class="header" href="#环境变量-9">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__mention_only=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>multi_message_delay_ms</code> <span class="cfg-field-meta"><code>integer</code> · default <code>800</code></span></summary>
+<p>在 MultiMessage 模式下，发送每个段落之间的延迟（毫秒）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-11"><a class="header" href="#网关仪表板-11">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.multi_message_delay_ms</code> 字段。</p>
+<h4 id="zerocode-11"><a class="header" href="#zerocode-11">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.multi_message_delay_ms</code> 字段。</p>
+<h4 id="zeroclaw-config-10"><a class="header" href="#zeroclaw-config-10">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.multi_message_delay_ms &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-10"><a class="header" href="#环境变量-10">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__multi_message_delay_ms=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>password</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>Matrix 账户的可选登录密码（用于初始登录流程）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-12"><a class="header" href="#网关仪表板-12">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.password</code> 字段。</p>
+<h4 id="zerocode-12"><a class="header" href="#zerocode-12">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.password</code> 字段。</p>
+<h4 id="zeroclaw-config-11"><a class="header" href="#zeroclaw-config-11">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.password    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量-11"><a class="header" href="#环境变量-11">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__password=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>recovery_key</code> 🔑 <span class="cfg-field-meta"><code>secret</code> · default <code>null</code></span></summary>
+<p>可选的 Matrix 恢复密钥，用于自动还原 E2EE 密钥备份。设置后，ZeroClaw 会在启动时恢复房间密钥和交叉签名密钥。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-13"><a class="header" href="#网关仪表板-13">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.recovery_key</code> 字段。</p>
+<h4 id="zerocode-13"><a class="header" href="#zerocode-13">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.recovery_key</code> 字段。</p>
+<h4 id="zeroclaw-config-12"><a class="header" href="#zeroclaw-config-12">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.recovery_key    # 掩码输入，加密存储
+</code></pre>
+<h4 id="环境变量-12"><a class="header" href="#环境变量-12">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__recovery_key=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_in_thread</code> <span class="cfg-field-meta"><code>bool</code> · default <code>true</code></span></summary>
+<p>为 true（默认值）时，回复将以话题回复的形式发送。如果尚不存在话题，则从传入消息开始新的话题。为 false 时，仅继续现有话题。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-14"><a class="header" href="#网关仪表板-14">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code> 字段。</p>
+<h4 id="zerocode-14"><a class="header" href="#zerocode-14">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code> 字段。</p>
+<h4 id="zeroclaw-config-13"><a class="header" href="#zeroclaw-config-13">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_in_thread &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-13"><a class="header" href="#环境变量-13">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__reply_in_thread=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_min_interval_secs</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>每个（通道，接收方）出站节流下限（秒）。范围：<code>0..=REPLY_MIN_INTERVAL_MAX_SECS</code>（0 表示禁用）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-15"><a class="header" href="#网关仪表板-15">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.reply_min_interval_secs</code> 字段。</p>
+<h4 id="zerocode-15"><a class="header" href="#zerocode-15">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.reply_min_interval_secs</code> 字段。</p>
+<h4 id="zeroclaw-config-14"><a class="header" href="#zeroclaw-config-14">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_min_interval_secs &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-14"><a class="header" href="#环境变量-14">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__reply_min_interval_secs=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>reply_queue_depth_max</code> <span class="cfg-field-meta"><code>integer</code> · default <code>0</code></span></summary>
+<p>每个（channel, recipient）出站节流队列的深度。取值范围：<code>0..=REPLY_QUEUE_DEPTH_CEILING</code>。当 <code>reply_min_interval_secs &gt; 0</code> 且此值为 <code>0</code> 时，节流封装器会使用 <code>DEFAULT_REPLY_QUEUE_DEPTH</code>（16）作为替代值。当队列已满时，最新的发送会被丢弃，并记录一条 <code>WARN</code> 日志。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-16"><a class="header" href="#网关仪表板-16">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.reply_queue_depth_max</code> 字段。</p>
+<h4 id="zerocode-16"><a class="header" href="#zerocode-16">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.reply_queue_depth_max</code> 字段。</p>
+<h4 id="zeroclaw-config-15"><a class="header" href="#zeroclaw-config-15">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_queue_depth_max &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-15"><a class="header" href="#环境变量-15">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__reply_queue_depth_max=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>stream_mode</code> <span class="cfg-field-meta"><code>StreamMode</code> · default <code>"off"</code></span></summary>
+<p>渐进式响应传送的流式模式。<code>"off"</code>（默认）：单条消息。<code>"partial"</code>：原位编辑草稿。<code>"multi_message"</code>：按段落拆分传送。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-17"><a class="header" href="#网关仪表板-17">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.stream_mode</code> 字段。</p>
+<h4 id="zerocode-17"><a class="header" href="#zerocode-17">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.stream_mode</code> 字段。</p>
+<h4 id="zeroclaw-config-16"><a class="header" href="#zeroclaw-config-16">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.stream_mode &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-16"><a class="header" href="#环境变量-16">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__stream_mode=
+</code></pre>
+</div>
+
+</details>
+<details class="cfg-field">
+<summary><code>user_id</code> <span class="cfg-field-meta"><code>string?</code> · default <code>null</code></span></summary>
+<p>可选的 Matrix 用户 ID（例如 <code>"@bot:matrix.org"</code>）。</p>
+<p><strong>将它放置在任何表面上：</strong></p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-18"><a class="header" href="#网关仪表板-18">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.user_id</code> 字段。</p>
+<h4 id="zerocode-18"><a class="header" href="#zerocode-18">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.user_id</code> 字段。</p>
+<h4 id="zeroclaw-config-17"><a class="header" href="#zeroclaw-config-17">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.user_id &lt;value&gt;
+</code></pre>
+<h4 id="环境变量-17"><a class="header" href="#环境变量-17">环境变量</a></h4>
+<p>导出此覆盖配置（POSIX shell；可放入 <code>~/.bashrc</code>、<code>~/.zshrc</code>、<code>.env</code> 或 Dockerfile 中）。将 <code>&lt;alias&gt;</code> 替换为实际的别名：</p>
+<pre><code class="language-sh">export ZEROCLAW_channels__matrix__&lt;alias&gt;__user_id=
+</code></pre>
+</div>
+
+</details>
+</div>
+
+<p>Matrix 配置为 <code>[channels.matrix.&lt;alias&gt;]</code> 块。可通过以下任一方式进行设置：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-19"><a class="header" href="#网关仪表板-19">网关仪表板</a></h4>
+<p>在 Web 仪表板中打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a>。</p>
+<h4 id="zerocode-19"><a class="header" href="#zerocode-19">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，<strong>Channels</strong> 下。</p>
+</div>
+
+<h3 id="推荐设置密码--恢复密钥"><a class="header" href="#推荐设置密码--恢复密钥">推荐设置：密码 + 恢复密钥</a></h3>
+<p>运行 Matrix 的官方、最省事方式是让 ZeroClaw 重新登录并管理其自己的设备身份：</p>
+<ul>
+<li><strong>省略 <code>device_id</code>。</strong> 在登录时让 homeserver 分配一个。ZeroClaw 会将分配到的 id 保存到 <code>session.json</code>，并在每次重启时重用它，因此你无需查找、复制或同步任何值。手动固定 <code>device_id</code> 是导致密钥共享失败的最常见原因。</li>
+<li><strong>省略 <code>access_token</code>。</strong> 当其未设置时，ZeroClaw 会回退到密码登录。自动恢复流程（<a href="#8-auto-recovery-from-corrupted-local-state">§8</a>）同样使用全新登录，因此机器人无需操作员介入即可从损坏的本地状态中自我修复。</li>
+<li><strong>设置 <code>password</code>。</strong> 在没有 <code>access_token</code> 的情况下，使用 <code>user_id</code> + <code>password</code> 进行登录。</li>
+<li><strong>设置 <code>recovery_key</code>。</strong> 这会从服务器端备份恢复房间密钥，并在每次启动时自动对新注册的设备进行交叉签名：无需 emoji 验证，无需手动共享密钥，无需引导。请参阅 <a href="#i-recovery-key-recommended-for-e2ee">§5I</a> 了解如何从 Element 获取它。</li>
+</ul>
+<p>因此，一个完整的推荐配置块会设置 <code>homeserver</code>、<code>user_id</code>、<code>password</code> 和 <code>recovery_key</code>，而不设置 <code>access_token</code> 和 <code>device_id</code>。</p>
+<p><code>access_token</code> + <code>device_id</code> 路径（<a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>）仍然可用，并为必须复用已有令牌的运维人员提供了完整文档，但它要求你自行维护一个稳定的 <code>device_id</code>，因此除非有特殊原因，否则建议优先使用密码 + 恢复密钥。</p>
+<blockquote>
+<p><strong><code>channels.matrix.&lt;alias&gt;.password</code> 是机密信息。</strong> 以加密形式存储，绝不以明文保存在 <code>config.toml</code> 中。请通过以下方式之一进行设置，这些方式会在写入时加密：</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-20"><a class="header" href="#网关仪表板-20">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a>，并在其中设置 <code>channels.matrix.&lt;alias&gt;.password</code> 字段。</p>
+<h4 id="zerocode-20"><a class="header" href="#zerocode-20">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.password</code> 字段（输入内容会被掩码处理）。</p>
+<h4 id="zeroclaw-config-18"><a class="header" href="#zeroclaw-config-18">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.password    # 提示输入掩码内容，以加密形式存储
+</code></pre>
+</div>
+
+<blockquote>
+<p>**<code>channels.matrix.&lt;alias&gt;.access_token</code> 是机密信息。**以加密方式存储，绝不以明文形式保存在 <code>config.toml</code> 中。请通过以下任一方式进行设置，这些方式会在写入时加密：</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-21"><a class="header" href="#网关仪表板-21">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并在其中设置 <code>channels.matrix.&lt;alias&gt;.access_token</code> 字段。</p>
+<h4 id="zerocode-21"><a class="header" href="#zerocode-21">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.access_token</code> 字段（输入内容已掩码）。</p>
+<h4 id="zeroclaw-config-19"><a class="header" href="#zeroclaw-config-19">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.access_token    # 提示输入掩码内容，以加密形式存储
+</code></pre>
+</div>
+
+<p><code>homeserver</code> 为必填项。对于推荐的设置，还需设置 <code>user_id</code>、<code>password</code> 和 <code>recovery_key</code>。<code>access_token</code> 和 <code>device_id</code> 仅在 <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> 中基于令牌的路径中需要；<code>allowed_rooms</code> 可选地限制 bot 在哪些房间中响应。通过<a href="#who-can-talk-to-the-agent">对等组</a>授权发送者。完整字段索引：<a href="../reference/config.html#channels">配置参考</a>。</p>
+<blockquote>
+<p><strong>还没有 <code>recovery_key</code>？</strong> 请参阅 <a href="#i-recovery-key-recommended-for-e2ee">§5I</a>：其中详细说明了如何在 Element 中生成一个。想改用令牌方式？请参阅 <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>，了解通过密码登录 API 调用一次性生成 <code>access_token</code> 和稳定 <code>device_id</code> 的方法。要查找你已有令牌对应的 <code>device_id</code>，请参阅 <a href="#h-finding-device_id-for-an-existing-token">§5H</a>。</p>
+</blockquote>
+<h3 id="关于-user_id-和-device_id"><a class="header" href="#关于-user_id-和-device_id">关于 <code>user_id</code> 和 <code>device_id</code></a></h3>
+<ul>
+<li>对于推荐的密码 + 恢复密钥设置，请设置 <code>user_id</code> 并将 <code>device_id</code> 留空：homeserver 会分配该值，ZeroClaw 会将其持久化保存。</li>
+<li>ZeroClaw 从 Matrix <code>/_matrix/client/v3/account/whoami</code> 读取身份信息。</li>
+<li>只有在使用 <code>access_token</code> 登录时，才需要手动设置 <code>device_id</code>：令牌登录所携带的设备是服务器已经创建的，而 ZeroClaw 需要这个确切的 id 来恢复 E2EE 会话（参见 <a href="#h-finding-device_id-for-an-existing-token">§5H</a> 了解如何查找它）。</li>
+</ul>
+<h3 id="线程与上下文"><a class="header" href="#线程与上下文">线程与上下文</a></h3>
+<p>当 Matrix 会话发生在某个话题（thread）中时，该话题就是其独立的会话。ZeroClaw 会为每个话题派生一个独立的会话密钥，因此每个话题都拥有独立的上下文窗口和历史记录：某个话题中的消息绝不会渗入另一个话题，并且代理也无法看到同级话题中较早的对话轮次。对于 Matrix，这一行为由 <code>reply_in_thread</code> 控制：当其开启时，顶层消息会开启一个话题，且每个话题都是一个独立的会话；当其关闭时，回复将发布在频道根级别，并且历史记录将改为按发送者和目标来索引，而非按话题。</p>
+<ul>
+<li><strong>隔离正是关键所在。</strong> 每个线程的上下文都是自包含的：它不会泄漏到线程之外，线程之外的任何内容也不会泄漏进来。并行线程持有各自独立的对话状态，因此互不相关的任务永远不会相互干扰。</li>
+<li><strong>长线程会增大上下文。</strong> 线程在保持活动状态期间会累积历史记录，因此与其他长对话一样，过长的线程最终会填满模型的上下文窗口。开始新线程即可重置。</li>
+<li><strong>进行中的工作以线程为单位进行隔离。</strong> 在某个线程中发送新消息不会取消另一个线程中进行中的响应；每个线程的任务都是独立的。</li>
+</ul>
+<p>为任意 surface 设置线程行为：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-22"><a class="header" href="#网关仪表板-22">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并切换 <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code> 字段。</p>
+<h4 id="zerocode-22"><a class="header" href="#zerocode-22">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.reply_in_thread</code> 字段。</p>
+<h4 id="zeroclaw-config-20"><a class="header" href="#zeroclaw-config-20">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.reply_in_thread true     线程回复开启
+zeroclaw config set channels.matrix.&lt;alias&gt;.reply_in_thread false    # 频道根目录的回复
+</code></pre>
+</div>
+
+<h2 id="3-令牌路径备选方案获取-access_token-和-device_id"><a class="header" href="#3-令牌路径备选方案获取-access_token-和-device_id">3. 令牌路径（备选方案）：获取 <code>access_token</code> 和 <code>device_id</code></a></h2>
+<blockquote>
+<p>[!IMPORTANT] 本节仅适用于 <code>access_token</code> 路径。如果你按照 <a href="#2-configuration">§2</a> 中推荐的密码 + 恢复密钥设置进行操作，则可以跳过本节：你不需要访问令牌或手动管理的 <code>device_id</code>。</p>
+</blockquote>
+<p>当你必须复用已有令牌（例如从另一部署中复制的令牌）时，请使用此路径。Element 不会直接公开令牌，因此生成令牌的规范方式是进行一次性的密码登录 API 调用，该调用会同时返回访问令牌和稳定的设备 ID。令牌登录会携带设备，因此在此路径下 <code>device_id</code> 是必需的，并且必须保持稳定。</p>
+<p>如果你的操作员账户已经拥有令牌，请跳至<a href="#4-quick-validation">§4</a>。如果你只需要查找现有令牌的 <code>device_id</code>，请参阅<a href="#h-finding-device_id-for-an-existing-token">§5H</a> 选项 1（<code>whoami</code>）或选项 2（Element）。</p>
+<h3 id="步骤-1通过密码登录获取令牌"><a class="header" href="#步骤-1通过密码登录获取令牌">步骤 1：通过密码登录获取令牌</a></h3>
+<p>运行一次此操作。替换 <code>your.homeserver</code>、机器人用户名、密码，并选择任意短字符串作为 <code>device_id</code>（字母数字，不含空格；这是 ZeroClaw 在每次重启时都会复用的_服务器端_设备标签）：</p>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh">curl -sS -X POST https://your.homeserver/_matrix/client/v3/login \
+  -H "Content-Type: application/json" \
+  -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"YOUR_BOT_USERNAME"},"password":"YOUR_PASSWORD","device_id":"NEW_DEVICE_ID"}'
+</code></pre>
+</div>
+
+<p>响应：</p>
+<pre><code class="language-json">{"user_id": "@bot:example.com", "access_token": "syt_...", "device_id": "NEWDEVICE"}
+</code></pre>
+<h3 id="步骤-2将两个值都应用到-zeroclaw"><a class="header" href="#步骤-2将两个值都应用到-zeroclaw">步骤 2：将两个值都应用到 ZeroClaw</a></h3>
+<p>将响应中的 <code>access_token</code>、<code>device_id</code> 和 <code>user_id</code> 填入你的 <code>[channels.matrix.&lt;alias&gt;]</code> 配置块（参见 <a href="#2-configuration">§2</a> 了解设置位置），然后重启：<code>zeroclaw service restart</code>。</p>
+<h3 id="备注"><a class="header" href="#备注">备注</a></h3>
+<ul>
+<li>首次粘贴时<strong>请保留令牌的副本</strong>。机密信息在静态存储时会被加密，<code>zeroclaw config get</code> 在令牌字段会显示 <code>[masked]</code>；你之后将无法再获取它。如果你在 <a href="#c-token-and-identity">§5C</a> 中需要用它来执行 curl 验证代码片段，请将其暂存到草稿笔记中。</li>
+<li><strong>每次重启时复用相同的 <code>device_id</code></strong>：更改它会强制进行新的服务器端设备注册，从而破坏加密房间中的密钥共享和验证。<a href="#8-auto-recovery-from-corrupted-local-state">§8</a> 中的自动恢复路径可处理那些清除确实是正确做法的罕见情况。</li>
+<li><strong>稍后轮换访问令牌</strong>而无需重新运行向导：更新配置中的 <code>access_token</code> 字段（参见 <a href="#2-configuration">§2</a>），然后执行 <code>zeroclaw service restart</code>。</li>
+<li><strong>Token 显示为已过期或无效</strong>：启动时，使用相同的 curl 生成一个新的，重复步骤 2。</li>
+</ul>
+<h2 id="4-快速验证"><a class="header" href="#4-快速验证">4. 快速验证</a></h2>
+<p>如果尚未应用，请先应用 <a href="#2-configuration">§2</a> 中设置的字段集，然后使用 <code>zeroclaw service restart</code>（后台）或 <code>zeroclaw daemon</code>（前台）重新启动。在已配置的 Matrix 房间中发送一条纯文本消息。确认：</p>
+<ul>
+<li>ZeroClaw 日志显示，Matrix 监听器启动时没有重复的同步/认证错误。</li>
+<li>在加密房间中，机器人可以读取并回复来自允许用户的加密消息。</li>
+</ul>
+<h2 id="5-排查无响应问题"><a class="header" href="#5-排查无响应问题">5. 排查“无响应“问题</a></h2>
+<p>按顺序处理。</p>
+<h3 id="a-房间与成员"><a class="header" href="#a-房间与成员">A. 房间与成员</a></h3>
+<ul>
+<li>确认机器人账号已加入房间。</li>
+<li>如果你要将某个房间放入 <code>allowed_rooms</code>，必须使用<strong>规范的</strong>房间 ID（<code>!room:server</code>），而不是 <code>#alias:server</code>。别名不会被解析用于允许列表，因此别名条目会静默地匹配不到任何内容。可在 Element 中通过房间设置 → 高级 → 内部房间 ID 找到规范 ID。</li>
+</ul>
+<h3 id="b-发送方允许列表对等组"><a class="header" href="#b-发送方允许列表对等组">B. 发送方允许列表（对等组）</a></h3>
+<p>发送方必须在 agent 的 peer 集合中，参见本页顶部的<a href="#who-can-talk-to-the-agent">谁可以与 agent 通信</a>。为便于诊断，可临时设置 <code>external_peers = ["*"]</code> 并重启守护进程。</p>
+<h3 id="c-令牌和身份"><a class="header" href="#c-令牌和身份">C. 令牌和身份</a></h3>
+<p>密钥在静态存储时已加密且不可检索：对于任何密钥字段，<code>zeroclaw config get</code> 都会打印 <code>[masked]</code>。要运行下面的检查，请使用你在 <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> 中生成的访问令牌（或重新生成一个）以及你自己的 homeserver URL。</p>
+<p>在服务端验证令牌：</p>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh">curl -sS -H Authorization: Bearer &lt;access_token&gt; \
+  "https://your.homeserver/_matrix/client/v3/account/whoami"
+</code></pre>
+</div>
+
+<ul>
+<li>返回的 <code>user_id</code> 必须与机器人账号匹配。</li>
+<li>如果响应中缺少 <code>device_id</code>，请手动设置（参见 <a href="#h-finding-device_id-for-an-existing-token">§5H</a>）。</li>
+<li>轮换访问令牌：更新配置中的 <code>access_token</code> 字段（参见 <a href="#2-configuration">§2</a>），然后执行 <code>zeroclaw service restart</code>。</li>
+</ul>
+<h3 id="d-e2ee-特定检查"><a class="header" href="#d-e2ee-特定检查">D. E2EE 特定检查</a></h3>
+<ul>
+<li>机器人设备必须已从受信任的设备接收房间密钥。</li>
+<li>如果尚未向此设备共享密钥，则无法解密加密事件。</li>
+<li>从受信任的 Matrix 会话验证设备信任关系和密钥共享。</li>
+<li><code>matrix_sdk_crypto::backups: Trying to backup room keys but no backup key was found</code>：此设备尚未启用密钥备份恢复功能。这对消息流不会造成致命影响；但仍建议完成设置（参见 <a href="#i-recovery-key-recommended-for-e2ee">§5I</a>）。</li>
+<li>如果收件人看到机器人消息显示为“未验证”，请从受信任的 Matrix 会话验证/签名机器人设备，并在重启过程中保持 <code>device_id</code> 稳定不变。</li>
+</ul>
+<h3 id="e-日志级别"><a class="header" href="#e-日志级别">E. 日志级别</a></h3>
+<p>ZeroClaw 默认将 <code>matrix_sdk</code>、<code>matrix_sdk_base</code> 和 <code>matrix_sdk_crypto</code> 抑制为 <code>warn</code> 级别；它们在 <code>info</code> 级别下会产生大量日志。如需恢复 SDK 输出以进行调试：</p>
+<div class="os-tabs-src">
+<h4 id="sh-2"><a class="header" href="#sh-2">sh</a></h4>
+<pre><code class="language-sh">RUST_LOG=info,matrix_sdk=info,matrix_sdk_base=info,matrix_sdk_crypto=info zeroclaw daemon
+</code></pre>
+</div>
+
+<h3 id="f-消息格式markdown"><a class="header" href="#f-消息格式markdown">F. 消息格式（Markdown）</a></h3>
+<ul>
+<li>ZeroClaw 将 Matrix 回复作为支持 Markdown 的 <code>m.room.message</code> 文本内容发送。</li>
+<li>支持 <code>formatted_body</code> 的 Matrix 客户端会渲染强调、列表和代码块。</li>
+<li>如果格式显示为纯文本：首先检查客户端功能，然后确认 ZeroClaw 正在运行支持 Markdown 输出的 Matrix 构建版本。</li>
+</ul>
+<h3 id="g-全新启动测试"><a class="header" href="#g-全新启动测试">G. 全新启动测试</a></h3>
+<p>配置更改后，请重启守护进程并发送新消息。旧的时间线历史将不会重新播放。</p>
+<h3 id="h-查找现有令牌的-device_id"><a class="header" href="#h-查找现有令牌的-device_id">H. 查找现有令牌的 <code>device_id</code></a></h3>
+<p>只有在使用 <code>access_token</code> 方式时才需要这一步（<a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>）。推荐的密码 + 恢复密钥配置完全省略了 <code>device_id</code>：由家庭服务器分配一个，并由 ZeroClaw 持久化保存，因此无需查找。如果你已切换到推荐的配置，请跳过本节。</p>
+<p>如果你确实需要固定一个 <code>device_id</code>（因为你正在复用现有的访问令牌，而非通过密码登录），可以用它来查找绑定到该令牌的 <code>device_id</code>。对于走令牌路径的全新机器人，请参阅 <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a>：那里的密码登录流程会同时返回这两个值。</p>
+<p>ZeroClaw 在令牌路径上进行 E2EE 会话恢复时需要一个稳定的 <code>device_id</code>。如果缺少它，每次重启都会注册一个新设备，从而破坏密钥共享和设备验证。</p>
+<h4 id="选项-1whoami最简单"><a class="header" href="#选项-1whoami最简单">选项 1：<code>whoami</code>（最简单）</a></h4>
+<div class="os-tabs-src">
+<h4 id="sh-3"><a class="header" href="#sh-3">sh</a></h4>
+<pre><code class="language-sh">curl -sS -H Authorization: Bearer &lt;access_token&gt; \
+  "https://your.homeserver/_matrix/client/v3/account/whoami"
+</code></pre>
+</div>
+
+<p>如果令牌绑定到设备会话，响应中将包含 <code>device_id</code>：</p>
+<pre><code class="language-json">{"user_id": "@bot:example.com", "device_id": "ABCDEF1234"}
+</code></pre>
+<p>如果缺少 <code>device_id</code>，则该令牌是在没有设备登录的情况下创建的（例如通过 admin API 创建）。请通过 <a href="#3-token-path-alternative-obtaining-access_token-and-device_id">§3</a> 同时铸造新的令牌和 device_id。</p>
+<h4 id="选项-2从-element-或其他-matrix-客户端"><a class="header" href="#选项-2从-element-或其他-matrix-客户端">选项 2：从 Element 或其他 Matrix 客户端</a></h4>
+<ol>
+<li>以机器人账户身份登录 Element。</li>
+<li>设置 → 会话。</li>
+<li>复制当前会话的设备 ID。</li>
+<li>在配置中设置 <code>device_id</code>（参见 <a href="#2-configuration">§2</a>），然后执行 <code>zeroclaw service restart</code>。请保持 <code>device_id</code> 稳定：更改它会强制进行新的设备注册，从而破坏现有的密钥共享和验证。</li>
+</ol>
+<h3 id="h续加密存储删除恢复"><a class="header" href="#h续加密存储删除恢复">H（续）。加密存储删除恢复</a></h3>
+<p><strong>症状：</strong> 检测到 Matrix 一次性密钥上传冲突；停止同步以避免无限重试循环，通道变得不可用。</p>
+<p><strong>原因：</strong> 本地加密存储已被删除，而旧设备仍在主服务器上注册了一次性密钥。由于旧密钥仍存在于服务器端，SDK 无法上传新密钥，导致无限的一次性密钥（OTK）冲突循环。</p>
+<h4 id="修复重新登录"><a class="header" href="#修复重新登录">修复：重新登录</a></h4>
+<p>全新登录会创建一个带有新 <code>device_id</code> 的新设备，从而完全绕过 OTK 冲突（无需通过 UIA 进行设备删除）。</p>
+<ol>
+<li>
+<p>停止 ZeroClaw。</p>
+<div class="os-tabs-src">
+<h4 id="sh-4"><a class="header" href="#sh-4">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service stop
+</code></pre>
+</div>
+
+</li>
+<li>
+<p>获取一个新的访问令牌和 <code>device_id</code>：</p>
+<div class="os-tabs-src">
+<h4 id="sh-5"><a class="header" href="#sh-5">sh</a></h4>
+<pre><code class="language-sh">curl -sS -X POST "https://matrix.org/_matrix/client/v3/login" \
+  -H "Content-Type: application/json" \
+  -d {"type":"m.login.password","identifier":{"type":"m.id.user","user":"YOUR_BOT_USERNAME"},"password":"YOUR_PASSWORD","device_id":"NEW_DEVICE_ID"}
+</code></pre>
+</div>
+
+<p>保存返回的 <code>access_token</code> 和 <code>device_id</code>。</p>
+</li>
+<li>
+<p>删除本地加密存储：</p>
+<div class="os-tabs-src">
+<h4 id="sh-6"><a class="header" href="#sh-6">sh</a></h4>
+<pre><code class="language-sh">rm -rf ~/.zeroclaw/state/matrix/
+</code></pre>
+</div>
+
+</li>
+<li>
+<p>应用新凭据：在配置中设置 <code>access_token</code>（密钥，参见 <a href="#2-configuration">§2</a>）和 <code>device_id</code>。</p>
+</li>
+<li>
+<p>重启：</p>
+<div class="os-tabs-src">
+<h4 id="sh-7"><a class="header" href="#sh-7">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service start
+</code></pre>
+</div>
+
+</li>
+</ol>
+<h4 id="首次重启时会出现的情况"><a class="header" href="#首次重启时会出现的情况">首次重启时会出现的情况</a></h4>
+<ul>
+<li><code>Our own device might have been deleted</code>：无害；旧设备已不存在。</li>
+<li><code>Failed to decrypt a room event</code>：来自重置之前的旧消息；无法恢复。</li>
+<li><code>Matrix E2EE recovery successful</code>：已从服务器备份恢复房间密钥（仅当设置了 <code>recovery_key</code> 时；参见 <a href="#i-recovery-key-recommended-for-e2ee">§5I</a>）。</li>
+<li>新消息解密并正常工作。</li>
+</ul>
+<p><strong>预防措施：</strong> 在计划重新登录之前，不要删除本地状态目录。如果需要从头开始，请先获取新的凭据，然后删除存储，再更新配置。</p>
+<h3 id="i-恢复密钥推荐用于端到端加密"><a class="header" href="#i-恢复密钥推荐用于端到端加密">I. 恢复密钥（推荐用于端到端加密）</a></h3>
+<p>恢复密钥让 ZeroClaw 能够自动从服务器端备份中恢复房间密钥和交叉签名密钥。设备重置、加密存储删除以及全新安装都会自动恢复：无需 emoji 验证，也无需手动共享密钥。</p>
+<h4 id="第-1-步从-element-获取你的恢复密钥"><a class="header" href="#第-1-步从-element-获取你的恢复密钥">第 1 步：从 Element 获取你的恢复密钥</a></h4>
+<ol>
+<li>在 Element（网页版或桌面版）中登录机器人账号。</li>
+<li>设置 → 安全与隐私 → 加密 → 安全备份</li>
+<li>如果已设置备份，则在首次启用备份时会显示您的恢复密钥。如果已保存该密钥，请使用它。</li>
+<li>如果尚未设置备份，请点击 “Set up Secure Backup” → “Generate a Security Key”。Element 会显示该密钥（形如 <code>EsTj 3yST y93F SLpB ...</code>）；请将其复制到安全的地方保存。</li>
+<li>越过密钥显示界面继续：Element 接着会要求你在确认框中<strong>重新输入密钥</strong>，以证明你已保存它。粘贴密钥并继续以完成设置。这与你填入 <code>recovery_key</code> 的值相同。</li>
+<li>（可选）密钥保存后，可退出该机器人的 Element 会话：点击账户菜单 → <strong>所有设置</strong> → Account，然后点击 <strong>Remove this device</strong>。保持登录状态也没问题，移除设备只是为了让设备列表更整洁。</li>
+</ol>
+<h4 id="步骤-2将恢复密钥添加到-zeroclaw"><a class="header" href="#步骤-2将恢复密钥添加到-zeroclaw">步骤 2：将恢复密钥添加到 ZeroClaw</a></h4>
+<p>将恢复密钥应用到 ZeroClaw：</p>
+<blockquote>
+<p><strong><code>channels.matrix.&lt;alias&gt;.recovery_key</code> 是一项机密信息。</strong> 它以加密形式存储，绝不会以明文保存在 <code>config.toml</code> 中。请通过以下方式之一进行设置，这些方式会在写入时进行加密：</p>
+</blockquote>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-23"><a class="header" href="#网关仪表板-23">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a>，并在其中设置 <code>channels.matrix.&lt;alias&gt;.recovery_key</code> 字段。</p>
+<h4 id="zerocode-23"><a class="header" href="#zerocode-23">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.recovery_key</code> 字段（输入内容会被遮蔽）。</p>
+<h4 id="zeroclaw-config-21"><a class="header" href="#zeroclaw-config-21">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.recovery_key    # 提示输入掩码内容，以加密形式存储
+</code></pre>
+</div>
+
+<p>然后运行 <code>zeroclaw service restart</code>。恢复密钥会立即在静态状态下加密。</p>
+<h4 id="第-3-步重启"><a class="header" href="#第-3-步重启">第 3 步：重启</a></h4>
+<div class="os-tabs-src">
+<h4 id="sh-8"><a class="header" href="#sh-8">sh</a></h4>
+<pre><code class="language-sh">zeroclaw service restart
+</code></pre>
+</div>
+
+<p>启动时你应该看到：</p>
+<pre><code>Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup.
+</code></pre>
+<p>从现在开始，即使本地加密存储被删除，ZeroClaw 也会在下次启动时自动恢复。</p>
+<h2 id="6-调试日志"><a class="header" href="#6-调试日志">6. 调试日志</a></h2>
+<p>Matrix 通道特定的诊断：</p>
+<div class="os-tabs-src">
+<h4 id="sh-9"><a class="header" href="#sh-9">sh</a></h4>
+<pre><code class="language-sh">RUST_LOG=zeroclaw::channels::matrix=debug zeroclaw daemon
+</code></pre>
+</div>
+
+<p>表面：</p>
+<ul>
+<li>会话恢复确认</li>
+<li>每个同步周期完成</li>
+<li>OTK 冲突标志状态</li>
+<li>健康检查结果</li>
+<li>瞬态与致命同步错误分类</li>
+</ul>
+<p>对于 SDK 级别的详细信息：</p>
+<div class="os-tabs-src">
+<h4 id="sh-10"><a class="header" href="#sh-10">sh</a></h4>
+<pre><code class="language-sh">RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemon
+</code></pre>
+</div>
+
+<h2 id="7-运维说明"><a class="header" href="#7-运维说明">7. 运维说明</a></h2>
+<ul>
+<li>将 Matrix 令牌从日志和屏幕截图中排除。</li>
+<li>先使用宽松的 <code>external_peers = ["*"]</code>，验证后再收紧为明确的用户 ID。</li>
+<li>在 <code>allowed_rooms</code> 中始终使用规范的房间 ID：入站允许列表不解析别名（仅在出站 <code>delivery.to</code> 中解析别名）。</li>
+<li><strong>线程：</strong> 当 <code>channels.matrix.reply_in_thread</code> 为 <code>true</code>（默认值）时，每条机器人回复都会位于以用户消息为根的线程中。顶层用户消息会开启一个新线程；已有的线程则会继续。主房间时间线仅承载用户发起的消息。</li>
+<li><strong>线程根上下文：</strong> ZeroClaw 在任意线程中看到的第一条入站消息会以 <code>[Thread root from @sender]: &lt;root body&gt;</code> 作为前缀，以便智能体获得触发该回复的对话内容。由机器人自身发起的线程会跳过此前导内容。跟踪仅在内存中进行；守护进程重启后，每个活跃线程中的下一条消息会重新注入该前导内容，且仅注入一次。</li>
+<li><strong>内联回复媒体：</strong> <code>channels.matrix.mention_only = true</code> 会让 bot 忽略纯媒体上传（没有可供提及的文本正文）。当用户对这样一个被丢弃的事件进行内联回复并提出问题时（<code>@bot can you see this?</code>），ZeroClaw 会遍历该回复的 <code>m.relates_to.m.in_reply_to.event_id</code>，获取父事件，并将其媒体拉取到当前消息中：尽管原始上传已被过滤掉，agent 的视觉处理管线仍能看到该图像。</li>
+<li><strong>附件随文本一起进入线程：</strong> 当存在线程锚点时，<code>room.send_attachment</code> 调用会携带带有 <code>EnforceThread::Threaded</code> 的 <code>AttachmentConfig::reply(...)</code>，因此 PDF / 图片 / 语音留言会落入机器人的线程内，而非主时间线。</li>
+<li><strong>出站媒体标记：</strong> 智能体会在其回复文本中输出 <code>[image:url|path]</code>、<code>[file:url|path]</code>、<code>[voice:url|path]</code>、<code>[video:...]</code>、<code>[audio:...]</code>（以及大写形式 / <code>[document:...]</code> 别名）；ZeroClaw 获取相应字节（<code>http(s)://</code> 使用 HTTP 获取，否则进行本地读取）并将其作为相应的 Matrix 消息事件上传。<strong>目标缺失或不可读不会导致致命错误：</strong> 通道会记录一条警告，仅丢弃该标记，并追加一行 <code>(note: I couldn't deliver the file at &lt;path&gt;.)</code>，以便操作员看到所尝试的操作，而不是回复被无声丢弃。</li>
+<li><strong>语音消息</strong>（MSC3245）：携带 <code>org.matrix.msc3245.voice</code> 字段的入站 <code>m.audio</code> 事件会被保存到 <code>{workspace_dir}/matrix_files/</code>，并通过该代理配置的转录服务商进行处理，以便代理同时获得转录文本和源文件路径。出站语音便笺使用 <code>[voice:&lt;url|path&gt;]</code> 标记；ZeroClaw 会将其作为带有语音标志和零波形设置的 <code>m.audio</code> 上传，使 Element 将该气泡渲染为语音便笺。有关转录服务商的设置，请参阅 <a href="../providers/overview.html">Model Providers</a>。</li>
+<li><strong>确认反应：</strong> 由 <code>channels.matrix.ack_reactions</code> 控制（默认为 <code>true</code>）。开启时，机器人在处理过程中会以 👀 作出反应，完成时则以 ✅ 作出反应。设为 <code>false</code> 可让房间保持无反应。</li>
+<li><strong>持久会话：</strong> 首次成功登录时，ZeroClaw 会写入 <code>~/.zeroclaw/state/matrix/session.json</code>（user_id + device_id + access_token + 可选的 refresh_token）。后续重启会从该数据块调用 <code>restore_session()</code>：无需重新登录。matrix-rust-sdk 的 SQLite 加密存储与之并列存放于 <code>~/.zeroclaw/state/matrix/store/</code>。<strong>一旦 <code>session.json</code> 存在，在配置中轮换 <code>access_token</code> 将不起作用，直到该文件被删除</strong>：已保存的令牌优先生效。删除 <code>session.json</code> 可强制根据配置值重新登录。</li>
+<li><strong>交叉签名：</strong> 当 <code>recovery_key</code> 与你账户服务器端密钥存储中封存的密钥匹配时，ZeroClaw 会在每次启动时运行 <code>recovery().recover(key)</code>，SDK 会导入你现有的 master / self-signing / user-signing 密钥，并自动为新注册的设备签名。<strong>无需引导，无需 UIA，无需密钥轮换。</strong> 如果你的账户尚未设置交叉签名，请先在 Element 中生成恢复密钥（Settings → Security &amp; Privacy → Secure Backup），然后再配置 <code>recovery_key</code>。</li>
+<li><strong>Cron 投递：</strong> <code>delivery.to</code> 应当是一个纯房间 id（<code>!abc:server</code>）或别名（<code>#room:server</code>）。对于旧版配置中写作 <code>&lt;sender&gt;||&lt;room&gt;</code> 的情况也予以兼容：ZeroClaw 会提取最后一个以 <code>!</code>/<code>#</code> 开头的片段，并就该格式错误的值发出警告。</li>
+</ul>
+<h3 id="流式传输"><a class="header" href="#流式传输">流式传输</a></h3>
+<p>Matrix 通过 <code>stream_mode</code> 设置来流式传输回复：</p>
+<ul>
+<li><strong><code>off</code></strong>（默认）：整条回复在 agent 完成后作为一条消息发送。最简单，且永远不会显示写到一半的答案。</li>
+<li><strong><code>partial</code></strong>：机器人会立即发布一条草稿，并在答案以流式方式生成时就地编辑该草稿。<code>draft_update_interval_ms</code> 用于控制编辑的节奏；如果 Matrix 对编辑进行限流，请调高该值。</li>
+<li><strong><code>multi_message</code></strong>：每个段落作为独立消息发送，以 <code>multi_message_delay_ms</code> 间隔分隔。适用于较长的回答，避免内容堆积成一大段文字。</li>
+</ul>
+<p>将其放置在任何表面上：</p>
+<div class="os-tabs-src">
+<h4 id="网关仪表板-24"><a class="header" href="#网关仪表板-24">网关仪表板</a></h4>
+<p>打开 <a href="http://127.0.0.1:42617/config/channels/matrix"><code>/config/channels/matrix</code></a> 并设置 <code>channels.matrix.&lt;alias&gt;.stream_mode</code> 字段。</p>
+<h4 id="zerocode-24"><a class="header" href="#zerocode-24">zerocode</a></h4>
+<p>在 <strong>Config</strong> 窗格中，设置 <code>channels.matrix.&lt;alias&gt;.stream_mode</code> 字段。</p>
+<h4 id="zeroclaw-config-22"><a class="header" href="#zeroclaw-config-22">zeroclaw config</a></h4>
+<pre><code class="language-sh">zeroclaw config set channels.matrix.&lt;alias&gt;.stream_mode &lt;value&gt;
+</code></pre>
+</div>
+
+<p>Matrix 特定行为：在 <code>partial</code> 模式下，工具执行状态通过同一编辑管道显示。在 <code>multi_message</code> 模式下，每个段落作为独立的线程消息发送，且拆分时会识别代码围栏，因此围栏块内的空行不会导致代码块跨消息断开。</p>
+<h2 id="8-从损坏的本地状态自动恢复"><a class="header" href="#8-从损坏的本地状态自动恢复">8. 从损坏的本地状态自动恢复</a></h2>
+<p>matrix-rust-sdk 默认的 SQLite 存储是单设备的，并假定本地视图与主服务器保持同步。有两种故障模式会不可恢复地破坏该假定；ZeroClaw 会在启动时检测每一种故障，并（当同时配置了 <code>password</code> 和 <code>user_id</code> 时）自动清除 <code>~/.zeroclaw/state/matrix/</code> 并重新认证，从而在服务器端创建一个全新的设备。</p>
+<ul>
+<li><strong>孤立的加密状态。</strong> 存在 <code>store/</code> 目录但缺少 <code>session.json</code>（手动清理、之前的安装被中断等原因）。在孤立的加密状态之上重新登录会重现无法自行恢复的 <code>Duplicate one-time keys</code> / <code>SigningKeyChanged</code> 冲突。</li>
+<li><strong><code>StateStoreDataKey::OneTimeKeyAlreadyUploaded</code> 标志已设置。</strong> SDK 在首次检测到重复 OTK 上传时会将此键持久化到状态存储中（参见 SDK 自己的注释：“we forgot about some of our one-time keys. This will lead to UTDs.”）。该标志在重启后依然存在；唯一的修复方法是清除数据并重新注册。</li>
+</ul>
+<p><strong>检测到 <code>device_id</code> 偏移时予以容忍，而非清除。</strong> 如果 <code>channels.matrix.device_id</code> 与 <code>session.json</code> 中存储的 device id 不一致，通道会记录一条警告并采用已保存的 id（即登录时 homeserver 实际分配的值）。在偏移时清除会造成恢复循环，因为自动恢复本身会生成新的 id，导致配置与会话永久失去同步。</p>
+<p>当 <strong><code>recover()</code> 本身失败时</strong>（通常为 <code>MAC check for the secret storage key failed</code>），该通道会记录 homeserver 的默认 secret-storage key id、密钥事件是否包含 passphrase 信息、去除空白字符后的输入长度，以及完整的错误链：这些信息可指明 <em>哪一</em> 层拒绝了恢复密钥，同时不会泄露其值。恢复失败属于<strong>非致命</strong>错误（不会触发自动擦除）；bot 会继续运行，只是新设备不会被交叉签名。</p>
+<p>如果未配置 <code>password</code> + <code>user_id</code>，则无法运行自动恢复：通道会中止并返回一个可操作的错误，指明两种选择：配置它们，或手动执行 <code>rm -rf ~/.zeroclaw/state/matrix/</code>。</p>
+<h2 id="另见"><a class="header" href="#另见">另见</a></h2>
+<ul>
+<li><a href="../ops/network-deployment.html">网络部署</a></li>
+<li><a href="../reference/config.html">配置参考</a>：根据实时架构生成</li>
+<li><a href="./overview.html">通道概述</a></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../channels/peer-groups.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../channels/discord.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../channels/peer-groups.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../channels/discord.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
