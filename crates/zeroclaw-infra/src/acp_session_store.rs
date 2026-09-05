@@ -60,6 +60,27 @@ pub struct AcpSessionSummary {
     pub message_count: usize,
 }
 
+/// A bounded, store-owned page of the typed ACP transcript. The cursor is
+/// deliberately opaque to RPC clients; callers must hand it back unchanged.
+#[derive(Debug)]
+pub struct AcpSessionPage {
+    pub messages: Vec<ConversationMessage>,
+    pub next_cursor: Option<String>,
+    pub has_older: bool,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AcpSessionCursor {
+    version: u8,
+    session_id: i64,
+    max_message_id: i64,
+    next_message_id: i64,
+    next_entry_offset: Option<usize>,
+}
+
+const ACP_SESSION_CURSOR_VERSION: u8 = 1;
+const ACP_SESSION_MAX_PAGE_SIZE: usize = 1_000;
+
 impl AcpSessionStore {
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
@@ -361,6 +382,161 @@ impl AcpSessionStore {
             last_activity,
             messages,
         }))
+    }
+
+    /// Load one bounded page of the projected ACP transcript. Cursor reads
+    /// hydrate only the durable groups needed for this page; the cursor's
+    /// message bound makes later appends invisible to an established walk.
+    pub fn load_message_page(
+        &self,
+        session_uuid: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<AcpSessionPage> {
+        let conn = self.conn.lock();
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::Error::msg(format!("unknown ACP session: {session_uuid}")))?;
+        let snapshot_max: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM acp_messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+
+        let state = match cursor {
+            Some(encoded) => decode_cursor(encoded)?,
+            None => AcpSessionCursor {
+                version: ACP_SESSION_CURSOR_VERSION,
+                session_id,
+                max_message_id: snapshot_max,
+                next_message_id: snapshot_max,
+                next_entry_offset: None,
+            },
+        };
+        if state.version != ACP_SESSION_CURSOR_VERSION
+            || state.session_id != session_id
+            || state.max_message_id < 0
+            || state.max_message_id > snapshot_max
+            || state.next_message_id < 0
+            || state.next_message_id > state.max_message_id
+            || state.next_entry_offset == Some(0)
+            || (cursor.is_some() && state.next_message_id == 0)
+        {
+            return Err(anyhow::Error::msg("invalid ACP session cursor"));
+        }
+        if limit == 0 || limit > ACP_SESSION_MAX_PAGE_SIZE {
+            return Err(anyhow::Error::msg(format!(
+                "cursor page limit must be between 1 and {ACP_SESSION_MAX_PAGE_SIZE}"
+            )));
+        }
+        if state.next_message_id == 0 {
+            return Ok(AcpSessionPage {
+                messages: Vec::new(),
+                next_cursor: None,
+                has_older: false,
+            });
+        }
+
+        let mut current_id = state.next_message_id;
+        let mut end_offset = state.next_entry_offset;
+        let mut remaining = limit;
+        let mut reverse_page = Vec::new();
+        let mut next: Option<AcpSessionCursor> = None;
+
+        while remaining > 0 && current_id > 0 {
+            let row = conn
+                .query_row(
+                    "SELECT id, role, content, reasoning_content
+                     FROM acp_messages
+                     WHERE session_id = ?1 AND id <= ?2 AND id <= ?3
+                     ORDER BY id DESC LIMIT 1",
+                    params![session_id, state.max_message_id, current_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((message_id, role, content, reasoning_content)) = row else {
+                break;
+            };
+            let group = load_projected_group(&conn, message_id, role, content, reasoning_content)?;
+            let end = end_offset.unwrap_or(group.len());
+            if end > group.len() {
+                return Err(anyhow::Error::msg("invalid ACP session cursor offset"));
+            }
+            if group.len() == 0 {
+                group.ensure_well_formed(&conn)?;
+            }
+            let start = end.saturating_sub(remaining);
+            reverse_page.push(group.entries_to_messages(
+                &conn,
+                start..end,
+                session_id,
+                state.max_message_id,
+                message_id,
+            )?);
+            remaining -= end - start;
+
+            let previous = if start > 0 {
+                next = Some(AcpSessionCursor {
+                    version: ACP_SESSION_CURSOR_VERSION,
+                    session_id,
+                    max_message_id: state.max_message_id,
+                    next_message_id: message_id,
+                    next_entry_offset: Some(start),
+                });
+                None
+            } else {
+                let previous: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM acp_messages
+                         WHERE session_id = ?1 AND id < ?2 AND id <= ?3
+                         ORDER BY id DESC LIMIT 1",
+                        params![session_id, message_id, state.max_message_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                next = previous.map(|id| AcpSessionCursor {
+                    version: ACP_SESSION_CURSOR_VERSION,
+                    session_id,
+                    max_message_id: state.max_message_id,
+                    next_message_id: id,
+                    next_entry_offset: None,
+                });
+                previous
+            };
+            if remaining == 0 {
+                break;
+            }
+            let Some(previous) = previous else {
+                next = None;
+                break;
+            };
+            current_id = previous;
+            end_offset = None;
+        }
+
+        let mut messages = Vec::new();
+        for group in reverse_page.into_iter().rev() {
+            messages.extend(group);
+        }
+        let next_cursor = next.map(encode_cursor).transpose()?;
+        let has_older = next_cursor.is_some();
+        Ok(AcpSessionPage {
+            messages,
+            next_cursor,
+            has_older,
+        })
     }
 
     /// Load only durable ACP rows that are allowed to become live sessions.
@@ -983,6 +1159,323 @@ impl AcpSessionStore {
     }
 }
 
+struct ProjectedGroup {
+    message_id: i64,
+    role: String,
+    content: String,
+    reasoning_content: Option<String>,
+    has_tool_events: bool,
+    input_count: usize,
+    unmatched_output_count: usize,
+}
+
+impl ProjectedGroup {
+    fn len(&self) -> usize {
+        if !self.has_tool_events {
+            1
+        } else {
+            usize::from(!self.content.is_empty()) + self.input_count + self.unmatched_output_count
+        }
+    }
+
+    fn ensure_well_formed(&self, conn: &Connection) -> Result<()> {
+        let malformed: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM acp_tool_calls
+                 WHERE message_id = ?1 AND event_kind NOT IN ('in', 'out')
+             )",
+            params![self.message_id],
+            |row| row.get(0),
+        )?;
+        if malformed {
+            return Err(anyhow::Error::msg(format!(
+                "unknown event_kind in acp_tool_calls for message_id {}",
+                self.message_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn entries_to_messages(
+        &self,
+        conn: &Connection,
+        range: std::ops::Range<usize>,
+        session_id: i64,
+        max_message_id: i64,
+        message_id: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        let mut messages = Vec::new();
+        if !self.has_tool_events {
+            if range.start == 0 && range.end > 0 {
+                messages.push(ConversationMessage::Chat(ChatMessage {
+                    role: self.role.clone(),
+                    content: self.content.clone(),
+                }));
+            }
+            return Ok(messages);
+        }
+        if range.start < range.end {
+            self.ensure_well_formed(conn)?;
+        }
+        let mut selected_ids = std::collections::HashSet::new();
+        let narration = usize::from(!self.content.is_empty());
+        if range.start < narration && !self.content.is_empty() {
+            messages.push(ConversationMessage::Chat(ChatMessage {
+                role: "assistant".to_string(),
+                content: self.content.clone(),
+            }));
+        }
+
+        let input_start = range.start.saturating_sub(narration);
+        let input_end = range.end.saturating_sub(narration).min(self.input_count);
+        if input_start < input_end {
+            let selected = input_end - input_start;
+            let mut stmt = conn.prepare(
+                "WITH selected_inputs AS (
+                     SELECT id, tool_call_id
+                     FROM acp_tool_calls
+                     WHERE message_id = ?1 AND event_kind = 'in'
+                     ORDER BY id LIMIT ?2 OFFSET ?3
+                 ), selected_ids AS (
+                     SELECT DISTINCT tool_call_id FROM selected_inputs
+                 ), ranked_inputs AS (
+                     SELECT input_rows.id, input_rows.tool_call_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY input_rows.tool_call_id ORDER BY input_rows.id
+                            ) - 1 AS input_ordinal
+                     FROM acp_tool_calls input_rows
+                     JOIN selected_ids USING (tool_call_id)
+                     WHERE input_rows.message_id = ?1 AND input_rows.event_kind = 'in'
+                 ), ranked_outputs AS (
+                     SELECT output_rows.id, output_rows.tool_call_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY output_rows.tool_call_id ORDER BY output_rows.id
+                            ) - 1 AS output_ordinal
+                     FROM acp_tool_calls output_rows
+                     JOIN selected_ids USING (tool_call_id)
+                     WHERE output_rows.message_id = ?1 AND output_rows.event_kind = 'out'
+                 )
+                 SELECT input_rows.tool_call_id, input_rows.tool_name,
+                        input_rows.payload, output_rows.payload,
+                        output_rows.tool_name
+                 FROM selected_inputs
+                 JOIN ranked_inputs ON ranked_inputs.id = selected_inputs.id
+                 JOIN acp_tool_calls input_rows ON input_rows.id = selected_inputs.id
+                 LEFT JOIN ranked_outputs
+                   ON ranked_outputs.tool_call_id = selected_inputs.tool_call_id
+                  AND ranked_outputs.output_ordinal = ranked_inputs.input_ordinal
+                 LEFT JOIN acp_tool_calls output_rows ON output_rows.id = ranked_outputs.id
+                 ORDER BY input_rows.id",
+            )?;
+            let rows = stmt.query_map(
+                params![self.message_id, selected as i64, input_start as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (tool_call_id, tool_name, arguments, output, output_name) = row?;
+                selected_ids.insert(tool_call_id.clone());
+                messages.push(ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: tool_call_id.clone(),
+                        name: tool_name,
+                        arguments,
+                        extra_content: None,
+                    }],
+                    reasoning_content: self.reasoning_content.clone(),
+                });
+                if let Some(content) = output {
+                    messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id,
+                        content,
+                        tool_name: output_name.unwrap_or_default(),
+                    }]));
+                }
+            }
+        }
+
+        let output_start = range.start.saturating_sub(narration + self.input_count);
+        let output_end = range
+            .end
+            .saturating_sub(narration + self.input_count)
+            .min(self.unmatched_output_count);
+        if output_start < output_end {
+            let selected = output_end - output_start;
+            let mut stmt = conn.prepare(
+                "WITH outputs AS (
+                     SELECT id, tool_call_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY tool_call_id ORDER BY id
+                            ) - 1 AS output_ordinal
+                     FROM acp_tool_calls
+                     WHERE message_id = ?1 AND event_kind = 'out'
+                 ), input_counts AS (
+                     SELECT tool_call_id, COUNT(*) AS input_count
+                     FROM acp_tool_calls
+                     WHERE message_id = ?1 AND event_kind = 'in'
+                     GROUP BY tool_call_id
+                 ), selected_outputs AS (
+                     SELECT outputs.id
+                     FROM outputs LEFT JOIN input_counts USING (tool_call_id)
+                     WHERE outputs.output_ordinal >= COALESCE(input_counts.input_count, 0)
+                     ORDER BY outputs.id LIMIT ?2 OFFSET ?3
+                 )
+                 SELECT output_rows.tool_call_id, output_rows.tool_name,
+                        output_rows.payload
+                 FROM selected_outputs
+                 JOIN acp_tool_calls output_rows ON output_rows.id = selected_outputs.id
+                 ORDER BY output_rows.id",
+            )?;
+            let rows = stmt.query_map(
+                params![self.message_id, selected as i64, output_start as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+            for row in rows {
+                let (tool_call_id, tool_name, content) = row?;
+                selected_ids.insert(tool_call_id.clone());
+                messages.push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    tool_call_id,
+                    content,
+                    tool_name,
+                }]));
+            }
+        }
+        let selected_ids = selected_ids.into_iter().collect::<Vec<_>>();
+        for ids in selected_ids.chunks(900) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT tc.tool_call_id
+                 FROM acp_tool_calls tc
+                 JOIN acp_messages m ON m.id = tc.message_id
+                 WHERE m.session_id = ? AND m.id <= ? AND m.id != ?
+                   AND tc.tool_call_id IN ({placeholders})
+                 LIMIT 1"
+            );
+            let mut values = vec![
+                rusqlite::types::Value::Integer(session_id),
+                rusqlite::types::Value::Integer(max_message_id),
+                rusqlite::types::Value::Integer(message_id),
+            ];
+            values.extend(ids.iter().cloned().map(rusqlite::types::Value::Text));
+            let reused = conn
+                .query_row(&sql, rusqlite::params_from_iter(values), |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?;
+            if let Some(tool_call_id) = reused {
+                return Err(anyhow::Error::msg(format!(
+                    "cross-group ACP tool_call_id reuse: {tool_call_id}"
+                )));
+            }
+        }
+        Ok(messages)
+    }
+}
+
+fn load_projected_group(
+    conn: &Connection,
+    message_id: i64,
+    role: String,
+    content: String,
+    reasoning_content: Option<String>,
+) -> Result<ProjectedGroup> {
+    let has_tool_events: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM acp_tool_calls WHERE message_id = ?1
+         )",
+        params![message_id],
+        |row| row.get(0),
+    )?;
+    if !has_tool_events {
+        return Ok(ProjectedGroup {
+            message_id,
+            role,
+            content,
+            reasoning_content,
+            has_tool_events,
+            input_count: 0,
+            unmatched_output_count: 0,
+        });
+    }
+    let input_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM acp_tool_calls
+         WHERE message_id = ?1 AND event_kind = 'in'",
+        params![message_id],
+        |row| row.get(0),
+    )?;
+    let unmatched_output_count: i64 = conn.query_row(
+        "WITH outputs AS (
+             SELECT tool_call_id, COUNT(*) AS output_count
+             FROM acp_tool_calls
+             WHERE message_id = ?1 AND event_kind = 'out'
+             GROUP BY tool_call_id
+         ), inputs AS (
+             SELECT tool_call_id, COUNT(*) AS input_count
+             FROM acp_tool_calls
+             WHERE message_id = ?1 AND event_kind = 'in'
+             GROUP BY tool_call_id
+         )
+         SELECT COALESCE(SUM(
+             CASE WHEN outputs.output_count > COALESCE(inputs.input_count, 0)
+                  THEN outputs.output_count - COALESCE(inputs.input_count, 0)
+                  ELSE 0 END
+         ), 0)
+         FROM outputs LEFT JOIN inputs USING (tool_call_id)",
+        params![message_id],
+        |row| row.get(0),
+    )?;
+    Ok(ProjectedGroup {
+        message_id,
+        role,
+        content,
+        reasoning_content,
+        has_tool_events,
+        input_count: input_count.max(0) as usize,
+        unmatched_output_count: unmatched_output_count.max(0) as usize,
+    })
+}
+
+fn encode_cursor(cursor: AcpSessionCursor) -> Result<String> {
+    let bytes = serde_json::to_vec(&cursor)?;
+    let mut encoded = String::from("acp1.");
+    for byte in bytes {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}")?;
+    }
+    Ok(encoded)
+}
+
+fn decode_cursor(encoded: &str) -> Result<AcpSessionCursor> {
+    let hex = encoded
+        .strip_prefix("acp1.")
+        .ok_or_else(|| anyhow::Error::msg("invalid ACP session cursor"))?;
+    if !hex.is_ascii() || hex.len() % 2 != 0 || hex.len() > 2048 {
+        return Err(anyhow::Error::msg("invalid ACP session cursor"));
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::Error::msg("invalid ACP session cursor"))?;
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::Error::msg("invalid ACP session cursor"))
+}
+
 fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
     s.parse::<DateTime<Utc>>().unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
@@ -1323,6 +1816,383 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM acp_messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "no orphan rows after failed append_turn");
+    }
+
+    #[test]
+    fn cursor_pages_newest_rows_and_walks_back_without_repeating() {
+        let (_tmp, store) = open_store();
+        store.create_session("cursor", "alpha", "/tmp").unwrap();
+        for content in ["old", "middle", "new"] {
+            store
+                .append_turn(
+                    "cursor",
+                    &[ConversationMessage::Chat(ChatMessage::assistant(content))],
+                )
+                .unwrap();
+        }
+
+        let first = store.load_message_page("cursor", 2, None).unwrap();
+        assert_eq!(first.messages.len(), 2);
+        assert!(first.has_older);
+        let second = store
+            .load_message_page("cursor", 2, first.next_cursor.as_deref())
+            .unwrap();
+        assert!(!second.has_older);
+        let text = |messages: &[ConversationMessage]| {
+            messages
+                .iter()
+                .map(|message| match message {
+                    ConversationMessage::Chat(chat) => chat.content.clone(),
+                    _ => "non-chat".to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(&first.messages), vec!["middle", "new"]);
+        assert_eq!(text(&second.messages), vec!["old"]);
+    }
+
+    #[test]
+    fn cursor_preserves_pure_chat_roles_including_empty_content() {
+        let (_tmp, store) = open_store();
+        store.create_session("chat-roles", "alpha", "/tmp").unwrap();
+        store
+            .append_turn(
+                "chat-roles",
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("question")),
+                    ConversationMessage::Chat(ChatMessage::assistant("answer")),
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "user".into(),
+                        content: String::new(),
+                    }),
+                ],
+            )
+            .unwrap();
+        let page = store.load_message_page("chat-roles", 3, None).unwrap();
+        assert_eq!(page.messages.len(), 3);
+        assert!(matches!(
+            &page.messages[0],
+            ConversationMessage::Chat(chat) if chat.role == "user" && chat.content == "question"
+        ));
+        assert!(matches!(
+            &page.messages[1],
+            ConversationMessage::Chat(chat) if chat.role == "assistant" && chat.content == "answer"
+        ));
+        assert!(matches!(
+            &page.messages[2],
+            ConversationMessage::Chat(chat) if chat.role == "user" && chat.content.is_empty()
+        ));
+    }
+
+    #[test]
+    fn cursor_pages_tool_group_by_projected_entry_offset() {
+        let (_tmp, store) = open_store();
+        store.create_session("tools", "alpha", "/tmp").unwrap();
+        store
+            .append_turn(
+                "tools",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("narration".into()),
+                        tool_calls: vec![
+                            ToolCall {
+                                id: "one".into(),
+                                name: "shell".into(),
+                                arguments: "{}".into(),
+                                extra_content: None,
+                            },
+                            ToolCall {
+                                id: "two".into(),
+                                name: "shell".into(),
+                                arguments: "{}".into(),
+                                extra_content: None,
+                            },
+                        ],
+                        reasoning_content: Some("tool reasoning".into()),
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        ToolResultMessage {
+                            tool_call_id: "two".into(),
+                            content: "two-result".into(),
+                            tool_name: "shell".into(),
+                        },
+                        ToolResultMessage {
+                            tool_call_id: "orphan".into(),
+                            content: "orphan-result".into(),
+                            tool_name: "shell".into(),
+                        },
+                        ToolResultMessage {
+                            tool_call_id: "one".into(),
+                            content: "one-result".into(),
+                            tool_name: "shell".into(),
+                        },
+                    ]),
+                ],
+            )
+            .unwrap();
+
+        let first = store.load_message_page("tools", 2, None).unwrap();
+        assert_eq!(
+            first.messages.len(),
+            3,
+            "two projected entries include paired outputs"
+        );
+        assert!(first.has_older);
+        let second = store
+            .load_message_page("tools", 2, first.next_cursor.as_deref())
+            .unwrap();
+        assert!(!second.has_older);
+        assert_eq!(second.messages.len(), 3, "narration plus paired first call");
+        for message in first.messages.iter().chain(&second.messages) {
+            if let ConversationMessage::AssistantToolCalls {
+                reasoning_content, ..
+            } = message
+            {
+                assert_eq!(reasoning_content.as_deref(), Some("tool reasoning"));
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_snapshot_excludes_appends_after_initial_page() {
+        let (_tmp, store) = open_store();
+        store.create_session("stable", "alpha", "/tmp").unwrap();
+        store
+            .append_turn(
+                "stable",
+                &[
+                    ConversationMessage::Chat(ChatMessage::assistant("old")),
+                    ConversationMessage::Chat(ChatMessage::assistant("middle")),
+                ],
+            )
+            .unwrap();
+        let first = store.load_message_page("stable", 1, None).unwrap();
+        store
+            .append_turn(
+                "stable",
+                &[ConversationMessage::Chat(ChatMessage::assistant("new"))],
+            )
+            .unwrap();
+        assert!(first.has_older);
+        let cursor = first.next_cursor.clone();
+
+        // A new initial request sees the append; the established cursor does
+        // not, which is the duplicate/gap-free snapshot guarantee.
+        let fresh = store.load_message_page("stable", 1, None).unwrap();
+        assert!(matches!(
+            &fresh.messages[0],
+            ConversationMessage::Chat(message) if message.content == "new"
+        ));
+        let older = store
+            .load_message_page("stable", 1, cursor.as_deref())
+            .unwrap();
+        assert!(matches!(
+            &older.messages[0],
+            ConversationMessage::Chat(message) if message.content == "old"
+        ));
+    }
+
+    #[test]
+    fn cursor_rejects_tool_id_reuse_across_message_groups() {
+        let (_tmp, store) = open_store();
+        store.create_session("reuse", "alpha", "/tmp").unwrap();
+        let call = |id: &str| ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        };
+        let result = |id: &str| {
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: id.into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }])
+        };
+        store
+            .append_turn("reuse", &[call("same"), result("same")])
+            .unwrap();
+        store
+            .append_turn("reuse", &[call("same"), result("same")])
+            .unwrap();
+        let error = store
+            .load_message_page("reuse", 1, None)
+            .expect_err("cross-group ID reuse must fail closed");
+        assert!(error.to_string().contains("cross-group"));
+    }
+
+    #[test]
+    fn cursor_defers_malformed_older_group_until_requested() {
+        let (_tmp, store) = open_store();
+        store.create_session("defer", "alpha", "/tmp").unwrap();
+        store
+            .append_turn(
+                "defer",
+                &[
+                    ConversationMessage::Chat(ChatMessage::assistant("old")),
+                    ConversationMessage::Chat(ChatMessage::assistant("new")),
+                ],
+            )
+            .unwrap();
+        let conn = store.conn.lock();
+        // Add an invalid event to the older row without affecting the newer
+        // page; loading that row later must be where the error appears.
+        let old_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_messages WHERE content = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls
+             (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (?1, 'bad', 'shell', 'bad', 'x', NULL, '2026-01-01T00:00:00Z')",
+            params![old_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let first = store.load_message_page("defer", 1, None).unwrap();
+        assert!(first.has_older);
+        let error = store
+            .load_message_page("defer", 1, first.next_cursor.as_deref())
+            .expect_err("malformed group should fail when its page is reached");
+        assert!(error.to_string().contains("unknown event_kind"));
+    }
+
+    #[test]
+    fn cursor_rejects_malformed_group_with_no_valid_projected_entries() {
+        let (_tmp, store) = open_store();
+        store.create_session("bad-empty", "alpha", "/tmp").unwrap();
+        store
+            .append_turn(
+                "bad-empty",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+        let conn = store.conn.lock();
+        let message_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_messages WHERE session_id = (SELECT id FROM acp_sessions WHERE session_uuid = 'bad-empty')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO acp_tool_calls
+             (message_id, tool_call_id, tool_name, event_kind, payload, outcome, created_at)
+             VALUES (?1, 'bad', 'shell', 'bad', 'x', NULL, '2026-01-01T00:00:00Z')",
+            params![message_id],
+        )
+        .unwrap();
+        drop(conn);
+        let error = store
+            .load_message_page("bad-empty", 1, None)
+            .expect_err("malformed-only group must not disappear");
+        assert!(error.to_string().contains("unknown event_kind"));
+    }
+
+    #[test]
+    fn cursor_rejects_invalid_and_wrong_session_tokens() {
+        let (_tmp, store) = open_store();
+        store.create_session("one", "alpha", "/tmp").unwrap();
+        store.create_session("two", "alpha", "/tmp").unwrap();
+        store
+            .append_turn(
+                "one",
+                &[
+                    ConversationMessage::Chat(ChatMessage::assistant("one")),
+                    ConversationMessage::Chat(ChatMessage::assistant("older")),
+                ],
+            )
+            .unwrap();
+        let page = store.load_message_page("one", 1, None).unwrap();
+        let token = page.next_cursor;
+        assert!(token.is_some());
+        let valid_state = decode_cursor(token.as_deref().unwrap()).unwrap();
+        let zero_offset = encode_cursor(AcpSessionCursor {
+            next_entry_offset: Some(0),
+            ..valid_state
+        })
+        .unwrap();
+        let valid_state = decode_cursor(token.as_deref().unwrap()).unwrap();
+        let terminal_position = encode_cursor(AcpSessionCursor {
+            next_message_id: 0,
+            next_entry_offset: None,
+            ..valid_state
+        })
+        .unwrap();
+        assert!(store.load_message_page("one", 1, Some("nope")).is_err());
+        assert!(store.load_message_page("two", 1, token.as_deref()).is_err());
+        assert!(
+            store
+                .load_message_page("one", 1, Some(&zero_offset))
+                .is_err()
+        );
+        assert!(
+            store
+                .load_message_page("one", 1, Some(&terminal_position))
+                .is_err()
+        );
+        assert!(store.load_message_page("one", 1, Some("acp1.éé")).is_err());
+        assert!(
+            store
+                .load_message_page("one", 1, Some("acp1.7b7d226e76657273696f6e223a327d"))
+                .is_err()
+        );
+        assert!(store.load_message_page("one", 0, None).is_err());
+        assert!(store.load_message_page("one", 1_001, None).is_err());
+        assert!(store.load_message_page("one", 1_000, None).is_ok());
+    }
+
+    #[test]
+    fn oversized_group_materializes_only_requested_projected_entries() {
+        let (_tmp, store) = open_store();
+        store.create_session("large", "alpha", "/tmp").unwrap();
+        let calls = (0..128)
+            .map(|index| ToolCall {
+                id: format!("call-{index}"),
+                name: "shell".into(),
+                arguments: format!("{{\"index\":{index}}}"),
+                extra_content: None,
+            })
+            .collect::<Vec<_>>();
+        store
+            .append_turn(
+                "large",
+                &[ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: calls,
+                    reasoning_content: None,
+                }],
+            )
+            .unwrap();
+
+        let page = store.load_message_page("large", 1, None).unwrap();
+        assert_eq!(page.messages.len(), 1);
+        assert!(matches!(
+            &page.messages[0],
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls[0].id == "call-127"
+        ));
+        let older = store
+            .load_message_page("large", 1, page.next_cursor.as_deref())
+            .unwrap();
+        assert_eq!(older.messages.len(), 1);
+        assert!(matches!(
+            &older.messages[0],
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls[0].id == "call-126"
+        ));
     }
 
     #[test]
