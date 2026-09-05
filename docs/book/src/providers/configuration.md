@@ -19,12 +19,106 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
-- `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
+- `wire_api`, `native_tools`, `provider_extra`, `think`, `thinking_passthrough`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
+
+## Anthropic thinking passthrough
+
+`thinking_passthrough = true` on an OpenAI-compatible provider entry opts that
+alias into Anthropic **extended-thinking passthrough**: the runtime's thinking
+budget is forwarded to the gateway, gateway thinking responses are normalized
+into replayable signed blocks, and signed blocks are replayed on outbound
+history.
+
+```toml
+[providers.models.custom.my-gateway]
+uri = "https://your-gateway.example.com"
+model = "claude-group/claude-fable-5"
+api_key = "..."
+wire_api = "chat_completions"
+thinking_passthrough = true
+```
+
+### What it does
+
+- **Request side**: when the runtime supplies native thinking params, request
+  bodies gain an Anthropic-shaped object at the top level:
+  `{"thinking": {"type": "enabled", "budget_tokens": N}}`. An explicit
+  `provider_extra` key always wins over the injected object, so you can pin a
+  custom shape through the escape hatch.
+- **Capture**: gateway thinking responses are normalized into the same
+  newline-delimited signed-JSON format the native Anthropic provider stores in
+  `reasoning_content` (one `{"thinking": ..., "signature": ...}` line per
+  block). Signature-only blocks (empty text, valid signature: the shape
+  TrueFoundry emits) are preserved. With the flag off, gateway
+  `reasoning_content` / `thinking_blocks` responses flow exactly as before,
+  so DeepSeek/GLM/Qwen reasoning behavior is untouched.
+- **Replay**: signed history reconstructs a `thinking_blocks` array on
+  outbound assistant messages and suppresses the string fields. The
+  reconstruction is all-or-nothing; see the limitation below. The
+  `replay_assistant_reasoning = false` override still wins: providers that
+  reject reasoning input receive nothing under any flag combination.
+
+### Requirements and limitations
+
+- **Requires a translating gateway.** The flag is only meaningful for
+  OpenAI-compatible endpoints that translate between OpenAI Chat Completions
+  and the Anthropic Messages API (LiteLLM documents this translation; the
+  shape was verified against a live TrueFoundry gateway). Pointed at a
+  non-translating upstream, the injected `thinking` object is an unknown
+  parameter and the request fails with **HTTP 400**. That is the designed
+  failure mode: loud, at the first request, not silent.
+- **Unsigned thinking voids the replay.** Thinking blocks Anthropic accepts
+  on input must carry a valid signature. History whose reasoning is unsigned
+  (streamed text, or a gateway that strips signatures) sends no reasoning at
+  all rather than fabricating blocks a gateway would reject: any unparseable
+  line or signature-less thinking line voids the whole message's replay (no
+  partial sequences). Structurally invalid `redacted_thinking` blocks (no
+  data payload) are omitted individually while their valid siblings replay.
+  The captured block whitelist is exactly `thinking` (text and/or signature
+  required) and `redacted_thinking` (opaque `data` required, replayed
+  verbatim and signature-less by design); any other block type a gateway
+  emits is skipped on capture and never forwarded on replay. The
+  prompt-guided fallback path replays the same validated blocks, so a second
+  schema fallback does not drop the signed trajectory.
+- **Nested content blocks are not captured.** Only top-level
+  `reasoning_content`, `reasoning`, and `thinking_blocks` fields are read.
+  Anthropic-shaped blocks nested inside a `content` array are not captured;
+  file an issue with a wire sample if your gateway emits them.
+- **Passthrough disables streaming on the leaf.** Capture normalization
+  applies to non-streaming responses, and gateway SSE thinking frames are
+  unverified territory, so the provider reports itself as non-streaming:
+  when it is the serving provider, the whole tool loop runs on the
+  non-streaming wire, where signed capture and replay stay correct. Two
+  boundary cases: a Router that resolves this provider dispatches its
+  non-streaming path and synthesizes the standard stream events, and a
+  reliability domain containing a streaming-capable fallback may serve the
+  turn on that fallback (surfacing the standard fallback notice), so
+  operators who require every turn on the opted-in provider should configure
+  an all-non-streaming domain. Turn-by-turn streaming on the leaf resumes
+  when wire-first streaming support lands.
+- **Thinking shape follows the model.** The injected object matches the
+  native provider's style resolution: fixed-budget models get
+  `{"type": "enabled", "budget_tokens": N}`, adaptive-only models
+  (Opus 4.7, the whole Fable 5 family) get `{"type": "adaptive"}` with no
+  budget key. Gateway model IDs may carry routing prefixes
+  (`claude-group/...`); resolution matches on substrings, so prefixed IDs
+  resolve to the same shape as bare names. When the runtime requests a
+  display mode, the snake_case `display` key rides on both shapes
+  (`omitted`, `updates`, `summarized`); with no display requested the key
+  is omitted entirely.
+- **Escape hatch**: for shapes this feature does not cover, `provider_extra`
+  still merges arbitrary top-level JSON into every request body, including a
+  static `thinking` object, at your own risk, with no response handling.
+
+### See also
+
+- Native extended thinking on the Anthropic provider: #10542.
+- Request-body escape hatch: `provider_extra` above; [reference](../reference/config.md#providers).
 
 ## Field resolution order
 

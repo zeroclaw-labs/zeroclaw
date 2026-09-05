@@ -3219,6 +3219,15 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
+        // Aggregation stays any(): a streaming-capable fallback may serve a
+        // turn whose selected primary disclaims streaming, surfacing the
+        // standard fallback notice (runtime contract, verified by
+        // streamed_turn_surfaces_streaming_provider_fallback_notice). The
+        // audit's stream-into-disclaiming-route hazard is closed at the
+        // dispatch layer instead: RouterModelProvider never streams a
+        // resolved route that disclaims streaming, and the passthrough
+        // leaf's streaming builders never attach thinking params to the
+        // streamed wire (unverified SSE frames, no signed capture there).
         self.model_providers
             .iter()
             .any(|entry| entry.provider().supports_streaming())

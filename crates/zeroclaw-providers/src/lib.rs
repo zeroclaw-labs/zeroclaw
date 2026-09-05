@@ -632,6 +632,11 @@ pub struct ModelProviderRuntimeOptions {
     /// When `Some(false)`, strip assistant reasoning fields from outbound
     /// history replay. `None` honours provider default.
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic extended thinking through OpenAI-compatible
+    /// providers: inject the runtime thinking params as an Anthropic-shaped
+    /// `thinking` request object and normalize gateway thinking responses
+    /// for replay. Propagated from `ModelProviderConfig::thinking_passthrough`.
+    pub thinking_passthrough: bool,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -677,6 +682,7 @@ impl Default for ModelProviderRuntimeOptions {
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
+            thinking_passthrough: false,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -741,6 +747,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
+        thinking_passthrough: entry.is_some_and(|e| e.thinking_passthrough),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
