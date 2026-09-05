@@ -1,6 +1,7 @@
 //! Shared read-only context for the per-iteration turn step functions.
 
 use super::events::DraftEvent;
+use super::outcome::ToolLoopCancelled;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
@@ -49,6 +50,16 @@ pub struct TurnMeta<'a> {
 }
 
 impl<'a> TurnCtx<'a> {
+    pub(crate) fn ensure_not_cancelled(&self) -> anyhow::Result<()> {
+        if self
+            .cancellation_token
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn meta(&self) -> TurnMeta<'a> {
         TurnMeta {
             agent_alias: self.agent_alias,

@@ -3765,6 +3765,132 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scheduler_reload_does_not_clear_claim_while_prior_owned_worker_is_live() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.enabled = true;
+        let job = crate::cron::add_agent_job(
+            &config,
+            "test-agent",
+            Some("reload ownership fence".into()),
+            crate::cron::Schedule::At {
+                at: Utc::now() + chrono::Duration::hours(1),
+            },
+            "test prompt",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .expect("create test cron job");
+        assert!(crate::cron::claim_job(&config, &job.id, Utc::now()).expect("claim test job"));
+        let original_claim =
+            crate::cron::current_claim_for_test(&config, &job.id).expect("read original claim");
+
+        let worker_config = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancellation_seen = Arc::new(AtomicBool::new(false));
+        let worker_cancellation_seen = Arc::clone(&cancellation_seen);
+        let mut prior_supervisor = zeroclaw_spawn::spawn!(async move {
+            crate::cron::scheduler::run_blocked_owned_worker_for_test(
+                &worker_config,
+                started_tx,
+                release_rx,
+                worker_cancellation_seen,
+            )
+            .await;
+        });
+        started_rx.await.expect("prior owned worker should start");
+        prior_supervisor.abort();
+        (&mut prior_supervisor)
+            .await
+            .expect_err("daemon-style abort should drop the prior supervisor");
+        assert_eq!(
+            crate::cron::scheduler::active_owned_worker_count_for_test(&config),
+            1
+        );
+
+        let (reload_control_tx, reload_control_rx) = tokio::sync::oneshot::channel();
+        let reload_control_tx = Arc::new(std::sync::Mutex::new(Some(reload_control_tx)));
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |_host, _port, _config, _event_tx, reload_controls, _tui_reg, _ready_tx| {
+                let reload_control_tx = Arc::clone(&reload_control_tx);
+                Box::pin(async move {
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    if let Some(ready) = reload_control_tx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        let _ = ready.send(reload_tx);
+                    }
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let daemon_config = config.clone();
+        let daemon = zeroclaw_spawn::spawn!(async move {
+            run(
+                daemon_config,
+                "127.0.0.1".to_string(),
+                0,
+                registry,
+                false,
+                false,
+            )
+            .await
+        });
+        let reload_tx = timeout(Duration::from_secs(2), reload_control_rx)
+            .await
+            .expect("replacement daemon gateway should start")
+            .expect("replacement daemon should publish reload control");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let claim_while_replacement_is_running =
+            crate::cron::current_claim_for_test(&config, &job.id);
+
+        reload_tx.send(true).expect("request replacement reload");
+        let daemon_result = timeout(Duration::from_secs(3), daemon).await;
+        let claim_after_replacement_stops = crate::cron::current_claim_for_test(&config, &job.id);
+
+        release_tx.send(()).expect("release prior owned worker");
+        timeout(
+            Duration::from_secs(2),
+            crate::cron::scheduler::wait_for_owned_workers_for_test(&config),
+        )
+        .await
+        .expect("prior owned worker should drain after release");
+
+        assert_eq!(
+            claim_while_replacement_is_running.expect("claim must remain while prior worker lives"),
+            original_claim
+        );
+        assert_eq!(
+            claim_after_replacement_stops.expect("reload must not clear a live worker's claim"),
+            original_claim
+        );
+        let exit = daemon_result
+            .expect("replacement daemon should return after reload")
+            .expect("replacement daemon task should not panic")
+            .expect("replacement daemon run should succeed");
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            cancellation_seen.load(Ordering::SeqCst),
+            "aborting the old supervisor must cancel its owned worker"
+        );
+    }
+
     #[tokio::test]
     async fn ephemeral_does_not_exit_before_client_connects() {
         use tokio::time::{Duration, timeout};

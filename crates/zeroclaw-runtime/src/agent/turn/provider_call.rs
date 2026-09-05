@@ -158,6 +158,10 @@ pub(crate) async fn call_provider(
     should_consume_provider_stream: bool,
     iteration: usize,
 ) -> Result<ProviderCallOutcome> {
+    // A synchronously blocking setup step can return after the owning cron
+    // deadline fired without yielding back to the outer supervisor. Refuse to
+    // cross the provider boundary in that state.
+    ctx.ensure_not_cancelled()?;
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
@@ -366,6 +370,15 @@ pub(crate) async fn call_provider(
     };
     let (attempts, _, accepted_route) = accounting.into_attempts_and_parts();
 
+    // If a provider blocked synchronously inside one poll, cancellation could
+    // have arrived while it was running. Do not hand a late successful
+    // response to tool preparation after the durable owner requested
+    // shutdown. Preserve typed streaming/cancellation failures so already
+    // forwarded partial output and failure telemetry can still be finalized.
+    if chat_result.is_ok() {
+        ctx.ensure_not_cancelled()?;
+    }
+
     Ok(ProviderCallOutcome {
         chat_result,
         attempts,
@@ -380,9 +393,13 @@ pub(crate) async fn call_provider(
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
     use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
-    use super::announce_llm_request;
+    use super::super::outcome::is_tool_loop_cancelled;
+    use super::{announce_llm_request, call_provider};
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_util::sync::CancellationToken;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
     use zeroclaw_log::LogConfig;
@@ -415,8 +432,18 @@ mod payload_capture_tests {
         }
     }
 
-    fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
-        test_ctx_with_delta(observer, pacing, None, StreamReasoningMode::Status)
+    fn test_ctx<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        cancellation_token: Option<&'a CancellationToken>,
+    ) -> TurnCtx<'a> {
+        test_ctx_with_delta(
+            observer,
+            pacing,
+            None,
+            StreamReasoningMode::Status,
+            cancellation_token,
+        )
     }
 
     fn test_ctx_with_delta<'a>(
@@ -424,6 +451,7 @@ mod payload_capture_tests {
         pacing: &'a PacingConfig,
         on_delta: Option<&'a tokio::sync::mpsc::Sender<StreamDelta>>,
         draft_reasoning: StreamReasoningMode,
+        cancellation_token: Option<&'a CancellationToken>,
     ) -> TurnCtx<'a> {
         TurnCtx {
             parent_agent_alias: None,
@@ -434,7 +462,7 @@ mod payload_capture_tests {
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
-            cancellation_token: None,
+            cancellation_token,
             on_delta,
             event_tx: None,
             hooks: None,
@@ -457,7 +485,7 @@ mod payload_capture_tests {
 
         for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
-            let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
+            let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode, None);
             let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
             drop(tx);
             assert!(matches!(
@@ -471,7 +499,13 @@ mod payload_capture_tests {
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
-        let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
+        let ctx = test_ctx_with_delta(
+            &observer,
+            &pacing,
+            Some(&tx),
+            StreamReasoningMode::Status,
+            None,
+        );
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 3).await;
         drop(tx);
         assert!(matches!(
@@ -551,7 +585,7 @@ mod payload_capture_tests {
         install_writer("redacted");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = test_ctx(&observer, &pacing, None);
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
         let on_record = next_llm_request(&mut rx).await;
 
@@ -590,7 +624,7 @@ mod payload_capture_tests {
         install_writer("off");
         while rx.try_recv().is_ok() {}
 
-        let ctx = test_ctx(&observer, &pacing);
+        let ctx = test_ctx(&observer, &pacing, None);
         let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
         let off_record = next_llm_request(&mut rx).await;
 
@@ -611,6 +645,59 @@ mod payload_capture_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("late provider response".into())
+        }
+    }
+
+    impl Attributable for CountingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "counting-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_does_not_cross_provider_boundary() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let ctx = test_ctx(&observer, &pacing, Some(&cancellation));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let error = call_provider(&ctx, &provider, "stub-model", &[], None, false, 0)
+            .await
+            .err()
+            .expect("a pre-cancelled turn must not dispatch a provider request");
+
+        assert!(is_tool_loop_cancelled(&error));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the provider must not be called after cancellation"
+        );
     }
 }
 
