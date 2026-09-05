@@ -2,7 +2,7 @@
 //! Each audit entry is chained via a Merkle hash: `entry_hash = SHA-256(prev_hash || canonical_json)`.
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use zeroclaw_config::schema::AuditConfig;
 
 /// Well-known seed for the genesis entry's `prev_hash`.
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const MAX_RETAINED_GENERATIONS: usize = 10;
 
 /// Audit event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,7 +328,7 @@ impl AuditLogger {
         };
 
         let log_path = zeroclaw_dir.join(&config.log_path);
-        let chain_state = recover_chain_state(&log_path);
+        let chain_state = recover_chain_state(&log_path)?;
         Ok(Self {
             log_path,
             config,
@@ -563,63 +564,158 @@ impl AuditLogger {
 
     /// Rotate the log file
     fn rotate(&self) -> Result<()> {
-        for i in (1..10).rev() {
-            let old_name = format!("{}.{}.log", self.log_path.display().to_string(), i);
-            let new_name = format!("{}.{}.log", self.log_path.display().to_string(), i + 1);
-            let _ = std::fs::rename(&old_name, &new_name);
+        for i in (1..MAX_RETAINED_GENERATIONS).rev() {
+            let old_name = rotated_log_path(&self.log_path, i);
+            let new_name = rotated_log_path(&self.log_path, i + 1);
+            match std::fs::rename(&old_name, &new_name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to rotate audit segment {} to {}",
+                            old_name.display(),
+                            new_name.display()
+                        )
+                    });
+                }
+            }
         }
 
-        let rotated = format!("{}.1.log", self.log_path.display().to_string());
+        let rotated = rotated_log_path(&self.log_path, 1);
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
 }
 
+fn rotated_log_path(log_path: &Path, generation: usize) -> PathBuf {
+    let mut path = log_path.as_os_str().to_os_string();
+    path.push(format!(".{generation}.log"));
+    PathBuf::from(path)
+}
+
+fn retained_log_paths(log_path: &Path) -> impl DoubleEndedIterator<Item = PathBuf> + '_ {
+    (1..=MAX_RETAINED_GENERATIONS)
+        .rev()
+        .map(|generation| rotated_log_path(log_path, generation))
+}
+
 /// Recover chain state from an existing log file.
-/// Returns the genesis state if the file does not exist or is empty.
-fn recover_chain_state(log_path: &Path) -> ChainState {
-    let file = match std::fs::File::open(log_path) {
-        Ok(f) => f,
-        Err(_) => {
-            return ChainState {
-                prev_hash: GENESIS_PREV_HASH.to_string(),
-                sequence: 0,
-            };
+/// Falls back through retained generations only when newer files have no records.
+fn recover_chain_state(log_path: &Path) -> Result<ChainState> {
+    let paths = std::iter::once(log_path.to_path_buf()).chain(retained_log_paths(log_path).rev());
+
+    for path in paths {
+        if let Some(entry) = last_audit_entry(&path)? {
+            return Ok(ChainState {
+                prev_hash: entry.entry_hash,
+                sequence: entry
+                    .sequence
+                    .checked_add(1)
+                    .context("audit sequence overflow during recovery")?,
+            });
         }
+    }
+
+    Ok(genesis_chain_state())
+}
+
+fn last_audit_entry(log_path: &Path) -> Result<Option<AuditEvent>> {
+    let file = match std::fs::File::open(log_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
 
     let reader = BufReader::new(file);
     let mut last_entry: Option<AuditEvent> = None;
-    for l in reader.lines().map_while(Result::ok) {
-        if let Ok(entry) = serde_json::from_str::<AuditEvent>(&l) {
-            last_entry = Some(entry);
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
         }
+        let entry = serde_json::from_str::<AuditEvent>(&line).with_context(|| {
+            format!(
+                "invalid audit record in {} at line {}",
+                log_path.display(),
+                line_idx + 1
+            )
+        })?;
+        last_entry = Some(entry);
     }
+    Ok(last_entry)
+}
 
-    match last_entry {
-        Some(entry) => ChainState {
-            prev_hash: entry.entry_hash,
-            sequence: entry.sequence + 1,
-        },
-        None => ChainState {
-            prev_hash: GENESIS_PREV_HASH.to_string(),
-            sequence: 0,
-        },
+fn genesis_chain_state() -> ChainState {
+    ChainState {
+        prev_hash: GENESIS_PREV_HASH.to_string(),
+        sequence: 0,
     }
 }
 
 pub fn verify_chain(log_path: &Path) -> Result<u64> {
-    let file = std::fs::File::open(log_path)?;
-    let reader = BufReader::new(file);
+    let mut expected = Some(genesis_chain_state());
+    verify_chain_file(log_path, &mut expected, false, signing_key().as_deref())
+}
 
-    let mut expected_prev_hash = GENESIS_PREV_HASH.to_string();
-    let mut expected_sequence: u64 = 0;
+/// Verify every retained generation and the active audit log as one chain.
+///
+/// The oldest available record is the retained-window trust boundary because
+/// rotation intentionally discards generations beyond the configured family.
+/// Every later record, including the first record after each rotation, must
+/// link to the preceding retained record.
+pub fn verify_rotated_chain(log_path: &Path) -> Result<u64> {
+    let mut expected = None;
+    let signing_key = signing_key();
+    let mut verified = 0;
 
-    // Attempt to load signing key from environment (optional)
-    let signing_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY")
+    for path in retained_log_paths(log_path) {
+        match verify_chain_file(&path, &mut expected, true, signing_key.as_deref()) {
+            Ok(count) => verified += count,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("audit chain verification failed for {}", path.display())
+                });
+            }
+        }
+    }
+
+    match verify_chain_file(log_path, &mut expected, false, signing_key.as_deref()) {
+        Ok(count) => verified += count,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("audit chain verification failed for {}", log_path.display())
+            });
+        }
+    }
+
+    Ok(verified)
+}
+
+fn signing_key() -> Option<Vec<u8>> {
+    std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY")
         .ok()
         .and_then(|key_hex| hex::decode(&key_hex).ok())
-        .filter(|key_bytes| key_bytes.len() == 32);
+        .filter(|key_bytes| key_bytes.len() == 32)
+}
+
+fn verify_chain_file(
+    log_path: &Path,
+    expected: &mut Option<ChainState>,
+    allow_retained_anchor: bool,
+    signing_key: Option<&[u8]>,
+) -> Result<u64> {
+    let file = std::fs::File::open(log_path)?;
+    let reader = BufReader::new(file);
+    let mut verified = 0;
 
     for (line_idx, line) in reader.lines().enumerate() {
         let line = line?;
@@ -627,24 +723,34 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
             continue;
         }
         let entry: AuditEvent = serde_json::from_str(&line)?;
+        let expected = expected.get_or_insert_with(|| {
+            if allow_retained_anchor && entry.sequence > 0 {
+                ChainState {
+                    prev_hash: entry.prev_hash.clone(),
+                    sequence: entry.sequence,
+                }
+            } else {
+                genesis_chain_state()
+            }
+        });
 
         // Check sequence continuity
-        if entry.sequence != expected_sequence {
+        if entry.sequence != expected.sequence {
             bail!(
                 "sequence gap at line {}: expected {}, got {}",
                 line_idx + 1,
-                expected_sequence,
+                expected.sequence,
                 entry.sequence
             );
         }
 
         // Check prev_hash linkage
-        if entry.prev_hash != expected_prev_hash {
+        if entry.prev_hash != expected.prev_hash {
             bail!(
                 "prev_hash mismatch at line {} (sequence {}): expected {}, got {}",
                 line_idx + 1,
                 entry.sequence,
-                expected_prev_hash,
+                expected.prev_hash,
                 entry.prev_hash
             );
         }
@@ -663,7 +769,7 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
 
         // Verify signature if present and key is available
         if let Some(ref signature) = entry.signature
-            && let Some(ref key_bytes) = signing_key
+            && let Some(key_bytes) = signing_key
         {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
@@ -691,11 +797,15 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
         }
         // If signature present but key not available, skip verification (backward compat)
 
-        expected_prev_hash = entry.entry_hash.clone();
-        expected_sequence += 1;
+        expected.prev_hash = entry.entry_hash.clone();
+        expected.sequence = expected
+            .sequence
+            .checked_add(1)
+            .context("audit sequence overflow during verification")?;
+        verified += 1;
     }
 
-    Ok(expected_sequence)
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -863,6 +973,159 @@ mod tests {
             std::path::Path::new(&rotated).exists(),
             "rotation must create .1.log backup"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_restart_before_next_append_recovers_retained_tail() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        let logger = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        drop(logger);
+
+        assert!(
+            !log_path.exists(),
+            "the crash window starts after rotation and before a new active append"
+        );
+        let retained_path = rotated_log_path(&log_path, 1);
+        let retained_tail = last_audit_entry(&retained_path)?.expect("retained audit tail");
+
+        let restarted = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        restarted.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+
+        let active = last_audit_entry(&log_path)?.expect("new active audit entry");
+        assert_eq!(active.sequence, retained_tail.sequence + 1);
+        assert_eq!(active.prev_hash, retained_tail.entry_hash);
+        assert_eq!(verify_rotated_chain(&log_path)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_chain_verification_rejects_broken_segment_link() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        let logger = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+
+        let mut active = last_audit_entry(&log_path)?.expect("active audit entry");
+        active.prev_hash = GENESIS_PREV_HASH.to_string();
+        active.entry_hash = compute_entry_hash(&active.prev_hash, &active);
+        std::fs::write(&log_path, format!("{}\n", serde_json::to_string(&active)?))?;
+
+        let error = verify_rotated_chain(&log_path)
+            .expect_err("a segment boundary with the wrong predecessor must fail");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("prev_hash mismatch"),
+            "unexpected verification error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_active_segment_does_not_fall_back_to_retained_tail() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        let logger = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        drop(logger);
+        std::fs::write(&log_path, "malformed audit record\n")?;
+
+        let Err(error) = AuditLogger::new(config(), tmp.path().to_path_buf()) else {
+            bail!("malformed active state must fail closed");
+        };
+        assert!(
+            error.to_string().contains("invalid audit record"),
+            "unexpected recovery error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_chain_verification_rejects_non_genesis_active_only_log() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+
+        let mut active = last_audit_entry(&log_path)?.expect("active audit entry");
+        active.sequence = 1;
+        active.prev_hash = "f".repeat(64);
+        active.entry_hash = compute_entry_hash(&active.prev_hash, &active);
+        std::fs::write(&log_path, format!("{}\n", serde_json::to_string(&active)?))?;
+
+        let error = verify_rotated_chain(&log_path)
+            .expect_err("an active-only audit log must start from genesis");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("sequence gap"),
+            "unexpected verification error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_shift_failure_preserves_active_and_immediate_retained_segment() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+        let retained_path = rotated_log_path(&log_path, 1);
+        let shift_source = rotated_log_path(&log_path, 9);
+        let conflicting_path = rotated_log_path(&log_path, 10);
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        std::fs::write(&shift_source, "retained generation nine\n")?;
+        std::fs::create_dir(&conflicting_path)?;
+        std::fs::write(conflicting_path.join("blocker"), "occupied\n")?;
+
+        let active_before = std::fs::read(&log_path)?;
+        let retained_before = std::fs::read(&retained_path)?;
+        let error = logger
+            .rotate()
+            .expect_err("a retained-generation shift failure must abort rotation");
+
+        assert!(
+            error.to_string().contains("failed to rotate audit segment"),
+            "unexpected rotation error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&log_path)?, active_before);
+        assert_eq!(std::fs::read(&retained_path)?, retained_before);
         Ok(())
     }
 
