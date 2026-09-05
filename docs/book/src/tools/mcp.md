@@ -190,13 +190,32 @@ gated by content shape, not by tool name. Materialization does not auto-deliver
 the file to ACP clients; the agent still calls `deliver_file` when outbound
 delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
 
+The two other binary MCP content shapes are mapped as follows. A `type: "image"`
+item (base64 `data` + `mimeType`) is materialized the same way and its content
+item is rewritten to a text item carrying the `[IMAGE:<path>]` marker, which the
+multimodal pipeline lifts into a native provider image part; the item's
+`annotations`/`_meta` and other non-binary fields are preserved. Only the raster
+formats the vision pipeline accepts are materialized: PNG, JPEG, WebP, and GIF.
+The on-disk extension is derived from the declared `mimeType` (canonicalized to
+its case-insensitive essence, parameters dropped) when it names one of those
+types, otherwise from sniffing the decoded bytes; the extension must match the
+bytes because the loader prefers a path's extension over its magic. An image
+whose type is neither a supported declared type nor a recognized supported
+signature degrades to `[attachment unavailable: …]` and is not written. A
+`type: "audio"` item is **not** materialized in this path, because no provider
+resolves an audio path into content parts today, so its `data` is stripped to a
+non-materializing `[audio attachment: <mime>]` placeholder. In every case the raw base64 never
+reaches the model, including for a malformed image/audio item whose `data` is
+empty or not a string.
+
 Because the result comes from an untrusted server, two per-call bounds are
-enforced before any blob is decoded, hashed, or written: at most **64** resource
-blobs per `tools/call` result, and an estimated aggregate decoded size of at most
-**10 MiB** across all of them. A result that exceeds either bound has every
-resource blob degraded to an `[attachment unavailable: …]` marker and writes
-nothing to disk, so an array of many empty or tiny blobs cannot force per-item
-work. Each individual blob is still bounded by the same 10 MB per-file limit.
+enforced before any payload is decoded, hashed, or written: at most **64**
+materializable binary items (resource blobs plus valid image items) per
+`tools/call` result, and an estimated aggregate decoded size of at most **10 MiB**
+across all of them. A result that exceeds either bound has every such item
+degraded to an `[attachment unavailable: …]` marker and writes nothing to disk,
+so an array of many empty or tiny items cannot force per-item work. Each
+individual payload is still bounded by the same 10 MB per-file limit.
 
 Separate from these *decoded* budgets, each HTTP/SSE MCP server also has a
 transport-level response-body cap, `max_response_bytes`, enforced on the raw
