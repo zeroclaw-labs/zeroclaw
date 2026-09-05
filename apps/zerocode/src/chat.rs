@@ -4501,6 +4501,34 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     Some(Rect::new(x, anchor.y, cells, 1))
 }
 
+fn pinned_preview_source(message: &str, width: u16) -> &str {
+    if width == 0 {
+        return "";
+    }
+
+    let mut has_content = false;
+    let mut cells = 0;
+    for (offset, grapheme, grapheme_width) in crate::display_width::grapheme_widths(message) {
+        // Match Span's control filtering and WordWrapper's oversized-symbol handling.
+        if grapheme.contains(char::is_control) || grapheme_width > usize::from(width) {
+            continue;
+        }
+        if !has_content {
+            if ratatui::text::StyledGrapheme::new(grapheme, Style::default()).is_whitespace() {
+                continue;
+            }
+            has_content = true;
+        }
+        // One positive-width lookahead lets the existing wrapper settle the first
+        // row's word boundary without laying out the invisible message tail.
+        if cells >= usize::from(width) && grapheme_width > 0 {
+            return &message[..offset + grapheme.len()];
+        }
+        cells += grapheme_width;
+    }
+    message
+}
+
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.refresh_title_hit_rects(area);
     state.expire_copy_feedback();
@@ -4539,7 +4567,10 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     if first_row_h == 1 {
         let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
         let msg = state.first_message.as_deref().unwrap_or_default();
-        let line = Line::from(Span::styled(msg.to_string(), theme::dim_style()));
+        let line = Line::from(Span::styled(
+            pinned_preview_source(msg, first_row.width),
+            theme::dim_style(),
+        ));
         f.render_widget(Paragraph::new(line).wrap(Wrap { trim: true }), first_row);
     }
 
@@ -14159,6 +14190,69 @@ mod tests {
         );
         s.session_name = Some("my work".to_string());
         assert_eq!(s.title(), "personal_code  — my work  40be773");
+    }
+
+    fn pinned_preview_buffer(message: &str, width: u16) -> ratatui::buffer::Buffer {
+        use ratatui::widgets::Widget;
+
+        let area = Rect::new(0, 0, width, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new(Line::from(Span::styled(message, theme::dim_style())))
+            .wrap(Wrap { trim: true })
+            .render(area, &mut buffer);
+        buffer
+    }
+
+    #[test]
+    fn pinned_preview_preserves_wrapped_first_row() {
+        let messages = [
+            "",
+            "   ",
+            "one two three four five",
+            "  original ask with leading space",
+            "a verylongunbrokenwordandmore",
+            "word       another word",
+            "line one\nline two\tand more",
+            "\u{754c}\u{754c} a \u{754c}bc",
+            "e\u{301} \u{26a0}\u{fe0f} \u{1f469}\u{200d}\u{1f4bb} next word",
+            "\u{200b} a\u{a0}b \u{200b}c",
+        ];
+        for message in messages {
+            for width in 0..=24 {
+                assert_eq!(
+                    pinned_preview_buffer(pinned_preview_source(message, width), width),
+                    pinned_preview_buffer(message, width),
+                    "message {message:?}, width {width}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_preview_long_message_only_borrows_visible_prefix() {
+        for message in ["word ".repeat(100_000), "x".repeat(500_000)] {
+            let preview = pinned_preview_source(&message, 80);
+            assert_eq!(preview.len(), 81);
+            assert_eq!(preview.as_ptr(), message.as_ptr());
+            assert_eq!(
+                pinned_preview_buffer(preview, 80),
+                pinned_preview_buffer(&message, 80),
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_preview_keeps_grapheme_clusters_and_recomputes_for_width() {
+        let message = "\u{1f469}\u{200d}\u{1f4bb}".repeat(1000);
+        for width in [2, 3, 8, 20] {
+            let preview = pinned_preview_source(&message, width);
+            assert_eq!(preview.chars().count() % 3, 0);
+            assert!(preview.len() <= (usize::from(width) / 2 + 2) * 11);
+            assert_eq!(
+                pinned_preview_buffer(preview, width),
+                pinned_preview_buffer(&message, width),
+            );
+        }
     }
 
     #[test]
