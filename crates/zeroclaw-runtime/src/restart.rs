@@ -38,6 +38,15 @@ pub fn record_launch() {
     });
 }
 
+/// Return the executable path captured for daemon self-respawn.
+///
+/// Once the daemon has recorded its launch command, this remains stable even
+/// after an in-app upgrade replaces the on-disk binary and `current_exe()`
+/// would resolve to an unspawnable "... (deleted)" path on Linux.
+pub fn recorded_launch_executable() -> Option<&'static std::path::Path> {
+    LAUNCH.get().map(|command| command.exe.as_path())
+}
+
 /// Request a self-respawn after the daemon shuts down. The caller is expected to
 /// also trigger the daemon's graceful shutdown so the loop tears down first.
 pub fn request_respawn() {

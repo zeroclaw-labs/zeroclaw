@@ -4691,25 +4691,36 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    let running_executable =
+        running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
         .degraded_sections
         .iter()
         .chain(config.degraded_security.iter())
     {
-        eprintln!(
-            "{}",
+        let path = config.config_path.display().to_string();
+        let warning = if let Some(executable) = running_executable.as_deref() {
             ta(
                 "cli-config-section-degraded",
                 &[
                     ("section", section),
-                    ("path", &config.config_path.display().to_string()),
+                    ("path", &path),
+                    ("executable", executable),
                 ],
                 "warning: config section is malformed and was reset to defaults \
-                 for this run. Values in that section are NOT in effect. Run \
-                 `zeroclaw config migrate` to see the parse error, then repair \
-                 the file."
+                 for this run. Values in that section are NOT in effect. Use the \
+                 running executable with `config migrate` to see the parse error, \
+                 then repair the file.",
             )
-        );
+        } else {
+            format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. The running \
+                 executable path could not be resolved; repair the file through a daemon-owned \
+                 config surface instead of an unqualified PATH command."
+            )
+        };
+        eprintln!("{warning}");
     }
     for section in &config.retired_wati_config_sections {
         let fallback = format!(
@@ -9409,6 +9420,20 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     );
 }
 
+fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::restart::recorded_launch_executable()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_exe().ok())
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -9418,13 +9443,27 @@ fn gate_security_posture(
     }
     let sections = config.degraded_security.join(", ");
     if !allow_degraded {
+        let remediation_executable = running_executable_for_remediation();
+        let remediation = remediation_executable.map_or_else(
+            || {
+                "The running executable path could not be resolved; use a daemon-owned repair \
+                 surface such as the gateway config editor instead of an unqualified PATH command."
+                    .to_string()
+            },
+            |exe| {
+                format!(
+                    "Running executable: {}. Use that executable with `config migrate` to see \
+                     the precise error.",
+                    exe.display()
+                )
+            },
+        );
         anyhow::bail!(
             "Config contains malformed security-critical sections ({sections}); \
              they were reset to defaults, so the running posture may be weaker \
              than intended. Refusing to serve with a degraded security posture. \
-             Repair these sections in {} and restart — run `zeroclaw config \
-             migrate` to see the precise error. To boot anyway (e.g. to reach \
-             the gateway config editor and repair from there), re-run with \
+             Repair these sections in {} and restart — {remediation} To boot anyway \
+             (e.g. to reach the gateway config editor and repair from there), re-run with \
              `--allow-degraded-security`.",
             config.config_path.display()
         );
