@@ -559,6 +559,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel(256);
         crate::broadcast::set_broadcast_hook(tx);
 
+        crate::writer::record_event(crate::event::LogEvent::new(
+            crate::event::Severity::Info,
+            "migration-test",
+            crate::event::EventCategory::Internal,
+        ));
+
         // Real entry point: installs the capture layer *and* the bridge.
         crate::try_install_capture_subscriber();
 
@@ -657,9 +663,13 @@ mod tests {
                 "every bridged message body must be the fixed marker: {record}"
             );
         }
+        let bridged_broadcast_count = broadcast
+            .iter()
+            .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
+            .filter(|frame| frame["attributes"]["log.target"].is_string())
+            .count();
         assert_eq!(
-            broadcast.len(),
-            BRIDGED_RECORD_COUNT,
+            bridged_broadcast_count, BRIDGED_RECORD_COUNT,
             "every third-party record must also reach the live broadcast: {broadcast:?}"
         );
 
