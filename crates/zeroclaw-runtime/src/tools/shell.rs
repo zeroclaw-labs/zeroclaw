@@ -112,6 +112,24 @@ impl ShellTool {
         self
     }
 
+    /// Name of the sandbox backend actually wired into this instance (e.g.
+    /// `"none"`, `"landlock"`, `"firejail"`). Used by delegation regression
+    /// tests to prove a Bounded cross-profile target keeps its own configured
+    /// sandbox instead of silently losing it to `NoopSandbox`.
+    #[cfg(test)]
+    pub(crate) fn sandbox_name(&self) -> &str {
+        self.sandbox.name()
+    }
+
+    /// The resolved command execution timeout, in seconds. Used by delegation
+    /// regression tests to prove a Bounded cross-profile target's rebuilt
+    /// shell tool inherits the correct timeout, including the "0 means the
+    /// global default" contract.
+    #[cfg(test)]
+    pub(crate) fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
     /// Overlay the TUI client's environment on top of the safe-env snapshot.
     /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
     /// calling this method at all).

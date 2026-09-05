@@ -380,6 +380,27 @@ pub struct SecurityPolicy {
 }
 
 impl SecurityPolicy {
+    /// Synthesize a [`crate::schema::SandboxConfig`] from this policy's own
+    /// `sandbox_enabled`/`sandbox_backend`/`firejail_args` fields — mirrors
+    /// `RiskProfileConfig::sandbox_config()` exactly, for callers (like a
+    /// `Bounded` delegate's target reconstruction) that only have a
+    /// `SecurityPolicy`, not the `RiskProfileConfig` it was built from.
+    #[must_use]
+    pub fn sandbox_config(&self) -> crate::schema::SandboxConfig {
+        let backend = self
+            .sandbox_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::schema::parse_sandbox_backend)
+            .unwrap_or_default();
+        crate::schema::SandboxConfig {
+            enabled: self.sandbox_enabled,
+            backend,
+            firejail_args: self.firejail_args.clone(),
+        }
+    }
+
     /// True when `name` is admissible under the current policy.
     /// `allowed_tools = None` is unrestricted; `Some(list)` is the
     /// allowlist. `excluded_tools` always subtracts.

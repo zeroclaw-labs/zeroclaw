@@ -1143,6 +1143,178 @@ impl McpRegistry {
         }
     }
 
+    /// Name of the server that owns `prefixed_name`, resolved through the
+    /// routing index rather than by parsing the name.
+    ///
+    /// `<server>__<tool>` is not decodable: a server may itself be named with
+    /// the separator, so `foo__admin__wipe` is a legitimate reading as both
+    /// `foo`/`admin__wipe` and `foo__admin`/`wipe`. Only the index knows which
+    /// one this registry actually routes.
+    #[must_use]
+    pub fn server_name_for(&self, prefixed_name: &str) -> Option<&str> {
+        let (server_idx, _) = self.tool_index.get(prefixed_name)?;
+        self.server_index
+            .iter()
+            .find(|(_, idx)| *idx == server_idx)
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Test-only: a registry holding ONE server that answers every request
+    /// with `result`, and whose tool index maps `<server_name>__<tool_name>`
+    /// onto it.
+    ///
+    /// This is the counterpart to [`Self::for_test_make_stub_server`], which
+    /// deliberately refuses requests and leaves the tool index empty: those
+    /// registries can be compared for identity but never called. A test that
+    /// needs to observe what a CONSUMER does with a tool result - notably the
+    /// embedded-resource materialization, whose destination directory comes
+    /// from the calling wrapper's own captured policy rather than from the
+    /// payload - has to get a payload back, which is what this provides.
+    ///
+    /// Gated behind `test-helpers`, which no production dependency edge
+    /// enables, so scripted transports do not exist in shipped builds.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_scripted_tool(
+        server_name: &str,
+        tool_name: &str,
+        result: serde_json::Value,
+    ) -> Self {
+        Self::for_test_with_scripted_tools(server_name, &[tool_name], result)
+    }
+
+    /// [`Self::for_test_with_scripted_tool`] with several tools on the one
+    /// server, so a test can distinguish admission per tool name rather than
+    /// per server.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_scripted_tools(
+        server_name: &str,
+        tool_names: &[&str],
+        result: serde_json::Value,
+    ) -> Self {
+        Self::for_test_with_scripted_tools_inner(server_name, tool_names, result, false)
+    }
+
+    /// [`Self::for_test_with_scripted_tools`] whose tools answer by reflecting
+    /// the arguments they were called with.
+    #[cfg(feature = "test-helpers")]
+    pub fn for_test_with_echoing_tool(server_name: &str, tool_name: &str) -> Self {
+        Self::for_test_with_scripted_tools_inner(
+            server_name,
+            &[tool_name],
+            serde_json::Value::Null,
+            true,
+        )
+    }
+
+    #[cfg(feature = "test-helpers")]
+    fn for_test_with_scripted_tools_inner(
+        server_name: &str,
+        tool_names: &[&str],
+        result: serde_json::Value,
+        echo_arguments: bool,
+    ) -> Self {
+        use crate::mcp_protocol::{JsonRpcResponse, McpToolDef};
+        use async_trait::async_trait;
+
+        struct ScriptedTransport {
+            result: serde_json::Value,
+            /// Reflect the call's arguments back in the payload instead of
+            /// answering with `result`. Tests that assert a tool's OUTPUT
+            /// reached the next model request need the answer to depend on
+            /// the input; a fixed payload cannot show that the call carried
+            /// anything.
+            echo_arguments: bool,
+        }
+
+        #[async_trait]
+        impl SharedMcpTransportConn for ScriptedTransport {
+            async fn send_and_recv(
+                &self,
+                request: &JsonRpcRequest,
+                _lifecycle: &McpRequestLifecycle,
+            ) -> Result<JsonRpcResponse> {
+                let result = if self.echo_arguments {
+                    let arguments = request
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("arguments").cloned())
+                        .unwrap_or(serde_json::Value::Null);
+                    // `echo:<value>` rather than the raw arguments: a caller
+                    // asserting that a tool RESULT reached the next model
+                    // request needs the result to be distinguishable from the
+                    // arguments, which appear in that same request anyway as
+                    // part of the assistant's tool call. Echoing them verbatim
+                    // would make such an assertion pass without the tool ever
+                    // having run.
+                    let echoed = match arguments.get("value").and_then(|v| v.as_str()) {
+                        Some(value) => format!("echo:{value}"),
+                        None => format!("echo:{arguments}"),
+                    };
+                    serde_json::json!({"content": [{"type": "text", "text": echoed}]})
+                } else {
+                    self.result.clone()
+                };
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id.clone(),
+                    result: Some(result),
+                    error: None,
+                })
+            }
+
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(ScriptedTransport {
+            result,
+            echo_arguments,
+        });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: server_name.to_string(),
+                ..McpServerConfig::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(0),
+            tools: tool_names
+                .iter()
+                .map(|name| McpToolDef {
+                    name: (*name).to_string(),
+                    description: Some(format!("scripted test tool {name}")),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                })
+                .collect(),
+            capabilities: McpServerCapabilities::default(),
+        };
+        let server = McpServer {
+            inner: std::sync::Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        };
+
+        let mut tool_index = HashMap::new();
+        for name in tool_names {
+            tool_index.insert(
+                format!("{server_name}__{name}"),
+                (0usize, (*name).to_string()),
+            );
+        }
+        let mut server_index = HashMap::new();
+        server_index.insert(server_name.to_string(), 0usize);
+
+        Self {
+            servers: vec![server],
+            tool_index,
+            server_index,
+        }
+    }
+
     /// All prefixed tool names across all connected servers.
     pub fn tool_names(&self) -> Vec<String> {
         self.tool_index.keys().cloned().collect()
