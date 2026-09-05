@@ -3993,17 +3993,18 @@ impl Config {
     }
 
     /// Return the first concrete `model` string available for use as a
-    /// default. Scans every typed slot's entries (iteration order is
-    /// the macro slot order) for one with `model` set. Returns `None`
-    /// only when no model-provider entry has any model configured at
-    /// all.
+    /// default: the model declared by the first entry that has one, in the
+    /// deterministic order of [`ModelProviders::first_entry_with_model`].
+    /// Returns `None` only when no model-provider entry has any model
+    /// configured at all.
     #[must_use]
     pub fn resolve_default_model(&self) -> Option<String> {
         self.providers
             .models
-            .iter_entries()
-            .filter_map(|(_, _, base)| base.model.as_deref().map(str::trim))
-            .find(|m| !m.is_empty())
+            .first_entry_with_model()
+            .and_then(|(_, _, base)| base.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
             .map(ToString::to_string)
     }
 
