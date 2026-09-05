@@ -87,7 +87,8 @@ impl SqliteSessionBackend {
                 created_at   TEXT NOT NULL,
                 last_activity TEXT NOT NULL,
                 message_count INTEGER NOT NULL DEFAULT 0,
-                name         TEXT
+                name         TEXT,
+                transcript_incomplete INTEGER NOT NULL DEFAULT 0
              );
 
              CREATE TABLE IF NOT EXISTS jsonl_import_receipts (
@@ -148,6 +149,13 @@ impl SqliteSessionBackend {
             (
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
+            ),
+            (
+                // Durable gateway transcript intent marker. The default is
+                // complete so existing sessions remain readable.
+                "transcript_incomplete",
+                "ALTER TABLE session_metadata ADD COLUMN transcript_incomplete \
+                 INTEGER NOT NULL DEFAULT 0",
             ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
@@ -458,10 +466,31 @@ impl SqliteSessionBackend {
             .context("Failed to enumerate JSONL sessions for SQLite migration")?;
 
         let mut candidates: Vec<(String, String, PathBuf, PathBuf, PathBuf, bool)> = Vec::new();
+        let mut incomplete_markers: Vec<(String, PathBuf)> = Vec::new();
         for entry in entries {
             let entry = entry.context("Failed to inspect JSONL session directory entry")?;
             let file_name = entry.file_name();
             let file_path = Path::new(&file_name);
+            // Durable JSONL transcript intent markers (`<key>.jsonl.incomplete`)
+            // are migrated into the SQLite marker column after their session
+            // import, or on their own when a failed first append left only the
+            // marker behind.
+            let is_incomplete_marker = file_path
+                .extension()
+                .is_some_and(|extension| extension == "incomplete")
+                && file_path
+                    .file_stem()
+                    .and_then(|stem| Path::new(stem).extension())
+                    .is_some_and(|extension| extension == "jsonl");
+            if is_incomplete_marker {
+                if let Some(key) = file_name
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".jsonl.incomplete"))
+                {
+                    incomplete_markers.push((key.to_owned(), entry.path()));
+                }
+                continue;
+            }
             let is_live = file_path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl");
@@ -507,6 +536,7 @@ impl SqliteSessionBackend {
         candidates.sort_by(|left, right| right.5.cmp(&left.5).then(left.0.cmp(&right.0)));
 
         let mut migrated = 0;
+        let mut imported_keys: Vec<String> = Vec::new();
         for (name, key, live_path, staged_path, migrated_path, staged) in candidates {
             let candidate_may_have_committed_receipt = staged && has_committed_import;
             if staged {
@@ -754,6 +784,24 @@ impl SqliteSessionBackend {
                 );
             }
             migrated += 1;
+            imported_keys.push(key);
+        }
+
+        for (key, marker_path) in incomplete_markers {
+            if !marker_path.exists() {
+                continue;
+            }
+            if self.mark_transcript_incomplete(&key).is_err() {
+                continue;
+            }
+            let migrated_marker = marker_path.with_extension("incomplete.migrated");
+            if std::fs::rename(&marker_path, &migrated_marker).is_err() {
+                continue;
+            }
+            // A session whose JSONL body was imported above is already counted.
+            if !imported_keys.iter().any(|imported| imported == &key) {
+                migrated += 1;
+            }
         }
 
         Ok(migrated)
@@ -820,6 +868,44 @@ impl SessionBackend for SqliteSessionBackend {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+    }
+
+    fn mark_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (
+                session_key, created_at, last_activity, message_count, transcript_incomplete
+             ) VALUES (?1, ?2, ?3, 0, 1)
+             ON CONFLICT(session_key) DO UPDATE SET transcript_incomplete = 1",
+            params![session_key, now, now],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE session_metadata SET transcript_incomplete = 0 WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn transcript_incomplete(&self, session_key: &str) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT transcript_incomplete != 0 FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            other => Err(other),
+        })
+        .map_err(std::io::Error::other)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -1665,6 +1751,36 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert!(!backend.delete_session("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn transcript_intent_marker_survives_restart_until_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let key = "restart_incomplete";
+
+        {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend.mark_transcript_incomplete(key).unwrap();
+            backend.append(key, &ChatMessage::user("partial")).unwrap();
+            assert!(backend.transcript_incomplete(key).unwrap());
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(backend.transcript_incomplete(key).unwrap());
+        backend.clear_transcript_incomplete(key).unwrap();
+        assert!(!backend.transcript_incomplete(key).unwrap());
+    }
+
+    #[test]
+    fn delete_session_removes_marker_even_without_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let key = "marker_only";
+
+        backend.mark_transcript_incomplete(key).unwrap();
+        assert!(backend.delete_session(key).unwrap());
+        assert!(!backend.transcript_incomplete(key).unwrap());
+        assert!(!backend.delete_session(key).unwrap());
     }
 
     #[test]
@@ -2806,5 +2922,56 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+    #[test]
+    fn migrate_from_jsonl_preserves_incomplete_marker() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = tmp
+            .path()
+            .join("sessions")
+            .join("poisoned.jsonl.incomplete");
+        {
+            let store = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+            store
+                .append("poisoned", &ChatMessage::user("partial"))
+                .unwrap();
+            store.mark_transcript_incomplete("poisoned").unwrap();
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(backend.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        assert!(backend.transcript_incomplete("poisoned").unwrap());
+        assert!(!marker_path.exists());
+        assert!(
+            tmp.path()
+                .join("sessions")
+                .join("poisoned.jsonl.incomplete.migrated")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn transcript_intent_column_migrates_existing_database() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        {
+            let conn = rusqlite::Connection::open(sessions_dir.join("sessions.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session_metadata (
+                    session_key TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    last_activity TEXT NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    name TEXT
+                 );",
+            )
+            .unwrap();
+        }
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert!(!backend.transcript_incomplete("legacy").unwrap());
+        backend.mark_transcript_incomplete("legacy").unwrap();
+        assert!(backend.transcript_incomplete("legacy").unwrap());
     }
 }

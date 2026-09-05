@@ -87,6 +87,36 @@ pub trait SessionBackend: Send + Sync {
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
 
+    /// Persist an intent marker before a gateway transcript mutation begins.
+    ///
+    /// The marker must survive process restart and remain set until
+    /// [`Self::clear_transcript_incomplete`] or [`Self::delete_session`]
+    /// succeeds. Backends that do not implement durable markers fail closed:
+    /// gateway writers must not start a mutation that could become partial.
+    fn mark_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session backend does not support durable transcript intent markers",
+        ))
+    }
+
+    /// Clear the durable intent marker after every transcript write succeeds.
+    fn clear_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session backend does not support durable transcript intent markers",
+        ))
+    }
+
+    /// Return whether an earlier transcript mutation did not finish cleanly.
+    ///
+    /// The default is unmarked for compatibility with read-only uses of
+    /// third-party backends. A gateway write still fails closed at
+    /// [`Self::mark_transcript_incomplete`] unless the backend opts in.
+    fn transcript_incomplete(&self, _session_key: &str) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 

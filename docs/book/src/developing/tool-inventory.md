@@ -43,7 +43,7 @@ product integrations.
 | `cron_add`, `cron_list`, `cron_remove`, `cron_update`, `cron_run`, `cron_runs`, `schedule` | Scheduling affects autonomous execution, ownership, and run history; keep it policy-visible in core. |
 | `spawn_subagent`, `delegate`, `send_message_to_peer` | Delegation is part of the agent execution model and must share risk profiles, tools, memory, and parent/child constraints. |
 | `ask_user`, `escalate_to_human`, `reaction`, `poll`, `channel_room` | These are channel-bridging operator interaction primitives with late-bound channel handles and receipts. |
-| `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | Session visibility and message sending must share the daemon/gateway session backend and agent ownership boundaries. |
+| `sessions_current`, `sessions_list`, `sessions_history`, `sessions_send` | Session visibility and message sending must share the daemon/gateway session backend and agent ownership boundaries. Generic `sessions_send` excludes gateway-owned `gw_` sessions; external gateway-session writes use the authenticated `POST /api/sessions/<id>/messages` operation so `SessionLifecycle` remains authoritative. |
 | `model_routing_config`, `model_switch`, `proxy_config` | These expose the current model/proxy routing control plane and should not drift from config-source behavior. |
 | `TodoWrite` | Maintains the agent's structured task list inside the runtime tool surface; keep its stable tool name and lifecycle behavior in core. |
 | `read_skill` and skill-defined tools with `kind = "shell"`, `kind = "http"`, or `kind = "builtin"` | Skills are an intended extension surface, but the runtime bridge that turns installed skills into tools is core. |

@@ -68,6 +68,7 @@ let configPutCalls: ConfigPutRequest[] = [];
 // Session ids the mocked gateway reports as already gone / failing on DELETE.
 let missingSessions = new Set<string>();
 let deleteFailures = new Set<string>();
+let abortCalls: string[] = [];
 let configPutHandler: ((request: ConfigPutRequest) => Promise<Response>) | null = null;
 
 globalThis.fetch = async (input, init) => {
@@ -102,6 +103,12 @@ globalThis.fetch = async (input, init) => {
       return new Response('{"error":"Session not found"}', { status: 404 });
     }
     body = { deleted: true, session_id: id };
+  }
+  else if (/\/api\/sessions\/[^/]+\/abort$/.test(url) && init?.method === 'POST') {
+    const segments = url.split('/');
+    const id = decodeURIComponent(segments[segments.length - 2] ?? '');
+    abortCalls.push(id);
+    body = { status: 'aborted' };
   }
   else return new Response('{"error":"not found"}', { status: 404 });
   return new Response(JSON.stringify(body), {
@@ -167,6 +174,7 @@ class FakeSocket implements SessionSocket {
 }
 
 type MessageFactory = () => Promise<SessionMessagesResponse>;
+type StateFactory = () => Promise<import('../types/api.ts').SessionStateResponse>;
 type DeleteFactory = () => Promise<{ deleted: boolean }>;
 
 class FakeSessionRuntime implements AgentSessionRuntime {
@@ -174,7 +182,9 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly deleteCalls: string[] = [];
   readonly renameCalls: Array<{ id: string; name: string }> = [];
   readonly messageCalls: string[] = [];
+  readonly stateCalls: string[] = [];
   readonly messagePlans = new Map<string, MessageFactory[]>();
+  readonly statePlans = new Map<string, StateFactory[]>();
   readonly deletePlans = new Map<string, DeleteFactory[]>();
   readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
   mintedIds: string[] = [];
@@ -189,6 +199,12 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     this.messageCalls.push(sessionId);
     const plan = this.messagePlans.get(sessionId)?.shift();
     return plan ? plan() : Promise.resolve(messagesResponse(sessionId, true));
+  }
+
+  getState(sessionId: string): Promise<import('../types/api.ts').SessionStateResponse> {
+    this.stateCalls.push(sessionId);
+    const plan = this.statePlans.get(sessionId)?.shift();
+    return plan ? plan() : Promise.resolve({ session_id: sessionId, state: 'idle', session_persistence: true });
   }
 
   delete(sessionId: string): Promise<{ deleted: boolean }> {
@@ -213,6 +229,12 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     const plans = this.messagePlans.get(sessionId) ?? [];
     plans.push(plan);
     this.messagePlans.set(sessionId, plans);
+  }
+
+  queueState(sessionId: string, plan: StateFactory): void {
+    const plans = this.statePlans.get(sessionId) ?? [];
+    plans.push(plan);
+    this.statePlans.set(sessionId, plans);
   }
 
   queueDelete(sessionId: string, plan: DeleteFactory): void {
@@ -341,6 +363,12 @@ async function goToSession(mounted: MountedChat, sessionId: string): Promise<boo
   return accepted;
 }
 
+async function wait(ms: number): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  });
+}
+
 async function unmount(renderer: ReactTestRenderer): Promise<void> {
   await act(async () => { renderer.unmount(); });
 }
@@ -348,6 +376,7 @@ async function unmount(renderer: ReactTestRenderer): Promise<void> {
 beforeEach(() => {
   storage.clear();
   configPutCalls = [];
+  abortCalls = [];
   missingSessions = new Set();
   deleteFailures = new Set();
   configPutHandler = null;
@@ -1003,5 +1032,172 @@ test('session switch disconnects both the effect-owned and replacement sockets',
   });
   assert.equal(mounted.context().messages.some((message) =>
     message.content === 'stale replacement'), false);
+  await unmount(mounted.renderer);
+});
+
+test('detached turn: disconnect during turn, reconnect locks composer, hydrates on completion, and accepts follow-up', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, [])));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  // Initial state: composer ready, not typing, Send button visible
+  assert.equal(mounted.context().typing, false);
+  const findButton = (ariaLabel: string) =>
+    mounted.renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === ariaLabel);
+  assert.ok(findButton('Send'));
+  assert.equal(findButton('Stop'), undefined);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+
+  // Send first message
+  await typeInComposer(mounted.renderer, 'First prompt');
+  const sendBtn = findButton('Send');
+  assert.ok(sendBtn);
+  await act(async () => { sendBtn.props.onClick(); });
+  await settle();
+  assert.deepEqual(runtime.sockets[0]?.sent, ['First prompt']);
+
+  // Turn starts running
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'thinking', content: 'Processing turn...' });
+  });
+  await settle();
+  assert.equal(mounted.context().typing, true);
+  assert.ok(findButton('Stop'));
+  assert.equal(findButton('Send'), undefined);
+  assert.equal(textarea(mounted.renderer).props.disabled, true);
+
+  // Viewer disconnects while turn is running (detached turn)
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await settle();
+
+  // Operator reconnects: prepare next state polls & completion hydration
+  // First poll sees running, second poll sees idle
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'running', session_persistence: true }));
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+  // Mount hydration while running
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['First prompt'])));
+  // Post-completion hydration after turn completes
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['First prompt', 'Persisted answer'])));
+
+  // Simulate viewer remount/reconnect on session A
+  await unmount(mounted.renderer);
+  const reconnected = await mountChat(runtime, true);
+  // Socket 1 created on remount
+  await openSocket(runtime, 1);
+  await settle();
+
+  // While running on reconnect: composer is locked (disabled, placeholder Running..., Stop button visible)
+  assert.equal(reconnected.context().typing, true);
+  assert.equal(textarea(reconnected.renderer).props.disabled, true);
+  assert.equal(textarea(reconnected.renderer).props.placeholder, 'Running…');
+  const findReconnectedButton = (ariaLabel: string) =>
+    reconnected.renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === ariaLabel);
+  assert.ok(findReconnectedButton('Stop'), 'Stop button must be shown while running');
+  assert.equal(findReconnectedButton('Send'), undefined, 'Send button must not exist while running');
+
+  // Let the poll interval elapse (SESSION_RECOVERY_POLL_MS is 500ms)
+  await wait(550);
+
+  // Recovery observes idle, hydrates history, and recycles socket once
+  // Socket 2 is created by shouldRecycleSocketAfterRecovery
+  assert.equal(runtime.sockets.length, 3);
+  await openSocket(runtime, 2);
+  await settle();
+
+  // Turn is complete: typing unlocked, composer enabled, Send button visible
+  assert.equal(reconnected.context().typing, false);
+  assert.equal(textarea(reconnected.renderer).props.disabled, false);
+  assert.ok(findReconnectedButton('Send'));
+  assert.equal(findReconnectedButton('Stop'), undefined);
+
+  // Hydrated transcript contains completed turn without duplicates
+  const messageContents = reconnected.context().messages.map((m) => m.content);
+  assert.deepEqual(messageContents, ['First prompt', 'Persisted answer']);
+
+  // Dependent follow-up continuity: composer accepts new input and sends on the recycled socket
+  await typeInComposer(reconnected.renderer, 'Follow-up prompt');
+  const followUpSend = findReconnectedButton('Send');
+  assert.ok(followUpSend);
+  await act(async () => { followUpSend.props.onClick(); });
+  await settle();
+
+  assert.deepEqual(runtime.sockets[2]?.sent, ['Follow-up prompt']);
+  await unmount(reconnected.renderer);
+});
+
+test('detached turn: explicit Stop aborts in-flight turn and unlocks composer', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, ['Long running task'])));
+  // Reconnect sees running
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'running', session_persistence: true }));
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  // Running: composer is locked
+  assert.equal(mounted.context().typing, true);
+  const stopBtn = mounted.renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Stop');
+  assert.ok(stopBtn, 'Stop button must be rendered while running');
+
+  // Operator clicks Stop
+  await act(async () => { stopBtn.props.onClick(); });
+  await settle();
+
+  // Server received abort call for session A
+  assert.deepEqual(abortCalls, ['A']);
+
+  // Server emits aborted frame on socket
+  await act(async () => {
+    runtime.sockets[0]!.emitMessage({ type: 'aborted' });
+  });
+  await settle();
+
+  // Typing unlocked, composer enabled, Send button visible
+  assert.equal(mounted.context().typing, false);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+  const sendBtn = mounted.renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Send');
+  assert.ok(sendBtn);
+  await unmount(mounted.renderer);
+});
+
+test('detached turn: recovery failure locks composer and offers retry which recovers', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true, [])));
+  // Reconnect state check fails with 401 Unauthorized (terminal status)
+  runtime.queueState('A', () => Promise.reject(new HttpError(401, 'Unauthorized')));
+
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  // Terminal failure blocks sending and offers Retry
+  assert.equal(mounted.context().typing, true);
+  assert.ok(mounted.context().error);
+  assert.equal(mounted.context().recoveryActionLabel, 'Retry');
+
+  const retryButton = mounted.renderer.root.findAllByType('button')
+    .find((b) => nodeText(b) === 'Retry');
+  assert.ok(retryButton, 'Retry button must be visible in error banner');
+  assert.equal(textarea(mounted.renderer).props.disabled, true);
+
+  // Now server/credentials recover: next state poll succeeds with idle
+  runtime.queueState('A', () => Promise.resolve({ session_id: 'A', state: 'idle', session_persistence: true }));
+
+  // Operator clicks Retry
+  await act(async () => { retryButton.props.onClick(); });
+  await settle();
+
+  // Recovery succeeds: error cleared, typing unlocked, composer usable
+  assert.equal(mounted.context().error, null);
+  assert.equal(mounted.context().recoveryActionLabel, null);
+  assert.equal(mounted.context().typing, false);
+  assert.equal(textarea(mounted.renderer).props.disabled, false);
+  const sendBtn = mounted.renderer.root.findAllByType('button').find((b) => b.props['aria-label'] === 'Send');
+  assert.ok(sendBtn);
+
   await unmount(mounted.renderer);
 });

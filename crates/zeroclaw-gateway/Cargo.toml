@@ -92,6 +92,7 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 # non-TLS loopback connection needs only the `connect` feature, no TLS.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 wiremock = "0.6"
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 
 [features]
 default = ["schema-export", "a2a"]

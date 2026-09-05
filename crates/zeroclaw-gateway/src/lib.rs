@@ -38,6 +38,8 @@ pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
 pub mod security_headers;
+pub mod session_identity;
+pub mod session_lifecycle;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
@@ -557,6 +559,22 @@ pub struct AppState {
     pub cancel_tokens: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
+    /// Per-session monotonic turn-completion version. Bumped exactly once,
+    /// at the end of `process_chat_message`, right after a turn's messages
+    /// are persisted and its cancel token is removed. A connection compares
+    /// this (read under the `session_queue` permit, so no other turn for
+    /// this session can be mid-completion) against the `seen_version` its
+    /// `Agent` was last known to reflect, to decide whether it must
+    /// rehydrate before running a prompt — see `ws::process_chat_message`
+    /// and the two `session_queue.acquire` call sites in `ws::handle_socket`.
+    /// Missing key == version 0 (no turn has ever completed for this
+    /// session yet).
+    pub session_turn_versions: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// Authoritative session lifecycle state for writers that queue behind a
+    /// `session_queue` permit: per-session deletion generations and
+    /// in-progress turn finalization. Backend existence probes cannot answer
+    /// either question — see [`session_lifecycle::SessionLifecycle`].
+    pub session_lifecycle: Arc<session_lifecycle::SessionLifecycle>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -1570,6 +1588,8 @@ pub async fn run_gateway(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_turn_versions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -4380,6 +4400,10 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5289,6 +5313,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5375,6 +5403,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6048,6 +6080,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6954,6 +6990,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7073,6 +7113,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7172,6 +7216,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7377,6 +7425,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7463,6 +7515,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7554,6 +7610,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7650,6 +7710,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7742,6 +7806,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7842,6 +7910,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7993,6 +8065,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
@@ -8871,6 +8947,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8956,6 +9036,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -9566,6 +9650,10 @@ path = "{trigger_path}"
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
