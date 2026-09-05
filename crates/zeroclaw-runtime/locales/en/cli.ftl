@@ -1136,6 +1136,16 @@ cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: m
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-delegate-error-output-token-limit = Agent '{$agent_name}' failed: the provider reached its output token limit before completing the response.
+cli-delegate-error-context-window = Agent '{$agent_name}' failed: the provider reached its context window before completing the response.
+cli-delegate-error-paused-turn = Agent '{$agent_name}' failed: the provider paused the turn before completing the response.
+cli-delegate-error-refusal = Agent '{$agent_name}' failed: the provider refused before completing the response.
+cli-agent-error-output-token-limit = The provider reached its output token limit before completing the response.
+cli-agent-error-context-window = The provider reached its context window before completing the response.
+cli-agent-error-paused-turn = The provider paused the turn before completing the response.
+cli-agent-error-refusal = The provider refused before completing the response.
+cli-delegate-error-invalid-terminal-reason = Agent '{$agent_name}' failed: the provider ended with an invalid terminal response state.
+cli-agent-error-invalid-terminal-reason = The provider ended with an invalid terminal response state.
 cli-agent-vision-unsupported-by-fallback = received {$marker_count} image marker(s), but fallback model_provider={$fallback_name} does not support vision input
 cli-agent-vision-unsupported-by-provider = received {$marker_count} image marker(s), but this model_provider does not support vision input
 cli-agent-error-provider-context-window = The request is too large for the selected model. Reduce the conversation or choose a model with a larger context window.

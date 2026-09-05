@@ -17,8 +17,7 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_providers::{ChatMessage, ChatResponse, ToolCall};
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, build_native_assistant_history_from_parsed_calls,
-    looks_like_tool_protocol_example, parse_tool_calls, strip_think_tags,
-    strip_trailing_terminal_markers,
+    looks_like_tool_protocol_example, normalize_terminal_display_text, parse_tool_calls,
 };
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -136,10 +135,7 @@ pub(crate) async fn interpret_chat_response(
 ) -> InterpretedResponse {
     let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
 
-    let response_text = strip_think_tags(resp.text_or_empty());
-    // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
-    // Handles stacked markers with arbitrary whitespace between them.
-    let response_text = strip_trailing_terminal_markers(&response_text);
+    let response_text = normalize_terminal_display_text(resp.text_or_empty());
     // First try native structured tool calls (OpenAI-format).
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —

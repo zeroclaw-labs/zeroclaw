@@ -67,7 +67,7 @@ impl ResponseMessage {
 /// reasoning-only result is therefore a typed terminal failure, not a valid
 /// string result for direct callers that do not use the structured chat API.
 fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+    if zeroclaw_api::model_provider::normalize_terminal_display_text(&content).is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));
@@ -1327,8 +1327,15 @@ mod tests {
     }
 
     #[test]
-    fn string_completion_rejects_empty_and_think_only_text() {
-        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+    fn string_completion_rejects_semantically_empty_terminal_text() {
+        for text in [
+            "",
+            "  \n",
+            "<think>internal reasoning</think>",
+            "<eom>",
+            "<|eom|>",
+            "<think>internal reasoning</think><eom>",
+        ] {
             let error = require_terminal_text(text.to_string())
                 .expect_err("a string-only semantic-empty completion must fail");
             assert!(error.chain().any(|cause| {

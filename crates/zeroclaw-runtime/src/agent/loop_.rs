@@ -4220,7 +4220,7 @@ mod tests {
     #[test]
     fn direct_cli_terminal_completion_projection_localizes_delivery() {
         let error =
-            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+            anyhow::Error::new(crate::agent::turn::outcome::SemanticEmptyTerminalCompletion);
         let diagnostic = error.to_string();
         let expected = crate::agent::semantic_empty_terminal_completion_message(None);
 
@@ -6214,6 +6214,83 @@ mod tests {
         .expect("text-only messages should succeed with default model_provider");
 
         assert_eq!(result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_rejects_marker_only_terminal_before_history_acceptance() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            "<think>internal reasoning</think><eom><|eom|>",
+        ]);
+        let mut history = vec![ChatMessage::user("return a final answer".to_string())];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = CapturingObserver::default();
+
+        let error = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "scripted",
+                    model: "scripted-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect_err("marker-only terminal response must fail the turn");
+
+        assert!(
+            crate::agent::turn::is_semantic_empty_terminal_completion(&error),
+            "expected the typed semantic-empty error, got: {error:#}"
+        );
+        assert_eq!(history.len(), 1, "rejected response must not enter history");
+        assert_eq!(history[0].role, "user");
+        assert!(
+            !observer
+                .events
+                .lock()
+                .iter()
+                .any(|event| { matches!(event, ObserverEvent::LlmResponse { success: true, .. }) }),
+            "rejected marker-only output must not emit a successful response event"
+        );
     }
 
     #[tokio::test]

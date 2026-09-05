@@ -395,9 +395,7 @@ mod tests {
     fn terminal_completion_keeps_diagnostic_and_delivery_text_separate() {
         let expected = crate::agent::semantic_empty_terminal_completion_message(None);
         let err = StreamedTurnError {
-            error: anyhow::Error::new(
-                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
-            ),
+            error: anyhow::Error::new(crate::agent::turn::outcome::SemanticEmptyTerminalCompletion),
             committed_response: String::new(),
             new_messages: Vec::new(),
         };

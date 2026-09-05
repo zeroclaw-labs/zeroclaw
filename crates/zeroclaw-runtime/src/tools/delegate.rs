@@ -26,7 +26,7 @@ use zeroclaw_config::schema::{
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_tools::memory_export::MemoryExportTool;
 use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
@@ -1926,10 +1926,15 @@ impl DelegateTool {
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
-        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
+        let model_access = ResolvedModelAccess {
+            model_provider: &*model_provider,
+            provider_name: &provider_type,
+            model: &model,
+            temperature,
+        };
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            model_access.run_text_query(system_prompt_ref, &full_prompt),
         )
         .await;
 
@@ -1961,21 +1966,26 @@ impl DelegateTool {
         result: anyhow::Result<String>,
     ) -> ToolResult {
         match result {
-            Ok(response)
-                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
-            {
-                ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(invalid_semantic_completion_error(agent_name)),
+            Ok(response) => {
+                let response =
+                    zeroclaw_api::model_provider::normalize_terminal_display_text(&response);
+                if response.is_empty() {
+                    ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(invalid_semantic_completion_error(agent_name)),
+                    }
+                } else {
+                    ToolResult {
+                        success: true,
+                        output: format!(
+                            "[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",
+                        )
+                        .into(),
+                        error: None,
+                    }
                 }
             }
-            Ok(response) => ToolResult {
-                success: true,
-                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
-                    .into(),
-                error: None,
-            },
             Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -7075,20 +7085,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_agentic_delegate_projects_typed_terminal_failure() {
+    async fn non_agentic_delegate_rejects_marker_only_terminal_completion() {
+        for response in ["<eom>", "<think>internal reasoning</think><eom><|eom|>"] {
+            let result = DelegateTool::render_non_agentic_result(
+                "delegate",
+                "test-provider",
+                "test-model",
+                Ok(response.to_string()),
+            );
+
+            assert!(
+                !result.success,
+                "marker-only completion must fail: {response:?}"
+            );
+            assert!(
+                result.output.is_empty(),
+                "failed delegate must not emit output"
+            );
+            assert_eq!(
+                result.error.as_deref(),
+                Some(invalid_semantic_completion_error("delegate").as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_normalizes_successful_terminal_output() {
         let result = DelegateTool::render_non_agentic_result(
             "delegate",
             "test-provider",
             "test-model",
-            Err(anyhow::Error::new(
-                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
-            )),
+            Ok("<think>internal reasoning</think>answer<eom><|eom|>".to_string()),
         );
 
-        assert!(!result.success);
-        assert!(result.output.is_empty());
-        let expected = invalid_semantic_completion_error("delegate");
-        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+        assert!(result.success);
+        assert_eq!(
+            result.output.to_string(),
+            "[Agent 'delegate' (test-provider/test-model)]\nanswer"
+        );
     }
 
     #[tokio::test]
@@ -7117,7 +7151,10 @@ mod tests {
     #[test]
     fn delegate_failure_projects_provider_tools_terminal_category() {
         let error = anyhow::Error::new(
-            crate::agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse { usage: None },
+            crate::agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse {
+                usage: None,
+                cause: None,
+            },
         );
         let expected = crate::agent::turn::outcome::terminal_completion_error_message(
             &error,
@@ -7191,6 +7228,37 @@ mod tests {
         );
         let error = result.error.as_deref().unwrap_or_default();
         assert_eq!(error, invalid_semantic_completion_error("agentic"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_incomplete_completion_after_tool_result() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &ToolThenIncompleteTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "incomplete terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("output token limit"), "{error}");
         assert!(!error.contains("[Empty response]"), "{error}");
     }
 
@@ -7423,6 +7491,8 @@ mod tests {
 
     struct ToolThenEmptyTerminalModelProvider;
 
+    struct ToolThenIncompleteTerminalModelProvider;
+
     #[async_trait]
     impl ModelProvider for FinalOnlyModelProvider {
         async fn chat_with_system(
@@ -7561,6 +7631,66 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "ToolThenEmptyTerminalModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenIncompleteTerminalModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == "tool")
+            {
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                ));
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo_tool".to_string(),
+                    arguments: "{\"value\":\"ping\"}".to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenIncompleteTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolThenIncompleteTerminalModelProvider"
         }
     }
 

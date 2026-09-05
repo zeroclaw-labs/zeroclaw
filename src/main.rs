@@ -9470,6 +9470,11 @@ fn gate_security_posture(
 /// `Handle::current()` so the sync, under-the-engine-lock adapter calls can bridge
 /// to the async channel/provider calls.
 #[cfg(feature = "agent-runtime")]
+fn qualified_provider_identity(provider_type: impl std::fmt::Display, alias: &str) -> String {
+    format!("{provider_type}.{alias}")
+}
+
+#[cfg(feature = "agent-runtime")]
 fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapters {
     // `llm.generate` runs on the DEFAULT agent's resolved model provider — the
     // daemon-level model of record. No resolvable provider = fail-closed.
@@ -9511,8 +9516,9 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 };
                 let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
                 Some(std::sync::Arc::new(
-                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::with_provider_name(
                         std::sync::Arc::from(provider),
+                        qualified_provider_identity(provider_type, alias),
                         model,
                     ),
                 ) as _)
@@ -9978,6 +9984,20 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn sop_provider_identity_keeps_same_family_aliases_distinct() {
+        let fast = qualified_provider_identity("openai", "fast");
+        let smart = qualified_provider_identity("openai", "smart");
+
+        assert_eq!(fast, "openai.fast");
+        assert_eq!(smart, "openai.smart");
+        assert_ne!(
+            fast, smart,
+            "pricing requires the configured alias identity"
+        );
+    }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
     #[test]

@@ -3,8 +3,9 @@
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
     StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
-    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion,
+    StreamInterruptedAfterOutput, StreamPreExecutedToolsCause,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
+    StreamTerminalCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -43,19 +44,20 @@ pub(crate) async fn consume_provider_streaming_response(
     strict_tool_parsing: bool,
     draft_reasoning: StreamReasoningMode,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
-        ChatRequest {
-            messages,
-            tools: request_tools,
-            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
-        },
-        model,
-        temperature,
-        zeroclaw_providers::traits::StreamOptions::new(true),
-    );
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider)
+        .stream_chat_terminal_aware(
+            ChatRequest {
+                messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
+            model,
+            temperature,
+            zeroclaw_providers::traits::StreamOptions::new(true),
+        );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
@@ -73,6 +75,11 @@ pub(crate) async fn consume_provider_streaming_response(
     // rather than duplicates.
     let mut visible_event_output = false;
     let mut forwarded_text = String::new();
+    // Whitespace before the first meaningful chunk is not immutable output.
+    // Keep it until a later chunk makes it part of visible text; otherwise a
+    // whitespace-only stream would suppress the permitted pre-output retry.
+    let mut pending_leading_whitespace = String::new();
+    let mut saw_meaningful_visible_text = false;
 
     macro_rules! forward_visible {
         ($text:expr, $count_visible:tt) => {{
@@ -84,24 +91,48 @@ pub(crate) async fn consume_provider_streaming_response(
             // StreamInterruptedAfterOutput path and disable the non-streaming
             // fallback even though the user saw no text. Guard so empty text is
             // never counted as visible output.
-            if !visible.is_empty() {
-                if event_tx.is_some() || delta_sender.is_some() {
-                    outcome.forwarded_visible_text.push_str(&visible);
-                }
+            if visible.trim().is_empty() && !saw_meaningful_visible_text {
+                pending_leading_whitespace.push_str(&visible);
+            } else if !visible.is_empty() {
+                let visible = if saw_meaningful_visible_text {
+                    visible
+                } else {
+                    let mut prefixed = std::mem::take(&mut pending_leading_whitespace);
+                    prefixed.push_str(&visible);
+                    prefixed
+                };
+                let mut delivered_live = false;
                 if let Some(tx) = event_tx {
-                    outcome.forwarded_live_deltas = true;
-                    forward_visible!(@count $count_visible, visible);
-                    let _ = tx
+                    if tx
                         .send(TurnEvent::Chunk {
                             delta: visible.clone(),
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        outcome.forwarded_live_deltas = true;
+                        delivered_live = true;
+                        forward_visible!(@count $count_visible, visible);
+                    }
                 }
                 if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(visible)).await.is_err() {
+                    if tx.send(StreamDelta::Text(visible.clone())).await.is_ok() {
+                        outcome.forwarded_live_deltas = true;
+                        delivered_live = true;
+                    } else {
                         delta_sender = None;
                     }
+                }
+                // This buffer is used only to avoid duplicating successfully
+                // delivered live text on a later successful final response.
+                // It may include mutable drafts; interruption persistence
+                // below uses `forwarded_text`, which records only successful
+                // immutable Chunk events.
+                if delivered_live {
+                    outcome.forwarded_visible_text.push_str(&visible);
+                }
+                if !visible.trim().is_empty() {
+                    saw_meaningful_visible_text = true;
                 }
             }
         }};
@@ -120,13 +151,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     // exactly like the pre-consolidation engine's
                     // committed-partial-on-cancel.
                     if forwarded_text.is_empty() {
-                        return Err(StreamCancelledWithUsage::new(outcome.usage).into());
+                        return Err(StreamCancelledWithUsage::new(outcome.usage.clone()).into());
                     }
-                    return Err(StreamCancelledAfterOutput::with_usage(
-                        forwarded_text,
-                        outcome.usage,
-                    )
-                    .into());
+                    return Err(
+                        StreamCancelledAfterOutput::with_usage(
+                            forwarded_text,
+                            outcome.usage.clone(),
+                        )
+                        .into(),
+                    );
                 }
                 chunk = provider_stream.next() => chunk,
             }
@@ -149,20 +182,126 @@ pub(crate) async fn consume_provider_streaming_response(
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"
                 );
+                if let Some(failure) =
+                    zeroclaw_api::model_provider::semantic_empty_terminal_failure(&err)
+                {
+                    let usage = outcome.usage.clone().or_else(|| failure.usage.clone());
+                    if visible_event_output {
+                        let failure = if failure.has_pre_executed_tool_activity() {
+                            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(usage)
+                        } else {
+                            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_no_replay(usage)
+                        };
+                        return Err(StreamInterruptedAfterOutput::semantic_empty(
+                            forwarded_text,
+                            failure,
+                        )
+                        .into());
+                    }
+                    if failure.has_pre_executed_tool_activity() {
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                            usage,
+                            cause: None,
+                        }
+                        .into());
+                    }
+                    return Err(StreamSemanticEmptyCompletion {
+                        usage,
+                        replayable: failure.is_replayable() && outcome.tool_calls.is_empty(),
+                    }
+                    .into());
+                }
+                if let Some(failure) =
+                    zeroclaw_api::model_provider::terminal_completion_failure(&err).cloned()
+                {
+                    if visible_event_output {
+                        let failure = zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            failure.reason,
+                            outcome.usage.clone().or(failure.usage),
+                        );
+                        return Err(StreamInterruptedAfterOutput::terminal(
+                            forwarded_text,
+                            failure,
+                        )
+                        .into());
+                    }
+                    if outcome.saw_pre_executed_tool_activity {
+                        return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                            usage: outcome.usage.clone().or(failure.usage.clone()),
+                            cause: Some(StreamPreExecutedToolsCause::Terminal(failure)),
+                        }
+                        .into());
+                    }
+                    let mut policy = zeroclaw_providers::terminal_completion_context(&err)
+                        .map(zeroclaw_providers::TerminalCompletionContext::policy)
+                        .unwrap_or_else(|| {
+                            zeroclaw_providers::default_terminal_policy(failure.reason)
+                        });
+                    if !outcome.tool_calls.is_empty() {
+                        policy = zeroclaw_providers::TerminalCompletionPolicy::new(
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            policy.usage_chargeability(),
+                        );
+                    }
+                    return Err(StreamTerminalCompletion { failure, policy }.into());
+                }
+
                 let message = format!("model_provider stream error: {err}");
                 let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
-                    // Persist only what the consumer actually saw
-                    // (`forwarded_text`), never the raw accumulated text —
-                    // that includes guard-withheld protocol fragments and
-                    // suppression-buffered output nobody received.
-                    return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                    // Preserve only the immutable prefix that the caller
+                    // actually received, even when a client tool call also
+                    // makes replay ineligible.
+                    if outcome.saw_pre_executed_tool_activity {
+                        return Err(StreamInterruptedAfterOutput::semantic_empty(
+                            forwarded_text,
+                            zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::with_pre_executed_tool_activity(outcome.usage),
+                        )
+                        .into());
+                    }
+                    return Err(StreamInterruptedAfterOutput::reliable_provider(
+                        forwarded_text,
                         message,
-                        usage: outcome.usage,
-                        cause: zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                        outcome.usage,
+                        zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
                             &provider_error,
                         ),
+                    )
+                    .into());
+                }
+                if !outcome.tool_calls.is_empty() {
+                    // A client tool call has already advanced the turn. This
+                    // defense protects direct or legacy providers that report
+                    // a generic stream error instead of a typed no-replay
+                    // terminal failure after emitting that call.
+                    return Err(StreamTerminalCompletion {
+                        failure: zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason,
+                            outcome.usage,
+                        ),
+                        policy: zeroclaw_providers::TerminalCompletionPolicy::new(
+                            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay,
+                            zeroclaw_providers::TerminalUsageChargeability::Billable,
+                        ),
+                    }
+                    .into());
+                }
+                if outcome.saw_pre_executed_tool_activity && !forwarded_text.is_empty() {
+                    return Err(StreamInterruptedAfterOutput::transport(
+                        forwarded_text,
+                        message,
+                        outcome.usage,
+                    )
+                    .into());
+                }
+                if outcome.saw_pre_executed_tool_activity {
+                    return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                        usage: outcome.usage,
+                        cause: Some(StreamPreExecutedToolsCause::Reliable(
+                            zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                                &provider_error,
+                            ),
+                        )),
                     }
                     .into());
                 }
@@ -195,9 +334,10 @@ pub(crate) async fn consume_provider_streaming_response(
                 {
                     let _ = tx.send(StreamDelta::Reasoning(delta.clone())).await;
                 }
-                if let Some(tx) = event_tx {
+                if let Some(tx) = event_tx
+                    && tx.send(TurnEvent::Thinking { delta }).await.is_ok()
+                {
                     visible_event_output = true;
-                    let _ = tx.send(TurnEvent::Thinking { delta }).await;
                 }
             }
             // Durable replay-only finalized reasoning: appended to
@@ -216,15 +356,17 @@ pub(crate) async fn consume_provider_streaming_response(
                     .entry(name.clone())
                     .or_default()
                     .push_back(id.clone());
-                if let Some(tx) = event_tx {
-                    visible_event_output = true;
-                    let _ = tx
+                if let Some(tx) = event_tx
+                    && tx
                         .send(TurnEvent::ToolCall {
                             id,
                             name,
                             args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                {
+                    visible_event_output = true;
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
@@ -233,16 +375,18 @@ pub(crate) async fn consume_provider_streaming_response(
                     .get_mut(&name)
                     .and_then(|ids| ids.pop_front())
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
-                if let Some(tx) = event_tx {
-                    visible_event_output = true;
-                    let _ = tx
+                if let Some(tx) = event_tx
+                    && tx
                         .send(TurnEvent::ToolResult {
                             id,
                             name,
                             output,
                             artifact: None,
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                {
+                    visible_event_output = true;
                 }
             }
             StreamEvent::TextDelta(chunk) => {
@@ -263,13 +407,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     }
                     // Thinking is surfaced as its own TurnEvent variant; it
                     // must never reach the Chunk/draft text surfaces.
-                    if let Some(tx) = event_tx {
-                        visible_event_output = true;
-                        let _ = tx
+                    if let Some(tx) = event_tx
+                        && tx
                             .send(TurnEvent::Thinking {
                                 delta: reasoning.to_string(),
                             })
-                            .await;
+                            .await
+                            .is_ok()
+                    {
+                        visible_event_output = true;
                     }
                 }
 
@@ -328,6 +474,9 @@ pub(crate) async fn consume_provider_streaming_response(
     if let Some(forward_text) = text_guard.finish() {
         forward_visible!(forward_text, false);
     }
+    // Keep the leading-whitespace buffer intentionally unflushed: without a
+    // later meaningful character it was never immutable user-visible output.
+    let _ = saw_meaningful_visible_text;
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
@@ -347,11 +496,16 @@ pub(crate) async fn consume_provider_streaming_response(
         if outcome.saw_pre_executed_tool_activity {
             return Err(StreamPreExecutedToolsWithoutFinalResponse {
                 usage: outcome.usage,
+                cause: None,
             }
             .into());
         }
         return Err(StreamSemanticEmptyCompletion {
             usage: outcome.usage,
+            // Reasoning delivered through TurnEvent is already immutable
+            // user-visible progress. A semantic-empty terminal result after
+            // that delivery must not replay the completed provider request.
+            replayable: !visible_event_output,
         }
         .into());
     }
@@ -371,10 +525,14 @@ mod tests {
     };
 
     struct ToolThenTextProvider;
+    struct ToolThenGenericErrorProvider;
+    struct SemanticEmptyAfterTextProvider;
 
     struct EmptyStreamProvider;
+    struct ProviderToolThenVisibleFailureProvider;
+    struct ProviderToolThenTerminalFailureProvider;
+    struct TerminalAfterTextProvider;
     struct ReasoningProvider;
-
     struct CancelAfterUsageProvider {
         cancellation: CancellationToken,
         cancel_after_visible_output: bool,
@@ -393,6 +551,34 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenGenericErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ToolThenGenericErrorProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SemanticEmptyAfterTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "SemanticEmptyAfterTextProvider"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for EmptyStreamProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -401,8 +587,50 @@ mod tests {
                 ),
             )
         }
+
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ProviderToolThenVisibleFailureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ProviderToolThenVisibleFailureProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ProviderToolThenTerminalFailureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ProviderToolThenTerminalFailureProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TerminalAfterTextProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TerminalAfterTextProvider"
         }
     }
 
@@ -496,6 +724,79 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelProvider for ToolThenGenericErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: "noop".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                })),
+                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "stream broke".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptyAfterTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("visible"))),
+                Err(zeroclaw_api::model_provider::StreamError::SemanticEmpty(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(None),
+                )),
+            ]))
+        }
+    }
+
+    #[async_trait]
     impl ModelProvider for EmptyStreamProvider {
         async fn chat_with_system(
             &self,
@@ -527,7 +828,130 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::ThinkingDelta("internal".to_string())),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ProviderToolThenVisibleFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cached_input_tokens: None,
+                })),
+                Ok(StreamEvent::PreExecutedToolCall {
+                    name: "search".to_string(),
+                    args: "{}".to_string(),
+                }),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                    "visible partial",
+                ))),
+                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "upstream failed".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ProviderToolThenTerminalFailureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::PreExecutedToolCall {
+                    name: "search".to_string(),
+                    args: "{}".to_string(),
+                }),
+                Err(
+                    zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                        zeroclaw_api::model_provider::TerminalCompletionFailure::from(
+                            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        ),
+                    ),
+                ),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for TerminalAfterTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::reasoning("internal"))),
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("draft text"))),
+                Err(
+                    zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                        zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                            None,
+                        ),
+                    ),
+                ),
+            ]))
         }
     }
 
@@ -773,10 +1197,269 @@ mod tests {
         .await
         .expect_err("a semantically empty stream must not complete successfully");
 
-        assert_eq!(
-            err.to_string(),
-            "provider stream completed without final text or tool calls"
+        assert!(
+            err.downcast_ref::<StreamSemanticEmptyCompletion>()
+                .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn reasoning_delivered_to_event_sink_makes_empty_terminal_no_replay() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let err = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("a reasoning-only terminal stream must fail");
+
+        let semantic_empty = err
+            .downcast_ref::<StreamSemanticEmptyCompletion>()
+            .expect("failure stays typed");
+        assert!(
+            !semantic_empty.replayable,
+            "a delivered immutable reasoning event prevents replay"
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(TurnEvent::Thinking { delta }) if delta == "internal"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_thinking_event_send_keeps_empty_terminal_replayable() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);
+        drop(event_rx);
+        let error = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("a reasoning-only terminal stream must fail");
+
+        let semantic_empty = error
+            .downcast_ref::<StreamSemanticEmptyCompletion>()
+            .expect("failure stays typed");
+        assert!(
+            semantic_empty.replayable,
+            "a failed immutable thinking send cannot suppress recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_error_after_client_tool_call_is_no_replay_terminal_failure() {
+        let error = consume_provider_streaming_response(
+            &ToolThenGenericErrorProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("client tool followed by a generic error must not replay");
+
+        let terminal = error
+            .downcast_ref::<StreamTerminalCompletion>()
+            .expect("client-tool boundary must use typed terminal failure");
+        assert_eq!(
+            terminal.failure.reason,
+            zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason
+        );
+        assert_eq!(
+            terminal.policy.recovery(),
+            zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_empty_after_visible_chunk_preserves_no_replay_partial() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let error = consume_provider_streaming_response(
+            &SemanticEmptyAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("visible text must prevent semantic-empty replay");
+
+        let interrupted = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("immutable output must retain its partial prefix");
+        assert_eq!(interrupted.partial_text, "visible");
+        assert!(
+            zeroclaw_api::model_provider::semantic_empty_terminal_failure(&error)
+                .is_some_and(|failure| !failure.is_replayable())
+        );
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(TurnEvent::Chunk { delta }) if delta == "visible"
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_tool_failure_after_visible_text_preserves_partial_output() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let error = consume_provider_streaming_response(
+            &ProviderToolThenVisibleFailureProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("provider-tool stream failure must remain non-replayable");
+
+        let interrupted = error
+            .downcast_ref::<StreamInterruptedAfterOutput>()
+            .expect("visible partial output must use the interruption outcome");
+        assert_eq!(interrupted.partial_text, "visible partial");
+        assert_eq!(
+            interrupted.usage().and_then(|usage| usage.output_tokens),
+            Some(5)
+        );
+        assert!(
+            zeroclaw_api::model_provider::semantic_empty_terminal_failure(&error)
+                .is_some_and(|failure| failure.has_pre_executed_tool_activity()),
+            "the partial-output wrapper must retain the no-replay semantic-empty cause"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnEvent::Chunk { delta } if delta == "visible partial"
+        )));
+    }
+
+    #[tokio::test]
+    async fn provider_tool_terminal_failure_preserves_typed_delivery_cause_without_replay() {
+        let error = consume_provider_streaming_response(
+            &ProviderToolThenTerminalFailureProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("provider-tool terminal failure must surface");
+
+        assert!(
+            error
+                .downcast_ref::<StreamPreExecutedToolsWithoutFinalResponse>()
+                .is_some(),
+            "provider work must keep the no-replay outcome"
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<zeroclaw_api::model_provider::TerminalCompletionFailure>()
+                .is_some_and(|failure| {
+                    failure.reason
+                        == zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+                })
+        }));
+        assert_eq!(
+            crate::agent::turn::outcome::terminal_completion_error_message(&error, None),
+            Some(
+                "The provider reached its output token limit before completing the response."
+                    .to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_only_text_does_not_disable_terminal_recovery() {
+        let (draft_tx, mut draft_rx) = tokio::sync::mpsc::channel(4);
+        let error = consume_provider_streaming_response(
+            &TerminalAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&draft_tx),
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("the terminal failure must surface");
+
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a mutable draft is not an immutable persisted prefix"
+        );
+        assert!(error.downcast_ref::<StreamTerminalCompletion>().is_some());
+        assert!(matches!(
+            draft_rx.try_recv(),
+            Ok(StreamDelta::Text(text)) if text == "draft text"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_event_send_does_not_create_a_persisted_prefix() {
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);
+        drop(event_rx);
+        let error = consume_provider_streaming_response(
+            &TerminalAfterTextProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("the terminal failure must surface");
+
+        assert!(
+            error
+                .downcast_ref::<StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a failed immutable send cannot become a persisted prefix"
+        );
+        assert!(error.downcast_ref::<StreamTerminalCompletion>().is_some());
     }
 
     #[tokio::test]
@@ -1173,11 +1856,12 @@ mod tests {
         );
     }
 
-    /// Provider that emits a single marker-only text delta (`<eom>`) and then
-    /// a stream error, with no text ever produced. Used to pin the strict-mode
-    /// fallback eligibility: a marker-only delta yields empty stripped text,
-    /// which must NOT count as visible output.
-    struct MarkerOnlyThenErrorProvider;
+    /// Provider that emits a marker-only text delta followed by a typed
+    /// terminal failure. The marker is protocol metadata, not user-visible
+    /// partial output, so the failure must retain pre-output recovery.
+    struct MarkerOnlyThenErrorProvider {
+        text: &'static str,
+    }
 
     impl ::zeroclaw_api::attribution::Attributable for MarkerOnlyThenErrorProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -1237,26 +1921,26 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            let events: Vec<StreamResult<StreamEvent>> = vec![
-                Ok(StreamEvent::TextDelta(StreamChunk::delta("<eom>"))),
-                Err(::zeroclaw_api::model_provider::StreamError::ModelProvider(
-                    "provider exploded after marker-only delta".into(),
+            let events: Vec<StreamResult<StreamEvent>> =
+                vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta(self.text))),
+                Err(::zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                    zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                        None,
+                    ),
                 )),
             ];
             Box::pin(futures_util::stream::iter(events))
         }
     }
 
-    /// Strict-mode marker-only deltas must not count as visible output: if a
-    /// marker-only delta (stripped to empty text) is forwarded as a visible
-    /// Chunk, a later provider error turns the failure into
-    /// `StreamInterruptedAfterOutput`, which disables the non-streaming
-    /// fallback even though the user received no text. The error must instead
-    /// surface as a plain error with an empty visible prefix, keeping the
-    /// pre-output fallback eligible.
+    /// Marker-only deltas must not count as visible output: otherwise a later
+    /// terminal failure becomes `StreamInterruptedAfterOutput`, suppressing
+    /// an allowed fallback even though the user received no text.
     #[tokio::test]
-    async fn strict_marker_only_delta_does_not_disable_fallback_on_provider_error() {
-        let provider = MarkerOnlyThenErrorProvider;
+    async fn marker_only_delta_keeps_terminal_recovery_pre_output() {
+        let provider = MarkerOnlyThenErrorProvider { text: "<eom>" };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
@@ -1286,21 +1970,119 @@ mod tests {
             "no Chunk event may be forwarded for a marker-only delta: {chunks:?}"
         );
 
-        // The failure must be a plain error, NOT StreamInterruptedAfterOutput
-        // (which would disable the non-streaming fallback despite no visible
-        // text). Asserting the error type is not the interruption type is the
-        // observable fallback-eligibility signal.
-        let err = result.expect_err("provider error must surface");
+        let err = result.expect_err("terminal failure must surface");
         assert!(
             err.downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
                 .is_none(),
-            "a marker-only delta followed by a provider error must stay eligible for the \
-             non-streaming fallback; got StreamInterruptedAfterOutput instead"
+            "a marker-only terminal failure must stay eligible for fallback; \
+             got StreamInterruptedAfterOutput instead"
         );
+        let terminal = err
+            .downcast_ref::<StreamTerminalCompletion>()
+            .expect("marker-only terminal failure must preserve its typed cause");
+        assert_eq!(
+            terminal.failure.reason,
+            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        );
+        assert_eq!(
+            terminal.policy.recovery(),
+            zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate
+        );
+    }
+
+    #[tokio::test]
+    async fn whitespace_before_terminal_marker_does_not_disable_pre_output_recovery() {
+        let provider = MarkerOnlyThenErrorProvider { text: " <eom>" };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let result = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&tx),
+            true,
+            StreamReasoningMode::Status,
+        )
+        .await;
+
+        drop(tx);
         assert!(
-            err.to_string().contains("provider exploded"),
-            "the underlying provider error must be surfaced: {err}"
+            rx.try_recv().is_err(),
+            "whitespace before a stripped terminal marker is not a visible Chunk"
         );
+        let err = result.expect_err("terminal failure must surface");
+        let terminal = err
+            .downcast_ref::<StreamTerminalCompletion>()
+            .expect("blank output must remain eligible for pre-output recovery");
+        assert_eq!(
+            terminal.policy.recovery(),
+            zeroclaw_providers::TerminalRecoveryDisposition::NextCandidate
+        );
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_stream_emits_no_chunk_and_is_replayable_semantic_empty() {
+        let provider = MarkerTestProvider::with_text_sequence(vec![" \n\t"]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let err = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&tx),
+            true,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("whitespace-only terminal output must fail semantically");
+
+        drop(tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "whitespace-only output must not become an immutable Chunk"
+        );
+        let semantic_empty = err
+            .downcast_ref::<StreamSemanticEmptyCompletion>()
+            .expect("whitespace-only output must use the semantic-empty outcome");
+        assert!(semantic_empty.replayable);
+    }
+
+    #[tokio::test]
+    async fn leading_whitespace_is_released_with_later_meaningful_text() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["  ", "answer"]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            Some(&tx),
+            true,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect("meaningful text after whitespace must complete");
+
+        drop(tx);
+        let event = rx.recv().await.expect("meaningful text must be forwarded");
+        assert!(matches!(event, TurnEvent::Chunk { ref delta } if delta == "  answer"));
+        assert!(
+            rx.try_recv().is_err(),
+            "leading whitespace must not become a separate Chunk"
+        );
+        assert_eq!(outcome.forwarded_visible_text, "  answer");
     }
 
     #[tokio::test]
