@@ -148,16 +148,40 @@ fn existing_marker_payloads(output: &str) -> std::collections::HashSet<&str> {
     set
 }
 
+/// Maximum number of bare image paths a single tool result may have promoted
+/// into `[IMAGE:...]` markers.
+///
+/// A tool that genuinely produces images emits a handful of them. A directory
+/// listing or a recursive find over a workspace emits hundreds, and promoting
+/// those uploads unrelated local files to the provider and can push the request
+/// past the model's context window. Beyond this bound the result is treated as
+/// a listing and nothing is promoted.
+///
+/// This is the content-based half of the rule in
+/// `docs/book/src/architecture/memory-payload-lifecycle.md`: "image-path
+/// promotion must only happen for producing tools, not path-listing tools".
+/// [`is_path_listing_tool`] covers the tools we can name; this covers the
+/// generic ones we cannot, such as a shell tool running `find`.
+const MAX_PROMOTED_TOOL_RESULT_IMAGES: usize = 8;
+
 /// Rewrite real local image file paths in tool output into `[IMAGE:...]`
 /// markers so the multimodal pipeline can normalize them before the next
 /// provider call. This targets shell/skill outputs that print filesystem
 /// paths directly rather than returning explicit media markers.
+///
+/// A result carrying more than `MAX_PROMOTED_TOOL_RESULT_IMAGES` promotable
+/// paths is treated as a path listing: nothing is promoted and every path
+/// survives as ordinary text, so the model still sees the listing. Explicit
+/// `[IMAGE:...]` markers already present in the output are never affected —
+/// a producing tool keeps working even when its output also lists files.
 pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
     let existing_markers = existing_marker_payloads(output);
-    let mut rewritten = String::with_capacity(output.len());
-    let mut cursor = 0usize;
-    let mut changed = false;
 
+    // Resolve the promotable spans before rewriting anything, so the count is
+    // known before the decision. Collection stops as soon as the bound is
+    // exceeded, which also spares an enormous listing one filesystem probe per
+    // entry.
+    let mut promotable: Vec<(usize, usize)> = Vec::new();
     for mat in LOCAL_IMAGE_PATH_RE.find_iter(output) {
         let start = mat.start();
         let end = mat.end();
@@ -179,16 +203,33 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
             continue;
         }
 
-        rewritten.push_str(&output[cursor..start]);
-        rewritten.push_str("[IMAGE:");
-        rewritten.push_str(path);
-        rewritten.push(']');
-        cursor = end;
-        changed = true;
+        if promotable.len() == MAX_PROMOTED_TOOL_RESULT_IMAGES {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "max_promoted_images": MAX_PROMOTED_TOOL_RESULT_IMAGES,
+                    })),
+                "tool result looks like a path listing; leaving image paths as text"
+            );
+            return output.to_string();
+        }
+
+        promotable.push((start, end));
     }
 
-    if !changed {
+    if promotable.is_empty() {
         return output.to_string();
+    }
+
+    let mut rewritten = String::with_capacity(output.len());
+    let mut cursor = 0usize;
+    for (start, end) in promotable {
+        rewritten.push_str(&output[cursor..start]);
+        rewritten.push_str("[IMAGE:");
+        rewritten.push_str(&output[start..end]);
+        rewritten.push(']');
+        cursor = end;
     }
 
     rewritten.push_str(&output[cursor..]);
@@ -515,6 +556,80 @@ mod tests {
         let input = "Already tagged [IMAGE:/tmp/already-tagged.png]";
         let output = canonicalize_tool_result_media_markers(input);
         assert_eq!(output, input);
+    }
+
+    /// Write `count` real PNG files and return a newline-joined listing of
+    /// their absolute paths, shaped like `find`/`fd`/`ls` output.
+    fn image_path_listing(dir: &Path, count: usize) -> String {
+        let mut lines = Vec::with_capacity(count);
+        for index in 0..count {
+            let image = dir.join(format!("asset-{index}.png"));
+            std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+            lines.push(image.display().to_string());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn canonicalize_promotes_up_to_the_listing_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES);
+
+        let output = canonicalize_tool_result_media_markers(&input);
+
+        assert_eq!(
+            output.matches("[IMAGE:").count(),
+            MAX_PROMOTED_TOOL_RESULT_IMAGES,
+            "a producing tool emitting up to the bound keeps every promotion"
+        );
+    }
+
+    #[test]
+    fn canonicalize_leaves_path_listings_as_text() {
+        // The regression: a recursive find over a workspace prints real image
+        // paths, and promoting them base64-inlines unrelated local files into
+        // the next provider request.
+        let dir = tempfile::tempdir().unwrap();
+        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
+
+        let output = canonicalize_tool_result_media_markers(&input);
+
+        assert_eq!(
+            output, input,
+            "a result over the bound is a listing: nothing is promoted and the \
+             paths stay visible to the model as text"
+        );
+    }
+
+    #[test]
+    fn canonicalize_for_generic_shell_tool_leaves_path_listings_as_text() {
+        // `is_path_listing_tool` only names dedicated search tools, so the
+        // generic shell tool has to be covered by the content bound.
+        let dir = tempfile::tempdir().unwrap();
+        let input = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
+
+        let output = canonicalize_tool_result_media_markers_for("shell", &input);
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn canonicalize_listing_still_preserves_an_explicit_marker() {
+        // Suppression must not strip a marker a producing tool emitted
+        // deliberately, even when the same output also lists files.
+        let dir = tempfile::tempdir().unwrap();
+        let listing = image_path_listing(dir.path(), MAX_PROMOTED_TOOL_RESULT_IMAGES + 1);
+        let input = format!("[IMAGE:/tmp/deliberate.png]\n{listing}");
+
+        let output = canonicalize_tool_result_media_markers(&input);
+
+        assert_eq!(output, input);
+        assert!(output.contains("[IMAGE:/tmp/deliberate.png]"));
+        assert_eq!(
+            output.matches("[IMAGE:").count(),
+            1,
+            "only the explicit marker survives; no listing path is promoted"
+        );
     }
 
     #[test]
