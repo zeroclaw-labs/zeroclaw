@@ -50,6 +50,39 @@ A server is reached over one of three transports (the `transport` field):
 
 Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
 
+### Example: Parallel Search
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+provides public web search and page extraction without a Parallel account or API
+key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
+`http` transport:
+
+```toml
+[[mcp.servers]]
+name = "parallel"
+transport = "http"
+url = "https://search.parallel.ai/mcp"
+
+[mcp_bundles.web]
+servers = ["parallel"]
+
+[agents.assistant]
+mcp_bundles = ["web"]
+```
+
+Merge these entries into your existing `config.toml`, using the alias of the
+agent you want to grant access. Add `"web"` to that agent's existing
+`mcp_bundles` list rather than replacing its other grants. If the `web` bundle
+already exists, add `"parallel"` to its `servers` list. Keep `mcp.enabled = true`
+and restart the affected session after changing grants.
+
+The agent can then use `parallel__web_search` and `parallel__web_fetch`, subject
+to its normal tool authorization and approval policy. Calls send queries,
+requested URLs, and any supplied objective or context to Parallel. Once granted
+access, the agent may choose these tools during its work. To revoke access,
+remove `"parallel"` from every bundle granted to that agent, or add it to a
+granted bundle's `exclude` list, then restart the session.
+
 ## Editing servers
 
 Three surfaces edit the same `[[mcp.servers]]` table:
