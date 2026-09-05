@@ -1,11 +1,15 @@
 //! Knowledge management tool for capturing, searching, and reusing expertise.
 //! Exposes the knowledge graph to the agent via the `Tool` trait.
+//!
+//! Every store access carries the [`KnowledgeScope`] bound at construction
+//! time, so reads and writes are attributed to the calling agent. The
+//! caller identity is never taken from tool arguments.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
-use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, NodeType, Relation};
+use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, KnowledgeScope, NodeType, Relation};
 
 const CLIENT_NETWORK_INTERACTION_LIMIT: usize = 20;
 const CLIENT_NETWORK_ENTITY_LIMIT: usize = 100;
@@ -29,11 +33,14 @@ const KNOWLEDGE_ACTIONS: &[&str] = &[
 /// Tool for managing a knowledge graph of patterns, decisions, lessons, and experts.
 pub struct KnowledgeTool {
     graph: Arc<KnowledgeGraph>,
+    /// Trusted caller identity for every graph access. Bound by the
+    /// runtime at registration; there is no unscoped constructor.
+    scope: KnowledgeScope,
 }
 
 impl KnowledgeTool {
-    pub fn new(graph: Arc<KnowledgeGraph>) -> Self {
-        Self { graph }
+    pub fn new(graph: Arc<KnowledgeGraph>, scope: KnowledgeScope) -> Self {
+        Self { graph, scope }
     }
 }
 
@@ -229,10 +236,14 @@ impl KnowledgeTool {
 
         let source_project = args.get("source_project").and_then(|v| v.as_str());
 
-        match self
-            .graph
-            .add_node(node_type, title, content, &tags, source_project)
-        {
+        match self.graph.add_node(
+            &self.scope,
+            node_type,
+            title,
+            content,
+            &tags,
+            source_project,
+        ) {
             Ok(id) => Ok(ToolResult {
                 success: true,
                 output: json!({ "node_id": id }).to_string().into(),
@@ -276,7 +287,7 @@ impl KnowledgeTool {
 
         let results = if query.is_empty() && !filter_tags.is_empty() {
             // Tag-only search -- apply node_type and project filters consistently.
-            let mut nodes = self.graph.query_by_tags(&filter_tags)?;
+            let mut nodes = self.graph.query_by_tags(&self.scope, &filter_tags)?;
             if let Some(ref nt) = parsed_filter_type {
                 nodes.retain(|n| &n.node_type == nt);
             }
@@ -288,7 +299,7 @@ impl KnowledgeTool {
                 .map(|node| json!({ "id": node.id, "type": node.node_type, "title": node.title, "score": 1.0 }))
                 .collect::<Vec<_>>()
         } else if !query.is_empty() {
-            let mut search_results = self.graph.query_by_similarity(query, 20)?;
+            let mut search_results = self.graph.query_by_similarity(&self.scope, query, 20)?;
 
             // Post-filter by type if specified.
             if let Some(ref nt) = parsed_filter_type {
@@ -388,7 +399,7 @@ impl KnowledgeTool {
             anyhow::Error::msg(format!("{e}"))
         })?;
 
-        match self.graph.add_edge(from_id, to_id, relation) {
+        match self.graph.add_edge(&self.scope, from_id, to_id, relation) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: "relationship created".to_string().into(),
@@ -421,7 +432,7 @@ impl KnowledgeTool {
                 anyhow::Error::msg("missing 'query' or 'content' for suggest")
             })?;
 
-        let results = self.graph.query_by_similarity(query, 10)?;
+        let results = self.graph.query_by_similarity(&self.scope, query, 10)?;
         let suggestions: Vec<serde_json::Value> = results
             .into_iter()
             .map(|r| {
@@ -464,7 +475,7 @@ impl KnowledgeTool {
             });
         }
 
-        let experts = self.graph.find_experts(&tags)?;
+        let experts = self.graph.find_experts(&self.scope, &tags)?;
         let output: Vec<serde_json::Value> = experts
             .into_iter()
             .map(|r| {
@@ -559,7 +570,7 @@ impl KnowledgeTool {
     }
 
     fn handle_graph_stats(&self) -> anyhow::Result<ToolResult> {
-        match self.graph.stats() {
+        match self.graph.stats(&self.scope) {
             Ok(stats) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string(&stats).unwrap_or_default().into(),
@@ -586,7 +597,7 @@ impl KnowledgeTool {
         };
         let limit = bounded_limit(args, DEFAULT_GRAPH_NEIGHBOR_LIMIT);
 
-        let root = match self.graph.get_node(node_id)? {
+        let root = match self.graph.get_node(&self.scope, node_id)? {
             Some(root) => root,
             None => {
                 return Ok(ToolResult {
@@ -597,8 +608,8 @@ impl KnowledgeTool {
             }
         };
 
-        let outbound = self.graph.find_outbound(node_id, limit)?;
-        let inbound = self.graph.find_inbound(node_id, limit)?;
+        let outbound = self.graph.find_outbound(&self.scope, node_id, limit)?;
+        let inbound = self.graph.find_inbound(&self.scope, node_id, limit)?;
 
         let outbound: Vec<_> = outbound
             .iter()
@@ -643,12 +654,14 @@ impl KnowledgeTool {
             }
         };
         let contacts = self.graph.find_inbound_by_relation_and_type(
+            &self.scope,
             &client.id,
             Relation::ContactOf,
             NodeType::Contact,
             CLIENT_NETWORK_ENTITY_LIMIT,
         )?;
         let managers = self.graph.find_inbound_by_relation_and_type(
+            &self.scope,
             &client.id,
             Relation::ManagesClient,
             NodeType::Expert,
@@ -764,7 +777,7 @@ impl KnowledgeTool {
                 anyhow::Error::msg(format!("missing 'client_id' for {action}"))
             })?;
 
-        let Some(client) = self.graph.get_node(client_id)? else {
+        let Some(client) = self.graph.get_node(&self.scope, client_id)? else {
             anyhow::bail!("client node not found: {client_id}");
         };
         if client.node_type != NodeType::Client {
@@ -783,6 +796,7 @@ impl KnowledgeTool {
         limit: usize,
     ) -> anyhow::Result<Vec<zeroclaw_memory::knowledge_graph::KnowledgeNode>> {
         self.graph.find_outbound_by_relation_and_type(
+            &self.scope,
             client_id,
             Relation::InteractedWith,
             NodeType::Interaction,
@@ -832,11 +846,28 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::knowledge_graph::KnowledgeGraph;
 
+    const TEST_AGENT: &str = "test-agent";
+
+    fn scope_for(alias: &str) -> KnowledgeScope {
+        KnowledgeScope::for_agent(alias, Vec::new())
+    }
+
     fn test_tool() -> (TempDir, KnowledgeTool) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("knowledge.db");
         let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
-        (tmp, KnowledgeTool::new(graph))
+        (tmp, KnowledgeTool::new(graph, scope_for(TEST_AGENT)))
+    }
+
+    /// Two tools over one shared store, as the runtime builds them for a
+    /// two-agent deployment: same database, different bound scopes.
+    fn sibling_tools() -> (TempDir, KnowledgeTool, KnowledgeTool) {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
+        let agent_a = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_a"));
+        let agent_b = KnowledgeTool::new(graph, scope_for("agent_b"));
+        (tmp, agent_a, agent_b)
     }
 
     #[tokio::test]
@@ -977,7 +1008,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("knowledge.db");
         let graph = Arc::new(KnowledgeGraph::new(&db_path, 100).unwrap());
-        let tool = KnowledgeTool::new(graph);
+        let tool = KnowledgeTool::new(graph, scope_for(TEST_AGENT));
 
         assert_eq!(tool.name(), "knowledge");
         assert!(tool.description().contains("relationship links"));
@@ -1233,6 +1264,184 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("not a client"));
+    }
+
+    #[tokio::test]
+    async fn issue_repro_foreign_agent_cannot_read_captured_knowledge() {
+        let (_tmp, agent_a, agent_b) = sibling_tools();
+
+        // Agent B captures private knowledge: a client and its interactions.
+        let client_id = capture_node(
+            &agent_b,
+            "client",
+            "Agent B client",
+            "Confidential enterprise account",
+        )
+        .await;
+        let interaction_id = capture_node(
+            &agent_b,
+            "interaction",
+            "Private call",
+            "Confidential negotiation notes",
+        )
+        .await;
+        relate_nodes(&agent_b, &client_id, &interaction_id, "interacted_with").await;
+
+        // Acting as agent_a: search must not surface agent_b's nodes.
+        let result = agent_a
+            .execute(json!({ "action": "search", "query": "confidential enterprise" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 0);
+
+        // client_network / interaction_log must deny by reading as absent.
+        for action in ["client_network", "interaction_log"] {
+            let result = agent_a
+                .execute(json!({ "action": action, "client_id": client_id }))
+                .await
+                .unwrap();
+            assert!(!result.success, "{action} must not reach a foreign client");
+            assert!(result.error.unwrap().contains("not found"));
+        }
+
+        // graph_neighbors on a foreign node reads as absent too.
+        let result = agent_a
+            .execute(json!({ "action": "graph_neighbors", "node_id": client_id }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+
+        // relate onto a foreign node is refused like a missing node.
+        let own_id = capture_node(&agent_a, "pattern", "Agent A note", "Own pattern").await;
+        let result = agent_a
+            .execute(json!({
+                "action": "relate",
+                "from_id": own_id,
+                "to_id": client_id,
+                "relation": "applies_to"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not found"));
+
+        // Agent B's own view is unchanged by any of the above.
+        let result = agent_b
+            .execute(json!({ "action": "client_network", "client_id": client_id }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["interaction_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn graph_stats_only_counts_scope_visible_rows() {
+        let (_tmp, agent_a, agent_b) = sibling_tools();
+        capture_node(&agent_b, "lesson", "Agent B lesson", "Private lesson").await;
+
+        let result = agent_a
+            .execute(json!({ "action": "graph_stats" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["total_nodes"], 0);
+
+        let result = agent_b
+            .execute(json!({ "action": "graph_stats" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["total_nodes"], 1);
+    }
+
+    #[tokio::test]
+    async fn read_knowledge_from_allowlist_widens_search_but_writes_stay_own() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
+        let agent_b = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_b"));
+        let agent_a = KnowledgeTool::new(
+            Arc::clone(&graph),
+            KnowledgeScope::for_agent("agent_a", vec!["agent_b".to_string()]),
+        );
+
+        let agent_b_id = capture_node(
+            &agent_b,
+            "decision",
+            "Shared decision",
+            "Visible to agent_a",
+        )
+        .await;
+
+        let result = agent_a
+            .execute(json!({ "action": "search", "query": "shared decision" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 1);
+
+        let result = agent_a
+            .execute(json!({ "action": "graph_neighbors", "node_id": agent_b_id }))
+            .await
+            .unwrap();
+        assert!(result.success, "allowlisted sibling nodes must be readable");
+
+        // Agent A's capture is still attributed to agent_a: agent_b (with no
+        // reciprocal grant) does not see it.
+        capture_node(&agent_a, "pattern", "Agent A pattern", "Agent A private").await;
+        let result = agent_b
+            .execute(json!({ "action": "search", "query": "agent_a private" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 0, "the read allowlist is directional");
+    }
+
+    #[tokio::test]
+    async fn legacy_unowned_rows_stay_hidden_until_assigned() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        let graph = Arc::new(KnowledgeGraph::new(&db_path, 10000).unwrap());
+        // Seed an unowned row the way migrated pre-attribution data looks.
+        graph
+            .add_node(
+                &KnowledgeScope::unrestricted(),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Legacy pattern",
+                "Captured before attribution existed",
+                &[],
+                None,
+            )
+            .unwrap();
+        let agent_a = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_a"));
+        let agent_b = KnowledgeTool::new(Arc::clone(&graph), scope_for("agent_b"));
+
+        for tool in [&agent_a, &agent_b] {
+            let result = tool
+                .execute(json!({ "action": "search", "query": "legacy pattern" }))
+                .await
+                .unwrap();
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            assert_eq!(output["count"], 0, "unowned legacy rows fail closed");
+        }
+
+        graph.prepare_legacy_ownership(Some("agent_a")).unwrap();
+        let result = agent_a
+            .execute(json!({ "action": "search", "query": "legacy pattern" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 1);
+        let result = agent_b
+            .execute(json!({ "action": "search", "query": "legacy pattern" }))
+            .await
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 0);
     }
 
     async fn capture_node(
