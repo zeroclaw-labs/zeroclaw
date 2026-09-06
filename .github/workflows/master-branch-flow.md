@@ -26,7 +26,7 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 
 | File | Trigger | Purpose |
 |---|---|---|
-| `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` (dormant) | Lint + test + build on PRs and trusted post-merge cache-warming runs. The `merge_group` trigger stays wired but never fires while the merge queue is disabled. |
+| `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` (dormant) | Lint + test + build on PRs and trusted post-merge cache-warming runs, plus advisory affected-scope Windows nextest and conditional plugin-host fixture coverage on PRs only. The `merge_group` trigger stays wired but never fires while the merge queue is disabled. |
 | `platform-tests.yml` | changes to this workflow in a `pull_request` → `master`; `workflow_dispatch`; nightly schedule | Advisory macOS/Windows workspace tests, outside the required PR gate and merge queue. |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
 | `docker-publish.yml` | `workflow_call`, `workflow_dispatch`, tag push `v*` | Build, sign, and scan the generated Docker variant matrix |
@@ -43,7 +43,7 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 
 | Event | What runs |
 |---|---|
-| PR opened or updated against `master` | `ci.yml` (full lint + test + build), `pr-path-labeler.yml`, and `pr-size-labeler.yml`; `platform-tests.yml` only when that workflow changes |
+| PR opened or updated against `master` | `ci.yml` (full required lint + test + build plus advisory Windows scope measurement), `pr-path-labeler.yml`, and `pr-size-labeler.yml`; `platform-tests.yml` only when that workflow changes |
 | PR added to the merge queue (`merge_group`) | **Inactive**: the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Nightly at 03:17 UTC | `platform-tests.yml` (scheduled macOS/Windows tests) |
@@ -72,13 +72,10 @@ tag push.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
+   - `windows-test-scope` and `windows-test`: advisory-only Windows measurement. The selector compares base SHA..`HEAD` and chooses baseline `skip`, `scoped`, or `full` plus the orthogonal `needs_plugin_host` flag; the Windows job records both outputs, passes explicit `-p` arguments for `scoped`, uses the full workspace command for `full`, and when the flag is true installs `wasm32-wasip2` and runs the feature-enabled plugin component, library, runtime config, runtime admission, gateway, CLI, and root host tests. Baseline and appended invocations use `--no-fail-fast`, retain separate failure statuses, and report baseline, plugin-host, and total durations.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
-3. When the PR changes `platform-tests.yml`, that workflow checks formatting,
-   then runs the same workspace nextest selection on `macos-14` and
-   `windows-latest` as non-blocking checks. Maintainers can manually
-   dispatch the workflow against other platform-sensitive branches.
-   `--no-fail-fast` inventories all platform failures.
+3. The advisory Windows job is outside `CI Required Gate`, uses restore-only cache behavior on PRs, and is visibly non-blocking. Direct changes to the root, gateway, or provider packages, plus changes to plugin, runtime, plugin config, WIT, root plugin activation, plugin backend filter, dependency, selector, selector-contract, or `ci.yml` paths, set `needs_plugin_host=true`; malformed or unavailable paths select baseline `full` and true. Missing or malformed Cargo metadata also selects baseline `full` with `needs_plugin_host=true` because the dependency closure cannot be established safely. The controlling-file cases make workflow revisions exercise the plugin-host path they own. Ordinary `scoped` and `full` selections do not install the plugin target or run the feature-enabled host tests. When the PR changes `platform-tests.yml`, that workflow checks formatting, then runs the same full workspace nextest selection on `macos-14` and `windows-latest` as non-blocking checks. The nightly schedule is the full-platform backstop, and maintainers can manually dispatch the workflow against other platform-sensitive branches. `--no-fail-fast` inventories all platform failures.
 4. Maintainer reviews. Once the gate is green and review policy is satisfied,
    the maintainer merges the PR directly (squash).
 
@@ -140,6 +137,8 @@ for the full procedure. In summary:
 flowchart TD
   A["PR opened or updated → master"] --> B["ci.yml"]
   A -. "workflow changed" .-> P["platform-tests.yml"]
+  A --> W["windows-test-scope\nskip · scoped · full"]
+  W --> WT["windows-test\nadvisory nextest"]
   B --> L["lint\nfmt · clippy"]
   L --> T["test\ncargo nextest --workspace"]
   P --> PF["fmt"]
@@ -150,6 +149,7 @@ flowchart TD
   L --> BCH["bench\ncompile check"]
   L --> SEC["security\ncargo deny check"]
   T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
+  WT -. "not required" .-> N["measurement only"]
   G -->|red| D["PR stays open"]
   G -->|green| R["Maintainer merges (squash) → master"]
 ```
