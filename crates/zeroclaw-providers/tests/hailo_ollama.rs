@@ -2712,7 +2712,7 @@ async fn native_hailo_rejects_unloadable_image_markers_before_http() {
     let provider = hailo_provider(&format!("http://{addr}"));
     let error = provider
         .simple_chat(
-            "Describe this [IMAGE:/definitely/not/here.png]",
+            "Describe this [IMAGE:missing-image.invalid]",
             "qwen3:1.7b",
             Some(0.2),
         )
