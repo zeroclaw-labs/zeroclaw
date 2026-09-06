@@ -115,7 +115,7 @@ impl Tool for CronRemoveTool {
             return Ok(blocked);
         }
 
-        match cron::remove_job(&self.config, &job_id) {
+        match cron::remove_job_for_agent(&self.config, &job_id, &self.agent_alias) {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Removed cron job {job_id}").into(),

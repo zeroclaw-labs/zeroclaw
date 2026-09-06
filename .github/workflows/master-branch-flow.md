@@ -33,7 +33,8 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 | `trivy-scheduled.yml` | `workflow_dispatch`; weekly schedule | Re-scan published `dist` and `default-features` images for new CVEs |
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `cross-platform-clippy.yml` | `workflow_dispatch`; weekly schedule | Advisory macOS/Windows Clippy coverage, outside the required PR gate |
-| `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
+| `pr-path-labeler.yml` | `pull_request_target` lifecycle | Automatic path-based PR labeling |
+| `pr-size-labeler.yml` | `pull_request_target` lifecycle | Automatic canonical `size:*` labeling from PR file metadata |
 | `project-dashboard-plan.yml` | `workflow_dispatch` | Manual report-only issue Project Status planning; does not mutate ProjectV2, issues, or labels |
 
 ---
@@ -42,7 +43,7 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 
 | Event | What runs |
 |---|---|
-| PR opened or updated against `master` | `ci.yml` (full lint + test + build); `platform-tests.yml` only when that workflow changes |
+| PR opened or updated against `master` | `ci.yml` (full lint + test + build), `pr-path-labeler.yml`, and `pr-size-labeler.yml`; `platform-tests.yml` only when that workflow changes |
 | PR added to the merge queue (`merge_group`) | **Inactive**: the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Nightly at 03:17 UTC | `platform-tests.yml` (scheduled macOS/Windows tests) |

@@ -397,6 +397,12 @@ impl AccountedChatScope {
         crate::reliable::mark_stream_recovery_semantic_empty();
     }
 
+    /// Preserve a stream failure's safe classification if recovery exhausts
+    /// later candidates without replaying the failed stream entry.
+    pub fn record_stream_recovery_failure(&self, error: &anyhow::Error) {
+        crate::reliable::record_stream_recovery_failure(error);
+    }
+
     /// Clear a provisional route before an in-scope recovery replaces it.
     ///
     /// This has no presentation effect until [`commit_accepted_provider_route`]

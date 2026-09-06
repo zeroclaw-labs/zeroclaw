@@ -1,0 +1,40 @@
+name: PR Size Labeler
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: pr-size-labeler-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  size:
+    name: Apply PR size label
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch trusted workflow classifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/contents/scripts/github/pr_size_label.py?ref=$WORKFLOW_SHA" \
+            --jq .content | base64 --decode > "$RUNNER_TEMP/pr_size_label.py"
+          test -s "$RUNNER_TEMP/pr_size_label.py" || {
+            echo "trusted classifier fetch produced an empty file" >&2
+            exit 1
+          }
+
+      - name: Apply size label from PR metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 "$RUNNER_TEMP/pr_size_label.py"
