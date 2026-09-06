@@ -76,8 +76,8 @@ Then bind it to an agent with `channels = ["wecom_ws.primary"]` (use the alias f
 Defaults worth knowing:
 
 - Downloaded media attachments are decrypted, cached under the channel workspace, and cleaned up after `file_retention_days` (default 7); downloads over `max_file_size_mb` (default 20) are rejected.
-- Replies stream as draft updates by default (`stream_mode = "partial"`); set `stream_mode = "off"` for a single whole-reply delivery, or `"multi_message"` to send paragraphs as separate messages.
-- The per-channel `proxy_url`, `excluded_tools`, and `reply_min_interval_secs` (pacing) fields apply as usual.
+- Replies stream as draft updates by default (`stream_mode = "partial"`); set `stream_mode = "off"` for a single whole-reply delivery. Only `partial` and `off` are supported on this channel; `multi_message` is rejected at startup.
+- The per-channel `proxy_url` and `excluded_tools` fields apply as usual.
 
 Inbound sender IDs may also come from a [peer group](./peer-groups.md) whose `channel` is `wecom_ws` or `wecom_ws.<alias>`, instead of the `allowed_*` lists above.
 
