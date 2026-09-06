@@ -14,7 +14,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 
 // AnySearch skill protocol identifier. Keep this synchronized with the
 // upstream anysearch-ai/anysearch-skill CLIENT_HEADER value.
-const ANYSEARCH_CLIENT_HEADER: &str = "skill/3.0.1";
+const ANYSEARCH_CLIENT_HEADER: &str = "skill/3.1.1";
 const ANYSEARCH_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const ANYSEARCH_CONFIG_PARSE_ERROR: &str = "anysearch_config_parse_failed";
 
