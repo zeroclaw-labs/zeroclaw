@@ -79,9 +79,33 @@ fn nudge_around_image_marker(s: &str, boundary: usize, side: TruncationSide) -> 
     }
 }
 
-pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
+/// Output plus byte-accurate measurements from one tool-result truncation.
+pub(crate) struct ToolResultTruncation {
+    pub(crate) output: String,
+    pub(crate) original_bytes: usize,
+    pub(crate) retained_bytes: usize,
+    pub(crate) elided_bytes: usize,
+}
+
+impl ToolResultTruncation {
+    pub(crate) fn was_truncated(&self) -> bool {
+        self.elided_bytes > 0
+    }
+}
+
+/// Truncate a tool result and report the loss without retaining a second copy.
+pub(crate) fn truncate_tool_result_with_metadata(
+    output: &str,
+    max_chars: usize,
+) -> ToolResultTruncation {
+    let original_bytes = output.len();
     if max_chars == 0 || output.len() <= max_chars {
-        return output.to_string();
+        return ToolResultTruncation {
+            output: output.to_string(),
+            original_bytes,
+            retained_bytes: original_bytes,
+            elided_bytes: 0,
+        };
     }
     let head_len = max_chars * 2 / 3;
     let tail_len = max_chars.saturating_sub(head_len);
@@ -106,15 +130,31 @@ pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
 
     // Guard against overlap when max_chars is very small
     if head_end >= tail_start {
-        return output[..output.floor_char_boundary(max_chars)].to_string();
+        let retained_bytes = output.floor_char_boundary(max_chars);
+        return ToolResultTruncation {
+            output: output[..retained_bytes].to_string(),
+            original_bytes,
+            retained_bytes,
+            elided_bytes: original_bytes.saturating_sub(retained_bytes),
+        };
     }
-    let truncated_chars = tail_start - head_end;
-    format!(
-        "{}\n\n[... {} characters truncated ...]\n\n{}",
-        &output[..head_end],
-        truncated_chars,
-        &output[tail_start..]
-    )
+    let elided_bytes = tail_start - head_end;
+    let retained_bytes = original_bytes - elided_bytes;
+    ToolResultTruncation {
+        output: format!(
+            "{}\n\n[... {} characters truncated ...]\n\n{}",
+            &output[..head_end],
+            elided_bytes,
+            &output[tail_start..]
+        ),
+        original_bytes,
+        retained_bytes,
+        elided_bytes,
+    }
+}
+
+pub fn truncate_tool_result(output: &str, max_chars: usize) -> String {
+    truncate_tool_result_with_metadata(output, max_chars).output
 }
 
 fn is_existing_local_image_path(path: &str) -> bool {
@@ -618,5 +658,29 @@ mod tests {
             truncated.starts_with(marker),
             "expected head to retain full marker, got: {truncated}"
         );
+    }
+
+    #[test]
+    fn truncation_metadata_reports_byte_accurate_loss() {
+        let output = format!("{}{}", "é".repeat(40), "z".repeat(80));
+
+        let result = truncate_tool_result_with_metadata(&output, 60);
+
+        assert!(result.was_truncated());
+        assert_eq!(result.original_bytes, output.len());
+        assert_eq!(result.retained_bytes + result.elided_bytes, output.len());
+        assert!(result.retained_bytes <= 60);
+        assert!(result.output.is_char_boundary(result.output.len()));
+    }
+
+    #[test]
+    fn truncation_metadata_reports_unchanged_results() {
+        let result = truncate_tool_result_with_metadata("small result", 100);
+
+        assert!(!result.was_truncated());
+        assert_eq!(result.original_bytes, 12);
+        assert_eq!(result.retained_bytes, 12);
+        assert_eq!(result.elided_bytes, 0);
+        assert_eq!(result.output, "small result");
     }
 }

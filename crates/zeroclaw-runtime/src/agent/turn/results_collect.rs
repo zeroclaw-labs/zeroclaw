@@ -4,7 +4,7 @@
 
 use crate::agent::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers_for,
-    truncate_tool_result,
+    truncate_tool_result_with_metadata,
 };
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
@@ -123,7 +123,25 @@ pub(crate) fn collect_tool_results(
         }
         let canonical_output =
             canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
-        let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
+        let truncation =
+            truncate_tool_result_with_metadata(&canonical_output, max_tool_result_chars);
+        if truncation.was_truncated() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "original_bytes": truncation.original_bytes,
+                        "retained_bytes": truncation.retained_bytes,
+                        "elided_bytes": truncation.elided_bytes,
+                        "limit_bytes": max_tool_result_chars,
+                    })),
+                "tool_result_truncated"
+            );
+        }
+        let mut result_output = truncation.output;
         // Append HMAC receipt to tool result when receipts are enabled
         if let Some(ref receipt) = outcome.receipt {
             ::zeroclaw_log::record!(
@@ -238,7 +256,12 @@ mod tests {
     /// Run one results-collection pass over `n` `file_read` calls that each use
     /// different args but return an identical `output` string, with the given
     /// `success` flag.
-    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+    fn run_with_limit(
+        n: usize,
+        output: &str,
+        success: bool,
+        max_tool_result_chars: usize,
+    ) -> Result<CollectedResults> {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
@@ -262,12 +285,64 @@ mod tests {
             &mut history,
             &mut detector,
             &ignore,
-            10_000,
+            max_tool_result_chars,
             None,
             "test-model",
             0,
             "turn-test",
         )
+    }
+
+    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+        run_with_limit(n, output, success, 10_000)
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn truncation_emits_content_free_measurements() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+
+        while rx.try_recv().is_ok() {}
+        run_with_limit(1, &"x".repeat(100), true, 30).unwrap();
+
+        let record = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(value)
+                        if value.get("message").and_then(|v| v.as_str())
+                            == Some("tool_result_truncated") =>
+                    {
+                        break value;
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before truncation record arrived")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("truncation record should arrive");
+
+        let attrs = record.get("attributes").expect("record carries attributes");
+        assert_eq!(
+            attrs.get("original_bytes").and_then(|v| v.as_u64()),
+            Some(100)
+        );
+        assert_eq!(
+            attrs.get("retained_bytes").and_then(|v| v.as_u64()),
+            Some(30)
+        );
+        assert_eq!(attrs.get("elided_bytes").and_then(|v| v.as_u64()), Some(70));
+        assert_eq!(attrs.get("limit_bytes").and_then(|v| v.as_u64()), Some(30));
+
+        assert!(
+            attrs.get("output").is_none(),
+            "logs must not retain tool output"
+        );
     }
 
     #[test]
