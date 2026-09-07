@@ -224,7 +224,11 @@ def is_obviously_irrelevant(path: str) -> bool:
         return True
     if path.startswith(".github/actions/"):
         return False
-    if path.startswith(".github/") and not path.startswith(".github/workflows/"):
+    if path.startswith(".github/workflows/"):
+        # Only the Quality Gate workflow drives the Windows suite; sibling
+        # workflows (labelers, audits, release) cannot change what it tests.
+        return path != ".github/workflows/ci.yml"
+    if path.startswith(".github/"):
         return True
     if path.startswith("scripts/") and not path.startswith("scripts/ci/"):
         return True
@@ -272,7 +276,7 @@ def select_pull_request(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
                 needs_plugin_host,
             )
-        if path.startswith(".github/workflows/") or path.startswith("scripts/ci/"):
+        if path.startswith("scripts/ci/"):
             return full(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
                 needs_plugin_host,
