@@ -139,6 +139,15 @@ When replacing an existing file, the writer creates a same-directory
 Gateway writes also snapshot the pre-write file and best-effort restore it if
 persistence fails before swapping in-memory state.
 
+On Unix, auth-profile persistence verifies that the shared config directory is
+owned by the daemon's effective user and owner-only (`0700`) before writing a
+credential profile. The same verification runs before decrypting an encrypted
+profile only when the local key is absent and decryption would create
+replacement key material. This can tighten an existing looser config-directory
+mode; if ownership or the mode cannot be verified, the profile write or that
+key-recreating read fails rather than placing credential state under an unsafe
+parent.
+
 There is no general transactional rollback for a valid but undesired config
 change after it has been saved and applied. Restore the previous `config.toml`
 from backup, edit the field back through the CLI or dashboard, then reload or

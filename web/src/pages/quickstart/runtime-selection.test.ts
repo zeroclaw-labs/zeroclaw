@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  quickstartCredentialPresentation,
   requiredQuickstartSelectionsComplete,
   runtimeAfterProviderChange,
   runtimeDefaultForProvider,
@@ -52,4 +53,34 @@ test("required selections reject a missing runtime", () => {
     requiredQuickstartSelectionsComplete({ ...complete, runtime: null }),
     false,
   );
+});
+
+test("Anthropic setup-token mode relabels the transport credential field", () => {
+  const setupToken = quickstartCredentialPresentation({
+    providerType: "anthropic",
+    authMode: "setup_token",
+    fieldKey: "api_key",
+    label: "api_key",
+    help: "Paste an Anthropic Console API key.",
+    setupTokenLabel: "setup_token",
+    setupTokenHelp: "Paste the token from claude setup-token.",
+  });
+  assert.deepEqual(setupToken, {
+    label: "setup_token",
+    help: "Paste the token from claude setup-token.",
+  });
+
+  const apiKey = quickstartCredentialPresentation({
+    providerType: "anthropic",
+    authMode: "api_key",
+    fieldKey: "api_key",
+    label: "api_key",
+    help: "Paste an Anthropic Console API key.",
+    setupTokenLabel: "setup_token",
+    setupTokenHelp: "Paste the token from claude setup-token.",
+  });
+  assert.deepEqual(apiKey, {
+    label: "api_key",
+    help: "Paste an Anthropic Console API key.",
+  });
 });

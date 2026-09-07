@@ -60,11 +60,22 @@ returned.
 `PATCH /api/config` accepts a JSON Patch document (RFC 6902). The supported
 config operations are `add`, `replace`, `remove`, and `test`. ZeroClaw also
 accepts a `comment` extension for config annotations. Config operations run
-against an in-memory copy; once every operation has applied,
-`Config::validate()` runs once on the result. If validation passes, the new
-state is persisted and swapped in. If any operation or final validation fails,
-on-disk and in-memory state are unchanged. Comment annotations are applied
-after the save on a non-fatal, best-effort basis.
+against an in-memory copy; once every operation has applied, the final
+validation checks the changed (dirty) paths. An error affecting a changed path
+rejects the request, leaving on-disk and in-memory state unchanged. An existing
+error at an unrelated path can be isolated by the repair validator: the valid
+change is persisted and the response carries a structured
+`pre_existing_validation_error` warning with that path. The validator continues
+checking after each isolated error, so an earlier unrelated error cannot mask a
+later error caused by the submitted change. Validation errors retain `path` as
+their primary display target and may include additive `related_paths` for the
+other fields participating in a cross-field rule; a change to any of those
+paths is mutation-caused and is rejected rather than demoted to a warning.
+Retained legacy static Anthropic
+aliases containing `:` use the distinct `legacy_colon_alias_retained` warning.
+Clients must surface warnings; they mean the saved whole configuration still
+needs a separate repair. Comment annotations are applied after the save on a
+non-fatal, best-effort basis.
 
 `move` and `copy` return `400 op_not_supported` because safe reference-graph
 rewriting is not part of this surface. `test` against a `#[secret]` path is
@@ -77,7 +88,7 @@ server normalises.
 
 The CLI counterpart is `zeroclaw config patch <file-or-stdin>`, which applies
 the same op set against the local Config and returns the same structured
-response shape (`--json` for scripts).
+response shape (`--json` for scripts), including repair warnings.
 
 ## Secrets: write-only over HTTP
 

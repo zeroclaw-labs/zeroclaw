@@ -40,7 +40,8 @@ fn masked_secret(buf: &str) -> String {
 
 use crate::client::{
     AppliedAgent, QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor,
-    QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
+    QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface,
+    QuickstartWarning, RpcClient,
 };
 use crate::theme;
 use crate::widgets::HelpNode;
@@ -291,20 +292,41 @@ fn synth_enter() -> KeyEvent {
 fn queue_apply_handoff(
     reconnect_state: &crate::app::SharedReconnectState,
     alias: String,
+    notice: Option<String>,
     daemon_restarted: bool,
 ) -> Option<String> {
     let Ok(mut guard) = reconnect_state.lock() else {
         return None;
     };
     if daemon_restarted {
-        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect(
-            alias.clone(),
-        ));
+        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect {
+            alias: alias.clone(),
+            notice,
+        });
         Some(alias)
     } else {
-        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::Immediate(alias));
+        guard.pending_quickstart_chat =
+            Some(crate::app::PendingQuickstartChat::Immediate { alias, notice });
         None
     }
+}
+
+fn quickstart_success_label(alias: &str, warnings: &[QuickstartWarning]) -> String {
+    let created = crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias)]);
+    let Some(first) = warnings.first() else {
+        return created;
+    };
+
+    let remaining = warnings.len().saturating_sub(1);
+    let suffix = if remaining == 0 {
+        String::new()
+    } else {
+        crate::i18n::t_args(
+            "zc-quickstart-status-more-warnings",
+            &[("count", &remaining.to_string())],
+        )
+    };
+    format!("{created} — {}{suffix}", first.message)
 }
 
 fn typed_char(key: &KeyEvent) -> Option<char> {
@@ -1099,6 +1121,7 @@ pub struct QuickstartPane {
     last_step: Option<QuickstartStep>,
     state_snapshot: Option<QuickstartStateResult>,
     last_errors: Vec<QuickstartError>,
+    last_warnings: Vec<QuickstartWarning>,
     applied_alias: Option<String>,
     busy: bool,
     active_modal: Option<Modal>,
@@ -1137,6 +1160,7 @@ impl QuickstartPane {
             last_step: None,
             state_snapshot: None,
             last_errors: Vec::new(),
+            last_warnings: Vec::new(),
             applied_alias: None,
             busy: false,
             active_modal: None,
@@ -2420,8 +2444,9 @@ impl QuickstartPane {
             Ok(QuickstartApplyResult::Applied {
                 agent,
                 daemon_restarted,
+                warnings,
             }) => {
-                self.handle_apply_success(agent, daemon_restarted);
+                self.handle_apply_success(agent, daemon_restarted, warnings);
             }
             Ok(QuickstartApplyResult::Errors { errors }) => {
                 self.last_errors = errors;
@@ -2437,13 +2462,21 @@ impl QuickstartPane {
         self.busy = false;
     }
 
-    fn handle_apply_success(&mut self, agent: AppliedAgent, daemon_restarted: bool) {
+    fn handle_apply_success(
+        &mut self,
+        agent: AppliedAgent,
+        daemon_restarted: bool,
+        warnings: Vec<QuickstartWarning>,
+    ) {
         // A real daemon reload must survive the old connection closing:
         // use the immediate handoff only when the daemon reports that no
         // reconnect is needed.
+        let notice =
+            (!warnings.is_empty()).then(|| quickstart_success_label(&agent.alias, &warnings));
         self.applied_alias =
-            queue_apply_handoff(&self.reconnect_state, agent.alias, daemon_restarted);
+            queue_apply_handoff(&self.reconnect_state, agent.alias, notice, daemon_restarted);
         self.last_errors.clear();
+        self.last_warnings = warnings;
     }
 
     fn draw_title(&self, frame: &mut Frame, area: Rect) {
@@ -2503,7 +2536,7 @@ impl QuickstartPane {
         let label = if self.busy {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
-            crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
+            quickstart_success_label(alias, &self.last_warnings)
         } else if let Some(first) = self.last_errors.first() {
             // Name the first actionable field error so the user knows
             // which field is invalid, instead of only a count. The
@@ -2538,7 +2571,11 @@ impl QuickstartPane {
         } else {
             crate::i18n::t_args("zc-quickstart-status-hint", &[("chord", "c")])
         };
-        let style = if self.applied_alias.is_some() || can_create {
+        let style = if self.applied_alias.is_some() && !self.last_warnings.is_empty() {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if self.applied_alias.is_some() || can_create {
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD)
@@ -2860,6 +2897,41 @@ fn field_form_uses_openai_codex_auth(form: &FieldFormModal) -> bool {
         })
 }
 
+fn field_form_uses_anthropic_setup_token_auth(form: &FieldFormModal) -> bool {
+    matches!(form.selector, Selector::ModelProvider)
+        && form.type_key.trim().eq_ignore_ascii_case("anthropic")
+        && form.fields.iter().any(|row| {
+            row.descriptor.key == "auth_mode" && row.buf.trim().eq_ignore_ascii_case("setup_token")
+        })
+}
+
+const ANTHROPIC_SETUP_TOKEN_LABEL_KEY: &str = "zc-quickstart-anthropic-setup-token-label";
+const ANTHROPIC_SETUP_TOKEN_HELP_KEY: &str = "zc-quickstart-anthropic-setup-token-help";
+
+fn field_form_row_translation_override(
+    form: &FieldFormModal,
+    row: &FieldFormRow,
+) -> Option<(&'static str, &'static str)> {
+    (field_form_uses_anthropic_setup_token_auth(form) && row.descriptor.key == "api_key").then_some(
+        (
+            ANTHROPIC_SETUP_TOKEN_LABEL_KEY,
+            ANTHROPIC_SETUP_TOKEN_HELP_KEY,
+        ),
+    )
+}
+
+fn field_form_row_label(form: &FieldFormModal, row: &FieldFormRow) -> String {
+    field_form_row_translation_override(form, row)
+        .map(|(label, _)| crate::i18n::t(label))
+        .unwrap_or_else(|| row.descriptor.label.clone())
+}
+
+fn field_form_row_help(form: &FieldFormModal, row: &FieldFormRow) -> String {
+    field_form_row_translation_override(form, row)
+        .map(|(_, help)| crate::i18n::t(help))
+        .unwrap_or_else(|| row.descriptor.help.clone())
+}
+
 fn field_form_row_visible(form: &FieldFormModal, index: usize) -> bool {
     let Some(row) = form.fields.get(index) else {
         return false;
@@ -3060,7 +3132,7 @@ fn draw_modal(
                 };
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
-                    Span::styled(format!("{:14}", row.descriptor.label), label_style),
+                    Span::styled(format!("{:14}", field_form_row_label(f, row)), label_style),
                     Span::styled("  ", Style::default()),
                     Span::styled(if is_enum { "‹ " } else { "" }, theme::accent_style()),
                     Span::styled(display, value_style),
@@ -3078,12 +3150,12 @@ fn draw_modal(
             let header_lines: Vec<Line> = f
                 .fields
                 .get(f.cursor)
-                .map(|row| row.descriptor.help.as_str())
+                .map(|row| field_form_row_help(f, row))
                 .filter(|h| !h.is_empty())
                 .map(|h| {
                     vec![
                         Line::from(Span::styled(
-                            h.to_string(),
+                            h,
                             theme::dim_style().add_modifier(Modifier::ITALIC),
                         )),
                         Line::from(""),
@@ -3504,6 +3576,29 @@ fn draw_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_setup_status_reports_all_warning_count() {
+        let warnings = vec![
+            QuickstartWarning {
+                step: QuickstartStep::Agent,
+                field: "personality_files".into(),
+                message: "Could not persist SOUL.md".into(),
+            },
+            QuickstartWarning {
+                step: QuickstartStep::Agent,
+                field: "personality_files".into(),
+                message: "Could not persist IDENTITY.md".into(),
+            },
+        ];
+
+        let label = quickstart_success_label("researcher", &warnings);
+        let remaining =
+            crate::i18n::t_args("zc-quickstart-status-more-warnings", &[("count", "1")]);
+
+        assert!(label.contains("Could not persist SOUL.md"));
+        assert!(label.ends_with(&remaining));
+    }
 
     fn field_row(key: &str, value: &str) -> FieldFormRow {
         FieldFormRow {
@@ -4124,15 +4219,21 @@ mod tests {
             crate::app::CrossReconnectState::default(),
         ));
 
-        let applied_alias = queue_apply_handoff(&state, "agent-a".into(), true);
+        let applied_alias = queue_apply_handoff(
+            &state,
+            "agent-a".into(),
+            Some("created with warning".into()),
+            true,
+        );
         let guard = state.lock().unwrap();
 
         assert_eq!(applied_alias.as_deref(), Some("agent-a"));
         assert_eq!(
             guard.pending_quickstart_chat,
-            Some(crate::app::PendingQuickstartChat::AfterReconnect(
-                "agent-a".into()
-            ))
+            Some(crate::app::PendingQuickstartChat::AfterReconnect {
+                alias: "agent-a".into(),
+                notice: Some("created with warning".into()),
+            })
         );
     }
 
@@ -4142,15 +4243,21 @@ mod tests {
             crate::app::CrossReconnectState::default(),
         ));
 
-        let applied_alias = queue_apply_handoff(&state, "agent-a".into(), false);
+        let applied_alias = queue_apply_handoff(
+            &state,
+            "agent-a".into(),
+            Some("created with warning".into()),
+            false,
+        );
         let guard = state.lock().unwrap();
 
         assert!(applied_alias.is_none());
         assert_eq!(
             guard.pending_quickstart_chat,
-            Some(crate::app::PendingQuickstartChat::Immediate(
-                "agent-a".into()
-            ))
+            Some(crate::app::PendingQuickstartChat::Immediate {
+                alias: "agent-a".into(),
+                notice: Some("created with warning".into()),
+            })
         );
     }
 
@@ -4380,6 +4487,56 @@ mod tests {
             .map(|index| form.fields[index].descriptor.key.as_str())
             .collect();
         assert_eq!(keys, vec!["alias", "model", "auth_mode", "api_key"]);
+    }
+
+    #[test]
+    fn anthropic_setup_token_auth_relabels_api_key_row_in_tui_form() {
+        let fields = vec![
+            QuickstartFieldDescriptor {
+                key: "auth_mode".into(),
+                label: "Authentication".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::Enum,
+                is_secret: false,
+                enum_variants: Some(vec!["api_key".into(), "setup_token".into()]),
+                required: true,
+                default: Some("setup_token".into()),
+            },
+            QuickstartFieldDescriptor {
+                key: "api_key".into(),
+                label: "Anthropic Console API key".into(),
+                help: "Paste an Anthropic Console API key.".into(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: true,
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+        ];
+        let form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "anthropic".into(),
+            alias: "subscription".into(),
+            model_catalog_state: ModelCatalogState::Empty,
+            model_catalog_attempts: 0,
+            fields: build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, None),
+            cursor: 1,
+        };
+
+        let api_key = form
+            .fields
+            .iter()
+            .find(|row| row.descriptor.key == "api_key")
+            .expect("api_key row");
+        assert!(field_form_uses_anthropic_setup_token_auth(&form));
+        assert_eq!(
+            field_form_row_translation_override(&form, api_key),
+            Some((
+                ANTHROPIC_SETUP_TOKEN_LABEL_KEY,
+                ANTHROPIC_SETUP_TOKEN_HELP_KEY
+            )),
+            "setup-token mode must select its dedicated translated label and help"
+        );
     }
 
     #[test]

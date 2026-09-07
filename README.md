@@ -116,7 +116,7 @@ requires_openai_auth = true
 Notes:
 
 - Normal OpenAI Codex subscription auth uses stored auth profiles, not an `api_key` on the provider entry.
-- Claude Max setup-token auth stays on the canonical Anthropic slot: run `claude setup-token`, choose `setup_token` in Quickstart, and paste the generated token into the API key/token prompt.
+- Claude Max setup-token auth uses the canonical Anthropic slot: choose `setup_token` in Quickstart to store the generated token in ZeroClaw's Anthropic auth profile and write `auth_mode = "oauth"`. Existing aliases that keep a setup token in `api_key` remain supported.
 - Only set `api_key` / `uri` on `[providers.models.openai.<alias>]` when intentionally targeting a custom OpenAI-compatible gateway or endpoint.
 - If you see `provider streaming failed, falling back to non-streaming chat`, ZeroClaw retries the same request in non-streaming mode. Check `zeroclaw auth status` before changing provider config.
 

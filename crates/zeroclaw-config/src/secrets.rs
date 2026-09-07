@@ -49,6 +49,9 @@ pub enum ProvisioningState {
     NeedsInitialization,
     /// Key material is managed externally; nothing to check locally.
     ExternallyProvisioned,
+    /// The key source cannot establish whether a local key exists. Using it
+    /// will fail rather than safely provisioning replacement material.
+    Unavailable,
 }
 
 /// Abstracts where the master encryption key is obtained.
@@ -111,15 +114,18 @@ impl KeySource for FileKeySource {
 
     fn provisioning_state(&self) -> ProvisioningState {
         // Bind the "initialized?" check to the same no-follow open the read
-        // path uses: a symlink / reparse point must never count as Initialized,
-        // and the check is against an opened handle rather than a second path
-        // resolution.  A directory is rejected via the is_file() recheck.
+        // path uses. Only an absent path can cause `with_key()` to provision
+        // replacement material; a symlink, directory, or inaccessible path
+        // must remain unavailable and fail closed instead.
         match open_no_follow(&self.key_path) {
             Ok(f) => match f.metadata() {
                 Ok(m) if m.is_file() => ProvisioningState::Initialized,
-                _ => ProvisioningState::NeedsInitialization,
+                _ => ProvisioningState::Unavailable,
             },
-            Err(_) => ProvisioningState::NeedsInitialization,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ProvisioningState::NeedsInitialization
+            }
+            Err(_) => ProvisioningState::Unavailable,
         }
     }
 
@@ -177,6 +183,16 @@ impl SecretStore {
     #[cfg(test)]
     pub fn key_source_ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.key_source, &other.key_source)
+    }
+
+    /// Whether the configured key source would create local key material on
+    /// its next use.
+    ///
+    /// Callers that must validate the directory which will hold new key
+    /// material can use this as a side-effect-free preflight. Existing key
+    /// material and externally provisioned sources do not require it.
+    pub fn needs_key_initialization(&self) -> bool {
+        self.key_source.provisioning_state() == ProvisioningState::NeedsInitialization
     }
 
     /// Obtain the master key through the trait callback contract.
@@ -1920,6 +1936,19 @@ exit 65
     }
 
     #[test]
+    fn secret_store_reports_only_a_missing_file_key_as_needing_initialization() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        assert!(store.needs_key_initialization());
+        store.encrypt("test-secret").unwrap();
+        assert!(
+            !store.needs_key_initialization(),
+            "an initialized file key must not trigger creation preflight again"
+        );
+    }
+
+    #[test]
     fn key_file_wrong_length_rejected() {
         let tmp = TempDir::new().unwrap();
         let key_path = tmp.path().join(".secret_key");
@@ -2262,8 +2291,8 @@ exit 65
         let fs = FileKeySource::new(link);
         assert_eq!(
             fs.provisioning_state(),
-            ProvisioningState::NeedsInitialization,
-            "Symlink must not be reported as Initialized"
+            ProvisioningState::Unavailable,
+            "Symlink must not be reported as initialized or provisionable"
         );
     }
 

@@ -88,7 +88,7 @@ impl ConfigApiCode {
 
 /// Structured error returned by the new HTTP CRUD endpoints and the `zeroclaw config`
 /// subcommands they share infrastructure with.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ConfigApiError {
     /// Stable error code for programmatic matching.
@@ -99,6 +99,14 @@ pub struct ConfigApiError {
     /// error is whole-config (e.g. `ReloadFailed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Other configuration paths whose values participate in this error.
+    ///
+    /// `path` remains the primary display target for existing clients. This
+    /// additive field lets mutation/repair callers distinguish an error that
+    /// was already present from one introduced through a sibling or referenced
+    /// value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_paths: Vec<String>,
     /// Index into the JSON Patch operation array, when the error originated
     /// from a specific op in a `PATCH /api/config` batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,13 +119,43 @@ impl ConfigApiError {
             code,
             message: message.into(),
             path: None,
+            related_paths: Vec::new(),
             op_index: None,
         }
     }
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
+        let path = path.into();
+        self.related_paths.retain(|related| related != &path);
+        self.path = Some(path);
         self
+    }
+
+    /// Attach the non-primary paths that causally participate in this error.
+    /// Empty paths and duplicates of the primary path are omitted so wire
+    /// clients can treat this as an additive list of *other* fields.
+    pub fn with_related_paths(
+        mut self,
+        paths: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        for path in paths {
+            let path = path.into();
+            if !path.is_empty()
+                && self.path.as_deref() != Some(path.as_str())
+                && !self.related_paths.contains(&path)
+            {
+                self.related_paths.push(path);
+            }
+        }
+        self
+    }
+
+    /// Iterate over the primary display path followed by every causal sibling.
+    pub fn affected_paths(&self) -> impl Iterator<Item = &str> {
+        self.path
+            .as_deref()
+            .into_iter()
+            .chain(self.related_paths.iter().map(String::as_str))
     }
 
     pub fn with_op_index(mut self, index: usize) -> Self {
@@ -193,6 +231,15 @@ impl std::error::Error for ConfigApiError {}
 
 #[macro_export]
 macro_rules! validation_bail {
+    ($code:ident, $path:expr, related [$($related:expr),* $(,)?], $($msg:tt)*) => {{
+        let err = $crate::api_error::ConfigApiError::new(
+            $crate::api_error::ConfigApiCode::$code,
+            format!($($msg)*),
+        )
+        .with_path($path)
+        .with_related_paths([$($related),*]);
+        return Err(::anyhow::Error::from(err));
+    }};
     ($code:ident, $path:expr, $($msg:tt)*) => {{
         let err = $crate::api_error::ConfigApiError::new(
             $crate::api_error::ConfigApiCode::$code,
@@ -255,6 +302,46 @@ mod tests {
         assert_eq!(err.code, ConfigApiCode::PathNotFound);
         assert_eq!(err.path.as_deref(), Some("providers.models"));
         assert!(err.message.contains("providers.models"));
+    }
+
+    #[test]
+    fn related_paths_are_additive_and_drive_affected_path_iteration() {
+        let err = ConfigApiError::new(ConfigApiCode::InvalidFormat, "conflicting values")
+            .with_path("nodes.mdns.peer_ttl_secs")
+            .with_related_paths([
+                "nodes.mdns.announce_interval_secs",
+                "nodes.mdns.peer_ttl_secs",
+                "",
+            ]);
+
+        assert_eq!(err.related_paths, vec!["nodes.mdns.announce_interval_secs"]);
+        assert_eq!(
+            err.affected_paths().collect::<Vec<_>>(),
+            vec![
+                "nodes.mdns.peer_ttl_secs",
+                "nodes.mdns.announce_interval_secs"
+            ]
+        );
+        let serialized = serde_json::to_value(&err).expect("serialize error");
+        assert_eq!(
+            serialized["related_paths"],
+            serde_json::json!(["nodes.mdns.announce_interval_secs"])
+        );
+    }
+
+    #[test]
+    fn setting_primary_path_after_related_paths_keeps_them_disjoint() {
+        let err = ConfigApiError::new(ConfigApiCode::InvalidFormat, "conflicting values")
+            .with_related_paths(["nodes.mdns.announce_interval_secs"])
+            .with_path("nodes.mdns.announce_interval_secs");
+
+        assert!(err.related_paths.is_empty());
+        assert_eq!(
+            err.affected_paths().collect::<Vec<_>>(),
+            vec!["nodes.mdns.announce_interval_secs"]
+        );
+        let serialized = serde_json::to_value(&err).expect("serialize error");
+        assert!(serialized.get("related_paths").is_none());
     }
 
     #[test]

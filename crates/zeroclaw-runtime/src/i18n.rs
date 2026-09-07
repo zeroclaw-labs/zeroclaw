@@ -770,6 +770,79 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_setup_token_recovery_is_available_in_every_builtin_locale() {
+        for (source, locale) in committed_locale_sources() {
+            for (key, args) in [
+                (
+                    "cli-quickstart-error-anthropic-setup-token-required",
+                    &[][..],
+                ),
+                (
+                    "cli-quickstart-error-anthropic-setup-token-store",
+                    &[("err", "synthetic auth-profile write failure")][..],
+                ),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} must format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} in {locale} must provide a user-visible error"
+                );
+                if key == "cli-quickstart-error-anthropic-setup-token-store" {
+                    assert!(
+                        value.contains("synthetic auth-profile write failure"),
+                        "{key} in {locale} must preserve the actionable failure detail"
+                    );
+                }
+            }
+
+            let hint = format_ftl_message(
+                source,
+                locale,
+                "cli-quickstart-auth-anthropic-skip-hint",
+                &[("alias", "subscription")],
+            )
+            .unwrap_or_else(|| panic!("Anthropic recovery hint must format in {locale}"));
+            assert!(
+                hint.contains("setup_token"),
+                "Anthropic recovery hint in {locale} must direct the user to select setup_token when rerunning Quickstart: {hint:?}"
+            );
+            assert!(
+                !hint.contains("zeroclaw auth")
+                    && !hint.contains("paste-token")
+                    && !hint.contains("--auth-kind")
+                    && !hint.contains("claude setup-token"),
+                "Anthropic recovery hint in {locale} must not advertise a post-hoc credential setup path: {hint:?}"
+            );
+
+            let api_key_help =
+                format_ftl_message(source, locale, "cli-quickstart-anthropic-api-key-help", &[])
+                    .unwrap_or_else(|| panic!("Anthropic API-key help must format in {locale}"));
+            assert!(
+                api_key_help.contains("setup_token") && api_key_help.contains("claude setup-token"),
+                "Anthropic API-key help in {locale} must direct Claude Max users to choose setup_token after claude setup-token: {api_key_help:?}"
+            );
+            let token_placement_marker = match locale {
+                // Keep a word boundary for English too: unrelated words such
+                // as "there" must not satisfy the regression guard.
+                "en" => " here",
+                "es" => "aquí",
+                // The removed French wording was "collez ici". Keep the
+                // boundary so unrelated words such as "officiel" do not
+                // satisfy this regression guard.
+                "fr" => " ici",
+                "ja" => "ここ",
+                "zh-CN" => "这里",
+                _ => unreachable!("committed locale registry contains only built-in locales"),
+            };
+            assert!(
+                !api_key_help.contains(token_placement_marker),
+                "Anthropic API-key help in {locale} must not tell users to paste a setup token into the API-key field: {api_key_help:?}"
+            );
+        }
+    }
+
+    #[test]
     fn doctor_ctxwin_write_failed_formats_in_english_and_japanese() {
         let cases = [(
             "cli-doctor-ctxwin-write-failed",
@@ -806,32 +879,16 @@ mod tests {
         // carries it, and that the four localized ones are actually translated
         // rather than copied from `en` — a copy would pass a mere
         // "the key resolves" check while leaving the string un-localized.
-        const KEY: &str = "channel-approval-group-visibility-warning";
+        assert_cli_key_translated_in_every_locale("channel-approval-group-visibility-warning");
+    }
 
-        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", KEY, &[])
-            .unwrap_or_else(|| panic!("{KEY} should format in en"));
-        assert!(
-            !english.trim().is_empty(),
-            "{KEY} must not be empty in en; got {english:?}"
-        );
-
-        for (source, locale) in [
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
-            let value = format_ftl_message(source, locale, KEY, &[])
-                .unwrap_or_else(|| panic!("{KEY} should format in {locale}"));
-            assert!(
-                !value.trim().is_empty(),
-                "{KEY} must not be empty in {locale}; got {value:?}"
-            );
-            assert_ne!(
-                value, english,
-                "{KEY} in {locale} is the English string verbatim, so that catalogue was never translated"
-            );
-        }
+    #[test]
+    fn quickstart_uncertain_credential_rollback_warning_is_translated_in_every_locale() {
+        // This warning tells an operator that the config was not committed but
+        // a stored credential may remain. It must be available in the locale
+        // selected for the failed Quickstart surface, rather than silently
+        // falling back to English at a security-relevant recovery boundary.
+        assert_cli_key_translated_in_every_locale("cli-agent-not-created-disk-state-uncertain");
     }
 
     #[test]
@@ -1670,6 +1727,28 @@ mod tests {
             (include_str!("../locales/ja/cli.ftl"), "ja"),
             (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
         ]
+    }
+
+    fn assert_cli_key_translated_in_every_locale(key: &str) {
+        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, &[])
+            .unwrap_or_else(|| panic!("{key} should format in en"));
+        assert!(
+            !english.trim().is_empty(),
+            "{key} must not be empty in en; got {english:?}"
+        );
+
+        for (source, locale) in committed_locale_sources().into_iter().skip(1) {
+            let value = format_ftl_message(source, locale, key, &[])
+                .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+            assert!(
+                !value.trim().is_empty(),
+                "{key} must not be empty in {locale}; got {value:?}"
+            );
+            assert_ne!(
+                value, english,
+                "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+            );
+        }
     }
 
     #[test]

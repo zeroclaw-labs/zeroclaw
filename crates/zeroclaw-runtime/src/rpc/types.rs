@@ -8,6 +8,7 @@ use serde_json::Value;
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
 pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
+pub use crate::quickstart::QuickstartWarning;
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
@@ -1552,6 +1553,10 @@ pub enum QuickstartApplyResult {
         /// — caller must restart the daemon manually to pick up the
         /// change.
         daemon_restarted: bool,
+        /// Non-fatal issues discovered after the Quickstart configuration
+        /// committed. Older clients deserialize an omitted field as empty.
+        #[serde(default)]
+        warnings: Vec<QuickstartWarning>,
     },
     Errors {
         errors: Vec<QuickstartError>,
@@ -1736,6 +1741,7 @@ mod tests {
                 memory_backend: "sqlite".into(),
             },
             daemon_restarted: false,
+            warnings: Vec::new(),
         })
         .unwrap();
         assert_eq!(v["kind"], json!("applied"));

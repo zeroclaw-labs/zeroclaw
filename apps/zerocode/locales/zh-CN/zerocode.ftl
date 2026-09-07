@@ -359,6 +359,8 @@ zc-quickstart-modal-action-save = 保存
 zc-quickstart-modal-type-prefix = 类型：
 zc-quickstart-field-label-alias = 别名
 zc-quickstart-field-help-alias = 此提供方实例的唯一标识符。如果您的配置中已存在使用该别名的实例，请将其从 "default" 改为其他值。
+zc-quickstart-anthropic-setup-token-label = 设置令牌
+zc-quickstart-anthropic-setup-token-help = 粘贴 `claude setup-token` 的令牌。ZeroClaw 会将其存储在此别名的 Anthropic 认证配置文件中，并设置 `auth_mode = "oauth"`。
 zc-quickstart-model-loading = 正在加载 { $provider } 的模型...
 zc-quickstart-model-retrying = 正在重试加载 { $provider } 的模型目录...
 zc-quickstart-model-catalog-empty = 目录不可用 - 输入模型名称
@@ -370,6 +372,7 @@ zc-quickstart-status-created = 已创建 `{ $alias }`。正在重新加载守护
 zc-quickstart-status-errors = { $count } 个错误 — 修正选择器并重新提交
 zc-quickstart-status-first-error = { $where }{ $field }：{ $message }{ $more }
 zc-quickstart-status-more-errors = { " " }（还有 { $count } 个）
+zc-quickstart-status-more-warnings = { " " }（另外 { $count } 个警告）
 zc-quickstart-status-can-create = 所有必填选择器 ✓。按 `{ $chord }` 创建。
 zc-quickstart-status-hint = ↑/↓ 移动，回车打开。当所有必填选择器都为 ✓ 时启用 `{ $chord }`。
 zc-quickstart-missing-model-provider = 创建前请选择一个模型提供商。

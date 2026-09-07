@@ -1716,6 +1716,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                     model: Some("claude-test".to_string()),
                     ..Default::default()
                 },
+                // This local fixture uses the legacy static API-key path.
+                // OAuth would reject its nonofficial test endpoint by design.
+                auth_mode: None,
             },
         );
         config.risk_profiles.insert(
