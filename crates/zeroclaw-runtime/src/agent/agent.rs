@@ -3623,7 +3623,22 @@ mod tests {
         }
     }
 
-    struct RefusingCandidateProvider;
+    struct RefusingCandidateProvider {
+        /// Usage billed by the refusing attempt, when the provider reports it.
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    }
+
+    impl RefusingCandidateProvider {
+        fn refusal(&self, model: &str) -> anyhow::Error {
+            anyhow::Error::new(zeroclaw_providers::AnthropicRefusalError {
+                requested_model: model.into(),
+                category: Some("private-category".into()),
+                usage: self.usage.clone().map(Box::new),
+                attempted_candidate: None,
+                attempted_candidate_index: None,
+            })
+        }
+    }
 
     #[async_trait]
     impl ModelProvider for RefusingCandidateProvider {
@@ -3634,15 +3649,7 @@ mod tests {
             model: &str,
             _temperature: Option<f64>,
         ) -> Result<String> {
-            Err(anyhow::Error::new(
-                zeroclaw_providers::AnthropicRefusalError {
-                    requested_model: model.into(),
-                    category: Some("private-category".into()),
-                    usage: None,
-                    attempted_candidate: None,
-                    attempted_candidate_index: None,
-                },
-            ))
+            Err(self.refusal(model))
         }
 
         async fn chat(
@@ -3651,15 +3658,7 @@ mod tests {
             model: &str,
             _temperature: Option<f64>,
         ) -> Result<zeroclaw_providers::ChatResponse> {
-            Err(anyhow::Error::new(
-                zeroclaw_providers::AnthropicRefusalError {
-                    requested_model: model.into(),
-                    category: Some("private-category".into()),
-                    usage: None,
-                    attempted_candidate: None,
-                    attempted_candidate_index: None,
-                },
-            ))
+            Err(self.refusal(model))
         }
     }
 
@@ -4055,7 +4054,7 @@ mod tests {
             vec![
                 (
                     "candidate-a".into(),
-                    Box::new(RefusingCandidateProvider) as Box<dyn ModelProvider>,
+                    Box::new(RefusingCandidateProvider { usage: None }) as Box<dyn ModelProvider>,
                 ),
                 (
                     "candidate-b".into(),
@@ -4347,6 +4346,57 @@ mod tests {
             last_assistant_content(&agent.history),
             Some("accepted from c"),
             "persisted content stays undecorated"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_refusal_with_billed_usage_delivers_safety_guidance() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![(
+                "candidate-a".into(),
+                Box::new(RefusingCandidateProvider {
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(3),
+                        cached_input_tokens: None,
+                    }),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let mut agent = blank_input_agent(Box::new(reliable));
+        agent.model_name = "requested-a".into();
+
+        let error = agent
+            .turn("hello")
+            .await
+            .expect_err("an unrescued refusal fails the turn");
+
+        let usage = zeroclaw_providers::rejected_attempt_usage_from_error(&error)
+            .expect("billed refusal usage survives the terminal error");
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(3));
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_providers::AnthropicRefusalError>()
+                .is_none(),
+            "production shape keeps the refusal beneath Reliable's envelopes: {error:#}"
+        );
+
+        let message = crate::agent::terminal_completion_error_message(&error, None)
+            .expect("an exhausted refusal projects a user-facing message");
+        assert_eq!(
+            message,
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-refusal")
+        );
+        assert!(message.contains("safety system"), "{message}");
+        assert!(!message.contains("private-category"));
+        assert!(
+            zeroclaw_providers::reliable::transient_error_hint(&error)
+                .is_some_and(|hint| hint.contains("safety system")),
+            "the channel hint fallback must also see the refusal"
         );
     }
 

@@ -43,6 +43,26 @@ pub use safeguard_notice::{
     scope_safeguard_fallback, take_last_safeguard_fallback, visible_provider_fallback,
 };
 
+/// Return the typed refusal that terminated a provider result, if any.
+///
+/// Reliable keeps the final cause underneath its rejected-usage and terminal
+/// failure envelopes, and a streamed refusal arrives inside `StreamError`, so
+/// the leaf type is found by walking the chain rather than by an outer
+/// downcast. A later non-refusal failure replaces the refusal as the final
+/// cause and therefore yields `None`.
+pub fn model_refusal_from_error(error: &anyhow::Error) -> Option<&AnthropicRefusalError> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<AnthropicRefusalError>().or_else(|| {
+            match cause.downcast_ref::<zeroclaw_api::model_provider::StreamError>() {
+                Some(zeroclaw_api::model_provider::StreamError::ModelRefusal(refusal)) => {
+                    Some(refusal.as_ref())
+                }
+                _ => None,
+            }
+        })
+    })
+}
+
 /// Return billed usage carried by a rejected provider result.
 ///
 /// Reliable's aggregate is authoritative when present; a leaf refusal's own

@@ -233,6 +233,13 @@ fn terminal_completion_error_message_with_renderer(
     agent_name: Option<&str>,
     render: CliStringRenderer,
 ) -> Option<String> {
+    // A refusal that is still the final cause sits beneath Reliable's
+    // envelopes; it needs safety-specific guidance rather than the generic
+    // provider-failure projection. A later non-refusal failure replaces it as
+    // the final cause and keeps the generic projection below.
+    if zeroclaw_providers::model_refusal_from_error(err).is_some() {
+        return Some(render("cli-agent-error-provider-refusal", &[]));
+    }
     if let Some(failure) = err.chain().find_map(|source| {
         source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
     }) {
@@ -653,5 +660,82 @@ mod tests {
             None,
         ));
         assert!(is_tool_loop_cancelled(&e));
+    }
+
+    const REFUSAL_GUIDANCE: &str = "The model's safety system declined this request. Rephrase it, \
+                                    or configure fallback_models on the provider to auto-switch \
+                                    models.";
+
+    fn private_refusal() -> zeroclaw_api::model_provider::ModelRefusalError {
+        zeroclaw_api::model_provider::ModelRefusalError {
+            requested_model: "claude-primary".into(),
+            category: Some("private-category".into()),
+            usage: None,
+            attempted_candidate: None,
+            attempted_candidate_index: None,
+        }
+    }
+
+    #[test]
+    fn refusal_final_cause_projects_safety_guidance_beneath_reliable_envelopes() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        // Production shape: Reliable classifies the refusal as an ordinary
+        // terminal failure and keeps the typed refusal as its cause.
+        let error = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Other,
+                None,
+                "All model providers/models failed after 1 failure event(s).".to_string(),
+            )
+            .with_terminal_cause(anyhow::Error::new(private_refusal())),
+        );
+
+        let message = terminal_completion_error_message_in_english(&error, None)
+            .expect("an exhausted refusal must project a user-facing message");
+        assert_eq!(message, REFUSAL_GUIDANCE);
+        assert!(!message.contains("private-category"));
+    }
+
+    #[test]
+    fn later_non_refusal_final_cause_keeps_generic_projection() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Other,
+                None,
+                "All model providers/models failed after 2 failure event(s).".to_string(),
+            )
+            .with_terminal_cause(anyhow::anyhow!("500 later provider failure")),
+        );
+
+        assert_eq!(
+            terminal_completion_error_message_in_english(&error, None),
+            Some(crate::i18n::get_english_cli_string_with_args(
+                "cli-agent-error-provider-generic",
+                &[]
+            ))
+        );
+    }
+
+    #[test]
+    fn streamed_refusal_cause_projects_safety_guidance() {
+        let error = anyhow::Error::new(StreamErrorWithUsage {
+            message: "model_provider stream error: refusal".to_string(),
+            usage: None,
+            source: zeroclaw_api::model_provider::StreamError::ModelRefusal(Box::new(
+                private_refusal(),
+            )),
+        });
+
+        let message = terminal_completion_error_message_in_english(&error, None)
+            .expect("a streamed refusal must project a user-facing message");
+        assert_eq!(message, REFUSAL_GUIDANCE);
+        assert!(!message.contains("private-category"));
     }
 }

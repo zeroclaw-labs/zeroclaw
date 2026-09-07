@@ -497,7 +497,7 @@ fn record_accepted_route(route: AcceptedRoute) {
 }
 
 pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
-    if err.downcast_ref::<AnthropicRefusalError>().is_some() {
+    if crate::model_refusal_from_error(err).is_some() {
         return Some(
             "The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.",
         );
@@ -3928,6 +3928,47 @@ mod tests {
             .await
             .expect_err("chat_with_system must report the later failure");
         assert_later_failure_keeps_refusal_usage(&error);
+    }
+
+    #[tokio::test]
+    async fn transient_error_hint_finds_refusal_beneath_reliable_envelopes() {
+        let exhausted_refusal = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "anthropic",
+                "anthropic.primary",
+                "anthropic-primary",
+                "claude-primary",
+                Box::new(RefusalThenFailureStub {
+                    mode: RefusalThenFailureMode::Refusal,
+                }),
+            )],
+            0,
+            1,
+        );
+        let error = exhausted_refusal
+            .chat_with_system(None, "hello", "claude-primary", Some(0.0))
+            .await
+            .expect_err("a single refusing candidate exhausts the chain");
+        assert!(
+            error.downcast_ref::<AnthropicRefusalError>().is_none(),
+            "the refusal must sit beneath the rejected-usage envelope: {error:#}"
+        );
+        assert!(crate::model_refusal_from_error(&error).is_some());
+        assert!(
+            transient_error_hint(&error).is_some_and(|hint| hint.contains("safety system")),
+            "an exhausted refusal must select the safety-specific hint"
+        );
+
+        let error = refusal_then_failure_reliable()
+            .chat_with_system(None, "hello", "claude-primary", Some(0.0))
+            .await
+            .expect_err("the later failure is terminal");
+        assert!(crate::model_refusal_from_error(&error).is_none());
+        assert!(
+            transient_error_hint(&error).is_none_or(|hint| !hint.contains("safety system")),
+            "a later non-refusal failure keeps the generic guidance"
+        );
     }
 
     /// Leaf stub for an ordinary transport failure that precedes a fallback.
