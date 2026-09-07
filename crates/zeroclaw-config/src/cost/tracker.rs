@@ -217,6 +217,23 @@ impl CostTracker {
         task_id: Option<String>,
         honor_enabled: bool,
     ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_sync(
+            usage,
+            agent_alias,
+            task_id,
+            honor_enabled,
+            File::sync_all,
+        )
+    }
+
+    fn record_usage_with_owned_task_attribution_inner_with_sync(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        honor_enabled: bool,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
         let (enabled, track_per_agent) = {
             let config = self.config.read();
             (config.enabled, config.track_per_agent)
@@ -246,10 +263,8 @@ impl CostTracker {
         let record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
 
-        {
-            let mut storage = self.lock_storage();
-            storage.add_record(record)?;
-        }
+        let mut storage = self.lock_storage();
+        let append_outcome = storage.add_record_with_sync(record, sync_file)?;
 
         {
             let mut totals = self.lock_session_totals();
@@ -259,12 +274,13 @@ impl CostTracker {
             entry.request_count += 1;
         }
 
-        Ok(())
+        drop(storage);
+        append_outcome.into_result()
     }
 
     /// Get the current cost summary. When `[cost].track_per_agent` is
-    /// enabled, the response includes a `by_agent` rollup over today's
-    /// records.
+    /// enabled, the response includes a `by_agent` rollup over the current
+    /// month's records.
     pub fn get_summary(&self) -> Result<CostSummary> {
         self.get_summary_filtered(None)
     }
@@ -312,8 +328,16 @@ impl CostTracker {
     /// persisted ledger rows carrying the task-attribution key; no consumed
     /// counters are stored on feature-specific extension records.
     pub fn get_summary_for_task(&self, task_id: &str) -> Result<CostSummary> {
+        self.get_summary_for_task_at_period(task_id, ReportingPeriod::current())
+    }
+
+    fn get_summary_for_task_at_period(
+        &self,
+        task_id: &str,
+        period: ReportingPeriod,
+    ) -> Result<CostSummary> {
         let mut storage = self.lock_storage();
-        storage.summary_for_task(task_id)
+        storage.summary_for_task(task_id, period)
     }
 
     /// Get usage totals for a durable attributed task without building model/agent
@@ -332,10 +356,22 @@ impl CostTracker {
     }
 
     fn get_summary_filtered(&self, agent_filter: Option<&str>) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost, daily_records) = {
+        self.get_summary_filtered_at_period(agent_filter, ReportingPeriod::current())
+    }
+
+    fn get_summary_filtered_at_period(
+        &self,
+        agent_filter: Option<&str>,
+        period: ReportingPeriod,
+    ) -> Result<CostSummary> {
+        let (daily_cost, monthly_cost, period, current_month_records) = {
             let mut storage = self.lock_storage();
-            let (d, m) = storage.get_aggregated_costs()?;
-            (d, m, storage.daily_records()?)
+            storage.ensure_period_cache_current_at(period)?;
+            let period = storage.reporting_period();
+            let daily_cost = storage.daily_cost_usd;
+            let monthly_cost = storage.monthly_cost_usd;
+            let records = storage.current_month_records(period)?;
+            (daily_cost, monthly_cost, period, records)
         };
 
         let (session_cost, total_tokens, request_count) = {
@@ -361,31 +397,31 @@ impl CostTracker {
         };
 
         // Daily-scoped per-model rollup. Filter by agent when scoped.
-        let model_records: Vec<&CostRecord> =
-            daily_records.iter().filter(|r| matches_agent(r)).collect();
-        let by_model = build_model_stats(model_records.iter().copied());
+        let by_model = build_model_stats(
+            current_month_records
+                .iter()
+                .filter(|r| matches_agent(r))
+                .filter(|r| period.contains_day(r.usage.timestamp)),
+        );
 
         let (daily_total, monthly_total, by_agent) = if let Some(alias) = agent_filter {
             // Per-agent view: re-aggregate day/month from persisted records.
             let mut daily_total = 0.0;
             let mut monthly_total = 0.0;
-            let today = Utc::now().date_naive();
-            let now = Utc::now();
-            for record in &daily_records {
+            for record in &current_month_records {
                 if record.agent_alias.as_deref() != Some(alias) {
                     continue;
                 }
-                let ts = record.usage.timestamp.naive_utc();
-                if ts.date() == today {
+                if period.contains_day(record.usage.timestamp) {
                     daily_total += record.usage.cost_usd;
                 }
-                if ts.year() == now.year() && ts.month() == now.month() {
+                if period.contains_month(record.usage.timestamp) {
                     monthly_total += record.usage.cost_usd;
                 }
             }
             (daily_total, monthly_total, HashMap::new())
         } else if self.config_snapshot().track_per_agent {
-            let by_agent = build_agent_stats(&daily_records);
+            let by_agent = build_agent_stats(&current_month_records);
             (daily_cost, monthly_cost, by_agent)
         } else {
             (daily_cost, monthly_cost, HashMap::new())
@@ -613,6 +649,10 @@ fn add_usage_to_agent_stats(entry: &mut AgentCostStats, record: &CostRecord) {
 struct CostSummaryAccumulator {
     /// Aggregated USD cost for the scanned records.
     total_cost: f64,
+    /// Aggregated USD cost for records on the cached UTC day.
+    daily_cost: f64,
+    /// Aggregated USD cost for records in the cached UTC month.
+    monthly_cost: f64,
     /// Aggregated token count for the scanned records.
     total_tokens: u64,
     /// Number of scanned usage records.
@@ -624,8 +664,14 @@ struct CostSummaryAccumulator {
 }
 
 impl CostSummaryAccumulator {
-    fn record(&mut self, record: &CostRecord) {
+    fn record(&mut self, record: &CostRecord, period: ReportingPeriod) {
         self.total_cost += record.usage.cost_usd;
+        if period.contains_day(record.usage.timestamp) {
+            self.daily_cost += record.usage.cost_usd;
+        }
+        if period.contains_month(record.usage.timestamp) {
+            self.monthly_cost += record.usage.cost_usd;
+        }
         self.total_tokens += record.usage.total_tokens;
         self.request_count += 1;
         add_model_stats(&mut self.by_model, record);
@@ -635,8 +681,8 @@ impl CostSummaryAccumulator {
     fn finish(self) -> CostSummary {
         CostSummary {
             session_cost_usd: self.total_cost,
-            daily_cost_usd: self.total_cost,
-            monthly_cost_usd: self.total_cost,
+            daily_cost_usd: self.daily_cost,
+            monthly_cost_usd: self.monthly_cost,
             total_tokens: self.total_tokens,
             request_count: self.request_count,
             by_model: self.by_model,
@@ -662,6 +708,47 @@ struct CostStorage {
     aggregates_current: bool,
 }
 
+enum AppendOutcome {
+    Synced,
+    AppendedButSyncFailed(anyhow::Error),
+}
+
+impl AppendOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Synced => Ok(()),
+            Self::AppendedButSyncFailed(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReportingPeriod {
+    day: NaiveDate,
+    year: i32,
+    month: u32,
+}
+
+impl ReportingPeriod {
+    fn current() -> Self {
+        let now = Utc::now();
+        Self {
+            day: now.date_naive(),
+            year: now.year(),
+            month: now.month(),
+        }
+    }
+
+    fn contains_day(self, timestamp: DateTime<Utc>) -> bool {
+        timestamp.naive_utc().date() == self.day
+    }
+
+    fn contains_month(self, timestamp: DateTime<Utc>) -> bool {
+        let timestamp = timestamp.naive_utc();
+        timestamp.year() == self.year && timestamp.month() == self.month
+    }
+}
+
 impl CostStorage {
     /// Create or open cost storage.
     fn new(path: &Path) -> Result<Self> {
@@ -683,6 +770,19 @@ impl CostStorage {
             cached_month: now.month(),
             aggregates_current: false,
         })
+    }
+
+    fn recover_concatenated_records<F>(
+        input: &str,
+        mut on_record: F,
+    ) -> Result<(), serde_json::Error>
+    where
+        F: FnMut(CostRecord),
+    {
+        for value in serde_json::Deserializer::from_str(input).into_iter::<CostRecord>() {
+            on_record(value?);
+        }
+        Ok(())
     }
 
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
@@ -717,20 +817,9 @@ impl CostStorage {
 
             match serde_json::from_str::<CostRecord>(trimmed) {
                 Ok(record) => on_record(record),
-                Err(error) => {
-                    let mut recovered = 0usize;
-                    let stream =
-                        serde_json::Deserializer::from_str(trimmed).into_iter::<CostRecord>();
-                    for value in stream {
-                        match value {
-                            Ok(record) => {
-                                on_record(record);
-                                recovered += 1;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if recovered == 0 {
+                Err(_) => {
+                    if let Err(error) = Self::recover_concatenated_records(trimmed, &mut on_record)
+                    {
                         ::zeroclaw_log::record!(
                             WARN,
                             ::zeroclaw_log::Event::new(
@@ -780,24 +869,26 @@ impl CostStorage {
     }
 
     fn ensure_period_cache_current(&mut self) -> Result<()> {
-        let now = Utc::now();
-        let day = now.date_naive();
-        let year = now.year();
-        let month = now.month();
+        self.ensure_period_cache_current_at(ReportingPeriod::current())
+    }
 
+    fn ensure_period_cache_current_at(&mut self, period: ReportingPeriod) -> Result<()> {
         if !self.aggregates_current
-            || day != self.cached_day
-            || year != self.cached_year
-            || month != self.cached_month
+            || period.day != self.cached_day
+            || period.year != self.cached_year
+            || period.month != self.cached_month
         {
-            self.rebuild_aggregates(day, year, month)?;
+            self.rebuild_aggregates(period.day, period.year, period.month)?;
         }
 
         Ok(())
     }
 
-    /// Add a new record.
-    fn add_record(&mut self, record: CostRecord) -> Result<()> {
+    fn add_record_with_sync(
+        &mut self,
+        record: CostRecord,
+        sync_file: fn(&File) -> std::io::Result<()>,
+    ) -> Result<AppendOutcome> {
         self.ensure_period_cache_current()?;
 
         let mut file = OpenOptions::new()
@@ -819,12 +910,6 @@ impl CostStorage {
                 self.path.display().to_string()
             )
         })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "Failed to sync cost storage at {}",
-                self.path.display().to_string()
-            )
-        })?;
 
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
@@ -833,7 +918,18 @@ impl CostStorage {
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
             self.monthly_cost_usd += record.usage.cost_usd;
         }
-        Ok(())
+
+        let sync_result = sync_file(&file).with_context(|| {
+            format!(
+                "Failed to sync cost storage at {}",
+                self.path.display().to_string()
+            )
+        });
+
+        Ok(match sync_result {
+            Ok(()) => AppendOutcome::Synced,
+            Err(error) => AppendOutcome::AppendedButSyncFailed(error),
+        })
     }
 
     /// Get aggregated costs for current day and month.
@@ -842,17 +938,21 @@ impl CostStorage {
         Ok((self.daily_cost_usd, self.monthly_cost_usd))
     }
 
+    fn reporting_period(&self) -> ReportingPeriod {
+        ReportingPeriod {
+            day: self.cached_day,
+            year: self.cached_year,
+            month: self.cached_month,
+        }
+    }
+
     /// Snapshot every record whose timestamp falls within the current
     /// calendar month. Used to build per-agent rollups without folding a
     /// new aggregate table into the JSONL file.
-    fn daily_records(&mut self) -> Result<Vec<CostRecord>> {
-        self.ensure_period_cache_current()?;
-        let year = self.cached_year;
-        let month = self.cached_month;
+    fn current_month_records(&self, period: ReportingPeriod) -> Result<Vec<CostRecord>> {
         let mut out = Vec::new();
         self.for_each_record(|record| {
-            let ts = record.usage.timestamp.naive_utc();
-            if ts.year() == year && ts.month() == month {
+            if period.contains_month(record.usage.timestamp) {
                 out.push(record);
             }
         })?;
@@ -878,11 +978,13 @@ impl CostStorage {
         Ok(out)
     }
 
-    fn summary_for_task(&mut self, task_id: &str) -> Result<CostSummary> {
+    fn summary_for_task(&mut self, task_id: &str, period: ReportingPeriod) -> Result<CostSummary> {
+        self.ensure_period_cache_current_at(period)?;
+        let period = self.reporting_period();
         let mut summary = CostSummaryAccumulator::default();
         self.for_each_record(|record| {
             if record.task_id.as_deref() == Some(task_id) {
-                summary.record(&record);
+                summary.record(&record, period);
             }
         })?;
         Ok(summary.finish())
@@ -941,7 +1043,7 @@ impl CostStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{Duration, TimeZone, Utc};
     use tempfile::TempDir;
 
     fn enabled_config() -> CostConfig {
@@ -949,6 +1051,45 @@ mod tests {
             enabled: true,
             ..Default::default()
         }
+    }
+
+    fn record_at(
+        model: &str,
+        cost_usd: f64,
+        timestamp: DateTime<Utc>,
+        task_id: Option<&str>,
+    ) -> CostRecord {
+        let usage = TokenUsage {
+            model: model.to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            total_tokens: 20,
+            cost_usd,
+            pricing_available: true,
+            timestamp,
+        };
+        CostRecord::with_attribution(
+            "fixture-session",
+            Some("fixture-agent".to_string()),
+            task_id.map(str::to_string),
+            usage,
+        )
+    }
+
+    fn write_records(path: &Path, records: &[CostRecord]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for record in records {
+            writeln!(file, "{}", serde_json::to_string(record).unwrap()).unwrap();
+        }
+        file.sync_all().unwrap();
     }
 
     #[test]
@@ -983,6 +1124,94 @@ mod tests {
         let mut count = 0usize;
         storage.for_each_record(|_| count += 1).unwrap();
         assert_eq!(count, 2, "both concatenated records should be recovered");
+    }
+
+    #[test]
+    fn recovery_helper_accepts_clean_concatenated_records() {
+        let first = record_at("test/model-a", 1.0, Utc::now(), Some("task-a"));
+        let second = record_at("test/model-b", 2.0, Utc::now(), Some("task-b"));
+        let input = format!(
+            "{}{}",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records(&input, |record| recovered.push(record));
+
+        assert!(result.is_ok());
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].id, first.id);
+        assert_eq!(recovered[1].id, second.id);
+    }
+
+    #[test]
+    fn recovery_helper_returns_error_after_recovering_valid_prefix() {
+        let record = record_at("test/model", 1.0, Utc::now(), Some("task-a"));
+        let input = format!("{}{{malformed", serde_json::to_string(&record).unwrap());
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records(&input, |record| recovered.push(record));
+
+        assert!(result.is_err());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, record.id);
+    }
+
+    #[test]
+    fn recovery_helper_returns_error_without_recovering_wholly_malformed_input() {
+        let mut recovered = Vec::new();
+
+        let result =
+            CostStorage::recover_concatenated_records("not-json", |record| recovered.push(record));
+
+        assert!(result.is_err());
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn sync_failure_keeps_all_process_visible_totals_consistent() {
+        fn fail_sync(_: &File) -> std::io::Result<()> {
+            Err(std::io::Error::other("forced sync failure"))
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let usage = TokenUsage {
+            model: "test/model".to_string(),
+            input_tokens: 10,
+            output_tokens: 10,
+            cached_input_tokens: 0,
+            total_tokens: 20,
+            cost_usd: 1.0,
+            pricing_available: true,
+            timestamp: Utc::now(),
+        };
+
+        let error = tracker
+            .record_usage_with_owned_task_attribution_inner_with_sync(
+                usage,
+                None,
+                Some("task-a".to_string()),
+                true,
+                fail_sync,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Failed to sync cost storage"));
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.session_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((summary.daily_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((summary.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(summary.total_tokens, 20);
+        assert_eq!(summary.request_count, 1);
+
+        let model = summary.by_model.get("test/model").unwrap();
+        assert!((model.cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(model.total_tokens, 20);
+        assert_eq!(model.request_count, 1);
     }
 
     #[test]
@@ -1246,6 +1475,82 @@ mod tests {
         );
         assert!(summary.by_model.contains_key("session/model"));
         assert!(summary.by_model.contains_key("prior/model"));
+    }
+
+    #[test]
+    fn summaries_use_one_cached_period_for_task_and_model_rollups() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let period = ReportingPeriod {
+            day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            year: 2025,
+            month: 6,
+        };
+        let month_start = period.day.with_day(1).unwrap();
+        let other_current_month = month_start;
+        let prior_month = month_start - Duration::days(1);
+        write_records(
+            &storage_path,
+            &[
+                record_at(
+                    "today/model",
+                    1.0,
+                    Utc.from_utc_datetime(&period.day.and_hms_opt(12, 0, 0).unwrap()),
+                    Some("task-periods"),
+                ),
+                record_at(
+                    "earlier-month/model",
+                    2.0,
+                    Utc.from_utc_datetime(&other_current_month.and_hms_opt(0, 0, 0).unwrap()),
+                    Some("task-periods"),
+                ),
+                record_at(
+                    "prior-month/model",
+                    4.0,
+                    Utc.from_utc_datetime(&prior_month.and_hms_opt(0, 0, 0).unwrap()),
+                    Some("task-periods"),
+                ),
+            ],
+        );
+
+        let mut config = enabled_config();
+        config.track_per_agent = true;
+        let tracker = CostTracker::new(config, tmp.path()).unwrap();
+
+        let task = tracker
+            .get_summary_for_task_at_period("task-periods", period)
+            .unwrap();
+        assert_eq!(task.request_count, 3);
+        assert!((task.session_cost_usd - 7.0).abs() < f64::EPSILON);
+        assert!((task.monthly_cost_usd - 3.0).abs() < f64::EPSILON);
+        assert!((task.daily_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!(task.by_model.contains_key("prior-month/model"));
+
+        let summary = tracker
+            .get_summary_filtered_at_period(None, period)
+            .unwrap();
+        assert_eq!(summary.by_model.len(), 1);
+        assert!(summary.by_model.contains_key("today/model"));
+        assert!(!summary.by_model.contains_key("earlier-month/model"));
+        assert!(!summary.by_model.contains_key("prior-month/model"));
+        assert_eq!(
+            summary
+                .by_agent
+                .get("fixture-agent")
+                .map(|stats| stats.request_count),
+            Some(2),
+            "per-agent aggregation retains current-month rows"
+        );
+
+        let filtered = tracker
+            .get_summary_filtered_at_period(Some("fixture-agent"), period)
+            .unwrap();
+        assert!((filtered.daily_cost_usd - 1.0).abs() < f64::EPSILON);
+        assert!((filtered.monthly_cost_usd - 3.0).abs() < f64::EPSILON);
+        assert_eq!(filtered.by_model.len(), 1);
+        assert!(filtered.by_model.contains_key("today/model"));
+        assert!(!filtered.by_model.contains_key("earlier-month/model"));
+        assert!(!filtered.by_model.contains_key("prior-month/model"));
     }
 
     #[test]

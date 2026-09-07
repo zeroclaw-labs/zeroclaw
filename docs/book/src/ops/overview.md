@@ -89,6 +89,8 @@ curl -s http://localhost:42617/health | jq
 
 Each component carries `status` (`starting` / `ok` / `error`), `last_ok`, `last_error`, and `restart_count`. Watch for `status: "error"` and climbing `restart_count`.
 
+A channel reads `starting` with a null `last_ok` until it confirms it can actually reach its service, not merely until its listener starts. Some channels report what they observed while talking to the service, so a listener that is running but has never completed an exchange stays `starting` rather than `ok`, and one whose calls are failing reads `error`. A channel restarting under an alias that previously reported `ok` returns to `starting` until it produces its own successful exchange. Channels that offer no such signal are marked `ok` for as long as their listener runs.
+
 ### 3. Provider reliability
 
 Providers surface as components in the same `/health` snapshot. For request-level signal (latency, success rate, token counts), scrape `/metrics` (see below) and read `zeroclaw_llm_requests_total` and `zeroclaw_request_latency_seconds`.

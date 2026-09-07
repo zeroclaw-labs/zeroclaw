@@ -551,12 +551,11 @@ mod tests {
         let cap = LlmGenerateCapability::new(Some(adapter));
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
         assert!(!out.success);
-        assert_eq!(
-            out.error.as_deref(),
-            Some(
-                "llm.generate: model call failed: The model provider returned an invalid semantic completion."
-            )
+        let expected = format!(
+            "llm.generate: model call failed: {}",
+            crate::agent::semantic_empty_terminal_completion_message(None)
         );
+        assert_eq!(out.error.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
@@ -565,12 +564,11 @@ mod tests {
         let out = cap.execute(ctx(), json!({"instruction": "x"})).unwrap();
 
         assert!(!out.success);
-        assert_eq!(
-            out.error.as_deref(),
-            Some(
-                "llm.generate: model call failed: The model provider returned an invalid semantic completion."
-            )
+        let expected = format!(
+            "llm.generate: model call failed: {}",
+            crate::agent::semantic_empty_terminal_completion_message(None)
         );
+        assert_eq!(out.error.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

@@ -166,8 +166,8 @@ fn manual_stable_release_calls_container_matrix_at_release_tag() {
         publisher
             .matches("ref: ${{ inputs.release_ref || github.ref }}")
             .count(),
-        2,
-        "matrix resolution and image builds must use the requested immutable ref"
+        3,
+        "matrix resolution, image builds, and the relay image build must use the requested immutable ref"
     );
 }
 
