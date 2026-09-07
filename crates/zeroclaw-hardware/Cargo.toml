@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Hardware discovery, peripherals, and device management for ZeroClaw."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true
@@ -39,7 +40,7 @@ rppal = { version = "0.22", optional = true }
 default = []
 hardware = ["dep:nusb", "dep:tokio-serial", "dep:dialoguer", "dep:console"]
 peripheral-rpi = ["rppal"]
-probe = ["dep:probe-rs"]
+probe = ["dep:probe-rs", "zeroclaw-tools/probe"]
 # Extends the serial peripheral allow-list with `/tmp/zc-sim-*` for hardware-free
 # local testing (paired with the `esp32_sim` example). Off by default; opt-in.
 #

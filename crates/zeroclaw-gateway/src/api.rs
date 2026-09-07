@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
@@ -231,6 +232,47 @@ pub struct SessionMessagePostBody {
 
 // ── Handlers ────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusNodes {
+    pub connected: Vec<String>,
+    pub mdns_peers: Vec<crate::nodes::mdns::MdnsPeerSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusResponse {
+    pub version: String,
+    /// Dotted `<type>.<alias>` of the resolved model provider, or `null` when none is configured.
+    /// The unqualified provider name is reserved; this field is always qualified.
+    pub model_provider: Option<String>,
+    pub model: String,
+    /// Resolved model temperature, or `null` when no temperature is configured.
+    pub temperature: Option<f64>,
+    pub uptime_seconds: u64,
+    /// RFC 3339 UTC wall-clock time when the daemon started.
+    pub daemon_started_at: String,
+    pub gateway_port: u16,
+    pub locale: String,
+    pub memory_backend: String,
+    pub paired: bool,
+    pub channels: BTreeMap<String, bool>,
+    pub nodes: StatusNodes,
+    pub health: zeroclaw_runtime::health::HealthSnapshot,
+    /// Configured agent alias used for per-agent resolution, or `null` for the install-wide view.
+    pub agent_alias: Option<String>,
+    /// Self-process resource snapshot; unsupported hosts report zero memory and a null CPU value.
+    pub process: zeroclaw_runtime::process_stats::ProcessStats,
+    /// Whether the gateway polls for newer releases and shows an update indicator.
+    pub check_updates: bool,
+    /// Whether browser-triggered self-upgrade is enabled.
+    pub allow_self_upgrade: bool,
+    /// How the daemon is restarted after an upgrade: supervised, self-respawn, or manual.
+    pub restart_mode: crate::version::RestartMode,
+    /// Operator-facing command or instruction for completing an upgrade restart.
+    pub restart_hint: String,
+}
+
 /// Query parameters for `GET /api/status`. Pass `?agent=<alias>` to
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
@@ -256,10 +298,10 @@ pub async fn handle_api_status(
 
     // Per-alias map keyed by composite `<type>.<alias>`. Every
     // populated `[channels.<type>.<alias>]` is a separate dashboard row.
-    let mut channels = serde_json::Map::new();
+    let mut channels = BTreeMap::new();
     for info in config.channels_by_alias() {
         let composite = format!("{}.{}", info.channel_type, info.alias);
-        channels.insert(composite, serde_json::Value::Bool(true));
+        channels.insert(composite, true);
     }
 
     let locale = config
@@ -315,30 +357,30 @@ pub async fn handle_api_status(
     // the upgrade button, and which restart command to show afterwards.
     let restart = crate::version::detect_restart();
 
-    let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "model_provider": model_provider,
-        "model": model,
-        "temperature": temperature,
-        "uptime_seconds": health.uptime_seconds,
-        "daemon_started_at": zeroclaw_runtime::health::daemon_started_at(),
-        "gateway_port": config.gateway.port,
-        "locale": locale,
-        "memory_backend": memory_backend,
-        "paired": state.pairing.is_paired(),
-        "channels": channels,
-        "nodes": {
-            "connected": state.node_registry.node_ids(),
-            "mdns_peers": state.mdns_peer_registry.snapshots(),
+    let body = StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model_provider,
+        model,
+        temperature,
+        uptime_seconds: health.uptime_seconds,
+        daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
+        gateway_port: config.gateway.port,
+        locale,
+        memory_backend,
+        paired: state.pairing.is_paired(),
+        channels,
+        nodes: StatusNodes {
+            connected: state.node_registry.node_ids(),
+            mdns_peers: state.mdns_peer_registry.snapshots(),
         },
-        "health": health,
-        "agent_alias": agent_alias,
-        "process": process,
-        "check_updates": config.gateway.check_updates,
-        "allow_self_upgrade": config.gateway.allow_self_upgrade,
-        "restart_mode": restart.mode.as_str(),
-        "restart_hint": restart.hint,
-    });
+        health,
+        agent_alias: agent_alias.map(String::from),
+        process,
+        check_updates: config.gateway.check_updates,
+        allow_self_upgrade: config.gateway.allow_self_upgrade,
+        restart_mode: restart.mode,
+        restart_hint: restart.hint,
+    };
 
     Json(body).into_response()
 }
@@ -2366,7 +2408,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn api_status_includes_connected_nodes_and_mdns_peers() {
+    async fn api_status_contract_includes_connected_nodes_and_mdns_peers() {
         let state = test_state(zeroclaw_config::schema::Config::default());
         let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(1);
         assert!(state.node_registry.register(nodes::NodeInfo {
@@ -2412,6 +2454,72 @@ pub(crate) mod tests {
                 "base_url": "http://10.0.0.2:42617/peer",
             }])
         );
+    }
+
+    #[tokio::test]
+    async fn api_status_contract_preserves_nullable_and_nested_fields() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        let actual_fields: std::collections::BTreeSet<_> = json
+            .as_object()
+            .expect("status response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_fields = [
+            "agent_alias",
+            "allow_self_upgrade",
+            "channels",
+            "check_updates",
+            "daemon_started_at",
+            "gateway_port",
+            "health",
+            "locale",
+            "memory_backend",
+            "model",
+            "model_provider",
+            "nodes",
+            "paired",
+            "process",
+            "restart_hint",
+            "restart_mode",
+            "temperature",
+            "uptime_seconds",
+            "version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_fields, expected_fields);
+        assert!(json["version"].as_str().is_some());
+        assert!(json["temperature"].is_null());
+        assert!(json["agent_alias"].is_null());
+        assert!(json["uptime_seconds"].is_u64());
+        assert!(json["daemon_started_at"].as_str().is_some());
+        assert!(json["channels"].is_object());
+        assert!(json["nodes"]["connected"].is_array());
+        assert!(json["nodes"]["mdns_peers"].is_array());
+        assert!(json["health"]["pid"].is_u64());
+        assert!(json["health"]["components"].is_object());
+        assert!(json["process"]["rss_bytes"].is_u64());
+        assert!(
+            json["process"]["cpu_percent"].is_null() || json["process"]["cpu_percent"].is_number()
+        );
+        assert!(json["check_updates"].is_boolean());
+        assert!(json["allow_self_upgrade"].is_boolean());
+        assert_eq!(
+            json["restart_mode"],
+            crate::version::detect_restart().mode.as_str()
+        );
+        assert!(json["restart_hint"].as_str().is_some());
     }
 
     #[test]

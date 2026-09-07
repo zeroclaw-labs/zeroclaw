@@ -104,6 +104,7 @@ fn manifest() -> PluginManifest {
         })),
         signature: None,
         publisher_key: None,
+        egress: Default::default(),
     }
 }
 
