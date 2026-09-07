@@ -1321,7 +1321,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_includes_display_when_present() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
@@ -1334,7 +1335,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_omits_display_when_absent() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: None,
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
