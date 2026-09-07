@@ -20,12 +20,21 @@ const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
 /// model validation, so the two are kept distinct all the way to the operator-visible
 /// `ToolResult` instead of being flattened into one `anyhow::Error` and sorted
 /// by the chat-oriented `is_non_retryable` heuristic.
+///
+/// Both variants carry the effective model the probe had resolved when the
+/// failure happened, so operator-facing diagnostics can name the model that
+/// was actually validated rather than the one saved on disk.
 #[derive(Debug)]
 enum ProbeFailure {
     /// The provider could not be built from the effective configuration.
-    Construction(anyhow::Error),
-    /// The provider was built and the ping request itself failed.
-    Request(anyhow::Error),
+    /// `model` is `None` when the failure happened before the effective
+    /// model was resolved, i.e. the environment layer could not be rebuilt.
+    Construction {
+        model: Option<String>,
+        error: anyhow::Error,
+    },
+    /// The provider was built and the ping request for `model` failed.
+    Request { model: String, error: anyhow::Error },
 }
 
 #[derive(Debug)]
@@ -38,7 +47,15 @@ enum ProbeConfigFailure {
 impl ProbeFailure {
     fn error(&self) -> &anyhow::Error {
         match self {
-            Self::Construction(error) | Self::Request(error) => error,
+            Self::Construction { error, .. } | Self::Request { error, .. } => error,
+        }
+    }
+
+    /// The effective model the probe resolved before failing, if it got that far.
+    fn model(&self) -> Option<&str> {
+        match self {
+            Self::Construction { model, .. } => model.as_deref(),
+            Self::Request { model, .. } => Some(model),
         }
     }
 
@@ -49,8 +66,8 @@ impl ProbeFailure {
     /// the new config.
     fn is_fatal(&self) -> bool {
         match self {
-            Self::Construction(_) => true,
-            Self::Request(error) => zeroclaw_providers::reliable::is_non_retryable(error),
+            Self::Construction { .. } => true,
+            Self::Request { error, .. } => zeroclaw_providers::reliable::is_non_retryable(error),
         }
     }
 }
@@ -663,8 +680,12 @@ impl ModelRoutingConfigTool {
             .probe_model(&cfg, &provider_name, current_model.as_deref())
             .await
         {
-            let model_name = current_model
-                .as_deref()
+            // Name the model the probe actually validated. Only a failure
+            // that happened before the effective model was resolved falls
+            // back to the saved model, since nothing else exists to name.
+            let model_name = probe_err
+                .model()
+                .or(current_model.as_deref())
                 .unwrap_or("environment-effective model");
             if probe_err.is_fatal() {
                 let reverted_model = previous_provider_entry
@@ -809,7 +830,7 @@ impl ModelRoutingConfigTool {
             Err(
                 ProbeConfigFailure::EnvironmentOverride(error) | ProbeConfigFailure::Task(error),
             ) => {
-                return Err(ProbeFailure::Construction(error));
+                return Err(ProbeFailure::Construction { model: None, error });
             }
         };
         let (family, alias) = provider_name
@@ -878,8 +899,12 @@ impl ModelRoutingConfigTool {
         };
 
         let model_provider =
-            zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name)
-                .map_err(ProbeFailure::Construction)?;
+            zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name).map_err(
+                |error| ProbeFailure::Construction {
+                    model: Some(probe_model_name.clone()),
+                    error,
+                },
+            )?;
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
@@ -891,7 +916,10 @@ impl ModelRoutingConfigTool {
                 Some(PING_TEMPERATURE),
             )
             .await
-            .map_err(ProbeFailure::Request)?;
+            .map_err(|error| ProbeFailure::Request {
+                model: probe_model_name,
+                error,
+            })?;
 
         Ok(())
     }
@@ -1455,6 +1483,27 @@ mod tests {
         let contents = std::fs::read_to_string(cfg_path).ok()?;
         let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
         cfg.providers.models.find(family, alias).cloned()
+    }
+
+    /// Mount the OpenAI-shaped `404 model_not_found` rejection the composed
+    /// unavailable-model regressions drive through `set_default`.
+    async fn mount_model_not_found(server: &wiremock::MockServer, model: &str) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "The model `{model}` does not exist or you do not have access to it."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found"
+                }
+            })))
+            .mount(server)
+            .await;
     }
 
     async fn env_override_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
@@ -2023,7 +2072,7 @@ mod tests {
              disk key would have constructed cleanly",
         );
         assert!(
-            matches!(failure, ProbeFailure::Construction(_)),
+            matches!(failure, ProbeFailure::Construction { .. }),
             "an unusable effective credential is a construction failure, not a request failure"
         );
         assert!(
@@ -2309,6 +2358,60 @@ mod tests {
         );
     }
 
+    /// When the environment overrides the alias model, the probe validates the
+    /// environment-effective model, so a failure must name that model rather
+    /// than the one just written to disk.
+    #[tokio::test]
+    async fn set_default_failure_names_the_environment_effective_model() {
+        use wiremock::MockServer;
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_model_diagnostic_case";
+
+        let server = MockServer::start().await;
+        mount_model_not_found(&server, "gpt-env-missing").await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.model = Some("gpt-known".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let model_var =
+            "ZEROCLAW_providers__models__openai__probe_env_model_diagnostic_case__model";
+        let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-missing");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-disk"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        let output = result.output.to_string();
+        assert!(
+            output.contains("Model 'gpt-env-missing' is not available"),
+            "the diagnostic must name the model the probe dispatched: {output}"
+        );
+        assert!(
+            !output.contains("Model 'gpt-disk'"),
+            "the diagnostic must not name a saved model the runtime never serves: {output}"
+        );
+        let after = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("a pre-existing alias must survive rollback");
+        assert_eq!(after.model.as_deref(), Some("gpt-known"));
+    }
+
     #[tokio::test]
     async fn probe_model_surfaces_environment_override_reconstruction_errors() {
         let _env_guard = env_override_test_lock().await;
@@ -2328,7 +2431,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(ProbeFailure::Construction(_))),
+            matches!(result, Err(ProbeFailure::Construction { .. })),
             "an invalid environment layer must be a fatal reconstruction failure: {result:?}"
         );
     }
@@ -2339,18 +2442,27 @@ mod tests {
     #[tokio::test]
     async fn probe_failure_is_fatal_only_for_construction_and_non_retryable_requests() {
         assert!(
-            ProbeFailure::Construction(anyhow::Error::msg("API key prefix mismatch")).is_fatal(),
+            ProbeFailure::Construction {
+                model: Some("gpt-test".to_string()),
+                error: anyhow::Error::msg("API key prefix mismatch"),
+            }
+            .is_fatal(),
             "a local construction failure is never transient"
         );
         assert!(
-            !ProbeFailure::Request(anyhow::Error::msg(
-                "error sending request: connection reset"
-            ))
+            !ProbeFailure::Request {
+                model: "gpt-test".to_string(),
+                error: anyhow::Error::msg("error sending request: connection reset"),
+            }
             .is_fatal(),
             "a transient request failure must keep the new config"
         );
         assert!(
-            ProbeFailure::Request(anyhow::Error::msg("404 model not found")).is_fatal(),
+            ProbeFailure::Request {
+                model: "gpt-test".to_string(),
+                error: anyhow::Error::msg("404 model not found"),
+            }
+            .is_fatal(),
             "a non-retryable request failure must still roll back"
         );
     }
