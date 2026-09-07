@@ -14945,6 +14945,10 @@ pub struct TelegramConfig {
     /// sender/chat authorization are recorded as passive conversation context
     /// without starting an agent turn. Lets the bot follow the discussion and
     /// answer with full context when later @-mentioned. Default: `false`.
+    ///
+    /// Requires `mention_only = true`. With the default `mention_only = false`
+    /// the bot already answers every authorized group message, so there is no
+    /// unaddressed message left to record and this flag changes nothing.
     #[tab(Behavior)]
     #[serde(default)]
     pub passive_group_context: bool,
