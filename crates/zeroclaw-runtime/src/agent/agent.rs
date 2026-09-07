@@ -5701,11 +5701,26 @@ mod tests {
         #[tokio::test]
         async fn turn_rebuilds_prompt_for_vision_routed_xml_provider() {
             // Base provider supports native tools but not vision. The configured
-            // vision provider is a custom OpenAI-compatible endpoint: it supports
-            // vision but not native tools.
+            // vision provider is a custom OpenAI-compatible endpoint that supports
+            // vision but NOT native tools — an explicit `native_tools = false`
+            // alias override, since custom OpenAI-compatible endpoints now default
+            // to native tools ON (see the CustomModelProviderConfig factory).
+            // Modeled via a real config alias (not the bare "custom:URL" shorthand,
+            // which always uses ModelProviderRuntimeOptions::default() with no way
+            // to force native_tools off) so this test exercises the same path a
+            // real operator would use to configure this scenario.
             let (base_provider, _captured) = capturing_provider(true);
+            let vision_alias_config: zeroclaw_config::schema::Config = toml::from_str(
+                r#"
+schema_version = 3
+[providers.models.custom.myvision]
+uri = "http://127.0.0.1:9"
+native_tools = false
+"#,
+            )
+            .expect("config parses");
             let mm_config = zeroclaw_config::schema::MultimodalConfig {
-                vision_model_provider: Some("custom:http://127.0.0.1:9".into()),
+                vision_model_provider: Some("custom.myvision".into()),
                 ..Default::default()
             };
             let mut agent = test_agent_with_provider_and_multimodal(
@@ -5714,6 +5729,9 @@ mod tests {
                 Some(Box::new(NativeToolDispatcher)),
                 Some(mm_config),
             );
+            agent.provider_switch_config = Some(ProviderSwitchConfig {
+                config: Some(std::sync::Arc::new(vision_alias_config)),
+            });
 
             let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
 
