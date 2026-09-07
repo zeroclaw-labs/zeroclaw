@@ -2358,6 +2358,84 @@ mod tests {
         );
     }
 
+    /// The composed unavailable-model boundary the linked issue calls for: a
+    /// realistic `model_not_found` rejection from the endpoint must reach the
+    /// operator as an unsuccessful result and restore the persisted alias.
+    #[tokio::test]
+    async fn set_default_restores_the_persisted_alias_when_the_effective_model_is_not_found() {
+        use wiremock::MockServer;
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_unavailable_model_case";
+
+        let server = MockServer::start().await;
+        mount_model_not_found(&server, "gpt-missing").await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.model = Some("gpt-known".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+        let before = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("precondition: the alias exists before set_default updates it");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-missing"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a model the endpoint rejects must not pass validation: {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(requests.len(), 1, "exactly one probe reaches the endpoint");
+        let body: serde_json::Value = requests[0]
+            .body_json()
+            .expect("the probe sends a JSON chat request");
+        assert_eq!(body["model"].as_str(), Some("gpt-missing"));
+
+        let output = result.output.to_string();
+        assert!(
+            output.contains("Model 'gpt-missing' is not available"),
+            "the result must name the rejected model: {output}"
+        );
+        assert!(
+            output.contains("404"),
+            "the rejection status must reach the operator: {output}"
+        );
+        assert!(
+            output.contains("Reverted to 'gpt-known'"),
+            "the result must report the restored model: {output}"
+        );
+        assert!(
+            result.error.is_some(),
+            "an unsuccessful probe result must carry the error field"
+        );
+
+        let after = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("a pre-existing alias must survive rollback");
+        assert_eq!(
+            after.model, before.model,
+            "rollback must restore the previous model on disk, not keep the rejected one"
+        );
+        assert_eq!(after.model.as_deref(), Some("gpt-known"));
+    }
+
     /// When the environment overrides the alias model, the probe validates the
     /// environment-effective model, so a failure must name that model rather
     /// than the one just written to disk.
