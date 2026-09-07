@@ -294,7 +294,11 @@ recover it two ways:
 Either way the delivered reply carries a short footer naming the requested and
 served models, so the switch is visible to the user. In the web dashboard chat
 the same switch surfaces as an inline notice just before the answer, showing
-only the requested and served model names.
+only the requested and served model names. When an ordinary provider failure
+already moved the request to a client-side fallback before Anthropic switched
+models on its side, the reply keeps the ordinary fallback notice as well, so
+the originally requested model stays visible and the two causes are not
+conflated.
 
 Streaming has a limit: a refusal that arrives after streamed output has begun
 keeps the existing interrupted-reply behavior; fallback applies only to refusals

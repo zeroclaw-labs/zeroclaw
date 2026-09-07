@@ -2010,15 +2010,18 @@ impl Agent {
     /// and streamed as a trailing [`TurnEvent::Chunk`] (rendered by streaming
     /// consumers that discard the final text on a clean finish, e.g. the
     /// ZeroCode TUI).
+    ///
+    /// A safeguard notice composed from the original request replaces this
+    /// generic notice; a server-side safeguard notice does not, because the
+    /// generic record is then the only presentation of the ordinary leg that
+    /// preceded it. The safeguard notice itself is rendered by the caller.
     async fn append_model_fallback_notice(
         response: String,
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
         safeguard: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> String {
-        if safeguard.is_some() {
-            return response;
-        }
+        let fallback = zeroclaw_providers::visible_provider_fallback(fallback, safeguard);
         let with_notice = Self::format_model_fallback_notice(response.clone(), fallback);
         if with_notice == response {
             return response;
@@ -2695,14 +2698,20 @@ impl Agent {
         };
 
         let response = self.append_receipts_block(response, receipt_scope.as_ref());
-        let response = if turn_safeguard_fallback.is_some() {
-            crate::agent::append_safeguard_fallback_notice(
-                response,
+        // The ordinary recovery leg is rendered first so the route reads in
+        // order: an ordinary provider fallback, then any safeguard switch the
+        // accepted attempt itself went through.
+        let response = Self::format_model_fallback_notice(
+            response,
+            zeroclaw_providers::visible_provider_fallback(
+                turn_provider_recovery.as_ref(),
                 turn_safeguard_fallback.as_ref(),
-            )
-        } else {
-            Self::format_model_fallback_notice(response, turn_provider_recovery.as_ref())
-        };
+            ),
+        );
+        let response = crate::agent::append_safeguard_fallback_notice(
+            response,
+            turn_safeguard_fallback.as_ref(),
+        );
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
@@ -3654,6 +3663,45 @@ mod tests {
         }
     }
 
+    /// Candidate that fails with an ordinary transport error, never a refusal.
+    struct UnavailableCandidateProvider;
+
+    #[async_trait]
+    impl ModelProvider for UnavailableCandidateProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            anyhow::bail!("503 service unavailable")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for UnavailableCandidateProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UnavailableCandidateProvider"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for RefusingCandidateProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -3863,6 +3911,46 @@ mod tests {
         .await;
         assert_eq!(out, "hello");
         assert!(rx.try_recv().is_err(), "no generic fallback chunk");
+    }
+
+    #[tokio::test]
+    async fn server_side_safeguard_keeps_generic_model_fallback_notice() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // Ordinary failure on model A moved the request to pinned model B;
+        // Anthropic then served B's request with C. The safeguard notice
+        // covers only B to C, so the generic A to B leg must stay visible.
+        let info = fallback_info("anthropic", "model-a", "anthropic", "model-b");
+        let safeguard = zeroclaw_providers::SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+            requested_model: "model-b".into(),
+            served_model: "model-c".into(),
+            category: None,
+        };
+        let out = Agent::append_model_fallback_notice(
+            "hello".to_string(),
+            Some(&info),
+            Some(&safeguard),
+            &tx,
+        )
+        .await;
+        assert!(out.starts_with("hello\n\n"), "reply text preserved: {out}");
+        assert!(
+            out.contains("model-a") && out.contains("model-b"),
+            "the ordinary leg must keep naming the original request: {out}"
+        );
+        assert!(
+            !out.contains("model-c"),
+            "the safeguard leg is rendered by the caller, not here: {out}"
+        );
+        match rx.try_recv() {
+            Ok(TurnEvent::Chunk { delta }) => {
+                assert!(
+                    delta.contains("model-a"),
+                    "streamed chunk carries the leg: {delta}"
+                );
+            }
+            other => panic!("expected the generic notice chunk, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4087,6 +4175,179 @@ mod tests {
             ConversationMessage::Chat(message) => !message.content.contains("served-c"),
             _ => true,
         }));
+    }
+
+    /// One accepted native response served by Anthropic's server fallback C.
+    async fn served_by_c_anthropic_server() -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "model": "served-c",
+                    "content": [{"type": "text", "text": "accepted from c"}],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "iterations": [
+                            {"type": "message"},
+                            {"type": "fallback_message"}
+                        ]
+                    }
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Candidate A fails with an ordinary 503, Reliable advances to candidate
+    /// B (the real Anthropic client), and Anthropic serves B's request with C.
+    fn ordinary_failure_then_server_fallback_reliable(
+        server_uri: &str,
+    ) -> zeroclaw_providers::reliable::ReliableModelProvider {
+        let anthropic =
+            zeroclaw_providers::anthropic::AnthropicModelProvider::builder("candidate-b")
+                .credential(Some("synthetic-key"))
+                .base_url(server_uri)
+                .server_fallback_models(vec!["served-c".into()])
+                .build();
+        zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "candidate-a".into(),
+                    Box::new(UnavailableCandidateProvider) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "candidate-b".into(),
+                    Box::new(NonStreamingAnthropicProvider { inner: anthropic })
+                        as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    fn last_assistant_content(messages: &[ConversationMessage]) -> Option<&str> {
+        messages.iter().rev().find_map(|message| match message {
+            ConversationMessage::Chat(message) if message.role == "assistant" => {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_then_real_anthropic_server_fallback_keeps_original_request_visible() {
+        let server = served_by_c_anthropic_server().await;
+        let mut agent = blank_input_agent(Box::new(
+            ordinary_failure_then_server_fallback_reliable(&server.uri()),
+        ));
+        agent.model_name = "requested-a".into();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("candidate B and Anthropic server fallback C recover the turn");
+
+        let notice = outcome
+            .safeguard_fallback
+            .as_ref()
+            .expect("server-side attribution for the accepted attempt");
+        assert_eq!(
+            notice.kind,
+            zeroclaw_providers::SafeguardFallbackKind::ServerSide,
+            "an ordinary 503 is not a refusal-triggered client recovery"
+        );
+        assert_eq!(notice.requested_model, "requested-a");
+        assert_eq!(notice.served_model, "served-c");
+
+        // The ordinary A to B leg is delivered as the generic notice, both in
+        // the returned text and as a streamed chunk, so the original route is
+        // not erased by the safeguard notice.
+        assert!(
+            outcome.response.starts_with("accepted from c\n\n"),
+            "reply text precedes the route notices: {}",
+            outcome.response
+        );
+        assert!(
+            outcome.response.contains("candidate-a") && outcome.response.contains("candidate-b"),
+            "the ordinary leg must name the original route: {}",
+            outcome.response
+        );
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let TurnEvent::Chunk { delta } = event {
+                streamed.push_str(&delta);
+            }
+        }
+        assert!(
+            streamed.contains("candidate-a"),
+            "delta-only consumers must also receive the ordinary leg: {streamed}"
+        );
+
+        let display =
+            crate::agent::append_safeguard_fallback_notice(outcome.response.clone(), Some(notice));
+        assert_eq!(display.matches("Safety safeguards").count(), 1);
+        assert!(display.contains("served-c"));
+        assert!(
+            display.find("candidate-a") < display.find("Safety safeguards"),
+            "the ordinary leg precedes the safety leg: {display}"
+        );
+        assert!(
+            !display.contains("fallback chain"),
+            "the client leg was an ordinary failure, not a refusal chain: {display}"
+        );
+        assert_eq!(
+            last_assistant_content(&outcome.new_messages),
+            Some("accepted from c"),
+            "persisted content stays undecorated"
+        );
+        assert_eq!(
+            last_assistant_content(&agent.history),
+            Some("accepted from c")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_then_server_fallback_direct_turn_renders_both_legs_once() {
+        let server = served_by_c_anthropic_server().await;
+        let mut agent = blank_input_agent(Box::new(
+            ordinary_failure_then_server_fallback_reliable(&server.uri()),
+        ));
+        agent.model_name = "requested-a".into();
+
+        let response = agent
+            .turn("hello")
+            .await
+            .expect("candidate B and Anthropic server fallback C recover the turn");
+
+        assert!(
+            response.starts_with("accepted from c\n\n"),
+            "reply text precedes the route notices: {response}"
+        );
+        assert!(
+            response.contains("candidate-a"),
+            "the ordinary leg must keep the original request visible: {response}"
+        );
+        assert_eq!(response.matches("Safety safeguards").count(), 1);
+        assert!(response.contains("served-c"));
+        assert!(
+            response.find("candidate-a") < response.find("Safety safeguards"),
+            "the ordinary leg precedes the safety leg: {response}"
+        );
+        assert!(!response.contains("fallback chain"));
+        assert_eq!(
+            last_assistant_content(&agent.history),
+            Some("accepted from c"),
+            "persisted content stays undecorated"
+        );
     }
 
     #[test]

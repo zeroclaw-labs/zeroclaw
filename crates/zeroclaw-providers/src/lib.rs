@@ -40,7 +40,7 @@ pub use reliable::{
 };
 pub use safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
-    scope_safeguard_fallback, take_last_safeguard_fallback,
+    scope_safeguard_fallback, take_last_safeguard_fallback, visible_provider_fallback,
 };
 
 /// Return billed usage carried by a rejected provider result.

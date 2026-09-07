@@ -3930,6 +3930,195 @@ mod tests {
         assert_later_failure_keeps_refusal_usage(&error);
     }
 
+    /// Leaf stub for an ordinary transport failure that precedes a fallback.
+    struct UnavailableStub;
+
+    #[async_trait]
+    impl ModelProvider for UnavailableStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("503 service unavailable")
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for UnavailableStub {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "UnavailableStub"
+        }
+    }
+
+    /// Leaf stub whose accepted attempt was served by its own server-side
+    /// fallback, recorded the way the native Anthropic client records it.
+    struct ServerFallbackStub {
+        served_model: &'static str,
+    }
+
+    impl ServerFallbackStub {
+        fn serve(&self, requested_model: &str) -> String {
+            commit_safeguard_fallback(Some(SafeguardFallbackNotice {
+                kind: SafeguardFallbackKind::ServerSide,
+                requested_model: requested_model.to_string(),
+                served_model: self.served_model.to_string(),
+                category: None,
+            }));
+            "served by fallback".to_string()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ServerFallbackStub {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.serve(model))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some(self.serve(model)),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ServerFallbackStub {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ServerFallbackStub"
+        }
+    }
+
+    /// Primary model A on a pinned entry, a separate pinned client fallback
+    /// entry using model B, and B's request served by its server fallback C.
+    fn pinned_server_fallback_reliable(primary: Box<dyn ModelProvider>) -> ReliableModelProvider {
+        ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.primary",
+                    "anthropic-primary",
+                    "model-a",
+                    primary,
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.fallback",
+                    "anthropic-fallback",
+                    "model-b",
+                    Box::new(ServerFallbackStub {
+                        served_model: "model-c",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    async fn accepted_route_records(
+        provider: &ReliableModelProvider,
+    ) -> (
+        anyhow::Result<String>,
+        Option<ProviderFallbackInfo>,
+        Option<SafeguardFallbackNotice>,
+    ) {
+        crate::scope_safeguard_fallback(scope_provider_fallback(async {
+            let response = provider
+                .chat_with_system(None, "hello", "model-a", Some(0.0))
+                .await;
+            (
+                response,
+                take_last_provider_fallback(),
+                take_last_safeguard_fallback(),
+            )
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_then_pinned_server_fallback_keeps_both_route_legs() {
+        let provider = pinned_server_fallback_reliable(Box::new(UnavailableStub));
+        let (response, fallback, notice) = accepted_route_records(&provider).await;
+
+        assert_eq!(response.unwrap(), "served by fallback");
+        let fallback = fallback.expect("the ordinary A to B recovery is recorded");
+        assert_eq!(fallback.requested_model, "model-a");
+        assert_eq!(fallback.actual_model, "model-b");
+        let notice = notice.expect("the server-side B to C switch is recorded");
+        assert_eq!(
+            notice.kind,
+            SafeguardFallbackKind::ServerSide,
+            "an ordinary failure must not be described as a refusal-triggered client recovery"
+        );
+        assert_eq!(notice.requested_model, "model-b");
+        assert_eq!(notice.served_model, "model-c");
+
+        let visible = crate::visible_provider_fallback(Some(&fallback), Some(&notice))
+            .expect("the A to B leg is the only record naming the original request");
+        assert_eq!(visible.requested_model, "model-a");
+        assert_eq!(visible.actual_model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn refusal_then_pinned_server_fallback_composes_one_client_and_server_notice() {
+        let provider = pinned_server_fallback_reliable(Box::new(RefusalThenFailureStub {
+            mode: RefusalThenFailureMode::Refusal,
+        }));
+        let (response, fallback, notice) = accepted_route_records(&provider).await;
+
+        assert_eq!(response.unwrap(), "served by fallback");
+        let fallback = fallback.expect("the client recovery is still recorded");
+        assert_eq!(fallback.requested_model, "model-a");
+        let notice = notice.expect("refusal recovery composes the accepted route");
+        assert_eq!(notice.kind, SafeguardFallbackKind::ClientAndServer);
+        assert_eq!(notice.requested_model, "model-a");
+        assert_eq!(notice.served_model, "model-c");
+        assert_eq!(notice.category.as_deref(), Some("test-category"));
+        assert!(
+            crate::visible_provider_fallback(Some(&fallback), Some(&notice)).is_none(),
+            "the composed notice already names the original request"
+        );
+    }
+
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,

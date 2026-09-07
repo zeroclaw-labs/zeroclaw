@@ -352,6 +352,54 @@ fn append_provider_fallback_footer(
     fallback: Option<&ProviderFallbackInfo>,
     safeguard: Option<&SafeguardFallbackNotice>,
 ) -> String {
+    // The ordinary recovery leg comes first so the footers read in route
+    // order: the provider fallback, then the safeguard switch the accepted
+    // attempt itself went through.
+    match (
+        zeroclaw_providers::visible_provider_fallback(fallback, safeguard),
+        safeguard,
+    ) {
+        // A server-side safeguard notice names the client-fallback model as
+        // its request, so this leg is the only place the originally requested
+        // model appears and must name it. The alias-only footer below cannot
+        // (same-alias pinned entries share one display name), so the leg uses
+        // the model-naming notice. An identical requested and served pair is
+        // a retry, not a leg worth naming.
+        (Some(fallback), Some(_))
+            if fallback.requested_provider != fallback.actual_provider
+                || fallback.requested_model != fallback.actual_model =>
+        {
+            response.push_str("\n\n---\n");
+            response.push_str(&channel_runtime_cli_string_with_args(
+                "turn-model-fallback-notice",
+                &[
+                    ("requested_model", fallback.requested_model.as_str()),
+                    ("requested_provider", fallback.requested_provider.as_str()),
+                    ("actual_model", fallback.actual_model.as_str()),
+                    ("actual_provider", fallback.actual_provider.as_str()),
+                ],
+            ));
+        }
+        (Some(fallback), None) => {
+            let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
+            let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
+            let same_family = requested_family == actual_family
+                || requested_family.starts_with(actual_family)
+                || actual_family.starts_with(requested_family);
+            if !same_family {
+                response.push_str("\n\n---\n");
+                response.push_str(&channel_runtime_cli_string_with_args(
+                    "channel-runtime-fallback-footer",
+                    &[
+                        ("requested", fallback.requested_provider.as_str()),
+                        ("actual", fallback.actual_provider.as_str()),
+                        ("model", fallback.actual_model.as_str()),
+                    ],
+                ));
+            }
+        }
+        _ => {}
+    }
     if let Some(notice) = safeguard {
         let key = match notice.kind {
             SafeguardFallbackKind::ServerSide => "channel-runtime-safeguard-footer-server",
@@ -366,26 +414,6 @@ fn append_provider_fallback_footer(
             &[
                 ("requested", notice.requested_model.as_str()),
                 ("served", notice.served_model.as_str()),
-            ],
-        ));
-        return response;
-    }
-    let Some(fallback) = fallback else {
-        return response;
-    };
-    let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
-    let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
-    let same_family = requested_family == actual_family
-        || requested_family.starts_with(actual_family)
-        || actual_family.starts_with(requested_family);
-    if !same_family {
-        response.push_str("\n\n---\n");
-        response.push_str(&channel_runtime_cli_string_with_args(
-            "channel-runtime-fallback-footer",
-            &[
-                ("requested", fallback.requested_provider.as_str()),
-                ("actual", fallback.actual_provider.as_str()),
-                ("model", fallback.actual_model.as_str()),
             ],
         ));
     }
@@ -13831,6 +13859,76 @@ pub(crate) mod tests {
         assert!(delivered.contains("claude-opus"));
         assert!(!delivered.contains("private-category"));
         assert!(!delivered.contains("anthropic.backup"));
+    }
+
+    #[test]
+    fn server_side_safeguard_keeps_same_family_ordinary_leg_visible() {
+        // Ordinary failure on model A, Reliable advances to the pinned client
+        // fallback B (same alias, so both entries carry the bare family name),
+        // and Anthropic serves B's request with its server fallback C. No
+        // refusal occurred, so the safeguard notice covers only B to C.
+        let fallback = ProviderFallbackInfo {
+            requested_provider: "anthropic".to_string(),
+            requested_model: "model-a".to_string(),
+            actual_provider: "anthropic".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let safeguard = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ServerSide,
+            requested_model: "model-b".to_string(),
+            served_model: "model-c".to_string(),
+            category: Some("private-category".to_string()),
+        };
+
+        let delivered = append_provider_fallback_footer(
+            "accepted response".to_string(),
+            Some(&fallback),
+            Some(&safeguard),
+        );
+
+        assert!(delivered.starts_with("accepted response\n\n---\n"));
+        assert_eq!(
+            delivered.matches("---").count(),
+            2,
+            "both route legs must be delivered: {delivered}"
+        );
+        assert!(
+            delivered.contains("model-a"),
+            "the originally requested model must stay visible: {delivered}"
+        );
+        assert!(delivered.contains("model-b"));
+        assert!(delivered.contains("model-c"));
+        assert_eq!(delivered.matches("🛡️").count(), 1);
+        assert!(
+            delivered.find("model-a") < delivered.find("🛡️"),
+            "the ordinary leg precedes the safety leg: {delivered}"
+        );
+        assert!(
+            !delivered.contains("fallback chain"),
+            "an ordinary failure is not a refusal chain: {delivered}"
+        );
+        assert!(!delivered.contains("private-category"));
+
+        // Without a safeguard leg the same-family switch stays silent as before.
+        assert_eq!(
+            append_provider_fallback_footer("accepted response".to_string(), Some(&fallback), None),
+            "accepted response"
+        );
+
+        // A same-candidate retry served by C is only the server-side leg.
+        let retry = ProviderFallbackInfo {
+            requested_provider: "anthropic".to_string(),
+            requested_model: "model-b".to_string(),
+            actual_provider: "anthropic".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let delivered = append_provider_fallback_footer(
+            "accepted response".to_string(),
+            Some(&retry),
+            Some(&safeguard),
+        );
+        assert_eq!(delivered.matches("---").count(), 1, "{delivered}");
+        assert_eq!(delivered.matches("🛡️").count(), 1);
     }
 
     #[test]
