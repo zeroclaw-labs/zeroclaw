@@ -171,10 +171,11 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 
 # Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
 
-# Linux-only: `desktop --install` opens candidate `.desktop` entries with
-# O_NONBLOCK|O_NOFOLLOW so a FIFO or symlink planted in an XDG data dir cannot
-# block or redirect the read.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Unix: the Quickstart checklist measures the terminal behind the descriptor
+# it draws on (TIOCGWINSZ). Linux additionally uses it for `desktop --install`,
+# which opens candidate `.desktop` entries with O_NONBLOCK|O_NOFOLLOW so a FIFO
+# or symlink planted in an XDG data dir cannot block or redirect the read.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # Installer/surface metadata: which `[features]` are internal aggregates or
@@ -417,7 +418,6 @@ panic = "abort"
 # registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
 # binary build, so the assemble()-only seal holds in production.
 zeroclaw-runtime = { workspace = true, features = ["test-util"] }
-libc = "0.2"
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"

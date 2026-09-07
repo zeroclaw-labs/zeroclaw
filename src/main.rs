@@ -335,6 +335,8 @@ enum QuickstartSelectorKey {
 
 #[cfg(feature = "agent-runtime")]
 trait QuickstartSelectorTerminal {
+    /// Geometry of the terminal that receives `write_line` output, as
+    /// `(rows, columns)`, or `None` when it cannot be determined.
     fn size_checked(&mut self) -> Option<(u16, u16)>;
     fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
     fn clear_screen(&mut self) -> std::io::Result<()>;
@@ -347,28 +349,34 @@ trait QuickstartSelectorTerminal {
     fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
 }
 
+/// The input half of the Crossterm selector: raw-mode ownership plus key
+/// decoding. It is separate from the output half so a regression can drive the
+/// production output adapter with injected keys.
 #[cfg(feature = "agent-runtime")]
-struct CrosstermQuickstartTerminal {
-    stderr: std::io::Stderr,
+trait QuickstartSelectorInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartInput {
     restore_cooked_mode: bool,
 }
 
 #[cfg(feature = "agent-runtime")]
-impl CrosstermQuickstartTerminal {
-    fn stderr() -> std::io::Result<Self> {
+impl CrosstermQuickstartInput {
+    fn new() -> std::io::Result<Self> {
         let raw_mode_was_enabled = terminal::is_raw_mode_enabled()?;
         if !raw_mode_was_enabled {
             terminal::enable_raw_mode()?;
         }
         Ok(Self {
-            stderr: std::io::stderr(),
             restore_cooked_mode: !raw_mode_was_enabled,
         })
     }
 }
 
 #[cfg(feature = "agent-runtime")]
-impl Drop for CrosstermQuickstartTerminal {
+impl Drop for CrosstermQuickstartInput {
     fn drop(&mut self) {
         if self.restore_cooked_mode {
             let _ = terminal::disable_raw_mode();
@@ -377,47 +385,7 @@ impl Drop for CrosstermQuickstartTerminal {
 }
 
 #[cfg(feature = "agent-runtime")]
-impl QuickstartSelectorTerminal for CrosstermQuickstartTerminal {
-    fn size_checked(&mut self) -> Option<(u16, u16)> {
-        terminal::size().ok().map(|(columns, rows)| (rows, columns))
-    }
-
-    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
-        execute!(self.stderr.lock(), EnterAlternateScreen)
-    }
-
-    fn clear_screen(&mut self) -> std::io::Result<()> {
-        execute!(self.stderr.lock(), Clear(ClearType::All))
-    }
-
-    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
-        execute!(self.stderr.lock(), MoveTo(0, 0))
-    }
-
-    fn hide_cursor(&mut self) -> std::io::Result<()> {
-        execute!(self.stderr.lock(), Hide)
-    }
-
-    fn show_cursor(&mut self) -> std::io::Result<()> {
-        execute!(self.stderr.lock(), Show)
-    }
-
-    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
-        // Crossterm uses the native screen-buffer API on legacy Windows
-        // consoles and the ANSI sequence on terminals that support it.
-        execute!(self.stderr.lock(), LeaveAlternateScreen)
-    }
-
-    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        // Raw mode disables the Unix terminal driver's LF-to-CRLF mapping.
-        // Emit both controls explicitly so every row begins in column zero.
-        write!(self.stderr.lock(), "{line}\r\n")
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stderr.lock().flush()
-    }
-
+impl QuickstartSelectorInput for CrosstermQuickstartInput {
     fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
         loop {
             match event::read()? {
@@ -447,6 +415,128 @@ impl QuickstartSelectorTerminal for CrosstermQuickstartTerminal {
                 _ => {}
             }
         }
+    }
+}
+
+/// A frame destination whose own terminal geometry can be measured.
+///
+/// Quickstart requires stdin and stderr to be terminals, not the same
+/// terminal. The frame is therefore fitted to the descriptor it is written to
+/// rather than to whichever terminal a process-global query describes.
+#[cfg(all(feature = "agent-runtime", unix))]
+trait QuickstartSelectorOutput: Write + std::os::fd::AsFd {}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl<W: Write + std::os::fd::AsFd> QuickstartSelectorOutput for W {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+trait QuickstartSelectorOutput: Write {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+impl<W: Write> QuickstartSelectorOutput for W {}
+
+/// Measure the terminal behind `output` as `(rows, columns)`.
+///
+/// A zero dimension means the driver holds no geometry for that terminal. It
+/// is reported as unknown so the caller fails closed instead of fitting rows
+/// to a zero-width frame.
+#[cfg(all(feature = "agent-runtime", unix))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(output: &W) -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    // SAFETY: `size` points to writable `winsize` storage and the borrowed
+    // descriptor stays open for the duration of the call.
+    let result = unsafe {
+        libc::ioctl(
+            output.as_fd().as_raw_fd(),
+            libc::TIOCGWINSZ,
+            size.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
+    let size = unsafe { size.assume_init() };
+    (size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
+/// Measure the active console screen buffer as `(rows, columns)`.
+///
+/// Crossterm offers no per-handle geometry query here. A native console
+/// shares one screen buffer between stdout and stderr, so the measured
+/// surface is the one that receives the frame. Native-console rendering is
+/// not exercised by hosted checks and remains a documented verification gap.
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(_output: &W) -> Option<(u16, u16)> {
+    terminal::size().ok().map(|(columns, rows)| (rows, columns))
+}
+
+/// Crossterm-backed selector terminal: frames go to `output`, keys come from
+/// `input`, and geometry is always read from `output`.
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartTerminal<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> {
+    output: W,
+    input: K,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartTerminal<std::io::Stderr, CrosstermQuickstartInput> {
+    fn stderr() -> std::io::Result<Self> {
+        Ok(Self {
+            output: std::io::stderr(),
+            input: CrosstermQuickstartInput::new()?,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> QuickstartSelectorTerminal
+    for CrosstermQuickstartTerminal<W, K>
+{
+    fn size_checked(&mut self) -> Option<(u16, u16)> {
+        quickstart_output_terminal_size(&self.output)
+    }
+
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, EnterAlternateScreen)
+    }
+
+    fn clear_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Clear(ClearType::All))
+    }
+
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+        execute!(self.output, MoveTo(0, 0))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Hide)
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Show)
+    }
+
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+        // Crossterm uses the native screen-buffer API on legacy Windows
+        // consoles and the ANSI sequence on terminals that support it.
+        execute!(self.output, LeaveAlternateScreen)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        // Raw mode disables the Unix terminal driver's LF-to-CRLF mapping.
+        // Emit both controls explicitly so every row begins in column zero.
+        write!(self.output, "{line}\r\n")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        self.input.read_key()
     }
 }
 
@@ -513,10 +603,13 @@ enum QuickstartSelectorOutcome {
 /// Render the fixed-size Quickstart checklist without dialoguer paging.
 ///
 /// The terminal dimensions sampled for fitting are part of this interaction's
-/// contract. Every input event rechecks them before navigation or selection;
-/// a resize exits the selector-owned alternate screen instead of trying to
-/// erase a main-screen frame whose physical rows the terminal may have
-/// reflowed. Leaving the alternate screen atomically restores unrelated output.
+/// contract. They describe the terminal that receives the frame, and every
+/// input event rechecks them before navigation or selection; a resize exits
+/// the selector-owned alternate screen instead of trying to erase a
+/// main-screen frame whose physical rows the terminal may have reflowed. A
+/// resize of the output terminal alone raises no input event, so it is caught
+/// at the next key. Leaving the alternate screen atomically restores
+/// unrelated output.
 #[cfg(feature = "agent-runtime")]
 fn interact_quickstart_selector<T: QuickstartSelectorTerminal>(
     term: &mut T,
@@ -10524,105 +10617,58 @@ mod tests {
         }
     }
 
-    /// A real PTY-backed terminal writer with deterministic injected input.
+    /// One step of a deterministic PTY interaction: a key press, or a resize
+    /// of the output terminal applied between key presses the way a terminal
+    /// emulator changes a window while the selector waits for input.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    enum PtyStep {
+        Key(QuickstartSelectorKey),
+        ResizeOutput { rows: u16, columns: u16 },
+    }
+
+    /// Injected input for the production Crossterm adapter.
     ///
-    /// The production crossterm adapter and this test adapter emit the same
-    /// commands. Keeping input injected lets the regression exercise repeated
-    /// navigation without racing a process-global terminal event reader.
+    /// Keys are queued rather than read from the process-global event source
+    /// so the regression runs under a test harness without racing a
+    /// controlling terminal. Resizes are applied to the PTY master exactly as
+    /// a terminal emulator would, so the adapter's own geometry query must
+    /// observe them.
     #[cfg(all(feature = "agent-runtime", unix))]
-    struct PtyWriter(std::fs::File);
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    impl std::io::Write for PtyWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            self.0.write(buffer)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.0.flush()
-        }
+    struct PtyQuickstartInput {
+        master: std::fs::File,
+        steps: std::collections::VecDeque<PtyStep>,
     }
 
     #[cfg(all(feature = "agent-runtime", unix))]
-    struct PtySelectorTestTerminal {
-        slave: PtyWriter,
-        keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
-    }
-
-    #[cfg(all(feature = "agent-runtime", unix))]
-    impl QuickstartSelectorTerminal for PtySelectorTestTerminal {
-        fn size_checked(&mut self) -> Option<(u16, u16)> {
-            use std::os::fd::AsRawFd;
-
-            let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
-            // SAFETY: `size` points to writable `winsize` storage and `slave`
-            // owns a live PTY descriptor for the duration of this call.
-            let result = unsafe {
-                libc::ioctl(
-                    self.slave.0.as_raw_fd(),
-                    libc::TIOCGWINSZ,
-                    size.as_mut_ptr(),
-                )
-            };
-            (result == 0).then(|| {
-                // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
-                let size = unsafe { size.assume_init() };
-                (size.ws_row, size.ws_col)
-            })
-        }
-
-        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
-            execute!(self.slave, EnterAlternateScreen)
-        }
-
-        fn clear_screen(&mut self) -> std::io::Result<()> {
-            execute!(self.slave, Clear(ClearType::All))
-        }
-
-        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
-            execute!(self.slave, MoveTo(0, 0))
-        }
-
-        fn hide_cursor(&mut self) -> std::io::Result<()> {
-            execute!(self.slave, Hide)
-        }
-
-        fn show_cursor(&mut self) -> std::io::Result<()> {
-            execute!(self.slave, Show)
-        }
-
-        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
-            execute!(self.slave, LeaveAlternateScreen)
-        }
-
-        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-            write!(self.slave, "{line}\r\n")
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.slave.flush()
-        }
-
+    impl QuickstartSelectorInput for PtyQuickstartInput {
         fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
-            self.keys.pop_front().unwrap_or_else(|| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "no injected selector key",
-                ))
-            })
+            loop {
+                match self.steps.pop_front() {
+                    Some(PtyStep::Key(key)) => return Ok(key),
+                    Some(PtyStep::ResizeOutput { rows, columns }) => {
+                        set_pty_size(&self.master, rows, columns);
+                    }
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "no injected selector key",
+                        ));
+                    }
+                }
+            }
         }
     }
 
+    /// Open a PTY pair sized `rows` by `columns`, returned as `(master, slave)`.
     #[cfg(all(feature = "agent-runtime", unix))]
-    #[test]
-    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
-        use std::os::fd::{AsRawFd, FromRawFd};
+    fn open_pty(rows: u16, columns: u16) -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
 
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut dimensions = libc::winsize {
-            ws_row: 20,
-            ws_col: 80,
+            ws_row: rows,
+            ws_col: columns,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
@@ -10642,28 +10688,52 @@ mod tests {
 
         // SAFETY: `openpty` returned two distinct, live descriptors. Each is
         // transferred to exactly one `File`, which closes it exactly once.
-        let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-        let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
-        let mut term = PtySelectorTestTerminal {
-            slave: PtyWriter(slave),
-            keys: [
-                Ok(QuickstartSelectorKey::Down),
-                Ok(QuickstartSelectorKey::Down),
-                Ok(QuickstartSelectorKey::Up),
-                Ok(QuickstartSelectorKey::Cancel),
-            ]
-            .into_iter()
-            .collect(),
-        };
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(master_fd),
+                std::fs::File::from_raw_fd(slave_fd),
+            )
+        }
+    }
 
-        let outcome = interact_quickstart_selector(
-            &mut term,
-            &["first".to_string(), "second".to_string()],
-            "Choose",
-            (20, 80),
-        )
-        .expect("repeated PTY navigation should succeed");
-        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn set_pty_size(pty: &std::fs::File, rows: u16, columns: u16) {
+        use std::os::fd::AsRawFd;
+
+        let dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `pty` owns a live PTY descriptor and `dimensions` is a fully
+        // initialized `winsize` that outlives the call.
+        let result =
+            unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &raw const dimensions) };
+        assert_eq!(result, 0, "TIOCSWINSZ failed");
+    }
+
+    /// Build the production Crossterm adapter over a PTY slave with injected
+    /// input, so the exact production escape sequences and geometry query run.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn pty_quickstart_terminal(
+        master: &std::fs::File,
+        slave: std::fs::File,
+        steps: impl IntoIterator<Item = PtyStep>,
+    ) -> CrosstermQuickstartTerminal<std::fs::File, PtyQuickstartInput> {
+        CrosstermQuickstartTerminal {
+            output: slave,
+            input: PtyQuickstartInput {
+                master: master.try_clone().expect("PTY master should be clonable"),
+                steps: steps.into_iter().collect(),
+            },
+        }
+    }
+
+    /// Read everything written to the PTY, returning once the output is idle.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn drain_pty_output(master: &mut std::fs::File) -> String {
+        use std::os::fd::AsRawFd;
 
         // SAFETY: the PTY master descriptor is live; preserving its current
         // flags and adding O_NONBLOCK prevents a spurious poll wakeup from
@@ -10703,16 +10773,186 @@ mod tests {
                 Err(error) => panic!("failed to read PTY output: {error}"),
             }
         }
+        String::from_utf8(output).expect("selector output should be UTF-8")
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_CLEAR_AND_HOME: &str = "\u{1b}[2J\u{1b}[1;1H";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_SHOW_CURSOR_AND_LEAVE_SCREEN: &str = "\u{1b}[?25h\u{1b}[?1049l";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
+        let (mut master, slave) = open_pty(20, 80);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Up),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("repeated PTY navigation should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut master);
         drop(term);
 
-        let output = String::from_utf8(output).expect("selector output should be UTF-8");
-        let clear_and_home = "\u{1b}[2J\u{1b}[1;1H";
         assert_eq!(
-            output.matches(clear_and_home).count(),
+            output.matches(PTY_CLEAR_AND_HOME).count(),
             4,
             "the initial frame and all three navigation redraws must begin at the PTY origin; \
              output: {output:?}"
         );
+    }
+
+    /// Quickstart accepts distinct input and output terminals. The frame must
+    /// be fitted to the terminal that receives it: a process-global query can
+    /// describe the controlling terminal while stderr is a narrower one.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_measures_the_terminal_that_receives_the_frame() {
+        let (controlling_master, controlling_slave) = open_pty(20, 80);
+        let (mut output_master, output_slave) = open_pty(20, 40);
+
+        let mut controlling = pty_quickstart_terminal(&controlling_master, controlling_slave, []);
+        assert_eq!(
+            controlling.size_checked(),
+            Some((20, 80)),
+            "the adapter over the controlling PTY reports that PTY's geometry"
+        );
+
+        let mut term = pty_quickstart_terminal(
+            &output_master,
+            output_slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let output_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(
+            output_size,
+            (20, 40),
+            "the adapter over the output PTY must report the output PTY, not the controlling one"
+        );
+
+        // Fit exactly as the Quickstart caller does, from the sampled output
+        // geometry, with content that only fits the wider terminal unfitted.
+        let row_budget = quickstart_selector_row_budget(usize::from(output_size.1))
+            .expect("40 columns is a supported width");
+        let prompt = "Open a selector (Enter), or pick Create. Esc to quit.";
+        let fitted_prompt = fit_quickstart_selector_row(prompt, row_budget);
+        assert_ne!(
+            fitted_prompt, prompt,
+            "the prompt needs fitting at 40 columns"
+        );
+        let label = "[ ] Model provider — not yet chosen (pick one to continue)";
+        let fitted_label = fit_quickstart_selector_row(label, row_budget);
+        assert_ne!(fitted_label, label, "the row needs fitting at 40 columns");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            std::slice::from_ref(&fitted_label),
+            &fitted_prompt,
+            output_size,
+        )
+        .expect("navigation on the output PTY should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut output_master);
+        drop(term);
+        drop(controlling);
+
+        assert!(
+            output.contains(&format!("? {fitted_prompt}")) && output.contains(&fitted_label),
+            "the fitted prompt and row must reach the output terminal; output: {output:?}"
+        );
+        assert!(
+            !output.contains(prompt) && !output.contains(label),
+            "unfitted text must never reach the 40-column output terminal; output: {output:?}"
+        );
+        for line in output.split("\r\n") {
+            assert!(
+                console::measure_text_width(line) <= 40,
+                "{line:?} exceeds the 40-column output terminal"
+            );
+        }
+    }
+
+    /// A resize of the output terminal alone raises no Crossterm resize event,
+    /// so the recheck on the next key must read the output terminal itself.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_fails_closed_when_only_the_output_terminal_resizes() {
+        let (mut master, slave) = open_pty(20, 40);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::ResizeOutput {
+                    rows: 20,
+                    columns: 30,
+                },
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let initial_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(initial_size, (20, 40));
+
+        let error = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            initial_size,
+        )
+        .expect_err("an output-only resize must stop the selector");
+        assert_eq!(
+            error.to_string(),
+            quickstart_selector_resize_error((20, 40), (20, 30)).to_string(),
+            "the recheck must report the output terminal's new geometry"
+        );
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            2,
+            "only the initial frame and the pre-resize redraw may be drawn; output: {output:?}"
+        );
+        assert!(
+            output.ends_with(PTY_SHOW_CURSOR_AND_LEAVE_SCREEN),
+            "the cursor and main screen must be restored after the resize; output: {output:?}"
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_output_terminal_size_is_unknown_without_reported_geometry() {
+        let not_a_terminal = tempfile::tempfile().expect("temporary file");
+        assert_eq!(quickstart_output_terminal_size(&not_a_terminal), None);
+
+        let (_unset_master, unset_slave) = open_pty(0, 0);
+        assert_eq!(quickstart_output_terminal_size(&unset_slave), None);
+
+        let (_master, slave) = open_pty(9, 20);
+        assert_eq!(quickstart_output_terminal_size(&slave), Some((9, 20)));
     }
 
     #[cfg(feature = "agent-runtime")]
