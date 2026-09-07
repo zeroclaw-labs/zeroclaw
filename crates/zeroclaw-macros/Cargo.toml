@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Proc macros for ZeroClaw (config field derivation)"
+repository.workspace = true
+publish = true
 
 [lib]
 proc-macro = true

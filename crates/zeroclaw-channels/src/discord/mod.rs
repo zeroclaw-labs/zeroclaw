@@ -271,18 +271,12 @@ impl DiscordChannel {
     }
 
     /// Configure voice transcription for audio attachments.
-    pub fn with_transcription(
-        mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
-    ) -> Self {
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
         if !config.enabled {
             return self;
         }
         match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
+            Ok(manager) => return self.with_transcription_manager(config, manager),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -294,6 +288,31 @@ impl DiscordChannel {
             }
         }
         self
+    }
+
+    pub(crate) fn with_transcription_manager(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: super::transcription::TranscriptionManager,
+    ) -> Self {
+        self.transcription_manager = Some(std::sync::Arc::new(manager));
+        self.transcription = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_attachments_for_test(
+        &self,
+        attachments: &[serde_json::Value],
+        client: &reqwest::Client,
+    ) -> (String, Vec<MediaAttachment>) {
+        process_attachments(
+            attachments,
+            client,
+            self.workspace_dir.as_deref(),
+            self.transcription_manager.as_deref(),
+        )
+        .await
     }
 
     /// Configure streaming mode for progressive draft updates or multi-message delivery.

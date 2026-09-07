@@ -125,7 +125,23 @@ pub(crate) async fn gate_tool_approval(
                      a user's decision."
                 )
             } else {
-                "Denied by user.".to_string()
+                // A real operator said no. The three-word form this replaces
+                // carried the fact and none of its meaning, so the model
+                // supplied the meaning itself and did not do it the same way
+                // twice: on one run it reported the decline correctly, on the
+                // next it offered three invented causes, none of them what
+                // happened. The host owns the fact, so the host states what it
+                // means. `Denied by user.` is kept as the opening sentence
+                // because it is the phrase that distinguishes this path from
+                // the runtime-generated denial above, and dropping it would
+                // lose that distinction for every reader that already looks
+                // for it.
+                format!(
+                    "Denied by user. The operator was asked to approve \
+                     '{tool_name}' and declined, so the call did not run. Tell \
+                     the user the request was declined. Do not retry this call \
+                     and do not speculate about why it was declined."
+                )
             };
             ::zeroclaw_log::record!(
                 WARN,
