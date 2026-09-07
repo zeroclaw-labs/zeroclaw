@@ -36,8 +36,8 @@ pub fn run(
         .args(["build", "-d", "po-extract"])
         .env("MDBOOK_OUTPUT__XGETTEXT__POT_FILE", "messages.pot")
         .current_dir(&book);
-    if let Some((key, value)) = peer_groups_preprocessor_env() {
-        extract.env(key, value);
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        extract.envs(env);
     }
     run_cmd(&mut extract)?;
 
