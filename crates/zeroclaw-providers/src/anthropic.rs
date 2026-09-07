@@ -2116,7 +2116,9 @@ impl AnthropicModelProvider {
         temperature: Option<f64>,
         model: &str,
     ) -> ResolvedRequestTuning {
-        use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
+        use crate::claude_models::{
+            ClaudeThinkingShape, claude_accepts_display_updates, claude_thinking_shape,
+        };
 
         // The provider entry's own knob wins outright when it is set, and
         // `omitted` there means the API default with no display field at
@@ -2131,6 +2133,24 @@ impl AnthropicModelProvider {
                 Some(ThinkingDisplay::Updates)
             }
             None => thinking.and_then(|params| params.display),
+        };
+        // Generation 5.1 narrowed the display values to summarized and
+        // omitted, so the nearest readable value goes out instead of a 400.
+        let display = match display {
+            Some(ThinkingDisplay::Updates) if !claude_accepts_display_updates(model) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "model": model,
+                            "requested_display": ThinkingDisplay::Updates.as_str(),
+                            "sent_display": ThinkingDisplay::Summarized.as_str(),
+                        })),
+                    "thinking display fitted: this model generation accepts only summarized or omitted, so updates was sent as summarized"
+                );
+                Some(ThinkingDisplay::Summarized)
+            }
+            display => display,
         };
 
         if claude_thinking_shape(model) == ClaudeThinkingShape::FixedBudget {
@@ -2213,14 +2233,18 @@ impl AnthropicModelProvider {
         }
     }
 
-    /// The `anthropic-beta` value for this request, or `None` when no beta
-    /// feature is in play. The subscription credential and the progress-note
-    /// display each contribute, and both can apply at once.
+    /// The `anthropic-beta` value for a request to `model` with no thinking
+    /// depth chosen, or `None` when no beta feature is in play. The
+    /// subscription credential and the display value actually sent each
+    /// contribute, and both can apply at once. Mirrors the send paths, which
+    /// ask for the display beta whenever the request carries a display field.
     #[cfg(test)]
-    fn beta_header_value(&self, credential: &str) -> Option<String> {
+    fn beta_header_value(&self, credential: &str, model: &str) -> Option<String> {
         let is_oauth = Self::is_setup_token(credential);
-        let thinking_display_beta = self.thinking_display
-            == Some(zeroclaw_config::schema::AnthropicThinkingDisplay::Updates);
+        let thinking_display_beta = self
+            .resolve_thinking(None, None, model)
+            .thinking
+            .is_some_and(|config| config.display.is_some());
         anthropic_beta_features(is_oauth, thinking_display_beta)
     }
 
@@ -4499,7 +4523,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
-            display: Some(ThinkingDisplay::Updates),
+            display: Some(ThinkingDisplay::Summarized),
         };
         let tuning =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
@@ -4508,7 +4532,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("adaptive thinking config for fable-5-1");
         assert_eq!(thinking.kind, "adaptive");
         assert_eq!(thinking.budget_tokens, None);
-        assert_eq!(thinking.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
         assert!(tuning.temperature.is_none());
         assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
@@ -4649,7 +4673,9 @@ data: {\"type\":\"message_stop\"}\n\n";
             display: Some(ThinkingDisplay::Updates),
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
-        let thinking = tuning.thinking.expect("the profile value applies when the entry is unset");
+        let thinking = tuning
+            .thinking
+            .expect("the profile value applies when the entry is unset");
         assert_eq!(thinking.display, Some(ThinkingDisplay::Updates));
     }
 
@@ -4661,7 +4687,26 @@ data: {\"type\":\"message_stop\"}\n\n";
             .thinking_display(Some(AnthropicThinkingDisplay::Updates))
             .build();
         assert_eq!(
-            provider.beta_header_value("sk-ant-key").as_deref(),
+            provider
+                .beta_header_value("sk-ant-key", "claude-opus-4-7")
+                .as_deref(),
+            Some(THINKING_DISPLAY_UPDATES_BETA)
+        );
+    }
+
+    #[test]
+    fn fitted_display_still_asks_for_the_beta_feature() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("sk-ant-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Updates))
+            .build();
+        // The request goes out with a summarized display field, which needs
+        // the same beta.
+        assert_eq!(
+            provider
+                .beta_header_value("sk-ant-key", "claude-fable-5-1")
+                .as_deref(),
             Some(THINKING_DISPLAY_UPDATES_BETA)
         );
     }
@@ -4674,7 +4719,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .thinking_display(Some(AnthropicThinkingDisplay::Updates))
             .build();
         let header = provider
-            .beta_header_value("sk-ant-oat01-token")
+            .beta_header_value("sk-ant-oat01-token", "claude-opus-4-7")
             .expect("both beta features apply");
         assert!(header.starts_with(SETUP_TOKEN_BETAS), "{header}");
         assert!(header.ends_with(THINKING_DISPLAY_UPDATES_BETA), "{header}");
@@ -4685,7 +4730,72 @@ data: {\"type\":\"message_stop\"}\n\n";
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("sk-ant-key"))
             .build();
-        assert!(provider.beta_header_value("sk-ant-key").is_none());
+        assert!(
+            provider
+                .beta_header_value("sk-ant-key", "claude-opus-4-7")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn updates_display_is_sent_as_summarized_from_generation_5_1() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        for model in ["claude-fable-5-1", "claude-mythos-5-1", "claude-next"] {
+            let tuning = provider.resolve_thinking(Some(params), None, model);
+            let thinking = tuning
+                .thinking
+                .unwrap_or_else(|| panic!("{model}: a display value sends the object"));
+            assert_eq!(
+                thinking.display,
+                Some(ThinkingDisplay::Summarized),
+                "{model} rejects updates, so the nearest readable value goes out"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_updates_display_is_sent_as_summarized_from_generation_5_1() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Updates))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        let thinking = tuning.thinking.expect("a display value sends the object");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn updates_display_is_kept_before_generation_5_1() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Updates))
+            .build();
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            let tuning = provider.resolve_thinking(None, None, model);
+            let thinking = tuning
+                .thinking
+                .unwrap_or_else(|| panic!("{model}: a display value sends the object"));
+            assert_eq!(
+                thinking.display,
+                Some(ThinkingDisplay::Updates),
+                "{model} still takes the updates display"
+            );
+        }
     }
 
     #[test]

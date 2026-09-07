@@ -14,24 +14,56 @@ pub enum ClaudeThinkingShape {
 
 /// Classify a model id by the Claude generation it names.
 ///
-/// Anchors on the `claude-` substring so Bedrock ids carrying region and
-/// vendor prefixes resolve the same way as bare API ids. Generations before
-/// 4.6 keep the fixed budget. Generation 4.6 and later, and any Claude id
-/// whose version cannot be read, are adaptive, so a new release needs no code
-/// change here. Ids that are not Claude models at all keep the fixed budget,
-/// which is the shape Anthropic-compatible proxies accepted before this
-/// classification existed.
+/// Generations before 4.6 keep the fixed budget. Generation 4.6 and later,
+/// and any Claude id whose version cannot be read, are adaptive, so a new
+/// release needs no code change here. Ids that are not Claude models at all
+/// keep the fixed budget, which is the shape Anthropic-compatible proxies
+/// accepted before this classification existed.
 #[must_use]
 pub fn claude_thinking_shape(model: &str) -> ClaudeThinkingShape {
+    match claude_id(model) {
+        ClaudeId::NotClaude => ClaudeThinkingShape::FixedBudget,
+        ClaudeId::Generation(generation) if generation < (4, 6) => ClaudeThinkingShape::FixedBudget,
+        ClaudeId::Generation(_) | ClaudeId::Unversioned => ClaudeThinkingShape::Adaptive,
+    }
+}
+
+/// Whether a Claude model accepts `updates` as its thinking display value.
+///
+/// Generation 5.1 narrowed the display values to `summarized` and `omitted`.
+/// Earlier generations keep accepting `updates`, and so do ids that are not
+/// Claude models, whose wire contract this module does not know. A Claude id
+/// whose version cannot be read follows the newest generation, the same rule
+/// `claude_thinking_shape` applies.
+#[must_use]
+pub fn claude_accepts_display_updates(model: &str) -> bool {
+    match claude_id(model) {
+        ClaudeId::NotClaude => true,
+        ClaudeId::Generation(generation) => generation < (5, 1),
+        ClaudeId::Unversioned => false,
+    }
+}
+
+/// What a model id says about the Claude generation it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeId {
+    /// The id does not name a Claude model.
+    NotClaude,
+    /// A Claude id whose generation cannot be read.
+    Unversioned,
+    /// A Claude id naming this `(major, minor)` generation.
+    Generation((u32, u32)),
+}
+
+/// Anchors on the `claude-` substring so Bedrock ids carrying region and
+/// vendor prefixes resolve the same way as bare API ids.
+fn claude_id(model: &str) -> ClaudeId {
     let lower = model.to_ascii_lowercase();
     let Some(start) = lower.find("claude-") else {
-        return ClaudeThinkingShape::FixedBudget;
+        return ClaudeId::NotClaude;
     };
     let rest = &lower[start + "claude-".len()..];
-    match claude_generation(rest) {
-        Some(generation) if generation < (4, 6) => ClaudeThinkingShape::FixedBudget,
-        _ => ClaudeThinkingShape::Adaptive,
-    }
+    claude_generation(rest).map_or(ClaudeId::Unversioned, ClaudeId::Generation)
 }
 
 /// Read the `(major, minor)` generation from the id tokens after `claude-`.
@@ -130,6 +162,58 @@ mod tests {
             assert_eq!(
                 claude_thinking_shape(model),
                 ClaudeThinkingShape::FixedBudget,
+                "{model} is not a Claude id"
+            );
+        }
+    }
+
+    #[test]
+    fn display_updates_is_refused_from_generation_5_1() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-fable-5-1-20260815",
+            "claude-mythos-5-1",
+            "claude-opus-5-2",
+            "claude-sonnet-6",
+            "anthropic.claude-fable-5-1",
+            "us.anthropic.claude-mythos-5-1-v1",
+        ] {
+            assert!(
+                !claude_accepts_display_updates(model),
+                "{model} should not take the updates display"
+            );
+        }
+    }
+
+    #[test]
+    fn display_updates_is_accepted_before_generation_5_1() {
+        for model in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7-20260101",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "us.anthropic.claude-opus-4-8-v1",
+        ] {
+            assert!(
+                claude_accepts_display_updates(model),
+                "{model} should take the updates display"
+            );
+        }
+    }
+
+    #[test]
+    fn unversioned_claude_ids_refuse_display_updates() {
+        assert!(!claude_accepts_display_updates("claude-next"));
+    }
+
+    #[test]
+    fn non_claude_ids_keep_display_updates() {
+        for model in ["gpt-4o", "minimax-m2", ""] {
+            assert!(
+                claude_accepts_display_updates(model),
                 "{model} is not a Claude id"
             );
         }
