@@ -4507,7 +4507,6 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
 struct ConversationRenderWork {
     visible_cached_entries: usize,
     transcript_cached_lines: usize,
-    copy_cached_lines_scanned: usize,
     copy_cached_blocks: usize,
     entry_rect_candidates: usize,
 }
@@ -4674,8 +4673,7 @@ fn render_conversation(
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
-    let (copy_cached_lines_scanned, copy_cached_blocks) =
-        state.rebuild_copy_regions(scroll, body_rect);
+    let copy_cached_blocks = state.rebuild_copy_regions(scroll, body_rect);
     if state.in_browse_mode() {
         state.rebuild_message_copy_region(body_rect);
     } else {
@@ -4711,14 +4709,13 @@ fn render_conversation(
         ConversationRenderWork {
             visible_cached_entries: visible_cached_window.entries.len(),
             transcript_cached_lines,
-            copy_cached_lines_scanned,
             copy_cached_blocks,
             entry_rect_candidates: visible_cached_window.entries.len(),
         }
     }
     #[cfg(not(test))]
     {
-        let _ = (copy_cached_lines_scanned, copy_cached_blocks);
+        let _ = copy_cached_blocks;
     }
 }
 
@@ -6920,7 +6917,7 @@ impl ChatState {
         }
     }
 
-    fn rebuild_copy_regions(&mut self, scroll: u16, body: Rect) -> (usize, usize) {
+    fn rebuild_copy_regions(&mut self, scroll: u16, body: Rect) -> usize {
         let mut regions: Vec<CopyHitRegion> = Vec::new();
         let mut context_regions: Vec<CopyHitRegion> = Vec::new();
         let view_end = scroll.saturating_add(body.height);
@@ -6970,7 +6967,7 @@ impl ChatState {
         }
         self.copy_hit_regions = regions;
         self.context_copy_regions = context_regions;
-        (0, visited_blocks)
+        visited_blocks
     }
 
     fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
@@ -10033,10 +10030,6 @@ mod tests {
                 large.visible_cached_entries, large.entry_rect_candidates,
                 "{case:?} entry rectangles must reuse the single resolved range"
             );
-            assert_eq!(
-                large.copy_cached_lines_scanned, 0,
-                "{case:?} copy projection must use the derived fence cache"
-            );
             assert!(
                 large.visible_cached_entries <= 24,
                 "{case:?} cached entry work must stay bounded by the viewport, got {large:?}"
@@ -10049,7 +10042,6 @@ mod tests {
             ConversationRenderWork {
                 visible_cached_entries: 0,
                 transcript_cached_lines: 0,
-                copy_cached_lines_scanned: 0,
                 copy_cached_blocks: 0,
                 entry_rect_candidates: 0,
             },
@@ -10096,7 +10088,6 @@ mod tests {
             work.transcript_cached_lines <= usize::from(area.height.saturating_sub(2)),
             "one large entry must materialize only viewport lines: {work:?}"
         );
-        assert_eq!(work.copy_cached_lines_scanned, 0);
         assert_eq!(work.copy_cached_blocks, 1);
         assert_eq!(work.entry_rect_candidates, 1);
 
