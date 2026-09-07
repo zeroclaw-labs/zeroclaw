@@ -726,6 +726,12 @@ async fn dial_pinned(addresses: &[SocketAddr], deadline: Instant) -> Result<TcpS
     let mut attempted = false;
     for address in addresses {
         attempted = true;
+        // A ready loopback connect can win timeout_at's first poll even after
+        // its deadline has elapsed. Do not let that fast path fund another
+        // attempt from the shared budget.
+        if deadline <= Instant::now() {
+            return Err(ErrorCode::ConnectionTimeout);
+        }
         match timeout_at(deadline, TcpStream::connect(*address)).await {
             Ok(Ok(stream)) => return Ok(stream),
             // Refused or unreachable: try the next validated address.
