@@ -2336,7 +2336,7 @@ mod tests {
 
         assert!(
             result.success,
-            "no effective model leaves nothing to validate, as when the saved entry has none: \\
+            "no effective model leaves nothing to validate, as when the saved entry has none: \
              {result:?}"
         );
         let requests = server
@@ -2345,7 +2345,7 @@ mod tests {
             .expect("the mock server records requests");
         assert!(
             requests.is_empty(),
-            "the saved model must not be probed once the environment cleared the effective one; \\
+            "the saved model must not be probed once the environment cleared the effective one; \
              got {} request(s)",
             requests.len()
         );
