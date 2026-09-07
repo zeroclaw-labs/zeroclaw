@@ -2201,7 +2201,7 @@ impl AnthropicModelProvider {
                         "model": model,
                         "temperature": temperature,
                     })),
-                "temperature dropped: this model generation rejects sampling parameters"
+                "temperature dropped: this model generation only accepts temperature 1 while thinking is active"
             );
         }
         if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
@@ -4510,7 +4510,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(
             tuning.temperature.is_none(),
-            "this generation rejects sampling parameters"
+            "this generation only accepts temperature 1 while thinking is active"
         );
         assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
@@ -4853,7 +4853,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(
             (tuning.temperature.unwrap() - 0.3_f64).abs() < f64::EPSILON,
-            "older generations still accept sampling parameters"
+            "older generations keep the caller's temperature"
         );
     }
 

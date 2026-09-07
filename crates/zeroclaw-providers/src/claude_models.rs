@@ -7,8 +7,8 @@ pub enum ClaudeThinkingShape {
     /// budget, and the request must pin the sampling temperature to 1.0.
     FixedBudget,
     /// Thinking is adaptive: the request may say `type: "adaptive"` and steer
-    /// depth with `output_config.effort`; a fixed budget and any sampling
-    /// parameter are rejected.
+    /// depth with `output_config.effort`; a fixed budget is rejected, and so
+    /// is a temperature other than 1 while thinking is active.
     Adaptive,
 }
 

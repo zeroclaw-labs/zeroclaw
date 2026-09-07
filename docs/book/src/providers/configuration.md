@@ -159,7 +159,7 @@ header follows the value actually sent.
 
 ### Anthropic
 
-Current Claude models think adaptively: the model decides how much to reason per request, and the API rejects both the older fixed thinking budget and every sampling parameter. Earlier models keep the fixed budget. ZeroClaw reads the generation from the alias `model`, so one alias entry works for either.
+Current Claude models think adaptively: the model decides how much to reason per request, and the API rejects the older fixed thinking budget, and a temperature other than 1 while thinking is active, which on these generations is the normal state. Earlier models keep the fixed budget. ZeroClaw reads the generation from the alias `model`, so one alias entry works for either.
 
 ```toml
 [providers.models.anthropic.fable]
@@ -176,7 +176,7 @@ fallback_models = ["claude-opus-5"]
 - `max_tokens`: reasoning counts toward this cap on the current models, so the 4096 default is low. ZeroClaw warns when an adaptive model runs at or below it. Use 16000 or more, and 32000 for agentic work.
 - `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
 - `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.
-- `temperature`: current models reject sampling parameters. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
+- `temperature`: current models reject a temperature other than 1 while thinking is active. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
 
 Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or a `/think:<level>` prefix on one message, maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high` and `max` ask for those. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones.
 
