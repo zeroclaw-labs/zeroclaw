@@ -139,6 +139,17 @@ The setting requires an Anthropic account enrolled in the
 request. Set `display = "off"` (or remove the field) to return to the
 previous wire behavior.
 
+### Per-entry override
+
+Each entry on the `anthropic` slot carries its own `thinking_display` field
+(`omitted`, `summarized` or `updates`). When it is set it wins over
+`agent.thinking.display` for requests through that entry. This includes
+`omitted`, which on the entry means the API default: no display field is
+sent, whatever the profile says. Leave the field unset to inherit the
+profile-level value. This is the same entry-overrides-profile pattern that
+`temperature` and `max_tokens` follow; see the [Anthropic](#anthropic)
+example below.
+
 ## Per-family knobs: worked examples
 
 ### Anthropic
@@ -156,7 +167,7 @@ thinking_display = "summarized"
 fallback_models = ["claude-opus-5"]
 ```
 
-- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary, and `updates` returns the short progress notes the model writes between tool calls. Leave it unset for the API default, which returns reasoning blocks with their text withheld. ZeroClaw adds the beta header `updates` needs. Older models ignore the field.
+- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary, and `updates` returns the short progress notes the model writes between tool calls. Leave it unset to inherit `agent.thinking.display`, or set `omitted` for the API default, which returns reasoning blocks with their text withheld. A value set here overrides the profile-level setting for this entry (see [Native thinking display](#native-thinking-display-anthropic)). ZeroClaw adds the beta header the field needs. Older models ignore the field.
 - `max_tokens`: reasoning counts toward this cap on the current models, so the 4096 default is low. ZeroClaw warns when an adaptive model runs at or below it. Use 16000 or more, and 32000 for agentic work.
 - `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
 - `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.

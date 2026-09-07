@@ -2118,18 +2118,20 @@ impl AnthropicModelProvider {
     ) -> ResolvedRequestTuning {
         use crate::claude_models::{ClaudeThinkingShape, claude_thinking_shape};
 
-        let display = self
-            .thinking_display
-            .and_then(|display| match display {
-                zeroclaw_config::schema::AnthropicThinkingDisplay::Omitted => None,
-                zeroclaw_config::schema::AnthropicThinkingDisplay::Summarized => {
-                    Some(ThinkingDisplay::Summarized)
-                }
-                zeroclaw_config::schema::AnthropicThinkingDisplay::Updates => {
-                    Some(ThinkingDisplay::Updates)
-                }
-            })
-            .or_else(|| thinking.and_then(|p| p.display));
+        // The provider entry's own knob wins outright when it is set, and
+        // `omitted` there means the API default with no display field at
+        // all. The profile-level `agent.thinking.display` applies only when
+        // the entry leaves the knob unset.
+        let display = match self.thinking_display {
+            Some(zeroclaw_config::schema::AnthropicThinkingDisplay::Omitted) => None,
+            Some(zeroclaw_config::schema::AnthropicThinkingDisplay::Summarized) => {
+                Some(ThinkingDisplay::Summarized)
+            }
+            Some(zeroclaw_config::schema::AnthropicThinkingDisplay::Updates) => {
+                Some(ThinkingDisplay::Updates)
+            }
+            None => thinking.and_then(|params| params.display),
+        };
 
         if claude_thinking_shape(model) == ClaudeThinkingShape::FixedBudget {
             let Some(budget) = thinking.and_then(|params| params.budget_tokens) else {
@@ -4594,6 +4596,61 @@ data: {\"type\":\"message_stop\"}\n\n";
             tuning.thinking.is_none(),
             "the API default needs no request field"
         );
+    }
+
+    #[test]
+    fn entry_display_overrides_the_profile_display() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        let thinking = tuning.thinking.expect("a display value sends the object");
+        assert_eq!(
+            thinking.display,
+            Some(ThinkingDisplay::Summarized),
+            "the entry-level value must win over the profile-level one"
+        );
+    }
+
+    #[test]
+    fn entry_display_omitted_overrides_the_profile_display() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        assert!(
+            tuning.thinking.is_none(),
+            "an explicit omitted on the entry must not fall through to the profile value"
+        );
+    }
+
+    #[test]
+    fn unset_entry_display_inherits_the_profile_display() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        let thinking = tuning.thinking.expect("the profile value applies when the entry is unset");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Updates));
     }
 
     #[test]

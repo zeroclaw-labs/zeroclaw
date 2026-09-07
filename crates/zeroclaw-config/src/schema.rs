@@ -1192,9 +1192,11 @@ pub struct AnthropicModelProviderConfig {
     pub base: ModelProviderConfig,
     /// How much of the model's reasoning is returned: `summarized` for a
     /// readable summary, `updates` for the short progress notes written
-    /// between tool calls. Leave unset for the API default, which withholds
-    /// the text. Signed reasoning is replayed within a tool round either way;
-    /// this only controls what a person can read.
+    /// between tool calls, `omitted` for the API default, which withholds
+    /// the text. When set, this entry-level value overrides the profile-level
+    /// `agent.thinking.display` for requests through this entry; leave it
+    /// unset to inherit that setting. Signed reasoning is replayed within a
+    /// tool round either way; this only controls what a person can read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_display: Option<AnthropicThinkingDisplay>,
 }
