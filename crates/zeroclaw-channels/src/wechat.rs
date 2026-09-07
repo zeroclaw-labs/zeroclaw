@@ -667,16 +667,27 @@ enum PendingPairingReply {
     InvalidCode,
 }
 
+/// The response a completed pairing attempt still owes, together with the
+/// context token of the transport message that triggered it. iLink associates
+/// a reply with a conversation through that token, so the initial send and
+/// every retained-batch replay must carry the triggering message's token
+/// rather than whichever token the per-user cache holds by then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPairingResponse {
+    reply: PendingPairingReply,
+    context_token: Option<String>,
+}
+
 /// State of the one pairing attempt allowed for a transport message while its
 /// getUpdates cursor remains pending.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingPairingEffect {
     /// The attempt is reserved before crossing an async boundary.
     AttemptReserved,
     /// The attempt produced no response (for example, lockout).
     NoReply,
     /// The attempt completed, but its response has not been delivered yet.
-    ReplyPending(PendingPairingReply),
+    ReplyPending(PendingPairingResponse),
     /// The attempt and its response both completed.
     ReplyDelivered,
     /// The attempt completed, but iLink deterministically rejected its
@@ -1313,7 +1324,7 @@ impl WeChatChannel {
         }
         let key = (from_user_id.to_string(), message_id.to_string());
         if let Some(effect) = pending.messages.get(&key) {
-            return Some(*effect);
+            return Some(effect.clone());
         }
         pending
             .messages
@@ -1349,7 +1360,7 @@ impl WeChatChannel {
         pending
             .messages
             .get(&(from_user_id.to_string(), message_id.to_string()))
-            .copied()
+            .cloned()
     }
 
     /// Release replay bookkeeping only after the cursor for that batch has
@@ -2561,20 +2572,23 @@ impl WeChatChannel {
         }
     }
 
+    /// Deliver a pairing response with the context token of the `/bind`
+    /// message it answers. The per-user cache is deliberately not consulted:
+    /// by the time a staged response is sent, a later message from the same
+    /// sender may already have refreshed that cache.
     async fn send_pending_pairing_reply(
         &self,
         from_user_id: &str,
-        reply: PendingPairingReply,
+        response: &PendingPairingResponse,
     ) -> anyhow::Result<()> {
-        let key = match reply {
+        let key = match response.reply {
             PendingPairingReply::BoundSuccess => "cli-wechat-bound-success",
             PendingPairingReply::InvalidCode => "cli-wechat-invalid-bind-code",
         };
-        let context_token = self.get_context_token(from_user_id);
         self.send_text(
             from_user_id,
             &wechat_cli_string(key),
-            context_token.as_deref(),
+            response.context_token.as_deref(),
         )
         .await
     }
@@ -2585,13 +2599,16 @@ impl WeChatChannel {
         from_user_id: &str,
         message_id: &str,
     ) -> bool {
-        let Some(PendingPairingEffect::ReplyPending(reply)) =
+        let Some(PendingPairingEffect::ReplyPending(response)) =
             self.pending_pairing_effect(batch_cursor, from_user_id, message_id)
         else {
             return true;
         };
 
-        match self.send_pending_pairing_reply(from_user_id, reply).await {
+        match self
+            .send_pending_pairing_reply(from_user_id, &response)
+            .await
+        {
             Ok(()) => {
                 self.set_pending_pairing_effect(
                     batch_cursor,
@@ -2608,7 +2625,7 @@ impl WeChatChannel {
                         batch_cursor,
                         from_user_id,
                         message_id,
-                        PendingPairingEffect::ReplyUndeliverable(reply),
+                        PendingPairingEffect::ReplyUndeliverable(response.reply),
                     );
                     ::zeroclaw_log::record!(
                         WARN,
@@ -2640,13 +2657,16 @@ impl WeChatChannel {
     /// Handle an unauthorized message. Pairing attempts and response delivery
     /// have separate replay dispositions: a retained batch may retry a failed
     /// response, but it never invokes `try_pair` twice for one transport
-    /// message on the same channel handle.
+    /// message on the same channel handle. `context_token` is the token the
+    /// triggering message carried; it is recorded with a pending response so
+    /// the initial send and any replay answer with the same association.
     async fn handle_unauthorized_message(
         &self,
         batch_cursor: &str,
         from_user_id: &str,
         message_id: &str,
         text: &str,
+        context_token: Option<&str>,
     ) -> bool {
         if let Some(code) = Self::extract_bind_code(text) {
             if self
@@ -2654,7 +2674,10 @@ impl WeChatChannel {
                 .is_none()
             {
                 let effect = match self.run_pairing_attempt(from_user_id, code).await {
-                    Some(reply) => PendingPairingEffect::ReplyPending(reply),
+                    Some(reply) => PendingPairingEffect::ReplyPending(PendingPairingResponse {
+                        reply,
+                        context_token: context_token.map(str::to_string),
+                    }),
                     None => PendingPairingEffect::NoReply,
                 };
                 self.set_pending_pairing_effect(batch_cursor, from_user_id, message_id, effect);
@@ -2964,6 +2987,7 @@ impl Channel for WeChatChannel {
                     message_id: String,
                     text: String,
                     timestamp: u64,
+                    context_token: Option<String>,
                 },
                 /// A message from an unauthorized sender. Handling it has
                 /// side effects (pairing attempts, outbound replies), so it
@@ -2974,10 +2998,14 @@ impl Channel for WeChatChannel {
                 /// replay sees that canonical authorization and treats the
                 /// already-applied `/bind` as a control no-op. Its attempt is
                 /// never repeated; only an undelivered response may retry.
+                /// The message's own context token travels with it so the
+                /// deferred response answers the triggering message rather
+                /// than whichever token the per-user cache holds by then.
                 Unauthorized {
                     from_user_id: String,
                     message_id: String,
                     text: String,
+                    context_token: Option<String>,
                 },
                 /// A control message or empty message that has already been
                 /// handled during authorization-aware preparation and must
@@ -3008,6 +3036,11 @@ impl Channel for WeChatChannel {
                 {
                     self.set_context_token(from_user_id, ctx_token);
                 }
+                // Snapshot the token a deferred reply to THIS message must
+                // carry. Later messages in the batch overwrite the per-user
+                // cache before the staged pairing side effects run, so the
+                // cache cannot be read at send time.
+                let reply_context_token = self.get_context_token(from_user_id);
 
                 let items = msg
                     .get("item_list")
@@ -3050,6 +3083,7 @@ impl Channel for WeChatChannel {
                         from_user_id: from_user_id.to_string(),
                         message_id,
                         text,
+                        context_token: reply_context_token,
                     });
                     continue;
                 }
@@ -3072,6 +3106,7 @@ impl Channel for WeChatChannel {
                         message_id,
                         text,
                         timestamp,
+                        context_token: reply_context_token,
                     });
                     continue;
                 }
@@ -3124,6 +3159,7 @@ impl Channel for WeChatChannel {
                             from_user_id,
                             message_id,
                             text,
+                            context_token,
                         } => {
                             if !self
                                 .handle_unauthorized_message(
@@ -3131,6 +3167,7 @@ impl Channel for WeChatChannel {
                                     &from_user_id,
                                     &message_id,
                                     &text,
+                                    context_token.as_deref(),
                                 )
                                 .await
                             {
@@ -3143,6 +3180,7 @@ impl Channel for WeChatChannel {
                             message_id,
                             text,
                             timestamp,
+                            context_token,
                         } => {
                             if !self.is_user_allowed(&from_user_id) {
                                 // The preceding bind was invalid or could
@@ -3155,6 +3193,7 @@ impl Channel for WeChatChannel {
                                         &from_user_id,
                                         &message_id,
                                         &text,
+                                        context_token.as_deref(),
                                     )
                                     .await
                                 {
@@ -4350,6 +4389,29 @@ mod tests {
         })
     }
 
+    /// The `msg.context_token` carried by each `sendmessage` request the
+    /// mock server has received, in arrival order.
+    async fn sendmessage_context_tokens(mock_server: &wiremock::MockServer) -> Vec<String> {
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .ok()
+                    .and_then(|body| {
+                        body.get("msg")?
+                            .get("context_token")?
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     /// Like `wechat_channel_for_mock`, but also points the CDN base URL at
     /// the mock server and configures a workspace directory so inbound
     /// attachments can be downloaded and saved.
@@ -4706,9 +4768,10 @@ mod tests {
         assert_eq!(*channel.cursor.lock(), "original_cursor");
         assert_eq!(
             channel.pending_pairing_effect("original_cursor", "invalid_user", "1"),
-            Some(PendingPairingEffect::ReplyPending(
-                PendingPairingReply::InvalidCode
-            ))
+            Some(PendingPairingEffect::ReplyPending(PendingPairingResponse {
+                reply: PendingPairingReply::InvalidCode,
+                context_token: None,
+            }))
         );
         assert!(
             !config
@@ -4769,7 +4832,10 @@ mod tests {
             "cursor",
             "new_user",
             "message-1",
-            PendingPairingEffect::ReplyPending(PendingPairingReply::BoundSuccess),
+            PendingPairingEffect::ReplyPending(PendingPairingResponse {
+                reply: PendingPairingReply::BoundSuccess,
+                context_token: None,
+            }),
         );
 
         assert!(
@@ -5157,6 +5223,144 @@ mod tests {
             2,
             "replay must retry the failed response without repeating the successful bind attempt"
         );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// A pairing response answers one specific staged `/bind`, so it must
+    /// carry that message's context token even after a later message from
+    /// the same sender has refreshed the per-user cache. The retained token
+    /// must also survive a held-batch replay of the response without
+    /// repeating the pairing attempt.
+    #[tokio::test]
+    async fn listen_pairing_reply_uses_triggering_bind_context_token() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "context_token": "ctx_bind",
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "context_token": "ctx_followup",
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": "hello after bind"}
+                    }]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sendmessage_context_tokens(&mock_server).await.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failed pairing response must become observable");
+        assert_eq!(
+            sendmessage_context_tokens(&mock_server).await,
+            vec!["ctx_bind".to_string()],
+            "the initial pairing response must carry the bind message's token, not the later cached one"
+        );
+        assert_eq!(
+            channel.pending_pairing_effect("original_cursor", "new_user", "1"),
+            Some(PendingPairingEffect::ReplyPending(PendingPairingResponse {
+                reply: PendingPairingReply::BoundSuccess,
+                context_token: Some("ctx_bind".to_string()),
+            })),
+            "the pending response must retain the triggering token for replay"
+        );
+        assert_eq!(*channel.cursor.lock(), "original_cursor");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "held batch must publish no message"
+        );
+
+        let delivered = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for the post-bind message after the response retry")
+            .expect("listener closed before the post-bind message");
+        assert_eq!(delivered.sender, "new_user");
+        assert_eq!(delivered.content, "hello after bind");
+        assert_eq!(*channel.cursor.lock(), "cursor_after_batch");
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()]
+        );
+        assert_eq!(
+            sendmessage_context_tokens(&mock_server).await,
+            vec!["ctx_bind".to_string(), "ctx_bind".to_string()],
+            "replay must retry the response with the retained bind token without repeating the pairing attempt"
+        );
+        assert_eq!(
+            channel.get_context_token("new_user").as_deref(),
+            Some("ctx_followup"),
+            "the per-user cache still tracks the latest token for ordinary outbound sends"
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(duplicate.is_err(), "post-bind message must deliver once");
 
         handle.abort();
         let _ = handle.await;
