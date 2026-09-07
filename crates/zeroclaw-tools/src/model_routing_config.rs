@@ -780,8 +780,10 @@ impl ModelRoutingConfigTool {
 
     /// Send a minimal 1-token chat request to verify the model is accessible.
     /// Returns `Ok(())` if the probe succeeds **or** if no API key or model
-    /// resolves for the saved alias (checking the runtime snapshot too — see
-    /// below), or the saved config's secrets cannot be decrypted. Those skips
+    /// resolves for the effective alias (checking the runtime snapshot for the
+    /// key too — see below; an environment override that clears the model
+    /// counts as no model), or the saved config's secrets cannot be
+    /// decrypted. Those skips
     /// let an operator configure an alias while offline without turning an
     /// unrelated auth/decryption condition into a model-validity failure.
     /// Environment-override reconstruction errors remain distinct and fatal:
@@ -850,14 +852,29 @@ impl ModelRoutingConfigTool {
         // in memory after load, so probing the saved value would validate a
         // model the runtime never uses — and could roll the disk change back
         // over a model that was never going to be served.
+        //
+        // The override layer treats an empty value as an explicit clear of an
+        // optional field, so "the environment wrote this path and it is now
+        // empty" and "no override touched this path" must not collapse into
+        // one case: the saved model is the effective one only in the latter.
+        // After an explicit clear the runtime resolves no model for the alias
+        // (an entry without a model is only usable through routes that carry
+        // their own), so there is nothing to validate, exactly as when the
+        // saved entry itself has no model.
+        let model_path = format!("providers.models.{family}.{alias}.model");
         let effective_model = effective
             .providers
             .models
             .find(family, alias)
             .and_then(|e| e.model.clone())
             .filter(|value| !value.trim().is_empty());
-        let Some(probe_model_name) = effective_model.as_deref().or(model) else {
-            return Ok(());
+        let probe_model_name = match effective_model {
+            Some(name) => name,
+            None if effective.prop_is_env_overridden(&model_path) => return Ok(()),
+            None => match model {
+                Some(name) => name.to_string(),
+                None => return Ok(()),
+            },
         };
 
         let model_provider =
@@ -870,7 +887,7 @@ impl ModelRoutingConfigTool {
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
-                probe_model_name,
+                &probe_model_name,
                 Some(PING_TEMPERATURE),
             )
             .await
@@ -2194,6 +2211,102 @@ mod tests {
             "the environment-only model must not be persisted"
         );
         assert_eq!(persisted.temperature, Some(0.4));
+    }
+
+    /// The override layer treats an empty `ZEROCLAW_*` value as an explicit
+    /// clear of an optional field. A cleared alias model means the reloaded
+    /// runtime resolves no model at all, so the probe must not fall back to
+    /// the saved model: dispatching it would validate, and could accept, a
+    /// model the runtime never serves.
+    #[tokio::test]
+    async fn set_default_does_not_probe_the_saved_model_after_an_explicit_empty_override() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_cleared_model_case";
+
+        let server = MockServer::start().await;
+        // Any request that arrives is accepted, so a dispatched saved model is
+        // observable only through the request count asserted below.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let model_var = "ZEROCLAW_providers__models__openai__probe_env_cleared_model_case__model";
+        let _model = TestEnvVar::set(&_env_guard, model_var, "");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-disk"
+            }))
+            .await
+            .unwrap();
+
+        // The scenario is real, not vacuous: the effective entry resolves no
+        // model, exactly as the runtime resolves it, and the path is recorded
+        // as environment-owned.
+        let effective = ModelRoutingConfigTool::build_effective_config_for_probe(
+            tool.load_config_without_env().unwrap(),
+        )
+        .expect("the effective configuration rebuilds from the saved file");
+        let effective_entry = effective
+            .providers
+            .models
+            .find("openai", ALIAS)
+            .expect("the effective configuration keeps the alias");
+        assert_eq!(
+            effective_entry.model, None,
+            "an empty override clears the alias model in the effective configuration"
+        );
+        assert!(
+            effective.prop_is_env_overridden(&format!("providers.models.openai.{ALIAS}.model")),
+            "the cleared model path must be recorded as environment-owned"
+        );
+
+        assert!(
+            result.success,
+            "no effective model leaves nothing to validate, as when the saved entry has none: \\
+             {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert!(
+            requests.is_empty(),
+            "the saved model must not be probed once the environment cleared the effective one; \\
+             got {} request(s)",
+            requests.len()
+        );
+        let persisted = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("set_default preserves the configured alias");
+        assert_eq!(
+            persisted.model.as_deref(),
+            Some("gpt-disk"),
+            "the saved model stays on disk; only the effective view is cleared"
+        );
     }
 
     #[tokio::test]
