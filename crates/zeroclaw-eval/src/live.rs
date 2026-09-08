@@ -933,7 +933,7 @@ mod tests {
             completion.history
         );
         assert!(
-            !completion.all_tools_succeeded,
+            !completion.all_tools_succeeded(),
             "the out-of-workspace file_read must not report success"
         );
     }

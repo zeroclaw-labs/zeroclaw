@@ -678,6 +678,10 @@ mod tests {
             r#"{"max_tool_calls":0}"#,
             r#"{"all_tools_succeeded":false}"#,
             r#"{"response_matches":["^a"]}"#,
+            r#"{"min_tool_calls":1}"#,
+            r#"{"exact_tool_calls":0}"#,
+            r#"{"tool_arguments_contain":[{"tool":"echo","needle":"alpha"}]}"#,
+            r#"{"tool_results_contain":[{"tool":"echo","needle":"alpha"}]}"#,
         ];
         for raw in cases {
             let expects: TraceExpects = serde_json::from_str(raw).unwrap();

@@ -8,9 +8,15 @@
   ],
   "expects": {
     "response_contains": ["no usable message"],
-    "response_matches": ["\\S"],
+    "response_matches": ["^The echo tool received no usable message\\b"],
     "tools_used": ["echo"],
-    "max_tool_calls": 1,
-    "all_tools_succeeded": true
+    "exact_tool_calls": 1,
+    "all_tools_succeeded": true,
+    "tool_arguments_contain": [
+      { "tool": "echo", "needle": "wrong_key", "call_index": 0 }
+    ],
+    "tool_results_contain": [
+      { "tool": "echo", "needle": "(empty)", "call_index": 0 }
+    ]
   }
 }

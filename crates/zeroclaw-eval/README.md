@@ -113,7 +113,7 @@ filter it to the effective allowlist; `shell` remains unavailable.
   recorded-call list is the canonical dispatch fact; tool names and aggregate
   success are derived from it rather than stored again.
 - `grader` — non-panicking `GradeResult` checks: expectations, workspace
-  end state, and run budgets (the `Grader` trait remains the extension point,
-  with the LLM-judge grader still a later phase).
+  end state, run budgets, and the diagnostic-only LLM judge (the `Grader` trait
+  remains the extension point).
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.

@@ -798,6 +798,54 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_missing_the_expected_argument_reaches_the_tool_and_the_loop_continues() {
+        // The shape the `missing_tool_argument_continues_loop` fixture replays: the
+        // model asks for `echo` with a key the tool does not read. The dispatch has
+        // to happen against the real tool with the arguments as written, and its
+        // fallback output has to come back, or the fixture's boundary expectations
+        // would be grading something the harness invented.
+        const MALFORMED: &str = r#"{
+            "model_name": "test-missing-tool-argument",
+            "turns": [{
+                "user_input": "Echo my greeting for zeroclaw_user.",
+                "steps": [
+                    { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"wrong_key": "hello"} }] } },
+                    { "response": { "type": "text", "content": "The echo tool received no usable message." } }
+                ]
+            }],
+            "expects": {}
+        }"#;
+        let trace: LlmTrace = serde_json::from_str(MALFORMED).unwrap();
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        let completion = outcome.record.completion_or_default();
+
+        assert_eq!(
+            completion.tool_calls.len(),
+            1,
+            "calls: {:?}",
+            completion.tool_calls
+        );
+        let call = &completion.tool_calls[0];
+        assert_eq!(call.name, "echo");
+        assert!(
+            call.arguments.contains("wrong_key"),
+            "the malformed key did not survive to the dispatch boundary: {:?}",
+            call.arguments
+        );
+        assert!(
+            call.result.contains("(empty)"),
+            "the tool's missing-message fallback did not reach the record: {:?}",
+            call.result
+        );
+        assert!(call.success, "the dispatch itself must not be an error");
+        // The loop continued past the tool call to the turn's second scripted step.
+        assert_eq!(
+            completion.final_response,
+            "The echo tool received no usable message."
+        );
+    }
+
+    #[tokio::test]
     async fn run_suite_rejects_a_zero_turn_fixture_instead_of_reporting_it_green() {
         // The turn loop below runs zero times for such a fixture, so the empty
         // initial response and empty tool record grade `max_tool_calls: 0` as

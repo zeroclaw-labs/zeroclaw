@@ -448,6 +448,7 @@ mod tests {
                     autonomy: "supervised".to_string(),
                     workspace_only: false,
                 },
+                judge_ref: None,
             },
             completion: Some(RunCompletion::default()),
         };

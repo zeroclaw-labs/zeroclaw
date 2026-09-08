@@ -19,7 +19,8 @@ Suites of agent evaluation cases for `zeroclaw eval run` (crate: `crates/zerocla
   expectation. Unknown keys, omitted or empty expectation blocks, and
   zero-length string expectations are load errors, so a case that cannot fail
   never reaches the gate.
-- `expects` supports response checks (`response_contains`/`response_not_contains`/`response_matches`/`response_json`), tool checks (`tools_used`/`tools_not_used`/`max_tool_calls`/`all_tools_succeeded`), workspace end-state checks (`workspace.file_exists`/`file_absent`/`file_contains`), and resource budgets (`budget.max_*`). See the eval-harness book page for the full field reference. Do not assert tool-call order or tool arguments; agents find valid alternate paths, so those checks are deliberately excluded.
+- `expects` supports response checks (`response_contains`/`response_not_contains`/`response_matches`/`response_json`), tool checks (`tools_used`/`tools_not_used`/`max_tool_calls`/`min_tool_calls`/`exact_tool_calls`/`all_tools_succeeded`), dispatch-boundary checks (`tool_arguments_contain`/`tool_results_contain`), workspace end-state checks (`workspace.file_exists`/`file_absent`/`file_contains`), and resource budgets (`budget.max_*`). See the eval-harness book page for the full field reference.
+- Every case must fail when the run produces nothing. A lone bound such as `max_tool_calls: 0` survives load but holds over an idle run, so `regression_suite.rs` grades every gated fixture against an empty run and requires a failed check.
 - Privacy: fixtures ship forever. Placeholder identities only (`zeroclaw_user`, `example.com`) per `docs/book/src/contributing/privacy.md`. Never paste real transcripts, names, keys, or hostnames.
 
 Suite owner: the maintainer group for `crates/zeroclaw-eval` (update when a named owner volunteers).

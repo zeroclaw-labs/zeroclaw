@@ -500,6 +500,16 @@ Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`
 authoring rules, including the two-experts test and the privacy requirement that
 fixtures use placeholder identities only.
 
+Expectations that grade the *dispatch boundary* rather than scripted text
+(`tool_arguments_contain`, `tool_results_contain`, and `exact_tool_calls`) are
+documented in `crates/zeroclaw-eval/README.md`. Reach for them whenever a case
+claims that a value round-tripped through a tool or that a specific number of
+tool calls happened; expectations over the final response alone cannot show
+either, because the replay provider scripts that response itself.
+The recorded-call list is the canonical dispatch fact. Tool names and aggregate
+success are derived from it at grading time, so richer boundary evidence does
+not create a second independently mutable tool-call summary.
+
 Fixture loading fails closed, because a required gate must not certify a case
 that cannot fail. `LlmTrace::from_file()` rejects a fixture that declares no
 conversation turns (the replay would drive the agent zero times and grade its
@@ -510,7 +520,16 @@ empty, one holding a zero-length entry in a string-backed expectation family
 expectation key. The nested blocks follow the same rule: a present-but-empty
 `workspace` or `budget` block, an empty `file_contains` list, and an empty
 `file_contains` needle (every file trivially contains the empty string) are all
-load errors. Every rejection names the offending fixture and field.
+load errors. The dispatch-boundary families fail closed on the same principle:
+an empty `tool` or `needle`, a vacuous `min_tool_calls: 0`, and count bounds
+that contradict each other are all rejected at load. Every rejection names the
+offending fixture and field.
+
+Admission cannot see one remaining form of vacuity: an assertion that a run
+producing nothing already satisfies, such as a lone `max_tool_calls: 0`. The
+gated suite test grades every committed fixture against an empty run and
+requires at least one failed check, so a case that certifies no behavior cannot
+join the required gate.
 
 Case identity is part of that admission. A fixture whose display id is empty
 (no `id` and an empty `model_name`, or an explicit `"id": ""`) is rejected at

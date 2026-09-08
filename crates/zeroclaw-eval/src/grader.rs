@@ -793,7 +793,8 @@ pub async fn grade_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::case::TraceExpects;
+    use crate::case::{ToolPayloadExpect, TraceExpects};
+    use crate::observer::RecordedCall;
     use crate::record::RunRecord;
 
     #[tokio::test]
@@ -866,6 +867,27 @@ mod tests {
                     .collect(),
                 ..crate::record::RunCompletion::default()
             }),
+        }
+    }
+
+    /// A record whose recorded calls carry real argument/result payloads.
+    fn run_with_calls(resp: &str, calls: Vec<RecordedCall>) -> RunRecord {
+        RunRecord {
+            completion: Some(crate::record::RunCompletion {
+                final_response: resp.to_string(),
+                tool_calls: calls,
+                ..crate::record::RunCompletion::default()
+            }),
+            ..run(resp, &[], true)
+        }
+    }
+
+    fn call(name: &str, arguments: &str, result: &str) -> RecordedCall {
+        RecordedCall {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+            result: result.to_string(),
+            success: true,
         }
     }
 
@@ -986,6 +1008,249 @@ mod tests {
         assert!(out[0].detail.contains("invalid regex"));
         assert!(out[1].passed);
         assert_eq!(out[1].detail, "matched");
+    }
+
+
+    // ---- B1: argument / result round-trip expectations ----
+
+    #[test]
+    fn tool_results_contain_passes_on_exact_unicode() {
+        // The Unicode string must come back from the *tool result*, not from a
+        // scripted final response.
+        let record = run_with_calls(
+            "Echoed: naïve café 日本語 ✓",
+            vec![call(
+                "echo",
+                r#"{"message":"naïve café 日本語 ✓"}"#,
+                "naïve café 日本語 ✓",
+            )],
+        );
+        let expects = TraceExpects {
+            tool_arguments_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "naïve café 日本語 ✓".to_string(),
+                call_index: None,
+            }],
+            tool_results_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "naïve café 日本語 ✓".to_string(),
+                call_index: None,
+            }],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|g| g.passed), "grades: {out:?}");
+    }
+
+    #[test]
+    fn tool_arguments_contain_fails_when_argument_mutated() {
+        // The mutation proof: `echo` still dispatched and still succeeded, and the
+        // final response still carries the Unicode text — but the argument that
+        // crossed the dispatch boundary was mangled. The grade must go red.
+        let record = run_with_calls(
+            "Echoed: naïve café 日本語 ✓",
+            vec![call(
+                "echo",
+                r#"{"message":"naive cafe ??? x"}"#,
+                "naive cafe ??? x",
+            )],
+        );
+        let expects = TraceExpects {
+            response_contains: vec!["naïve café 日本語 ✓".to_string()],
+            tools_used: vec!["echo".to_string()],
+            all_tools_succeeded: Some(true),
+            tool_arguments_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "naïve café 日本語 ✓".to_string(),
+                call_index: None,
+            }],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        // Everything the old fixture asserted still passes...
+        for name in ["response_contains", "tools_used", "all_tools_succeeded"] {
+            let g = out.iter().find(|g| g.check.starts_with(name)).unwrap();
+            assert!(g.passed, "{name} should still pass: {g:?}");
+        }
+        // ...and only the boundary check catches the regression.
+        let arg_grade = out
+            .iter()
+            .find(|g| g.check.starts_with("tool_arguments_contain"))
+            .unwrap();
+        assert!(
+            !arg_grade.passed,
+            "mutated argument must fail the grade: {arg_grade:?}"
+        );
+        assert!(arg_grade.detail.contains("naive cafe"));
+    }
+
+    #[test]
+    fn tool_results_contain_fails_when_result_mutated() {
+        let record = run_with_calls(
+            "Echoed: naïve café 日本語 ✓",
+            vec![call(
+                "echo",
+                r#"{"message":"naïve café 日本語 ✓"}"#,
+                "(empty)",
+            )],
+        );
+        let expects = TraceExpects {
+            tool_results_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "naïve café 日本語 ✓".to_string(),
+                call_index: None,
+            }],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].passed);
+        assert!(out[0].detail.contains("(empty)"));
+    }
+
+    #[test]
+    fn tool_payload_expect_fails_when_tool_never_called() {
+        let record = run_with_calls("no tools here", vec![]);
+        let expects = TraceExpects {
+            tool_arguments_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "alpha".to_string(),
+                call_index: None,
+            }],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        assert!(!out[0].passed);
+        assert!(out[0].detail.contains("never called"));
+    }
+
+    // ---- B2: exact call count and per-call ordering ----
+
+    #[test]
+    fn exact_tool_calls_fails_when_one_dispatch_missing() {
+        // The reviewer's counterexample verbatim: one `echo` call, a scripted
+        // "Echoed: beta" final response, everything successful. The old
+        // expectations pass; `exact_tool_calls(2)` must not.
+        let record = run_with_calls(
+            "Echoed: beta",
+            vec![call("echo", r#"{"message":"beta"}"#, "beta")],
+        );
+        let expects = TraceExpects {
+            response_contains: vec!["beta".to_string()],
+            tools_used: vec!["echo".to_string()],
+            max_tool_calls: Some(2),
+            all_tools_succeeded: Some(true),
+            exact_tool_calls: Some(2),
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        for name in [
+            "response_contains",
+            "tools_used",
+            "max_tool_calls",
+            "all_tools_succeeded",
+        ] {
+            let g = out.iter().find(|g| g.check.starts_with(name)).unwrap();
+            assert!(g.passed, "{name} should still pass: {g:?}");
+        }
+        let exact = out
+            .iter()
+            .find(|g| g.check.starts_with("exact_tool_calls"))
+            .unwrap();
+        assert!(!exact.passed, "a missing dispatch must fail: {exact:?}");
+        assert!(exact.detail.contains("1 tool call(s)"));
+    }
+
+    #[test]
+    fn exact_tool_calls_passes_on_two_dispatches() {
+        let record = run_with_calls(
+            "Echoed: beta",
+            vec![
+                call("echo", r#"{"message":"alpha"}"#, "alpha"),
+                call("echo", r#"{"message":"beta"}"#, "beta"),
+            ],
+        );
+        let expects = TraceExpects {
+            exact_tool_calls: Some(2),
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].passed, "grades: {out:?}");
+    }
+
+    #[test]
+    fn indexed_payload_expect_grades_per_call_ordering() {
+        let record = run_with_calls(
+            "Echoed: beta",
+            vec![
+                call("echo", r#"{"message":"alpha"}"#, "alpha"),
+                call("echo", r#"{"message":"beta"}"#, "beta"),
+            ],
+        );
+        let ordered = TraceExpects {
+            tool_arguments_contain: vec![
+                ToolPayloadExpect {
+                    tool: "echo".to_string(),
+                    needle: "alpha".to_string(),
+                    call_index: Some(0),
+                },
+                ToolPayloadExpect {
+                    tool: "echo".to_string(),
+                    needle: "beta".to_string(),
+                    call_index: Some(1),
+                },
+            ],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&ordered, &record);
+        assert!(out.iter().all(|g| g.passed), "grades: {out:?}");
+
+        // Swapped order must fail — this is what makes the ordering claim graded
+        // rather than implied by the scripted text.
+        let swapped = TraceExpects {
+            tool_arguments_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "beta".to_string(),
+                call_index: Some(0),
+            }],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&swapped, &record);
+        assert!(!out[0].passed, "grades: {out:?}");
+        assert!(out[0].detail.contains("alpha"));
+    }
+
+    #[test]
+    fn indexed_payload_expect_fails_when_index_out_of_range() {
+        let record = run_with_calls(
+            "Echoed: beta",
+            vec![call("echo", r#"{"message":"beta"}"#, "beta")],
+        );
+        let expects = TraceExpects {
+            tool_arguments_contain: vec![ToolPayloadExpect {
+                tool: "echo".to_string(),
+                needle: "beta".to_string(),
+                call_index: Some(1),
+            }],
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        assert!(!out[0].passed);
+        assert!(out[0].detail.contains("only 1 call(s) observed"));
+    }
+
+    #[test]
+    fn min_tool_calls_bounds_below() {
+        let record = run_with_calls("done", vec![call("echo", "{}", "x")]);
+        let expects = TraceExpects {
+            min_tool_calls: Some(2),
+            ..Default::default()
+        };
+        let out = evaluate_expects(&expects, &record);
+        assert!(!out[0].passed);
+        assert_eq!(out[0].check, "min_tool_calls(2)");
     }
 
     use std::collections::BTreeMap;
