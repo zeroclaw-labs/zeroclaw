@@ -947,8 +947,8 @@ impl BedrockModelProvider {
     /// output cap, which the model generation constrains together.
     ///
     /// Older generations name a token budget and must pin the temperature.
-    /// Newer ones think adaptively, take a depth setting instead, and reject
-    /// both a budget and any sampling parameter.
+    /// Newer ones think adaptively, take a depth setting instead, reject a
+    /// budget, and only accept temperature 1 while thinking is active.
     fn resolve_thinking(
         &self,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
@@ -984,7 +984,7 @@ impl BedrockModelProvider {
                         "model": model,
                         "temperature": temperature,
                     })),
-                "temperature dropped: this model generation rejects sampling parameters"
+                "temperature dropped: this model generation only accepts temperature 1 while thinking is active"
             );
         }
         if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
@@ -2333,7 +2333,7 @@ mod tests {
         );
         assert!(
             temperature.is_none(),
-            "this generation rejects sampling parameters"
+            "this generation only accepts temperature 1 while thinking is active"
         );
         assert_eq!(
             fields,

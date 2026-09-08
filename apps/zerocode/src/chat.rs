@@ -8540,8 +8540,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_ctrl_p_reopens_latest_plan_after_hidden_update() {
-        use crossterm::event::{KeyCode, KeyModifiers};
+    async fn todo_primary_p_reopens_latest_plan_after_hidden_update() {
+        use crossterm::event::KeyCode;
 
         let mut chat = active_chat();
         let ChatPhase::Active(state) = &mut chat.phase else {
@@ -8564,7 +8564,10 @@ mod tests {
         assert!(
             !chat
                 .handle_key(
-                    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    KeyEvent::new(
+                        KeyCode::Char('p'),
+                        crate::keymap::Chord::primary('p').effective_modifiers(),
+                    ),
                     &mut term,
                 )
                 .await
@@ -8584,7 +8587,10 @@ mod tests {
         assert!(
             !chat
                 .handle_key(
-                    KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                    KeyEvent::new(
+                        KeyCode::Char('p'),
+                        crate::keymap::Chord::primary('p').effective_modifiers(),
+                    ),
                     &mut term,
                 )
                 .await

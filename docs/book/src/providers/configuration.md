@@ -142,11 +142,27 @@ may choose a different display for itself, which beats this setting; the
 Anthropic slot's `thinking_display` fills in behind both (see
 [Anthropic](#anthropic)).
 
+### Per-entry override
+
+Each entry on the `anthropic` slot carries its own `thinking_display` field
+(`omitted`, `summarized` or `updates`). When it is set it wins over
+`agent.thinking.display` for requests through that entry. This includes
+`omitted`, which on the entry means the API default: no display field is
+sent, whatever the profile says. Leave the field unset to inherit the
+profile-level value. This is the same entry-overrides-profile pattern that
+`temperature` and `max_tokens` follow; see the [Anthropic](#anthropic)
+example below.
+
+Generation 5.1 and later accept only `summarized` and `omitted`, so a
+configured `updates` (from either knob) is sent to those models as
+`summarized`, and a warning names the model and the substitution. The beta
+header follows the value actually sent.
+
 ## Per-family knobs: worked examples
 
 ### Anthropic
 
-Current Claude models think adaptively: the model decides how much to reason per request, and the API rejects both the older fixed thinking budget and every sampling parameter. Earlier models keep the fixed budget. ZeroClaw reads the generation from the alias `model`, so one alias entry works for either.
+Current Claude models think adaptively: the model decides how much to reason per request, and the API rejects the older fixed thinking budget, and a temperature other than 1 while thinking is active, which on these generations is the normal state. Earlier models keep the fixed budget. ZeroClaw reads the generation from the alias `model`, so one alias entry works for either.
 
 ```toml
 [providers.models.anthropic.fable]
@@ -159,11 +175,11 @@ thinking_display = "summarized"
 fallback_models = ["claude-opus-5"]
 ```
 
-- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary. Leave it unset for the API default, which returns reasoning blocks with their text withheld. `updates`, the short progress notes some models write between tool calls, is accepted but sent as `summarized` with a warning, because the one family documented to write them rejected the value in a live probe; a display the model generation does not take at all (generation 4.6 takes none) is dropped with a warning. A zerocode session can choose a different display for itself; see [Session controls](../zerocode/running.md#session-controls).
+- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary, and `updates` returns the short progress notes the model writes between tool calls. Leave it unset to inherit `agent.thinking.display`, or set `omitted` for the API default, which returns reasoning blocks with their text withheld. A value set here overrides the profile-level setting for this entry. `updates` is sent as `summarized` with a warning from generation 5.1 onward, because the one family documented to write them rejected the value in a live probe; a display the model generation does not take at all (generation 4.6 takes none) is dropped with a warning. ZeroClaw adds the beta header the progress notes need only when the request actually carries them. Older models ignore the field. A zerocode session can choose a different display for itself; see [Session controls](../zerocode/running.md#session-controls).
 - `max_tokens`: reasoning counts toward this cap on the current models, so the 4096 default is low. ZeroClaw warns when an adaptive model runs at or below it. Use 16000 or more, and 32000 for agentic work.
 - `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
 - `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.
-- `temperature`: current models reject sampling parameters. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
+- `temperature`: current models reject a temperature other than 1 while thinking is active. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
 
 Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or an `/effort:<level>` prefix on one message (`/think:<level>` is still accepted), maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high`, `xhigh` and `max` ask for those. `xhigh` arrived with the 4.7 generation, so on 4.6 it is sent as `high`. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones. Channels take `/effort <level>` (`/thinking` and `/think` still work), and zerocode offers the depths its session's model accepts as a picker; see [Session controls](../zerocode/running.md#session-controls).
 

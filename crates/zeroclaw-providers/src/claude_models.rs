@@ -9,8 +9,8 @@ pub enum ClaudeThinkingShape {
     /// budget, and the request must pin the sampling temperature to 1.0.
     FixedBudget,
     /// Thinking is adaptive: the request may say `type: "adaptive"` and steer
-    /// depth with `output_config.effort`; a fixed budget and any sampling
-    /// parameter are rejected.
+    /// depth with `output_config.effort`; a fixed budget is rejected, and so
+    /// is a temperature other than 1 while thinking is active.
     Adaptive,
 }
 
@@ -135,10 +135,19 @@ const EFFORTS_CURRENT: &[ThinkingEffort] = &[
     ThinkingEffort::Max,
 ];
 
-/// Displays every current family takes on the Anthropic API. Progress notes
-/// (`updates`) are not offered anywhere: the one family documented to write
-/// them, Fable 5.1, answered 400 to the value in a live probe, so a request
-/// for them is sent as a summary instead until a model is known to take it.
+/// Displays generations 4.7 through 5.0 take on the Anthropic API, including
+/// the short progress notes some of them write between tool calls.
+const DISPLAYS_PRE_5_1: &[ThinkingDisplay] = &[
+    ThinkingDisplay::Omitted,
+    ThinkingDisplay::Summarized,
+    ThinkingDisplay::Updates,
+];
+
+/// Displays generation 5.1 and later take on the Anthropic API. The
+/// generation narrowed the field to summaries and the API default: Fable 5.1,
+/// the one family documented to write progress notes, answered 400 to
+/// `updates` in a live probe, so a request for them is sent as a summary
+/// instead. A Claude id whose version cannot be read follows this row.
 const DISPLAYS_CURRENT: &[ThinkingDisplay] =
     &[ThinkingDisplay::Omitted, ThinkingDisplay::Summarized];
 
@@ -149,15 +158,17 @@ const DISPLAYS_CURRENT: &[ThinkingDisplay] =
 /// 4.6 keep the fixed budget. Generation 4.6 thinks adaptively but takes no
 /// display. Generation 4.7 and later, and any Claude id whose version cannot
 /// be read, take every depth, so a new release needs no code change here; on
-/// the Anthropic API they also take a display. The Bedrock adapter forwards
-/// no display. Ids that are not Claude models at all get no controls.
+/// the Anthropic API they also take a display, narrowed from generation 5.1
+/// onward. The Bedrock adapter forwards no display. Ids that are not Claude
+/// models at all get no controls.
 #[must_use]
 pub fn thinking_capabilities(slot: ClaudeProviderSlot, model: &str) -> ThinkingCapabilities {
     let lower = model.to_ascii_lowercase();
     let Some(rest) = claude_id_rest(&lower) else {
         return ThinkingCapabilities::NONE;
     };
-    match claude_generation(rest) {
+    let generation = claude_generation(rest);
+    match generation {
         Some(generation) if generation < (4, 6) => FIXED_BUDGET,
         Some((4, 6)) => ThinkingCapabilities {
             shape: ClaudeThinkingShape::Adaptive,
@@ -171,7 +182,10 @@ pub fn thinking_capabilities(slot: ClaudeProviderSlot, model: &str) -> ThinkingC
             efforts: EFFORTS_CURRENT,
             displays: match slot {
                 ClaudeProviderSlot::Bedrock => &[],
-                ClaudeProviderSlot::Anthropic => DISPLAYS_CURRENT,
+                ClaudeProviderSlot::Anthropic => match generation {
+                    Some(generation) if generation < (5, 1) => DISPLAYS_PRE_5_1,
+                    _ => DISPLAYS_CURRENT,
+                },
             },
         },
     }
@@ -325,6 +339,85 @@ mod tests {
     }
 
     #[test]
+    fn display_updates_is_refused_from_generation_5_1() {
+        for model in [
+            "claude-fable-5-1",
+            "claude-fable-5-1-20260815",
+            "claude-mythos-5-1",
+            "claude-opus-5-2",
+            "claude-sonnet-6",
+            "anthropic.claude-fable-5-1",
+            "us.anthropic.claude-mythos-5-1-v1",
+            // An id whose generation cannot be read follows the newest row.
+            "claude-next",
+        ] {
+            let capabilities = thinking_capabilities(ClaudeProviderSlot::Anthropic, model);
+            assert!(
+                !capabilities.supports_display(ThinkingDisplay::Updates),
+                "{model} should not take the updates display"
+            );
+            assert_eq!(
+                capabilities.fit_display(ThinkingDisplay::Updates),
+                Some(ThinkingDisplay::Summarized),
+                "{model} should read progress notes as a summary"
+            );
+        }
+    }
+
+    #[test]
+    fn display_updates_is_accepted_before_generation_5_1() {
+        for model in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7-20260101",
+            "us.anthropic.claude-opus-4-8-v1",
+        ] {
+            let capabilities = thinking_capabilities(ClaudeProviderSlot::Anthropic, model);
+            assert!(
+                capabilities.supports_display(ThinkingDisplay::Updates),
+                "{model} should take the updates display"
+            );
+            assert_eq!(
+                capabilities.fit_display(ThinkingDisplay::Updates),
+                Some(ThinkingDisplay::Updates),
+                "{model} should keep the requested progress notes"
+            );
+        }
+    }
+
+    #[test]
+    fn generations_without_a_display_field_take_no_updates() {
+        // The 4.6 generation reads no display at all, and the budget
+        // generations before it send none either, so progress notes are not
+        // fitted to a summary there; they are dropped.
+        for model in ["claude-sonnet-4-6", "claude-sonnet-4-5"] {
+            let capabilities = thinking_capabilities(ClaudeProviderSlot::Anthropic, model);
+            assert!(
+                !capabilities.supports_display(ThinkingDisplay::Updates),
+                "{model} should not take the updates display"
+            );
+            assert_eq!(
+                capabilities.fit_display(ThinkingDisplay::Updates),
+                None,
+                "{model} carries no display field"
+            );
+        }
+    }
+
+    #[test]
+    fn non_claude_ids_take_no_display_at_all() {
+        for model in ["gpt-4o", "minimax-m2", ""] {
+            let capabilities = thinking_capabilities(ClaudeProviderSlot::Anthropic, model);
+            assert!(
+                capabilities.displays.is_empty(),
+                "{model} is not a Claude id, so nothing is known about its displays"
+            );
+        }
+    }
+
+    #[test]
     fn date_and_revision_suffixes_never_read_as_a_version() {
         assert_eq!(claude_generation("sonnet-4-20250514"), Some((4, 0)));
         assert_eq!(claude_generation("opus-4-8-v1"), Some((4, 8)));
@@ -406,7 +499,7 @@ mod tests {
                 ClaudeThinkingShape::Adaptive,
                 false,
                 &[Low, High, XHigh, Max],
-                &[Omitted, Summarized],
+                &[Omitted, Summarized, Updates],
             ),
             (
                 Anthropic,
@@ -414,7 +507,7 @@ mod tests {
                 ClaudeThinkingShape::Adaptive,
                 false,
                 &[Low, High, XHigh, Max],
-                &[Omitted, Summarized],
+                &[Omitted, Summarized, Updates],
             ),
             (
                 Anthropic,
@@ -498,7 +591,14 @@ mod tests {
         assert_eq!(current.fit_effort(Low), Some(Low));
         assert!(current.supports_effort(Max));
         assert!(current.supports_display(Summarized));
-        assert!(!current.supports_display(Updates));
+        assert!(
+            current.supports_display(Updates),
+            "the 4.8 generation still reads the progress notes"
+        );
+        assert!(
+            !thinking_capabilities(Anthropic, "claude-fable-5-1").supports_display(Updates),
+            "generation 5.1 narrowed the field to summaries and the API default"
+        );
 
         assert_eq!(current.fit_effort(XHigh), Some(XHigh));
 

@@ -2187,7 +2187,7 @@ impl AnthropicModelProvider {
                         "model": model,
                         "temperature": temperature,
                     })),
-                "temperature dropped: this model generation rejects sampling parameters"
+                "temperature dropped: this model generation only accepts temperature 1 while thinking is active"
             );
         }
         if self.max_tokens <= zeroclaw_api::model_provider::BASELINE_MAX_TOKENS {
@@ -4523,7 +4523,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(
             tuning.temperature.is_none(),
-            "this generation rejects sampling parameters"
+            "this generation only accepts temperature 1 while thinking is active"
         );
         assert_eq!(tuning.max_tokens, provider.max_tokens);
     }
@@ -4536,7 +4536,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let params = zeroclaw_api::model_provider::NativeThinkingParams {
             budget_tokens: Some(10_000),
             effort: None,
-            display: Some(ThinkingDisplay::Updates),
+            display: Some(ThinkingDisplay::Summarized),
         };
         let tuning =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
@@ -4545,7 +4545,6 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("adaptive thinking config for fable-5-1");
         assert_eq!(thinking.kind, "adaptive");
         assert_eq!(thinking.budget_tokens, None);
-        // Progress notes are sent as a summary until a model is known to take them.
         assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
         assert!(tuning.temperature.is_none());
         assert_eq!(tuning.max_tokens, provider.max_tokens);
@@ -4819,6 +4818,67 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
+    fn updates_display_is_sent_as_summarized_from_generation_5_1() {
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+        let params = zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: None,
+            effort: None,
+            display: Some(ThinkingDisplay::Updates),
+        };
+        for model in ["claude-fable-5-1", "claude-mythos-5-1", "claude-next"] {
+            let tuning = provider.resolve_thinking(Some(params), None, model);
+            let thinking = tuning
+                .thinking
+                .unwrap_or_else(|| panic!("{model}: a display value sends the object"));
+            assert_eq!(
+                thinking.display,
+                Some(ThinkingDisplay::Summarized),
+                "{model} rejects updates, so the nearest readable value goes out"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_updates_display_is_sent_as_summarized_from_generation_5_1() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Updates))
+            .build();
+        let tuning = provider.resolve_thinking(None, None, "claude-fable-5-1");
+        let thinking = tuning.thinking.expect("a display value sends the object");
+        assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn updates_display_is_kept_before_generation_5_1() {
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Updates))
+            .build();
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            let tuning = provider.resolve_thinking(None, None, model);
+            let thinking = tuning
+                .thinking
+                .unwrap_or_else(|| panic!("{model}: a display value sends the object"));
+            assert_eq!(
+                thinking.display,
+                Some(ThinkingDisplay::Updates),
+                "{model} still takes the updates display"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_thinking_sends_nothing_without_a_chosen_depth() {
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
@@ -4898,7 +4958,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(
             (tuning.temperature.unwrap() - 0.3_f64).abs() < f64::EPSILON,
-            "older generations still accept sampling parameters"
+            "older generations keep the caller's temperature"
         );
     }
 

@@ -4526,6 +4526,79 @@ mod tests {
         }
     }
 
+    struct MutatingImageProvider {
+        calls: Arc<AtomicUsize>,
+        image_path: std::path::PathBuf,
+        original_data_uri: String,
+        replacement_bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MutatingImageProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in image-cache tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains(&self.original_data_uri)),
+                "every iteration must reuse the first prepared image bytes"
+            );
+
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = if call == 0 {
+                std::fs::write(&self.image_path, &self.replacement_bytes)?;
+                r#"<tool_call>
+{"name":"probe","arguments":{"value":"ok"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MutatingImageProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MutatingImageProvider"
+        }
+    }
+
     struct StreamingScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<String>>>,
         stream_calls: Arc<AtomicUsize>,
@@ -5658,6 +5731,94 @@ mod tests {
         );
         assert!(!requests[0][0].content.contains("[IMAGE:"));
         assert!(!requests[0][0].content.contains(&oversized_payload));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_reuses_fallback_image_cache_across_iterations() {
+        let temp = tempfile::tempdir().unwrap();
+        let uploads = temp.path().join("uploads");
+        std::fs::create_dir(&uploads).unwrap();
+        let image_path = uploads.join("cached.png");
+        let original_bytes = [
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 1, 2, 3, 4,
+        ];
+        let replacement_bytes = vec![
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 5, 6, 7, 8,
+        ];
+        std::fs::write(&image_path, original_bytes).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = MutatingImageProvider {
+            calls: Arc::clone(&calls),
+            image_path: image_path.clone(),
+            original_data_uri: format!("data:image/png;base64,{}", STANDARD.encode(original_bytes)),
+            replacement_bytes,
+        };
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("probe", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![ChatMessage::user(format!(
+            "inspect [IMAGE:{}]",
+            image_path.display()
+        ))];
+        let observer = NoopObserver;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("fallback cache should survive every tool-loop iteration");
+
+        assert_eq!(result, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
