@@ -639,11 +639,17 @@ pub async fn run_gateway(
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // Seed the install-wide default provider from the first entry that
+    // actually declares a `model`. Entries without one cannot serve as the
+    // default (there is no model string to pair with the provider), so
+    // skipping them keeps the boot family, credentials, runtime options, and
+    // model coherent — the previous "first entry, whatever it is" pick could
+    // build the provider from one entry while `resolve_default_model` sourced
+    // the model from another.
     let (boot_family, boot_alias, boot_entry) = config
         .providers
         .models
-        .iter_entries()
-        .next()
+        .first_entry_with_model()
         .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
         .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
@@ -686,34 +692,26 @@ pub async fn run_gateway(
     let model = if boot_provider_failed {
         String::new()
     } else {
-        match fallback
+        // `first_entry_with_model` guarantees a non-empty model for the boot
+        // entry, so reaching the empty fallback means no entry declares a
+        // model at all — the needs_quickstart onboarding path.
+        let model = fallback
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
             .filter(|m| !m.is_empty())
-        {
-            Some(m) => m.to_string(),
-            None => match config.resolve_default_model() {
-                Some(m) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
-                     providers.models entry as default. Set \
-                     [providers.models.<type>.<alias>] model = \"...\" to silence \
-                     this warning.");
-                    m
-                }
-                None => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                        &format!(
-                            "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
-                        )
-                    );
-                    String::new()
-                }
-            },
+            .map(ToString::to_string);
+        if model.is_none() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                &format!(
+                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                )
+            );
         }
+        model.unwrap_or_default()
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
