@@ -14,18 +14,6 @@ pub enum ClaudeThinkingShape {
     Adaptive,
 }
 
-/// The model family a Claude id names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaudeFamily {
-    Opus,
-    Sonnet,
-    Haiku,
-    Fable,
-    Mythos,
-    /// A family this build does not know, or a legacy id that names none.
-    Other,
-}
-
 /// Which provider slot serves the model. The adapters forward different
 /// request fields, so one model id can take different controls on each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,25 +222,6 @@ pub fn claude_generation(rest: &str) -> Option<(u32, u32)> {
     None
 }
 
-/// Read the family from the id tokens after `claude-`: the first token made
-/// of letters only. Legacy ids put the generation first (`3-5-haiku`), so
-/// the family is not always the first token.
-#[must_use]
-pub fn claude_family(rest: &str) -> ClaudeFamily {
-    rest.split('-')
-        .find(|token| !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphabetic()))
-        .map_or(ClaudeFamily::Other, |token| {
-            match token.to_ascii_lowercase().as_str() {
-                "opus" => ClaudeFamily::Opus,
-                "sonnet" => ClaudeFamily::Sonnet,
-                "haiku" => ClaudeFamily::Haiku,
-                "fable" => ClaudeFamily::Fable,
-                "mythos" => ClaudeFamily::Mythos,
-                _ => ClaudeFamily::Other,
-            }
-        })
-}
-
 fn short_number(token: &str) -> Option<u32> {
     (!token.is_empty() && token.len() < 4 && token.bytes().all(|b| b.is_ascii_digit()))
         .then(|| token.parse().ok())
@@ -426,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_follow_slot_family_and_generation() {
+    fn capabilities_follow_the_slot_and_the_generation() {
         type Row = (
             ClaudeProviderSlot,
             &'static str,
@@ -566,21 +535,6 @@ mod tests {
                 "displays of {model} on {slot:?}"
             );
         }
-    }
-
-    #[test]
-    fn family_is_the_first_alphabetic_token() {
-        assert_eq!(claude_family("opus-4-8-v1"), ClaudeFamily::Opus);
-        assert_eq!(claude_family("sonnet-5"), ClaudeFamily::Sonnet);
-        assert_eq!(
-            claude_family("3-5-haiku-20241022-v1:0"),
-            ClaudeFamily::Haiku
-        );
-        assert_eq!(claude_family("fable-5-1"), ClaudeFamily::Fable);
-        assert_eq!(claude_family("Mythos-5-1"), ClaudeFamily::Mythos);
-        assert_eq!(claude_family("next"), ClaudeFamily::Other);
-        assert_eq!(claude_family("instant-1.2"), ClaudeFamily::Other);
-        assert_eq!(claude_family(""), ClaudeFamily::Other);
     }
 
     #[test]
