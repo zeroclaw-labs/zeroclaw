@@ -76,10 +76,10 @@ macro_rules! keyactions {
             /// match in declaration order.
             ///
             /// The claim is tested with `Chord::same_key`, not `==`: dispatch
-            /// compares platform-normalised modifiers, so on darwin an explicit
-            /// `super+a` and a retained `ctrl+a` are one chord there and two
-            /// here. Raw equality left the shadowed default in the table and
-            /// the operator's own binding lost to it.
+            /// compares effective event modifiers, so on darwin an explicit
+            /// `super+a` and a retained `primary+a` are one chord there and
+            /// two here. Raw equality left the shadowed default in the table
+            /// and the operator's own binding lost to it.
             pub fn resolved_bindings() -> Vec<(Chord, $name)> {
                 let Some(over) = super::overrides::lookup(Self::TAG) else {
                     return Self::bindings();
@@ -146,7 +146,7 @@ keyactions! {
         ]                                                              => "help",
         PaneNavLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)]  => "prev pane",
         PaneNavRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "next pane",
-        ReloadDaemon [Chord::ctrl('r')]                                 => "reload daemon",
+        ReloadDaemon [Chord::primary('r')]                              => "reload daemon",
         ConfirmYes   []                                                 => "confirm",
         ConfirmNo    []                                                 => "cancel",
     }
@@ -173,8 +173,8 @@ keyactions! {
         BrowseDownVim           [Chord::char('j')] => "browse next (vim)",
         BrowseSelectExtend      [Chord::shift(KeyCode::Up)] => "extend selection up",
         BrowseSelectExtendDown  [Chord::shift(KeyCode::Down)] => "extend selection down",
-        FastScrollUp            [Chord::with(KeyCode::Up, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll up",
-        FastScrollDown          [Chord::with(KeyCode::Down, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll down",
+        FastScrollUp            [Chord::with_primary(KeyCode::Up, KeyModifiers::SHIFT)] => "fast scroll up",
+        FastScrollDown          [Chord::with_primary(KeyCode::Down, KeyModifiers::SHIFT)] => "fast scroll down",
         BrowseExitSelection     [Chord::key(KeyCode::Esc)] => "exit selection",
         CopySelection           [
             Chord::char('y'),
@@ -182,11 +182,11 @@ keyactions! {
         ] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
-        TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
+        TodoToggle              [Chord::primary('p')] => "toggle todo tracker",
         NewSession              [Chord::ctrl('n')] => "new session",
         SwitchSession           [Chord::ctrl('s')] => "switch session",
         DeleteSession           [] => "delete session",
-        CancelTurn              [Chord::ctrl('d')] => "cancel turn",
+        CancelTurn              [Chord::primary('d')] => "cancel turn",
         ApprovalApprove         [Chord::key(KeyCode::Enter)] => "approve",
         ApprovalDeny            [] => "deny",
         ApprovalApproveAll      [Chord::char('a')] => "approve all",
@@ -347,20 +347,20 @@ keyactions! {
 keyactions! {
     pub enum InputBarAction ("input_bar") {
         Submit             [Chord::key(KeyCode::Enter)] => "send",
-        Inject             [Chord::with(KeyCode::Enter, KeyModifiers::CONTROL)] => "send now",
+        Inject             [Chord::with_primary(KeyCode::Enter, KeyModifiers::NONE)] => "send now",
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",
         CursorWordLeft     [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
         CursorWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
         CursorStart        [Chord::key(KeyCode::Home)] => "line start",
-        CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
-        OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
+        CursorEnd          [Chord::key(KeyCode::End), Chord::primary('e')] => "line end",
+        OpenFileBrowser    [Chord::primary('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
-        DeletePreviousWord [Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
-        ClearInput         [Chord::ctrl('u')] => "clear input",
+        DeletePreviousWord [Chord::primary('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
+        ClearInput         [Chord::primary('u')] => "clear input",
         SelectAll          [] => "select all",
-        Paste              [Chord::ctrl('v')] => "paste",
+        Paste              [Chord::primary('v')] => "paste",
         HistoryPrev        [Chord::key(KeyCode::Up)] => "history prev",
         HistoryNext        [Chord::key(KeyCode::Down)] => "history next",
         AutocompleteNext   [] => "autocomplete next",

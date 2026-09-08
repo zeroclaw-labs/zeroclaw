@@ -10231,7 +10231,8 @@ pub fn register_channels_for_tools(
     feature = "channel-telegram",
     feature = "channel-discord",
     feature = "voice-wake",
-    feature = "channel-matrix"
+    feature = "channel-matrix",
+    feature = "whatsapp-web"
 ))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     config
@@ -10249,6 +10250,40 @@ fn configure_discord_transcription(
     config: &Config,
     channel_key: &str,
 ) -> DiscordChannel {
+    if !config.transcription.enabled {
+        return channel;
+    }
+
+    let provider = resolve_agent_transcription_provider(config, channel_key);
+    match crate::transcription::TranscriptionManager::from_config_with_provider(config, provider) {
+        Ok(manager) => channel.with_transcription_manager(config.transcription.clone(), manager),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "transcription manager init failed, voice transcription disabled"
+            );
+            channel
+        }
+    }
+}
+
+/// Bind the WhatsApp Web channel's transcription manager to the owning
+/// agent's `transcription_provider`.
+///
+/// `WhatsAppWebChannel::with_transcription` registers legacy `[transcription]`
+/// providers only and leaves the agent alias empty, so typed
+/// `[providers.transcription.<type>.<alias>]` entries are never reachable and
+/// `transcribe()` bails before dispatching. Mirrors
+/// `configure_discord_transcription`.
+#[cfg(feature = "whatsapp-web")]
+fn configure_whatsapp_transcription(
+    channel: WhatsAppWebChannel,
+    config: &Config,
+    channel_key: &str,
+) -> WhatsAppWebChannel {
     if !config.transcription.enabled {
         return channel;
     }
@@ -10318,6 +10353,50 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .parent()
         .map(|p| p.join("state").join("matrix").join(alias))
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
+/// Build the Matrix channel for `[channels.matrix.<alias>]` with every
+/// live-config resolver installed, mirroring
+/// [`build_configured_discord_channel`].
+///
+/// Extracted from [`collect_configured_channels`] so the *configured*
+/// construction path stays reachable: the loop wraps the result in
+/// `PacedChannel` and type-erases it to `Arc<dyn Channel>` immediately, so a
+/// test can otherwise never observe the resolvers this function installs.
+///
+/// Fallible because [`MatrixChannel::new`] validates `homeserver` and the
+/// credential pair; the caller logs and skips the alias on `Err`.
+#[cfg(feature = "channel-matrix")]
+pub(crate) fn build_configured_matrix_channel(
+    config_arc: &Arc<RwLock<Config>>,
+    config: &Config,
+    alias: &str,
+    mx: &zeroclaw_config::schema::MatrixConfig,
+) -> Result<MatrixChannel> {
+    let state_dir = matrix_state_dir(&config.config_path, alias);
+    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let cfg_arc = config_arc.clone();
+        let alias = alias.to_string();
+        Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
+    };
+    let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+    let transcription_config_arc = Arc::clone(config_arc);
+    let transcription_channel_key = format!("matrix.{alias}");
+    let channel = MatrixChannel::new(mx.clone(), alias.to_string(), peer_resolver, state_dir)?;
+    Ok(channel
+        .with_transcription_manager_factory(move || {
+            let config = transcription_config_arc.read();
+            if !config.transcription.enabled {
+                return None;
+            }
+            let provider =
+                resolve_agent_transcription_provider(&config, &transcription_channel_key);
+            Some(crate::matrix::build_transcription_manager(
+                &config, &provider,
+            ))
+        })
+        .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
+        .with_ack_reactions(ack))
 }
 
 fn collect_configured_channels(
@@ -10649,33 +10728,8 @@ fn collect_configured_channels(
         if !mx.enabled {
             continue;
         }
-        let state_dir = matrix_state_dir(&config.config_path, alias);
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
-        };
-        let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
-        let transcription_config_arc = Arc::clone(config_arc);
-        let transcription_channel_key = format!("matrix.{alias}");
-        match MatrixChannel::new(mx.clone(), alias.clone(), peer_resolver, state_dir) {
+        match build_configured_matrix_channel(config_arc, &config, alias, mx) {
             Ok(channel) => {
-                let channel = channel
-                    .with_transcription_manager_factory(move || {
-                        let config = transcription_config_arc.read();
-                        if !config.transcription.enabled {
-                            return None;
-                        }
-                        let provider = resolve_agent_transcription_provider(
-                            &config,
-                            &transcription_channel_key,
-                        );
-                        Some(crate::matrix::build_transcription_manager(
-                            &config, &provider,
-                        ))
-                    })
-                    .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
-                    .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
                     display_name: "Matrix",
                     alias: Some(alias.clone()),
@@ -10868,7 +10922,7 @@ fn collect_configured_channels(
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
-                            Arc::new(
+                            Arc::new(configure_whatsapp_transcription(
                                 WhatsAppWebChannel::new(
                                     wa,
                                     alias.clone(),
@@ -10876,12 +10930,13 @@ fn collect_configured_channels(
                                     allowed_groups_resolver,
                                 )
                                 .with_persistence(config_arc.clone())
-                                .with_transcription(config.transcription.clone())
                                 .with_tts(&config)
                                 .with_workspace_dir(workspace_dir)
                                 .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                 .with_group_mention_patterns(wa.group_mention_patterns.clone()),
-                            ),
+                                &config,
+                                &format!("whatsapp.{alias}"),
+                            )),
                             wa,
                         ),
                     });
@@ -13581,6 +13636,72 @@ pub(crate) mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    fn source_block_after<'a>(
+        source: &'a str,
+        marker: &str,
+        closing_indent: &str,
+    ) -> Option<&'a str> {
+        let (_, after_marker) = source.split_once(marker)?;
+        let closing_line = format!("\n{closing_indent}}}\n");
+        after_marker
+            .split_once(&closing_line)
+            .map(|(block, _)| block)
+    }
+
+    fn source_block_after_channel_loop<'a>(source: &'a str, field: &str) -> Option<&'a str> {
+        let marker = format!("in &config.channels.{field} {{");
+        source_block_after(source, &marker, "    ")
+    }
+
+    fn whatsapp_listener_branch_markers(key: &str) -> Option<(&'static str, &'static str)> {
+        match key {
+            "whatsapp" => Some((
+                "#[cfg(feature = \"channel-whatsapp-cloud\")]\n            \"cloud\" => {",
+                "            #[cfg(not(feature = \"channel-whatsapp-cloud\"))]",
+            )),
+            "whatsapp-web" | "whatsapp_web" => Some((
+                "#[cfg(feature = \"whatsapp-web\")]\n                if wa.is_web_config() {",
+                "                #[cfg(not(feature = \"whatsapp-web\"))]",
+            )),
+            _ => None,
+        }
+    }
+
+    fn whatsapp_listener_registration_in_loop(loop_body: &str, key: &str) -> bool {
+        let Some((start, end)) = whatsapp_listener_branch_markers(key) else {
+            return false;
+        };
+        let branch = source_segment_between(loop_body, start, end);
+        branch.is_some_and(|branch| branch.contains("channels.push(ConfiguredChannel {"))
+    }
+
+    fn source_segment_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let (_, after_start) = source.split_once(start)?;
+        after_start.split_once(end).map(|(segment, _)| segment)
+    }
+
+    fn announcement_arm_supports_delivery(dispatch: &str, key: &str) -> bool {
+        [format!("\"{key}\" => {{"), format!("\"{key}\" |")]
+            .iter()
+            .find_map(|marker| source_block_after(dispatch, marker, "        "))
+            .is_some_and(|arm| arm.contains("zeroclaw_api::channel::Channel::send("))
+    }
+
+    fn assert_channel_surface_disposition(
+        key: &str,
+        surface: &str,
+        surface_available: bool,
+        production_support_detected: bool,
+        intentionally_unsupported: &HashSet<&str>,
+    ) {
+        let claimed = surface_available && production_support_detected;
+        let expected = surface_available && !intentionally_unsupported.contains(key);
+        assert_eq!(
+            claimed, expected,
+            "compiled channel key `{key}` changed {surface} support without an explicit registration disposition"
+        );
+    }
 
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.
@@ -29912,6 +30033,189 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[test]
+    fn compiled_channel_families_have_listener_registration_or_explicit_runtime_ownership() {
+        let source = include_str!("mod.rs");
+        let collector = source
+            .split_once("fn collect_configured_channels(")
+            .expect("collect_configured_channels must exist")
+            .1
+            .split_once("\nfn no_real_time_channels_message(")
+            .expect("collector boundary must remain identifiable")
+            .0;
+        let async_assembly = source
+            .split_once("pub async fn start_channels(")
+            .expect("start_channels must exist")
+            .1
+            .split_once("\npub async fn deliver_announcement(")
+            .expect("async assembly boundary must remain identifiable")
+            .0;
+        let mqtt_owner = include_str!("../../../zeroclaw-runtime/src/daemon/registry.rs");
+        let acp_owner = include_str!("acp_server.rs");
+        let cli_owner = include_str!("../../../../src/main.rs");
+
+        for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
+            if !compiled {
+                continue;
+            }
+            let registered = type_keys.iter().any(|key| {
+                let field = match *key {
+                    "whatsapp-web" | "whatsapp_web" => "whatsapp".to_string(),
+                    _ => key.replace('-', "_"),
+                };
+                source_block_after_channel_loop(collector, &field).is_some_and(|loop_body| {
+                    if matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web") {
+                        whatsapp_listener_registration_in_loop(loop_body, key)
+                    } else {
+                        loop_body.contains("channels.push(ConfiguredChannel {")
+                    }
+                })
+            });
+            if registered {
+                continue;
+            }
+
+            let primary_key = type_keys[0];
+            let runtime_owner_verified = match primary_key {
+                "nostr" => source_block_after(
+                    async_assembly,
+                    "#[cfg(feature = \"channel-nostr\")]\n            {",
+                    "            ",
+                )
+                .is_some_and(|block| {
+                    block.contains("NostrChannel::new")
+                        && block.contains("configured_channels.push(ConfiguredChannel {")
+                }),
+                "filesystem" => source_block_after(
+                    async_assembly,
+                    "if let (Some(engine), Some(audit)) = (sop_engine.as_ref(), sop_audit.as_ref()) {",
+                    "            ",
+                )
+                .is_some_and(|block| {
+                    block.contains("config.channels.filesystem")
+                        && block.contains("FilesystemChannel::new")
+                        && block.contains("configured_channels.push(ConfiguredChannel {")
+                }),
+                "mqtt" => {
+                    source_block_after(mqtt_owner, "pub fn register_mqtt", "    ")
+                        .is_some_and(|block| block.contains("self.mqtt_start = Some(starter);"))
+                        && source_segment_between(
+                            cli_owner,
+                            "registry.register_mqtt(Box::new({",
+                            "registry.register_socket(Box::new(",
+                        )
+                        .is_some_and(|block| block.contains("run_mqtt_sop_listener("))
+                }
+                "plugin" => source_segment_between(
+                    async_assembly,
+                    "let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(",
+                    "publish_cron_channel_registry(&configured_channels)",
+                )
+                .is_some_and(|block| {
+                    block.contains("append_configured_plugin_channels(")
+                }),
+                "acp-server" => {
+                    source_block_after(
+                        acp_owner,
+                        "pub async fn run(self: Arc<Self>) -> Result<()> {",
+                        "    ",
+                    )
+                    .is_some_and(|block| {
+                        block.contains("self.serve_reader(tokio::io::stdin()).await?")
+                    })
+                        && source_segment_between(
+                            cli_owner,
+                            "Commands::Acp {\n            max_sessions,\n            session_timeout,\n        } => {",
+                            "Commands::Gateway {",
+                        )
+                        .is_some_and(|block| {
+                            block.contains("channels::acp_server::AcpServer::new")
+                                && block.contains("server.run().await")
+                        })
+                }
+                _ => false,
+            };
+            assert!(
+                runtime_owner_verified,
+                "compiled channel family `{primary_key}` has no synchronous listener registration or explicit runtime owner"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_listener_guard_requires_a_complete_config_field_name() {
+        let web_socket_only_collector = r#"
+    for (alias, wc_ws) in &config.channels.wecom_ws {
+        channels.push(ConfiguredChannel {
+            display_name: "WeCom WebSocket",
+        });
+    }
+"#;
+
+        assert!(source_block_after_channel_loop(web_socket_only_collector, "wecom").is_none());
+        assert!(
+            source_block_after_channel_loop(web_socket_only_collector, "wecom_ws")
+                .is_some_and(|loop_body| loop_body.contains("channels.push(ConfiguredChannel {"))
+        );
+    }
+
+    #[test]
+    fn compiled_channel_listener_guard_distinguishes_whatsapp_backends() {
+        const PUSH_MARKER: &str = "channels.push(ConfiguredChannel {";
+
+        let source = include_str!("mod.rs");
+        let whatsapp_loop = source_block_after_channel_loop(source, "whatsapp")
+            .expect("WhatsApp listener loop must remain identifiable");
+        assert!(whatsapp_listener_registration_in_loop(
+            whatsapp_loop,
+            "whatsapp"
+        ));
+        assert!(whatsapp_listener_registration_in_loop(
+            whatsapp_loop,
+            "whatsapp-web"
+        ));
+
+        let without_backend_push = |key: &str| {
+            let (branch_start_marker, branch_end_marker) =
+                whatsapp_listener_branch_markers(key).expect("WhatsApp backend key must be known");
+            let branch_start = whatsapp_loop
+                .find(branch_start_marker)
+                .expect("WhatsApp backend branch must remain identifiable")
+                + branch_start_marker.len();
+            let branch_end = branch_start
+                + whatsapp_loop[branch_start..]
+                    .find(branch_end_marker)
+                    .expect("WhatsApp backend branch boundary must remain identifiable");
+            let relative_push = whatsapp_loop[branch_start..branch_end]
+                .find(PUSH_MARKER)
+                .expect("WhatsApp backend branch must register a channel");
+            let push_start = branch_start + relative_push;
+            let mut mutated = whatsapp_loop.to_string();
+            mutated.replace_range(push_start..push_start + PUSH_MARKER.len(), "removed_push({");
+            mutated
+        };
+
+        let cloud_removed = without_backend_push("whatsapp");
+        assert!(!whatsapp_listener_registration_in_loop(
+            &cloud_removed,
+            "whatsapp"
+        ));
+        assert!(whatsapp_listener_registration_in_loop(
+            &cloud_removed,
+            "whatsapp-web"
+        ));
+
+        let web_removed = without_backend_push("whatsapp-web");
+        assert!(whatsapp_listener_registration_in_loop(
+            &web_removed,
+            "whatsapp"
+        ));
+        assert!(!whatsapp_listener_registration_in_loop(
+            &web_removed,
+            "whatsapp-web"
+        ));
+    }
+
     #[cfg(feature = "channel-mattermost")]
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
@@ -30535,6 +30839,16 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    /// A voice note on a configured Discord channel must reach the STT server
+    /// named by the owning agent's `transcription_provider`.
+    ///
+    /// Two providers are registered so the assertion distinguishes *selection*
+    /// from *presence*: against a lone registered provider, a dispatch that
+    /// ignored the named alias and reached whatever happened to be configured
+    /// would look identical to a correct one. The decoy must receive nothing.
+    ///
+    /// The channel alias, the agent alias and the provider aliases share no
+    /// name, so nothing can route correctly by coincidence.
     #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn configured_discord_transcription_dispatches_to_routed_agent_provider() {
@@ -30544,6 +30858,7 @@ This is an example JSON object for profile settings."#;
 
         let media_server = MockServer::start().await;
         let whisper_server = MockServer::start().await;
+        let decoy_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/voice.ogg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
@@ -30558,6 +30873,15 @@ This is an example JSON object for profile settings."#;
             )
             .expect(1)
             .mount(&whisper_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "decoy transcript"})),
+            )
+            .expect(0)
+            .mount(&decoy_server)
             .await;
 
         let mut config = Config::default();
@@ -30583,6 +30907,13 @@ This is an example JSON object for profile settings."#;
             "routed".to_string(),
             LocalWhisperTranscriptionProviderConfig {
                 uri: format!("{}/v1/transcribe", whisper_server.uri()),
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.local_whisper.insert(
+            "decoy".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", decoy_server.uri()),
                 ..Default::default()
             },
         );
@@ -30616,8 +30947,19 @@ This is an example JSON object for profile settings."#;
             media.is_empty(),
             "successful direct-channel transcription must not fall back to media"
         );
+        assert!(
+            decoy_server.received_requests().await.unwrap().is_empty(),
+            "the provider the agent did not name must never be called"
+        );
+        let routed = whisper_server.received_requests().await.unwrap();
+        assert_eq!(routed.len(), 1, "exactly one transcription request");
+        assert!(
+            routed[0].body.windows(10).any(|w| w == b"fake-audio"),
+            "the routed request must carry the downloaded audio bytes verbatim"
+        );
         media_server.verify().await;
         whisper_server.verify().await;
+        decoy_server.verify().await;
     }
 
     // Regression: Voice Wake bound its transcription manager to its own
@@ -30652,6 +30994,60 @@ This is an example JSON object for profile settings."#;
         assert_ne!(
             resolved, "frontdoor",
             "must not resolve to the channel alias"
+        );
+    }
+
+    /// Regression: the WhatsApp Web channel built its manager from the legacy
+    /// `[transcription]` section alone, so typed
+    /// `[providers.transcription.*]` entries never registered and the owning
+    /// agent's alias stayed empty — `transcribe()` then bailed with "Agent has
+    /// no transcription_provider configured" for every voice note.
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_transcription_registers_typed_provider_and_binds_the_agent_alias() {
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.providers.transcription.groq.insert(
+            "fast".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "voice-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["whatsapp.default".into()],
+                transcription_provider: "groq.fast".into(),
+                ..Default::default()
+            },
+        );
+
+        let provider = resolve_agent_transcription_provider(&config, "whatsapp.default");
+        assert_eq!(
+            provider, "groq.fast",
+            "the owning agent's provider must resolve for a whatsapp.<alias> key"
+        );
+
+        let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
+            &config, provider,
+        )
+        .expect("typed provider must build a manager");
+        assert!(
+            manager.available_providers().contains(&"groq.fast"),
+            "typed provider must register, got {:?}",
+            manager.available_providers()
         );
     }
 
@@ -32885,6 +33281,51 @@ This is an example JSON object for profile settings."#;
                 );
             }
             Ok(_) => panic!("should fail for unknown channel"),
+        }
+    }
+
+    #[test]
+    fn compiled_channel_keys_have_intentional_one_shot_builder_support() {
+        let config_arc = Arc::new(RwLock::new(Config::default()));
+        let intentionally_unsupported = HashSet::from([
+            "nextcloud",
+            "feishu",
+            "nostr",
+            "clawdtalk",
+            "reddit",
+            "bluesky",
+            "voice_call",
+            "voice-wake",
+            "voice_wake",
+            "mqtt",
+            "amqp",
+            "filesystem",
+            "webhook",
+            "plugin",
+            "acp-server",
+            "acp_server",
+        ]);
+
+        for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
+            if !compiled {
+                continue;
+            }
+            for key in type_keys {
+                let error = match build_channel_by_id(&config_arc, key) {
+                    Ok(_) => panic!("an empty config must not construct a one-shot channel"),
+                    Err(error) => error,
+                };
+                let feature_available =
+                    !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
+                        || cfg!(feature = "whatsapp-web");
+                assert_channel_surface_disposition(
+                    key,
+                    "one-shot builder",
+                    feature_available,
+                    error.downcast_ref::<UnknownChannelId>().is_none(),
+                    &intentionally_unsupported,
+                );
+            }
         }
     }
 
@@ -35797,6 +36238,116 @@ Done."#;
             !message.contains("unsupported delivery channel"),
             "dotted linq id must not be delegated to deliver_announcement; got: {message}"
         );
+    }
+
+    #[test]
+    fn compiled_channel_keys_have_intentional_announcement_delivery_registration() {
+        let source = include_str!("mod.rs");
+        let dispatch = source
+            .split_once("pub async fn deliver_announcement(")
+            .expect("deliver_announcement must exist")
+            .1
+            .split_once("match channel_type.as_str() {")
+            .expect("announcement dispatch match must exist")
+            .1
+            .split_once("\n    #[allow(unreachable_code)]")
+            .expect("announcement dispatch boundary must remain identifiable")
+            .0;
+        let intentionally_unsupported = HashSet::from([
+            "mattermost",
+            "imessage",
+            "matrix",
+            "linq",
+            "nextcloud",
+            "nextcloud-talk",
+            "nextcloud_talk",
+            "gmail-push",
+            "gmail_push",
+            "irc",
+            "twitch",
+            "dingtalk",
+            "wecom",
+            "wecom_ws",
+            "wecom-ws",
+            "qq",
+            "nostr",
+            "clawdtalk",
+            "reddit",
+            "bluesky",
+            "git",
+            "twitter",
+            "mochat",
+            "line",
+            "voice-call",
+            "voice_call",
+            "voice-wake",
+            "voice_wake",
+            "mqtt",
+            "amqp",
+            "filesystem",
+            "plugin",
+            "acp-server",
+            "acp_server",
+        ]);
+
+        for (_, type_keys, compiled) in crate::listing::channel_compile_specs_for_tests() {
+            if !compiled {
+                continue;
+            }
+            for key in type_keys {
+                let surface_available =
+                    !matches!(*key, "whatsapp" | "whatsapp-web" | "whatsapp_web")
+                        || cfg!(feature = "whatsapp-web");
+                let production_support_detected = announcement_arm_supports_delivery(dispatch, key);
+                assert_channel_surface_disposition(
+                    key,
+                    "announcement delivery",
+                    surface_available,
+                    production_support_detected,
+                    &intentionally_unsupported,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_channel_guards_reject_new_support_with_stale_unsupported_disposition() {
+        let intentionally_unsupported = HashSet::from(["newly-supported"]);
+
+        for surface in ["one-shot builder", "announcement delivery"] {
+            let result = std::panic::catch_unwind(|| {
+                assert_channel_surface_disposition(
+                    "newly-supported",
+                    surface,
+                    true,
+                    true,
+                    &intentionally_unsupported,
+                );
+            });
+            assert!(
+                result.is_err(),
+                "{surface} support must fail while its unsupported disposition is stale"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_channel_announcement_guard_requires_positive_delivery_in_combined_arms() {
+        let dispatch = r#"
+        "supported" | "supported-alias" => {
+            zeroclaw_api::channel::Channel::send(&ch, &message).await?;
+        }
+        "rejected" | "rejected-alias" => {
+            anyhow::bail!("not connected");
+        }
+"#;
+
+        for key in ["supported", "supported-alias"] {
+            assert!(announcement_arm_supports_delivery(dispatch, key));
+        }
+        for key in ["rejected", "rejected-alias"] {
+            assert!(!announcement_arm_supports_delivery(dispatch, key));
+        }
     }
 
     #[tokio::test]

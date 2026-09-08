@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:244cc2b53f46f9e876304391d17682b0ddae9ac33491f4857e25e35a36ba7995
+ARG ZEROCLAW_BASE_NODE_ALPINE=node:24-alpine3.23@sha256:0388af2af070cd4736a1567cfed02469ba117848845b4165d87a333edb53d2ca
 # >>> end generated:base-arg-node-alpine <<<
 # >>> generated:base-arg-rust-alpine from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
 ARG ZEROCLAW_BASE_RUST_ALPINE=rust:1.98-alpine3.23@sha256:4743b6231029d726d7a0f81d730a7c9f4eff23225a4499c01e275efb5e260235

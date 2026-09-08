@@ -340,7 +340,7 @@ jobs:
 
             # Persist custom domain (#6142) and disable Jekyll on every push, or
             # Pages drops the CNAME and 404s every underscore-prefixed path.
-            echo "docs.zeroclawlabs.ai" > CNAME
+            echo "docs.zeroclaw.com" > CNAME
             touch .nojekyll
 
             # Drop pre-versioned orphan dirs (including any legacy stable/), then

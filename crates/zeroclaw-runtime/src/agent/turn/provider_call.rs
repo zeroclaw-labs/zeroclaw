@@ -283,8 +283,8 @@ pub(crate) async fn call_provider(
                             let result = if let Some(token) = ctx.cancellation_token {
                                 tokio::select! {
                                     biased;
-                                    result = recovery => result,
                                     () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                    result = recovery => result,
                                 }
                             } else {
                                 recovery.await
@@ -625,6 +625,7 @@ mod streaming_fallback_tests {
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use axum::{Router, http::StatusCode, routing::post};
+    use futures_util::StreamExt;
     use futures_util::stream::BoxStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -640,7 +641,9 @@ mod streaming_fallback_tests {
     };
 
     struct EmptyStreamThenTextProvider {
-        non_stream_calls: AtomicUsize,
+        stream_calls: Arc<AtomicUsize>,
+        non_stream_calls: Arc<AtomicUsize>,
+        cancel_on_final: Option<tokio_util::sync::CancellationToken>,
     }
 
     struct PreExecutedToolThenEmptyProvider {
@@ -731,7 +734,11 @@ mod streaming_fallback_tests {
             Ok(ChatResponse {
                 text: Some("fallback response".to_string()),
                 tool_calls: Vec::new(),
-                usage: None,
+                usage: Some(TokenUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                }),
                 reasoning_content: None,
             })
         }
@@ -747,14 +754,28 @@ mod streaming_fallback_tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-            Box::pin(futures_util::stream::iter(vec![
-                Ok(StreamEvent::Usage(TokenUsage {
-                    input_tokens: Some(10),
-                    output_tokens: Some(5),
-                    cached_input_tokens: None,
-                })),
-                Ok(StreamEvent::Final),
-            ]))
+            self.stream_calls.fetch_add(1, Ordering::Relaxed);
+            let cancel_on_final = self.cancel_on_final.clone();
+            Box::pin(
+                futures_util::stream::iter(vec![
+                    Ok(StreamEvent::Usage(TokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        cached_input_tokens: None,
+                    })),
+                    Ok(StreamEvent::TextDelta(
+                        zeroclaw_api::model_provider::StreamChunk::reasoning("private reasoning"),
+                    )),
+                    Ok(StreamEvent::Final),
+                ])
+                .inspect(move |event| {
+                    if matches!(event, Ok(StreamEvent::Final))
+                        && let Some(token) = &cancel_on_final
+                    {
+                        token.cancel();
+                    }
+                }),
+            )
         }
     }
 
@@ -943,13 +964,37 @@ mod streaming_fallback_tests {
 
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
+        check_empty_stream_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_empty_stream_does_not_start_recovery() {
+        check_empty_stream_recovery(true).await;
+    }
+
+    async fn check_empty_stream_recovery(cancel_on_final: bool) {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let token = tokio_util::sync::CancellationToken::new();
         let provider = EmptyStreamThenTextProvider {
-            non_stream_calls: AtomicUsize::new(0),
+            stream_calls: Arc::clone(&stream_calls),
+            non_stream_calls: Arc::clone(&non_stream_calls),
+            cancel_on_final: cancel_on_final.then(|| token.clone()),
         };
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".to_string(),
+                Box::new(provider) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let cost_context = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let ctx = TurnCtx {
             observer: &observer,
             provider_name: "test-provider",
@@ -958,9 +1003,9 @@ mod streaming_fallback_tests {
             approval: None,
             channel_name: "test",
             channel_reply_target: None,
-            cancellation_token: None,
+            cancellation_token: Some(&token),
             on_delta: None,
-            event_tx: None,
+            event_tx: Some(&event_tx),
             hooks: None,
             dedup_exempt_tools: &[],
             pacing: &pacing,
@@ -989,20 +1034,45 @@ mod streaming_fallback_tests {
                 ),
             )
             .await
-            .expect("stream failure is recovered by one non-streaming request");
-        let response = outcome.chat_result.expect("fallback response succeeds");
+            .expect("provider call returns its terminal outcome");
 
-        assert_eq!(response.text.as_deref(), Some("fallback response"));
-        assert_eq!(provider.non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(stream_calls.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            event_rx
+                .try_recv()
+                .expect("reasoning event must be forwarded once"),
+            zeroclaw_api::agent::TurnEvent::Thinking { delta }
+                if delta == "private reasoning"
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "reasoning must be forwarded once"
+        );
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 0);
         assert_eq!(recorded.output_tokens, 0);
-        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].provider_ref(), "primary");
         assert!(matches!(
             outcome.attempts[0].outcome(),
             zeroclaw_providers::dispatch::AttemptUsageOutcome::OutcomeUnknown {
                 observed: Some(usage),
             } if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
+        ));
+        if cancel_on_final {
+            assert!(outcome.chat_result.unwrap_err().is::<ToolLoopCancelled>());
+            assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(outcome.attempts.len(), 1);
+            return;
+        }
+        let response = outcome.chat_result.expect("fallback response succeeds");
+        assert_eq!(response.text.as_deref(), Some("fallback response"));
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[1].provider_ref(), "primary");
+        assert!(matches!(
+            outcome.attempts[1].outcome(),
+            zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(20) && usage.output_tokens == Some(7)
         ));
     }
 
