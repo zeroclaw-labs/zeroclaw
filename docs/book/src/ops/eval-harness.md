@@ -169,7 +169,10 @@ expectations against an empty run), one whose expectation block is omitted or
 empty, one holding a zero-length entry in a string-backed expectation family
 (`response_contains`, `response_not_contains`, `response_matches`,
 `tools_used`, `tools_not_used`), and one carrying an unknown top-level or
-expectation key. Every rejection names the offending fixture and field.
+expectation key. The nested blocks follow the same rule: a present-but-empty
+`workspace` or `budget` block, an empty `file_contains` list, and an empty
+`file_contains` needle (every file trivially contains the empty string) are all
+load errors. Every rejection names the offending fixture and field.
 
 Report aggregation independently requires at least one grade, so an in-memory
 caller cannot manufacture a green case from an empty grade vector.
