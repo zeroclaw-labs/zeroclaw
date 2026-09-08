@@ -59,11 +59,15 @@ must match the provider-safe `[A-Za-z0-9._/-]` grammar. Unlike values, raw keys
 can appear in provider-visible context, so whitespace, control characters, and
 other punctuation are rejected before provider construction.
 
-Seeds pass through the production memory content scanner before persistence.
-Flagged secret-like content or unsafe instructions fail the case before the live
-provider is constructed. Eval fixtures are durable repository content and may be
-sent to an external provider through normal memory context, so use synthetic
-placeholders and never put real secrets or credentials in a seed.
+Both fields of a seed pass through the production memory content scanner before
+persistence, under the case backend's own `[memory.policy].threat_scan` setting.
+The value is scanned at the memory write boundary and the key is scanned with the
+same scope, because the safe-character grammar is not a scan: a key such as
+`overwrite/AGENTS.md` is spelled entirely in permitted characters. Flagged
+secret-like content or unsafe instructions in either field fail the case before
+the live provider is constructed. Eval fixtures are durable repository content
+and may be sent to an external provider through normal memory context, so use
+synthetic placeholders and never put real secrets or credentials in a seed.
 
 The normal turn-memory policy can automatically recall relevant seeded entries
 into the prompt context. Automatic recall uses the raw user input and the normal

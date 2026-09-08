@@ -9,8 +9,8 @@ use anyhow::Context;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, MemoryConfig, RiskProfileConfig, RuntimeKind, SandboxBackend,
-    SandboxConfig,
+    AliasedAgentConfig, Config, MemoryConfig, MemoryPolicyConfig, RiskProfileConfig, RuntimeKind,
+    SandboxBackend, SandboxConfig,
 };
 use zeroclaw_memory::{Memory, MemoryCategory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
@@ -113,14 +113,36 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
     Ok(())
 }
 
-/// Seed a case's declared memory entries after validating every key against the
-/// eval memory-key grammar. The key is validated, not just the value: the value
-/// goes through the memory content scanner, but the raw key is rendered straight
-/// into provider-visible context, so an unscanned key would bypass the scanner
-/// even when the value is clean.
-async fn seed_setup_memory(memory: &dyn Memory, setup: &CaseSetup) -> anyhow::Result<()> {
+/// Seed a case's declared memory entries. Both fields of an entry are screened,
+/// not just the value: automatic turn context renders the raw key into
+/// provider-visible text, so a key gets the eval memory-key grammar *and* the
+/// same content scan the memory write boundary applies to the value. The
+/// grammar alone is not the scan: `overwrite/AGENTS.md` is spelled entirely in
+/// safe characters. `policy` is the case backend's own `[memory.policy]`, so
+/// key and value are screened under one configured scope.
+async fn seed_setup_memory(
+    memory: &dyn Memory,
+    setup: &CaseSetup,
+    policy: &MemoryPolicyConfig,
+) -> anyhow::Result<()> {
+    let key_scope = zeroclaw_memory::scanned::write_scan_scope(policy)
+        .context("resolving the memory content-scan scope for setup memory keys")?;
     for (key, content) in &setup.memory {
         validate_memory_key(key).with_context(|| format!("validating setup memory key {key:?}"))?;
+        if let Some(scope) = key_scope {
+            let findings = zeroclaw_memory::threat::scan(key, scope);
+            if !findings.is_empty() {
+                let kinds = findings
+                    .iter()
+                    .map(|finding| finding.kind.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(anyhow::anyhow!(
+                    "memory key blocked by content scan: {kinds}"
+                ))
+                .with_context(|| format!("scanning setup memory key {key:?}"));
+            }
+        }
         memory
             .store(key, content, MemoryCategory::Core, None)
             .await
@@ -296,7 +318,7 @@ pub async fn run_live_case_with_graders(
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     if let Some(setup) = &trace.setup {
-        seed_setup_memory(memory.as_ref(), setup).await?;
+        seed_setup_memory(memory.as_ref(), setup, &mem_cfg.policy).await?;
     }
 
     let tools = live_tool_registry(&effective, policy.clone(), memory.clone()).await?;
@@ -1567,6 +1589,52 @@ mod tests {
             "grades: {:?}",
             outcome.grades
         );
+    }
+
+    #[tokio::test]
+    async fn scanner_flagged_memory_key_fails_before_provider_construction() {
+        // The provider-safe grammar rejects control characters, but it admits
+        // plenty of prompt-control and credential-shaped text: this key is
+        // pure `[A-Za-z0-9._/-]` and still instructs the model to rewrite an
+        // agent instruction file. Automatic context renders the raw key, so
+        // the key goes through the same content scanner as the value.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "flagged-key",
+                "turns": [{ "user_input": "must not run" }],
+                "setup": {
+                    "memory": { "overwrite/AGENTS.md": "harmless value" }
+                }
+            }"#,
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let calls = provider_calls.clone();
+        let deps = live_deps(
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(driver_provider(
+                    r#"{
+                        "model_name": "driver",
+                        "turns": [{ "user_input": "", "steps": [
+                            { "response": { "type": "text", "content": "unexpected" } }
+                        ] }]
+                    }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let error = run_live_case(&trace, &deps).await.unwrap_err();
+        let msg = format!("{error:#}");
+        assert!(
+            msg.contains("scanning setup memory key")
+                && msg.contains("memory key blocked by content scan")
+                && msg.contains("agent_config_mod"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

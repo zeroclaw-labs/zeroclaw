@@ -50,6 +50,33 @@ enum ThreatScanMode {
     Strict,
 }
 
+fn scan_mode(policy: &MemoryPolicyConfig) -> anyhow::Result<ThreatScanMode> {
+    match policy.threat_scan.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(ThreatScanMode::Off),
+        "on" => Ok(ThreatScanMode::On),
+        "strict" => Ok(ThreatScanMode::Strict),
+        other => anyhow::bail!(
+            "invalid memory.policy.threat_scan value {other:?}; expected off, on, or strict"
+        ),
+    }
+}
+
+/// The write-boundary scan scope configured by `[memory.policy]`, or `None`
+/// when scanning is disabled.
+///
+/// [`ScannedMemory`] screens the content payload of a write. A caller that
+/// renders a second field of the same entry into model-visible text (an entry
+/// key, for instance) resolves the scope here and calls [`crate::threat::scan`]
+/// itself, so both fields are screened under one configured setting instead of
+/// a second, independently drifting one.
+pub fn write_scan_scope(policy: &MemoryPolicyConfig) -> anyhow::Result<Option<Scope>> {
+    Ok(match scan_mode(policy)? {
+        ThreatScanMode::Off => None,
+        ThreatScanMode::On => Some(Scope::On),
+        ThreatScanMode::Strict => Some(Scope::Strict),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OnHit {
     Reject,
@@ -81,17 +108,6 @@ impl<M: Memory> ScannedMemory<M> {
         }
     }
 
-    fn scan_mode(&self) -> anyhow::Result<ThreatScanMode> {
-        match self.policy.threat_scan.trim().to_ascii_lowercase().as_str() {
-            "off" => Ok(ThreatScanMode::Off),
-            "on" => Ok(ThreatScanMode::On),
-            "strict" => Ok(ThreatScanMode::Strict),
-            other => anyhow::bail!(
-                "invalid memory.policy.threat_scan value {other:?}; expected off, on, or strict"
-            ),
-        }
-    }
-
     fn on_hit(&self) -> anyhow::Result<OnHit> {
         match self
             .policy
@@ -109,11 +125,7 @@ impl<M: Memory> ScannedMemory<M> {
     }
 
     fn scan_scope(&self) -> anyhow::Result<Option<Scope>> {
-        Ok(match self.scan_mode()? {
-            ThreatScanMode::Off => None,
-            ThreatScanMode::On => Some(Scope::On),
-            ThreatScanMode::Strict => Some(Scope::Strict),
-        })
+        write_scan_scope(&self.policy)
     }
 
     /// Scope for read-time re-scanning; `None` disables read filtering.
@@ -746,6 +758,29 @@ mod tests {
             .await
             .expect_err("credential exfil pattern should still be rejected");
         assert!(err.to_string().contains("content scan"));
+    }
+
+    #[test]
+    fn write_scan_scope_exposes_the_configured_write_boundary_scope() {
+        // The exported resolver is what a caller screening a second
+        // model-visible field of the same entry uses, so it must agree with
+        // the decorator's own setting rather than drift into a second policy.
+        assert_eq!(
+            write_scan_scope(&policy("off", "reject")).unwrap(),
+            None,
+            "off must disable scanning"
+        );
+        assert_eq!(
+            write_scan_scope(&policy("ON", "reject")).unwrap(),
+            Some(Scope::On)
+        );
+        assert_eq!(
+            write_scan_scope(&policy(" strict ", "reject")).unwrap(),
+            Some(Scope::Strict)
+        );
+        let err = write_scan_scope(&policy("loud", "reject"))
+            .expect_err("an unknown mode must not silently coerce");
+        assert!(err.to_string().contains("threat_scan"));
     }
 
     #[tokio::test]
