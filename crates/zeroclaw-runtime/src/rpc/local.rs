@@ -1430,6 +1430,102 @@ mod tests {
         drop(writer);
     }
 
+    /// Read frames until the response carrying `id` arrives, skipping the
+    /// notifications a turn emits on the way. A closed connection is reported
+    /// as such rather than as a parse failure.
+    #[cfg(unix)]
+    async fn read_response_with_id(
+        reader: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        id: u64,
+    ) -> serde_json::Value {
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "connection closed before the response to request {id} arrived"
+            );
+            let frame: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            if frame["id"] == serde_json::json!(id) {
+                return frame;
+            }
+        }
+    }
+
+    /// A prompt runs on a handle that shares the connection generation token.
+    /// Dropping that handle on normal completion must not end the connection.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_prompt_keeps_the_local_connection_serving() {
+        use crate::rpc::dispatch::connection_test_support::{
+            IMMEDIATE_SID, fixture, insert_immediate_session,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = fixture(tmp.path()).await;
+        insert_immediate_session(&fixture.ctx, tmp.path()).await;
+        let sock_path = fixture.ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&fixture.ctx);
+        let server_count = Arc::clone(&count);
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
+        });
+
+        wait_for_socket(&sock_path).await;
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": IMMEDIATE_SID, "prompt": "run"}),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let prompt = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_response_with_id(&mut reader, 2),
+        )
+        .await
+        .expect("the prompt should complete and answer its request");
+        assert!(
+            prompt["error"].is_null(),
+            "unexpected prompt error: {prompt}"
+        );
+
+        writer
+            .write_all(rpc_request(Method::Health, &serde_json::json!({}), 3).as_bytes())
+            .await
+            .unwrap();
+        let health = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_response_with_id(&mut reader, 3),
+        )
+        .await
+        .expect("a completed prompt must leave its connection open for the next request");
+        assert!(
+            health["error"].is_null(),
+            "unexpected health error: {health}"
+        );
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "the connection must still be counted after its prompt finished"
+        );
+
+        cancel.cancel();
+        wait_for_client_count(&count, 0).await;
+        drop(writer);
+    }
+
     #[cfg(unix)]
     async fn assert_reload_drains_local_connection_generation() {
         use crate::rpc::dispatch::connection_test_support::{QUEUED_SID, RUNNING_SID, fixture};

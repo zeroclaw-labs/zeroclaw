@@ -503,6 +503,11 @@ pub struct RpcDispatcher {
     /// Generation token for the transport connection that accepted work.
     /// Every detached prompt is linked to it and drained before teardown.
     connection_cancel: CancellationToken,
+    /// Whether this dispatcher owns the transport connection. Only the owner
+    /// may end the generation: prompt handles from [`Self::spawn_handle`] read
+    /// the same token to observe teardown, and a completing prompt dropping
+    /// its handle must not close the connection that is still serving requests.
+    owns_connection: bool,
     prompt_tasks: Vec<JoinHandle<()>>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
@@ -532,6 +537,7 @@ impl RpcDispatcher {
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
             connection_cancel,
+            owns_connection: true,
             prompt_tasks: Vec::new(),
             peer_cert_fingerprint: None,
         }
@@ -576,6 +582,10 @@ impl RpcDispatcher {
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
+    ///
+    /// The handle observes the connection generation token but does not own it:
+    /// a prompt finishing normally drops its handle, and that drop must leave
+    /// the connection open for the requests that follow.
     fn spawn_handle(&self) -> Self {
         Self {
             ctx: Arc::clone(&self.ctx),
@@ -589,6 +599,7 @@ impl RpcDispatcher {
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
             connection_cancel: self.connection_cancel.clone(),
+            owns_connection: false,
             prompt_tasks: Vec::new(),
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
@@ -5337,6 +5348,12 @@ fn response_id_key(id: &Value) -> Option<String> {
 
 impl Drop for RpcDispatcher {
     fn drop(&mut self) {
+        // Only the connection owner ends the generation. A prompt handle shares
+        // the token so it can observe teardown; cancelling here would let a
+        // prompt that simply finished close its own connection.
+        if !self.owns_connection {
+            return;
+        }
         self.connection_cancel.cancel();
         for task in &self.prompt_tasks {
             task.abort();
@@ -5567,6 +5584,7 @@ pub(crate) mod connection_test_support {
 
     pub(crate) const RUNNING_SID: &str = "connection-running";
     pub(crate) const QUEUED_SID: &str = "connection-queued";
+    pub(crate) const IMMEDIATE_SID: &str = "connection-immediate";
 
     pub(crate) struct ConnectionPromptFixture {
         pub(crate) ctx: Arc<RpcContext>,
@@ -5638,6 +5656,37 @@ pub(crate) mod connection_test_support {
         fn alias(&self) -> &str {
             "connection-counting"
         }
+    }
+
+    struct ImmediateProvider;
+
+    #[async_trait]
+    impl ModelProvider for ImmediateProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".to_string())
+        }
+    }
+
+    impl Attributable for ImmediateProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "connection-immediate"
+        }
+    }
+
+    /// Install a session whose provider answers straight away, so a prompt on
+    /// it runs to normal completion instead of parking.
+    pub(crate) async fn insert_immediate_session(ctx: &Arc<RpcContext>, path: &Path) {
+        insert_session(ctx, path, IMMEDIATE_SID, Box::new(ImmediateProvider)).await;
     }
 
     pub(crate) async fn insert_session(

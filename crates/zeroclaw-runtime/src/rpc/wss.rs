@@ -1620,6 +1620,154 @@ mod accept_error_tests {
         .unwrap()
     }
 
+    /// Read frames until the response carrying `id` arrives, skipping the
+    /// notifications a turn emits on the way.
+    async fn read_response_with_id(
+        stream: &mut futures_util::stream::SplitStream<
+            WebSocketStream<impl AsyncRead + AsyncWrite + Unpin>,
+        >,
+        id: u64,
+    ) -> serde_json::Value {
+        loop {
+            let message = stream
+                .next()
+                .await
+                .unwrap_or_else(|| {
+                    panic!("connection closed before the response to request {id} arrived")
+                })
+                .expect("server frame should be valid");
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if frame["id"] == serde_json::json!(id) {
+                return frame;
+            }
+        }
+    }
+
+    /// A prompt runs on a handle that shares the connection generation token.
+    /// Dropping that handle on normal completion must not end the connection.
+    async fn assert_completed_prompt_keeps_the_wss_connection_serving() {
+        use crate::rpc::dispatch::connection_test_support::{
+            IMMEDIATE_SID, fixture, insert_immediate_session,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = fixture(tmp.path()).await;
+        insert_immediate_session(&fixture.ctx, tmp.path()).await;
+        let listener_cancel = CancellationToken::new();
+        let connection_cancel = listener_cancel.child_token();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (server_io, scanner) = ScanningStream::new(server_io);
+        let (server_ws, client_ws) = tokio::join!(
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None),
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None),
+        );
+        let mut transport = WssTransport::new(
+            server_ws,
+            "127.0.0.1:43111".parse().unwrap(),
+            scanner,
+            Duration::from_secs(DEFAULT_INCOMPLETE_MESSAGE_TIMEOUT_SECS),
+            connection_cancel.clone(),
+        );
+        let writer_tx = crate::rpc::transport::RpcTransport::writer(&transport);
+        let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+            Arc::clone(&fixture.ctx),
+            writer_tx,
+            "wss:127.0.0.1:43111".to_string(),
+            connection_cancel.clone(),
+        );
+        let connection = zeroclaw_spawn::spawn!(async move {
+            dispatcher.run_connection(&mut transport).await;
+        });
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+        };
+        client_sink
+            .send(Message::Text(
+                rpc_request(Method::Initialize, &init, 1).into(),
+            ))
+            .await
+            .unwrap();
+        let initialized = read_response_with_id(&mut client_stream, 1).await;
+        assert!(initialized["error"].is_null());
+
+        client_sink
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": IMMEDIATE_SID, "prompt": "run"}),
+                    2,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let prompt = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_response_with_id(&mut client_stream, 2),
+        )
+        .await
+        .expect("the prompt should complete and answer its request");
+        assert!(
+            prompt["error"].is_null(),
+            "unexpected prompt error: {prompt}"
+        );
+
+        client_sink
+            .send(Message::Text(
+                rpc_request(Method::Health, &serde_json::json!({}), 3).into(),
+            ))
+            .await
+            .unwrap();
+        let health = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_response_with_id(&mut client_stream, 3),
+        )
+        .await
+        .expect("a completed prompt must leave its connection open for the next request");
+        assert!(
+            health["error"].is_null(),
+            "unexpected health error: {health}"
+        );
+        assert!(
+            !connection_cancel.is_cancelled(),
+            "a completed prompt must not cancel its connection generation"
+        );
+
+        listener_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(7), connection)
+            .await
+            .expect("WSS connection should end once its generation is cancelled")
+            .expect("WSS connection task should not panic");
+    }
+
+    #[test]
+    fn completed_prompt_keeps_the_wss_connection_serving() {
+        std::thread::Builder::new()
+            .name("wss-completed-prompt".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(assert_completed_prompt_keeps_the_wss_connection_serving());
+            })
+            .unwrap()
+            .join()
+            .expect("WSS completed prompt test thread should not panic");
+    }
+
     async fn assert_reload_drains_wss_connection_generation() {
         use crate::rpc::dispatch::connection_test_support::{QUEUED_SID, RUNNING_SID, fixture};
 
