@@ -507,6 +507,111 @@ impl DiscordChannel {
         }
     }
 
+    /// Record a newly observed event under this alias, or leave an existing
+    /// row alone when it already belongs to another alias or channel.
+    ///
+    /// Discord message and reaction ids are global, so two aliases that both
+    /// legitimately observe an event address the same archive key in the
+    /// shared sidecar. Writing later must not move the row's namespace,
+    /// session, and content, which is what decides whose scoped
+    /// `discord_search` still returns it. Redelivery to the owning alias
+    /// stays an ordinary refresh.
+    async fn archive_new_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+    ) {
+        match archive_mem
+            .store_preserving_provenance(
+                key,
+                content,
+                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+                session_id,
+                &self.archive_namespace(),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_attrs(::serde_json::json!({"key": key})),
+                    "discord archive row belongs to another alias or channel; not overwritten"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "archive store failed"
+                );
+            }
+        }
+    }
+
+    /// Format and archive one observed message. `author_id` is the gateway
+    /// author id, used only as the display fallback when the payload omits a
+    /// username.
+    async fn archive_message_create(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        d: &serde_json::Value,
+        author_id: &str,
+    ) {
+        let archive_channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        let is_dm_event = d.get("guild_id").is_none();
+        let username = d
+            .get("author")
+            .and_then(|a| a.get("username"))
+            .and_then(|u| u.as_str())
+            .unwrap_or(author_id);
+        let content_raw = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let archive_msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if content_raw.is_empty() {
+            return;
+        }
+        let ts = chrono::Utc::now().to_rfc3339();
+        let channel_display = if is_dm_event {
+            "dm"
+        } else {
+            archive_channel_id
+        };
+        let atts = d
+            .get("attachments")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let mut mem_content = format!("@{username} in #{channel_display} at {ts}: {content_raw}");
+        if !atts.is_empty() {
+            mem_content.push_str(&format!(" [attachments: {atts}]"));
+        }
+        let mem_key = if archive_msg_id.is_empty() {
+            format!("discord_{}", Uuid::new_v4())
+        } else {
+            format!("discord_{archive_msg_id}")
+        };
+        let session = if archive_channel_id.is_empty() {
+            None
+        } else {
+            Some(archive_channel_id)
+        };
+        self.archive_new_entry(archive_mem, &mem_key, &mem_content, session)
+            .await;
+    }
+
     /// Append a deletion tombstone. Idempotent: gateway redelivery (and a
     /// MESSAGE_DELETE racing a bulk delete) must not double-stamp.
     async fn apply_archive_tombstone(
@@ -744,28 +849,8 @@ impl DiscordChannel {
         } else {
             Some(channel_id)
         };
-        if let Err(e) = archive_mem
-            .store_with_metadata(
-                &key,
-                &content,
-                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
-                session,
-                Some(&self.archive_namespace()),
-                None,
-            )
-            .await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error": format!("{e}"),
-                        "key": key,
-                    })),
-                "failed to archive discord reaction"
-            );
-        }
+        self.archive_new_entry(archive_mem, &key, &content, session)
+            .await;
     }
 
     async fn sweep_message_reactions(&self, event_type: &str, d: &serde_json::Value) {
@@ -2200,7 +2285,6 @@ impl Channel for DiscordChannel {
         let guild_filter = self.guild_ids.clone();
         let channel_filter = self.channel_ids.clone();
         let archive_memory = self.archive_memory.clone();
-        let archive_namespace = self.archive_namespace();
 
         // --- Stall watchdog --------------------------------------------------
         let watchdog = if self.stall_timeout_secs > 0 {
@@ -3295,64 +3379,7 @@ impl Channel for DiscordChannel {
 
                     // Archive every non-bot message to discord.db when enabled.
                     if let Some(ref archive_mem) = archive_memory {
-                        let archive_channel_id =
-                            d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
-                        let is_dm_event = d.get("guild_id").is_none();
-                        let username = d
-                            .get("author")
-                            .and_then(|a| a.get("username"))
-                            .and_then(|u| u.as_str())
-                            .unwrap_or(author_id);
-                        let content_raw =
-                            d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let archive_msg_id =
-                            d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                        if !content_raw.is_empty() {
-                            let ts = chrono::Utc::now().to_rfc3339();
-                            let channel_display =
-                                if is_dm_event { "dm" } else { archive_channel_id };
-                            let atts = d
-                                .get("attachments")
-                                .and_then(|a| a.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default();
-                            let mut mem_content = format!(
-                                "@{username} in #{channel_display} at {ts}: {content_raw}"
-                            );
-                            if !atts.is_empty() {
-                                mem_content.push_str(&format!(" [attachments: {atts}]"));
-                            }
-                            let mem_key = if archive_msg_id.is_empty() {
-                                format!("discord_{}", Uuid::new_v4())
-                            } else {
-                                format!("discord_{archive_msg_id}")
-                            };
-                            let session = if archive_channel_id.is_empty() {
-                                None
-                            } else {
-                                Some(archive_channel_id)
-                            };
-                            if let Err(e) = archive_mem
-                                .store_with_metadata(
-                                    &mem_key,
-                                    &mem_content,
-                                    zeroclaw_memory::MemoryCategory::Custom(
-                                        "discord".to_string(),
-                                    ),
-                                    session,
-                                    Some(&archive_namespace),
-                                    None,
-                                )
-                                .await
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "archive store failed");
-                            }
-                        }
+                        self.archive_message_create(archive_mem, d, author_id).await;
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -5765,6 +5792,91 @@ mod tests {
             .await;
 
         assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn overlapping_alias_cannot_take_over_archive_rows_it_also_observes() {
+        // Discord message and reaction ids are global, so two enabled aliases
+        // watching the same channel address the same key in the shared
+        // discord.db. Both admissions are legitimate; only the first writer
+        // owns the row.
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = sqlite.clone();
+        let first = channel_for_shared_archive(&mem, "first", vec!["200".to_string()]);
+        let second = channel_for_shared_archive(&mem, "second", vec!["200".to_string()]);
+
+        let message = serde_json::json!({
+            "id": "111", "channel_id": "200", "guild_id": "g1",
+            "content": "shared observation",
+            "author": {"id": "u-alice", "username": "alice", "bot": false}
+        });
+        let reaction = serde_json::json!({
+            "user_id": "u1", "message_id": "111", "channel_id": "200",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "member": {"user": {"username": "bob"}}
+        });
+        let reaction_key = "discord_reaction_111_u1_👍";
+
+        first
+            .archive_message_create(&mem, &message, "u-alice")
+            .await;
+        first
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &reaction, "botid")
+            .await;
+        let owned_message = mem.get("discord_111").await.unwrap().unwrap().content;
+        let owned_reaction = mem.get(reaction_key).await.unwrap().unwrap().content;
+
+        second
+            .archive_message_create(&mem, &message, "u-alice")
+            .await;
+        second
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &reaction, "botid")
+            .await;
+
+        for (key, content) in [
+            ("discord_111", owned_message),
+            (reaction_key, owned_reaction),
+        ] {
+            let entry = mem.get(key).await.unwrap().unwrap();
+            assert_eq!(entry.content, content);
+            assert_eq!(entry.namespace, "discord.first");
+            assert_eq!(entry.session_id.as_deref(), Some("200"));
+        }
+
+        // Scoped `discord_search` visibility follows the preserved namespace.
+        let first_scope = sqlite
+            .recall_in_namespaces(&["discord.first".to_string()], "*", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first_scope.len(), 2);
+        assert!(
+            sqlite
+                .recall_in_namespaces(&["discord.second".to_string()], "*", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Redelivery to the owning alias is still an ordinary refresh.
+        let refreshed = serde_json::json!({
+            "id": "111", "channel_id": "200", "guild_id": "g1",
+            "content": "shared observation (redelivered)",
+            "author": {"id": "u-alice", "username": "alice", "bot": false}
+        });
+        first
+            .archive_message_create(&mem, &refreshed, "u-alice")
+            .await;
+        assert!(
+            mem.get("discord_111")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("shared observation (redelivered)")
+        );
     }
 
     #[tokio::test]
