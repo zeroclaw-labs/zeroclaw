@@ -738,17 +738,18 @@ mod tests {
 
     #[test]
     fn load_suite_rejects_duplicate_display_ids() {
+        // Both fixtures are otherwise admissible (a real turn, a real
+        // expectation), so the duplicate identity is the only reason the load
+        // can fail. A zero-turn stand-in would be rejected earlier and let this
+        // regression pass without ever reaching the identity check.
+        let duplicate = |model: &str| {
+            format!(
+                r#"{{"model_name":"{model}","id":"same","turns":[{{"user_input":"hi","steps":[{{"response":{{"type":"text","content":"ok"}}}}]}}],"expects":{{"max_tool_calls":0}}}}"#
+            )
+        };
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("a.json"),
-            r#"{"model_name":"first","id":"same","turns":[],"expects":{"max_tool_calls":0}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("b.json"),
-            r#"{"model_name":"second","id":"same","turns":[],"expects":{"max_tool_calls":0}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("a.json"), duplicate("first")).unwrap();
+        std::fs::write(dir.path().join("b.json"), duplicate("second")).unwrap();
 
         let err = load_suite(dir.path()).expect_err("duplicate receipt identities must fail");
         let rendered = format!("{err:#}");

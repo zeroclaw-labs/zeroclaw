@@ -488,9 +488,16 @@ pub(crate) mod tests {
         ))
         .unwrap();
         let outcome = run_case(&over, &RunDeps::replay()).await.unwrap();
-        assert_eq!(outcome.record.llm_calls, 2, "record: {:?}", outcome.record);
-        assert_eq!(outcome.record.input_tokens, 80);
-        assert_eq!(outcome.record.output_tokens, 25);
+        assert!(
+            outcome.record.is_complete(),
+            "the run must have completed, or the metric assertions below read \
+             the inert stand-in instead of real counters: {:?}",
+            outcome.record
+        );
+        let metrics = outcome.record.completion_or_default();
+        assert_eq!(metrics.llm_calls, 2, "record: {:?}", outcome.record);
+        assert_eq!(metrics.input_tokens, 80);
+        assert_eq!(metrics.output_tokens, 25);
         for check in [
             "max_llm_calls(1)",
             "max_total_tokens(104)",

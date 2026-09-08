@@ -893,20 +893,25 @@ mod tests {
         let sent_for_factory = sent.clone();
         let read_path = host_file.to_string_lossy().to_string();
 
-        let deps = RunDeps {
-            mode: Mode::Live,
-            provider: Box::new(move |_trace: &LlmTrace| {
-                Ok(CaseProvider::from_provider(Box::new(ReadEscapeProvider {
+        let deps = live_deps(
+            move |_trace: &LlmTrace| {
+                Ok(Box::new(ReadEscapeProvider {
                     read_path: read_path.clone(),
                     sent: sent_for_factory.clone(),
                     calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                })))
-            }),
-            live_tools: vec!["file_read".to_string()],
-            case_timeout: Duration::from_secs(5),
-        };
+                }) as Box<dyn ModelProvider>)
+            },
+            vec!["file_read".to_string()],
+            Duration::from_secs(5),
+        );
 
         let record = run_live_case(&trace, &deps).await.unwrap().record;
+        assert!(
+            record.is_complete(),
+            "the run must have completed, or the transcript assertions below \
+             would pass against an empty stand-in: {record:?}"
+        );
+        let completion = record.completion_or_default();
 
         let sent = sent.lock().unwrap();
         assert!(
@@ -922,13 +927,13 @@ mod tests {
             );
         }
         assert!(
-            !format!("{:?}", record.history).contains(MARKER),
+            !format!("{:?}", completion.history).contains(MARKER),
             "confidentiality breach: host file contents reached the fed-back \
              conversation: {:?}",
-            record.history
+            completion.history
         );
         assert!(
-            !record.all_tools_succeeded,
+            !completion.all_tools_succeeded,
             "the out-of-workspace file_read must not report success"
         );
     }

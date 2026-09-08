@@ -377,6 +377,7 @@ mod tests {
             cases: vec![CaseReport {
                 name: "vacuous".to_string(),
                 source: "vacuous.json".to_string(),
+                record: None,
                 grades: vec![GradeResult::new(
                     "effective_checks".to_string(),
                     false,
