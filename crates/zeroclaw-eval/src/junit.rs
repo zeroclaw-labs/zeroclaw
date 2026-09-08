@@ -429,6 +429,64 @@ mod tests {
     }
 
     #[test]
+    fn comparison_ids_select_the_same_cases_the_writer_skips() {
+        use crate::Mode;
+        use crate::baseline::{Baseline, CaseComparison, compare};
+        use crate::record::{
+            CaseProvenance, RECORD_SCHEMA, RunCompletion, RunRecord, SandboxStamp, ToolSurface,
+        };
+
+        let record = |case_id: &str, hash: &str| RunRecord {
+            provenance: CaseProvenance {
+                schema: RECORD_SCHEMA.to_string(),
+                mode: Mode::Replay,
+                case_id: case_id.to_string(),
+                case_hash: hash.to_string(),
+                provider_ref: "scripted".to_string(),
+                tool_surface: ToolSurface::default(),
+                sandbox: SandboxStamp {
+                    autonomy: "supervised".to_string(),
+                    workspace_only: false,
+                },
+            },
+            completion: Some(RunCompletion::default()),
+        };
+        // The provenance id and the display name deliberately differ: the writer
+        // and the comparison must agree on which of the two identifies a case.
+        let with_record = |hash: &str| CaseReport {
+            record: Some(record("provenance-id", hash)),
+            ..case("display-name", vec![grade("c", true, "")], None)
+        };
+
+        let baseline = Baseline::from_report(&SuiteReport {
+            cases: vec![with_record("hash-a")],
+        })
+        .expect("baseline from a complete run");
+        // A changed comparability key makes the case unverifiable.
+        let current = SuiteReport {
+            cases: vec![with_record("hash-b")],
+        };
+        let comparison = compare(&current, &baseline).expect("comparison");
+
+        // Exactly the derivation `finalize` uses to build the skip list.
+        let skipped: Vec<&str> = comparison
+            .per_case
+            .iter()
+            .filter(|(_, c)| matches!(c, CaseComparison::Unverifiable))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert_eq!(skipped, vec!["provenance-id"]);
+
+        let xml = render_junit(&current, &skipped, &[]);
+        assert!(
+            xml.contains("<skipped/>"),
+            "an id the comparison calls unverifiable must reach the writer's skip \
+             matching; the two case-identity derivations have diverged: {xml}"
+        );
+        assert!(xml.contains("skipped=\"1\""));
+    }
+
+    #[test]
     fn flaky_and_unverifiable_both_skip_without_double_counting() {
         let report = SuiteReport {
             cases: vec![

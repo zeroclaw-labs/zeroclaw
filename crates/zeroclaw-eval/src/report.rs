@@ -13,6 +13,17 @@ pub(crate) fn case_id(case: &CaseReport) -> &str {
         .unwrap_or(&case.name)
 }
 
+/// A case's comparison id: the record's `case_id` when present, else its name.
+/// This mirrors the identity `baseline::compare` keys its per-case map on, so the
+/// ids that comparison reports as unverifiable or flaky select the same cases the
+/// JUnit writer marks skipped. The two derivations must stay in step.
+pub(crate) fn case_id(case: &CaseReport) -> &str {
+    case.record
+        .as_ref()
+        .map(|record| record.provenance.case_id.as_str())
+        .unwrap_or(&case.name)
+}
+
 /// The result of running a single eval case.
 #[derive(Debug)]
 pub struct CaseReport {
