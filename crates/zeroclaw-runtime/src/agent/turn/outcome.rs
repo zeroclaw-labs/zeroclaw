@@ -711,7 +711,7 @@ mod tests {
                 None,
                 "All model providers/models failed after 2 failure event(s).".to_string(),
             )
-            .with_terminal_cause(anyhow::anyhow!("500 later provider failure")),
+            .with_terminal_cause(anyhow::Error::msg("500 later provider failure")),
         );
 
         assert_eq!(
