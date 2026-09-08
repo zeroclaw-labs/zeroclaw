@@ -668,18 +668,17 @@ impl ModelRoutingConfigTool {
 
         cfg.save().await?;
 
-        // Probe the new model with a minimal API call to catch invalid model IDs
-        // before the channel hot-reload picks up the change.
+        // Probe the effective model with a minimal API call to catch invalid
+        // model IDs before the channel hot-reload picks up the change. The
+        // saved model is read only to name something in diagnostics when the
+        // probe failed before it resolved the effective one.
         let current_model = cfg
             .providers
             .models
             .find(&type_k, &alias_k)
             .and_then(|e| e.model.clone());
         let provider_name = format!("{type_k}.{alias_k}");
-        if let Err(probe_err) = self
-            .probe_model(&cfg, &provider_name, current_model.as_deref())
-            .await
-        {
+        if let Err(probe_err) = self.probe_model(&cfg, &provider_name).await {
             // Name the model the probe actually validated. Only a failure
             // that happened before the effective model was resolved falls
             // back to the saved model, since nothing else exists to name.
@@ -800,10 +799,13 @@ impl ModelRoutingConfigTool {
     }
 
     /// Send a minimal 1-token chat request to verify the model is accessible.
+    /// The model is taken from the effective alias entry alone, so it is
+    /// always the one a reload would serve.
+    ///
     /// Returns `Ok(())` if the probe succeeds **or** if no API key or model
     /// resolves for the effective alias (checking the runtime snapshot for the
     /// key too — see below; an environment override that clears the model
-    /// counts as no model), or the saved config's secrets cannot be
+    /// leaves no model), or the saved config's secrets cannot be
     /// decrypted. Those skips
     /// let an operator configure an alias while offline without turning an
     /// unrelated auth/decryption condition into a model-validity failure.
@@ -814,12 +816,7 @@ impl ModelRoutingConfigTool {
     ///
     /// Errors are classified via [`ProbeFailure`] so the caller can tell a
     /// local construction failure from a request failure.
-    async fn probe_model(
-        &self,
-        cfg: &Config,
-        provider_name: &str,
-        model: Option<&str>,
-    ) -> Result<(), ProbeFailure> {
+    async fn probe_model(&self, cfg: &Config, provider_name: &str) -> Result<(), ProbeFailure> {
         // Resolve alias identity, endpoint, credentials, and runtime options
         // from the effective post-reload view of what was just saved — disk
         // decrypted, then the `ZEROCLAW_*` layer applied on top — rather than
@@ -868,34 +865,27 @@ impl ModelRoutingConfigTool {
             entry.api_key = Some(api_key);
         }
 
-        // Probe the model the post-reload runtime will actually serve. A
-        // `ZEROCLAW_*` override on the alias's `model` field is authoritative
-        // in memory after load, so probing the saved value would validate a
-        // model the runtime never uses — and could roll the disk change back
-        // over a model that was never going to be served.
+        // Probe the model the post-reload runtime will actually serve, and
+        // take it from the effective entry alone. A `ZEROCLAW_*` override on
+        // the alias's `model` field is authoritative in memory after load, so
+        // falling back to the saved value would validate a model the runtime
+        // never uses — and could roll the disk change back over a model that
+        // was never going to be served. The override layer also treats an
+        // empty value as an explicit clear of an optional field, and a saved
+        // fallback would silently undo that clear.
         //
-        // The override layer treats an empty value as an explicit clear of an
-        // optional field, so "the environment wrote this path and it is now
-        // empty" and "no override touched this path" must not collapse into
-        // one case: the saved model is the effective one only in the latter.
-        // After an explicit clear the runtime resolves no model for the alias
-        // (an entry without a model is only usable through routes that carry
-        // their own), so there is nothing to validate, exactly as when the
-        // saved entry itself has no model.
-        let model_path = format!("providers.models.{family}.{alias}.model");
-        let effective_model = effective
+        // No effective model means the reloaded runtime resolves none for this
+        // alias (such an entry is only usable through routes that carry their
+        // own model), so there is nothing to validate and the probe stops
+        // before dispatch instead of failing the update.
+        let Some(probe_model_name) = effective
             .providers
             .models
             .find(family, alias)
             .and_then(|e| e.model.clone())
-            .filter(|value| !value.trim().is_empty());
-        let probe_model_name = match effective_model {
-            Some(name) => name,
-            None if effective.prop_is_env_overridden(&model_path) => return Ok(()),
-            None => match model {
-                Some(name) => name.to_string(),
-                None => return Ok(()),
-            },
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(());
         };
 
         let model_provider =
@@ -1801,7 +1791,7 @@ mod tests {
         // this alias at all, so probing directly against it is a legitimate
         // skip (no API key means nothing to validate).
         let against_stale = tool
-            .probe_model(stale_snapshot.as_ref(), "openai.default", Some("gpt-test"))
+            .probe_model(stale_snapshot.as_ref(), "openai.default")
             .await;
         assert!(against_stale.is_ok(), "{against_stale:?}");
 
@@ -1813,16 +1803,13 @@ mod tests {
         // given, not fall back to the runtime snapshot captured at tool
         // construction.
         let mut saved = (*stale_snapshot).clone();
-        saved
-            .providers
-            .models
-            .ensure("openai", "default")
-            .unwrap()
-            .api_key = Some("sk-ant-not-an-openai-key".to_string());
+        {
+            let entry = saved.providers.models.ensure("openai", "default").unwrap();
+            entry.api_key = Some("sk-ant-not-an-openai-key".to_string());
+            entry.model = Some("gpt-test".to_string());
+        }
 
-        let against_saved = tool
-            .probe_model(&saved, "openai.default", Some("gpt-test"))
-            .await;
+        let against_saved = tool.probe_model(&saved, "openai.default").await;
         assert!(
             against_saved.is_err(),
             "probe must resolve credentials from the saved alias config, not the stale runtime snapshot"
@@ -1834,16 +1821,14 @@ mod tests {
         let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let mut cfg = (*test_config(&tmp).await).clone();
-        cfg.providers
-            .models
-            .ensure("openai", "default")
-            .unwrap()
-            .api_key = Some("sk-ant-not-an-openai-key".to_string());
+        {
+            let entry = cfg.providers.models.ensure("openai", "default").unwrap();
+            entry.api_key = Some("sk-ant-not-an-openai-key".to_string());
+            entry.model = Some("gpt-test".to_string());
+        }
         let tool = ModelRoutingConfigTool::new(Arc::new(cfg.clone()), test_security());
 
-        let result = tool
-            .probe_model(&cfg, "openai.default", Some("gpt-test"))
-            .await;
+        let result = tool.probe_model(&cfg, "openai.default").await;
         let error = result.expect_err(
             "a model_provider that fails to construct must not be reported as a passing probe",
         );
@@ -1871,12 +1856,17 @@ mod tests {
         let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
 
         // The saved config - what `load_config_without_env` produced - has
-        // no credential for this alias at all.
-        let saved = (*base).clone();
+        // the model this update just wrote but no credential for the alias at
+        // all.
+        let mut saved = (*base).clone();
+        saved
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .model = Some("gpt-test".to_string());
 
-        let result = tool
-            .probe_model(&saved, "openai.default", Some("gpt-test"))
-            .await;
+        let result = tool.probe_model(&saved, "openai.default").await;
         assert!(
             result.is_err(),
             "probe must fall back to the runtime snapshot's credential for this alias instead of silently skipping"
@@ -2052,6 +2042,7 @@ mod tests {
         {
             let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
             entry.api_key = Some("sk-disk-key".to_string());
+            entry.model = Some("gpt-test".to_string());
         }
 
         // Phase 1 — the credential the probe actually uses. Only the key is
@@ -2063,8 +2054,7 @@ mod tests {
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
         let probe = {
             let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
-            tool.probe_model(&saved, &format!("openai.{ALIAS}"), Some("gpt-test"))
-                .await
+            tool.probe_model(&saved, &format!("openai.{ALIAS}")).await
         };
 
         let failure = probe.expect_err(
@@ -2165,9 +2155,7 @@ mod tests {
         let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env");
 
         let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
-        let probe = tool
-            .probe_model(&saved, &format!("openai.{ALIAS}"), Some("gpt-disk"))
-            .await;
+        let probe = tool.probe_model(&saved, &format!("openai.{ALIAS}")).await;
 
         assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
 
@@ -2501,11 +2489,7 @@ mod tests {
 
         let tool = ModelRoutingConfigTool::new(Arc::clone(&saved), test_security());
         let result = tool
-            .probe_model(
-                saved.as_ref(),
-                "openai.probe_env_error_case",
-                Some("gpt-test"),
-            )
+            .probe_model(saved.as_ref(), "openai.probe_env_error_case")
             .await;
 
         assert!(
