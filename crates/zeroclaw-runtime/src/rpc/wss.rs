@@ -1248,12 +1248,14 @@ pub async fn run_wss_listener(
     // Drain accepted connection tasks. Each connection cancels its prompts
     // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
     // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
-    // exceeds that window, force-abort remaining connection tasks and join them.
+    // exceeds that window, force-abort remaining connection tasks and join them;
+    // aborting a connection drops its dispatcher, which aborts the prompt
+    // handles it still owns.
     tokio::select! {
         _ = async {
             while connection_tasks.join_next().await.is_some() {}
         } => {}
-        _ = tokio::time::sleep(Duration::from_millis(5500)) => {
+        _ = tokio::time::sleep(crate::rpc::CONNECTION_DRAIN_GRACE) => {
             connection_tasks.shutdown().await;
         }
     }
