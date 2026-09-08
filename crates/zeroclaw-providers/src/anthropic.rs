@@ -3017,17 +3017,14 @@ impl ModelProvider for AnthropicModelProvider {
         let tuning = self.resolve_thinking(request.thinking, temperature, model);
         let effective_temperature = tuning.temperature;
         let effective_max_tokens = tuning.max_tokens;
-        let display_sent = tuning
-            .thinking
-            .as_ref()
-            .is_some_and(|config| config.display.is_some());
         // Only the progress-note display needs its beta feature.
         let thinking_display_beta = tuning.display == Some(ThinkingDisplay::Updates);
 
-        // Only a fixed budget without a display takes the non-streaming
-        // path: adaptive requests stream, so long turns are not bound by the
-        // whole-request timeout.
-        if tuning.uses_fixed_budget() && !display_sent {
+        // Only a fixed budget takes the non-streaming path, and it never
+        // carries a display. Adaptive requests stream whether or not they
+        // name one, so a long turn is not bound by the whole-request timeout
+        // and the reasoning arrives as it is written.
+        if tuning.uses_fixed_budget() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3040,7 +3037,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                     })),
-                "native thinking without display beta; using non-streaming fallback to preserve signed thinking blocks"
+                "fixed thinking budget; using the non-streaming path to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
                 model: model.to_string(),
@@ -9221,6 +9218,122 @@ data: {\"type\":\"message_stop\"}\n\n";
             body["thinking"].get("budget_tokens").is_none(),
             "an adaptive request carries no budget: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn adaptive_thinking_without_a_display_uses_the_streaming_production_path() {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use futures_util::StreamExt as _;
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingEffort};
+
+        // The route this change moves: a request that names a depth and no
+        // display used to take the non-streaming fallback, and now streams.
+        // The signed block it returns carries no text, which is the shape an
+        // omitted display produces, so the round trip has to keep it.
+        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |body: axum::body::Bytes| {
+                let captured = captured_for_route.clone();
+                async move {
+                    if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        *captured.lock().unwrap() = Some(parsed);
+                    }
+                    let sse = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\"}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-1\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+                    axum::body::Body::from_stream(futures_util::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(sse))
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Anthropic SSE test server");
+        let addr = listener.local_addr().expect("Anthropic SSE test address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Anthropic SSE test");
+        });
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .build();
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: Some(NativeThinkingParams {
+                    budget_tokens: None,
+                    effort: Some(ThinkingEffort::High),
+                    display: None,
+                    profile_display: None,
+                }),
+            },
+            "claude-fable-5-1",
+            None,
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+
+        let mut reasoning_payloads = Vec::new();
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("an adaptive stream must not fail") {
+                StreamEvent::ReasoningFinalized(payload) => reasoning_payloads.push(payload),
+                StreamEvent::TextDelta(chunk) => text.push_str(&chunk.delta),
+                StreamEvent::Final => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("streaming request body must be captured");
+        assert_eq!(
+            body["stream"],
+            serde_json::json!(true),
+            "an adaptive request with no display must still stream: {body}"
+        );
+        assert_eq!(body["output_config"]["effort"], serde_json::json!("high"));
+        assert!(
+            body["thinking"].get("display").is_none(),
+            "no display was chosen, so none is sent: {body}"
+        );
+        assert_eq!(text, "done");
+        assert_eq!(
+            reasoning_payloads.len(),
+            1,
+            "the signature-only block must survive the streaming round trip"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reasoning_payloads[0]).expect("the replay payload must be JSON");
+        assert_eq!(parsed["signature"], serde_json::json!("sig-1"));
+        assert_eq!(parsed["thinking"], serde_json::json!(""));
     }
 
     #[test]
