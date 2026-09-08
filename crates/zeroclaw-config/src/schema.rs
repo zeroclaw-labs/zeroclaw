@@ -4637,9 +4637,15 @@ impl Config {
     /// structs. The generated property surface already projects each live `enabled`
     /// value while redacting credential fields, so it is the canonical safe view for
     /// generic channel discovery.
+    ///
+    /// Read the property surface of the `channels` section rather than the whole
+    /// config: `prop_fields` serializes its receiver to build that surface, and
+    /// this runs while tool registration holds the RPC `session/new` frame, whose
+    /// stack budget a regression test pins. The section carries the same
+    /// `channels.<type>.<alias>` names, so the projection is unchanged.
     fn configured_channel_aliases(&self) -> Vec<ChannelAliasInfo> {
         let mut aliases = Vec::new();
-        for field in self.prop_fields() {
+        for field in self.channels.prop_fields() {
             let Some(rest) = field.name.strip_prefix("channels.") else {
                 continue;
             };
