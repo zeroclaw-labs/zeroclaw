@@ -145,8 +145,6 @@ async-trait = "0.1"
 # Memory / persistence (migration.rs, behind agent-runtime)
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 chrono.workspace = true
-chrono-tz = { version = "0.10", optional = true }
-cron = { version = "0.15", optional = true }
 
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
