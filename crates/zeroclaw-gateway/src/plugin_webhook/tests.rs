@@ -12,6 +12,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::{
     GatewayRateLimiter, MAX_BODY_SIZE, SlidingWindowRateLimiter, tests::admin_paircode_state,
 };
+use zeroclaw_api::webhook::WebhookOutcome;
 
 fn plugin_webhook_test_router(
     state: AppState,
@@ -65,7 +66,7 @@ async fn plugin_webhook_router_delivers_exact_request() {
     zeroclaw_spawn::spawn!(async move {
         let request = receiver.recv().await.expect("route forwards request");
         let _ = seen.send((request.headers.clone(), request.body.clone()));
-        let _ = request.reply.send(Ok(()));
+        let _ = request.reply.send(Ok(WebhookOutcome::Ack));
     });
 
     let peer = SocketAddr::from(([203, 0, 113, 7], 30_300));
@@ -106,6 +107,7 @@ async fn plugin_webhook_router_keeps_all_diagnostics_private() {
                 b"guest" => {
                     WebhookReject::BadRequest("private payload parser diagnostic".to_string())
                 }
+                b"response" => WebhookReject::InvalidResponse,
                 _ => WebhookReject::Unavailable("wasmtime trap with private host path".to_string()),
             };
             let _ = request.reply.send(Err(rejection));
@@ -117,6 +119,11 @@ async fn plugin_webhook_router_keeps_all_diagnostics_private() {
     for (body, status, public) in [
         ("auth", StatusCode::UNAUTHORIZED, "unauthorized webhook"),
         ("guest", StatusCode::BAD_REQUEST, "invalid webhook"),
+        (
+            "response",
+            StatusCode::BAD_GATEWAY,
+            "invalid webhook response",
+        ),
         (
             "host",
             StatusCode::SERVICE_UNAVAILABLE,
@@ -189,6 +196,8 @@ async fn plugin_webhook_router_bounds_queue_body_and_route_availability() {
     let (prefill_reply, _) = tokio::sync::oneshot::channel();
     full_sink
         .try_send(RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: Vec::new(),
             body: Vec::new(),
             cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
@@ -242,7 +251,7 @@ async fn plugin_webhook_router_uses_the_canonical_client_key_policy() {
         mut receiver: tokio::sync::mpsc::Receiver<zeroclaw_api::webhook::RawWebhook>,
     ) {
         while let Some(request) = receiver.recv().await {
-            let _ = request.reply.send(Ok(()));
+            let _ = request.reply.send(Ok(WebhookOutcome::Ack));
         }
     }
 
@@ -330,6 +339,139 @@ async fn plugin_webhook_router_uses_the_canonical_client_key_policy() {
         .await
         .expect("plugin route is infallible");
     assert_eq!(repeated.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn plugin_webhook_routes_preserve_authoritative_request_metadata() {
+    use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let registry = Arc::new(PluginWebhookRegistry::new());
+    let lease = registry.start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(2);
+    assert!(lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), registry);
+    let worker = zeroclaw_spawn::spawn!(async move {
+        for method in ["GET", "POST"] {
+            let request = receiver
+                .recv()
+                .await
+                .expect("supported method reaches guest");
+            assert_eq!(request.method, method);
+            assert_eq!(request.query, "challenge=a%2Bb&part=one&part=two");
+            assert_eq!(request.body, b"exact bytes");
+            assert!(
+                request
+                    .headers
+                    .contains(&("x-webhook-method".to_string(), "DELETE".to_string()))
+            );
+            request
+                .reply
+                .send(Ok(WebhookOutcome::Body("echo".to_string())))
+                .expect("caller waits");
+        }
+    });
+    for method in [Method::GET, Method::POST] {
+        let mut request = plugin_webhook_request(
+            "fixture",
+            "exact bytes",
+            SocketAddr::from(([127, 0, 0, 1], 31000)),
+            None,
+        );
+        *request.method_mut() = method;
+        *request.uri_mut() = "/plugin/fixture?challenge=a%2Bb&part=one&part=two"
+            .parse()
+            .expect("valid URI");
+        request
+            .headers_mut()
+            .insert("X-Webhook-Method", HeaderValue::from_static("DELETE"));
+        request
+            .headers_mut()
+            .insert("X-Webhook-Query", HeaderValue::from_static("spoofed"));
+        let response = app.clone().oneshot(request).await.expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_text(response).await, "echo");
+    }
+    worker.await.expect("metadata checks passed");
+}
+
+#[tokio::test]
+async fn plugin_webhook_unsupported_methods_never_reach_the_guest() {
+    use zeroclaw_api::webhook::PluginWebhookRegistry;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let registry = Arc::new(PluginWebhookRegistry::new());
+    let lease = registry.start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
+    assert!(lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), registry);
+    for method in [
+        Method::HEAD,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+        Method::TRACE,
+    ] {
+        let mut request = plugin_webhook_request(
+            "fixture",
+            "",
+            SocketAddr::from(([127, 0, 0, 1], 31000)),
+            None,
+        );
+        *request.method_mut() = method;
+        let response = app.clone().oneshot(request).await.expect("route responds");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers()[header::ALLOW], "GET, POST");
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn plugin_webhook_response_limit_counts_utf8_bytes_at_the_gateway() {
+    use zeroclaw_api::webhook::{MAX_WEBHOOK_RESPONSE_BODY_BYTES, PluginWebhookRegistry};
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let registry = Arc::new(PluginWebhookRegistry::new());
+    let lease = registry.start_generation();
+    let (sink, mut receiver) = tokio::sync::mpsc::channel(1);
+    assert!(lease.replace(HashMap::from([("fixture".to_string(), sink)])));
+    let app = plugin_webhook_test_router(admin_paircode_state(&tmp, false, false), registry);
+    let bodies = [
+        String::new(),
+        "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2),
+        "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2 + 1),
+    ];
+    let responses = bodies.clone();
+    let worker = zeroclaw_spawn::spawn!(async move {
+        for body in responses {
+            let request = receiver.recv().await.expect("request arrives");
+            request
+                .reply
+                .send(Ok(WebhookOutcome::Body(body)))
+                .expect("caller waits");
+        }
+    });
+    for body in bodies {
+        let response = app
+            .clone()
+            .oneshot(plugin_webhook_request(
+                "fixture",
+                "",
+                SocketAddr::from(([127, 0, 0, 1], 31000)),
+                None,
+            ))
+            .await
+            .expect("route responds");
+        if body.len() <= MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response_text(response).await, body);
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(response_text(response).await, "invalid webhook response");
+        }
+    }
+    worker.await.expect("response worker joins");
 }
 
 #[tokio::test]

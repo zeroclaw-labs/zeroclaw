@@ -145,6 +145,10 @@ impl WebhookIdempotency {
 
 /// A raw inbound request received on `/plugin/{path}`.
 pub struct RawWebhook {
+    /// HTTP method supplied by the gateway request, never by a header.
+    pub method: String,
+    /// Raw query string, without the leading `?`.
+    pub query: String,
     /// Header names normalized to lowercase and their UTF-8 values.
     pub headers: Vec<(String, String)>,
     /// Exact received body bytes.
@@ -153,8 +157,18 @@ pub struct RawWebhook {
     pub cancellation: WebhookCancellation,
     /// Access to the gateway's canonical idempotency store.
     pub idempotency: Option<WebhookIdempotency>,
-    /// Outcome used to select the fixed public HTTP response.
-    pub reply: oneshot::Sender<Result<(), WebhookReject>>,
+    /// Outcome used to select the public HTTP response.
+    pub reply: oneshot::Sender<Result<WebhookOutcome, WebhookReject>>,
+}
+
+/// Maximum UTF-8 byte length of a plugin's HTTP challenge response.
+pub const MAX_WEBHOOK_RESPONSE_BODY_BYTES: usize = 4 * 1024;
+
+/// Acknowledgement after message delivery, or a response with no agent work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebhookOutcome {
+    Ack,
+    Body(String),
 }
 
 /// Why a plugin webhook request could not be accepted.
@@ -167,6 +181,8 @@ pub enum WebhookReject {
     /// Guest execution or downstream delivery was unavailable. Detail is
     /// host-only; the public response is always an opaque 503.
     Unavailable(String),
+    /// The plugin's response exceeds the host-owned body limit (opaque 502).
+    InvalidResponse,
     /// The request deadline cancelled guest parsing or delivery.
     Timeout,
 }

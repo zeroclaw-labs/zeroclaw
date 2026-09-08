@@ -13,7 +13,7 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage, WebhookRejection,
+        SendMessage, WebhookRejection, WebhookRequest, WebhookResponse,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::config::{ConfigError, get as config_get};
@@ -300,10 +300,13 @@ mod component {
             Some("fixture".to_string())
         }
 
-        fn parse_webhook(
-            headers: Vec<(String, String)>,
-            body: Vec<u8>,
-        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
+        fn parse_webhook(request: WebhookRequest) -> Result<WebhookResponse, WebhookRejection> {
+            let WebhookRequest {
+                method,
+                query,
+                headers,
+                body,
+            } = request;
             if body == b"spin" {
                 let mut value = 0_u64;
                 loop {
@@ -324,9 +327,15 @@ mod component {
                 ));
             }
 
+            if method == "GET" {
+                return Ok(WebhookResponse::Reply(query));
+            }
             let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
                 WebhookRejection::BadRequest(format!("private parser detail: {error}"))
             })?;
+            if let Some(challenge) = payload.get("challenge").and_then(serde_json::Value::as_str) {
+                return Ok(WebhookResponse::Reply(challenge.to_string()));
+            }
             let field = |name: &str| {
                 payload
                     .get(name)
@@ -339,19 +348,23 @@ mod component {
                         ))
                     })
             };
-            Ok(vec![InboundMessage {
+            Ok(WebhookResponse::Messages(vec![InboundMessage {
                 id: field("id")?,
                 sender: field("sender")?,
                 reply_target: field("reply_target")?,
                 content: field("content")?,
-                channel: "spoofed-channel".to_string(),
+                channel: payload
+                    .get("channel")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("spoofed-channel")
+                    .to_string(),
                 channel_alias: Some("spoofed-alias".to_string()),
                 timestamp: 7,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: Vec::new(),
                 subject: None,
-            }])
+            }]))
         }
     }
 

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use zeroclaw_api::channel::SendMessage;
-use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook};
+use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook, WebhookOutcome};
 use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
 use zeroclaw_config::providers::{ChannelRef, ModelProviderRef};
 use zeroclaw_config::schema::{
@@ -205,6 +205,8 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
         .expect("validated guest route is published atomically");
     let (reply, outcome) = tokio::sync::oneshot::channel();
     sink.send(RawWebhook {
+        method: "POST".to_string(),
+        query: String::new(),
         headers: vec![(
             "x-fixture-secret".to_string(),
             "channel-secret".to_string(),
@@ -216,7 +218,10 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     })
     .await
     .expect("published route remains live");
-    assert!(outcome.await.expect("webhook worker replies").is_ok());
+    assert!(matches!(
+        outcome.await.expect("webhook worker replies"),
+        Ok(WebhookOutcome::Ack)
+    ));
     let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .expect("webhook reaches shared channel receiver")
@@ -225,6 +230,24 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     assert_eq!(message.content, "from webhook");
     assert_eq!(message.channel, "plugin");
     assert_eq!(message.channel_alias.as_deref(), Some("operations"));
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    sink.send(RawWebhook {
+        method: "GET".to_string(),
+        query: "challenge=runtime-echo".to_string(),
+        headers: vec![("x-fixture-secret".to_string(), "channel-secret".to_string())],
+        body: Vec::new(),
+        cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
+        idempotency: None,
+        reply,
+    })
+    .await
+    .expect("published GET route remains live");
+    assert!(matches!(outcome.await.expect("challenge worker replies"),
+        Ok(WebhookOutcome::Body(body)) if body == "challenge=runtime-echo"));
+    assert!(
+        rx.try_recv().is_err(),
+        "challenge must not reach the agent queue"
+    );
     assert!(
         !listener.is_finished(),
         "the real plugin listener must retain its polling lifecycle"

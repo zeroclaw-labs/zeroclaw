@@ -115,6 +115,25 @@ interface channel {
         bad-request(string),
     }
 
+    /// Exact HTTP request metadata and bytes supplied by the gateway.
+    @unstable(feature = plugins-wit-v0)
+    record webhook-request {
+        method: string,
+        /// Raw query, without the leading `?`; never synthesized from headers.
+        query: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// A verified request either delivers messages or answers the provider.
+    @unstable(feature = plugins-wit-v0)
+    variant webhook-response {
+        messages(list<inbound-message>),
+        /// HTTP 200 text body; never enters sender policy, deduplication, or
+        /// agent delivery. At most 4096 UTF-8 bytes; excess returns opaque 502.
+        reply(string),
+    }
+
     /// Bitmask of optional capabilities this plugin implements.
     ///
     /// The runtime calls `get-channel-capabilities` once at load time. For each
@@ -340,17 +359,14 @@ interface channel {
     /// Gated by `webhook-ingress`; stub: return `none`.
     webhook-path: func() -> option<string>;
 
-    /// Authenticate and decode one raw inbound webhook into channel messages.
-    /// `headers` use lowercase names and UTF-8 values; `body` contains the exact
-    /// received bytes. Resolve scoped config and secrets at this point of use,
-    /// verify the platform signature before returning messages, and keep the
-    /// diagnostic string private to host logs.
+    /// Authenticate and decode a GET or POST webhook. The request carries the
+    /// gateway's method, raw query, lowercase UTF-8 headers, and exact body.
+    /// Resolve scoped config and secrets at this point of use and verify the
+    /// platform's authenticity before returning messages or a challenge reply.
+    /// Keep diagnostic strings private to host logs.
     /// Gated by `webhook-ingress`; stub: return
     /// `err(bad-request("unsupported"))`.
-    parse-webhook: func(
-        headers: list<tuple<string, string>>,
-        body: list<u8>,
-    ) -> result<list<inbound-message>, webhook-rejection>;
+    parse-webhook: func(request: webhook-request) -> result<webhook-response, webhook-rejection>;
 }
 
 /// A component that exports `channel` is a messaging-platform channel plugin.

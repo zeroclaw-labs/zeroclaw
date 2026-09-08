@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::webhook::{RawWebhook, WebhookIdempotency, WebhookReject};
+use zeroclaw_api::webhook::{
+    MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookIdempotency, WebhookOutcome, WebhookReject,
+};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
@@ -227,11 +229,13 @@ fn fixture_webhook(
     idempotency: Option<WebhookIdempotency>,
 ) -> (
     RawWebhook,
-    tokio::sync::oneshot::Receiver<Result<(), WebhookReject>>,
+    tokio::sync::oneshot::Receiver<Result<WebhookOutcome, WebhookReject>>,
 ) {
     let (reply, outcome) = tokio::sync::oneshot::channel();
     (
         RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
             headers: vec![("x-fixture-secret".to_string(), secret.to_string())],
             body: body.into(),
             cancellation,
@@ -519,6 +523,90 @@ async fn webhook_sender_policy_runs_before_idempotency_reservation() {
         "unauthorized sender must not reach the channel queue"
     );
 
+    listener.abort();
+}
+
+#[tokio::test]
+async fn typed_webhook_replies_bypass_message_policy_and_bound_utf8_output() {
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let observed_policy = Arc::clone(&policy_calls);
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(move |_| {
+            observed_policy.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+    let (sink, receiver) = tokio::sync::mpsc::channel(2);
+    channel.set_webhook_receiver(receiver);
+    let (tx, mut inbound) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+    let idempotency = WebhookIdempotency::new(
+        |_| panic!("challenge must not reserve a message ID"),
+        |_| panic!("challenge must not commit a message ID"),
+        |_| panic!("challenge must not roll back a message ID"),
+    );
+
+    for (method, text) in [
+        ("GET", "challenge=a%2Bb&part=one&part=two".to_string()),
+        ("POST", "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2)),
+        ("POST", "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2 + 1)),
+    ] {
+        let body =
+            serde_json::to_vec(&serde_json::json!({"challenge": text})).expect("encode challenge");
+        let (mut request, outcome) = fixture_webhook(
+            body,
+            "token-main",
+            zeroclaw_api::webhook::WebhookCancellation::new(),
+            Some(idempotency.clone()),
+        );
+        request.method = method.to_string();
+        request.query = text.clone();
+        request.headers.extend([
+            ("x-webhook-method".to_string(), "DELETE".to_string()),
+            ("x-webhook-query".to_string(), "spoofed".to_string()),
+        ]);
+        sink.send(request).await.expect("webhook receiver active");
+        let result = outcome.await.expect("guest replies");
+        if text.len() <= MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+            assert!(matches!(result, Ok(WebhookOutcome::Body(body)) if body == text));
+        } else {
+            assert!(matches!(result, Err(WebhookReject::InvalidResponse)));
+        }
+        assert!(inbound.try_recv().is_err());
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    let (mut request, outcome) = fixture_webhook(
+        b"",
+        "wrong-token",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        Some(idempotency),
+    );
+    request.method = "GET".to_string();
+    request.query = "challenge=unauthenticated".to_string();
+    sink.send(request).await.expect("webhook receiver active");
+    assert!(matches!(
+        outcome.await.expect("guest rejects"),
+        Err(WebhookReject::Unauthorized(_))
+    ));
+    assert!(inbound.try_recv().is_err());
+
+    let (request, outcome) = fixture_webhook(
+        br#"{"id":"sentinel-1","sender":"tester","reply_target":"room","content":"ordinary message","channel":"__webhook_reply__"}"#,
+        "token-main", zeroclaw_api::webhook::WebhookCancellation::new(), None,
+    );
+    sink.send(request).await.expect("webhook receiver active");
+    assert!(matches!(
+        outcome.await.expect("message acknowledged"),
+        Ok(WebhookOutcome::Ack)
+    ));
+    let delivered = inbound
+        .recv()
+        .await
+        .expect("sentinel name cannot divert a message to HTTP");
+    assert_eq!(delivered.id, "sentinel-1");
+    assert_eq!(delivered.channel, "plugin");
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 1);
     listener.abort();
 }
 

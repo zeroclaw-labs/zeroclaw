@@ -8,6 +8,7 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     ApprovalResponse as WitApprovalResponse, ChannelCapabilities,
     InboundMessage as WitInboundMessage, MediaAttachment as WitMediaAttachment,
     SendMessage as WitSendMessage, WebhookRejection as WitWebhookRejection,
+    WebhookRequest as WitWebhookRequest, WebhookResponse as WitWebhookResponse,
 };
 use crate::component::{
     PluginState, PluginStoreSpec, WarmPluginState, call_channel, call_channel_store, call_store,
@@ -31,8 +32,8 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_api::webhook::{
-    RawWebhook, WebhookIdempotency, WebhookReject, WebhookReservation, WebhookReservationStatus,
-    WebhookReservationToken,
+    MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookIdempotency, WebhookOutcome, WebhookReject,
+    WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
 };
 
 /// Live host policy for a normalized channel-plugin sender.
@@ -381,16 +382,15 @@ impl ChannelInstanceFactory {
     async fn parse_webhook(
         &self,
         endpoint: &PluginChannelEndpoint,
-        headers: &[(String, String)],
-        body: &[u8],
-    ) -> Result<Result<Vec<WitInboundMessage>, WitWebhookRejection>> {
+        request: &WitWebhookRequest,
+    ) -> Result<Result<WitWebhookResponse, WitWebhookRejection>> {
         let instance = self.instantiate(endpoint, InboundQueue::default()).await?;
         let (mut store, bindings) = instance.state;
         call_channel_store!(store, async |store: &mut Store<PluginState>| {
             wt(
                 bindings
                     .zeroclaw_plugin_channel()
-                    .call_parse_webhook(store, headers, body)
+                    .call_parse_webhook(store, request)
                     .await,
                 "channel.parse-webhook trapped",
             )
@@ -531,6 +531,7 @@ fn log_webhook_rejection(endpoint: &PluginChannelEndpoint, rejection: &WebhookRe
         }
         WebhookReject::BadRequest(detail) => ("plugin_webhook_invalid", Some(detail.as_str())),
         WebhookReject::Unavailable(detail) => ("plugin_webhook_unavailable", Some(detail.as_str())),
+        WebhookReject::InvalidResponse => ("plugin_webhook_invalid_response", None),
         WebhookReject::Timeout => ("plugin_webhook_timeout", None),
     };
     ::zeroclaw_log::record!(
@@ -783,6 +784,8 @@ impl Channel for WasmChannel {
         let webhook_tx = tx.clone();
         let webhook_loop = async move {
             while let Some(RawWebhook {
+                method,
+                query,
                 headers,
                 body,
                 cancellation,
@@ -790,15 +793,21 @@ impl Channel for WasmChannel {
                 reply,
             }) = webhook_receiver.recv().await
             {
+                let request = WitWebhookRequest {
+                    method,
+                    query,
+                    headers,
+                    body,
+                };
                 let parsed = tokio::select! {
                     biased;
                     () = cancellation.cancelled() => None,
-                    result = webhook_factory.parse_webhook(&webhook_endpoint, &headers, &body) => {
+                    result = webhook_factory.parse_webhook(&webhook_endpoint, &request) => {
                         Some(result)
                     }
                 };
                 let outcome = match parsed {
-                    Some(Ok(Ok(messages))) => {
+                    Some(Ok(Ok(WitWebhookResponse::Messages(messages)))) => {
                         deliver_webhook_messages(
                             messages,
                             &webhook_tx,
@@ -808,6 +817,14 @@ impl Channel for WasmChannel {
                             idempotency.as_ref(),
                         )
                         .await
+                        .map(|()| WebhookOutcome::Ack)
+                    }
+                    Some(Ok(Ok(WitWebhookResponse::Reply(body)))) => {
+                        if body.len() > MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+                            Err(WebhookReject::InvalidResponse)
+                        } else {
+                            Ok(WebhookOutcome::Body(body))
+                        }
                     }
                     Some(Ok(Err(WitWebhookRejection::Unauthorized(detail)))) => {
                         Err(WebhookReject::Unauthorized(bounded_webhook_detail(detail)))

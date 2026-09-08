@@ -7,10 +7,10 @@ use std::time::Duration;
 use axum::{
     Router,
     body::Bytes,
-    extract::{ConnectInfo, Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Path, RawQuery, State},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{IntoResponse, Json, Response},
-    routing::post,
+    routing::get,
 };
 
 use crate::{AppState, IdempotencyStore, RATE_LIMIT_WINDOW_SECS, client_key_from_request};
@@ -48,21 +48,38 @@ pub(super) fn routes(
     registry: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
 ) -> Router<AppState> {
     Router::new()
-        .route("/plugin/{path}", post(handle_plugin_webhook))
+        .route(
+            "/plugin/{path}",
+            get(handle_plugin_webhook)
+                .post(handle_plugin_webhook)
+                .head(unsupported_method)
+                .fallback(unsupported_method),
+        )
         .layer(axum::Extension(registry))
 }
 
-/// POST `/plugin/{path}` — forward exact request bytes to the channel plugin
+async fn unsupported_method() -> impl IntoResponse {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "GET, POST")],
+    )
+}
+
+/// GET/POST `/plugin/{path}` — forward exact request bytes to the channel plugin
 /// that atomically claimed `path` during this daemon generation.
 async fn handle_plugin_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     axum::Extension(registry): axum::Extension<Arc<zeroclaw_api::webhook::PluginWebhookRegistry>>,
     Path(path): Path<String>,
+    method: Method,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    use zeroclaw_api::webhook::{RawWebhook, WebhookReject};
+    use zeroclaw_api::webhook::{
+        MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookOutcome, WebhookReject,
+    };
 
     // Apply the same trusted-forwarded-aware client key and limiter as the
     // built-in webhook before route lookup or guest work.
@@ -105,6 +122,8 @@ async fn handle_plugin_webhook(
     let _cancel_on_exit = cancellation.clone().drop_guard();
     let (reply, outcome) = tokio::sync::oneshot::channel();
     let request = RawWebhook {
+        method: method.to_string(),
+        query: query.unwrap_or_default(),
         headers,
         body: body.to_vec(),
         cancellation,
@@ -125,7 +144,17 @@ async fn handle_plugin_webhook(
     }
 
     match tokio::time::timeout(Duration::from_secs(PLUGIN_WEBHOOK_TIMEOUT_SECS), outcome).await {
-        Ok(Ok(Ok(()))) => StatusCode::OK.into_response(),
+        Ok(Ok(Ok(WebhookOutcome::Ack))) => StatusCode::OK.into_response(),
+        Ok(Ok(Ok(WebhookOutcome::Body(body)))) => {
+            if body.len() > MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+                (StatusCode::BAD_GATEWAY, "invalid webhook response").into_response()
+            } else {
+                body.into_response()
+            }
+        }
+        Ok(Ok(Err(WebhookReject::InvalidResponse))) => {
+            (StatusCode::BAD_GATEWAY, "invalid webhook response").into_response()
+        }
         Ok(Ok(Err(WebhookReject::Unauthorized(_)))) => {
             ::zeroclaw_log::record!(
                 WARN,

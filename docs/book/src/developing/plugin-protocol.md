@@ -400,7 +400,7 @@ clone to the listener task so enqueued traffic is visible to the plugin's drain.
 
 A channel component can add `webhook-ingress` to its returned
 `channel-capabilities` and implement `webhook-path` plus `parse-webhook`. The
-host then mounts one POST-only route at `/plugin/<path>`. The path is a runtime
+host then mounts a GET/POST route at `/plugin/<path>`. The path is a runtime
 claim, not config: it must contain 1–64 ASCII letters, digits, hyphens, or
 underscores. The channel instance is rejected when the claim is empty, invalid,
 or duplicated. All claims are resolved before the daemon replaces its route
@@ -409,13 +409,22 @@ cannot publish a partial generation. Publication carries a generation lease;
 a retiring older channel supervisor cannot clear a newer route set.
 
 Webhook ingress requires the component's effective `config_read` grant. For
-each request, the gateway passes lowercase UTF-8 headers and the exact body
-bytes to `parse-webhook` in a disposable configured store. The guest resolves
+each request, the gateway passes a typed `webhook-request` containing the HTTP
+method, raw query, lowercase UTF-8 headers, and exact body bytes to
+`parse-webhook` in a disposable configured store. The guest resolves
 its current scoped config and secrets in that call, verifies platform
-authenticity, and returns either normalized inbound messages or a typed
-`unauthorized` / `bad-request` rejection. Cancelling or timing out the HTTP
+authenticity, and returns `webhook-response.messages`, `webhook-response.reply`,
+or a typed `unauthorized` / `bad-request` rejection. Cancelling or timing out the HTTP
 request drops that disposable store; it never strands the warm store used by
 polling and outbound channel calls.
+
+A verified challenge returns `reply(body)`: the gateway responds with HTTP 200
+and that text, without sender authorization, idempotency, or agent delivery.
+The host accepts at most 4096 UTF-8 bytes at both the component and HTTP
+boundaries; excess returns the fixed `502 invalid webhook response`. Method
+and query come from the request fields, never reserved headers. A message's
+channel name has no response-control meaning. `HEAD` and other unsupported
+methods return `405` with `Allow: GET, POST` before reaching the component.
 
 The unauthenticated edge remains host-governed:
 
