@@ -230,8 +230,11 @@ impl TraceExpects {
     /// A zero-length entry is admitted by [`is_empty`](Self::is_empty) because
     /// the vector is non-empty, yet it asserts nothing: every response contains
     /// the empty substring, the empty regex matches every response, and no tool
-    /// is ever recorded under an empty name. The negative families are rejected
-    /// on the same rule for a consistent schema.
+    /// is ever recorded under an empty name. In the positive families that
+    /// yields a tautological pass and in `tools_not_used` a degenerate one, so
+    /// such an entry can certify the required gate green without testing any
+    /// behavior. The negative families are rejected on the same rule for a
+    /// consistent schema, even though they fail rather than falsely certify.
     fn empty_entry_family(&self) -> Option<&'static str> {
         [
             ("response_contains", &self.response_contains),
@@ -241,7 +244,7 @@ impl TraceExpects {
             ("response_matches", &self.response_matches),
         ]
         .into_iter()
-        .find(|(_, values)| values.iter().any(String::is_empty))
+        .find(|(_, values)| values.iter().any(|value| value.is_empty()))
         .map(|(name, _)| name)
     }
 }
