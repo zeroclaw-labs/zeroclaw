@@ -4,8 +4,8 @@
 //! Consumers call `ChatTabAction::from_chord(&key)` directly — no
 //! `Keymap` struct, no plumbed argument.
 //!
-//! On darwin, `Chord::matches` translates most `CTRL` modifiers to
-//! `SUPER`; terminal-owned control chords remain literal.
+//! Chords carry literal Control, platform-primary, and literal Super intent
+//! explicitly; dispatch compares their effective event modifiers.
 
 pub mod actions;
 mod chord;
@@ -22,7 +22,7 @@ fn chord_bypasses_text_input(chord: &Chord) -> bool {
         return true;
     }
 
-    let mut modifiers = chord.modifiers;
+    let mut modifiers = chord.effective_modifiers();
     modifiers.remove(KeyModifiers::SHIFT);
     !modifiers.is_empty()
 }
@@ -283,16 +283,17 @@ mod tests {
     }
 
     #[test]
-    fn delete_previous_word_answers_to_both_ctrl_w_and_alt_backspace() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    fn delete_previous_word_answers_to_both_primary_w_and_alt_backspace() {
+        use crossterm::event::{KeyCode, KeyEvent};
 
         with_default_bindings(|| {
             // Both chords resolve to the one action, so the existing
             // Unicode-aware deletion stays the single behavior owner.
+            let primary_w = Chord::primary('w');
             assert_eq!(
                 InputBarAction::from_chord(&KeyEvent::new(
                     KeyCode::Char('w'),
-                    KeyModifiers::CONTROL
+                    primary_w.effective_modifiers(),
                 )),
                 Some(InputBarAction::DeletePreviousWord)
             );
@@ -311,7 +312,7 @@ mod tests {
             // Help and the rebinding surface read the defaults, so both chords
             // have to be advertised there, not just accepted at match time.
             let defaults = InputBarAction::DeletePreviousWord.default_chords();
-            assert!(defaults.contains(&Chord::ctrl('w')));
+            assert!(defaults.contains(&primary_w));
             assert!(defaults.contains(&Chord::with(KeyCode::Backspace, KeyModifiers::ALT)));
             assert_eq!(
                 action_key_labels(InputBarAction::DeletePreviousWord).len(),
@@ -371,17 +372,21 @@ mod tests {
 
     /// `same_key` has to answer exactly what dispatch would: two chords are one
     /// chord iff either matches the event the other describes. Asserted on both
-    /// platforms, so the Linux run still pins the contract even though only
-    /// darwin makes the ctrl/super pair equivalent.
+    /// platforms, so the Linux run still pins the contract even though the
+    /// platform-primary event differs by OS.
     #[test]
     fn same_key_agrees_with_dispatch() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let pairs = [
             (
+                Chord::primary('a'),
+                Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER),
+            ),
+            (
                 Chord::ctrl('a'),
                 Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER),
             ),
-            // Host-reserved on darwin, so CONTROL is never rewritten for it.
+            // Literal Control and literal Super remain distinct on every OS.
             (
                 Chord::ctrl('c'),
                 Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
@@ -398,7 +403,7 @@ mod tests {
             ),
         ];
         for (a, b) in pairs {
-            let as_event = KeyEvent::new(b.code, b.modifiers);
+            let as_event = KeyEvent::new(b.code, b.effective_modifiers());
             assert_eq!(
                 a.same_key(&b),
                 a.matches(&as_event),
@@ -410,10 +415,10 @@ mod tests {
         }
     }
 
-    /// The darwin-only half of the precedence contract. `normalise_mods`
-    /// rewrites CONTROL to SUPER for every chord the host has not reserved, so
+    /// The darwin-only half of the precedence contract. Platform-primary
+    /// intent resolves to the same event as literal Super there, so
     /// an operator's explicit `super+a` and the earlier-declared
-    /// `OpenFileBrowser`'s retained `ctrl+a` default are one chord at dispatch
+    /// `OpenFileBrowser`'s retained `primary+a` default are one chord at dispatch
     /// and two on the wire. Comparing raw values left the shadowed default in
     /// the table, and the operator's own binding lost to it by declaration
     /// order while Help advertised the chord twice.
@@ -423,7 +428,7 @@ mod tests {
     /// the part that runs everywhere.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_super_override_outranks_a_normalized_ctrl_default_on_darwin() {
+    fn a_super_override_outranks_a_primary_default_on_darwin() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let super_a = Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER);
 
@@ -435,7 +440,7 @@ mod tests {
             );
             assert!(
                 !action_key_labels(InputBarAction::OpenFileBrowser).contains(&super_a.display()),
-                "the shadowed ctrl+a default must leave Help too"
+                "the shadowed primary+a default must leave Help too"
             );
             assert_eq!(
                 action_key_labels(InputBarAction::DeletePreviousWord),
@@ -471,10 +476,11 @@ mod tests {
             );
 
             // The default that was not claimed is untouched.
+            let primary_w = Chord::primary('w');
             assert_eq!(
                 InputBarAction::from_chord(&KeyEvent::new(
                     KeyCode::Char('w'),
-                    KeyModifiers::CONTROL
+                    primary_w.effective_modifiers(),
                 )),
                 Some(InputBarAction::DeletePreviousWord)
             );
@@ -483,23 +489,23 @@ mod tests {
 
     #[test]
     fn override_precedence_does_not_depend_on_declaration_order() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent};
 
         // The mirror of the case above: the override is on the *earlier*
         // declared action and the retained default on the later one. Both
         // directions must land on the explicit binding, or the contract is
         // just an artifact of enum ordering.
-        let ctrl_u = Chord::ctrl('u');
-        with_input_bar_override("backspace", vec![ctrl_u.clone()], || {
+        let primary_u = Chord::primary('u');
+        with_input_bar_override("backspace", vec![primary_u.clone()], || {
             assert_eq!(
                 InputBarAction::from_chord(&KeyEvent::new(
                     KeyCode::Char('u'),
-                    KeyModifiers::CONTROL
+                    primary_u.effective_modifiers(),
                 )),
                 Some(InputBarAction::Backspace)
             );
             assert!(
-                !action_key_labels(InputBarAction::ClearInput).contains(&ctrl_u.display()),
+                !action_key_labels(InputBarAction::ClearInput).contains(&primary_u.display()),
                 "ClearInput's retained default lost the chord to an explicit binding"
             );
         });
