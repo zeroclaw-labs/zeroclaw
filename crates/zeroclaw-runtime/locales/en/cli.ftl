@@ -1020,11 +1020,11 @@ channel-runtime-scoped-model-switched = Model set to `{ $model }` (model_provide
 channel-runtime-shadow-note = ⚠️ A higher-precedence override is active, so messages will use `{ $model }` (`{ $provider }`) instead — see `/model`.
 channel-runtime-thinking-set =
     Thinking set to `{ $level }` for this sender session.
-    Use `/thinking reset` to return to the agent default.
+    Use `/effort reset` to return to the agent default.
 channel-runtime-thinking-cleared = Thinking override cleared. Using agent default `{ $default }` for this sender session.
 channel-runtime-thinking-default =
     Thinking is already using agent default `{ $default }` for this sender session.
-    Use `/thinking high`, `/thinking max`, or `/thinking off` to override it.
+    Use `/effort high`, `/effort max`, or `/effort off` to override it.
 channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/effort off|minimal|low|medium|high|xhigh|max`, `/effort on`, or `/effort reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Failed to initialize model_provider `{ $provider }`. Please run `/models` to choose another model_provider.
