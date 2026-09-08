@@ -143,7 +143,11 @@ pub fn thinking_options(context: &ThinkingContext<'_>) -> ThinkingOptions {
     } else if let Some(level) = context.session_level {
         (Some(level), Some(LevelSource::Session))
     } else {
-        let level = fit_level(context.profile.default_level, &capabilities);
+        let level = fit_level(
+            context.profile.default_level,
+            &capabilities,
+            context.profile,
+        );
         // The default level asks the provider for nothing.
         let source = if level == ThinkingLevel::Medium {
             LevelSource::ModelDefault
@@ -159,14 +163,14 @@ pub fn thinking_options(context: &ThinkingContext<'_>) -> ThinkingOptions {
         (Some(display), Some(DisplaySource::Session))
     } else if let Some(display) = context
         .alias_display
-        .filter(|display| capabilities.supports_display(*display))
+        .and_then(|display| capabilities.fit_display(display))
     {
         (Some(display), Some(DisplaySource::Alias))
     } else if let Some(display) = context
         .profile
         .display
         .to_display()
-        .filter(|display| capabilities.supports_display(*display))
+        .and_then(|display| capabilities.fit_display(display))
     {
         (Some(display), Some(DisplaySource::Profile))
     } else {
@@ -188,20 +192,33 @@ pub fn thinking_options(context: &ThinkingContext<'_>) -> ThinkingOptions {
     }
 }
 
-/// The level the profile default resolves to on this model: a depth the
-/// generation lacks becomes the depth just below, which is what the adapter
-/// sends.
-fn fit_level(level: ThinkingLevel, capabilities: &ThinkingCapabilities) -> ThinkingLevel {
-    match level.native_effort() {
-        Some(effort)
-            if capabilities.shape == ClaudeThinkingShape::Adaptive
-                && !capabilities.supports_effort(effort) =>
-        {
-            capabilities
-                .fit_effort(effort)
-                .map_or(level, level_for_effort)
+/// The level a standing default resolves to on this model: the name of the
+/// request the turn will actually carry, so the reported value, the offered
+/// list and the request agree.
+///
+/// On the depth generations a level the model lacks becomes the depth just
+/// below, and `off` and `minimal` read as `low`, which is the depth they send.
+/// On the budget generations a level that carries no budget reads as the
+/// default level, because that is the request it produces.
+fn fit_level(
+    level: ThinkingLevel,
+    capabilities: &ThinkingCapabilities,
+    profile: &ThinkingConfig,
+) -> ThinkingLevel {
+    match capabilities.shape {
+        ClaudeThinkingShape::Adaptive => {
+            level
+                .native_effort()
+                .map_or(ThinkingLevel::Medium, |effort| {
+                    capabilities
+                        .fit_effort(effort)
+                        .map_or(level, level_for_effort)
+                })
         }
-        _ => level,
+        ClaudeThinkingShape::FixedBudget if profile.budget_tokens_for(level).is_none() => {
+            ThinkingLevel::Medium
+        }
+        ClaudeThinkingShape::FixedBudget => level,
     }
 }
 
@@ -434,6 +451,47 @@ mod tests {
             "the session display is the request's own choice"
         );
         assert_eq!(params.profile_display, Some(Summarized));
+    }
+
+    #[test]
+    fn options_report_the_level_and_display_the_turn_will_send() {
+        use zeroclaw_config::scattered_types::{ThinkingDisplayMode, ThinkingLevel};
+        // `off` and `minimal` are not offered, and both ask the model for the
+        // low depth, so that is what the session reports having.
+        for level in [ThinkingLevel::Off, ThinkingLevel::Minimal] {
+            let shallow = profile(level, false);
+            let options =
+                thinking_options(&context("anthropic.default", "claude-fable-5-1", &shallow));
+            assert_eq!(
+                options.current_level,
+                Some(Low),
+                "{level:?} sends the low depth, so the picker must mark low"
+            );
+            assert_eq!(options.level_source, Some(LevelSource::Profile));
+            assert!(options.levels.contains(&Low));
+        }
+
+        // A configured display the generation narrowed away is reported as
+        // the value the adapter substitutes, not as the API default.
+        let mut notes = profile(High, false);
+        notes.display = ThinkingDisplayMode::Updates;
+        let mut ctx = context("anthropic.default", "claude-fable-5-1", &notes);
+        let options = thinking_options(&ctx);
+        assert_eq!(options.current_display, Some(Summarized));
+        assert_eq!(options.display_source, Some(DisplaySource::Profile));
+
+        ctx.alias_display = Some(Updates);
+        let options = thinking_options(&ctx);
+        assert_eq!(options.current_display, Some(Summarized));
+        assert_eq!(options.display_source, Some(DisplaySource::Alias));
+
+        // On a budget model, a level that carries no budget sends the same
+        // request as the default level.
+        let native = profile(ThinkingLevel::Low, true);
+        let options = thinking_options(&context("anthropic.default", "claude-haiku-4-5", &native));
+        assert_eq!(options.levels, vec![Medium, High, Max]);
+        assert_eq!(options.current_level, Some(Medium));
+        assert_eq!(options.level_source, Some(LevelSource::ModelDefault));
     }
 
     #[test]
