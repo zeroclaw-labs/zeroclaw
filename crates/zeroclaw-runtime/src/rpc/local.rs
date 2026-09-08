@@ -194,8 +194,11 @@ pub async fn run_local_listener(
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
                     dispatcher.run(&mut transport).await;
 
-                    if let Some(tui_id) = dispatcher.tui_id() {
-                        ctx.tui_registry.unregister(tui_id);
+                    // Epoch-checked for the same reason as the WSS teardown: a
+                    // reconnect adopting this TUI id must not be evicted by the
+                    // displaced connection's later cleanup.
+                    if let Some((tui_id, tui_epoch)) = dispatcher.tui_registration() {
+                        ctx.tui_registry.unregister(tui_id, tui_epoch);
                         use ::zeroclaw_log::Instrument as _;
                         let span = ::zeroclaw_log::info_span!(
                             target: "zeroclaw_log_internal_scope",

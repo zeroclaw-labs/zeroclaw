@@ -34,7 +34,7 @@ pub async fn process_file_entry(
     use sha2::{Digest, Sha256};
 
     // 1. Resolve bytes + filename + mime_type.
-    let (bytes, filename, mime_type, original_path) = if let Some(ref b64) = entry.data_b64 {
+    let (bytes, filename, mime_type) = if let Some(ref b64) = entry.data_b64 {
         let decoded = STANDARD
             .decode(b64)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Invalid base64: {e}")))?;
@@ -53,7 +53,7 @@ pub async fn process_file_entry(
             .mime_type
             .clone()
             .unwrap_or_else(|| mime_from_filename(&fname));
-        (decoded, fname, mime, None)
+        (decoded, fname, mime)
     } else if let Some(ref path) = entry.path {
         if is_wss {
             return Err(rpc_err(
@@ -86,7 +86,7 @@ pub async fn process_file_entry(
             .mime_type
             .clone()
             .unwrap_or_else(|| mime_from_filename(&fname));
-        (bytes, fname, mime, Some(path.clone()))
+        (bytes, fname, mime)
     } else {
         return Err(rpc_err(
             INVALID_PARAMS,
@@ -131,11 +131,8 @@ pub async fn process_file_entry(
     let workspace_path = strip_windows_verbatim_prefix(&dest.to_string_lossy()).into_owned();
 
     let kind = attachment_kind(&mime_type);
-    let is_clipboard = matches!(entry.source, FileSource::Clipboard);
     let marker = if kind == "IMAGE" {
-        let display_path =
-            image_marker_display_path(original_path.as_deref(), &workspace_path, is_clipboard);
-        format!("[IMAGE:{display_path}]")
+        format!("[IMAGE:{workspace_path}]")
     } else {
         // Non-image: prose format with workspace path so the agent can
         // read the file with its tools regardless of transport.
@@ -181,18 +178,6 @@ fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(rest);
     }
     std::borrow::Cow::Borrowed(path)
-}
-
-fn image_marker_display_path<'a>(
-    original_path: Option<&'a str>,
-    workspace_path: &'a str,
-    is_clipboard: bool,
-) -> std::borrow::Cow<'a, str> {
-    if is_clipboard {
-        std::borrow::Cow::Borrowed(workspace_path)
-    } else {
-        strip_windows_verbatim_prefix(original_path.unwrap_or(workspace_path))
-    }
 }
 
 /// Derive MIME type from filename extension via `mime_guess`.
@@ -272,22 +257,6 @@ mod tests {
             strip_windows_verbatim_prefix("/tmp/file.png"),
             "/tmp/file.png"
         );
-    }
-
-    #[test]
-    fn path_mode_image_marker_display_path_strips_original_verbatim_prefix() {
-        let workspace_path = r"C:\Users\me\.zeroclaw\uploads\copy.png";
-        let display_path = image_marker_display_path(
-            Some(r"\\?\C:\Users\me\Pictures\source.png"),
-            workspace_path,
-            false,
-        );
-        let marker = format!("[IMAGE:{display_path}]");
-
-        assert_eq!(display_path, r"C:\Users\me\Pictures\source.png");
-        assert_eq!(marker, r"[IMAGE:C:\Users\me\Pictures\source.png]");
-        assert!(!marker.contains(r"\\?\"));
-        assert!(!workspace_path.contains(r"\\?\"));
     }
 
     #[test]
@@ -685,5 +654,44 @@ mod tests {
         assert!(r.marker.contains(&r.workspace_path));
         assert!(!r.deduplicated);
         assert!(Path::new(&r.workspace_path).exists());
+    }
+
+    #[tokio::test]
+    async fn path_mode_image_marker_survives_original_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir(&ws).unwrap();
+        let ws = ws.to_string_lossy().to_string();
+        let store = setup_store(&ws).await;
+
+        let source_path = tmp.path().join("temporary.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&source_path, png).unwrap();
+        let entry = FileEntry {
+            path: Some(source_path.to_string_lossy().to_string()),
+            data_b64: None,
+            filename: None,
+            mime_type: None,
+            source: FileSource::File,
+        };
+
+        let result = process_file_entry(&entry, "s1", &ws, false, &store)
+            .await
+            .unwrap();
+        std::fs::remove_file(&source_path).unwrap();
+
+        assert_eq!(result.marker, format!("[IMAGE:{}]", result.workspace_path));
+        assert_eq!(std::fs::read(&result.workspace_path).unwrap(), png);
+        assert!(Path::new(&result.workspace_path).exists());
+
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &[zeroclaw_api::model_provider::ChatMessage::user(
+                result.marker,
+            )],
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.contains_images);
     }
 }

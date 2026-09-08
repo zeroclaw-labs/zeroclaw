@@ -1497,6 +1497,9 @@ impl SseTransport {
             // each event boundary. Bounds a single event so a persistent stream
             // cannot accumulate unbounded event data before dispatch.
             let mut cur_bytes: u64 = 0;
+            // Once an event is rejected, consume the rest of its lines through
+            // the blank boundary so a valid suffix cannot be dispatched alone.
+            let mut discard_event = false;
 
             loop {
                 tokio::select! {
@@ -1524,6 +1527,7 @@ impl SseTransport {
                                 cur_event = None;
                                 cur_id = None;
                                 cur_bytes = 0;
+                                discard_event = true;
                                 continue;
                             }
                             Ok(BoundedLine::Eof) | Err(_) => break,
@@ -1536,6 +1540,14 @@ impl SseTransport {
                             line.pop();
                         }
                         if line.is_empty() {
+                            if discard_event {
+                                cur_data.clear();
+                                cur_event = None;
+                                cur_id = None;
+                                cur_bytes = 0;
+                                discard_event = false;
+                                continue;
+                            }
                             if cur_event.is_none() && cur_id.is_none() && cur_data.is_empty() {
                                 continue;
                             }
@@ -1545,6 +1557,10 @@ impl SseTransport {
                             cur_bytes = 0;
                             let id = cur_id.take();
                             handle_sse_event(&server_name, &sse_url, &shared, &pending, &notify, event.as_deref(), id.as_deref(), data).await;
+                            continue;
+                        }
+
+                        if discard_event {
                             continue;
                         }
 
@@ -1577,6 +1593,7 @@ impl SseTransport {
                                 cur_event = None;
                                 cur_id = None;
                                 cur_bytes = 0;
+                                discard_event = true;
                                 continue;
                             }
                             cur_data.push(rest.to_string());
@@ -4015,6 +4032,84 @@ data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
             }
             other => panic!("expected a line, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn persistent_sse_reader_discards_suffix_after_oversized_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut sse_socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let bytes_read = sse_socket.read(&mut request).await.unwrap();
+            assert!(request[..bytes_read].starts_with(b"GET /sse "));
+
+            sse_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: keep-alive\r\n\r\n\
+event: endpoint\n\
+data: /messages\n\n",
+                )
+                .await
+                .unwrap();
+            sse_socket.flush().await.unwrap();
+
+            let (mut post_socket, _) = listener.accept().await.unwrap();
+            let bytes_read = post_socket.read(&mut request).await.unwrap();
+            assert!(request[..bytes_read].starts_with(b"POST /messages "));
+            post_socket
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            post_socket.shutdown().await.unwrap();
+
+            let suffix = r#"{"jsonrpc":"2.0","id":7,"result":{"source":"oversized-suffix"}}"#;
+            let expected = r#"{"jsonrpc":"2.0","id":7,"result":{"source":"next-event"}}"#;
+            let body = format!(
+                "data: {}\ndata: {}\n\ndata: {}\n\n",
+                "x".repeat(256),
+                suffix,
+                expected
+            );
+            sse_socket.write_all(body.as_bytes()).await.unwrap();
+            sse_socket.flush().await.unwrap();
+        });
+
+        let config = McpServerConfig {
+            name: "sse-event-boundary".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("http://{addr}/sse")),
+            max_response_bytes: Some(128),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("build transport");
+        let request = JsonRpcRequest::new(7, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = timeout(
+            Duration::from_secs(5),
+            SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle),
+        )
+        .await
+        .expect("next event should be delivered without waiting for EOF")
+        .expect("next event should parse");
+
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("source"))
+                .and_then(serde_json::Value::as_str),
+            Some("next-event")
+        );
+        server.await.unwrap();
+        transport.close().await.unwrap();
     }
 
     #[tokio::test]

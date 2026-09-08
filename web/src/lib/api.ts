@@ -52,6 +52,23 @@ export class ApiError extends Error {
 }
 
 /**
+ * A non-2xx response whose body is not a structured `ApiError` envelope, such
+ * as the session endpoints' `{"error": "..."}` bodies. Carries the HTTP status
+ * so a caller can branch on it (`404` = already gone) without regex-matching
+ * the message. The message keeps the historical `API <status>: <body>` text,
+ * so callers that only read `err.message` see no change.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    body: string,
+  ) {
+    super(`API ${status}: ${body}`);
+    this.name = "HttpError";
+  }
+}
+
+/**
  * Stable config-API error codes, sourced from the generated OpenAPI schema
  * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
  * a backend rename or a typo fails `tsc` here instead of silently regressing
@@ -79,6 +96,21 @@ interface RawResult {
 // Keyed entries are removed as soon as the request settles, so this only merges
 // genuinely-overlapping requests, never caches stale data.
 const inFlightGets = new Map<string, Promise<RawResult>>();
+
+/**
+ * Drop any in-flight coalesced GET for `path` so the next caller performs a
+ * fresh request. Callers already awaiting the shared request still receive
+ * its payload; the point is that a read started after a mutation can never
+ * attach to a request that began before it and report pre-mutation state as
+ * the newest result. Mutating endpoints call this for the listings they
+ * affect.
+ */
+function invalidateInFlightGet(path: string): void {
+  const suffix = ` ${apiOrigin}${basePath}${path}`;
+  for (const key of [...inFlightGets.keys()]) {
+    if (key.endsWith(suffix)) inFlightGets.delete(key);
+  }
+}
 
 export async function apiFetch<T = unknown>(
   path: string,
@@ -126,7 +158,11 @@ export async function apiFetch<T = unknown>(
     if (existing) {
       result = await existing;
     } else {
-      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      // Remove only our own entry on settle: invalidateInFlightGet may have
+      // replaced it with a newer request that must keep coalescing.
+      const pending: Promise<RawResult> = doFetch().finally(() => {
+        if (inFlightGets.get(coalesceKey) === pending) inFlightGets.delete(coalesceKey);
+      });
       inFlightGets.set(coalesceKey, pending);
       result = await pending;
     }
@@ -141,8 +177,8 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!result.ok) {
-    // Try to parse a structured ConfigApiError envelope. Falls back to a
-    // plain Error when the body is non-JSON or doesn't match the shape.
+    // Try to parse a structured ConfigApiError envelope. Falls back to an
+    // HttpError (status only) when the body is non-JSON or doesn't match.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
@@ -162,7 +198,7 @@ export async function apiFetch<T = unknown>(
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
+    throw new HttpError(result.status, result.text || result.statusText);
   }
 
   // Only 204 No Content is a genuinely empty success. A non-204 success with
@@ -2106,14 +2142,40 @@ export function getSessionMessages(
   );
 }
 
-/** Delete a persisted session by its full DB key. */
+/**
+ * Give a persisted session a display name.
+ *
+ * Takes the bare session id (the `gw_`-stripped `session_id`, not
+ * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
+ * the gateway has no metadata row for the session — notably when session
+ * persistence is disabled.
+ */
+export function renameSession(
+  id: string,
+  name: string,
+): Promise<{ session_id: string; name: string }> {
+  return apiFetch<{ session_id: string; name: string }>(
+    `/api/sessions/${encodeURIComponent(id)}`,
+    { method: "PUT", body: JSON.stringify({ name }) },
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
+}
+
+/**
+ * Delete a persisted session. Accepts either the full DB key or a bare gateway
+ * session id — the handler prefixes `gw_` only when the id carries no
+ * underscore. Unlike {@link renameSession}, which needs the bare id.
+ */
 export function deleteSession(
   sessionKey: string,
 ): Promise<{ deleted: boolean }> {
+  // A listing fetched before this delete settled must not be what a
+  // post-delete refresh reports: it would list the row just removed. Also on
+  // failure — a 404 means another client already deleted it, so an in-flight
+  // listing may be stale in exactly the same way.
   return apiFetch<{ deleted: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionKey)}`,
     { method: "DELETE" },
-  );
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
 /**
@@ -2258,5 +2320,32 @@ export function getCliTools(): Promise<CliTool[]> {
       const result = unwrapField(data, "cli_tools");
       return Array.isArray(result) ? result : [];
     },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Chat image upload
+// ---------------------------------------------------------------------------
+
+export interface UploadImageResult {
+  /** Absolute path of the saved file inside the agent workspace. */
+  path: string;
+  /** `[IMAGE:<path>]` marker ready to embed in a chat message. */
+  marker: string;
+}
+
+/**
+ * Upload an image for the given agent's chat. The body is the raw file — the
+ * gateway types it by magic bytes (client MIME and filename are never
+ * trusted), saves it under the agent workspace, and returns the
+ * `[IMAGE:<path>]` marker to embed in the next message.
+ */
+export function uploadChatImage(
+  agent: string,
+  file: Blob,
+): Promise<UploadImageResult> {
+  return apiFetch<UploadImageResult>(
+    `/api/upload?agent=${encodeURIComponent(agent)}`,
+    { method: "POST", body: file },
   );
 }

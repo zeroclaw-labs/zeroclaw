@@ -423,14 +423,21 @@ The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing work
 [providers.models.zerorouter.gateway]
 model   = "anthropic/claude-sonnet-5"
 api_key = "..."   # a ZeroRouter key (prefix `zcr_`); or inject from the env
-# uri = "https://zerorouter.ai/v1"  # a hosted or remote router; omit for the localhost default
+# uri = "http://localhost:8080/v1"  # a self-hosted or local router; omit for the hosted default
 ```
 
-Self-hosted, OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is a
-family of independently operated routers, so there is no canonical hosted
-default: the slot points at a locally running router at `http://localhost:8080/v1`.
-To reach the public deployment at `https://zerorouter.ai`, or any other remote
-router, set `uri` explicitly.
+OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is currently in
+beta. The slot defaults to the public hosted deployment at
+`https://zerorouter.ai/v1`, so model discovery works with no configuration at
+all. ZeroRouter is also self-hostable (AGPL); to reach your own router,
+locally at `http://localhost:8080/v1` or anywhere else, set `uri` explicitly.
+A key minted on one router does not authenticate on another, so `api_key`
+must come from the deployment `uri` points at.
+
+Beyond the chat-completions wire this slot speaks, ZeroRouter also serves the
+OpenAI Responses API inbound (`POST /v1/responses`), so Responses-wire
+clients, such as a Codex CLI `model_provider` with `wire_api = "responses"`,
+can point at the same deployment and key directly.
 
 The `/v1/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing
 and its prompt/completion pricing come live from the router itself without a

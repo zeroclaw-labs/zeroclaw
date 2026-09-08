@@ -689,6 +689,117 @@ body,
 }
 
 /* ---------------------------------------------------------------------------
+   B1.1. Reader controls
+   The scale is set on the root by pc-enhance.js and persisted in localStorage.
+   Keep the controls readable while making them follow the reader's chosen
+   scale alongside the content, sidebar, and page TOC. */
+#mdbook-content main {
+  font-size: calc(1.6rem * var(--pc-reader-scale, 1));
+}
+
+.sidebar .chapter {
+  font-size: calc(1em * var(--pc-reader-scale, 1));
+}
+
+.pc-reader-controls {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.pc-reader-toggle {
+  font-family: var(--pc-font-ui);
+  font-size: calc(1rem * var(--pc-reader-scale, 1));
+  font-weight: 700;
+  letter-spacing: -0.08em;
+  padding-inline: 0.6rem;
+}
+
+.pc-reader-popup {
+  position: absolute;
+  top: calc(100% + 0.5rem);
+  left: 0;
+  z-index: 1001;
+  width: 14rem;
+  padding: 0.8rem;
+  color: var(--pc-text-primary);
+  background: var(--pc-bg-elevated);
+  border: 1px solid var(--pc-border-strong);
+  border-radius: var(--pc-radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  font-size: calc(1.1rem * var(--pc-reader-scale, 1));
+}
+
+.pc-reader-popup[hidden] {
+  display: none;
+}
+
+.pc-reader-popup-title {
+  margin-bottom: 0.65rem;
+  color: var(--pc-text-primary);
+  font-size: 1em;
+  font-weight: 600;
+}
+
+.pc-reader-scale-label {
+  margin-bottom: 0.35rem;
+  color: var(--pc-text-muted);
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.pc-reader-scale-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.pc-reader-scale-button,
+.pc-reader-reset-button {
+  min-height: 2rem;
+  color: var(--pc-text-secondary);
+  background: var(--pc-bg-surface);
+  border: 1px solid var(--pc-border);
+  border-radius: 0.45rem;
+  cursor: pointer;
+  font: inherit;
+  transition: color 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+}
+
+.pc-reader-scale-button {
+  min-width: 2.5rem;
+  padding: 0.25rem 0.4rem;
+  font-weight: 600;
+}
+
+.pc-reader-scale-button:hover,
+.pc-reader-reset-button:hover {
+  color: var(--pc-accent);
+  background: var(--pc-hover-strong);
+  border-color: var(--pc-accent-dim);
+}
+
+.pc-reader-scale-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.pc-reader-scale-value {
+  min-width: 3.1rem;
+  color: var(--pc-text-primary);
+  font-family: var(--pc-font-mono);
+  font-size: 0.95em;
+  text-align: center;
+}
+
+.pc-reader-reset-button {
+  width: 100%;
+  margin-top: 0.65rem;
+  padding: 0.35rem 0.55rem;
+}
+
+/* ---------------------------------------------------------------------------
    B2. Right-hand "On this page" TOC
    The content column already centers via mdBook's max-width; we pin the TOC
    to the right gutter on wide viewports.
@@ -700,21 +811,69 @@ body,
   width: 15rem;
   max-height: calc(100vh - 8rem);
   overflow-y: auto;
-  font-size: 0.82rem;
+  font-size: calc(1rem * var(--pc-reader-scale, 1));
   padding-left: 0.9rem;
   border-left: 1px solid var(--pc-border);
   display: none;
   z-index: 5;
 }
 
+.pc-toc-toggle {
+  display: none;
+}
+
 @media (min-width: 1500px) {
   .pc-page-toc { display: block; }
+}
+
+@media (max-width: 1499px) {
+  .pc-toc-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    width: 100%;
+    margin: 0 0 0.7rem;
+    padding: 0.55rem 0.75rem;
+    color: var(--pc-text-secondary);
+    background: var(--pc-bg-surface);
+    border: 1px solid var(--pc-border);
+    border-radius: 0.55rem;
+    cursor: pointer;
+    font: inherit;
+    font-size: calc(1rem * var(--pc-reader-scale, 1));
+    text-align: start;
+  }
+
+  .pc-toc-toggle:hover,
+  .pc-toc-toggle:focus-visible {
+    color: var(--pc-accent);
+    border-color: var(--pc-accent-dim);
+  }
+
+  .pc-page-toc {
+    position: static;
+    width: auto;
+    max-height: none;
+    margin: 0 0 1.3rem;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid var(--pc-border);
+    border-radius: var(--pc-radius);
+    font-size: calc(1rem * var(--pc-reader-scale, 1));
+  }
+
+  .pc-page-toc.pc-toc-open {
+    display: block;
+  }
+
+  .pc-page-toc:not(.pc-toc-open) {
+    display: none;
+  }
 }
 
 .pc-toc-title {
   text-transform: uppercase;
   letter-spacing: 0.07em;
-  font-size: 0.68rem;
+  font-size: 0.9em;
   font-weight: 600;
   color: var(--pc-text-faint);
   margin-bottom: 0.6rem;
@@ -750,6 +909,184 @@ body,
   color: var(--pc-accent);
   border-left-color: var(--pc-accent);
   font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+   B2.1. Mermaid diagram zoom
+   Diagrams stay in the document at their normal responsive size. The modal is
+   only created when a reader opens one, so dense SVGs can be inspected without
+   changing the page flow or the Mermaid source. */
+.pc-diagram-zoomable {
+  cursor: zoom-in;
+  border-radius: var(--pc-radius);
+}
+
+.pc-diagram-zoomable:focus-visible {
+  outline: 2px solid var(--pc-accent);
+  outline-offset: 0.25rem;
+}
+
+.pc-diagram-modal[hidden] {
+  display: none;
+}
+
+.pc-diagram-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1002;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.7);
+}
+
+.pc-diagram-modal-open {
+  overflow: hidden;
+}
+
+.pc-diagram-surface {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: calc(100vw - 2rem);
+  height: calc(100vh - 2rem);
+  box-sizing: border-box;
+  padding: 1rem;
+  color: var(--pc-text-primary);
+  background: var(--pc-bg-elevated);
+  border: 1px solid var(--pc-border-strong);
+  border-radius: var(--pc-radius-lg);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+  font-size: calc(1rem * var(--pc-reader-scale, 1));
+}
+
+.pc-diagram-modal-title {
+  margin: 0 3rem 0.65rem 0.25rem;
+  color: var(--pc-text-primary);
+  font-size: 1.25em;
+  font-weight: 600;
+}
+
+.pc-diagram-close {
+  position: absolute;
+  top: 0.7rem;
+  right: 0.7rem;
+  width: 2.2rem;
+  height: 2.2rem;
+  color: var(--pc-text-secondary);
+  background: var(--pc-bg-surface);
+  border: 1px solid var(--pc-border);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 1.75em;
+  line-height: 1;
+}
+
+.pc-diagram-close:hover,
+.pc-diagram-close:focus-visible,
+.pc-diagram-control:hover,
+.pc-diagram-control:focus-visible {
+  color: var(--pc-accent);
+  border-color: var(--pc-accent-dim);
+}
+
+.pc-diagram-stage {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0.5rem;
+  background: var(--pc-bg-base);
+  border: 1px solid var(--pc-border);
+  border-radius: var(--pc-radius);
+  cursor: grab;
+  touch-action: none;
+}
+
+.pc-diagram-stage.pc-diagram-dragging {
+  cursor: grabbing;
+}
+
+.pc-diagram-stage > svg {
+  display: block;
+  flex: 0 0 auto;
+  width: auto;
+  max-width: min(88vw, 84rem);
+  max-height: 74vh;
+  transform-origin: center;
+  transition: transform 0.12s ease;
+  user-select: none;
+}
+
+.pc-diagram-dragging > svg {
+  transition: none;
+}
+
+.pc-diagram-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  padding-top: 0.75rem;
+}
+
+.pc-diagram-control {
+  min-width: 2.3rem;
+  min-height: 2rem;
+  padding: 0.3rem 0.55rem;
+  color: var(--pc-text-secondary);
+  background: var(--pc-bg-surface);
+  border: 1px solid var(--pc-border);
+  border-radius: 0.45rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 1em;
+  font-weight: 600;
+}
+
+.pc-diagram-control:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.pc-diagram-reset {
+  margin-left: 0.35rem;
+  font-family: var(--pc-font-mono);
+  font-size: 0.9em;
+}
+
+.pc-diagram-zoom-value {
+  min-width: 3.4rem;
+  color: var(--pc-text-primary);
+  font-family: var(--pc-font-mono);
+  font-size: 0.95em;
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  .pc-reader-popup {
+    left: -0.5rem;
+    width: min(14rem, calc(100vw - 1rem));
+  }
+
+  .pc-diagram-modal {
+    padding: 0.35rem;
+  }
+
+  .pc-diagram-surface {
+    width: 100%;
+    height: 96vh;
+    padding: 0.65rem;
+  }
+
+  .pc-diagram-stage > svg {
+    max-width: 90vw;
+    max-height: 78vh;
+  }
 }
 
 /* ---------------------------------------------------------------------------
