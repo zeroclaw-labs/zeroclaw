@@ -9,7 +9,7 @@ use std::process::Command;
 /// ZeroClaw Arduino Uno base firmware (capabilities, gpio_read, gpio_write).
 const FIRMWARE_INO: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../firmware/arduino/arduino.ino"
+    "/firmware/arduino/arduino.ino"
 ));
 
 const FQBN: &str = "arduino:avr:uno";

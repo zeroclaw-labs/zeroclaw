@@ -6330,6 +6330,64 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
