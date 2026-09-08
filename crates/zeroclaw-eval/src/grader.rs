@@ -208,6 +208,20 @@ impl Grader for MemoryGrader {
     }
 
     async fn grade(&self, _run: &RunRecord, ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+        // Fail closed on a block that cannot fail. Fixture loading already
+        // rejects this shape, but a block that emits zero grades disappears
+        // into any other passing grade, so `grade_with`'s all-empty backstop
+        // never sees it. This is the grader-level equivalent for cases built
+        // in-process (tests, embedded fixtures).
+        if self.expects.is_empty() {
+            return vec![GradeResult::new(
+                "memory_expectations".to_string(),
+                false,
+                "expects.memory declares no checks",
+                GradeCategory::Config,
+            )];
+        }
+
         let mut out = Vec::new();
 
         for key in &self.expects.present {
@@ -320,6 +334,21 @@ impl Grader for MemoryGrader {
                     "contains requires at least one substring",
                     GradeCategory::SideEffect,
                 ));
+                continue;
+            }
+            // `str::contains("")` is true for every stored value, so an empty
+            // needle is a check that cannot fail. Fail the entry the way an
+            // invalid key does, before the backend is read.
+            if needles.iter().any(String::is_empty) {
+                for needle in needles {
+                    out.push(GradeResult::new(
+                        format!("memory_contains({key:?}, {needle:?})"),
+                        false,
+                        "contains substrings must be non-empty; an empty substring \
+                         matches every value",
+                        GradeCategory::SideEffect,
+                    ));
+                }
                 continue;
             }
             let Some(memory) = ctx.memory else {
@@ -1155,6 +1184,89 @@ mod tests {
             assert!(!grades[0].passed);
             assert_eq!(grades[0].detail, "contains requires at least one substring");
             assert_eq!(grades[0].category, GradeCategory::SideEffect);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_grader_rejects_an_expectation_block_that_declares_no_checks() {
+        // `MemoryExpects::default()` used to emit zero grades, which a report
+        // with any other passing grade reads as a green memory assertion.
+        // `grade_with`'s all-empty backstop cannot see that, so the grader
+        // itself has to fail closed on a block that cannot fail.
+        let grades = MemoryGrader {
+            expects: MemoryExpects::default(),
+        }
+        .grade(
+            &run("", &[], true),
+            &GradeContext {
+                workspace: std::path::Path::new("/nonexistent"),
+                memory: Some(&PanicGetMemory),
+            },
+        )
+        .await;
+
+        assert_eq!(grades.len(), 1, "expected one config grade: {grades:?}");
+        assert_eq!(grades[0].check, "memory_expectations");
+        assert!(!grades[0].passed, "the config grade must fail: {grades:?}");
+        assert_eq!(grades[0].category, GradeCategory::Config);
+        assert!(
+            grades[0].detail.contains("no checks"),
+            "detail must explain the failure: {:?}",
+            grades[0].detail
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_grader_rejects_empty_contains_needles_without_backend_access() {
+        // `str::contains("")` is always true, so an empty needle grades green
+        // against any stored value. Fail the whole entry before the backend is
+        // touched, exactly as an invalid key does.
+        let expects = MemoryExpects {
+            contains: BTreeMap::from([(
+                "profile/role".into(),
+                vec![String::new(), "reviewer".into()],
+            )]),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let with_backend = MemoryGrader {
+            expects: expects.clone(),
+        }
+        .grade(
+            &run("", &[], true),
+            &GradeContext {
+                workspace: tmp.path(),
+                memory: Some(&PanicGetMemory),
+            },
+        )
+        .await;
+        let without_backend = MemoryGrader { expects }
+            .grade(&run("", &[], true), &dummy_ctx())
+            .await;
+
+        for grades in [&with_backend, &without_backend] {
+            assert_eq!(grades.len(), 2, "expected one grade per needle: {grades:?}");
+            assert!(
+                grades.iter().all(|grade| !grade.passed),
+                "no needle may pass: {grades:?}"
+            );
+            assert!(
+                grades
+                    .iter()
+                    .all(|grade| grade.category == GradeCategory::SideEffect),
+                "unexpected category: {grades:?}"
+            );
+            assert!(
+                grades
+                    .iter()
+                    .all(|grade| grade.detail.contains("non-empty")),
+                "detail must explain the failure: {grades:?}"
+            );
+            assert_eq!(grades[0].check, r#"memory_contains("profile/role", "")"#);
+            assert_eq!(
+                grades[1].check,
+                r#"memory_contains("profile/role", "reviewer")"#
+            );
         }
     }
 

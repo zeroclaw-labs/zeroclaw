@@ -309,7 +309,9 @@ impl WorkspaceExpects {
 }
 
 impl MemoryExpects {
-    fn is_empty(&self) -> bool {
+    /// True when the block declares no memory check at all. The grader reads
+    /// this too, so the "asserts nothing" rule has one definition.
+    pub(crate) fn is_empty(&self) -> bool {
         self.present.is_empty() && self.absent.is_empty() && self.contains.is_empty()
     }
 }
