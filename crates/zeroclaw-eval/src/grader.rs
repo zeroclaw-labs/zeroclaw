@@ -1010,7 +1010,6 @@ mod tests {
         assert_eq!(out[1].detail, "matched");
     }
 
-
     // ---- B1: argument / result round-trip expectations ----
 
     #[test]
