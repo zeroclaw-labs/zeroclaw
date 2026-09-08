@@ -3564,6 +3564,8 @@ mod tests {
     /// would then resolve to the previous incarnation's files (ADR-011).
     #[tokio::test]
     async fn agent_rename_retries_unreadable_workspace_before_alias_reuse() {
+        use axum::body::to_bytes;
+
         let tmp = tempfile::tempdir().unwrap();
         let mut config = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
