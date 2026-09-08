@@ -2507,6 +2507,14 @@ impl RpcDispatcher {
                 })
             }
             Ok(TurnOutcome::ContextExhausted { text, .. }) => {
+                // Context exhaustion ends the turn as a failure, so the durable
+                // row has to leave `running` exactly like the generic error arm
+                // below and like the gateway's failed-turn path. Skipping this
+                // write would leave `session/state` and stuck-session detection
+                // reporting a live turn that already returned to the caller.
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "error", Some(&turn_id));
+                }
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
@@ -13470,6 +13478,67 @@ mod tests {
         assert!(
             after.turn_id.is_some(),
             "the error state must still carry the turn id it failed under"
+        );
+    }
+
+    /// Context exhaustion returns a terminal RPC response, so the durable Chat
+    /// row must leave `running` on that path too. Otherwise `session/state` and
+    /// stuck-session detection keep reporting the finished turn as live.
+    #[tokio::test]
+    async fn session_prompt_leaves_running_state_on_context_exhaustion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-state-context-exhausted";
+        let session_key =
+            install_state_test_session(&sessions, &chat_backend, sid, PartialThenContextProvider)
+                .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-context-exhausted:pid=1".into());
+
+        let running = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.state, "idle", "the session starts out not running");
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "large request",
+            }))
+            .await
+            .expect("typed context exhaustion returns a terminal RPC result");
+        assert_eq!(result["stop_reason"], "context_exhausted");
+
+        let reported = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await
+            .expect("session/state must resolve the rpc_ row");
+        assert_ne!(
+            reported["state"], "running",
+            "a returned context-exhausted turn must not still report as running"
+        );
+        assert_eq!(
+            reported["state"], "error",
+            "context exhaustion is a failed turn, so it records the error state"
+        );
+        assert!(
+            reported["turn_id"].is_string(),
+            "the terminal state must carry the turn id it failed under"
         );
     }
 
