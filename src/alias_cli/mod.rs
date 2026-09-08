@@ -542,44 +542,62 @@ fn agent_delete_precheck(_config: &Config, _alias: &str) -> Result<()> {
     Ok(())
 }
 
+/// Archive the workspace and run the owned-state cascade, returning both halves
+/// so the caller can report every partial failure.
+///
+/// The gateway and RPC surfaces hand their archive and cascade warnings back to
+/// the requester; the CLI prints them. Keeping the side effects here and the
+/// printing in the caller is what lets a regression assert the archive half
+/// instead of only the cascade half.
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+async fn run_agent_delete_cascade(
+    config: &Config,
+    alias: &str,
+    workspace: &std::path::Path,
+) -> Result<(
+    zeroclaw_runtime::agent_owned_state::AgentDeletionArchive,
+    zeroclaw_runtime::agent_owned_state::OwnedStateReport,
+)> {
+    let (mem, session_backend) = build_owned_state_handles(config)?;
+    // Archive the workspace dir alongside the owned-state exports through the
+    // shared runtime helper, so this surface gets the same exclusive archive
+    // leaf as the gateway and RPC (a duplicate delete cannot truncate the first
+    // attempt's export) and the same fail-toward-residue workspace probe (an
+    // unreadable workspace is reported, not silently skipped). `workspace` was
+    // resolved by the caller before the config entry was removed, so a custom
+    // `workspace.path` is preserved (post-removal it would default).
+    let archive =
+        zeroclaw_runtime::agent_owned_state::archive_agent_workspace(config, alias, workspace)
+            .await;
+    let report = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
+        config,
+        Some(&mem),
+        session_backend.as_ref(),
+        alias,
+        &archive.path,
+    )
+    .await;
+    Ok((archive, report))
+}
+
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
 async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
 ) -> Result<()> {
-    let (mem, session_backend) = build_owned_state_handles(config)?;
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = config
-        .data_dir
-        .join("agents")
-        .join("_deleted")
-        .join(format!("{alias}-{ts}"));
-    tokio::fs::create_dir_all(&archive_dir).await.ok();
-    // Archive the workspace dir alongside the owned-state exports. `workspace`
-    // was resolved by the caller before the config entry was removed, so a
-    // custom `workspace.path` is preserved (post-removal it would default).
-    if workspace.exists()
-        && let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await
-    {
-        let es = e.to_string();
+    let (archive, report) = run_agent_delete_cascade(config, alias, workspace).await?;
+    let archive_dir = archive.path;
+    for warning in &archive.warnings {
         eprintln!(
             "{}",
             mta(
                 "cli-alias-warn-workspace-archive",
-                &[("error", es.as_str())],
+                &[("error", warning.as_str())],
                 "warning: workspace archive failed: {$error}"
             )
         );
     }
-    let report = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
-        config,
-        Some(&mem),
-        session_backend.as_ref(),
-        alias,
-        &archive_dir,
-    )
-    .await;
     let memory = report.memory_purged.to_string();
     let cron = report.cron_removed.to_string();
     let acp = report.acp_removed.to_string();
@@ -632,20 +650,40 @@ async fn agent_rename_owned_state(
     // Move the workspace dir (default per-alias location only; a custom path is
     // alias-independent → old_ws == new_ws → skip).
     let new_ws = config.agent_workspace_dir(to);
-    if old_ws != new_ws && old_ws.exists() {
-        if let Some(parent) = new_ws.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        if let Err(e) = tokio::fs::rename(old_ws, &new_ws).await {
-            let es = e.to_string();
-            eprintln!(
-                "{}",
-                mta(
-                    "cli-alias-warn-workspace-move",
-                    &[("error", es.as_str())],
-                    "warning: workspace move failed: {$error}"
-                )
-            );
+    if old_ws != new_ws {
+        // An unreadable source is residue, not absence: reporting a metadata
+        // failure as "nothing to move" would leave the retired workspace on
+        // disk while the rename looks clean, and recreating the old alias would
+        // resolve to the previous incarnation's files.
+        match tokio::fs::try_exists(old_ws).await {
+            Ok(true) => {
+                if let Some(parent) = new_ws.parent() {
+                    tokio::fs::create_dir_all(parent).await.ok();
+                }
+                if let Err(e) = tokio::fs::rename(old_ws, &new_ws).await {
+                    let es = e.to_string();
+                    eprintln!(
+                        "{}",
+                        mta(
+                            "cli-alias-warn-workspace-move",
+                            &[("error", es.as_str())],
+                            "warning: workspace move failed: {$error}"
+                        )
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let es = format!("workspace inspection failed for {}: {e}", old_ws.display());
+                eprintln!(
+                    "{}",
+                    mta(
+                        "cli-alias-warn-workspace-move",
+                        &[("error", es.as_str())],
+                        "warning: workspace move failed: {$error}"
+                    )
+                );
+            }
         }
     }
     let (mem, session_backend) = build_owned_state_handles(config)?;
@@ -1055,6 +1093,97 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a recreated alias must not inherit rows from the deleted incarnation"
+        );
+    }
+
+    /// Committed-delete recovery, CLI surface. A workspace whose metadata
+    /// cannot be read is residue, not absence: skipping it silently would leave
+    /// the retired directory on disk while the delete reports a clean result,
+    /// and recreating the alias would then resolve to the previous
+    /// incarnation's files (ADR-011). Routing the CLI archive step through the
+    /// shared helper is what surfaces the inspection failure here, the same way
+    /// the gateway and RPC surfaces already do.
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn agent_delete_retries_unreadable_workspace_before_alias_reuse_on_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        // Committed-delete shape: `agents.victim` is already gone, only the
+        // workspace still lags behind.
+        let workspace = config.agent_workspace_dir("victim");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("retired-marker.txt"), b"prior incarnation").unwrap();
+        assert!(config.agent("victim").is_none());
+
+        // Unreadable rather than absent: the workspace's parent becomes a file,
+        // so metadata lookups on it fail with an error instead of `false`. The
+        // archive root lives under `data_dir`, so it stays writable.
+        let agent_root = workspace.parent().unwrap().to_path_buf();
+        let saved_agent_root = agent_root.with_extension("saved");
+        std::fs::rename(&agent_root, &saved_agent_root).unwrap();
+        std::fs::write(&agent_root, b"blocks child metadata").unwrap();
+        assert!(workspace.try_exists().is_err());
+
+        let (archive, _report) = run_agent_delete_cascade(&config, "victim", &workspace)
+            .await
+            .expect("a refused archive is still a completed call");
+        assert!(
+            archive
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("workspace inspection failed")),
+            "an unreadable workspace must be reported, not skipped: {:?}",
+            archive.warnings
+        );
+        assert!(
+            agent_delete_residue_exists(&config, "victim").await,
+            "an uninspectable workspace is residue the retry must see"
+        );
+
+        std::fs::remove_file(&agent_root).unwrap();
+        std::fs::rename(&saved_agent_root, &agent_root).unwrap();
+        assert!(workspace.join("retired-marker.txt").exists());
+
+        handle_agents(
+            AgentsCommands::Delete {
+                alias: "victim".to_string(),
+                dry_run: false,
+                yes: true,
+            },
+            &mut config,
+        )
+        .await
+        .expect("the retry must re-enter the cascade, not bail `not configured`");
+
+        let archived = std::fs::read_dir(config.data_dir.join("agents/_deleted"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.path().join("workspace/retired-marker.txt").exists())
+            .expect("the repaired retry must archive the retired workspace");
+        assert!(archived.path().join("workspace").is_dir());
+        assert!(
+            !workspace.exists(),
+            "the retired workspace must not stay in place after convergence"
+        );
+
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(
+            !workspace.join("retired-marker.txt").exists(),
+            "reusing the alias must not expose the previous incarnation's files"
         );
     }
 
