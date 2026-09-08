@@ -4733,7 +4733,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[test]
-    fn progress_notes_are_sent_as_summaries_until_a_model_takes_them() {
+    fn progress_notes_are_sent_as_summaries_from_generation_5_1() {
         use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay};
         let provider = AnthropicModelProvider::builder("test")
             .credential(Some("test-key"))
@@ -4743,18 +4743,23 @@ data: {\"type\":\"message_stop\"}\n\n";
             effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
-        for model in ["claude-opus-4-7", "claude-fable-5-1"] {
-            let tuning = provider.resolve_thinking(Some(params), None, model);
-            assert_eq!(
-                tuning
-                    .thinking
-                    .as_ref()
-                    .and_then(|thinking| thinking.display),
-                Some(ThinkingDisplay::Summarized),
-                "{model} gets a summary in place of progress notes"
-            );
-            assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
-        }
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
+        assert_eq!(
+            tuning
+                .thinking
+                .as_ref()
+                .and_then(|thinking| thinking.display),
+            Some(ThinkingDisplay::Summarized),
+            "the generation that rejected the value gets a summary instead"
+        );
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+
+        let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-7");
+        assert_eq!(
+            tuning.display,
+            Some(ThinkingDisplay::Updates),
+            "an earlier generation still takes the progress notes"
+        );
 
         let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
         assert!(
