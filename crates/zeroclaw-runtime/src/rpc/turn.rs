@@ -740,6 +740,7 @@ mod thinking_scope_tests {
             budget_tokens: None,
             effort: Some(ThinkingEffort::Max),
             display: Some(ThinkingDisplay::Summarized),
+            profile_display: None,
         };
 
         execute_turn(

@@ -143,13 +143,18 @@ pub fn apply_thinking_level_with_config(
     // does not: a level the operator chose should reach the families that read
     // it, and the default level asks for nothing.
     let effort = level.native_effort();
-    let display = config.display.to_display();
-    params.native_thinking = (budget_tokens.is_some() || effort.is_some() || display.is_some())
-        .then_some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens,
-            effort,
-            display,
-        });
+    // The profile's display is the standing default, which the provider alias
+    // and a per-request choice both outrank, so it travels in its own field.
+    let profile_display = config.display.to_display();
+    params.native_thinking = (budget_tokens.is_some()
+        || effort.is_some()
+        || profile_display.is_some())
+    .then_some(zeroclaw_config::scattered_types::NativeThinkingParams {
+        budget_tokens,
+        effort,
+        display: None,
+        profile_display,
+    });
     params
 }
 
@@ -637,7 +642,15 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
-        assert_eq!(native.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(
+            native.profile_display,
+            Some(ThinkingDisplay::Updates),
+            "the profile value travels below the provider alias"
+        );
+        assert_eq!(
+            native.display, None,
+            "the profile chose nothing for this request in particular"
+        );
 
         // Default config (`display: off`) must leave the wire field unset.
         let config = ThinkingConfig {
@@ -649,6 +662,7 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
+        assert_eq!(native.profile_display, None);
         assert_eq!(native.display, None);
     }
 
@@ -722,6 +736,7 @@ display = "updates"
             budget_tokens: Some(32_000),
             effort: None,
             display: Some(ThinkingDisplay::Summarized),
+            profile_display: None,
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {

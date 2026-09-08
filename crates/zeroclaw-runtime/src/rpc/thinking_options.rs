@@ -158,17 +158,17 @@ pub fn thinking_options(context: &ThinkingContext<'_>) -> ThinkingOptions {
     } else if let Some(display) = context.session_display {
         (Some(display), Some(DisplaySource::Session))
     } else if let Some(display) = context
+        .alias_display
+        .filter(|display| capabilities.supports_display(*display))
+    {
+        (Some(display), Some(DisplaySource::Alias))
+    } else if let Some(display) = context
         .profile
         .display
         .to_display()
         .filter(|display| capabilities.supports_display(*display))
     {
         (Some(display), Some(DisplaySource::Profile))
-    } else if let Some(display) = context
-        .alias_display
-        .filter(|display| capabilities.supports_display(*display))
-    {
-        (Some(display), Some(DisplaySource::Alias))
     } else {
         (
             Some(ThinkingDisplay::Omitted),
@@ -215,10 +215,11 @@ fn level_for_effort(effort: ThinkingEffort) -> ThinkingLevel {
 }
 
 /// The native thinking parameters for one turn. The inline prefix beats the
-/// session override, which beats the profile default; the session display
-/// beats the profile's `display`, and the provider alias fills in behind
-/// both. `None` when nothing asks the provider for anything, which leaves
-/// the model to its own defaults.
+/// session override, which beats the profile default. The session display
+/// rides on the request itself, so the adapter reads it ahead of the provider
+/// alias, and the profile's `display` travels behind the alias in
+/// `profile_display`. `None` when nothing asks the provider for anything,
+/// which leaves the model to its own defaults.
 #[must_use]
 pub fn resolve_session_thinking(
     inline_level: Option<ThinkingLevel>,
@@ -231,14 +232,12 @@ pub fn resolve_session_thinking(
     let native =
         crate::agent::thinking::apply_thinking_level_with_config(level, profile).native_thinking;
     match (native, session_display) {
-        (Some(params), display) => Some(NativeThinkingParams {
-            display: display.or(params.display),
-            ..params
-        }),
+        (Some(params), display) => Some(NativeThinkingParams { display, ..params }),
         (None, Some(display)) => Some(NativeThinkingParams {
             budget_tokens: None,
             effort: None,
             display: Some(display),
+            profile_display: None,
         }),
         (None, None) => None,
     }
@@ -374,26 +373,44 @@ mod tests {
             Some(LevelSource::ModelDefault),
             "the default level leaves the depth to the model"
         );
-        assert_eq!(options.displays, vec![Omitted, Summarized]);
+        assert_eq!(
+            options.displays,
+            vec![Omitted, Summarized, Updates],
+            "the generations before 5.1 still offer the progress notes"
+        );
     }
 
     #[test]
-    fn options_report_the_profile_display_between_session_and_alias() {
+    fn options_report_the_alias_display_between_session_and_profile() {
         use zeroclaw_config::scattered_types::ThinkingDisplayMode;
         let mut profile = profile(High, false);
         profile.display = ThinkingDisplayMode::Summarized;
         let mut ctx = context("anthropic.default", "claude-opus-4-8", &profile);
         ctx.alias_display = Some(Omitted);
         let options = thinking_options(&ctx);
-        assert_eq!(options.current_display, Some(Summarized));
-        assert_eq!(options.display_source, Some(DisplaySource::Profile));
+        assert_eq!(
+            options.current_display,
+            Some(Omitted),
+            "the alias entry outranks the profile default"
+        );
+        assert_eq!(options.display_source, Some(DisplaySource::Alias));
 
-        ctx.session_display = Some(Omitted);
+        ctx.alias_display = None;
         let options = thinking_options(&ctx);
-        assert_eq!(options.current_display, Some(Omitted));
+        assert_eq!(options.current_display, Some(Summarized));
+        assert_eq!(
+            options.display_source,
+            Some(DisplaySource::Profile),
+            "the profile default applies where the alias names nothing"
+        );
+
+        ctx.alias_display = Some(Omitted);
+        ctx.session_display = Some(Summarized);
+        let options = thinking_options(&ctx);
+        assert_eq!(options.current_display, Some(Summarized));
         assert_eq!(options.display_source, Some(DisplaySource::Session));
 
-        // A profile display the generation does not take falls through.
+        // A display the generation does not take falls through.
         let mut ctx = context("anthropic.default", "claude-opus-4-6", &profile);
         ctx.alias_display = Some(Omitted);
         let options = thinking_options(&ctx);
@@ -402,12 +419,21 @@ mod tests {
 
         let params = resolve_session_thinking(None, None, None, &profile).unwrap();
         assert_eq!(
-            params.display,
+            params.display, None,
+            "nothing chose a display for the request itself"
+        );
+        assert_eq!(
+            params.profile_display,
             Some(Summarized),
-            "the profile display rides on the turn when the session chose none"
+            "the profile display rides behind the alias"
         );
         let params = resolve_session_thinking(None, None, Some(Updates), &profile).unwrap();
-        assert_eq!(params.display, Some(Updates), "the session display wins");
+        assert_eq!(
+            params.display,
+            Some(Updates),
+            "the session display is the request's own choice"
+        );
+        assert_eq!(params.profile_display, Some(Summarized));
     }
 
     #[test]

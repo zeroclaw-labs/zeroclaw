@@ -2202,12 +2202,15 @@ impl AnthropicModelProvider {
             );
         }
         // The request's own choice wins over the alias setting, so a session
-        // control can narrow or widen what the operator configured. A choice
-        // the generation does not take is dropped, and a choice that matches
-        // the API default sends nothing.
+        // control can narrow or widen what the operator configured; the alias
+        // in turn wins over the runtime profile's standing default, the same
+        // way `temperature` and `max_tokens` do. A choice the generation does
+        // not take is dropped, and a choice that matches the API default sends
+        // nothing.
         let requested_display = thinking
             .and_then(|params| params.display)
-            .or_else(|| self.thinking_display.map(Into::into));
+            .or_else(|| self.thinking_display.map(Into::into))
+            .or_else(|| thinking.and_then(|params| params.profile_display));
         let display = requested_display.and_then(|display| capabilities.fit_display(display));
         if requested_display != display {
             ::zeroclaw_log::record!(
@@ -4515,6 +4518,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-opus-4-7");
         assert!(
@@ -4537,6 +4541,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
             display: Some(ThinkingDisplay::Summarized),
+            profile_display: None,
         };
         let tuning =
             provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1-20260815");
@@ -4559,6 +4564,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
         assert!(tuning.uses_fixed_budget());
@@ -4582,6 +4588,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: Some(ThinkingEffort::High),
             display: None,
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-fable-5-1");
         let thinking = tuning
@@ -4649,6 +4656,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: None,
             display: Some(ThinkingDisplay::Summarized),
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
         let thinking = tuning
@@ -4671,6 +4679,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: None,
             display: Some(ThinkingDisplay::Omitted),
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
         assert!(
@@ -4692,6 +4701,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: Some(ThinkingEffort::High),
             display: None,
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
         let thinking = tuning
@@ -4700,6 +4710,69 @@ data: {\"type\":\"message_stop\"}\n\n";
             .expect("a chosen depth sends the object");
         assert_eq!(thinking.display, Some(ThinkingDisplay::Summarized));
         assert_eq!(tuning.display, Some(ThinkingDisplay::Summarized));
+    }
+
+    #[test]
+    fn the_display_chain_runs_request_then_alias_then_profile() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+        use zeroclaw_config::schema::AnthropicThinkingDisplay;
+        let params = |display, profile_display| NativeThinkingParams {
+            budget_tokens: None,
+            effort: Some(ThinkingEffort::High),
+            display,
+            profile_display,
+        };
+        let with_alias = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Summarized))
+            .build();
+        let without_alias = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .build();
+
+        // The session's own choice outranks both standing settings.
+        let tuning = with_alias.resolve_thinking(
+            Some(params(
+                Some(ThinkingDisplay::Updates),
+                Some(ThinkingDisplay::Omitted),
+            )),
+            None,
+            "claude-opus-4-8",
+        );
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Updates));
+
+        // The alias outranks the profile default.
+        let tuning = with_alias.resolve_thinking(
+            Some(params(None, Some(ThinkingDisplay::Updates))),
+            None,
+            "claude-opus-4-8",
+        );
+        assert_eq!(
+            tuning.display,
+            Some(ThinkingDisplay::Summarized),
+            "the entry-level value must win over the profile-level one"
+        );
+
+        // The profile default applies where the alias names nothing.
+        let tuning = without_alias.resolve_thinking(
+            Some(params(None, Some(ThinkingDisplay::Updates))),
+            None,
+            "claude-opus-4-8",
+        );
+        assert_eq!(tuning.display, Some(ThinkingDisplay::Updates));
+
+        // An explicit omitted on the alias means the API default, and does
+        // not fall through to the profile value behind it.
+        let omitted_alias = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .thinking_display(Some(AnthropicThinkingDisplay::Omitted))
+            .build();
+        let tuning = omitted_alias.resolve_thinking(
+            Some(params(None, Some(ThinkingDisplay::Updates))),
+            None,
+            "claude-opus-4-8",
+        );
+        assert_eq!(tuning.display, None);
     }
 
     #[test]
@@ -4714,6 +4787,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: Some(ThinkingEffort::High),
             display: Some(ThinkingDisplay::Updates),
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
         let thinking = tuning
@@ -4742,6 +4816,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: None,
             display: Some(ThinkingDisplay::Updates),
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-fable-5-1");
         assert_eq!(
@@ -4831,6 +4906,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: None,
             display: Some(ThinkingDisplay::Updates),
+            profile_display: None,
         };
         for model in ["claude-fable-5-1", "claude-mythos-5-1", "claude-next"] {
             let tuning = provider.resolve_thinking(Some(params), None, model);
@@ -4910,6 +4986,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 budget_tokens: None,
                 effort: Some(effort),
                 display: None,
+                profile_display: None,
             };
             let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-5");
             assert_eq!(
@@ -4930,6 +5007,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: Some(ThinkingEffort::XHigh),
             display: None,
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), None, "claude-opus-4-6");
         assert_eq!(
@@ -4954,6 +5032,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: None,
             effort: Some(ThinkingEffort::Max),
             display: None,
+            profile_display: None,
         };
         let tuning = provider.resolve_thinking(Some(params), Some(0.3_f64), "claude-haiku-4-5");
         assert!(tuning.thinking.is_none());
@@ -8791,6 +8870,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
             display: Some(ThinkingDisplay::Updates),
+            profile_display: None,
         };
         // Generation 4.6 takes no display; the families that write progress
         // notes do.
@@ -8805,6 +8885,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let tuning =
             model_provider.resolve_thinking(Some(params), Some(0.7_f64), "claude-sonnet-4-5");
@@ -9100,6 +9181,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                     budget_tokens: Some(2_048),
                     effort: None,
                     display: Some(ThinkingDisplay::Updates),
+                    profile_display: None,
                 }),
             },
             "claude-fable-5-1",

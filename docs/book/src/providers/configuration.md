@@ -137,9 +137,9 @@ display = "updates"
 `thinking-display-updates` beta; without enrollment the API rejects the
 request. Set `display = "off"` (or remove the field) to return to the
 previous wire behavior. The field reaches generation 4.7 and later only; a
-value the model does not take is dropped with a log line. A zerocode session
-may choose a different display for itself, which beats this setting; the
-Anthropic slot's `thinking_display` fills in behind both (see
+value the model does not take is dropped with a log line. This is the standing
+default at the bottom of the chain: the Anthropic slot's `thinking_display`
+overrides it, and a zerocode session's own choice overrides both (see
 [Anthropic](#anthropic)).
 
 ### Per-entry override

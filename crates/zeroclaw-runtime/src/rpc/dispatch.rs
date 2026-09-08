@@ -12514,16 +12514,19 @@ mod tests {
                     budget_tokens: None,
                     effort: Some(ThinkingEffort::Max),
                     display: Some(ThinkingDisplay::Summarized),
+                    profile_display: None,
                 }),
                 Some(NativeThinkingParams {
                     budget_tokens: None,
                     effort: Some(ThinkingEffort::Low),
                     display: Some(ThinkingDisplay::Summarized),
+                    profile_display: None,
                 }),
                 Some(NativeThinkingParams {
                     budget_tokens: None,
                     effort: Some(ThinkingEffort::High),
                     display: Some(ThinkingDisplay::Summarized),
+                    profile_display: None,
                 }),
             ],
             "the inline level applies to its own turn only; the session level and display carry over"
@@ -12561,6 +12564,7 @@ mod tests {
                 budget_tokens: None,
                 effort: Some(ThinkingEffort::High),
                 display: None,
+                profile_display: None,
             }),
             "the profile's default level reaches RPC turns natively"
         );

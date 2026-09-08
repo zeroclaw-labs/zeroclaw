@@ -89,17 +89,26 @@ impl ThinkingDisplay {
 /// whichever of the depth settings it accepts; both are absent when the caller
 /// asked for the provider's own default depth. The display travels alongside
 /// so one request can choose how much of the reasoning comes back.
+///
+/// The two display fields carry the two ends of the precedence chain the
+/// adapter resolves: `display` is the choice made for this request, which
+/// outranks the provider alias, and `profile_display` is the standing default
+/// the alias outranks in turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ThinkingEffort>,
-    /// How much of the reasoning comes back. `None` leaves the choice to the
-    /// runtime profile, then the provider alias, and past that to the API
-    /// default.
+    /// How much of the reasoning comes back, chosen for this request. `None`
+    /// leaves the choice to the provider alias, then to `profile_display`,
+    /// and past those to the API default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<ThinkingDisplay>,
+    /// The runtime profile's standing `agent.thinking.display`. It applies
+    /// only where neither this request nor the provider alias named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_display: Option<ThinkingDisplay>,
 }
 
 /// A single message in a conversation.
@@ -1396,6 +1405,7 @@ mod thinking_display_tests {
             budget_tokens: Some(1_024),
             effort: None,
             display: Some(ThinkingDisplay::Updates),
+            profile_display: None,
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
         assert!(
@@ -1410,6 +1420,7 @@ mod thinking_display_tests {
             budget_tokens: Some(1_024),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
         assert!(

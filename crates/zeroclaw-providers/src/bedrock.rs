@@ -2325,6 +2325,7 @@ mod tests {
             budget_tokens: Some(10_000),
             effort: Some(ThinkingEffort::High),
             display: None,
+            profile_display: None,
         };
         let (temperature, fields, max_tokens) = provider.resolve_thinking(
             Some(params),
@@ -2353,6 +2354,7 @@ mod tests {
             budget_tokens: Some(10_000),
             effort: None,
             display: None,
+            profile_display: None,
         };
         let (temperature, fields, max_tokens) = provider.resolve_thinking(
             Some(params),
@@ -2377,6 +2379,7 @@ mod tests {
             budget_tokens: None,
             effort: Some(ThinkingEffort::Max),
             display: None,
+            profile_display: None,
         };
         let (_, fields, _) =
             provider.resolve_thinking(Some(params), None, "us.anthropic.claude-opus-4-6-v1");
@@ -2396,6 +2399,7 @@ mod tests {
             budget_tokens: None,
             effort: Some(ThinkingEffort::XHigh),
             display: None,
+            profile_display: None,
         };
         let (_, fields, _) =
             provider.resolve_thinking(Some(params), None, "us.anthropic.claude-sonnet-4-6-v1");
@@ -2423,6 +2427,7 @@ mod tests {
             budget_tokens: None,
             effort: Some(ThinkingEffort::High),
             display: Some(ThinkingDisplay::Updates),
+            profile_display: None,
         };
         let (_, fields, _) =
             provider.resolve_thinking(Some(params), None, "anthropic.claude-fable-5-1");

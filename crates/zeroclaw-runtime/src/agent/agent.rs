@@ -9405,6 +9405,7 @@ mod tests {
                     budget_tokens: Some(1_024),
                     effort: None,
                     display: None,
+                    profile_display: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -9416,6 +9417,7 @@ mod tests {
                     budget_tokens: Some(2_048),
                     effort: None,
                     display: None,
+                    profile_display: None,
                 }),
                 agent_b.turn("same request"),
             )
