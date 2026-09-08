@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use zeroclaw_api::channel::SendMessage;
+use zeroclaw_api::webhook::{PluginWebhookRegistry, RawWebhook};
+use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
 use zeroclaw_config::providers::{ChannelRef, ModelProviderRef};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, AnthropicModelProviderConfig, Config, PluginChannelConfig,
@@ -154,13 +156,27 @@ fn activation_config(plugins: &TempDir, alias: &str, retry_count: &str) -> Confi
 #[tokio::test]
 async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
     let plugins = install_fixture_package();
-    let config = activation_config(&plugins, "operations", "5");
+    let mut config = activation_config(&plugins, "operations", "5");
+    config.peer_groups.insert(
+        "plugin-operations".to_string(),
+        PeerGroupConfig {
+            channel: ChannelRef::new("plugin.operations"),
+            external_peers: vec![PeerUsername::new("tester")],
+            ..PeerGroupConfig::default()
+        },
+    );
     config
         .validate()
         .expect("the activation declaration is valid operator config");
 
-    let channels =
-        zeroclaw_runtime::plugin_runtime::configured_plugin_channels(Arc::new(config), None).await;
+    let registry = Arc::new(PluginWebhookRegistry::new());
+    let webhook_generation = registry.start_generation();
+    let channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
+        Arc::new(config),
+        None,
+        Some(&webhook_generation),
+    )
+    .await;
 
     assert_eq!(channels.len(), 1, "the configured fixture must construct");
     let channel = Arc::clone(&channels[0]);
@@ -181,10 +197,34 @@ async fn configured_channel_reaches_real_guest_and_shared_listener_contract() {
 
     // The adapter owns its poll loop and must keep running until its receiver
     // goes away, which is the contract the shared supervisor relies on.
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let listener_channel = Arc::clone(&channel);
     let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
-    tokio::time::sleep(Duration::from_millis(75)).await;
+    let sink = registry
+        .get("fixture")
+        .expect("validated guest route is published atomically");
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    sink.send(RawWebhook {
+        headers: vec![(
+            "x-fixture-secret".to_string(),
+            "channel-secret".to_string(),
+        )],
+        body: br#"{"id":"runtime-1","sender":"tester","reply_target":"room","content":"from webhook"}"#.to_vec(),
+        cancellation: zeroclaw_api::webhook::WebhookCancellation::new(),
+        idempotency: None,
+        reply,
+    })
+    .await
+    .expect("published route remains live");
+    assert!(outcome.await.expect("webhook worker replies").is_ok());
+    let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("webhook reaches shared channel receiver")
+        .expect("listener remains connected");
+    assert_eq!(message.id, "runtime-1");
+    assert_eq!(message.content, "from webhook");
+    assert_eq!(message.channel, "plugin");
+    assert_eq!(message.channel_alias.as_deref(), Some("operations"));
     assert!(
         !listener.is_finished(),
         "the real plugin listener must retain its polling lifecycle"
@@ -211,6 +251,68 @@ async fn a_channel_whose_guest_rejects_its_config_is_not_activated() {
     assert!(
         channels.is_empty(),
         "a guest that refuses its configuration must not be registered"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_guest_routes_reject_every_claimant_before_registry_mutation() {
+    let plugins = install_fixture_package();
+    let mut config = activation_config(&plugins, "operations", "5");
+    config.plugins.max_active_instances = 2;
+    config.channels.plugin.insert(
+        "backup".to_string(),
+        PluginChannelConfig {
+            package: "channel-fixture".to_string(),
+            enabled: true,
+        },
+    );
+    config
+        .agents
+        .get_mut("operator")
+        .expect("operator agent")
+        .channels
+        .push(ChannelRef::new("plugin.backup"));
+
+    let host = PluginHost::from_plugins_dir(plugins.path()).expect("admit fixture package");
+    let manifest = host
+        .manifest("channel-fixture")
+        .expect("fixture manifest is admitted");
+    let scope = PluginInstanceScope::from_manifest(
+        manifest,
+        PluginCapability::Channel,
+        "backup",
+        manifest.permissions.iter().copied(),
+    )
+    .expect("admit backup channel scope");
+    config.plugins.entries.push(PluginEntryConfig {
+        name: scope
+            .id()
+            .config_entry_key()
+            .expect("derive backup config key"),
+        config: HashMap::from([
+            ("retry_count".to_string(), "5".to_string()),
+            ("credential_epoch".to_string(), "v1".to_string()),
+            ("api_token".to_string(), "backup-secret".to_string()),
+        ]),
+        ..PluginEntryConfig::default()
+    });
+
+    let registry = Arc::new(PluginWebhookRegistry::new());
+    let webhook_generation = registry.start_generation();
+    let channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels_with_webhooks(
+        Arc::new(config),
+        None,
+        Some(&webhook_generation),
+    )
+    .await;
+
+    assert!(
+        channels.is_empty(),
+        "both instances advertise the same fixture route and must both be rejected"
+    );
+    assert!(
+        registry.get("fixture").is_none(),
+        "claim resolution must finish before one partial winner mutates the registry"
     );
 }
 

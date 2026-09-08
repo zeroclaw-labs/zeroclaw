@@ -13,7 +13,7 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use zeroclaw::plugin::config::{ConfigError, get as config_get};
@@ -156,7 +156,9 @@ mod component {
             if matches!(config_get(), Err(ConfigError::Unavailable))
                 && matches!(secret_get("api_token"), Err(SecretError::Unavailable))
             {
-                ChannelCapabilities::HEALTH_CHECK | ChannelCapabilities::SELF_HANDLE
+                ChannelCapabilities::HEALTH_CHECK
+                    | ChannelCapabilities::SELF_HANDLE
+                    | ChannelCapabilities::WEBHOOK_INGRESS
             } else {
                 ChannelCapabilities::empty()
             }
@@ -292,6 +294,64 @@ mod component {
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        fn webhook_path() -> Option<String> {
+            Some("fixture".to_string())
+        }
+
+        fn parse_webhook(
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        ) -> Result<Vec<InboundMessage>, WebhookRejection> {
+            if body == b"spin" {
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
+            }
+
+            let token = secret_get("api_token").map_err(|_| {
+                WebhookRejection::Unauthorized("scoped webhook secret unavailable".to_string())
+            })?;
+            let supplied = headers
+                .iter()
+                .find(|(name, _)| name == "x-fixture-secret")
+                .map(|(_, value)| value.as_str());
+            if supplied != Some(token.as_str()) {
+                return Err(WebhookRejection::Unauthorized(
+                    "private signature mismatch diagnostic".to_string(),
+                ));
+            }
+
+            let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|error| {
+                WebhookRejection::BadRequest(format!("private parser detail: {error}"))
+            })?;
+            let field = |name: &str| {
+                payload
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .ok_or_else(|| {
+                        WebhookRejection::BadRequest(format!(
+                            "private parser detail: missing {name}"
+                        ))
+                    })
+            };
+            Ok(vec![InboundMessage {
+                id: field("id")?,
+                sender: field("sender")?,
+                reply_target: field("reply_target")?,
+                content: field("content")?,
+                channel: "spoofed-channel".to_string(),
+                channel_alias: Some("spoofed-alias".to_string()),
+                timestamp: 7,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: Vec::new(),
+                subject: None,
+            }])
         }
     }
 

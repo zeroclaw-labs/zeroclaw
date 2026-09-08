@@ -1,7 +1,7 @@
 ---
 type: reference
 status: accepted
-last-reviewed: 2026-07-17
+last-reviewed: 2026-09-07
 relates-to:
   - FND-001
   - ADR-003
@@ -49,8 +49,8 @@ omits the compiled component.
   the host; it gets exactly the host functions wired into its world and nothing
   more. Outbound HTTP is the one network surface that can be opened, and only
   when the manifest grants `http_client` and that capability adapter explicitly
-  enables its tested HTTP boundary. Tool and channel adapters do; memory does
-  not yet.
+  enables its tested HTTP boundary. The tool adapter does; channel and memory
+  currently withhold it.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -65,16 +65,17 @@ before you design around a capability that is not there.
   or channel schema can designate secrets withheld from public config and
   resolved in authorized service calls. An `http_client` grant is necessary
   for outbound `wasi:http`, but the capability adapter must also opt into that
-  host surface. Tool and channel adapters do; memory intentionally remains
-  HTTP-free until its network boundary has component-level coverage. Filesystem
-  and
+  host surface. The tool adapter does; channel and memory intentionally remain
+  HTTP-free until their network boundaries have component-level coverage.
+  Filesystem and
   memory-access permissions are still accepted by the manifest schema but
   inert: their host functions are not yet registered in the linker. See
   Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
-  through ambient WASI. A tool or channel plugin with an `http_client` grant
-  gets outbound `wasi:http` because those adapters opt in; it cannot listen.
+  through ambient WASI. A tool plugin with an `http_client` grant gets outbound
+  `wasi:http`; channel and memory plugins currently do not. No plugin can
+  listen.
   Channel plugins that must receive inbound traffic do not open a listener
   themselves: the host runs the listener and feeds messages through the
   `inbound` import, which the plugin drains from its `poll-message` export.
@@ -123,16 +124,16 @@ hold a warm store guarded by an async mutex for the lifetime of the plugin.
 
 Tool plugins are discovered and registered end to end: the runtime walks
 `channel_plugin_details()`'s tool counterpart and builds a `WasmTool` for each.
-The channel host adapter (`WasmChannel`, its `wasi:http` gating, point-of-use
+The channel host adapter (`WasmChannel`, its fail-closed `wasi:http` gating, point-of-use
 config services, and host-fed `inbound` queue) is complete and unit-covered, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
 to register. The runtime now resolves an explicitly declared
 `[channels.plugin.<alias>]` binding, constructs its `WasmChannel`, and registers
 it from the configured alias; that alias-aware construction and runtime config
 resolution landed in
-[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146). The remaining
-follow-up is the per-vendor host listener that drains each transport into the
-channel's `inbound` queue. The memory bridge
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146). A channel can
+also opt into the generic gateway-owned POST webhook ingress described below;
+vendor tunnels, polling clients, and other transports remain follow-ups. The memory bridge
 (`WasmMemory`) is in the same position one step earlier: the adapter implements
 the full `Memory` trait against the `memory-plugin` world, but the host does not
 yet expose a memory counterpart to `channel_plugin_details()` and the runtime
@@ -288,9 +289,9 @@ through `config.get` and secrets through `secrets.get` during `configure` and
 operational calls, while instantiation and static metadata discovery remain
 unavailable. `http_client` is a necessary grant, not a complete authority
 decision: the capability adapter must also construct the HTTP context and link
-`wasi:http`. Tool and channel adapters opt in after grant validation. The
-memory adapter deliberately does not, so granting `http_client` to a memory
-scope alone adds no network surface. The remaining variants
+`wasi:http`. The tool adapter opts in after grant validation. Channel and memory
+adapters deliberately do not, so granting `http_client` to either scope alone
+adds no network surface. The remaining variants
 (`file_read`, `file_write`, `memory_read`, `memory_write`) are accepted by the
 manifest schema but are not yet wired to a host import: declaring them grants
 nothing on its own. They reserve the names for the host functions that will
@@ -364,10 +365,10 @@ world's linker wires `logging` (via the host impl in `component_logging.rs`,
 linked alongside `add_wasi` in `component.rs`). Tool and channel link the
 instance-scoped `secrets` service. Channel also imports `config` for its typed
 public object and `inbound` for the host-fed message queue it drains from
-`poll-message`. Tool and channel adapters link outbound `wasi:http` only after
-the admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http`
-and `add_wasi_http` in `component.rs`). Memory withholds both the context and
-linker surface. The filesystem and memory-access permissions remain inert: the
+`poll-message`. The tool adapter links outbound `wasi:http` only after the
+admitted scope grants `http_client` (`PluginStoreSpec::with_granted_http` and
+`add_wasi_http` in `component.rs`). Channel and memory withhold both the context
+and linker surface. The filesystem and memory-access permissions remain inert: the
 host functions that would gate them are not yet wired into the linker. A
 plugin's ambient authority is the WASI context (no preopens, no ambient network)
 plus exactly the host imports its grants and adapter opt-ins jointly enable.
@@ -394,6 +395,54 @@ inbound-pending: func() -> u32;
 
 The host side owns an `InboundQueue` per channel; `WasmChannel::inbound` hands a
 clone to the listener task so enqueued traffic is visible to the plugin's drain.
+
+### Channel webhook ingress
+
+A channel component can add `webhook-ingress` to its returned
+`channel-capabilities` and implement `webhook-path` plus `parse-webhook`. The
+host then mounts one POST-only route at `/plugin/<path>`. The path is a runtime
+claim, not config: it must contain 1–64 ASCII letters, digits, hyphens, or
+underscores. The channel instance is rejected when the claim is empty, invalid,
+or duplicated. All claims are resolved before the daemon replaces its route
+map, so manifest iteration order cannot select a winner and a failed rebuild
+cannot publish a partial generation. Publication carries a generation lease;
+a retiring older channel supervisor cannot clear a newer route set.
+
+Webhook ingress requires the component's effective `config_read` grant. For
+each request, the gateway passes lowercase UTF-8 headers and the exact body
+bytes to `parse-webhook` in a disposable configured store. The guest resolves
+its current scoped config and secrets in that call, verifies platform
+authenticity, and returns either normalized inbound messages or a typed
+`unauthorized` / `bad-request` rejection. Cancelling or timing out the HTTP
+request drops that disposable store; it never strands the warm store used by
+polling and outbound channel calls.
+
+The unauthenticated edge remains host-governed:
+
+- The canonical trusted-forwarded-aware webhook rate limiter runs before route
+  lookup. Request bodies use the gateway's 64 KiB ceiling, each route has a
+  64-request queue, and parse plus delivery has a 10-second deadline.
+- Public responses are fixed: success is `200`; guest authentication and
+  payload rejections are opaque `401` and `400`; host, component, or downstream
+  failures are opaque `503`; timeout is `504`; queue or rate saturation is
+  `429`. Guest and Wasmtime diagnostics are bounded, attributed, and remain in
+  host logs; guest diagnostics must never contain credentials or raw secrets.
+- After guest authentication, the host stamps the admitted `plugin.<alias>`
+  identity and resolves `[peer_groups.*].external_peers` for that channel live.
+  Plugin sender matching is exact (`"*"` remains the explicit allow-all entry).
+  Denied senders never reserve an idempotency key or reach the channel queue.
+  The same live, default-deny gate applies to messages returned by
+  `poll-message`, so every plugin inbound bridge shares one host policy.
+- Non-empty guest message IDs are deduplicated in a namespace derived from the
+  route. An in-flight duplicate waits for the owning delivery to commit or roll
+  back; generation-scoped ownership tokens prevent a stale owner from erasing
+  a replacement reservation. Failed or cancelled delivery rolls back, so a
+  provider retry can become the new owner.
+
+This changes the unfrozen experimental `wit/v0` channel world. Every channel
+component, including one that does not serve webhooks, must be rebuilt against
+the WIT shipped by the target host and export the documented capability-gated
+stubs. The frozen-version compatibility window does not apply yet.
 
 ### `logging`
 
@@ -462,8 +511,8 @@ The host derives package, capability, binding, and effective grants from the
 admitted `PluginInstanceScope`; none are guest inputs. Only direct top-level
 string properties marked `x-secret: true` in the manifest schema are readable.
 Tools can read them while the host dispatches `execute`. Channels can read them
-during `configure` and operational calls such as send, poll, health, and
-capability-gated actions. Component initialization and static metadata exports
+during `configure` and operational calls such as send, poll, webhook parsing,
+health, and capability-gated actions. Component initialization and static metadata exports
 return `unavailable` without resolving config. Within one channel service frame,
 every `config.get` and `secrets.get` uses one resolved canonical config revision;
 that frame is dropped on every exit path. A compliant plugin therefore observes
