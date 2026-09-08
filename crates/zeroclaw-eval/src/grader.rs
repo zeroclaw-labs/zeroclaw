@@ -766,14 +766,29 @@ mod tests {
     fn grade_category_as_str_matches_serde() {
         // as_str() (the category_totals key) and the serde snake_case (the
         // grade.category value) must stay in lockstep so report consumers can
-        // join per-grade categories against category_totals.
-        for cat in [
+        // join per-grade categories against category_totals. `Config` belongs
+        // in this list like every other variant: it is the category the
+        // fail-closed backstop emits, so a consumer that cannot join it would
+        // lose exactly the grade that says the case asserted nothing.
+        let all = [
             GradeCategory::Response,
             GradeCategory::Tool,
             GradeCategory::SideEffect,
             GradeCategory::Budget,
             GradeCategory::Judge,
-        ] {
+            GradeCategory::Config,
+        ];
+        for cat in all {
+            // A new variant makes this match non-exhaustive, so the compiler
+            // stops here and the added arm is the prompt to list it in `all`.
+            match cat {
+                GradeCategory::Response
+                | GradeCategory::Tool
+                | GradeCategory::SideEffect
+                | GradeCategory::Budget
+                | GradeCategory::Judge
+                | GradeCategory::Config => {}
+            }
             let serde_label = serde_json::to_value(cat).unwrap();
             assert_eq!(serde_label.as_str(), Some(cat.as_str()));
         }
