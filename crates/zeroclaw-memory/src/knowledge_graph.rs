@@ -1183,8 +1183,10 @@ impl KnowledgeGraph {
                 "SELECT DISTINCT to_id FROM edges
                  WHERE from_id = ?1 AND relation = 'authored_by' AND {vis_edge}"
             );
+            // One statement for every matching node: the SQL is fixed for the
+            // whole lookup, only the anchor parameter changes.
+            let mut stmt = conn.prepare(&sql)?;
             for node in &matching {
-                let mut stmt = conn.prepare(&sql)?;
                 let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&node.id];
                 sql_params.extend(vis_params.iter().map(|owner| owner as &dyn rusqlite::ToSql));
                 let mut rows = stmt.query(&sql_params[..])?;
