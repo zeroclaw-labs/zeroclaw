@@ -8,7 +8,8 @@ use std::sync::Arc;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, MemoryConfig, RiskProfileConfig, SandboxBackend, SandboxConfig,
+    AliasedAgentConfig, Config, MemoryConfig, RiskProfileConfig, RuntimeKind, SandboxBackend,
+    SandboxConfig,
 };
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
@@ -181,7 +182,7 @@ pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> 
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         },
-        "native",
+        RuntimeKind::Native,
         Some(workspace),
         &zeroclaw_runtime::security::SandboxExtraRoots::default(),
     );
