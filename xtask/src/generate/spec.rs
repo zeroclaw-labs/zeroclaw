@@ -1628,6 +1628,23 @@ mod tests {
                 .unwrap();
         assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
         assert!(!release.contains("excluded_features"));
+        // The stable release build MUST pin --no-default-features against the
+        // generator's explicit per-target list, exactly like the manual workflow.
+        // Omitting it (or branching on an undefined matrix field) unions the root
+        // crate defaults back in and silently re-enables a target-excluded default
+        // feature (e.g. observability-prometheus on ARM). The excluded-feature
+        // string checks below do NOT catch that, since the leaked feature never
+        // appears as a literal in the workflow.
+        assert!(
+            release.contains(
+                "$BUILD_CMD --release --locked --no-default-features --features \"${FEATURES}\" --target ${{ matrix.target }}"
+            ),
+            "the stable release build must pin --no-default-features so target-excluded default features cannot leak back in"
+        );
+        assert!(
+            !release.contains("skip_prometheus"),
+            "the stable release build must not branch on an undefined skip_prometheus matrix field"
+        );
         let cross_install = "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: bash scripts/ci/install_release_tool.sh cross";
         assert!(release.contains(cross_install));
         assert!(!release.contains("cargo install cross"));
@@ -1678,12 +1695,15 @@ mod tests {
         assert!(manual.contains(
             "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
         ));
+        assert!(manual.contains(
+            "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
+        ));
         assert_eq!(
             manual
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
-            2,
-            "both the ZeroCode build and upload must skip Android"
+            4,
+            "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
         );
         assert!(!manual.contains("excluded_features"));
 

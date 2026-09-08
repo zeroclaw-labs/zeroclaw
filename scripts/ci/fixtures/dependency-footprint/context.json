@@ -1,0 +1,13 @@
+{
+  "cargo_version": "cargo 1.90.0",
+  "cargo_lock_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "git_dirty": false,
+  "git_revision": "432d36e13f0a596c1e59a50fd985bad8cc2cac96",
+  "git_worktree_digest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "resolved_selections": {
+    "dist": ["agent-runtime", "channel-matrix"]
+  },
+  "rustc_host": "x86_64-apple-darwin",
+  "rustc_version": "rustc 1.90.0 (dummy 2026-01-01)",
+  "target": "x86_64-apple-darwin"
+}
