@@ -1158,6 +1158,7 @@ mod tests {
 
         server.abort();
     }
+
     /// The in-process peer route accepts a send and, by default, lets the
     /// recipient finish detached. A supervised cron run drops its private
     /// runtime as soon as the parent returns, which would abort that detached
