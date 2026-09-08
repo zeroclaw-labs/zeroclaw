@@ -58,3 +58,12 @@ Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`
 `response_not_contains`, `max_tool_calls: 0`). See `evals/README.md` for the
 authoring rules, including the two-experts test and the privacy requirement that
 fixtures use placeholder identities only.
+
+Fixture loading fails closed, because a required gate must not certify a case
+that cannot fail. `LlmTrace::from_file()` rejects a fixture that declares no
+conversation turns (the replay would drive the agent zero times and grade its
+expectations against an empty run), one whose expectation block is omitted or
+empty, one holding a zero-length entry in a string-backed expectation family
+(`response_contains`, `response_not_contains`, `response_matches`,
+`tools_used`, `tools_not_used`), and one carrying an unknown top-level or
+expectation key. Every rejection names the offending fixture and field.
