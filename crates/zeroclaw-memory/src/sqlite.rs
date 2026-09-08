@@ -30,6 +30,17 @@ fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether an upsert may replace the provenance (`namespace`, `session_id`)
+/// of the row that already holds the conflicting key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProvenanceGuard {
+    /// Last writer wins, the historical `store`/`store_with_metadata` shape.
+    Overwrite,
+    /// Insert when the key is free and refresh only while the stored
+    /// provenance still matches the write; otherwise leave the row alone.
+    PreserveExisting,
+}
+
 #[derive(Clone)]
 pub struct SqliteMemory {
     alias: String,
@@ -378,6 +389,34 @@ impl SqliteMemory {
         options: StoreOptions,
         agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        self.upsert_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            options,
+            agent_id,
+            ProvenanceGuard::Overwrite,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Shared upsert for every metadata-carrying write. `guard` decides
+    /// whether a conflicting row may have its provenance replaced; the
+    /// predicate lives in the same statement as the write so no caller can
+    /// reopen a check/use race around it. Reports whether a row was inserted
+    /// or refreshed.
+    async fn upsert_row_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+        guard: ProvenanceGuard,
+    ) -> anyhow::Result<bool> {
         let embedding_bytes = match self.get_or_compute_embedding(content).await {
             Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
             Err(e) => {
@@ -411,14 +450,13 @@ impl SqliteMemory {
         let tenant_id = options.tenant_id;
         let aid = agent_id.map(String::from);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let conn = conn.lock();
             let now = Local::now().to_rfc3339();
             let cat = Self::category_to_str(&category);
             let id = Uuid::new_v4().to_string();
 
-            conn.execute(
-                "INSERT INTO memories (
+            let mut sql = "INSERT INTO memories (
                     id, key, content, category, embedding, created_at, updated_at,
                     session_id, namespace, importance, agent_id, kind, pinned, tenant_id
                  )
@@ -437,7 +475,17 @@ impl SqliteMemory {
                     importance = excluded.importance,
                     kind = excluded.kind,
                     pinned = excluded.pinned,
-                    tenant_id = excluded.tenant_id",
+                    tenant_id = excluded.tenant_id"
+                .to_string();
+            if guard == ProvenanceGuard::PreserveExisting {
+                sql.push_str(
+                    " WHERE memories.namespace = excluded.namespace
+                        AND memories.session_id IS excluded.session_id",
+                );
+            }
+
+            let affected = conn.execute(
+                &sql,
                 params![
                     id,
                     key,
@@ -455,7 +503,7 @@ impl SqliteMemory {
                     tenant_id
                 ],
             )?;
-            Ok(())
+            Ok(affected > 0)
         })
         .await?
     }
@@ -2138,6 +2186,31 @@ impl Memory for SqliteMemory {
                 ..StoreOptions::default()
             },
             None,
+        )
+        .await
+    }
+
+    async fn store_preserving_provenance(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: &str,
+    ) -> anyhow::Result<bool> {
+        // Same default-agent attribution as `store_with_metadata`; the
+        // conflicting row is therefore the one this write would replace.
+        self.upsert_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            StoreOptions {
+                namespace: Some(namespace.to_string()),
+                ..StoreOptions::default()
+            },
+            None,
+            ProvenanceGuard::PreserveExisting,
         )
         .await
     }
@@ -4328,6 +4401,78 @@ mod tests {
     }
 
     // ── Bulk deletion tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn store_preserving_provenance_never_transfers_a_claimed_row() {
+        let (_tmp, mem) = temp_sqlite();
+        assert!(
+            mem.store_preserving_provenance(
+                "discord_1",
+                "owner content",
+                MemoryCategory::Custom("discord".into()),
+                Some("channel-1"),
+                "discord.owner",
+            )
+            .await
+            .unwrap()
+        );
+
+        // A different namespace and a different channel are both foreign
+        // provenance; neither may take the key.
+        for (namespace, session) in [
+            ("discord.observer", Some("channel-1")),
+            ("discord.owner", Some("channel-2")),
+            ("discord.owner", None),
+        ] {
+            assert!(
+                !mem.store_preserving_provenance(
+                    "discord_1",
+                    "foreign content",
+                    MemoryCategory::Custom("discord".into()),
+                    session,
+                    namespace,
+                )
+                .await
+                .unwrap()
+            );
+        }
+
+        let entry = mem.get("discord_1").await.unwrap().unwrap();
+        assert_eq!(entry.content, "owner content");
+        assert_eq!(entry.namespace, "discord.owner");
+        assert_eq!(entry.session_id.as_deref(), Some("channel-1"));
+
+        // Scoped search visibility follows the preserved namespace.
+        let owned = mem
+            .recall_in_namespaces(&["discord.owner".to_string()], "*", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].key, "discord_1");
+        assert!(
+            mem.recall_in_namespaces(&["discord.observer".to_string()], "*", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Redelivery to the owning provenance is still an ordinary refresh.
+        assert!(
+            mem.store_preserving_provenance(
+                "discord_1",
+                "owner content (refreshed)",
+                MemoryCategory::Custom("discord".into()),
+                Some("channel-1"),
+                "discord.owner",
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "owner content (refreshed)"
+        );
+    }
 
     #[tokio::test]
     async fn provenance_conditional_update_and_delete_fail_closed() {

@@ -564,6 +564,30 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         )
     }
 
+    /// Insert a row for `key`, or refresh one that already carries the same
+    /// `namespace` and `session_id`. A row claimed by different provenance is
+    /// left untouched and the call reports `false`.
+    ///
+    /// Archive writers key rows by a globally unique upstream identifier and
+    /// share one database, so two writers can legitimately observe the same
+    /// event and address the same key. The create path therefore needs the
+    /// same storage-evaluated predicate as
+    /// [`update_content_if_provenance`](Self::update_content_if_provenance);
+    /// the default fails closed for the same reason.
+    async fn store_preserving_provenance(
+        &self,
+        _key: &str,
+        _content: &str,
+        _category: MemoryCategory,
+        _session_id: Option<&str>,
+        _namespace: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!(
+            "memory backend '{}' does not support provenance-conditional creates",
+            self.name()
+        )
+    }
+
     /// Atomically remove a row only when its persisted provenance matches.
     /// The default fails closed for the same reason as
     /// [`update_content_if_provenance`](Self::update_content_if_provenance).
