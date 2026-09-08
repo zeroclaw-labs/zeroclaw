@@ -31,6 +31,8 @@ read_knowledge_from = ["agent_b"]
 
 The grant is directional and read-only: `agent_a` can read (and privately annotate) `agent_b`'s entries, while `agent_b` learns nothing about `agent_a`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors. A configured but disabled sibling remains a valid source so an active agent can deliberately read its retained knowledge; the disabled sibling does not run or receive reciprocal access.
 
+Scoping is a confidentiality boundary, not a resource boundary. The `knowledge.max_nodes` budget stays install-wide, so one agent sitting at the cap stops `capture` for every agent on the install even though none of them can see each other's rows.
+
 ### Assign pre-attribution rows during upgrade
 
 Rows created by older releases have no owner. They are never visible through an
