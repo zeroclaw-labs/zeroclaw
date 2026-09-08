@@ -735,6 +735,89 @@ mod tests {
     }
 
     #[test]
+    fn from_file_rejects_empty_dispatch_payload_fields() {
+        // The dispatch-boundary families are nested, so `empty_entry_family`
+        // cannot see them. An empty `tool` matches no dispatched call and an
+        // empty `needle` is contained by every payload, so either one turns the
+        // expectation into a no-op that still reports a grade.
+        let cases = [
+            (
+                "tool_arguments_contain[0].tool",
+                r#"{"tool_arguments_contain":[{"tool":"","needle":"alpha"}]}"#,
+            ),
+            (
+                "tool_arguments_contain[0].needle",
+                r#"{"tool_arguments_contain":[{"tool":"echo","needle":""}]}"#,
+            ),
+            (
+                "tool_results_contain[0].tool",
+                r#"{"tool_results_contain":[{"tool":"","needle":"alpha"}]}"#,
+            ),
+            (
+                "tool_results_contain[0].needle",
+                r#"{"tool_results_contain":[{"tool":"echo","needle":""}]}"#,
+            ),
+        ];
+
+        for (field, expects) in cases {
+            let name = format!("empty_payload_{}", field.replace(['.', '[', ']'], "_"));
+            let err = load_fixture(
+                &name,
+                &format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .expect_err("an empty tool or needle must not load into a required gate");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(field),
+                "error must name the offending field {field}, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_file_rejects_unknown_dispatch_expectation_fields() {
+        // The nested payload expectation denies unknown keys for the same
+        // reason the outer blocks do: a misspelled `needle` would otherwise
+        // drop the substring and leave a check that asserts nothing.
+        let err = load_fixture(
+            "payload_typo",
+            r#"{"model_name":"demo","turns":[],"expects":{"tool_arguments_contain":[{"tool":"echo","nedle":"alpha"}]}}"#,
+        )
+        .expect_err("a typo in a nested expectation must fail loudly");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("nedle"),
+            "error must name the offending nested key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_file_rejects_vacuous_or_contradictory_tool_call_bounds() {
+        // `min_tool_calls: 0` holds for every run, and a min/max/exact triple
+        // that contradicts itself can never pass. Both shapes are refused at
+        // load rather than graded.
+        let cases = [
+            ("min_tool_calls", r#"{"min_tool_calls":0}"#),
+            ("exceeds", r#"{"min_tool_calls":2,"max_tool_calls":1}"#),
+            ("below", r#"{"min_tool_calls":2,"exact_tool_calls":1}"#),
+            ("exceeds", r#"{"max_tool_calls":1,"exact_tool_calls":2}"#),
+        ];
+
+        for (index, (reason, expects)) in cases.into_iter().enumerate() {
+            let err = load_fixture(
+                &format!("invalid_bounds_{index}"),
+                &format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .expect_err("invalid tool-call bounds must not load into a required gate");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(reason),
+                "error must explain the {reason} rejection, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn from_file_rejects_a_fixture_with_no_conversation_turns() {
         // `turns: []` passes every expectation check: `max_tool_calls: 0` is a
         // real assertion with no zero-length form. The replay would still run
