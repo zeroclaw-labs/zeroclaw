@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
@@ -22,6 +23,10 @@ pub struct SendMessageToPeerTool {
     config: Arc<Config>,
     sender_alias: String,
     description: String,
+    /// Set when the caller is a supervised run that owns a durable claim (the
+    /// cron scheduler's private runtime). See
+    /// [`with_run_owned_cancellation_token`](Self::with_run_owned_cancellation_token).
+    run_owned_cancellation: Option<CancellationToken>,
 }
 
 impl SendMessageToPeerTool {
@@ -32,7 +37,23 @@ impl SendMessageToPeerTool {
             config,
             sender_alias,
             description,
+            run_owned_cancellation: None,
         }
+    }
+
+    /// Bind this tool to a supervised run that owns a durable claim.
+    ///
+    /// In-process delivery to a peer agent normally detaches the recipient's
+    /// turn and reports acceptance immediately. Under a supervised run the
+    /// detached task lives on the run's private runtime, which is dropped once
+    /// the run returns, so an already-accepted send would be aborted mid-turn.
+    /// With this token set, the recipient runs inline under the caller's run
+    /// instead: the run is the delivery's lifecycle owner, the run deadline
+    /// bounds it, and the tool reports the outcome it actually observed.
+    #[must_use]
+    pub fn with_run_owned_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.run_owned_cancellation = Some(token);
+        self
     }
 }
 
@@ -188,7 +209,6 @@ impl Tool for SendMessageToPeerTool {
                 .unwrap_or_else(|| target.clone());
 
             let cfg = (*self.config).clone();
-            let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let body = message.clone();
             // Build the recipient's cost-tracking context from `&cfg` before
@@ -200,6 +220,55 @@ impl Tool for SendMessageToPeerTool {
             let turn_usage = cost_ctx
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
+
+            if let Some(run_token) = self.run_owned_cancellation.clone() {
+                // A supervised run owns this turn, and its private runtime is
+                // dropped as soon as the run returns. Detaching the recipient
+                // here would abort a send this tool had already reported as
+                // accepted, so run the recipient inline: the outcome reported
+                // is the one that actually happened, and the run's own deadline
+                // bounds it.
+                let delivery = async move {
+                    let turn = crate::agent::loop_::process_message(
+                        cfg,
+                        &recipient_alias,
+                        &body,
+                        None,
+                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                    );
+                    deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
+                };
+                return Ok(tokio::select! {
+                    biased;
+                    () = run_token.cancelled() => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "in-process delivery to peer agent {canonical:?} was not completed \
+                             before the owning run was cancelled; the message was not delivered"
+                        )),
+                    },
+                    outcome = delivery => match outcome {
+                        Ok(_) => ToolResult {
+                            success: true,
+                            output: format!(
+                                "delivered in-process to peer agent {canonical:?} (recipient turn completed under this run)"
+                            )
+                            .into(),
+                            error: None,
+                        },
+                        Err(e) => ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!(
+                                "in-process delivery to peer agent {canonical:?} failed: {e:#}"
+                            )),
+                        },
+                    },
+                });
+            }
+
+            let sender = self.sender_alias.clone();
             zeroclaw_spawn::spawn!(async move {
                 let turn = crate::agent::loop_::process_message(
                     cfg,
@@ -1085,6 +1154,149 @@ mod tests {
             budget_result.is_err(),
             "the recipient turn's real spend must count against the shared \
              process-wide daily budget, blocking an unrelated agent's next call"
+        );
+
+        server.abort();
+    }
+    /// The in-process peer route accepts a send and, by default, lets the
+    /// recipient finish detached. A supervised cron run drops its private
+    /// runtime as soon as the parent returns, which would abort that detached
+    /// recipient after the send was already reported as accepted. Bound to a
+    /// run-owned token, the tool must instead carry the recipient to
+    /// completion under the run, so a slow recipient still finishes even
+    /// though the private runtime is destroyed the instant `execute` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_owned_peer_send_completes_delayed_recipient_before_the_runtime_is_dropped() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // The counter is bumped only after the delay, so it records a turn
+        // that ran to completion rather than one that merely started.
+        type CompletedCalls = Arc<Mutex<u32>>;
+        async fn slow_chat(
+            State(count): State<CompletedCalls>,
+            Json(_body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            *count.lock() += 1;
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "slow peer turn complete"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }))
+        }
+
+        let completed: CompletedCalls = Arc::new(Mutex::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(slow_chat))
+            .with_state(completed.clone());
+        // The mock server stays on the test runtime; only the tool call runs
+        // on the private runtime under test.
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        let run_token = CancellationToken::new();
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .with_run_owned_cancellation_token(run_token);
+
+        let result = tokio::task::spawn_blocking(move || {
+            // A stand-in for the scheduler's private runtime: an owned thread
+            // driving its own current-thread runtime, destroyed the moment the
+            // supervised parent returns. The explicit stack size is a
+            // debug-build accommodation for the size of an agent-turn future,
+            // not part of the contract under test.
+            let worker = std::thread::Builder::new()
+                .name("peer-send-owned-test".into())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    let private_runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("private runtime should build");
+                    let result = private_runtime.block_on(tool.execute(json!({
+                        "channel": "telegram.prod",
+                        "target": "recipient",
+                        "message": "status please"
+                    })));
+                    drop(private_runtime);
+                    result
+                })
+                .expect("private runtime thread should start");
+            worker.join()
+        })
+        .await
+        .expect("the blocking join should not panic")
+        .expect("the private runtime thread should join")
+        .expect("execute should return a tool result");
+
+        assert!(
+            result.success,
+            "a run-owned peer send must report the delivery it actually completed: {result:?}"
+        );
+        assert!(
+            result.output.as_str().contains("delivered in-process"),
+            "unexpected run-owned delivery output: {}",
+            result.output
+        );
+        assert_eq!(
+            *completed.lock(),
+            1,
+            "the slow recipient turn must have finished before the private runtime was dropped; \
+             a detached recipient would have been aborted with the send already accepted"
         );
 
         server.abort();

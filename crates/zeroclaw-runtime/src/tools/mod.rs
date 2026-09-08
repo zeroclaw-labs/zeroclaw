@@ -943,10 +943,13 @@ pub fn all_tools_with_runtime(
             SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
                 .with_subagent_caller(is_subagent_caller),
         ),
-        Arc::new(SendMessageToPeerTool::new(
-            Arc::new(root_config.clone()),
-            agent_alias,
-        )),
+        Arc::new({
+            let peer_tool = SendMessageToPeerTool::new(Arc::new(root_config.clone()), agent_alias);
+            match run_cancellation.clone() {
+                Some(token) => peer_tool.with_run_owned_cancellation_token(token),
+                None => peer_tool,
+            }
+        }),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
