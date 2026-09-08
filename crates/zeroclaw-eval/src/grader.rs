@@ -410,9 +410,7 @@ impl Grader for JudgeGrader {
                 rubric,
             );
             let check = format!("judge:{}", rubric.name);
-            let reply = self
-                .deps
-                .provider
+            let reply = zeroclaw_providers::ProviderDispatch::from_ref(&*self.deps.provider)
                 .chat_with_system(Some(JUDGE_SYSTEM), &message, &self.deps.model, Some(0.0))
                 .await;
             let grade = match reply {
