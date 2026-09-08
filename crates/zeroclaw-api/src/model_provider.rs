@@ -15,7 +15,9 @@ pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 /// that take a depth setting rather than a token budget. Variants are declared
 /// in ascending depth, so they compare by depth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+// One word, matching `as_str`, the sibling `ThinkingDisplay` and the level
+// spelling every other surface uses; snake_case would emit `x_high`.
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingEffort {
     Low,
     High,
@@ -1350,7 +1352,28 @@ mod turn_order_tests {
 
 #[cfg(test)]
 mod thinking_display_tests {
-    use super::{NativeThinkingParams, ThinkingDisplay};
+    use super::{NativeThinkingParams, ThinkingDisplay, ThinkingEffort};
+
+    #[test]
+    fn effort_serializes_as_the_token_the_adapters_send() {
+        for effort in [
+            ThinkingEffort::Low,
+            ThinkingEffort::High,
+            ThinkingEffort::XHigh,
+            ThinkingEffort::Max,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&effort).unwrap(),
+                format!("\"{}\"", effort.as_str()),
+                "the serialized token must match the wire value"
+            );
+            assert_eq!(
+                serde_json::from_str::<ThinkingEffort>(&format!("\"{}\"", effort.as_str()))
+                    .unwrap(),
+                effort
+            );
+        }
+    }
 
     #[test]
     fn tokens_round_trip_ignoring_case() {
