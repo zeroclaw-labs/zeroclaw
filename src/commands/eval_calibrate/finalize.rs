@@ -340,7 +340,10 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use tempfile::tempdir;
-    use zeroclaw_eval::calibration::{JUDGE_LABEL_SCHEMA, append_judge_labels};
+    use zeroclaw_eval::calibration::{
+        CalibrationRejection, JUDGE_LABEL_SCHEMA, RubricGateRefusal, append_judge_labels,
+        judge_prompt_hash, load_calibration, rubric_hash,
+    };
 
     fn label(
         index: usize,
@@ -450,6 +453,61 @@ mod tests {
         let rubric = rubrics.values().next().expect("one rubric");
         assert_eq!(rubric["labeled_records"], 50);
         assert_eq!(rubric["agreement"], 0.8);
+    }
+
+    #[test]
+    fn finalized_calibration_round_trips_through_the_gating_consumer() {
+        // Producer and consumer share one artifact contract. An emitted
+        // calibration at or above the floor must gate the exact rubric it was
+        // labeled against, and nothing else; a low-agreement artifact stays
+        // inspectable on disk but must never reach the gate.
+        let temp = tempdir().expect("temporary directory should be created");
+        let judge_ref = "provider/model";
+        let prompt_hash = judge_prompt_hash("system", "contract");
+        let labeled_rubric = rubric_hash("accuracy", "rubric text", 0.7, false);
+
+        let gating_labels = temp.path().join("gating.jsonl");
+        let gating_output = temp.path().join("gating.json");
+        write_labels(&gating_labels, &labels_with_agreement(50, 45));
+        run_with_writer(
+            &gating_labels,
+            Some(&gating_output),
+            None,
+            None,
+            "2026-07-21",
+            &mut Vec::new(),
+        )
+        .expect("calibrated labels should finalize");
+
+        let validated = load_calibration(&gating_output, judge_ref, &prompt_hash)
+            .expect("a finalized calibration must satisfy the gating consumer");
+        assert_eq!(validated.artifact().labeled_records, 50);
+        assert_eq!(validated.rubric_gate_refusal(&labeled_rubric), None);
+        assert_eq!(
+            validated.rubric_gate_refusal(&rubric_hash("accuracy", "rubric text", 0.8, false)),
+            Some(RubricGateRefusal::Missing),
+            "a changed rubric contract must not inherit the calibrated evidence"
+        );
+
+        let low_labels = temp.path().join("low.jsonl");
+        let low_output = temp.path().join("low.json");
+        write_labels(&low_labels, &labels_with_agreement(50, 40));
+        run_with_writer(
+            &low_labels,
+            Some(&low_output),
+            None,
+            None,
+            "2026-07-21",
+            &mut Vec::new(),
+        )
+        .expect("low-agreement labels still emit an inspectable artifact");
+        assert!(low_output.exists());
+        let rejection = load_calibration(&low_output, judge_ref, &prompt_hash)
+            .expect_err("an artifact below the floor must not gate");
+        assert!(
+            matches!(rejection, CalibrationRejection::LowAgreement { .. }),
+            "unexpected rejection: {rejection}"
+        );
     }
 
     #[test]
