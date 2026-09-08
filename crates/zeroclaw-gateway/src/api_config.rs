@@ -1664,18 +1664,65 @@ async fn rename_config_cascade(
     .into_response()
 }
 
+/// Move a renamed agent's workspace, reporting whether anything moved.
+///
+/// `Ok(true)` means the directory was relocated, `Ok(false)` that there was
+/// nothing to relocate, and `Err` carries the operator-visible warning. An
+/// unreadable source is an `Err`, never a "nothing to move": collapsing a
+/// metadata failure into absence would let a committed rename report a clean
+/// result while the retired workspace is still on disk, and recreating the old
+/// alias would then resolve to the previous incarnation's files.
 async fn move_renamed_workspace(
     old_ws: &std::path::Path,
     new_ws: &std::path::Path,
-) -> Option<String> {
-    if old_ws == new_ws || !old_ws.exists() {
-        return None;
+) -> Result<bool, String> {
+    if old_ws == new_ws {
+        return Ok(false);
     }
-    if let Some(parent) = new_ws.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+    match tokio::fs::try_exists(old_ws).await {
+        Ok(false) => return Ok(false),
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "old": old_ws.display().to_string(),
+                        "new": new_ws.display().to_string(),
+                        "err": err.to_string()
+                    })),
+                "agent rename: workspace inspection failed"
+            );
+            return Err(format!(
+                "workspace inspection failed for {}: {err}",
+                old_ws.display()
+            ));
+        }
+        Ok(true) => {}
+    }
+    if let Some(parent) = new_ws.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "old": old_ws.display().to_string(),
+                    "new": new_ws.display().to_string(),
+                    "err": err.to_string()
+                })),
+            "agent rename: workspace move parent creation failed"
+        );
+        return Err(format!(
+            "workspace move {} -> {} failed: destination parent {} could not be created: {err}",
+            old_ws.display(),
+            new_ws.display(),
+            parent.display()
+        ));
     }
     match tokio::fs::rename(old_ws, new_ws).await {
-        Ok(()) => None,
+        Ok(()) => Ok(true),
         Err(err) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1688,7 +1735,7 @@ async fn move_renamed_workspace(
                     })),
                 "agent rename: workspace move failed"
             );
-            Some(format!(
+            Err(format!(
                 "workspace move {} -> {} failed: {err}",
                 old_ws.display(),
                 new_ws.display()
@@ -1697,67 +1744,25 @@ async fn move_renamed_workspace(
     }
 }
 
+/// Committed-rename recovery probe for the gateway surface.
+///
+/// Delegates to the shared runtime contract so gateway, CLI, and RPC agree on
+/// what counts as residue. That contract fails toward residue whenever a store
+/// or a path cannot be inspected, which is what keeps a committed rename over
+/// an unreadable workspace retryable instead of reporting convergence while the
+/// retired state is still there.
 async fn rename_residue_exists(
     state: &AppState,
     working: &zeroclaw_config::schema::Config,
     from: &str,
 ) -> bool {
-    // Workspace: the default per-alias dir for `from`. A custom/alias-independent
-    // path is not moved by the cascade, so it is not residue.
-    if working.agent_workspace_dir(from).exists() {
-        return true;
-    }
-
-    // Short-lived clone for the DB-backed stores - never hold the lock across an
-    // `.await`.
-    let cfg = state.config.read().clone();
-
-    // Cron jobs still owned by `from`.
-    if zeroclaw_runtime::cron::list_jobs_by_agent(&cfg, from)
-        .map(|jobs| !jobs.is_empty())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // ACP sessions (live OR killed) still owned by `from`.
-    if let Ok(store) = zeroclaw_infra::acp_session_store::AcpSessionStore::new(&cfg.data_dir)
-        && store
-            .list_sessions_by_agent(from)
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-    {
-        return true;
-    }
-
-    // Memory rows still attributed to `from`.
-    if state.mem.count_agent(from).await.unwrap_or(0) > 0 {
-        return true;
-    }
-
-    // Knowledge attribution is alias-owned durable state and follows the same
-    // retryable rename cascade. Treat an unreadable existing store as residue
-    // so the retry surfaces the failure instead of declaring convergence.
-    let knowledge_path = working.knowledge.resolved_db_path();
-    if knowledge_path.exists() {
-        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
-            &knowledge_path,
-            working.knowledge.max_nodes,
-        ) {
-            Ok(graph) if graph.count_owner(from).unwrap_or(1) > 0 => return true,
-            Err(_) => return true,
-            Ok(_) => {}
-        }
-    }
-
-    // Session-metadata attribution still pointing at `from`.
-    if let Some(backend) = state.session_backend.as_ref()
-        && backend.count_agent_attribution(from).unwrap_or(0) > 0
-    {
-        return true;
-    }
-
-    false
+    zeroclaw_runtime::agent_owned_state::committed_rename_residue_exists(
+        working,
+        Some(&state.mem),
+        state.session_backend.as_ref(),
+        from,
+    )
+    .await
 }
 
 async fn rename_agent_cascade(
@@ -1814,11 +1819,14 @@ async fn rename_agent_cascade(
     // Move the workspace dir. For the default per-alias location this is
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
-    let ws_existed = old_ws != new_ws && old_ws.exists();
-    let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
-    let workspace_moved = ws_existed && move_warning.is_none();
     let mut warnings: Vec<String> = Vec::new();
-    warnings.extend(move_warning);
+    let workspace_moved = match move_renamed_workspace(&old_ws, &new_ws).await {
+        Ok(moved) => moved,
+        Err(warning) => {
+            warnings.push(warning);
+            false
+        }
+    };
 
     // Re-point owned DB state (memory/cron/acp/session). Best-effort + reported.
     let owned = zeroclaw_runtime::agent_owned_state::cascade_rename_agent(
@@ -3251,18 +3259,30 @@ mod tests {
         std::fs::write(&blocker, b"x").unwrap();
         let new_ws = blocker.join("to-ws");
 
-        let warning = move_renamed_workspace(&old_ws, &new_ws).await;
-        assert!(
-            warning.is_some(),
-            "a failed workspace move must surface a warning"
-        );
-        assert!(warning.unwrap().contains("workspace move"));
+        let warning = move_renamed_workspace(&old_ws, &new_ws)
+            .await
+            .expect_err("a failed workspace move must surface a warning");
+        assert!(warning.contains("workspace move"));
         assert!(old_ws.exists(), "source dir stays put when the move fails");
 
-        // Nothing-to-move paths return None (no spurious warning).
-        assert!(move_renamed_workspace(&old_ws, &old_ws).await.is_none());
+        // Nothing-to-move paths report "nothing moved" (no spurious warning).
+        assert_eq!(move_renamed_workspace(&old_ws, &old_ws).await, Ok(false));
         let missing = tmp.path().join("does-not-exist");
-        assert!(move_renamed_workspace(&missing, &new_ws).await.is_none());
+        assert_eq!(move_renamed_workspace(&missing, &new_ws).await, Ok(false));
+
+        // An unreadable source is residue, not absence: a metadata failure must
+        // not be reported as a clean rename.
+        let unreadable_parent = tmp.path().join("unreadable-parent");
+        std::fs::write(&unreadable_parent, b"blocks child metadata").unwrap();
+        let unreadable = unreadable_parent.join("from-ws");
+        assert!(unreadable.try_exists().is_err());
+        let inspection = move_renamed_workspace(&unreadable, &new_ws)
+            .await
+            .expect_err("an unreadable source must surface a warning");
+        assert!(
+            inspection.contains("workspace inspection failed"),
+            "unexpected warning: {inspection}"
+        );
     }
 
     #[tokio::test]
@@ -3536,6 +3556,90 @@ mod tests {
         // Config still names `to` and never regained `from` (no double-rename).
         assert!(state.config.read().agents.contains_key("to"));
         assert!(!state.config.read().agents.contains_key("from"));
+    }
+
+    /// Committed-rename recovery, gateway surface. A workspace whose metadata
+    /// cannot be read is residue, not absence: reporting it as a clean rename
+    /// would leave the retired directory on disk, and recreating the old alias
+    /// would then resolve to the previous incarnation's files (ADR-011).
+    #[tokio::test]
+    async fn agent_rename_retries_unreadable_workspace_before_alias_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+
+        let old_ws = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        std::fs::write(old_ws.join("retired-marker.txt"), b"prior incarnation").unwrap();
+
+        // Committed-`to` shape: the config rename already persisted, so only the
+        // workspace still lags at `alpha`.
+        config.agents.remove("alpha");
+        config.agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let new_ws = config.agent_workspace_dir("beta");
+
+        // Make the retired workspace unreadable rather than absent: its parent
+        // becomes a file, so metadata lookups fail with an error.
+        let workspace_root = old_ws.parent().unwrap().parent().unwrap().to_path_buf();
+        let saved_workspace_root = workspace_root.with_extension("saved");
+        std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
+        std::fs::write(&workspace_root, b"blocks child metadata").unwrap();
+        assert!(old_ws.try_exists().is_err());
+
+        let state = crate::api::test_state(config.clone());
+        let body = RenameMapKeyBody {
+            path: "agents".to_string(),
+            from: "alpha".to_string(),
+            to: "beta".to_string(),
+        };
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let blocked = rename_agent_cascade(&state, config.clone(), &body, guard).await;
+        assert_eq!(blocked.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(blocked.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(
+            json["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("workspace inspection failed"))),
+            "the retry must surface unreadable workspace residue: {json}"
+        );
+
+        std::fs::remove_file(&workspace_root).unwrap();
+        std::fs::rename(&saved_workspace_root, &workspace_root).unwrap();
+        assert!(old_ws.join("retired-marker.txt").exists());
+
+        let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+        let repaired = rename_agent_cascade(&state, config.clone(), &body, guard).await;
+        assert_eq!(repaired.status(), axum::http::StatusCode::OK);
+        assert!(
+            new_ws.join("retired-marker.txt").exists(),
+            "the restored workspace must converge onto the new alias"
+        );
+        assert!(!old_ws.exists());
+
+        std::fs::create_dir_all(&old_ws).unwrap();
+        assert!(
+            !old_ws.join("retired-marker.txt").exists(),
+            "reusing the old alias must not expose the retired workspace"
+        );
     }
 
     #[tokio::test]
