@@ -3,8 +3,9 @@
 use crate::grader::GradeResult;
 
 /// A case's comparison id: the record's `case_id` when present, else its name.
-/// The single canonical case-identity derivation (baseline skip-matching and the
-/// JUnit writer both rely on it).
+/// This mirrors the identity `baseline::compare` keys its per-case map on, so the
+/// ids that comparison reports as unverifiable or flaky select the same cases the
+/// JUnit writer marks skipped. The two derivations must stay in step.
 pub(crate) fn case_id(case: &CaseReport) -> &str {
     case.record
         .as_ref()
