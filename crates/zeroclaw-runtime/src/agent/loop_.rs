@@ -491,6 +491,14 @@ impl InteractiveInputTask {
     }
 }
 
+/// Lend the canonical input worker to supervised approval prompts raised
+/// inside `future`.
+///
+/// This is Windows-only on purpose: there a supervised approval read blocks in
+/// the console and needs the worker's out-of-band cancellation so an active
+/// Ctrl+C can unwind it. Elsewhere the approval prompt keeps its existing
+/// controlling-terminal read, which is not interruptible mid-read, so this is a
+/// pass-through and the turn observes the cancellation once that read returns.
 async fn scope_interactive_approval_input<F: std::future::Future>(
     input: &InteractiveInputTask,
     future: F,
@@ -18020,6 +18028,27 @@ Let me check the result."#;
         drop(result_tx);
         signal_thread.join().expect("Ctrl+C generator thread");
         signal_task.shutdown().await;
+    }
+
+    /// Pins the platform scope the approval documentation claims: only the
+    /// Windows interactive owner lends its cancellable worker to supervised
+    /// approval reads. Everywhere else the approval prompt keeps its
+    /// synchronous controlling-terminal read, so this must stay a
+    /// pass-through until a non-Windows cancellable read exists.
+    #[tokio::test]
+    async fn interactive_input_lifecycle_scopes_cancellable_approval_only_on_windows() {
+        let (input, _request_rx, _result_tx) = interactive_test_input_task();
+
+        let scoped = scope_interactive_approval_input(&input, async {
+            crate::approval::cli_approval_input_is_scoped()
+        })
+        .await;
+
+        assert_eq!(
+            scoped,
+            cfg!(windows),
+            "cancellable approval input is scoped on Windows only"
+        );
     }
 
     #[cfg(windows)]

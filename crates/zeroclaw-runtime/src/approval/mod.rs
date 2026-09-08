@@ -101,6 +101,11 @@ type CliApprovalReadFuture =
 /// The ordinary CLI approval fallback still reads the controlling terminal.
 /// Interactive owners that already serialize process stdin can scope this
 /// adapter around a turn so approval does not create a competing reader.
+///
+/// Only the Windows interactive owner scopes this adapter today, because only
+/// there does a blocking console read need an out-of-band cancellation. The
+/// adapter is also compiled under `cfg(test)` so the boundary can be tested on
+/// any host.
 #[derive(Clone)]
 #[cfg(any(windows, test))]
 pub(crate) struct CliApprovalInput {
@@ -135,6 +140,15 @@ pub(crate) async fn scope_cli_approval_input<F: Future>(
     future: F,
 ) -> F::Output {
     CLI_APPROVAL_INPUT.scope(input, future).await
+}
+
+/// Whether the current task runs inside a scoped cancellable approval reader.
+///
+/// Tests use this to pin which platforms actually get the interruptible
+/// approval wait documented on `ApprovalManager::prompt_cli_cancellable`.
+#[cfg(test)]
+pub(crate) fn cli_approval_input_is_scoped() -> bool {
+    CLI_APPROVAL_INPUT.try_with(|_| ()).is_ok()
 }
 
 // ── ApprovalManager ──────────────────────────────────────────────
@@ -314,6 +328,15 @@ impl ApprovalManager {
 
     /// Prompt through the interactive owner's input worker when one is scoped
     /// for this turn, and stop waiting when the turn is cancelled.
+    ///
+    /// Platform scope: the wait itself is interruptible only when an
+    /// interactive owner has scoped its cancellable reader, which today is the
+    /// Windows interactive command. Every other build reads the controlling
+    /// terminal synchronously through `read_cli_approval_line`, so a
+    /// cancellation that arrives while that read is blocked is observed only
+    /// after the operator supplies a line or the read ends. The token is still
+    /// honored before the prompt is written and again after the read returns,
+    /// so a cancelled turn never turns a late answer into authorization.
     pub(crate) async fn prompt_cli_cancellable(
         &self,
         request: &ApprovalRequest,
