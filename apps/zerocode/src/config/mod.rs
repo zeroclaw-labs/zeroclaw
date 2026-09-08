@@ -43,6 +43,68 @@ impl ChordSpec {
     }
 }
 
+fn migrate_legacy_ctrl_bindings(value: &mut toml::Value) -> bool {
+    let Some(rows) = value.as_table_mut() else {
+        return false;
+    };
+    let mut migrated = false;
+    for (_, value) in rows.iter_mut() {
+        migrated |= migrate_legacy_ctrl_value(value);
+    }
+    migrated
+}
+
+fn migrate_legacy_ctrl_value(value: &mut toml::Value) -> bool {
+    match value {
+        toml::Value::String(wire) => migrate_legacy_ctrl_wire(wire),
+        toml::Value::Array(values) => {
+            let mut migrated = false;
+            for value in values {
+                migrated |= migrate_legacy_ctrl_value(value);
+            }
+            migrated
+        }
+        _ => false,
+    }
+}
+
+fn migrate_legacy_ctrl_wire(wire: &mut String) -> bool {
+    let segments: Vec<&str> = wire.trim().split('+').collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    let Some(key) = segments.last() else {
+        return false;
+    };
+    let replacement = if matches!(
+        key.to_ascii_lowercase().as_str(),
+        "c" | "g" | "k" | "n" | "s" | "f1"
+    ) {
+        "control"
+    } else {
+        "primary"
+    };
+    let mut found_legacy = false;
+    let migrated = segments
+        .iter()
+        .map(|segment| {
+            if segment.eq_ignore_ascii_case("ctrl") {
+                found_legacy = true;
+                replacement
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+    if found_legacy && migrated != wire.trim() {
+        *wire = migrated;
+        true
+    } else {
+        false
+    }
+}
+
 fn migrate_legacy_help_binding(rows: &mut HashMap<String, ChordSpec>) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -600,7 +662,20 @@ pub(crate) fn load_persisted(config_dir: &Path) -> Result<ZerocodeConfig> {
         }
     }
     if let Some(v) = doc.get("keybindings") {
-        match v.clone().try_into::<HashMap<String, ChordSpec>>() {
+        let mut migrated_value = v.clone();
+        let migrated_legacy = migrate_legacy_ctrl_bindings(&mut migrated_value);
+        if migrated_legacy {
+            // Rewrite legacy spellings before parsing the rows. A malformed,
+            // unrelated row must not leave otherwise valid legacy values in
+            // the file indefinitely; the tolerant loader still falls back to
+            // defaults for the malformed section below.
+            doc.insert("keybindings".to_string(), migrated_value.clone());
+            migrated_keybindings = true;
+        }
+        match migrated_value
+            .clone()
+            .try_into::<HashMap<String, ChordSpec>>()
+        {
             Ok(mut rows) => {
                 if migrate_legacy_help_binding(&mut rows) {
                     let key = GlobalAction::Help.action_key();
@@ -1354,6 +1429,25 @@ mod tests {
     }
 
     #[test]
+    fn persist_keybind_row_emits_only_canonical_modifier_wires() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_keybind_row(
+            dir.path(),
+            "input_bar.clear_input",
+            vec![Chord::ctrl('c'), Chord::primary('u')],
+        )
+        .unwrap();
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        let row = doc["keybindings"]["input_bar.clear_input"]
+            .as_array()
+            .unwrap();
+        assert_eq!(row[0].as_str(), Some("control+c"));
+        assert_eq!(row[1].as_str(), Some("primary+u"));
+        assert!(!read(dir.path()).contains("ctrl+"));
+    }
+
+    #[test]
     fn persist_keybindings_replaces_only_its_section() {
         let dir = tempfile::tempdir().unwrap();
         seed(
@@ -1438,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn customized_help_binding_is_not_migrated() {
+    fn customized_help_binding_migrates_legacy_primary() {
         // Reads the environment via `ensure_and_load`; serialize against the
         // env-mutating tests so a stray override cannot leak in.
         let _guard = env_test_lock();
@@ -1452,9 +1546,102 @@ mod tests {
         let resolved = cfg.resolve_keybindings().unwrap();
         assert_eq!(
             resolved["global"]["help"],
-            vec![Chord::char('?'), Chord::ctrl('h')]
+            vec![Chord::char('?'), Chord::primary('h')]
         );
-        assert!(read(dir.path()).contains("ctrl+h"));
+        assert!(read(dir.path()).contains("primary+h"));
+        assert!(!read(dir.path()).contains("ctrl+h"));
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_preserves_scalar_array_and_unrelated_config() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "locale = \"en\"\n\n[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n\"global.help\" = [\"ctrl+c\", \"ctrl+f1\"]\n\n[future]\nkeep = true\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let resolved = cfg.resolve_keybindings().unwrap();
+        assert_eq!(
+            resolved["input_bar"]["clear_input"],
+            vec![Chord::primary('u')]
+        );
+        assert_eq!(
+            resolved["global"]["help"],
+            vec![
+                Chord::ctrl('c'),
+                Chord::with(KeyCode::F(1), KeyModifiers::CONTROL),
+            ]
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["locale"].as_str(), Some("en"));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+        assert_eq!(
+            doc["keybindings"]["input_bar.clear_input"].as_str(),
+            Some("primary+u")
+        );
+        let global = doc["keybindings"]["global.help"].as_array().unwrap();
+        assert_eq!(global[0].as_str(), Some("control+c"));
+        assert_eq!(global[1].as_str(), Some("control+f1"));
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_uses_the_frozen_key_split() {
+        for key in ["c", "g", "k", "n", "s", "f1"] {
+            let mut wire = format!("ctrl+{key}");
+            assert!(migrate_legacy_ctrl_wire(&mut wire));
+            assert_eq!(wire, format!("control+{key}"));
+        }
+        for key in [
+            "a", "d", "e", "h", "p", "r", "u", "v", "w", "x", "enter", "up",
+        ] {
+            let mut wire = format!("ctrl+{key}");
+            assert!(migrate_legacy_ctrl_wire(&mut wire));
+            assert_eq!(wire, format!("primary+{key}"));
+        }
+        let mut canonical = "control+c".to_string();
+        assert!(!migrate_legacy_ctrl_wire(&mut canonical));
+        assert_eq!(canonical, "control+c");
+    }
+
+    #[test]
+    fn legacy_ctrl_migration_rewrites_before_tolerant_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"input_bar.clear_input\" = \"ctrl+u\"\n\"broken\" = [42]\n\n[future]\nkeep = true\n",
+        );
+
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(
+            cfg.keybindings.is_empty(),
+            "malformed rows still use defaults"
+        );
+
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(
+            doc["keybindings"]["input_bar.clear_input"].as_str(),
+            Some("primary+u")
+        );
+        assert_eq!(doc["keybindings"]["broken"][0].as_integer(), Some(42));
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn canonical_keybindings_reload_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[keybindings]\n\"input_bar.clear_input\" = \"primary+u\"\n\n[future]\nkeep = 1\n",
+        );
+
+        let _ = ensure_and_load(dir.path()).unwrap();
+        let first = read(dir.path());
+        let _ = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(read(dir.path()), first);
     }
 
     #[test]

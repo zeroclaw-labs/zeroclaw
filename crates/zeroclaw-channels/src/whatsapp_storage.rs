@@ -14,8 +14,6 @@ use std::sync::Arc;
 #[cfg(feature = "whatsapp-web")]
 use bytes::Bytes;
 #[cfg(feature = "whatsapp-web")]
-use prost::Message;
-#[cfg(feature = "whatsapp-web")]
 use wacore::appstate::hash::HashState;
 #[cfg(feature = "whatsapp-web")]
 use wacore::appstate::processor::AppStateMutationMAC;
@@ -27,6 +25,10 @@ use wacore::store::traits::DeviceInfo;
 use wacore::store::traits::DeviceStore as DeviceStoreTrait;
 #[cfg(feature = "whatsapp-web")]
 use wacore::store::traits::*;
+#[cfg(feature = "whatsapp-web")]
+// waproto 0.7 generates buffa messages, not prost; `encode_to_vec`/`decode`
+// come from buffa's `Message` trait, re-exported by waproto.
+use waproto::buffa::Message;
 
 #[cfg(feature = "whatsapp-web")]
 #[derive(Clone)]
@@ -159,7 +161,7 @@ impl RusqliteStore {
             table_exists && !has_raw_id
         };
 
-        let device_06_migrations: Vec<(&'static str, &'static str)> = {
+        let device_migrations: Vec<(&'static str, &'static str)> = {
             let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut stmt = conn.prepare("PRAGMA table_info(device)")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -168,14 +170,21 @@ impl RusqliteStore {
             }
             const ALL: &[(&str, &str)] = &[
                 ("next_pre_key_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("first_unupload_pre_key_id", "INTEGER NOT NULL DEFAULT 0"),
                 ("server_has_prekeys", "INTEGER NOT NULL DEFAULT 0"),
                 ("nct_salt", "BLOB"),
                 ("server_cert_chain", "BLOB"),
                 ("login_counter", "INTEGER NOT NULL DEFAULT 0"),
+                ("lid_migrated", "INTEGER NOT NULL DEFAULT 0"),
+                (
+                    "last_signed_pre_key_rotation_ms",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                ("read_receipts_disabled", "INTEGER NOT NULL DEFAULT 0"),
             ];
             // If the table doesn't exist yet (existing is empty), the
-            // CREATE TABLE inside the transaction will define all five
-            // columns, so we want an empty migration list. The same
+            // CREATE TABLE inside the transaction will define every column,
+            // so we want an empty migration list. The same
             // empty-set check that `needs_raw_id` relies on applies here.
             if existing.is_empty() {
                 Vec::new()
@@ -211,10 +220,14 @@ impl RusqliteStore {
                 edge_routing_info BLOB,
                 props_hash TEXT,
                 next_pre_key_id INTEGER NOT NULL DEFAULT 0,
+                first_unupload_pre_key_id INTEGER NOT NULL DEFAULT 0,
                 server_has_prekeys INTEGER NOT NULL DEFAULT 0,
                 nct_salt BLOB,
                 server_cert_chain BLOB,
-                login_counter INTEGER NOT NULL DEFAULT 0
+                login_counter INTEGER NOT NULL DEFAULT 0,
+                lid_migrated INTEGER NOT NULL DEFAULT 0,
+                last_signed_pre_key_rotation_ms INTEGER NOT NULL DEFAULT 0,
+                read_receipts_disabled INTEGER NOT NULL DEFAULT 0
             );
 
             -- Signal identity keys
@@ -344,6 +357,29 @@ impl RusqliteStore {
                 PRIMARY KEY (chat_jid, message_id, device_id)
             );
 
+            -- MessageContextInfo.messageSecret keyed by the outbound message
+            -- it belongs to. Needed to decrypt add-ons (reactions, edits,
+            -- poll votes, msmsg bot replies) that reference one of our own
+            -- sent messages. `expires_at` is an absolute unix-seconds
+            -- retention deadline (0 = never); `message_ts` is the parent
+            -- message's event time (0 = unknown), used to enforce the
+            -- edit-processing window.
+            CREATE TABLE IF NOT EXISTS msg_secrets (
+                chat TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                secret BLOB NOT NULL,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                message_ts INTEGER NOT NULL DEFAULT 0,
+                device_id INTEGER NOT NULL,
+                PRIMARY KEY (chat, sender, msg_id, device_id)
+            );
+
+            -- device_id first so the prune's `device_id = ? AND expires_at <= ?`
+            -- range scan stays localized to one account in a shared DB.
+            CREATE INDEX IF NOT EXISTS idx_msg_secrets_expires
+                ON msg_secrets (device_id, expires_at);
+
             -- Base keys for collision detection
             CREATE TABLE IF NOT EXISTS base_keys (
                 address TEXT NOT NULL,
@@ -390,7 +426,7 @@ impl RusqliteStore {
             ))?;
         }
 
-        for (col, ty) in &device_06_migrations {
+        for (col, ty) in &device_migrations {
             to_store_err!(execute: tx.execute(
                 &format!("ALTER TABLE device ADD COLUMN {col} {ty}"),
                 [],
@@ -540,6 +576,26 @@ impl SignalStore for RusqliteStore {
             "DELETE FROM prekeys WHERE id = ?1 AND device_id = ?2",
             params![id, self.device_id],
         ))
+    }
+
+    /// Flag the pre-keys in `ids` as uploaded to the server.
+    ///
+    /// UPDATE-only by contract: a key consumed (and deleted) between the
+    /// upload snapshot and this call must stay deleted, so an upsert here
+    /// would resurrect a spent key and hand it out twice.
+    async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> wacore::store::error::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock();
+        for id in ids {
+            to_store_err!(execute: conn.execute(
+                "UPDATE prekeys SET uploaded = 1 WHERE id = ?1 AND device_id = ?2",
+                params![id, self.device_id],
+            ))?;
+        }
+        Ok(())
     }
 
     // --- Signed PreKey Operations ---
@@ -763,6 +819,19 @@ impl AppSyncStore for RusqliteStore {
         Ok(())
     }
 
+    /// Drop every mutation MAC for one collection.
+    ///
+    /// Called on snapshot re-sync so the MAC store is rebuilt from the
+    /// snapshot and stays consistent with the ltHash baseline; a leftover
+    /// entry would corrupt the next patch's ltHash.
+    async fn clear_mutation_macs(&self, name: &str) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        to_store_err!(execute: conn.execute(
+            "DELETE FROM app_state_mutation_macs WHERE name = ?1 AND device_id = ?2",
+            params![name, self.device_id],
+        ))
+    }
+
     /// Get the most recently stored app state sync key ID.
     /// Added in wacore 0.6: used to seed app-state sync requests with the
     /// freshest key identifier we hold rather than scanning the table on each
@@ -783,6 +852,111 @@ impl AppSyncStore for RusqliteStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
         }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[async_trait]
+impl MsgSecretStore for RusqliteStore {
+    /// Batched upsert. On key conflict the merge is deterministic and matches
+    /// `wacore::store::traits::merge_msg_secret_expiry` /
+    /// `merge_msg_secret_message_ts`: the later deadline wins with `0`
+    /// ("never") beating any finite one, so a redelivery or edit re-persist
+    /// can never shorten a retention window; and the later non-zero parent
+    /// timestamp wins, so an unknown `0` never clobbers a known one.
+    async fn put_msg_secrets(
+        &self,
+        entries: Vec<MsgSecretEntry>,
+    ) -> wacore::store::error::Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = to_store_err!(conn.transaction())?;
+
+        let mut stored = 0usize;
+        for entry in &entries {
+            // Plain variant, not `execute:` — that one discards the row
+            // count, and the trait contract returns how many were stored.
+            stored += to_store_err!(tx.execute(
+                "INSERT INTO msg_secrets
+                     (chat, sender, msg_id, secret, expires_at, message_ts, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(chat, sender, msg_id, device_id) DO UPDATE SET
+                     secret = excluded.secret,
+                     expires_at = CASE
+                         WHEN msg_secrets.expires_at = 0 OR excluded.expires_at = 0 THEN 0
+                         ELSE MAX(msg_secrets.expires_at, excluded.expires_at)
+                     END,
+                     message_ts = MAX(msg_secrets.message_ts, excluded.message_ts)",
+                params![
+                    entry.chat,
+                    entry.sender,
+                    entry.msg_id,
+                    entry.secret,
+                    entry.expires_at,
+                    entry.message_ts,
+                    self.device_id,
+                ],
+            ))?;
+        }
+
+        to_store_err!(tx.commit())?;
+        Ok(stored)
+    }
+
+    async fn get_msg_secret(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        Ok(self
+            .get_msg_secret_with_ts(chat, sender, msg_id)
+            .await?
+            .map(|(secret, _)| secret))
+    }
+
+    /// Overridden rather than left to the trait default: this backend does
+    /// persist `message_ts`, so the receive path gets the real parent event
+    /// time instead of the default's `0`, and can enforce the edit window.
+    async fn get_msg_secret_with_ts(
+        &self,
+        chat: &str,
+        sender: &str,
+        msg_id: &str,
+    ) -> wacore::store::error::Result<Option<(Vec<u8>, i64)>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT secret, message_ts FROM msg_secrets
+             WHERE chat = ?1 AND sender = ?2 AND msg_id = ?3 AND device_id = ?4",
+            params![chat, sender, msg_id, self.device_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        );
+
+        match result {
+            Ok(found) => Ok(Some(found)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
+        }
+    }
+
+    /// Prune rows whose deadline has passed. `expires_at = 0` means "never",
+    /// so those rows are kept regardless of the cutoff.
+    async fn delete_expired_msg_secrets(
+        &self,
+        cutoff_timestamp: i64,
+    ) -> wacore::store::error::Result<u32> {
+        let conn = self.conn.lock();
+        // Plain variant, not `execute:` — the caller throttles its cleanup
+        // sweep on how many rows this actually removed.
+        let deleted = to_store_err!(conn.execute(
+            "DELETE FROM msg_secrets
+             WHERE expires_at != 0 AND expires_at <= ?1 AND device_id = ?2",
+            params![cutoff_timestamp, self.device_id],
+        ))?;
+        Ok(deleted as u32)
     }
 }
 
@@ -1162,6 +1336,54 @@ impl ProtocolStore for RusqliteStore {
         ))
     }
 
+    /// Advance only the sender-side bucket, atomically preserving a received
+    /// token written by the concurrent privacy-notification path.
+    async fn touch_tc_token_sender_timestamp(
+        &self,
+        jid: &str,
+        sender_timestamp: i64,
+    ) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        to_store_err!(execute: conn.execute(
+            "INSERT INTO tc_tokens
+                 (jid, token, token_timestamp, sender_timestamp, device_id, updated_at)
+             VALUES (?1, X'', ?2, ?2, ?3, ?4)
+             ON CONFLICT(jid, device_id) DO UPDATE SET
+                 sender_timestamp = CASE
+                     WHEN tc_tokens.sender_timestamp IS NULL
+                         THEN excluded.sender_timestamp
+                     ELSE MAX(tc_tokens.sender_timestamp, excluded.sender_timestamp)
+                 END,
+                 updated_at = excluded.updated_at",
+            params![jid, sender_timestamp, self.device_id, now],
+        ))
+    }
+
+    /// Store the newer received token in one statement while leaving the
+    /// sender-side bucket untouched.
+    async fn store_received_tc_token(
+        &self,
+        jid: &str,
+        token: &[u8],
+        token_timestamp: i64,
+    ) -> wacore::store::error::Result<()> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        to_store_err!(execute: conn.execute(
+            "INSERT INTO tc_tokens
+                 (jid, token, token_timestamp, sender_timestamp, device_id, updated_at)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5)
+             ON CONFLICT(jid, device_id) DO UPDATE SET
+                 token = excluded.token,
+                 token_timestamp = excluded.token_timestamp,
+                 updated_at = excluded.updated_at
+             WHERE length(tc_tokens.token) = 0
+                OR excluded.token_timestamp >= tc_tokens.token_timestamp",
+            params![jid, token, token_timestamp, self.device_id, now],
+        ))
+    }
+
     async fn delete_tc_token(&self, jid: &str) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
         to_store_err!(execute: conn.execute(
@@ -1189,13 +1411,21 @@ impl ProtocolStore for RusqliteStore {
 
     async fn delete_expired_tc_tokens(
         &self,
-        cutoff_timestamp: i64,
+        token_cutoff: i64,
+        sender_cutoff: i64,
     ) -> wacore::store::error::Result<u32> {
         let conn = self.conn.lock();
+        // Both halves must be dead before the row goes. Recent sender state is
+        // never dropped just because the received token expired, so the two
+        // cutoffs are ANDed rather than either one deleting the row alone. An
+        // empty token counts as absent, as does a NULL sender bucket.
         let deleted = conn
             .execute(
-                "DELETE FROM tc_tokens WHERE token_timestamp < ?1 AND device_id = ?2",
-                params![cutoff_timestamp, self.device_id],
+                "DELETE FROM tc_tokens
+                  WHERE device_id = ?3
+                    AND (token_timestamp < ?1 OR length(token) = 0)
+                    AND (sender_timestamp IS NULL OR sender_timestamp < ?2)",
+                params![token_cutoff, sender_cutoff, self.device_id],
             )
             .map_err(|e| {
                 wacore::store::error::StoreError::Database(
@@ -1324,7 +1554,7 @@ impl DeviceStoreTrait for RusqliteStore {
 
         // Safety: device account data is stored to DB only; to_store_err! converts
         // rusqlite errors without logging parameter values.
-        let account = device.account.as_ref().map(|a| a.encode_to_vec());
+        let account = device.account.as_ref().map(|a| a.as_ref().encode_to_vec());
 
         let server_cert_chain_blob = device
             .server_cert_chain
@@ -1340,12 +1570,14 @@ impl DeviceStoreTrait for RusqliteStore {
                 adv_secret_key, account, push_name, app_version_primary,
                 app_version_secondary, app_version_tertiary, app_version_last_fetched_ms,
                 edge_routing_info, props_hash,
-                next_pre_key_id, server_has_prekeys, nct_salt,
-                server_cert_chain, login_counter
+                next_pre_key_id, first_unupload_pre_key_id,
+                server_has_prekeys, nct_salt, server_cert_chain,
+                login_counter, lid_migrated,
+                last_signed_pre_key_rotation_ms, read_receipts_disabled
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                 ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23
+                ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
             )",
             params![
                 self.device_id,
@@ -1367,10 +1599,14 @@ impl DeviceStoreTrait for RusqliteStore {
                 device.edge_routing_info.clone(),
                 device.props_hash.clone(),
                 device.next_pre_key_id,
+                device.first_unupload_pre_key_id,
                 device.server_has_prekeys as i64,
                 device.nct_salt.clone(),
                 server_cert_chain_blob,
                 device.login_counter,
+                device.lid_migrated as i64,
+                device.last_signed_pre_key_rotation_ms,
+                device.read_receipts_disabled as i64,
             ],
         ))
     }
@@ -1446,10 +1682,13 @@ impl DeviceStoreTrait for RusqliteStore {
                 let account_bytes: Option<Vec<u8>> = row.get("account")?;
 
                 let account = if let Some(bytes) = account_bytes {
-                    Some(
-                        waproto::whatsapp::AdvSignedDeviceIdentity::decode(&*bytes)
+                    // buffa's `decode` wants `&mut impl Buf`; `decode_from_slice`
+                    // is the convenience form. 0.7 also stores the account behind
+                    // an `Arc` on `Device`.
+                    Some(std::sync::Arc::new(
+                        waproto::whatsapp::ADVSignedDeviceIdentity::decode_from_slice(&bytes)
                             .map_err(to_rusqlite_err)?,
-                    )
+                    ))
                 } else {
                     None
                 };
@@ -1462,6 +1701,8 @@ impl DeviceStoreTrait for RusqliteStore {
                     }
                 };
                 let server_has_prekeys_int: i64 = row.get("server_has_prekeys")?;
+                let lid_migrated_int: i64 = row.get("lid_migrated")?;
+                let read_receipts_disabled_int: i64 = row.get("read_receipts_disabled")?;
 
                 Ok(CoreDevice {
                     lid: lid_str.and_then(|s| s.parse().ok()),
@@ -1482,10 +1723,14 @@ impl DeviceStoreTrait for RusqliteStore {
                     edge_routing_info: row.get("edge_routing_info")?,
                     props_hash: row.get("props_hash")?,
                     next_pre_key_id: row.get("next_pre_key_id")?,
+                    first_unupload_pre_key_id: row.get("first_unupload_pre_key_id")?,
                     server_has_prekeys: server_has_prekeys_int != 0,
                     nct_salt: row.get("nct_salt")?,
                     server_cert_chain,
                     login_counter: row.get("login_counter")?,
+                    lid_migrated: lid_migrated_int != 0,
+                    last_signed_pre_key_rotation_ms: row.get("last_signed_pre_key_rotation_ms")?,
+                    read_receipts_disabled: read_receipts_disabled_int != 0,
                     ..Default::default()
                 })
             },
@@ -1558,6 +1803,150 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = RusqliteStore::new(tmp.path()).unwrap();
         assert_eq!(store.device_id, 1);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn msg_secret(msg_id: &str, expires_at: i64, message_ts: i64) -> MsgSecretEntry {
+        // 0.7 narrows these: the JID/id fields are `Arc<str>` and the secret is
+        // a fixed `[u8; MESSAGE_SECRET_SIZE]` rather than a `Vec<u8>`.
+        MsgSecretEntry {
+            chat: "chat@s.whatsapp.net".into(),
+            sender: "sender@s.whatsapp.net".into(),
+            msg_id: msg_id.into(),
+            secret: [7u8; 32],
+            expires_at,
+            message_ts,
+        }
+    }
+
+    /// A redelivery or edit re-persist must never shorten a retention window,
+    /// and `0` ("never") must beat any finite deadline in either direction.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn msg_secret_upsert_never_shortens_the_retention_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RusqliteStore::new(tmp.path().join("session.db")).unwrap();
+
+        store
+            .put_msg_secrets(vec![msg_secret("ID", 1_000, 0)])
+            .await
+            .unwrap();
+
+        // An earlier deadline loses to the one already stored.
+        store
+            .put_msg_secrets(vec![msg_secret("ID", 500, 0)])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.delete_expired_msg_secrets(600).await.unwrap(),
+            0,
+            "a 500 deadline must not have replaced the stored 1000"
+        );
+
+        // 0 means never, so it wins over the stored finite deadline.
+        store
+            .put_msg_secrets(vec![msg_secret("ID", 0, 0)])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.delete_expired_msg_secrets(i64::MAX).await.unwrap(),
+            0,
+            "a never-expires row must survive any cutoff"
+        );
+    }
+
+    /// The parent message's event time is immutable; a later write that does
+    /// not know it (`0`) must not erase the value already stored.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn msg_secret_upsert_keeps_a_known_parent_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RusqliteStore::new(tmp.path().join("session.db")).unwrap();
+
+        store
+            .put_msg_secrets(vec![msg_secret("ID", 0, 1_700_000_000)])
+            .await
+            .unwrap();
+        store
+            .put_msg_secrets(vec![msg_secret("ID", 0, 0)])
+            .await
+            .unwrap();
+
+        let (secret, message_ts) = store
+            .get_msg_secret_with_ts("chat@s.whatsapp.net", "sender@s.whatsapp.net", "ID")
+            .await
+            .unwrap()
+            .expect("secret must still be present");
+        assert_eq!(secret, vec![7u8; 32]);
+        assert_eq!(
+            message_ts, 1_700_000_000,
+            "an unknown (0) parent time must not clobber a known one"
+        );
+    }
+
+    /// Only deadlines that have actually passed are pruned; `0` never expires.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn expired_msg_secrets_prune_only_passed_deadlines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RusqliteStore::new(tmp.path().join("session.db")).unwrap();
+
+        store
+            .put_msg_secrets(vec![
+                msg_secret("NEVER", 0, 0),
+                msg_secret("PAST", 1_000, 0),
+                msg_secret("FUTURE", 9_000, 0),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(store.delete_expired_msg_secrets(5_000).await.unwrap(), 1);
+
+        let chat = "chat@s.whatsapp.net";
+        let sender = "sender@s.whatsapp.net";
+        assert!(
+            store
+                .get_msg_secret(chat, sender, "NEVER")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_msg_secret(chat, sender, "FUTURE")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_msg_secret(chat, sender, "PAST")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `mark_prekeys_uploaded` is UPDATE-only by contract: a key consumed
+    /// between the upload snapshot and the callback must stay deleted, or it
+    /// would be handed out to a second peer.
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn mark_prekeys_uploaded_never_resurrects_a_deleted_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RusqliteStore::new(tmp.path().join("session.db")).unwrap();
+
+        store.store_prekey(1, &[1u8; 32], false).await.unwrap();
+        store.store_prekey(2, &[2u8; 32], false).await.unwrap();
+        store.remove_prekey(2).await.unwrap();
+
+        store.mark_prekeys_uploaded(&[1, 2]).await.unwrap();
+
+        assert!(store.load_prekey(1).await.unwrap().is_some());
+        assert!(
+            store.load_prekey(2).await.unwrap().is_none(),
+            "a consumed pre-key must not be resurrected by the uploaded flag"
+        );
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1698,7 +2087,7 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     #[tokio::test]
-    async fn mutation_macs_round_trip_raw_bytes() {
+    async fn mutation_macs_round_trip_raw_bytes_and_clear_stays_scoped() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = RusqliteStore::new(tmp.path()).unwrap();
 
@@ -1721,13 +2110,69 @@ mod tests {
         let got = AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
             .await
             .unwrap();
-        assert_eq!(got, Some(value_mac));
+        assert_eq!(got, Some(value_mac.clone()));
 
         // Unknown index → None.
         let missing = AppSyncStore::get_mutation_mac(&store, "critical_block", &[1, 2, 3])
             .await
             .unwrap();
         assert_eq!(missing, None);
+
+        let other_index = vec![0x44, 0x55];
+        let other_mac = AppStateMutationMAC {
+            index_mac: other_index.clone(),
+            value_mac: vec![0x66, 0x77],
+        };
+        AppSyncStore::put_mutation_macs(
+            &store,
+            "regular_high",
+            1,
+            std::slice::from_ref(&other_mac),
+        )
+        .await
+        .unwrap();
+
+        let other_device = RusqliteStore {
+            device_id: 2,
+            ..store.clone()
+        };
+        AppSyncStore::put_mutation_macs(
+            &other_device,
+            "critical_block",
+            1,
+            std::slice::from_ref(&mac),
+        )
+        .await
+        .unwrap();
+
+        AppSyncStore::clear_mutation_macs(&store, "critical_block")
+            .await
+            .unwrap();
+        assert_eq!(
+            AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
+                .await
+                .unwrap(),
+            None,
+            "the named collection must be cleared for this device"
+        );
+        assert_eq!(
+            AppSyncStore::get_mutation_mac(&store, "regular_high", &other_index)
+                .await
+                .unwrap(),
+            Some(other_mac.value_mac),
+            "another collection on this device must survive"
+        );
+        assert_eq!(
+            AppSyncStore::get_mutation_mac(&other_device, "critical_block", &index_mac)
+                .await
+                .unwrap(),
+            Some(value_mac.clone()),
+            "the same collection on another device must survive"
+        );
+
+        AppSyncStore::put_mutation_macs(&store, "critical_block", 2, &[mac])
+            .await
+            .unwrap();
 
         // Delete removes the entry.
         AppSyncStore::delete_mutation_macs(
@@ -1777,7 +2222,7 @@ mod tests {
 
     #[cfg(feature = "whatsapp-web")]
     #[tokio::test]
-    async fn delete_expired_tc_tokens_returns_deleted_row_count() {
+    async fn delete_expired_tc_tokens_requires_both_halves_to_be_dead() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = RusqliteStore::new(tmp.path()).unwrap();
 
@@ -1791,6 +2236,21 @@ mod tests {
             token_timestamp: 1000,
             sender_timestamp: Some(1000),
         };
+        let expired_token_live_sender = TcTokenEntry {
+            token: vec![7, 8, 9],
+            token_timestamp: 10,
+            sender_timestamp: Some(1000),
+        };
+        let empty_token_expired_sender = TcTokenEntry {
+            token: Vec::new(),
+            token_timestamp: 1000,
+            sender_timestamp: Some(10),
+        };
+        let live_token_expired_sender = TcTokenEntry {
+            token: vec![10, 11, 12],
+            token_timestamp: 1000,
+            sender_timestamp: Some(10),
+        };
 
         ProtocolStore::put_tc_token(&store, "15550000001", &expired)
             .await
@@ -1798,11 +2258,20 @@ mod tests {
         ProtocolStore::put_tc_token(&store, "15550000002", &fresh)
             .await
             .unwrap();
-
-        let deleted = ProtocolStore::delete_expired_tc_tokens(&store, 100)
+        ProtocolStore::put_tc_token(&store, "15550000003", &expired_token_live_sender)
             .await
             .unwrap();
-        assert_eq!(deleted, 1);
+        ProtocolStore::put_tc_token(&store, "15550000004", &empty_token_expired_sender)
+            .await
+            .unwrap();
+        ProtocolStore::put_tc_token(&store, "15550000005", &live_token_expired_sender)
+            .await
+            .unwrap();
+
+        let deleted = ProtocolStore::delete_expired_tc_tokens(&store, 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
         assert!(
             ProtocolStore::get_tc_token(&store, "15550000001")
                 .await
@@ -1815,11 +2284,72 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert!(
+            ProtocolStore::get_tc_token(&store, "15550000003")
+                .await
+                .unwrap()
+                .is_some(),
+            "a live sender bucket must preserve an expired received token row"
+        );
+        assert!(
+            ProtocolStore::get_tc_token(&store, "15550000004")
+                .await
+                .unwrap()
+                .is_none(),
+            "an empty token with an expired sender bucket has no live state"
+        );
+        assert!(
+            ProtocolStore::get_tc_token(&store, "15550000005")
+                .await
+                .unwrap()
+                .is_some(),
+            "a live received token must preserve an expired sender bucket row"
+        );
     }
 
     #[cfg(feature = "whatsapp-web")]
     #[tokio::test]
-    async fn device_save_load_round_trips_wacore_06_fields() {
+    async fn tc_token_writers_atomically_preserve_each_others_fields() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+        const JID: &str = "15550000006";
+
+        ProtocolStore::touch_tc_token_sender_timestamp(&store, JID, 5_000)
+            .await
+            .unwrap();
+        ProtocolStore::store_received_tc_token(&store, JID, &[1, 2, 3], 4_000)
+            .await
+            .unwrap();
+        ProtocolStore::touch_tc_token_sender_timestamp(&store, JID, 3_000)
+            .await
+            .unwrap();
+        ProtocolStore::store_received_tc_token(&store, JID, &[9, 9, 9], 2_000)
+            .await
+            .unwrap();
+
+        let merged = ProtocolStore::get_tc_token(&store, JID)
+            .await
+            .unwrap()
+            .expect("both writer paths must converge on one row");
+        assert_eq!(merged.token, vec![1, 2, 3]);
+        assert_eq!(merged.token_timestamp, 4_000);
+        assert_eq!(merged.sender_timestamp, Some(5_000));
+
+        ProtocolStore::store_received_tc_token(&store, JID, &[4, 5, 6], 6_000)
+            .await
+            .unwrap();
+        let newer = ProtocolStore::get_tc_token(&store, JID)
+            .await
+            .unwrap()
+            .expect("the merged row must remain present");
+        assert_eq!(newer.token, vec![4, 5, 6]);
+        assert_eq!(newer.token_timestamp, 6_000);
+        assert_eq!(newer.sender_timestamp, Some(5_000));
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn device_save_load_round_trips_all_persisted_wacore_07_fields() {
         use wacore::store::Device as CoreDevice;
         use wacore::store::device::{CachedNoiseCert, CachedServerCertChain};
         use wacore::store::traits::DeviceStore as DeviceStoreTrait;
@@ -1827,12 +2357,13 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
 
-        // First boot: populate the 5 wacore-0.6 device fields with
-        // non-default values and persist.
+        // First boot: populate every post-0.5 persisted device field with a
+        // non-default value and persist it.
         {
             let store = RusqliteStore::new(&path).unwrap();
             let mut device = CoreDevice::new();
             device.next_pre_key_id = 42;
+            device.first_unupload_pre_key_id = 17;
             device.server_has_prekeys = true;
             device.nct_salt = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
             device.server_cert_chain = Some(CachedServerCertChain {
@@ -1848,6 +2379,9 @@ mod tests {
                 },
             });
             device.login_counter = 7;
+            device.lid_migrated = true;
+            device.last_signed_pre_key_rotation_ms = 1_750_000_000_000;
+            device.read_receipts_disabled = true;
             DeviceStoreTrait::save(&store, &device).await.unwrap();
         }
 
@@ -1860,6 +2394,7 @@ mod tests {
             .expect("device row should exist after save");
 
         assert_eq!(loaded.next_pre_key_id, 42);
+        assert_eq!(loaded.first_unupload_pre_key_id, 17);
         assert!(loaded.server_has_prekeys);
         assert_eq!(
             loaded.nct_salt.as_deref(),
@@ -1874,6 +2409,9 @@ mod tests {
         assert_eq!(cert.intermediate.not_before, 1_700_000_000);
         assert_eq!(cert.leaf.not_after, 1_800_000_000);
         assert_eq!(loaded.login_counter, 7);
+        assert!(loaded.lid_migrated);
+        assert_eq!(loaded.last_signed_pre_key_rotation_ms, 1_750_000_000_000);
+        assert!(loaded.read_receipts_disabled);
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1915,12 +2453,16 @@ mod tests {
             .unwrap();
         }
 
-        // Opening the store must add the 5 wacore-0.6 columns idempotently;
-        // a subsequent save+load round-trip must succeed.
+        // Opening the store must add every post-0.5 column idempotently; a
+        // subsequent save+load round-trip must succeed.
         let store = RusqliteStore::new(&path).unwrap();
         let mut device = CoreDevice::new();
         device.next_pre_key_id = 99;
+        device.first_unupload_pre_key_id = 50;
         device.login_counter = 3;
+        device.lid_migrated = true;
+        device.last_signed_pre_key_rotation_ms = 1_750_000_000_000;
+        device.read_receipts_disabled = true;
         DeviceStoreTrait::save(&store, &device).await.unwrap();
 
         let loaded = DeviceStoreTrait::load(&store)
@@ -1928,7 +2470,11 @@ mod tests {
             .unwrap()
             .expect("device row should exist after save");
         assert_eq!(loaded.next_pre_key_id, 99);
+        assert_eq!(loaded.first_unupload_pre_key_id, 50);
         assert_eq!(loaded.login_counter, 3);
+        assert!(loaded.lid_migrated);
+        assert_eq!(loaded.last_signed_pre_key_rotation_ms, 1_750_000_000_000);
+        assert!(loaded.read_receipts_disabled);
 
         // Re-opening a second time must be a no-op (idempotent ALTER).
         drop(store);
