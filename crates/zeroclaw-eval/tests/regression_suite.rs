@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
+use zeroclaw_eval::case::load_suite;
 use zeroclaw_eval::grader::evaluate_expects;
 use zeroclaw_eval::{LlmTrace, Mode, RecordedCall, RunRecord, run_case, run_suite};
 
@@ -67,6 +68,37 @@ async fn missing_argument_fixture_fails_when_the_dispatch_is_silently_repaired()
         "a repaired dispatch left every expectation green, so the case cannot \
          detect the regression its name claims"
     );
+}
+
+/// Every gated case must be falsifiable by the absence of behavior.
+///
+/// Fixture admission rejects a case that declares no assertion, but a case can
+/// still declare one that an idle run satisfies: a lone `max_tool_calls: 0`
+/// holds over a run with no response and no dispatch. Such a case would report
+/// green in the required suite while certifying nothing, so grade every
+/// committed fixture against a run that produced nothing and require at least
+/// one failed check.
+#[tokio::test]
+async fn no_gated_fixture_passes_on_a_run_that_produced_nothing() {
+    let suite = load_suite(&regression_dir()).expect("the gated suite must load");
+    assert!(!suite.is_empty(), "the gated suite must not be empty");
+
+    for (path, trace) in suite {
+        let idle = RunRecord {
+            final_response: String::new(),
+            history: Vec::new(),
+            tool_calls: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let grades = evaluate_expects(&trace.expects, &idle);
+        assert!(
+            grades.iter().any(|grade| !grade.passed),
+            "{} passes on a run that produced no response and dispatched no tool, \
+             so it cannot certify any behavior",
+            path.display()
+        );
+    }
 }
 
 #[test]

@@ -80,3 +80,9 @@ expectation key. The dispatch-boundary families fail closed on the same
 principle: an empty `tool` or `needle`, a vacuous `min_tool_calls: 0`, and
 count bounds that contradict each other are all rejected at load. Every
 rejection names the offending fixture and field.
+
+Admission cannot see one remaining form of vacuity: an assertion that a run
+producing nothing already satisfies, such as a lone `max_tool_calls: 0`. The
+gated suite test grades every committed fixture against an empty run and
+requires at least one failed check, so a case that certifies no behavior cannot
+join the required gate.
