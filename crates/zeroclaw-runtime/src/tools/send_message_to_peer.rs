@@ -223,12 +223,15 @@ impl Tool for SendMessageToPeerTool {
 
             if let Some(run_token) = self.run_owned_cancellation.clone() {
                 // A supervised run owns this turn, and its private runtime is
-                // dropped as soon as the run returns. Detaching the recipient
-                // here would abort a send this tool had already reported as
-                // accepted, so run the recipient inline: the outcome reported
-                // is the one that actually happened, and the run's own deadline
-                // bounds it.
-                let delivery = async move {
+                // dropped as soon as the run returns. Reporting the send as
+                // accepted and walking away would let that drop abort the
+                // recipient, so wait for the recipient here: the run is the
+                // delivery's lifecycle owner, its own deadline bounds the wait,
+                // and the reported outcome is the one that actually happened.
+                // The recipient stays on its own task rather than being awaited
+                // in place so this tool's future does not carry a whole agent
+                // turn's state.
+                let mut delivery = zeroclaw_spawn::spawn!(async move {
                     let turn = crate::agent::loop_::process_message(
                         cfg,
                         &recipient_alias,
@@ -237,33 +240,46 @@ impl Tool for SendMessageToPeerTool {
                         zeroclaw_api::ingress::TurnOrigin::AgentDirect,
                     );
                     deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
-                };
-                return Ok(tokio::select! {
+                });
+                let joined = tokio::select! {
                     biased;
-                    () = run_token.cancelled() => ToolResult {
+                    () = run_token.cancelled() => None,
+                    joined = &mut delivery => Some(joined),
+                };
+                let Some(joined) = joined else {
+                    delivery.abort();
+                    return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
                         error: Some(format!(
                             "in-process delivery to peer agent {canonical:?} was not completed \
                              before the owning run was cancelled; the message was not delivered"
                         )),
+                    });
+                };
+                return Ok(match joined {
+                    Ok(Ok(_)) => ToolResult {
+                        success: true,
+                        output: format!(
+                            "delivered in-process to peer agent {canonical:?} (recipient turn completed under this run)"
+                        )
+                        .into(),
+                        error: None,
                     },
-                    outcome = delivery => match outcome {
-                        Ok(_) => ToolResult {
-                            success: true,
-                            output: format!(
-                                "delivered in-process to peer agent {canonical:?} (recipient turn completed under this run)"
-                            )
-                            .into(),
-                            error: None,
-                        },
-                        Err(e) => ToolResult {
-                            success: false,
-                            output: ToolOutput::default(),
-                            error: Some(format!(
-                                "in-process delivery to peer agent {canonical:?} failed: {e:#}"
-                            )),
-                        },
+                    Ok(Err(e)) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "in-process delivery to peer agent {canonical:?} failed: {e:#}"
+                        )),
+                    },
+                    Err(join_error) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!(
+                            "in-process delivery to peer agent {canonical:?} did not run to \
+                             completion: {join_error}"
+                        )),
                     },
                 });
             }
@@ -1257,12 +1273,9 @@ mod tests {
         let result = tokio::task::spawn_blocking(move || {
             // A stand-in for the scheduler's private runtime: an owned thread
             // driving its own current-thread runtime, destroyed the moment the
-            // supervised parent returns. The explicit stack size is a
-            // debug-build accommodation for the size of an agent-turn future,
-            // not part of the contract under test.
+            // supervised parent returns.
             let worker = std::thread::Builder::new()
                 .name("peer-send-owned-test".into())
-                .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
                     let private_runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
