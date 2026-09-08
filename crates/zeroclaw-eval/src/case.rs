@@ -998,7 +998,7 @@ mod tests {
     fn populated_memory_and_workspace_blocks_are_admitted() {
         let trace = load_fixture(
             "populated_side_effects",
-            r#"{"model_name":"m","turns":[],"expects":{"memory":{"contains":{"project/status":["green"]}},"workspace":{"file_exists":["out.txt"]}}}"#,
+            r#"{"model_name":"m","turns":[{"user_input":"go"}],"expects":{"memory":{"contains":{"project/status":["green"]}},"workspace":{"file_exists":["out.txt"]}}}"#,
         )
         .expect("non-empty side-effect expectations must load");
         assert!(trace.expects.memory.is_some());

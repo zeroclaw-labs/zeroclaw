@@ -521,7 +521,10 @@ pub(crate) mod tests {
         // The turn loop below runs zero times for such a fixture, so the empty
         // initial response and empty tool record grade `max_tool_calls: 0` as
         // passed. Admission has to stop the fixture before the suite can
-        // certify a case that never drove the agent.
+        // certify a case that never drove the agent. The suite keeps the
+        // rejected fixture as one named failing case rather than aborting the
+        // directory, so the guarantee is `!all_passed()` with the reason
+        // attached to that case.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("zero_turns.json"),
@@ -529,14 +532,19 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let err = run_suite(dir.path(), &RunDeps::replay())
-            .await
-            .expect_err("a suite holding a zero-turn fixture must not report a pass");
+        let report = run_suite(dir.path(), &RunDeps::replay()).await.unwrap();
 
-        let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("declares no conversation turns"),
-            "the suite must fail on the zero-turn fixture, got: {rendered}"
+            !report.all_passed(),
+            "a suite holding a zero-turn fixture must not report a pass: {report:?}"
+        );
+        assert_eq!(report.cases.len(), 1);
+        let case = &report.cases[0];
+        assert_eq!(case.source, "zero_turns.json");
+        let error = case.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("declares no conversation turns"),
+            "the failure must name the zero-turn fixture reason, got: {error}"
         );
     }
 
