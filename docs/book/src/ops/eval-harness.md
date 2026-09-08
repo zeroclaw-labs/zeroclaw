@@ -65,6 +65,29 @@ Each live case runs inside a sandbox:
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
 | Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+| Network | The only egress live mode performs is the configured provider call itself. No tool it can admit opens a network connection, and no OS-level network rule is applied, because none is needed at this tool surface. |
+
+### What a live case can actually touch
+
+The controls above bound the surface to a closed set. After the allowlist
+intersection and the `shell` denylist, the only tools live mode can admit from
+the runtime defaults are `file_read`, `file_write`, `file_edit`, `glob_search`,
+and `content_search`. Each is wrapped in the generic path guard and resolves its
+target against the per-case workspace root before touching disk, so the
+filesystem confinement is application-layer path canonicalization plus
+`workspace_only`, not an OS sandbox: with `shell` excluded, live mode constructs
+no OS sandbox at all. `deliver_file` is dropped by the assembly context because
+live mode delivers nothing, and an empty allowlist leaves only the in-process
+echo tool.
+
+That closed set is what makes the confidentiality claim checkable rather than
+aspirational, and it is pinned by regressions in
+`crates/zeroclaw-eval/src/live.rs`: one asserts the admitted set itself (so a
+future runtime default tool cannot widen live mode silently), and one drives a
+model-directed `file_read` at a host path outside the workspace and asserts the
+host content reaches neither the fed-back tool result nor the next provider
+request. The residual exposure is therefore what a case deliberately puts in its
+own workspace and sends to the configured provider.
 
 ### Shell is excluded
 
