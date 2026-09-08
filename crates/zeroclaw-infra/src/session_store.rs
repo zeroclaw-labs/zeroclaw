@@ -59,6 +59,12 @@ pub(crate) fn read_metadata_sidecar(
 }
 
 /// Archive a session's ownership sidecar alongside its migrated JSONL file.
+///
+/// Callers reach this only after the transcript is archived and the sidecar's
+/// ownership fields are committed to SQLite, so a sidecar left live here would
+/// list as an empty session that no longer has a transcript. When the rename
+/// cannot complete, delete the sidecar instead and surface the rename failure
+/// only if that cleanup also fails.
 pub(crate) fn mark_metadata_sidecar_migrated(
     sessions_dir: &Path,
     session_key: &str,
@@ -72,7 +78,14 @@ pub(crate) fn mark_metadata_sidecar_migrated(
         sanitize_session_key(session_key),
         JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX
     ));
-    std::fs::rename(&path, migrated)
+    let Err(rename_error) = std::fs::rename(&path, migrated) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(rename_error),
+    }
 }
 
 pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
@@ -1394,5 +1407,37 @@ mod tests {
         assert!(backend.delete_session("owned").unwrap());
         assert!(!metadata_path.exists());
         assert!(!backend.session_exists("owned"));
+    }
+
+    #[test]
+    fn blocked_sidecar_rename_leaves_no_live_metadata_behind() {
+        // The migrated marker path is occupied by a directory, so the rename
+        // cannot succeed. The transcript is already archived at that point,
+        // so the sidecar must not survive as a metadata-only session.
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        backend
+            .append("owned", &ChatMessage::user("private"))
+            .unwrap();
+        backend.set_session_agent_alias("owned", "rowan").unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let sidecar = metadata_sidecar_path(&sessions_dir, "owned");
+        assert!(sidecar.exists());
+        std::fs::create_dir_all(sessions_dir.join(format!(
+            "{}{}",
+            sanitize_session_key("owned"),
+            JSONL_SESSION_MIGRATED_METADATA_FILE_SUFFIX
+        )))
+        .unwrap();
+
+        mark_metadata_sidecar_migrated(&sessions_dir, "owned").unwrap();
+
+        assert!(!sidecar.exists());
+        assert!(
+            read_metadata_sidecar(&sessions_dir, "owned")
+                .unwrap()
+                .is_none()
+        );
     }
 }
