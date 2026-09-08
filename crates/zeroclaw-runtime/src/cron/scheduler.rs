@@ -5018,6 +5018,20 @@ mod tests {
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
     }
 
+    /// Wait for a persistence worker that outlived its caller's deadline to
+    /// commit, instead of pinning the assertion to a fixed sleep that a loaded
+    /// machine can overrun.
+    async fn wait_for_committed_runs(config: &Config, job_id: &str) -> Vec<crate::cron::CronRun> {
+        for _ in 0..600 {
+            let runs = cron::list_runs(config, job_id, 10).unwrap();
+            if !runs.is_empty() {
+                return runs;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the persistence worker never committed a run row for job {job_id}");
+    }
+
     #[tokio::test]
     async fn blocked_persistence_reports_pending_and_retains_live_claim() {
         let tmp = TempDir::new().unwrap();
@@ -5033,7 +5047,7 @@ mod tests {
             .scope(
                 Duration::from_millis(25),
                 TEST_PERSIST_BLOCK.scope(
-                    Duration::from_millis(200),
+                    Duration::from_secs(2),
                     persist_claimed_job_result(
                         &config,
                         &job,
@@ -5052,7 +5066,7 @@ mod tests {
             crate::i18n::get_required_cli_string("cron-result-persistence-pending")
         );
         assert!(
-            wall_started.elapsed() < Duration::from_millis(150),
+            wall_started.elapsed() < Duration::from_secs(1),
             "scheduler must stop awaiting a blocked persistence worker"
         );
 
@@ -5067,8 +5081,7 @@ mod tests {
             "a live owner cannot be replaced merely because wall-clock time passed"
         );
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        let runs = wait_for_committed_runs(&config, &job.id).await;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].output.as_deref(), Some("late old result"));
         assert!(
@@ -5094,7 +5107,7 @@ mod tests {
                     .scope(
                         Duration::from_millis(25),
                         TEST_PERSIST_BLOCK.scope(
-                            Duration::from_millis(300),
+                            Duration::from_secs(2),
                             persist_claimed_job_result(
                                 &config,
                                 &job,
@@ -5162,13 +5175,15 @@ mod tests {
         let pool = Arc::new(tokio::sync::Semaphore::new(1));
         TEST_PERSISTENCE_WORKER_POOL
             .scope(Arc::clone(&pool), async {
-                // The first write holds the only permit well past its caller's
-                // deadline, so the second job finishes while admission is full.
+                // The first job's write takes the only permit and holds it far
+                // past its own caller's deadline, so the second job completes
+                // while admission is full. Nothing here asserts on the first
+                // call's own outcome: bounded admission is the test above.
                 let first = TEST_PERSIST_TIMEOUT
                     .scope(
                         Duration::from_millis(25),
                         TEST_PERSIST_BLOCK.scope(
-                            Duration::from_millis(300),
+                            Duration::from_millis(1_500),
                             persist_claimed_job_result(
                                 &config,
                                 &first_job,
@@ -5181,14 +5196,16 @@ mod tests {
                         ),
                     )
                     .await;
-                assert!(!first.success);
-                assert_eq!(pool.available_permits(), 0);
+                assert_eq!(
+                    first.output,
+                    crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+                );
 
-                // A completed, already delivered result must survive a full pool:
-                // the caller keeps owning it until capacity returns.
+                // A completed, already delivered result must survive a full
+                // pool: the caller keeps owning it until capacity returns.
                 let second = TEST_PERSIST_TIMEOUT
                     .scope(
-                        Duration::from_secs(5),
+                        Duration::from_secs(20),
                         persist_claimed_job_result(
                             &config,
                             &second_job,
@@ -5216,6 +5233,15 @@ mod tests {
                 assert!(
                     crate::cron::store::current_claim_for_test(&config, &second_job.id).is_err(),
                     "persisting the retained result releases its claim without a scheduler restart"
+                );
+
+                // The first job's own write committed on its worker, so both
+                // distinct jobs end durable with neither claim stranded.
+                let first_runs = wait_for_committed_runs(&config, &first_job.id).await;
+                assert_eq!(first_runs.len(), 1);
+                assert!(
+                    crate::cron::store::current_claim_for_test(&config, &first_job.id).is_err(),
+                    "the held write releases its own claim when it finally commits"
                 );
             })
             .await;
@@ -6151,7 +6177,7 @@ mod tests {
             .scope(
                 Duration::from_millis(25),
                 TEST_PERSIST_BLOCK.scope(
-                    Duration::from_millis(200),
+                    Duration::from_secs(2),
                     process_due_jobs(&config, vec![job.clone()], &component, &event_tx),
                 ),
             )
@@ -6170,8 +6196,7 @@ mod tests {
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
         assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_ok());
 
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+        assert_eq!(wait_for_committed_runs(&config, &job.id).await.len(), 1);
         assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_err());
     }
 
