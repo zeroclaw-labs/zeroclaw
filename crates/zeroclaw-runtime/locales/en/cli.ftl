@@ -1250,6 +1250,17 @@ cli-eval-self-judge-warning = {"  "}warning: judge and live provider use the sam
 cli-eval-unknown-suite-kind = unknown --suite-kind '{$kind}' (expected 'regression' or 'capability')
 
 # ── LLM-judge calibration ──
+cli-eval-calibrate-about = Calibrate an LLM judge against blind human labels
+cli-eval-calibrate-label-about = Blindly label LLM-judge run records for calibration
+cli-eval-calibrate-label-help-records = Judge-run JSONL file, or a directory containing judge-runs.jsonl
+cli-eval-calibrate-label-help-labels = Append-only labels JSONL path (defaults under evals/calibration/labels)
+cli-eval-calibrate-label-help-labeler = Human labeler name (defaults to git config user.name)
+cli-eval-calibrate-label-help-judge-ref = Judge reference to label when records contain multiple judges
+cli-eval-calibrate-finalize-about = Finalize labels into an LLM-judge calibration file
+cli-eval-calibrate-finalize-help-labels = Labels JSONL file to finalize
+cli-eval-calibrate-finalize-help-out = Calibration JSON output path (defaults under evals/calibration)
+cli-eval-calibrate-finalize-help-min-agreement = Refuse to emit when agreement is below this fraction
+cli-eval-calibrate-finalize-help-labeler = Override the labeler recorded in the calibration file
 cli-eval-calibrate-records-appended =   judge-run records: appended {$count} to {$path}
 cli-eval-calibrate-gate-missing =   warning: [eval].judge_gate is set but no calibration file for {$judge_ref}; judge grades stay diagnostic
 cli-eval-calibrate-gate-rejected =   warning: [eval].judge_gate is set but calibration for {$judge_ref} was rejected ({$reason}); judge grades stay diagnostic
