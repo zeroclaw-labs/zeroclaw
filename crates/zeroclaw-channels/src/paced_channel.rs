@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    ProgressEvent, RoomCreationOptions, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage,
+    ChannelModelPickerRequest, DraftProgress, ProgressEvent, RoomCreationOptions, SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -345,6 +345,13 @@ impl Channel for PacedChannel {
 
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
+    }
+
+    /// The picker is an interactive control surface, not paced outbound
+    /// traffic. Without this forward the trait default's `Ok(false)` would
+    /// silently swallow the picker whenever pacing wraps the channel.
+    async fn present_model_picker(&self, request: &ChannelModelPickerRequest) -> Result<bool> {
+        self.inner.present_model_picker(request).await
     }
 
     /// Forward the inner channel's passive observation.
