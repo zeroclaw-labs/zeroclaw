@@ -211,15 +211,6 @@ pub async fn grade_with(
     grades
 }
 
-/// Build the case's default graders and run them while the workspace is alive.
-pub async fn grade_run(
-    trace: &crate::case::LlmTrace,
-    record: &RunRecord,
-    workspace: &std::path::Path,
-) -> Vec<GradeResult> {
-    grade_with(&default_graders(trace), record, workspace).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,11 +219,11 @@ mod tests {
 
     #[tokio::test]
     async fn grades_run_while_workspace_alive() {
-        // A grader receives, through GradeContext, a workspace path that exists at
-        // grade time. `run_case` awaits `grade_run` before its `tmp` (TempDir)
-        // drops, so a workspace-aware grader always sees a live directory. The
-        // control below (drop, then re-check the same path) proves this exists()
-        // check is meaningful, not tautological: it flips to false once dropped.
+        // Control for the two runner-path regressions in `runner.rs` and
+        // `live.rs`: those assert the runner still has the workspace alive when
+        // it awaits grading, and this proves that exists() check is meaningful
+        // rather than tautological, because the same probe on the same path
+        // flips to false once the directory is dropped.
         struct Probe;
         #[async_trait::async_trait]
         impl Grader for Probe {
