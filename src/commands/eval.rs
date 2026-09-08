@@ -550,27 +550,44 @@ fn write_run_history_with(
     comparison: Option<&baseline::BaselineComparison>,
     writer: impl FnOnce(&Path, &HistoryReceipt) -> Result<PathBuf>,
 ) -> Option<PathBuf> {
-    let dir = resolved_history_dir(override_dir, &config.eval.history_dir)?;
+    let (path, warnings) =
+        attempt_run_history(config, override_dir, report, run, comparison, writer);
+    for warning in warnings {
+        eprintln!("{warning}");
+    }
+    path
+}
+
+/// Attempt the receipt write and return the receipt path plus the exact lines
+/// the caller will print.
+///
+/// The warnings are returned rather than printed here so the operator-visible
+/// text is a graded value: history is best effort, its destination is an
+/// operator-supplied path, and the writer's error chain names that path, so
+/// neither may reach retained CI stderr.
+fn attempt_run_history(
+    config: &Config,
+    override_dir: Option<&Path>,
+    report: &SuiteReport,
+    run: HistoryRun,
+    comparison: Option<&baseline::BaselineComparison>,
+    writer: impl FnOnce(&Path, &HistoryReceipt) -> Result<PathBuf>,
+) -> (Option<PathBuf>, Vec<String>) {
+    let Some(dir) = resolved_history_dir(override_dir, &config.eval.history_dir) else {
+        return (None, Vec::new());
+    };
+    let mut warnings = Vec::new();
     if path_is_under_target(&dir) {
-        eprintln!(
-            "{}",
-            get_required_cli_string("cli-eval-history-target-warning")
-        );
+        warnings.push(get_required_cli_string("cli-eval-history-target-warning"));
     }
 
     match HistoryReceipt::from_report(report, run, comparison)
         .and_then(|receipt| writer(&dir, &receipt))
     {
-        Ok(path) => Some(path),
+        Ok(path) => (Some(path), warnings),
         Err(_) => {
-            // History is best effort and its destination can contain host identity.
-            // Keep retained CI stderr useful without echoing the configured path or
-            // the path-rich anyhow chain from the writer.
-            eprintln!(
-                "{}",
-                get_required_cli_string("cli-eval-history-write-warning")
-            );
-            None
+            warnings.push(get_required_cli_string("cli-eval-history-write-warning"));
+            (None, warnings)
         }
     }
 }
@@ -1892,6 +1909,53 @@ mod tests {
         assert!(written.is_none());
         assert!(!writer_called.get());
         assert!(resolved_history_dir(None, &config.eval.history_dir).is_none());
+    }
+
+    #[test]
+    fn history_warnings_carry_neither_the_configured_path_nor_the_writer_error() {
+        // Both warnings are the only history output that reaches retained CI
+        // logs. The configured directory is operator-supplied and the writer's
+        // error chain names it, so neither may appear in what is printed.
+        const DIR_MARKER: &str = "zeroclaw-operator-identity";
+        const ERROR_MARKER: &str = "receipt-writer-failure-detail";
+        let mut config = Config::default();
+        // Under `target/`, so the target warning fires alongside the write warning.
+        config.eval.history_dir = format!("target/{DIR_MARKER}/history");
+        let report = SuiteReport {
+            cases: vec![case_report("pass", true)],
+        };
+
+        let (written, warnings) = attempt_run_history(
+            &config,
+            None,
+            &report,
+            HistoryRun {
+                recorded_at: chrono::Utc::now(),
+                suite_dir: "evals/regression".to_string(),
+                suite_kind: SuiteKind::Regression,
+                mode: Mode::Replay,
+                provider_ref: "scripted".to_string(),
+            },
+            None,
+            |dir, _| anyhow::bail!("{ERROR_MARKER} at {}", dir.display()),
+        );
+
+        assert!(written.is_none(), "a failed write must publish no receipt");
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        for warning in &warnings {
+            assert!(
+                !warning.contains(DIR_MARKER),
+                "the configured history directory reached stderr: {warning:?}"
+            );
+            assert!(
+                !warning.contains(ERROR_MARKER),
+                "the writer's error context reached stderr: {warning:?}"
+            );
+            assert!(
+                !warning.contains('{'),
+                "an unresolved placeholder can still interpolate a path: {warning:?}"
+            );
+        }
     }
 
     #[test]
