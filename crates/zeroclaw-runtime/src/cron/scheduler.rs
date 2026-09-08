@@ -1813,21 +1813,36 @@ async fn persist_claimed_job_result(
     let job_state_at = Utc::now();
     #[cfg(test)]
     let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
-    let permit = match persistence_worker_pool().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job.id})),
-                "Cron persistence pool at capacity; retaining the fenced claim for recovery"
-            );
-            return ClaimedJobResult {
-                success: false,
-                output: crate::i18n::get_required_cli_string("cron-result-persistence-pending"),
-            };
-        }
+    #[cfg(test)]
+    let persist_timeout = TEST_PERSIST_TIMEOUT
+        .try_with(|duration| *duration)
+        .unwrap_or(CRON_PERSIST_TIMEOUT);
+    #[cfg(not(test))]
+    let persist_timeout = CRON_PERSIST_TIMEOUT;
+    // One deadline spans admission and the write. Bounded admission must not
+    // discard a result that is already produced and already delivered: while
+    // every permit is busy this caller stays the result's owner and waits for
+    // capacity, so a burst of concurrent jobs above the pool size only delays
+    // persistence instead of leaving a finished job claimed with nothing left
+    // to write it. A pool still full at the deadline means persistence itself
+    // is wedged, which is the retained-claim case below.
+    let persist_deadline = time::Instant::now() + persist_timeout;
+    let admitted = time::timeout_at(persist_deadline, persistence_worker_pool().acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok);
+    let Some(permit) = admitted else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": persist_timeout.as_secs_f64()})),
+            "Cron persistence pool stayed at capacity; retaining the fenced claim for recovery"
+        );
+        return ClaimedJobResult {
+            success: false,
+            output: crate::i18n::get_required_cli_string("cron-result-persistence-pending"),
+        };
     };
     let worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -1906,14 +1921,7 @@ async fn persist_claimed_job_result(
         true
     });
 
-    #[cfg(test)]
-    let persist_timeout = TEST_PERSIST_TIMEOUT
-        .try_with(|duration| *duration)
-        .unwrap_or(CRON_PERSIST_TIMEOUT);
-    #[cfg(not(test))]
-    let persist_timeout = CRON_PERSIST_TIMEOUT;
-
-    match time::timeout(persist_timeout, worker).await {
+    match time::timeout_at(persist_deadline, worker).await {
         Ok(Ok(true)) => ClaimedJobResult {
             success: reported_success,
             output: public_output,
@@ -5106,18 +5114,22 @@ mod tests {
                 );
 
                 // The first worker is still sleeping inside its blocking task and holds the 1 permit.
-                // A second call must be immediately rejected by admission capacity without starting
-                // an untracked blocking thread.
-                let second = persist_claimed_job_result(
-                    &config,
-                    &job,
-                    true,
-                    "stalled result 2",
-                    started,
-                    started + ChronoDuration::milliseconds(10),
-                    &claim,
-                )
-                .await;
+                // A second call waits for admission only until its own deadline and must then stop
+                // without starting an untracked blocking thread.
+                let second = TEST_PERSIST_TIMEOUT
+                    .scope(
+                        Duration::from_millis(25),
+                        persist_claimed_job_result(
+                            &config,
+                            &job,
+                            true,
+                            "stalled result 2",
+                            started,
+                            started + ChronoDuration::milliseconds(10),
+                            &claim,
+                        ),
+                    )
+                    .await;
                 assert!(!second.success);
                 assert_eq!(
                     second.output,
@@ -5127,6 +5139,83 @@ mod tests {
                     pool.available_permits(),
                     0,
                     "the stalled worker must retain its persistence pool permit until finished"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn persist_claimed_job_result_persists_second_job_after_capacity_returns() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let first_job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo one").unwrap();
+        let second_job = cron::add_job(&config, TEST_AGENT, "*/7 * * * *", "echo two").unwrap();
+        assert_ne!(first_job.id, second_job.id);
+        let started = Utc::now();
+        let first_claim = claim_job_with_token(&config, &first_job.id, started)
+            .unwrap()
+            .expect("first worker claims its job");
+        let second_claim = claim_job_with_token(&config, &second_job.id, started)
+            .unwrap()
+            .expect("second worker claims its job");
+
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        TEST_PERSISTENCE_WORKER_POOL
+            .scope(Arc::clone(&pool), async {
+                // The first write holds the only permit well past its caller's
+                // deadline, so the second job finishes while admission is full.
+                let first = TEST_PERSIST_TIMEOUT
+                    .scope(
+                        Duration::from_millis(25),
+                        TEST_PERSIST_BLOCK.scope(
+                            Duration::from_millis(300),
+                            persist_claimed_job_result(
+                                &config,
+                                &first_job,
+                                true,
+                                "held result",
+                                started,
+                                started + ChronoDuration::milliseconds(10),
+                                &first_claim,
+                            ),
+                        ),
+                    )
+                    .await;
+                assert!(!first.success);
+                assert_eq!(pool.available_permits(), 0);
+
+                // A completed, already delivered result must survive a full pool:
+                // the caller keeps owning it until capacity returns.
+                let second = TEST_PERSIST_TIMEOUT
+                    .scope(
+                        Duration::from_secs(5),
+                        persist_claimed_job_result(
+                            &config,
+                            &second_job,
+                            true,
+                            "queued behind a busy pool",
+                            started,
+                            started + ChronoDuration::milliseconds(10),
+                            &second_claim,
+                        ),
+                    )
+                    .await;
+                assert!(
+                    second.success,
+                    "the second result must persist once a permit frees up: {}",
+                    second.output
+                );
+
+                let runs = cron::list_runs(&config, &second_job.id, 10).unwrap();
+                assert_eq!(runs.len(), 1);
+                assert_eq!(
+                    runs[0].output.as_deref(),
+                    Some("queued behind a busy pool"),
+                    "the retained result is the one written"
+                );
+                assert!(
+                    crate::cron::store::current_claim_for_test(&config, &second_job.id).is_err(),
+                    "persisting the retained result releases its claim without a scheduler restart"
                 );
             })
             .await;
