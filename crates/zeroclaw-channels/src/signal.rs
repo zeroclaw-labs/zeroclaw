@@ -995,10 +995,17 @@ impl SignalChannel {
     ///
     /// Only sync sent-messages addressed to `self.account` are accepted;
     /// sync echoes of messages sent to other contacts and group sync
-    /// messages are ignored. Sender and reply target both resolve to the
-    /// envelope's source (falling back to `self.account`), mirroring the
-    /// direct-DM path so replies land back in the Note-to-Self
-    /// conversation.
+    /// messages are ignored. The sender still resolves from the envelope
+    /// so authorization and reaction bookkeeping keep the real identity,
+    /// but the reply target is always `self.account`.
+    ///
+    /// The reply target cannot follow the sender here: the envelope may
+    /// spell the account as a UUID, and echo correlation only registers
+    /// outbound sends whose recipient equals the configured account. A
+    /// UUID-addressed reply would therefore leave the guard, and its own
+    /// sent-sync echo would start a second agent turn. Addressing the
+    /// canonical account keeps the reply in the same Note-to-Self
+    /// conversation and inside the correlation guard.
     async fn process_sent_sync_message(
         &self,
         envelope: &Envelope,
@@ -1054,7 +1061,9 @@ impl SignalChannel {
             return Vec::new();
         }
 
-        self.build_messages(&sender, &sender, timestamp, vec![content.to_string()])
+        // Reply to the canonical account, not to the sender spelling, so the
+        // outbound send registers an echo ticket and cannot loop back in.
+        self.build_messages(&sender, &self.account, timestamp, vec![content.to_string()])
     }
 
     /// Build one `ChannelMessage` per content string, seeding
@@ -3253,6 +3262,114 @@ mod tests {
             },
         );
         assert!(ch.process_envelope_async(&event).await.is_empty());
+        assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
+    }
+
+    /// The reply-routing regression for a UUID-spelled Note-to-Self sender.
+    ///
+    /// signal-cli may spell the linked account as a UUID in `source`, and a
+    /// UUID is an accepted direct recipient. If the sync path used that
+    /// spelling as the reply target, `send` would address a recipient that is
+    /// not the configured account and would register no echo ticket, so the
+    /// reply's own sent-sync event would arrive uncorrelated and start a
+    /// second agent turn -- the self-reply loop this feature exists to
+    /// prevent. Runs the whole path: allowlisted UUID sender in, reply out
+    /// through the real `send`, echo classified back in.
+    #[tokio::test]
+    async fn uuid_note_to_self_reply_stays_inside_the_account_guard() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const UUID: &str = "b7c2e1a0-1111-4222-8333-444455556666";
+        const ACCOUNT: &str = "+15550000006";
+        const REPLY_TIMESTAMP: u64 = 1_700_000_000_456;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": { "timestamp": REPLY_TIMESTAMP },
+                "id": "ignored"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ch = SignalChannel::new(
+            server.uri(),
+            ACCOUNT.to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec![UUID.to_string()]),
+            false,
+            false,
+        );
+
+        // A phone-authored note whose envelope names the account by UUID.
+        let note = Envelope {
+            source: Some(UUID.to_string()),
+            source_number: None,
+            source_uuid: None,
+            data_message: None,
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+            sync_message: Some(SyncMessage {
+                sent_message: Some(SentMessage {
+                    destination: Some(ACCOUNT.to_string()),
+                    destination_number: Some(ACCOUNT.to_string()),
+                    message: Some("uuid note".to_string()),
+                    timestamp: Some(1_700_000_000_000),
+                    group_info: None,
+                    attachments: None,
+                }),
+            }),
+        };
+
+        let mut msgs = ch.process_envelope_async(&note).await;
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
+        // Authorization and reaction bookkeeping keep the envelope identity.
+        assert_eq!(msg.sender, UUID);
+        assert_eq!(
+            ch.recent_targets
+                .lock()
+                .peek(&msg.id)
+                .expect("recent_targets should contain the just-emitted id")
+                .author,
+            UUID
+        );
+        // The reply target is the canonical account, not the UUID spelling.
+        assert_eq!(msg.reply_target, ACCOUNT);
+
+        ch.send(&SendMessage::new("uuid reply", &msg.reply_target))
+            .await
+            .unwrap();
+        // A reply addressed to the UUID would leave this snapshot empty.
+        assert_eq!(ch.self_send_guard.snapshot(), (0, 1, false));
+
+        let echo = Envelope {
+            source: Some(UUID.to_string()),
+            source_number: None,
+            source_uuid: None,
+            data_message: None,
+            story_message: None,
+            timestamp: Some(REPLY_TIMESTAMP),
+            sync_message: Some(SyncMessage {
+                sent_message: Some(SentMessage {
+                    destination: Some(ACCOUNT.to_string()),
+                    destination_number: Some(ACCOUNT.to_string()),
+                    message: Some("uuid reply".to_string()),
+                    timestamp: Some(REPLY_TIMESTAMP),
+                    group_info: None,
+                    attachments: None,
+                }),
+            }),
+        };
+        assert!(
+            ch.process_envelope_async(&echo).await.is_empty(),
+            "the reply's own sent-sync echo must not start a second turn"
+        );
         assert_eq!(ch.self_send_guard.snapshot(), (0, 0, false));
     }
 

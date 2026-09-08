@@ -26,6 +26,13 @@ the send RPC and does not re-ingest it. An event that arrives before the
 RPC response waits for that timestamp; an equal body with a different
 timestamp remains a genuine note.
 
+The reply to a Note-to-Self message is always addressed to the configured
+`account`, even when the sync envelope names the account by UUID instead of
+its number. Sender authorization and reaction bookkeeping still use the
+identity carried on the envelope. Replying to the UUID spelling would place
+the reply outside echo correlation, so its own sync event would arrive
+uncorrelated and start a second turn.
+
 If the daemon accepts a self-send but the HTTP response is lost or cannot
 be parsed, ZeroClaw cannot recover the canonical timestamp safely. It then
 fails Note-to-Self closed until the ZeroClaw daemon restarts rather than risk
