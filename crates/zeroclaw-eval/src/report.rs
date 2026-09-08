@@ -1128,6 +1128,8 @@ mod tests {
                     crate::grader::GradeCategory::Config,
                 )],
                 error: None,
+                repeat: None,
+                cluster: None,
             }],
         };
         let json: serde_json::Value =
