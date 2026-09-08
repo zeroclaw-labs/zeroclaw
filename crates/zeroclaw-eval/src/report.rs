@@ -688,6 +688,47 @@ mod tests {
     }
 
     #[test]
+    fn config_backstop_grade_joins_its_category_totals_entry() {
+        // The fail-closed backstop is the one grade a consumer must be able to
+        // find: it says the case asserted nothing. Its serialized `category`
+        // and its `category_totals` key are produced by two different code
+        // paths (serde and `GradeCategory::as_str`), so join them in the
+        // rendered JSON rather than trusting them to agree.
+        let suite = SuiteReport {
+            cases: vec![CaseReport {
+                name: "vacuous".to_string(),
+                source: "vacuous.json".to_string(),
+                record: None,
+                grades: vec![GradeResult::new(
+                    "effective_checks".to_string(),
+                    false,
+                    "case declares no effective checks",
+                    crate::grader::GradeCategory::Config,
+                )],
+                error: None,
+            }],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, None)).unwrap();
+        let case = &json["cases"][0];
+        assert_eq!(case["passed"].as_bool(), Some(false));
+        assert_eq!(case["score"].as_f64(), Some(0.0));
+        let category = case["grades"][0]["category"]
+            .as_str()
+            .expect("grade category must serialize as a string")
+            .to_string();
+        assert_eq!(category, "config");
+        assert_eq!(
+            case["category_totals"][&category]["passed"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            case["category_totals"][&category]["total"].as_u64(),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn category_totals_aggregate_correctly() {
         use crate::grader::GradeCategory;
         let grade_cat = |passed: bool, category: GradeCategory| GradeResult {

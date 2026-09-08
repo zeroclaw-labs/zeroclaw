@@ -474,6 +474,70 @@ pub(crate) mod tests {
         "expects": { "response_contains": ["Hello"], "response_not_contains": ["error"], "max_tool_calls": 0 }
     }"#;
 
+    #[tokio::test]
+    async fn budget_grades_read_the_runners_real_run_metrics() {
+        // The budget graders are only as good as the metrics the runner hands
+        // them. If `llm_calls` or the token totals were left at zero, every
+        // `budget.max_*` bound would pass no matter what the case did, which is
+        // the vacuous green this layer exists to prevent. ECHO scripts two
+        // model round-trips totalling 80 input and 25 output tokens, so bounds
+        // one below the observed values must fail and bounds exactly at them
+        // must pass.
+        let over: LlmTrace = serde_json::from_str(&echo_with_budget(
+            r#"{"max_llm_calls": 1, "max_total_tokens": 104, "max_input_tokens": 79}"#,
+        ))
+        .unwrap();
+        let outcome = run_case(&over, &RunDeps::replay()).await.unwrap();
+        assert!(
+            outcome.record.is_complete(),
+            "the run must have completed, or the metric assertions below read \
+             the inert stand-in instead of real counters: {:?}",
+            outcome.record
+        );
+        let metrics = outcome.record.completion_or_default();
+        assert_eq!(metrics.llm_calls, 2, "record: {:?}", outcome.record);
+        assert_eq!(metrics.input_tokens, 80);
+        assert_eq!(metrics.output_tokens, 25);
+        for check in [
+            "max_llm_calls(1)",
+            "max_total_tokens(104)",
+            "max_input_tokens(79)",
+        ] {
+            let grade = grade_named(&outcome.grades, check);
+            assert!(!grade.passed, "{check} must fail: {grade:?}");
+        }
+
+        let at_limit: LlmTrace = serde_json::from_str(&echo_with_budget(
+            r#"{"max_llm_calls": 2, "max_total_tokens": 105, "max_input_tokens": 80}"#,
+        ))
+        .unwrap();
+        let outcome = run_case(&at_limit, &RunDeps::replay()).await.unwrap();
+        for check in [
+            "max_llm_calls(2)",
+            "max_total_tokens(105)",
+            "max_input_tokens(80)",
+        ] {
+            let grade = grade_named(&outcome.grades, check);
+            assert!(grade.passed, "{check} must pass at the bound: {grade:?}");
+        }
+    }
+
+    /// ECHO with an added `budget` block, so both halves of the test above run
+    /// the same scripted conversation.
+    fn echo_with_budget(budget: &str) -> String {
+        ECHO.replace(
+            r#""expects": {"#,
+            &format!(r#""expects": {{ "budget": {budget},"#),
+        )
+    }
+
+    fn grade_named<'a>(grades: &'a [GradeResult], check: &str) -> &'a GradeResult {
+        grades
+            .iter()
+            .find(|g| g.check == check)
+            .unwrap_or_else(|| panic!("no grade named {check:?} in {grades:?}"))
+    }
+
     const ECHO: &str = r#"{
         "model_name": "test-single-tool-echo",
         "turns": [{
@@ -524,6 +588,30 @@ pub(crate) mod tests {
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
             outcome.grades
+        );
+    }
+
+    #[tokio::test]
+    async fn run_suite_rejects_a_zero_turn_fixture_instead_of_reporting_it_green() {
+        // The turn loop below runs zero times for such a fixture, so the empty
+        // initial response and empty tool record grade `max_tool_calls: 0` as
+        // passed. Admission has to stop the fixture before the suite can
+        // certify a case that never drove the agent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("zero_turns.json"),
+            r#"{"model_name":"empty-turns","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+
+        let err = run_suite(dir.path(), &RunDeps::replay())
+            .await
+            .expect_err("a suite holding a zero-turn fixture must not report a pass");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("declares no conversation turns"),
+            "the suite must fail on the zero-turn fixture, got: {rendered}"
         );
     }
 

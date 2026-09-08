@@ -161,8 +161,8 @@ jobs:
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
           build-args: ${{ matrix.cargo_flags && format('ZEROCLAW_CARGO_FLAGS={0}', matrix.cargo_flags) || '' }}
 
-      - name: Verify default production image runs as non-root
-        if: matrix.dockerfile == 'Dockerfile' && matrix.platform == 'linux/amd64'
+      - name: Verify loaded production image runs as non-root
+        if: matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags)
         run: |
           actual_user=$(docker inspect --format='{{.Config.User}}' "${{ matrix.tag }}")
           if [ "$actual_user" != "65534:65534" ]; then
