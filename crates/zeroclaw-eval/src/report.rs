@@ -4,16 +4,6 @@ use crate::grader::GradeResult;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 /// A case's comparison id: the record's `case_id` when present, else its name.
-/// The single canonical case-identity derivation (baseline skip-matching and the
-/// JUnit writer both rely on it).
-pub(crate) fn case_id(case: &CaseReport) -> &str {
-    case.record
-        .as_ref()
-        .map(|record| record.provenance.case_id.as_str())
-        .unwrap_or(&case.name)
-}
-
-/// A case's comparison id: the record's `case_id` when present, else its name.
 /// This mirrors the identity `baseline::compare` keys its per-case map on, so the
 /// ids that comparison reports as unverifiable or flaky select the same cases the
 /// JUnit writer marks skipped. The two derivations must stay in step.
@@ -1159,6 +1149,8 @@ mod tests {
                     crate::grader::GradeCategory::Config,
                 )],
                 error: None,
+                repeat: None,
+                cluster: None,
             }],
         };
         let json: serde_json::Value =
