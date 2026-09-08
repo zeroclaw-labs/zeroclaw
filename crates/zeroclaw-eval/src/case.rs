@@ -19,6 +19,9 @@ pub struct LlmTrace {
     #[serde(default)]
     pub id: Option<String>,
     /// Conversation turns, replayed in order.
+    ///
+    /// Must be non-empty. [`LlmTrace::from_file`] rejects a zero-turn fixture,
+    /// which would grade its expectations against a run that never happened.
     pub turns: Vec<TraceTurn>,
     /// Declarative expectations graded against the run.
     #[serde(default)]
@@ -280,8 +283,11 @@ impl TraceExpects {
     /// A zero-length entry is admitted by [`is_empty`](Self::is_empty) because
     /// the vector is non-empty, yet it asserts nothing: every response contains
     /// the empty substring, the empty regex matches every response, and no tool
-    /// is ever recorded under an empty name. The negative families are rejected
-    /// on the same rule for a consistent schema.
+    /// is ever recorded under an empty name. In the positive families that
+    /// yields a tautological pass and in `tools_not_used` a degenerate one, so
+    /// such an entry can certify the required gate green without testing any
+    /// behavior. The negative families are rejected on the same rule for a
+    /// consistent schema, even though they fail rather than falsely certify.
     fn empty_entry_family(&self) -> Option<&'static str> {
         [
             ("response_contains", &self.response_contains),
@@ -291,7 +297,7 @@ impl TraceExpects {
             ("response_matches", &self.response_matches),
         ]
         .into_iter()
-        .find(|(_, values)| values.iter().any(String::is_empty))
+        .find(|(_, values)| values.iter().any(|value| value.is_empty()))
         .map(|(name, _)| name)
     }
 }
@@ -366,6 +372,15 @@ impl LlmTrace {
                  nothing and cannot certify the required regression gate",
                 path.display(),
                 family
+            );
+        }
+        if trace.turns.is_empty() {
+            anyhow::bail!(
+                "trace fixture {} declares no conversation turns; the replay would drive the \
+                 agent zero times and grade a real-looking expectation such as \
+                 `max_tool_calls: 0` against an empty run, certifying the required regression \
+                 gate green without exercising any behavior",
+                path.display()
             );
         }
         Ok(trace)
@@ -469,6 +484,14 @@ pub fn load_suite_entries(dir: &Path) -> anyhow::Result<Vec<(PathBuf, anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The smallest fixture body that satisfies every admission rule: one
+    /// replayed turn plus one real assertion.
+    fn admissible_fixture(name: &str) -> String {
+        format!(
+            r#"{{"model_name":"{name}","turns":[{{"user_input":"hi","steps":[{{"response":{{"type":"text","content":"{name}"}}}}]}}],"expects":{{"response_contains":["{name}"]}}}}"#
+        )
+    }
 
     #[test]
     fn trace_response_text_variant_defaults_tokens_to_zero() {
@@ -593,13 +616,10 @@ mod tests {
     #[test]
     fn from_file_reads_and_parses_trace() {
         let path = std::env::temp_dir().join("zeroclaw_eval_case_from_file_test.json");
-        std::fs::write(
-            &path,
-            r#"{"model_name":"demo","turns":[],"expects":{"response_contains":["ok"]}}"#,
-        )
-        .unwrap();
+        std::fs::write(&path, admissible_fixture("demo")).unwrap();
         let t = LlmTrace::from_file(&path).unwrap();
         assert_eq!(t.model_name, "demo");
+        assert_eq!(t.turns.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -740,6 +760,48 @@ mod tests {
     }
 
     #[test]
+    fn from_file_rejects_a_fixture_with_no_conversation_turns() {
+        // `turns: []` passes every expectation check: `max_tool_calls: 0` is a
+        // real assertion with no zero-length form. The replay would still run
+        // the agent zero times and grade that bound against an empty run, so
+        // the case reports green while certifying nothing.
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_zero_turns_test.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"empty-turns","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+
+        let err = LlmTrace::from_file(&path)
+            .expect_err("a fixture that replays no turn must not load into a required gate");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("declares no conversation turns"),
+            "error must explain the zero-turn rejection, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("zeroclaw_eval_case_zero_turns_test.json"),
+            "error must name the offending fixture, got: {rendered}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_file_admits_a_single_turn_fixture() {
+        // The zero-turn rule must reject only the degenerate case: one turn is
+        // enough to drive the agent, so it stays admissible.
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_single_turn_test.json");
+        std::fs::write(&path, admissible_fixture("single-turn")).unwrap();
+
+        let trace = LlmTrace::from_file(&path).expect("one turn is a real replay");
+
+        assert_eq!(trace.turns.len(), 1);
+        assert_eq!(trace.turns[0].user_input, "hi");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn trace_expects_keeps_non_empty_entries_admissible() {
         let expects: TraceExpects = serde_json::from_str(
             r#"{"response_contains":["ok"],"tools_not_used":["shell"],"response_matches":["^o"]}"#,
@@ -791,16 +853,8 @@ mod tests {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("b.json"),
-            r#"{"model_name":"b","turns":[],"expects":{"response_contains":["b"]}}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("a.json"),
-            r#"{"model_name":"a","turns":[],"expects":{"response_contains":["a"]}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("b.json"), admissible_fixture("b")).unwrap();
+        std::fs::write(dir.join("a.json"), admissible_fixture("a")).unwrap();
         std::fs::write(dir.join("note.txt"), "ignored").unwrap();
         let suite = load_suite(&dir).unwrap();
         assert_eq!(suite.len(), 2); // the .txt file is ignored
@@ -978,14 +1032,16 @@ mod tests {
     #[test]
     fn a_single_real_check_is_enough_to_load() {
         // Anti-vacuity for the rejections above: the validator is not simply
-        // refusing every fixture.
+        // refusing every fixture. The turn is what separates this fixture from
+        // the zero-turn rejection, which carries the same expectation.
         let trace = load_fixture(
             "one_check",
-            r#"{"model_name":"m","turns":[],"expects":{"max_tool_calls":0}}"#,
+            r#"{"model_name":"m","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"hi"}}]}],"expects":{"max_tool_calls":0}}"#,
         )
         .expect("a case with one real check must load");
         assert_eq!(trace.expects.max_tool_calls, Some(0));
         assert!(!trace.expects.is_empty());
+        assert_eq!(trace.turns.len(), 1);
     }
 
     #[test]
