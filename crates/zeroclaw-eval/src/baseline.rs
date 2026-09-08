@@ -181,6 +181,16 @@ fn entry_from_case(case: &CaseReport) -> anyhow::Result<BaselineEntry> {
     let score = case
         .score()
         .ok_or_else(|| anyhow::Error::msg(format!("case {:?} produced no grades", case.name)))?;
+    // The writer must not emit an entry its own parser refuses: `from_json`
+    // rejects an empty `case_id`, so serializing one would produce a baseline
+    // file that can be written once and never read back.
+    if rec.provenance.case_id.is_empty() {
+        anyhow::bail!(
+            "case {:?} carries an empty case_id; a baseline keyed on a blank identity \
+             cannot be compared against and would be rejected on load",
+            case.name
+        );
+    }
     Ok(BaselineEntry {
         case_id: rec.provenance.case_id.clone(),
         case_hash: rec.provenance.case_hash.clone(),
@@ -640,6 +650,29 @@ mod tests {
     }
 
     #[test]
+    fn from_report_rejects_a_blank_case_id() {
+        // Suite loading now refuses a fixture with an empty display id, but the
+        // writer is a public API of its own. It must never serialize an entry
+        // that `from_json` would refuse, which would leave a baseline file that
+        // can be written once and never read back.
+        let mut blank = case("blank", vec![grade("c", true, GradeCategory::Response)], 10);
+        blank
+            .record
+            .as_mut()
+            .expect("the helper builds a complete record")
+            .provenance
+            .case_id = String::new();
+        let report = SuiteReport { cases: vec![blank] };
+
+        let err = Baseline::from_report(&report)
+            .expect_err("a blank case_id must not reach the baseline file");
+        assert!(
+            err.to_string().contains("empty case_id"),
+            "the error must name the blank identity: {err}"
+        );
+    }
+
+    #[test]
     fn from_report_accepts_a_complete_report() {
         // Every case has completion data and grades, including a *failing* one.
         // An execution error blocks the write; an honest check failure does not.
@@ -790,15 +823,20 @@ mod tests {
         let err = Baseline::from_json(&baseline.to_json().unwrap()).unwrap_err();
         assert!(err.to_string().contains("duplicate case_id"));
 
-        let empty_report = SuiteReport {
+        // The writer refuses to emit a blank identity, so the empty-id document
+        // is built by editing a valid one: the parser guards against a
+        // hand-edited or foreign baseline file, not just against our own writer.
+        let one = SuiteReport {
             cases: vec![case(
-                "",
+                "solo",
                 vec![grade("c", true, GradeCategory::Response)],
                 10,
             )],
         };
-        let empty_baseline = Baseline::from_report(&empty_report).unwrap();
-        let err = Baseline::from_json(&empty_baseline.to_json().unwrap()).unwrap_err();
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&Baseline::from_report(&one).unwrap().to_json().unwrap()).unwrap();
+        doc["entries"][0]["case_id"] = serde_json::Value::String(String::new());
+        let err = Baseline::from_json(&doc.to_string()).unwrap_err();
         assert!(err.to_string().contains("empty case_id"));
     }
 

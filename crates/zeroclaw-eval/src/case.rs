@@ -301,6 +301,14 @@ impl LlmTrace {
             .expects
             .validate()
             .with_context(|| format!("validating trace fixture {}", path.display()))?;
+        if trace.display_id().is_empty() {
+            anyhow::bail!(
+                "trace fixture {} declares an empty case identity; report rows, receipt \
+                 provenance, and the baseline `case_id` key all join on that identity, and a \
+                 blank one cannot be told apart from another case's",
+                path.display()
+            );
+        }
         if trace.turns.is_empty() {
             anyhow::bail!(
                 "trace fixture {} declares no conversation turns; the replay would drive the \
@@ -854,6 +862,61 @@ mod tests {
         assert!(
             chain.contains("no effective expectation"),
             "error must explain the vacuous case: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_display_id_is_rejected_at_load() {
+        // A blank identity is not a name: every downstream join (report rows,
+        // receipt provenance, the baseline `case_id` key) collapses on it, and
+        // the baseline parser already refuses to read an entry whose `case_id`
+        // is empty. Rejecting the fixture at load keeps one invariant instead
+        // of writing a baseline that can never be read back.
+        let blank_model = load_fixture(
+            "blank_model",
+            r#"{"model_name":"","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"ok"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .expect_err("an empty model_name leaves the case with no display identity");
+        let chain = format!("{blank_model:#}");
+        assert!(
+            chain.contains("empty case identity"),
+            "error must name the empty identity: {chain}"
+        );
+        assert!(
+            chain.contains("blank_model.json"),
+            "error must name the fixture path: {chain}"
+        );
+
+        // The explicit `id` override is the other way to reach the same blank
+        // identity, and a non-empty `model_name` must not excuse it.
+        let blank_id = load_fixture(
+            "blank_id",
+            r#"{"model_name":"m","id":"","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"ok"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .expect_err("an empty id override leaves the case with no display identity");
+        assert!(
+            format!("{blank_id:#}").contains("empty case identity"),
+            "an empty `id` must be rejected even when model_name is set: {blank_id:#}"
+        );
+    }
+
+    #[test]
+    fn load_suite_rejects_a_fixture_with_an_empty_display_id() {
+        // The suite boundary is where reports, receipts, and baseline joins are
+        // built, so a blank identity must not survive it even when it is the
+        // only fixture (a second blank case would be caught as a duplicate).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("blank.json"),
+            r#"{"model_name":"","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"ok"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("named.json"), admissible_fixture("named")).unwrap();
+
+        let err = load_suite(dir.path()).expect_err("a blank case identity must fail the suite");
+        assert!(
+            format!("{err:#}").contains("empty case identity"),
+            "got: {err:#}"
         );
     }
 

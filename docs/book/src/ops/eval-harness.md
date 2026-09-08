@@ -351,6 +351,13 @@ expectation key. The nested blocks follow the same rule: a present-but-empty
 `file_contains` needle (every file trivially contains the empty string) are all
 load errors. Every rejection names the offending fixture and field.
 
+Case identity is part of that admission. A fixture whose display id is empty
+(no `id` and an empty `model_name`, or an explicit `"id": ""`) is rejected at
+load, and a suite whose fixtures declare the same display id twice is rejected
+before any case runs, naming both fixture paths. Report rows, receipts, and the
+baseline `case_id` key all join on that identity, so a blank or shared one lets
+one result mask another.
+
 Report aggregation independently requires at least one grade, so an in-memory
 caller cannot manufacture a green case from an empty grade vector.
 
