@@ -137,10 +137,10 @@ async fn seed_setup_memory(
                     .map(|finding| finding.kind.to_string())
                     .collect::<Vec<_>>()
                     .join(",");
-                return Err(anyhow::anyhow!(
-                    "memory key blocked by content scan: {kinds}"
-                ))
-                .with_context(|| format!("scanning setup memory key {key:?}"));
+                anyhow::bail!(
+                    "scanning setup memory key {key:?}: memory key blocked by content scan: \
+                     {kinds}"
+                );
             }
         }
         memory
