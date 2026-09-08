@@ -466,7 +466,25 @@ impl DelegateTool {
 
     /// Attach a cancellation token for cascade control of background tasks.
     /// When the token is cancelled, all background sub-agents are aborted.
+    ///
+    /// This is ordinary cascade cancellation: it does not claim ownership of a
+    /// durable run, so background delegation stays available. A caller whose
+    /// token fences a durable claim uses
+    /// [`with_run_owned_cancellation_token`](Self::with_run_owned_cancellation_token)
+    /// instead.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation = DelegationCancellation::Local(token);
+        self
+    }
+
+    /// Attach a cancellation token that belongs to a supervised run holding a
+    /// durable claim (the cron scheduler's owned run).
+    ///
+    /// Unlike [`with_cancellation_token`](Self::with_cancellation_token), this
+    /// marks the token as the run's owner, which fails `background=true`
+    /// closed: a detached task would outlive the run's private runtime and
+    /// escape the claim boundary that releases the job.
+    pub fn with_run_owned_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation = DelegationCancellation::RunOwned(token);
         self
     }
@@ -6071,6 +6089,134 @@ mod tests {
         assert!(
             bg_desc.contains("Unavailable for supervised cron runs"),
             "run-owned schema must disclose background unavailability: {bg_desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_cancellation_token_keeps_background_delegation_available() {
+        // `with_cancellation_token` is the pre-existing public setter for
+        // ordinary cascade cancellation. Only the cron factory's run-owned
+        // setter fences background delegation, so a caller that supplies its
+        // own token keeps `background=true` and still cancels through it.
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let (_server, requests) = start_hanging_chat_server().await;
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(_server.uri.clone()),
+            model: Some("generic-cancellation-test".to_string()),
+            api_key: Some("generic-cancellation-key".to_string()),
+            timeout_secs: Some(30),
+            ..ModelProviderConfig::default()
+        };
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let generic_token = CancellationToken::new();
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_security))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_workspace_dir(workspace_dir)
+            .with_providers_models(providers_models)
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_cancellation_token(generic_token.clone());
+
+        let desc = tool.description();
+        assert!(
+            !desc.contains("unavailable for supervised cron runs"),
+            "an ordinary cancellation token must not advertise the cron restriction: {desc}"
+        );
+        let schema = tool.parameters_schema();
+        let bg_desc = schema["properties"]["background"]["description"]
+            .as_str()
+            .expect("background description must be present");
+        assert!(
+            !bg_desc.contains("Unavailable for supervised cron runs"),
+            "an ordinary cancellation token must keep the background schema unrestricted: {bg_desc}"
+        );
+
+        let result = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "wait for cancellation",
+                "background": true
+            }))
+            .await
+            .expect("background delegation returns a tool result");
+        assert!(
+            result.success,
+            "a generic cancellation token must keep background delegation available: {result:?}"
+        );
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background delegation returns a task id")
+            .trim_start_matches("task_id: ")
+            .trim()
+            .to_string();
+
+        // The background delegate really started: it reached the provider.
+        wait_for_request_count(&requests, 1).await;
+
+        generic_token.cancel();
+        let settled = wait_for_terminal_background_result(&tool, &task_id).await;
+        assert_eq!(
+            settled.status,
+            BackgroundTaskStatus::Cancelled,
+            "the supplied token must still cascade to the background delegate: {settled:?}"
         );
     }
 

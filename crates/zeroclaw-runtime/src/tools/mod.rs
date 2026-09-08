@@ -1793,7 +1793,7 @@ pub fn all_tools_with_runtime(
         .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
         if let Some(cancellation) = run_cancellation {
-            delegate_tool = delegate_tool.with_cancellation_token(cancellation);
+            delegate_tool = delegate_tool.with_run_owned_cancellation_token(cancellation);
         }
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
