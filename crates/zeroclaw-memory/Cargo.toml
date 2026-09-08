@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Memory backends, embeddings, consolidation, and retrieval for ZeroClaw."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true

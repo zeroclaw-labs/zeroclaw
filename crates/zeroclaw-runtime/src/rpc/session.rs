@@ -111,6 +111,9 @@ type GatedOpPause = (
     Arc<tokio::sync::Notify>,
 );
 
+#[cfg(test)]
+type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -130,6 +133,43 @@ pub struct SessionStore {
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
+    /// Test-only pause immediately after a prompt registers its cancellation
+    /// token. Removal-race tests use this to issue close/kill/delete while the
+    /// prompt owns admission but before any fallible setup or provider work.
+    #[cfg(test)]
+    test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+}
+
+/// Generation-owned handle for the canonical cancellation-token registration.
+///
+/// The token map in [`SessionStore`] remains the source of truth. This handle
+/// only guarantees that the exact generation installed by one admitted prompt
+/// is removed on every exit path, including setup failures before provider
+/// execution starts.
+pub(crate) struct CancelTokenRegistration<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    generation: Option<u64>,
+}
+
+impl CancelTokenRegistration<'_> {
+    /// Drain the turn's cancellation attribution before unregistering the
+    /// token. `remove_cancel_token` intentionally clears any leftover cause.
+    pub(crate) fn finish(mut self) -> Option<CancelCause> {
+        let cause = self.store.take_cancel_cause(self.session_id);
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(self.session_id, generation);
+        }
+        cause
+    }
+}
+
+impl Drop for CancelTokenRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(self.session_id, generation);
+        }
+    }
 }
 
 impl SessionStore {
@@ -146,6 +186,8 @@ impl SessionStore {
             session_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_registration_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -617,6 +659,44 @@ impl SessionStore {
         generation
     }
 
+    pub(crate) fn register_cancel_token_guard<'a>(
+        &'a self,
+        id: &'a str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> CancelTokenRegistration<'a> {
+        CancelTokenRegistration {
+            store: self,
+            session_id: id,
+            generation: Some(self.register_cancel_token(id, token)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_prompt_registration_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_registration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
         {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -634,13 +714,29 @@ impl SessionStore {
     }
 
     pub fn cancel_session(&self, id: &str) -> bool {
-        self.record_cancel_cause(id, CancelCause::ClientRpc);
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.signal_cancellation(id, CancelCause::ClientRpc)
+    }
+
+    /// Signal an in-flight turn before a close/delete handler waits for the
+    /// session admission permit. The handler removes the session only after
+    /// the admitted prompt has finalized under its original incarnation.
+    pub fn signal_session_removal(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::SessionRemoved)
+    }
+
+    /// Signal an in-flight turn before an administrative kill waits for the
+    /// session admission permit.
+    pub fn signal_session_kill(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::AdminKill)
+    }
+
+    fn signal_cancellation(&self, id: &str, cause: CancelCause) -> bool {
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        tokens
             .get(id)
-            .map(|(_, t)| {
-                t.cancel();
+            .map(|(_, token)| {
+                self.record_cancel_cause(id, cause);
+                token.cancel();
                 true
             })
             .unwrap_or(false)
