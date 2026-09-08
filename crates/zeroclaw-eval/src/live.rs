@@ -990,6 +990,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_grades_read_the_live_case_workspace() {
+        // The workspace grader is the only grader that reads state outside the
+        // `RunRecord`, and the live path is the only production path that seeds
+        // a case workspace. Drive it end to end through `run_live_case` (the
+        // production wrapper, so the default catalog builds the grader) and
+        // include one expectation that must fail, so a grader that never looked
+        // at the directory could not report all-green.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "live-workspace-grades",
+                "setup": { "workspace_files": { "report.txt": "status ok" } },
+                "turns": [{ "user_input": "hi" }],
+                "expects": { "workspace": {
+                    "file_exists": ["report.txt", "never_written.txt"],
+                    "file_absent": ["nope.txt"],
+                    "file_contains": { "report.txt": ["ok", "absent-needle"] }
+                } }
+            }"#,
+        )
+        .unwrap();
+
+        let deps = live_deps(
+            |_trace| {
+                Ok(driver_provider(
+                    r#"{ "model_name": "driver", "turns": [{ "user_input": "x", "steps": [{ "response": { "type": "text", "content": "done" } }] }] }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let grade = |check: &str| -> &crate::grader::GradeResult {
+            outcome
+                .grades
+                .iter()
+                .find(|g| g.check == check)
+                .unwrap_or_else(|| panic!("no grade named {check:?} in {:?}", outcome.grades))
+        };
+        assert!(grade(r#"file_exists("report.txt")"#).passed);
+        assert!(grade(r#"file_absent("nope.txt")"#).passed);
+        assert!(grade(r#"file_contains("report.txt", "ok")"#).passed);
+        assert!(
+            !grade(r#"file_exists("never_written.txt")"#).passed,
+            "a file the case never created must not grade as present"
+        );
+        assert!(
+            !grade(r#"file_contains("report.txt", "absent-needle")"#).passed,
+            "a needle absent from the seeded file must not grade as found"
+        );
+    }
+
+    #[tokio::test]
     async fn live_runner_grades_before_dropping_the_case_workspace() {
         // The live path duplicates the replay path's grade-then-drop sequence
         // (`live.rs` vs `runner.rs`), so it needs its own guard: a duplicated

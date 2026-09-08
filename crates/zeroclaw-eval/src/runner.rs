@@ -388,6 +388,63 @@ pub(crate) mod tests {
         "expects": { "response_contains": ["Hello"], "response_not_contains": ["error"], "max_tool_calls": 0 }
     }"#;
 
+    #[tokio::test]
+    async fn budget_grades_read_the_runners_real_run_metrics() {
+        // The budget graders are only as good as the metrics the runner hands
+        // them. If `llm_calls` or the token totals were left at zero, every
+        // `budget.max_*` bound would pass no matter what the case did, which is
+        // the vacuous green this layer exists to prevent. ECHO scripts two
+        // model round-trips totalling 80 input and 25 output tokens, so bounds
+        // one below the observed values must fail and bounds exactly at them
+        // must pass.
+        let over: LlmTrace = serde_json::from_str(&echo_with_budget(
+            r#"{"max_llm_calls": 1, "max_total_tokens": 104, "max_input_tokens": 79}"#,
+        ))
+        .unwrap();
+        let outcome = run_case(&over, &RunDeps::replay()).await.unwrap();
+        assert_eq!(outcome.record.llm_calls, 2, "record: {:?}", outcome.record);
+        assert_eq!(outcome.record.input_tokens, 80);
+        assert_eq!(outcome.record.output_tokens, 25);
+        for check in [
+            "max_llm_calls(1)",
+            "max_total_tokens(104)",
+            "max_input_tokens(79)",
+        ] {
+            let grade = grade_named(&outcome.grades, check);
+            assert!(!grade.passed, "{check} must fail: {grade:?}");
+        }
+
+        let at_limit: LlmTrace = serde_json::from_str(&echo_with_budget(
+            r#"{"max_llm_calls": 2, "max_total_tokens": 105, "max_input_tokens": 80}"#,
+        ))
+        .unwrap();
+        let outcome = run_case(&at_limit, &RunDeps::replay()).await.unwrap();
+        for check in [
+            "max_llm_calls(2)",
+            "max_total_tokens(105)",
+            "max_input_tokens(80)",
+        ] {
+            let grade = grade_named(&outcome.grades, check);
+            assert!(grade.passed, "{check} must pass at the bound: {grade:?}");
+        }
+    }
+
+    /// ECHO with an added `budget` block, so both halves of the test above run
+    /// the same scripted conversation.
+    fn echo_with_budget(budget: &str) -> String {
+        ECHO.replace(
+            r#""expects": {"#,
+            &format!(r#""expects": {{ "budget": {budget},"#),
+        )
+    }
+
+    fn grade_named<'a>(grades: &'a [GradeResult], check: &str) -> &'a GradeResult {
+        grades
+            .iter()
+            .find(|g| g.check == check)
+            .unwrap_or_else(|| panic!("no grade named {check:?} in {grades:?}"))
+    }
+
     const ECHO: &str = r#"{
         "model_name": "test-single-tool-echo",
         "turns": [{
