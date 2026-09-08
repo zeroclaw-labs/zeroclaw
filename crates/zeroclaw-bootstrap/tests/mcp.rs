@@ -16,7 +16,7 @@ use support::{FixtureOrigin, NeverFetches, checksum_manifest, tar_gz};
 use zeroclaw_bootstrap::mcp::{
     self, Reaction, ServeCtx, TOOL_HANDOFF, TOOL_INSTALL, TOOL_NAMES, TOOL_PLAN, TOOL_STATUS,
 };
-use zeroclaw_bootstrap::origin::{PinnedUrl, ReleaseTag};
+use zeroclaw_bootstrap::origin::{PinnedUrl, ReleaseTag, default_release_tag};
 use zeroclaw_bootstrap::plan::{HostEnv, InstallPlan};
 
 const TRIPLE: &str = "x86_64-unknown-linux-gnu";
@@ -25,7 +25,7 @@ const BINARY_BODY: &[u8] = b"#!/bin/sh\necho 'zeroclaw 0.8.4'\n";
 const BIN: &str = env!("CARGO_BIN_EXE_zeroclaw-bootstrap");
 
 fn tag() -> ReleaseTag {
-    ReleaseTag::parse("v0.8.4").expect("valid tag")
+    default_release_tag()
 }
 
 fn temp_env(root: &std::path::Path) -> HostEnv {
@@ -211,9 +211,9 @@ fn plan_returns_the_pinned_selection_and_the_digest_a_human_approves() {
     assert_eq!(frame["result"]["isError"], false);
 
     let sc = &frame["result"]["structuredContent"];
-    assert_eq!(sc["version"], "0.8.4");
+    assert_eq!(sc["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(sc["channel"], "stable");
-    assert_eq!(sc["release_tag"], "v0.8.4");
+    assert_eq!(sc["release_tag"], concat!("v", env!("CARGO_PKG_VERSION")));
     assert_eq!(sc["target"], TRIPLE);
     assert_eq!(sc["asset"], ASSET);
     assert!(

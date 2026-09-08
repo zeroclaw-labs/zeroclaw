@@ -563,7 +563,10 @@ mod tests {
             encoder.write_all(&tar_bytes).expect("gzip");
             let archive = encoder.finish().expect("gzip finish");
 
-            let tag = crate::origin::ReleaseTag::parse("v0.8.4").expect("tag");
+            // Track the crate's own default tag so the fixture's manifest/asset
+            // URLs always match what production resolves — no re-break on a
+            // version bump (the tag is version-derived).
+            let tag = crate::origin::default_release_tag();
             let manifest = format!("{}  {TEST_ASSET}\n", crate::fetch::sha256_hex(&archive));
             Self {
                 manifest_url: crate::origin::PinnedUrl::checksum_manifest(&tag)

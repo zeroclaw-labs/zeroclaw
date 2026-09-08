@@ -6,7 +6,7 @@ mod support;
 use support::{FixtureOrigin, NeverFetches, checksum_manifest};
 
 use zeroclaw_bootstrap::error::BootstrapError;
-use zeroclaw_bootstrap::origin::{PinnedUrl, ReleaseTag};
+use zeroclaw_bootstrap::origin::{PinnedUrl, ReleaseTag, default_release_tag};
 use zeroclaw_bootstrap::plan::{HostEnv, InstallPlan};
 
 fn unix_env() -> HostEnv {
@@ -18,7 +18,7 @@ fn unix_env() -> HostEnv {
 }
 
 fn tag() -> ReleaseTag {
-    ReleaseTag::parse("v0.8.4").expect("valid tag")
+    default_release_tag()
 }
 
 /// Builds an origin carrying a manifest that lists every registered target's
@@ -64,7 +64,8 @@ fn plans_the_registry_artifact_for_every_published_target() {
         assert_eq!(
             plan.source_url.as_str(),
             format!(
-                "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v0.8.4/{}",
+                "https://github.com/zeroclaw-labs/zeroclaw/releases/download/{}/{}",
+                tag().as_str(),
                 plan.asset_name
             )
         );
@@ -73,7 +74,7 @@ fn plans_the_registry_artifact_for_every_published_target() {
             plan.manifest_url.as_str()
         ));
         assert_eq!(plan.artifact_digest.len(), 64);
-        assert_eq!(plan.version, "0.8.4");
+        assert_eq!(plan.version, env!("CARGO_PKG_VERSION"));
         assert!(
             plan.binary_path.ends_with(target.binary_name),
             "binary name must come from the registry"
@@ -196,9 +197,9 @@ fn the_rendered_plan_shows_everything_an_approval_covers() {
     let rendered = plan.render();
 
     for expected in [
-        "0.8.4",
+        env!("CARGO_PKG_VERSION"),
         "stable",
-        "v0.8.4",
+        concat!("v", env!("CARGO_PKG_VERSION")),
         "x86_64-unknown-linux-gnu",
         "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
         "https://github.com/zeroclaw-labs/zeroclaw/releases/download/",

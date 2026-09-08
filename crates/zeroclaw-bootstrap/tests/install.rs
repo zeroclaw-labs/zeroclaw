@@ -6,7 +6,7 @@ use support::{FixtureOrigin, NeverFetches, checksum_manifest, tar_gz};
 
 use zeroclaw_bootstrap::error::BootstrapError;
 use zeroclaw_bootstrap::install;
-use zeroclaw_bootstrap::origin::{PinnedUrl, ReleaseTag};
+use zeroclaw_bootstrap::origin::{PinnedUrl, ReleaseTag, default_release_tag};
 use zeroclaw_bootstrap::plan::{HostEnv, InstallPlan};
 
 const TRIPLE: &str = "x86_64-unknown-linux-gnu";
@@ -14,7 +14,7 @@ const ASSET: &str = "zeroclaw-x86_64-unknown-linux-gnu.tar.gz";
 const BINARY_BODY: &[u8] = b"#!/bin/sh\necho 'zeroclaw 0.8.4'\n";
 
 fn tag() -> ReleaseTag {
-    ReleaseTag::parse("v0.8.4").expect("valid tag")
+    default_release_tag()
 }
 
 struct Fixture {
