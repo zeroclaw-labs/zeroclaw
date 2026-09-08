@@ -823,7 +823,11 @@ mod tests {
             archive_agent_workspace(&config, "agent_a", &workspace),
         );
         assert!(first_race.warnings.is_empty(), "{:?}", first_race.warnings);
-        assert!(second_race.warnings.is_empty(), "{:?}", second_race.warnings);
+        assert!(
+            second_race.warnings.is_empty(),
+            "{:?}",
+            second_race.warnings
+        );
         assert_ne!(
             first_race.path, second_race.path,
             "concurrent duplicate deletes must not share an archive directory"
@@ -837,7 +841,11 @@ mod tests {
         assert!(first.warnings.is_empty(), "{:?}", first.warnings);
         assert!(first.path.join("workspace/owned.txt").exists());
         let first_report = cascade_owned_state(&config, None, None, "agent_a", &first.path).await;
-        assert!(first_report.warnings.is_empty(), "{:?}", first_report.warnings);
+        assert!(
+            first_report.warnings.is_empty(),
+            "{:?}",
+            first_report.warnings
+        );
         assert_eq!(first_report.cron_removed, 1);
         let first_export = std::fs::read_to_string(first.path.join("cascade/cron.json")).unwrap();
         assert!(first_export.contains("duplicate cascade proof"));
