@@ -12,6 +12,7 @@ zeroclaw-api.workspace = true
 zeroclaw-runtime.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-memory.workspace = true
+zeroclaw-providers.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 chrono.workspace = true
