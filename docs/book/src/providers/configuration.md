@@ -116,15 +116,20 @@ delivered when native thinking is enabled (`agent.thinking.native_thinking
 = true`). Accepted values:
 
 - `off` (default): no `display` field is sent; requests are byte-identical
-  to earlier ZeroClaw versions and thinking requests use the non-streaming
-  fallback.
+  to earlier ZeroClaw versions. On the older generations, which spend a
+  thinking token budget, such a request takes the non-streaming path, because
+  the budget cannot ride on the streaming API. The adaptive generations
+  stream whether or not a display is chosen, so a depth alone no longer
+  turns streaming off.
 - `omitted`: the API's own default on the current generations, so nothing is
   sent; thinking text stays withheld, and on the models that think only when
   asked this does not switch reasoning on by itself.
-- `updates`: accepted, but sent as `summarized` with a warning until a model
-  is known to take it; the one family documented to write progress notes
-  rejected the value in a live probe. When it is sent, the request carries
-  the `thinking-display-updates-2026-08-18` beta.
+- `updates`: the short progress notes the model writes between tool calls.
+  Generation 5.1 narrowed the field, so from there on the value is sent as
+  `summarized` with a warning naming the substitution; the one family
+  documented to write the notes rejected it in a live probe. When the notes
+  do go out, the request carries the `thinking-display-updates-2026-08-18`
+  beta.
 - `summarized`: same streaming behavior, requesting summarized thinking.
 
 ```toml
@@ -180,6 +185,10 @@ fallback_models = ["claude-opus-5"]
 - `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
 - `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.
 - `temperature`: current models reject a temperature other than 1 while thinking is active. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
+
+`native_thinking` gates the fixed token budget only. It does not gate the
+adaptive depth: on the current generations a chosen level reaches the request
+as `output_config.effort` with `native_thinking` left at its default.
 
 Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or an `/effort:<level>` prefix on one message (`/think:<level>` is still accepted), maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high`, `xhigh` and `max` ask for those. `xhigh` arrived with the 4.7 generation, so on 4.6 it is sent as `high`. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones. Channels take `/effort <level>` (`/thinking` and `/think` still work), and zerocode offers the depths its session's model accepts as a picker; see [Session controls](../zerocode/running.md#session-controls).
 

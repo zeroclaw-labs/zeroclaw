@@ -47,13 +47,13 @@ Next to the model, the chat title shows the session's reasoning **effort** and *
 
 The options come from the daemon and follow the session's model, so the pickers list only what the model accepts:
 
-- Claude 4.7 and later (Opus 4.7, 4.8 and 5, Sonnet 5, Fable and Mythos) offer `low`, `medium`, `high`, `xhigh` and `max`, and the displays `omitted` and `summarized`. `updates`, the progress notes some models write between tool calls, is not offered: the one family documented to write them rejected the value in a live probe, so a configured `updates` is sent as `summarized` with a warning until a model is known to take it.
+- Claude 4.7 and later (Opus 4.7, 4.8 and 5, Sonnet 5, Fable and Mythos) offer `low`, `medium`, `high`, `xhigh` and `max`. Generations 4.7 through 5.0 also offer `updates`, the progress notes some models write between tool calls, alongside `omitted` and `summarized`; generation 5.1 narrowed the field to those two, so a configured `updates` is sent to them as `summarized` with a warning.
 - Claude 4.6 offers no `xhigh` and no display choice.
 - Older Claude models offer `medium`, `high` and `max` only when the runtime profile sets `native_thinking = true`, because those levels spend a token budget.
 - Claude on Bedrock offers depths but no display.
 - Other providers offer nothing: both segments stay hidden, and `/effort` reports that nothing is adjustable.
 
-`medium` sends no depth and lets the model choose. `off` and `minimal` are not offered here: on the current models they send the same request as `low`, and the prompt hints that tell them apart on the CLI and on channels are not applied to daemon sessions, because rewriting the prompt on every change would restart the provider's prompt cache and break signed-thinking replay within a tool round.
+`medium` sends no depth and lets the model choose. The profile's `native_thinking` switch gates the token budget of the older generations only, so leaving it off does not stop a depth from reaching a model that reads one. `off` and `minimal` are not offered here: on the current models they send the same request as `low`, and the prompt hints that tell them apart on the CLI and on channels are not applied to daemon sessions, because rewriting the prompt on every change would restart the provider's prompt cache and break signed-thinking replay within a tool round.
 
 A choice lives on the daemon session and sits at the top of the display chain: it beats the Anthropic slot's `thinking_display`, which in turn beats the runtime profile's `agent.thinking.display`. Switching the model or the provider clears it, because the new model may not accept it, and a new session (Ctrl+N) starts without it. zerocode remembers your last choice per agent in `zerocode-config.toml`:
 
