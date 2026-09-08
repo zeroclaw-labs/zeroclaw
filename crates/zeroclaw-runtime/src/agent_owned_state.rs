@@ -272,9 +272,12 @@ pub async fn archive_agent_workspace(
     let archive_dir = match allocate_archive_dir(&archive_root, alias, &ts).await {
         Ok(dir) => dir,
         Err(error) => {
-            // Keep reporting the unsuffixed leaf: the cascade below re-derives
-            // its own subdirectory from this path, fails there too, and refuses
-            // to purge, which is what keeps the deletion retryable.
+            // Report the unsuffixed leaf. Whichever way allocation failed, the
+            // cascade cannot complete against it: an unusable archive root
+            // fails again when the cascade creates its own subdirectory, and an
+            // exhausted name space means the leaf belongs to another attempt,
+            // whose exports the cascade refuses to replace. Either way the
+            // purge does not run and the deletion stays retryable.
             let archive_dir = archive_root.join(format!("{alias}-{ts}"));
             ::zeroclaw_log::record!(
                 WARN,
@@ -360,10 +363,16 @@ pub struct OwnedStateReport {
     pub warnings: Vec<String>,
 }
 
+/// Write one archive artifact, refusing to replace an existing one.
+///
+/// Every artifact is written exactly once per cascade, and each cascade owns a
+/// freshly reserved archive leaf, so an existing file here means two attempts
+/// somehow reached the same leaf. `create_new` turns that into a reported
+/// failure, which keeps the purge from running, rather than letting the second
+/// attempt overwrite an export the first one already made durable.
 async fn write_json(path: &Path, bytes: Vec<u8>) -> anyhow::Result<()> {
     let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .open(path)
         .await
@@ -876,6 +885,46 @@ mod tests {
         assert!(
             first.path.join("workspace/owned.txt").exists(),
             "the duplicate must not disturb the first attempt's archived workspace"
+        );
+    }
+
+    /// Defense in depth behind the leaf allocator. Exclusive allocation is what
+    /// normally keeps two cascades apart, but the export writes must not depend
+    /// on it: handed a leaf that already holds an export, a second cascade has
+    /// to fail and leave the purge undone rather than replace the durable copy.
+    #[tokio::test]
+    async fn a_shared_archive_leaf_cannot_replace_an_existing_export() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        seed_owned_cron_job(&config, "agent_a", "shared leaf proof");
+        let shared = tmp.path().join("shared-archive");
+        std::fs::create_dir_all(&shared).unwrap();
+
+        let first = cascade_owned_state(&config, None, None, "agent_a", &shared).await;
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        assert_eq!(first.cron_removed, 1);
+
+        // Same leaf, and the store is already purged, so this export is empty.
+        let second = cascade_owned_state(&config, None, None, "agent_a", &shared).await;
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cron archive")),
+            "a refused export must be reported: {:?}",
+            second.warnings
+        );
+        let preserved = std::fs::read_to_string(shared.join("cascade/cron.json")).unwrap();
+        assert!(
+            preserved.contains("shared leaf proof"),
+            "the second cascade replaced the only durable export: {preserved}"
         );
     }
 
