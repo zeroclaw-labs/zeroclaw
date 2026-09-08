@@ -8,7 +8,8 @@ use std::sync::Arc;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, MemoryConfig, RiskProfileConfig, SandboxBackend, SandboxConfig,
+    AliasedAgentConfig, Config, MemoryConfig, RiskProfileConfig, RuntimeKind, SandboxBackend,
+    SandboxConfig,
 };
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
@@ -189,7 +190,7 @@ pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> 
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         },
-        "native",
+        RuntimeKind::Native,
         Some(workspace),
         &zeroclaw_runtime::security::SandboxExtraRoots::default(),
     );
@@ -387,6 +388,7 @@ mod tests {
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, ConversationMessage, ModelProvider, ProviderCapabilities,
+        ToolCall,
     };
 
     /// Build a `RunDeps` for the live path with an injected provider factory.
@@ -519,6 +521,60 @@ mod tests {
         let registry = live_tool_registry(&[], policy).await.unwrap();
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name(), "echo");
+    }
+
+    #[tokio::test]
+    async fn live_admits_only_workspace_confined_tools_from_the_runtime_defaults() {
+        // The security disclosure for live mode says the tools a case can run
+        // act inside the per-case workspace and that the only network egress
+        // is the configured provider call. Both claims are properties of the
+        // *set* of tools live mode can admit, so pin that set here rather than
+        // leaving it as prose: ask for every runtime default tool from both
+        // sides of the intersection and assert what survives.
+        //
+        // If a future runtime default tool widens this surface (a network
+        // client, a host-scoped reader, an unguarded executor), this fails and
+        // the disclosure has to be re-derived before live mode can ship it.
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+
+        let every_default_tool: Vec<String> =
+            zeroclaw_runtime::tools::default_tools(policy.clone())
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect();
+        assert!(
+            every_default_tool.iter().any(|name| name == "shell"),
+            "the runtime defaults must still contain the tool the denylist \
+             exists for, else this test proves nothing: {every_default_tool:?}"
+        );
+
+        let effective = effective_live_tools(Some(&every_default_tool), &every_default_tool);
+        let policy = Arc::new(SecurityPolicy {
+            allowed_tools: Some(effective.clone()),
+            ..(*policy).clone()
+        });
+        let registry = live_tool_registry(&effective, policy).await.unwrap();
+
+        let mut admitted: Vec<String> = registry.iter().map(|t| t.name().to_string()).collect();
+        admitted.sort();
+        assert_eq!(
+            admitted,
+            vec![
+                "content_search".to_string(),
+                "file_edit".to_string(),
+                "file_read".to_string(),
+                "file_write".to_string(),
+                "glob_search".to_string(),
+            ],
+            "live mode must admit only the path-guarded workspace tools: \
+             `shell` is denylisted, and `deliver_file` is dropped by the \
+             assembly context because live mode delivers nothing"
+        );
     }
 
     #[tokio::test]
@@ -740,6 +796,149 @@ mod tests {
         );
     }
 
+    /// A provider that captures the full text of every request the agent sends
+    /// it, and answers with a fixed two-step script: first a `file_read` of
+    /// `read_path`, then a plain text reply. Capturing the wire text (rather
+    /// than only the recorded history) is what lets a test assert that host
+    /// content never reached the *next provider request*.
+    struct ReadEscapeProvider {
+        read_path: String,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Attributable for ReadEscapeProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "read-escape"
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for ReadEscapeProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+        async fn chat_with_system(
+            &self,
+            _s: Option<&str>,
+            _m: &str,
+            _model: &str,
+            _t: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _t: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let wire = request
+                .messages
+                .iter()
+                .map(|m| format!("{}: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.sent.lock().unwrap().push(wire);
+
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            if first {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "1".into(),
+                        name: "file_read".into(),
+                        arguments: serde_json::json!({ "path": self.read_path }).to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_case_cannot_read_host_content_into_tool_output_or_the_next_request() {
+        // The confidentiality half of the live-mode boundary. Blocking an
+        // out-of-workspace *write* (the test above) is not enough: live tool
+        // output is fed back into the conversation and shipped to the real
+        // configured provider on the following turn, so a host read that
+        // succeeds is a disclosure even though it changes nothing on disk.
+        //
+        // The model here directs `file_read` at an absolute path outside the
+        // case workspace. The marker must appear in neither the fed-back tool
+        // result nor any request the provider actually received.
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_file = host_dir.path().join("host-only.txt");
+        const MARKER: &str = "zeroclaw-eval-host-marker-4f19a2";
+        std::fs::write(&host_file, MARKER).unwrap();
+
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "read-escape", "turns": [{ "user_input": "read the host file" }], "tools": ["file_read"] }"#,
+        )
+        .unwrap();
+
+        let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent_for_factory = sent.clone();
+        let read_path = host_file.to_string_lossy().to_string();
+
+        let deps = live_deps(
+            move |_trace: &LlmTrace| {
+                Ok(Box::new(ReadEscapeProvider {
+                    read_path: read_path.clone(),
+                    sent: sent_for_factory.clone(),
+                    calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }) as Box<dyn ModelProvider>)
+            },
+            vec!["file_read".to_string()],
+            Duration::from_secs(5),
+        );
+
+        let record = run_live_case(&trace, &deps).await.unwrap().record;
+        assert!(
+            record.is_complete(),
+            "the run must have completed, or the transcript assertions below \
+             would pass against an empty stand-in: {record:?}"
+        );
+        let completion = record.completion_or_default();
+
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.len() >= 2,
+            "the agent must have made a follow-up request after the tool ran, \
+             otherwise this proves nothing about the next request: {sent:?}"
+        );
+        for (i, request) in sent.iter().enumerate() {
+            assert!(
+                !request.contains(MARKER),
+                "confidentiality breach: host file contents reached provider \
+                 request {i}: {request}"
+            );
+        }
+        assert!(
+            !format!("{:?}", completion.history).contains(MARKER),
+            "confidentiality breach: host file contents reached the fed-back \
+             conversation: {:?}",
+            completion.history
+        );
+        assert!(
+            !completion.all_tools_succeeded,
+            "the out-of-workspace file_read must not report success"
+        );
+    }
+
     /// A provider that records the `model` string it is called with on every
     /// `chat` invocation, so tests can assert the agent was actually built with
     /// the configured model rather than `Agent::builder()`'s "<unconfigured>"
@@ -829,6 +1028,59 @@ mod tests {
         assert!(
             seen.iter().all(|m| m == "model-under-test"),
             "every chat call must carry the configured model: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_grades_read_the_live_case_workspace() {
+        // The workspace grader is the only grader that reads state outside the
+        // `RunRecord`, and the live path is the only production path that seeds
+        // a case workspace. Drive it end to end through `run_live_case` (the
+        // production wrapper, so the default catalog builds the grader) and
+        // include one expectation that must fail, so a grader that never looked
+        // at the directory could not report all-green.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "live-workspace-grades",
+                "setup": { "workspace_files": { "report.txt": "status ok" } },
+                "turns": [{ "user_input": "hi" }],
+                "expects": { "workspace": {
+                    "file_exists": ["report.txt", "never_written.txt"],
+                    "file_absent": ["nope.txt"],
+                    "file_contains": { "report.txt": ["ok", "absent-needle"] }
+                } }
+            }"#,
+        )
+        .unwrap();
+
+        let deps = live_deps(
+            |_trace| {
+                Ok(driver_provider(
+                    r#"{ "model_name": "driver", "turns": [{ "user_input": "x", "steps": [{ "response": { "type": "text", "content": "done" } }] }] }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let grade = |check: &str| -> &crate::grader::GradeResult {
+            outcome
+                .grades
+                .iter()
+                .find(|g| g.check == check)
+                .unwrap_or_else(|| panic!("no grade named {check:?} in {:?}", outcome.grades))
+        };
+        assert!(grade(r#"file_exists("report.txt")"#).passed);
+        assert!(grade(r#"file_absent("nope.txt")"#).passed);
+        assert!(grade(r#"file_contains("report.txt", "ok")"#).passed);
+        assert!(
+            !grade(r#"file_exists("never_written.txt")"#).passed,
+            "a file the case never created must not grade as present"
+        );
+        assert!(
+            !grade(r#"file_contains("report.txt", "absent-needle")"#).passed,
+            "a needle absent from the seeded file must not grade as found"
         );
     }
 

@@ -1258,6 +1258,70 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
+    // TTS provider api_key presence. Unlike the model_provider check above,
+    // a missing key on `openai`, `elevenlabs`, or `google` is not "may rely
+    // on env vars or model_provider defaults" — `OpenAiTtsProvider::new` and
+    // its siblings (`crates/zeroclaw-channels/src/tts.rs`) bail on a
+    // missing/blank `api_key` before the entry is ever registered, so the
+    // provider silently drops out of `[providers.tts.*]` entirely.
+    // `edge` and `piper` have no key gate and are never checked here.
+    {
+        const TTS_KEY_GATED_FAMILIES: &[&str] = &["openai", "elevenlabs", "google"];
+        for (family, alias, entry) in config.providers.tts.iter_entries() {
+            if !TTS_KEY_GATED_FAMILIES.contains(&family) {
+                continue;
+            }
+            let label = format!("providers.tts.{family}.{alias}");
+            if entry
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|k| !k.is_empty())
+            {
+                items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "{label}: no api_key set — this provider will NOT register (not a soft fallback); set `[{label}].api_key` or remove the entry"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Transcription provider api_key presence — same shape as the TTS check
+    // above. `groq`, `openai`, `deepgram`, `assemblyai`, and `google` all
+    // gate registration on `api_key` in
+    // `crates/zeroclaw-channels/src/transcription.rs`. `local_whisper` has
+    // no api_key concept (its optional `bearer_token` is a different field)
+    // and is never checked here.
+    {
+        use zeroclaw_config::providers::TranscriptionProviderEntry;
+
+        for (family, alias, entry) in config.providers.transcription.iter_entries() {
+            let api_key = match entry {
+                TranscriptionProviderEntry::Groq(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::OpenAi(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::Deepgram(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::AssemblyAi(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::Google(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::LocalWhisper(_) => continue,
+            };
+            let label = format!("providers.transcription.{family}.{alias}");
+            if api_key.map(str::trim).is_some_and(|k| !k.is_empty()) {
+                items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "{label}: no api_key set — this provider will NOT register (not a soft fallback); set `[{label}].api_key` or remove the entry"
+                    ),
+                ));
+            }
+        }
+    }
+
     // Gateway port range
     let port = config.gateway.port;
     if port > 0 {
@@ -2048,6 +2112,142 @@ mod tests {
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
         assert!(temp_item.is_some());
         assert_eq!(temp_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn tts_doctor_warns_for_keyless_gated_provider() {
+        let mut config = Config::default();
+        config.providers.tts.openai.insert(
+            "stoa".to_string(),
+            zeroclaw_config::schema::OpenAITtsProviderConfig {
+                base: zeroclaw_config::schema::TtsProviderConfig {
+                    uri: Some("http://localhost:8880/v1/audio/speech".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.tts.openai.stoa"))
+            .expect("keyless openai TTS provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            item.message.contains("will NOT register"),
+            "message: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn tts_doctor_ok_for_keyed_provider() {
+        let mut config = Config::default();
+        config.providers.tts.openai.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::OpenAITtsProviderConfig {
+                base: zeroclaw_config::schema::TtsProviderConfig {
+                    api_key: Some("sk-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.tts.openai.default"))
+            .expect("keyed openai TTS provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn tts_doctor_no_warning_for_keyless_families() {
+        let mut config = Config::default();
+        config.providers.tts.edge.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::EdgeTtsProviderConfig::default(),
+        );
+        config.providers.tts.piper.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::PiperTtsProviderConfig::default(),
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("providers.tts.edge") || m.contains("providers.tts.piper")),
+            "edge/piper have no api_key gate and must not produce an api_key item: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn transcription_doctor_warns_for_keyless_gated_provider() {
+        let mut config = Config::default();
+        config.providers.transcription.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig::default(),
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.transcription.groq.default"))
+            .expect("keyless groq transcription provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Warn);
+        assert!(
+            item.message.contains("will NOT register"),
+            "message: {}",
+            item.message
+        );
+    }
+
+    #[test]
+    fn transcription_doctor_ok_for_keyed_provider() {
+        let mut config = Config::default();
+        config.providers.transcription.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("gsk-test".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let item = items
+            .iter()
+            .find(|i| i.message.contains("providers.transcription.groq.default"))
+            .expect("keyed groq transcription provider must produce a doctor item");
+        assert_eq!(item.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn transcription_doctor_no_warning_for_local_whisper() {
+        let mut config = Config::default();
+        config.providers.transcription.local_whisper.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                uri: "http://localhost:8001/inference".to_string(),
+                bearer_token: None,
+                language: None,
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 30,
+            },
+        );
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("providers.transcription.local_whisper")),
+            "local_whisper has no api_key concept and must not produce an api_key item: {messages:?}"
+        );
     }
 
     #[test]
