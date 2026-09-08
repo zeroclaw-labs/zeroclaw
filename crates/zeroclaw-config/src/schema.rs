@@ -11154,6 +11154,54 @@ fn resolve_ws_proxy_url(
     preferred.or_else(|| normalize_proxy_url_option(cfg.all_proxy.as_deref()))
 }
 
+/// Root certificates trusted for outbound `wss://` connections.
+///
+/// Combines the bundled webpki (Mozilla) roots with the platform trust store
+/// so WebSocket channels honor the same operator-installed CAs (corporate
+/// proxies, `SSL_CERT_FILE`, `SSL_CERT_DIR`) as the reqwest HTTP clients in
+/// the same binary. Native store errors are logged and skipped; the webpki
+/// roots always remain as a baseline.
+fn ws_root_cert_store() -> rustls::RootCertStore {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let native = rustls_native_certs::load_native_certs();
+    for error in &native.errors {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+            "Failed to load a native root certificate for WebSocket TLS"
+        );
+    }
+    let (_, ignored) = root_store.add_parsable_certificates(native.certs);
+    if ignored > 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"ignored": ignored})),
+            "Ignored unparsable native root certificates for WebSocket TLS"
+        );
+    }
+    root_store
+}
+
+/// Shared rustls client config for outbound `wss://` connections, built once.
+fn ws_tls_client_config() -> std::sync::Arc<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            std::sync::Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(ws_root_cert_store())
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
+}
+
 /// Connect a WebSocket through the configured proxy (if any).
 ///
 /// When no proxy applies, this is a thin wrapper around
@@ -11211,14 +11259,7 @@ pub async fn ws_connect_with_proxy(
 
             let is_secure = target.scheme() == "wss";
             let stream: BoxedIo = if is_secure {
-                let mut root_store = rustls::RootCertStore::empty();
-                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                let tls_config = std::sync::Arc::new(
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth(),
-                );
-                let connector = tokio_rustls::TlsConnector::from(tls_config);
+                let connector = tokio_rustls::TlsConnector::from(ws_tls_client_config());
                 let server_name = rustls_pki_types::ServerName::try_from(target_host.clone())
                     .with_context(|| format!("Invalid TLS server name: {target_host}"))?;
                 let tls_stream = connector
@@ -11373,14 +11414,7 @@ async fn ws_connect_via_proxy(
     // If the target is wss://, wrap in TLS.
     let is_secure = target.scheme() == "wss";
     let stream: BoxedIo = if is_secure {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = std::sync::Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
-        );
-        let connector = tokio_rustls::TlsConnector::from(tls_config);
+        let connector = tokio_rustls::TlsConnector::from(ws_tls_client_config());
         let server_name = rustls_pki_types::ServerName::try_from(target_host.clone())
             .with_context(|| format!("Invalid TLS server name: {target_host}"))?;
 
@@ -43684,5 +43718,46 @@ model_provider = \"ollama.default\"
             ..Default::default()
         };
         assert!(agent.is_dispatchable());
+    }
+
+    // ── WebSocket TLS: trust the platform store alongside webpki roots ──
+    //
+    // Outbound `wss://` connections used to trust only the bundled webpki
+    // roots, so an operator CA (corporate MITM proxy) that the reqwest HTTP
+    // clients in the same binary already honored was rejected on the
+    // WebSocket upgrade. Both TLS surfaces must resolve the same trust.
+
+    // Throwaway self-signed certificate. Public data only; no key material.
+    const WS_TEST_ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBizCCATGgAwIBAgIULP0lrjPORzrT4D/mPJ0EcY8LSLIwCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQWmVyb0NsYXcgVGVzdCBDQTAeFw0yNjA5MDgwMTI4NTdaFw0z
+NjA5MDUwMTI4NTdaMBsxGTAXBgNVBAMMEFplcm9DbGF3IFRlc3QgQ0EwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAAT/pXbDLu2G/HSlye0jD5s0vMZv3wElYBKQvoDf
+8tvfXhZvKghFNBbi56Q1l04GV2ttkPYR8ZlhGADMu2Nn9VEVo1MwUTAdBgNVHQ4E
+FgQUTY4Mmbtq9Rj/NnTdQ/7QY4oDxiYwHwYDVR0jBBgwFoAUTY4Mmbtq9Rj/NnTd
+Q/7QY4oDxiYwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiEAlVMp
+NSDjl0ckCXi/gzqZlJ6FDqUgbh4gnSffsTSo54YCIC6TBJz4bmBgvZ9cjmA0Kuvd
+i2R4lHKBJF9emJYXCaS+
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    async fn ws_root_cert_store_includes_operator_ca_from_ssl_cert_file() {
+        let _env_guard = env_override_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let ca_path = tmp.path().join("operator-ca.pem");
+        std::fs::write(&ca_path, WS_TEST_ROOT_PEM).unwrap();
+        // With SSL_CERT_FILE set, rustls-native-certs reads only that file
+        // (plus SSL_CERT_DIR), so the native contribution is deterministic.
+        let _file = EnvValueGuard::set("SSL_CERT_FILE", &ca_path);
+        let _dir = EnvValueGuard::remove("SSL_CERT_DIR");
+
+        let store = ws_root_cert_store();
+
+        assert_eq!(
+            store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len() + 1,
+            "wss root store must contain the webpki roots plus the operator CA"
+        );
     }
 }

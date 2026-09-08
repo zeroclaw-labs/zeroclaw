@@ -125,6 +125,8 @@ Secrets (bot tokens, API keys, passwords) are stored encrypted; set them through
 
 Inbound senders are gated through [peer groups](./peer-groups.md), not a per-channel field.
 
+Outbound TLS, including the WebSocket connections used by Slack Socket Mode, Discord, and similar channels, trusts the bundled Mozilla roots plus the operating system trust store. Behind a TLS-inspecting corporate proxy, install its CA system-wide or point `SSL_CERT_FILE` at it; no per-channel setting is needed.
+
 ## Streaming capability
 
 Channels declare what kind of streaming they support: see [Providers → Streaming](../providers/streaming.md) for the capability matrix and what `supports_draft_updates` / `supports_multi_message_streaming` mean.
