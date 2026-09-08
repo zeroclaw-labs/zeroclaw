@@ -792,15 +792,6 @@ pub async fn grade_with(
     grades
 }
 
-/// Build the case's default graders and run them while the workspace is alive.
-pub async fn grade_run(
-    trace: &crate::case::LlmTrace,
-    record: &RunRecord,
-    workspace: &std::path::Path,
-) -> Vec<GradeResult> {
-    grade_with(&default_graders(trace), record, workspace).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,11 +800,11 @@ mod tests {
 
     #[tokio::test]
     async fn grades_run_while_workspace_alive() {
-        // A grader receives, through GradeContext, a workspace path that exists at
-        // grade time. `run_case` awaits `grade_run` before its `tmp` (TempDir)
-        // drops, so a workspace-aware grader always sees a live directory. The
-        // control below (drop, then re-check the same path) proves this exists()
-        // check is meaningful, not tautological: it flips to false once dropped.
+        // Control for the two runner-path regressions in `runner.rs` and
+        // `live.rs`: those assert the runner still has the workspace alive when
+        // it awaits grading, and this proves that exists() check is meaningful
+        // rather than tautological, because the same probe on the same path
+        // flips to false once the directory is dropped.
         struct Probe;
         #[async_trait::async_trait]
         impl Grader for Probe {
@@ -891,7 +882,11 @@ mod tests {
         let grades = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(grade_run(&trace, &run("hi", &[], true), tmp.path()));
+            .block_on(grade_with(
+                &default_graders(&trace),
+                &run("hi", &[], true),
+                tmp.path(),
+            ));
         assert_eq!(grades.len(), 1, "expected one config grade: {grades:?}");
         assert!(!grades[0].passed, "the config grade must fail: {grades:?}");
         assert_eq!(grades[0].category, GradeCategory::Config);
@@ -901,7 +896,7 @@ mod tests {
             grades[0].detail
         );
         // The raw expectation evaluator still emits nothing; the fail-closed
-        // decision lives in grade_run, so this documents the boundary.
+        // decision lives in grade_with, so this documents the boundary.
         assert!(evaluate_expects(&TraceExpects::default(), &run("hi", &[], true)).is_empty());
     }
 
@@ -1128,14 +1123,29 @@ mod tests {
     fn grade_category_as_str_matches_serde() {
         // as_str() (the category_totals key) and the serde snake_case (the
         // grade.category value) must stay in lockstep so report consumers can
-        // join per-grade categories against category_totals.
-        for cat in [
+        // join per-grade categories against category_totals. `Config` belongs
+        // in this list like every other variant: it is the category the
+        // fail-closed backstop emits, so a consumer that cannot join it would
+        // lose exactly the grade that says the case asserted nothing.
+        let all = [
             GradeCategory::Response,
             GradeCategory::Tool,
             GradeCategory::SideEffect,
             GradeCategory::Budget,
             GradeCategory::Judge,
-        ] {
+            GradeCategory::Config,
+        ];
+        for cat in all {
+            // A new variant makes this match non-exhaustive, so the compiler
+            // stops here and the added arm is the prompt to list it in `all`.
+            match cat {
+                GradeCategory::Response
+                | GradeCategory::Tool
+                | GradeCategory::SideEffect
+                | GradeCategory::Budget
+                | GradeCategory::Judge
+                | GradeCategory::Config => {}
+            }
             let serde_label = serde_json::to_value(cat).unwrap();
             assert_eq!(serde_label.as_str(), Some(cat.as_str()));
         }

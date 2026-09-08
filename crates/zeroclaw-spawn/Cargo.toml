@@ -4,7 +4,8 @@ version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Attribution-propagating, lifecycle-logged wrapper around tokio::spawn for ZeroClaw."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 # zeroclaw-spawn IS the sanctioned interface against tokio::spawn for the

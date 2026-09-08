@@ -745,6 +745,83 @@ fn run_cli_get(config_dir: &std::path::Path, path: &str) -> serde_json::Value {
     serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
 }
 
+/// Run one non-interactive property write in a fresh CLI process.
+fn run_cli_set(config_dir: &std::path::Path, path: &str, value: &str) {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "set", "--no-interactive", path, value])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config set");
+    assert!(
+        output.status.success(),
+        "config set {path} should succeed in a new process: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn required_field_sections_can_be_completed_across_cli_processes() {
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        (
+            "gateway.tls",
+            &[
+                ("gateway.tls.cert_path", "/tmp/zeroclaw-test-cert.pem"),
+                ("gateway.tls.key_path", "/tmp/zeroclaw-test-key.pem"),
+            ],
+        ),
+        (
+            "transcription.local_whisper",
+            &[(
+                "transcription.local_whisper.url",
+                "http://127.0.0.1:8080/v1/transcribe",
+            )],
+        ),
+        (
+            "tunnel.openvpn",
+            &[("tunnel.openvpn.config_file", "/tmp/zeroclaw-test.ovpn")],
+        ),
+    ];
+
+    for (section, writes) in cases {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let initialized = run_cli_init(config_dir.path(), section);
+        assert!(
+            initialized["initialized"]
+                .as_array()
+                .expect("initialized should be an array")
+                .iter()
+                .any(|value| value == section),
+            "explicit init must include `{section}`: {initialized}",
+        );
+
+        // Each helper invocation launches a new process. Intermediate files may
+        // still be incomplete, so every later write must repair from the
+        // original TOML instead of relying on the resilient in-memory section.
+        for (path, value) in *writes {
+            run_cli_set(config_dir.path(), path, value);
+        }
+
+        let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+            .expect("read completed config");
+        let strict: Config = toml::from_str(&saved).unwrap_or_else(|error| {
+            panic!("completed `{section}` must strictly reload: {error}\n{saved}")
+        });
+        for (path, value) in *writes {
+            assert_eq!(
+                strict
+                    .get_prop(path)
+                    .expect("completed property should exist"),
+                *value,
+                "completed `{section}` property `{path}` must survive strict reload",
+            );
+        }
+    }
+}
+
 #[test]
 fn config_init_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");

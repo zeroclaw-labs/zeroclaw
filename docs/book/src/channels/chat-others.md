@@ -24,6 +24,63 @@ iMessage is bridged through the Linq Partner API (`[channels.linq.<alias>]`):
 
 WeChat personal iLink Bot uses QR-code login against the iLink Bot API for personal WeChat conversations.
 
+## WeCom (企业微信 / WeChat Work)
+
+Two WeCom variants are implemented. They map to different WeCom products, build features, and config keys, so pick the one that matches how the bot is provisioned:
+
+| | Bot Webhook (群机器人) | AI Bot WebSocket (智能机器人) |
+|---|---|---|
+| Build feature | `channel-wecom` | `channel-wecom-ws` |
+| Config key | `[channels.wecom.<alias>]` | `[channels.wecom_ws.<alias>]` |
+| Message flow | Outbound text only | Bidirectional with streaming drafts |
+| Endpoint | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send` | `wss://openws.work.weixin.qq.com` long connection |
+
+### Bot Webhook (群机器人)
+
+A WeCom **group robot** (群机器人) sends text messages to the group it was created in. Add a robot to the target group from the WeCom client, copy the webhook `key` out of its webhook URL, and configure the channel under the `default` alias:
+
+```toml
+[channels.wecom.default]
+enabled = true
+webhook_key = "<GROUP-BOT-WEBHOOK-KEY>"
+```
+
+Then bind it to an agent with `channels = ["wecom"]`.
+
+This variant is outbound only: WeCom group-robot webhooks expose no callback that ZeroClaw subscribes to, so group messages never reach the agent through it. Use it to push agent notifications into a group. For conversations that start from inbound WeCom messages, use the AI Bot WebSocket variant below.
+
+### AI Bot WebSocket (智能机器人)
+
+The WeCom **AI Bot** (智能机器人) long-connection API gives a bidirectional channel: it receives single-chat and group messages and replies over the same socket, including streaming draft updates. The bot credentials (`bot_id` and `secret`) are issued when the AI Bot is created in the WeCom admin console.
+
+```toml
+[channels.wecom_ws.primary]
+enabled = true
+bot_id = "<AI-BOT-ID>"
+secret = "<AI-BOT-SECRET>"
+
+# Inbound authorization. Empty lists deny everything: without at least one
+# entry no inbound message is accepted. "*" allows any sender and disables
+# the allowlist, so prefer concrete IDs.
+allowed_users = ["<wecom-user-id>"]
+allowed_groups = ["<group-chat-id>"]
+
+# Optional: how the bot is addressed in group text, e.g. "danya" for
+# "@danya say hi". Lets the generic reply-intent precheck recognize that a
+# group message was addressed to the bot.
+bot_name = "<BOT-NAME>"
+```
+
+Then bind it to an agent with `channels = ["wecom_ws.primary"]` (use the alias from the config key).
+
+Defaults worth knowing:
+
+- Downloaded media attachments are decrypted, cached under the channel workspace, and cleaned up after `file_retention_days` (default 7); downloads over `max_file_size_mb` (default 20) are rejected.
+- Replies stream as draft updates by default (`stream_mode = "partial"`); set `stream_mode = "off"` for a single whole-reply delivery. Only `partial` and `off` are supported on this channel; `multi_message` is rejected at startup.
+- The per-channel `proxy_url` and `excluded_tools` fields apply as usual.
+
+Inbound sender IDs may also come from a [peer group](./peer-groups.md) whose `channel` is `wecom_ws` or `wecom_ws.<alias>`, instead of the `allowed_*` lists above.
+
 ## DingTalk
 
 Alibaba's enterprise messenger.

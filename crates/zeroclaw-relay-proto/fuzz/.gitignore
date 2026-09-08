@@ -1,0 +1,6 @@
+# cargo-fuzz runtime state. The corpus dir holds committed SEED inputs;
+# do not commit fuzzer-generated corpus growth.
+/target
+/artifacts
+/coverage
+Cargo.lock

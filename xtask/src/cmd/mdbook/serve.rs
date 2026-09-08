@@ -67,8 +67,8 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
         .current_dir(&book)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some((key, value)) = peer_groups_preprocessor_env() {
-        watch_cmd.env(key, value);
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        watch_cmd.envs(env);
     }
     let mut watch = watch_cmd.spawn()?;
 
@@ -135,8 +135,8 @@ fn build_one_locale(book: &Path, tag_dir: &str, locale: &str) -> anyhow::Result<
     cmd.args(["build", "-d", &dest])
         .env("MDBOOK_BOOK__LANGUAGE", locale)
         .current_dir(book);
-    if let Some((key, value)) = peer_groups_preprocessor_env() {
-        cmd.env(key, value);
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        cmd.envs(env);
     }
     run_cmd(&mut cmd)
 }

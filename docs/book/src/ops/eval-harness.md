@@ -91,6 +91,29 @@ Each live case runs inside a sandbox:
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
 | Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+| Network | The only egress live mode performs is the configured provider call itself. No tool it can admit opens a network connection, and no OS-level network rule is applied, because none is needed at this tool surface. |
+
+### What a live case can actually touch
+
+The controls above bound the surface to a closed set. After the allowlist
+intersection and the `shell` denylist, the only tools live mode can admit from
+the runtime defaults are `file_read`, `file_write`, `file_edit`, `glob_search`,
+and `content_search`. Each is wrapped in the generic path guard and resolves its
+target against the per-case workspace root before touching disk, so the
+filesystem confinement is application-layer path canonicalization plus
+`workspace_only`, not an OS sandbox: with `shell` excluded, live mode constructs
+no OS sandbox at all. `deliver_file` is dropped by the assembly context because
+live mode delivers nothing, and an empty allowlist leaves only the in-process
+echo tool.
+
+That closed set is what makes the confidentiality claim checkable rather than
+aspirational, and it is pinned by regressions in
+`crates/zeroclaw-eval/src/live.rs`: one asserts the admitted set itself (so a
+future runtime default tool cannot widen live mode silently), and one drives a
+model-directed `file_read` at a host path outside the workspace and asserts the
+host content reaches neither the fed-back tool result nor the next provider
+request. The residual exposure is therefore what a case deliberately puts in its
+own workspace and sends to the configured provider.
 
 ### Shell is excluded
 
@@ -367,28 +390,73 @@ locale-independent; only the human-readable table is localized.
 
 Every case run produces a receipt: a schema tag, the mode, the case id, a
 SHA-256 `case_hash` of the case's canonical JSON, the `provider_ref`
-(`scripted` for replay, `<type>.<alias>:<model>` for live), the sorted effective
-`tool_surface`, a `sandbox` stamp, and an optional model-inclusive `judge_ref`.
-These fields appear per case in the JSON report and make runs comparable across
-time (the baseline workflow builds on them).
+(`scripted` for replay, `<type>.<alias>:<model>` for live), the `tool_surface`,
+a `sandbox` stamp, and an optional model-inclusive `judge_ref`. These fields
+appear per case in the JSON report and make runs comparable across time (the
+baseline workflow builds on them).
+
+The receipt is built before the fallible work starts, so a case that errors,
+times out, or never reaches the provider still carries every field above.
+Completion-only data (the transcript and `total_tokens`) is absent for such a
+case rather than reported as a real zero.
+
+`tool_surface` records three sorted stages, because the pre-registry request
+list alone describes neither run faithfully:
+
+- `requested`: the case's `tools` intersected with `[eval].live_allowed_tools`,
+  verbatim.
+- `effective`: what survives eval-side filtering, including the unconditional
+  live `shell` denial.
+- `registered`: the names the assembled registry actually hands to the agent.
+  This includes implicit built-ins such as `echo` (which an empty `effective`
+  list still exposes) and excludes an allowlisted name that matches no runtime
+  tool.
 
 Records can be dumped as JSON:
 
 - `--dump-records <dir>` writes `<dir>/<case_id>.json` (record plus grades) for
-  every case. The directory and files are restricted to the current user.
+  every case.
 - On every completed run, failed or errored cases are auto-dumped under
   `<install>/eval-artifacts/runs/<run-id>/`. The table footer prints the exact
-  directory when any failed-case records exist. The owner-only
+  directory when any failed-case records exist. The
   `<install>/eval-artifacts/last-run` pointer names that completed run.
 
+Dump files are published complete: the payload is written to a sibling temporary
+file, synced, and then renamed into a name that did not previously exist, so a
+reader never sees a partial transcript and a colliding case id never overwrites
+an earlier dump.
+
+### Artifact location, permissions, and retention
+
+Automatic artifacts live under the configured install root, never under the
+process working directory, so running the harness from a nested directory cannot
+drop an unredacted transcript into a tracked path. On Unix, every directory this
+harness creates is `0700` and every file it writes is `0600`, for the automatic
+location and for a `--dump-records <dir>` you name yourself; an existing dump
+directory is tightened to `0700` rather than inheriting a looser prior mode.
+
+The retention contract is exactly one completed run:
+
+- A run stages into its own `<install>/eval-artifacts/staging/<run-id>/`, which
+  no other process reads or removes.
+- On completion the staging directory is renamed to
+  `<install>/eval-artifacts/runs/<run-id>/` and the `last-run` pointer file is
+  replaced atomically to name it.
+- The previously completed run under `runs/` is then removed. Nothing else is
+  retained, and a removal failure other than "already gone" is reported instead
+  of being swallowed.
+- An OS file lock (`<install>/eval-artifacts/.publish.lock`) serializes those
+  three steps, so concurrent runs select one complete run and never mix or erase
+  each other's records.
+
+A run that is rejected before it finishes (bad provider config, missing suite
+directory) leaves the previous completed run and its pointer untouched.
+
 Dumps are debugging artifacts, not fixtures. A live transcript can embed
-workspace file content and model output, so **never commit a dump**;
-the automatic directory is private runtime state outside the current working
-directory. Completed-run publication is serialized across processes: a new run
-replaces the pointer atomically, then retires the previous completed run while
-leaving other processes' active staging directories alone. Promoting a dump into
-a suite fixture requires the same privacy placeholder pass as any other fixture
-(see the privacy contract): no real names, transcripts, hostnames, or credentials.
+workspace file content and model output, so **never commit a dump**. Promoting
+one into a suite fixture requires the same privacy placeholder pass as any other
+fixture (see the privacy contract): no real names, transcripts, hostnames, or
+credentials.
 
 ## Run history
 
@@ -432,14 +500,27 @@ Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`
 authoring rules, including the two-experts test and the privacy requirement that
 fixtures use placeholder identities only.
 
-### Every case must assert something
+Fixture loading fails closed, because a required gate must not certify a case
+that cannot fail. `LlmTrace::from_file()` rejects a fixture that declares no
+conversation turns (the replay would drive the agent zero times and grade its
+expectations against an empty run), one whose expectation block is omitted or
+empty, one holding a zero-length entry in a string-backed expectation family
+(`response_contains`, `response_not_contains`, `response_matches`,
+`tools_used`, `tools_not_used`), and one carrying an unknown top-level or
+expectation key. The nested blocks follow the same rule: a present-but-empty
+`workspace` or `budget` block, an empty `file_contains` list, and an empty
+`file_contains` needle (every file trivially contains the empty string) are all
+load errors. Every rejection names the offending fixture and field.
 
-Fixture loading fails closed when an unknown key, an omitted or empty
-expectation block, or a zero-length string expectation would make a case unable
-to certify meaningful behavior. One invalid fixture aborts the suite load; it
-is never silently skipped. Report aggregation independently requires at least
-one grade, so an in-memory caller cannot manufacture a green case from an empty
-grade vector.
+Case identity is part of that admission. A fixture whose display id is empty
+(no `id` and an empty `model_name`, or an explicit `"id": ""`) is rejected at
+load, and a suite whose fixtures declare the same display id twice is rejected
+before any case runs, naming both fixture paths. Report rows, receipts, and the
+baseline `case_id` key all join on that identity, so a blank or shared one lets
+one result mask another.
+
+Report aggregation independently requires at least one grade, so an in-memory
+caller cannot manufacture a green case from an empty grade vector.
 
 ### Grader catalog
 
