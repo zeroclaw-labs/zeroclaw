@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Configuration schema, secrets, and related types for ZeroClaw."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
