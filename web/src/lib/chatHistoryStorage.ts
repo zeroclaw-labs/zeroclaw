@@ -177,6 +177,11 @@ export function uiMessagesToPersisted(
  * to the corresponding server user occurrence. This keeps a missed notice
  * before later turns and prevents an unrelated identical assistant message
  * from consuming the fallback.
+ *
+ * The failed turn stays whole across reloads: its user row is restored when the
+ * server never received it, and a retained message the server did receive keeps
+ * the server copy while adopting the local lifecycle marker, so the next
+ * hydration recognises the same turn instead of drifting.
  */
 const RUNTIME_USER_ENVELOPE_RE =
   /^\[CURRENT DATE & TIME: [^\]\r\n]+\]\r?\n\r?\n/;
@@ -188,12 +193,67 @@ function rawServerUserContent(content: string): string {
   return content.replace(RUNTIME_USER_ENVELOPE_RE, '');
 }
 
+/**
+ * The comparable identity of a user row, on either side of the merge.
+ *
+ * A hydrated server row is mirrored back into localStorage with the runtime
+ * envelope it was displayed with, so the next mount reads an already-enriched
+ * local anchor. Normalising both sides keeps the anchor comparable across
+ * repeated hydrations while the displayed content stays untouched. A bubble
+ * flagged `local` is verbatim composer input that never passed through the
+ * runtime, so it is compared as typed.
+ */
+function userAnchorKey(message: PersistedChatBubble): string {
+  return message.local === true ? message.content : rawServerUserContent(message.content);
+}
+
 function sameUserOccurrence(
   serverMessage: PersistedChatBubble,
   localMessage: PersistedChatBubble,
 ): boolean {
   return serverMessage.role === 'user'
-    && rawServerUserContent(serverMessage.content) === localMessage.content;
+    && userAnchorKey(serverMessage) === userAnchorKey(localMessage);
+}
+
+/**
+ * How many times this prompt occurs at or after `fromIndex`, counting to the
+ * end of the transcript.
+ *
+ * Local history is a bounded suffix (`MAX_MESSAGES`), so an occurrence number
+ * counted from the start is not a stable identity: once an earlier identical
+ * prompt is evicted, the retained turn looks like the first occurrence and the
+ * terminal sequence binds to an older server turn. Both transcripts end at the
+ * same conversation, so counting back from the end survives that window.
+ */
+function occurrenceFromEnd(
+  messages: PersistedChatBubble[],
+  fromIndex: number,
+  key: string,
+): number {
+  let occurrence = 0;
+  for (let index = fromIndex; index < messages.length; index += 1) {
+    const candidate = messages[index];
+    if (candidate?.role === 'user' && userAnchorKey(candidate) === key) {
+      occurrence += 1;
+    }
+  }
+  return occurrence;
+}
+
+/** Index of the `occurrence`-th matching server user row counted from the end. */
+function serverUserIndexFromEnd(
+  server: PersistedChatBubble[],
+  anchor: PersistedChatBubble,
+  occurrence: number,
+): number {
+  let seen = 0;
+  for (let index = server.length - 1; index >= 0; index -= 1) {
+    const candidate = server[index];
+    if (!candidate || !sameUserOccurrence(candidate, anchor)) continue;
+    seen += 1;
+    if (seen === occurrence) return index;
+  }
+  return -1;
 }
 
 function isRetainedTerminalMessage(message: PersistedChatBubble): boolean {
@@ -206,6 +266,8 @@ export function mergeServerHistoryWithLocalNotices(
 ): PersistedChatBubble[] {
   const insertions = new Map<number, PersistedChatBubble[]>();
   const matchedServerMessages = new Set<number>();
+  const markedServerMessages = new Map<number, PersistedChatBubble>();
+  const restoredLocalAnchors = new Set<number>();
   for (let localIndex = 0; localIndex < local.length; localIndex += 1) {
     const message = local[localIndex];
     if (!message) continue;
@@ -218,20 +280,11 @@ export function mergeServerHistoryWithLocalNotices(
     const localAnchor = local[localAnchorIndex];
     let serverAnchorIndex = -1;
     if (localAnchor) {
-      let anchorOccurrence = 0;
-      for (let index = 0; index <= localAnchorIndex; index += 1) {
-        const candidate = local[index];
-        if (candidate?.role === 'user' && candidate.content === localAnchor.content) {
-          anchorOccurrence += 1;
-        }
-      }
-
-      let seen = 0;
-      serverAnchorIndex = server.findIndex((candidate) => {
-        if (!sameUserOccurrence(candidate, localAnchor)) return false;
-        seen += 1;
-        return seen === anchorOccurrence;
-      });
+      serverAnchorIndex = serverUserIndexFromEnd(
+        server,
+        localAnchor,
+        occurrenceFromEnd(local, localAnchorIndex, userAnchorKey(localAnchor)),
+      );
     }
 
     const nextTurnOffset = serverAnchorIndex < 0
@@ -271,18 +324,43 @@ export function mergeServerHistoryWithLocalNotices(
       }
       if (persistedIndex >= 0) {
         matchedServerMessages.add(persistedIndex);
+        const persistedMessage = server[persistedIndex];
+        if (persistedMessage) {
+          // The server row wins on content, ordering, and timestamp; it only
+          // adopts the lifecycle marker the local copy carried. Without that
+          // marker the merged transcript is mirrored back to localStorage as an
+          // ordinary assistant row, so the next mount can no longer recognise
+          // the failed turn — and the notice loses its warning presentation.
+          markedServerMessages.set(persistedIndex, {
+            ...persistedMessage,
+            notice: retainedMessage.notice,
+            terminalPartial: retainedMessage.terminalPartial,
+          });
+        }
         beforeIndex = persistedIndex;
         continue;
       }
       insertions.set(beforeIndex, [retainedMessage, ...(insertions.get(beforeIndex) ?? [])]);
     }
+
+    // Gateway appends are per-message and keep going after one of them fails,
+    // so the failed user row can be the only casualty while its partial and
+    // notice reach the server. Restoring the anchor here keeps the request that
+    // explains the terminal sequence attached to it; without it the reload
+    // shows an orphaned answer and stop reason. Ordinary local-only bubbles
+    // stay dropped: only the user turn that anchors a retained terminal
+    // sequence is restored, and only when the server has no copy of it.
+    if (localAnchor && serverAnchorIndex < 0 && !restoredLocalAnchors.has(localAnchorIndex)) {
+      restoredLocalAnchors.add(localAnchorIndex);
+      insertions.set(beforeIndex, [localAnchor, ...(insertions.get(beforeIndex) ?? [])]);
+    }
   }
 
-  if (insertions.size === 0) return server;
+  if (insertions.size === 0 && markedServerMessages.size === 0) return server;
   const merged: PersistedChatBubble[] = [];
   for (let index = 0; index <= server.length; index += 1) {
     merged.push(...(insertions.get(index) ?? []));
-    const current = server[index];
+    const current = markedServerMessages.get(index) ?? server[index];
     if (current) merged.push(current);
   }
   return merged;
