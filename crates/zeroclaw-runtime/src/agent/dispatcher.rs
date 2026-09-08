@@ -125,15 +125,16 @@ impl ToolDispatcher for XmlToolDispatcher {
             return String::new();
         }
 
-        let mut instructions = String::new();
-        instructions.push_str("## Tool Use Protocol\n\n");
-        instructions
-            .push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
-        instructions.push_str(
-            "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
-        );
-
-        instructions
+        // The tool-call formatting guidance has one home: `tool_call_format`.
+        // Do not re-type it here — this builder and `loop_`'s had already
+        // drifted once (this one was missing the `CRITICAL:` line and the
+        // worked example), which made tool-use behavior depend on which
+        // builder produced the prompt.
+        //
+        // The tool listing itself is deliberately NOT emitted here: for this
+        // path `ToolsSection` in `agent::prompt` renders it, and duplicating
+        // it caused double schema injection (see the dispatcher tests).
+        super::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS.to_string()
     }
 
     fn to_provider_messages(&self, history: &[ConversationMessage]) -> Vec<ChatMessage> {
