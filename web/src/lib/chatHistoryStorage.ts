@@ -13,7 +13,10 @@ export interface PersistedChatBubble {
   /** Trusted lifecycle marker retained for a locally durable terminal notice. */
   notice?: boolean;
   /** Streamed assistant output retained only when the terminal frame reports
-   *  that the canonical failed-turn delta was not fully persisted. */
+   *  that the canonical failed-turn delta was not fully persisted. Hydration
+   *  carries the marker onto the server copy of that row once one exists, so a
+   *  later mount still recognises the row as part of a failed turn. Neither
+   *  form is rendered differently; the marker only scopes the merge. */
   terminalPartial?: boolean;
   /** Verbatim locally-composed user input — never gateway-prefixed, so the
    *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
