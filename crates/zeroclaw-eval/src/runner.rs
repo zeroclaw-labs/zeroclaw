@@ -224,8 +224,9 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
 /// Run a case, repeating it for live suites with `repeat > 1`. Each repeat is a
 /// fully isolated run (fresh temp workspace, agent, and provider). Returns a
 /// representative outcome (a failing run when any exists, so its grades explain
-/// the failure; otherwise the first run) plus aggregated [`RepeatStats`]. The
-/// representative's grades make the case pass iff every run passed (pass^k).
+/// the failure; otherwise the first run) plus aggregated
+/// [`RepeatStats`](crate::stats::RepeatStats). The representative's grades make
+/// the case pass iff every run passed (pass^k).
 ///
 /// If a repetition errors, the repetitions already completed are still
 /// aggregated and returned rather than discarded: live runs are paid, and the
