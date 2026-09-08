@@ -3698,7 +3698,15 @@ impl RpcDispatcher {
         })
     }
 
-    async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
+    /// Boxed for the same reason as its rename twin: the agent branch carries
+    /// the whole owned-state cascade, and leaving that future inline in
+    /// `dispatch` puts `process_line` over the two-megabyte stack budget that
+    /// `process_line_session_new_creates_session_on_two_megabyte_stack` pins.
+    fn handle_config_map_key_delete<'a>(&'a self, params: &'a Value) -> BoxRpcFuture<'a> {
+        Box::pin(self.run_config_map_key_delete(params))
+    }
+
+    async fn run_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         if matches!(
