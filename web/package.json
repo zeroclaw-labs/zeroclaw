@@ -54,7 +54,6 @@
     "happy-dom": "^20.11.6",
     "jiti": "^2.7.0",
     "openapi-typescript": "^7.13.0",
-    "react-test-renderer": "19.2.4",
     "rollup": "^4.59.0",
     "react-test-renderer": "19.2.4",
     "tailwindcss": "^4.0.0",
