@@ -15,6 +15,7 @@ Suites of agent evaluation cases for `zeroclaw eval run` (crate: `crates/zerocla
 - Every case states its class: a **positive** case (behavior must happen) or a **negative** case (behavior must NOT happen — e.g. `tools_not_used`, `response_not_contains`, `max_tool_calls: 0`). Keep the suite balanced; one-sided evals create one-sided optimization.
 - The two-experts test: two people reading the case must independently reach the same pass/fail verdict from the case text alone. If they wouldn't, the case is ambiguous — tighten it.
 - A replay case's scripted steps double as its reference solution: they prove the task is solvable.
+- Every case replays at least one turn and declares at least one assertion with no zero-length value. Fixture loading rejects anything less, so a case that cannot fail never reaches the gate.
 - Privacy: fixtures ship forever. Placeholder identities only (`zeroclaw_user`, `example.com`) per `docs/book/src/contributing/privacy.md`. Never paste real transcripts, names, keys, or hostnames.
 
 Suite owner: the maintainer group for `crates/zeroclaw-eval` (update when a named owner volunteers).

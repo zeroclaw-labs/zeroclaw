@@ -68,3 +68,15 @@ either, because the replay provider scripts that response itself.
 The recorded-call list is the canonical dispatch fact. Tool names and aggregate
 success are derived from it at grading time, so richer boundary evidence does
 not create a second independently mutable tool-call summary.
+
+Fixture loading fails closed, because a required gate must not certify a case
+that cannot fail. `LlmTrace::from_file()` rejects a fixture that declares no
+conversation turns (the replay would drive the agent zero times and grade its
+expectations against an empty run), one whose expectation block is omitted or
+empty, one holding a zero-length entry in a string-backed expectation family
+(`response_contains`, `response_not_contains`, `response_matches`,
+`tools_used`, `tools_not_used`), and one carrying an unknown top-level or
+expectation key. The dispatch-boundary families fail closed on the same
+principle: an empty `tool` or `needle`, a vacuous `min_tool_calls: 0`, and
+count bounds that contradict each other are all rejected at load. Every
+rejection names the offending fixture and field.

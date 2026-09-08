@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
+use zeroclaw_plugins::egress::{EgressHostService, EgressPolicy, EgressPolicyResolver};
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
@@ -63,6 +64,19 @@ fn limits(call_timeout: Duration, call_fuel: u64) -> PluginLimits {
     }
 }
 
+/// The operator's egress grant for the fixture instance, built through the
+/// shared service exactly as the shipped host path does. These tests drive real
+/// `wasi:http` to an in-process loopback server, so the fixture instance must be
+/// granted `127.0.0.1` both as an allowlisted host and as a private-address
+/// carve-out — loopback is a blocked address class above the allowlist.
+fn policy(hosts: &[&str], allow_private: &[&str]) -> EgressHostService {
+    let hosts: Vec<String> = hosts.iter().map(|h| (*h).to_string()).collect();
+    let allow_private: Vec<String> = allow_private.iter().map(|h| (*h).to_string()).collect();
+    EgressHostService::new(EgressPolicyResolver::new(move |_| {
+        EgressPolicy::new(&hosts, &allow_private, &[], 256)
+    }))
+}
+
 /// A warm fixture plugin. `call_execute` resolves the plugin's non-secret
 /// config through the host-service bundle injected at `create_plugin`, so the
 /// test carries only the warm plugin.
@@ -110,9 +124,15 @@ async fn plugin_with_fuel(call_timeout: Duration, call_fuel: u64) -> Fixture {
             resolve_plugin_config(&manifest, scope, None)
         }))
     };
-    let plugin = runtime::create_plugin(path, &scope, &services, limits(call_timeout, call_fuel))
-        .await
-        .expect("instantiate timeout fixture");
+    let plugin = runtime::create_plugin_with_egress(
+        path,
+        &scope,
+        &services,
+        limits(call_timeout, call_fuel),
+        Some(policy(&["127.0.0.1"], &["127.0.0.1"])),
+    )
+    .await
+    .expect("instantiate timeout fixture");
     Fixture { plugin }
 }
 
