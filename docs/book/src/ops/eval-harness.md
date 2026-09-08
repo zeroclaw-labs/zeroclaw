@@ -292,8 +292,9 @@ Memory checks (category `side_effect`), under `memory`:
 
 - `present` / `absent`: exact keys that must / must not exist after the run.
 - `contains`: a map of exact key to substrings that must appear in that entry's
-  content. Each map value must contain at least one substring; an empty list is
-  a failed malformed expectation rather than a vacuous pass.
+  content. Each map value must contain at least one substring, and every
+  substring must be non-empty; an empty list or an empty substring is a failed
+  malformed expectation rather than a vacuous pass.
 
 Memory checks query the case's isolated memory backend by exact key rather than
 using ranked recall. Each key must satisfy the same `[A-Za-z0-9._/-]` grammar as
@@ -301,6 +302,12 @@ seed keys and is validated before the backend is queried; an invalid key is a
 failed check, never a memory access.
 Memory expectations are live-mode only; replay rejects their declaration and
 names `--mode live` in the error.
+
+A memory expectation that cannot fail is rejected twice. Fixture loading refuses
+an `expects.memory` block with no checks, an unknown field such as a typoed
+`present`, an empty `contains` list, and an empty substring. The grader repeats
+the same rule at run time, so a case assembled in process reports a failed grade
+instead of contributing nothing to the report.
 
 Budget checks (category `budget`), under `budget`, each an inclusive bound:
 `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_duration_ms`,
