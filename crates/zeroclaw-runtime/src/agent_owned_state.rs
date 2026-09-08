@@ -217,36 +217,83 @@ pub struct AgentDeletionArchive {
     pub warnings: Vec<String>,
 }
 
+/// How many leaf names one allocation may try before giving up.
+///
+/// Each attempt is a single `create_dir` syscall, and the names only collide
+/// within one clock second, so this bound is far above the number of duplicate
+/// lifecycle requests a surface can land in that window.
+const ARCHIVE_LEAF_ATTEMPTS: u32 = 64;
+
+/// Reserve a fresh archive leaf for `alias` under `root`, creating it exclusively.
+///
+/// The leaf name is derived from the alias and the current UTC second, so two
+/// deletions of the same alias inside one second used to resolve to the same
+/// directory. Because the cascade exports with truncating writes, the later
+/// attempt could then overwrite an earlier non-empty export with its own
+/// post-purge (empty) one and leave no recoverable copy. `create_dir` fails
+/// with `AlreadyExists` instead of adopting an occupied directory, so each
+/// attempt owns a distinct leaf and no export can be truncated by a duplicate.
+async fn allocate_archive_dir(root: &Path, alias: &str, ts: &str) -> std::io::Result<PathBuf> {
+    tokio::fs::create_dir_all(root).await?;
+    for attempt in 0..ARCHIVE_LEAF_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            root.join(format!("{alias}-{ts}"))
+        } else {
+            root.join(format!("{alias}-{ts}-{attempt}"))
+        };
+        match tokio::fs::create_dir(&candidate).await {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "no free archive directory for `{alias}` under {}",
+            root.display()
+        ),
+    ))
+}
+
 /// Create the canonical agent-deletion archive and move its workspace into it.
+///
+/// Every lifecycle surface routes its deletion archive through here so that all
+/// of them share one exclusive leaf allocator and one fail-toward-residue
+/// workspace probe.
 pub async fn archive_agent_workspace(
     config: &Config,
     alias: &str,
     workspace: &Path,
 ) -> AgentDeletionArchive {
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = config
-        .data_dir
-        .join("agents")
-        .join("_deleted")
-        .join(format!("{alias}-{ts}"));
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let archive_root = config.data_dir.join("agents").join("_deleted");
     let mut warnings = Vec::new();
-    if let Err(error) = tokio::fs::create_dir_all(&archive_dir).await {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "agent": alias,
-                    "archive": archive_dir.display().to_string(),
-                    "error": error.to_string(),
-                })),
-            "agent delete: archive directory creation failed"
-        );
-        warnings.push(format!(
-            "archive directory creation failed ({}): {error}",
-            archive_dir.display()
-        ));
-    }
+    let archive_dir = match allocate_archive_dir(&archive_root, alias, &ts).await {
+        Ok(dir) => dir,
+        Err(error) => {
+            // Keep reporting the unsuffixed leaf: the cascade below re-derives
+            // its own subdirectory from this path, fails there too, and refuses
+            // to purge, which is what keeps the deletion retryable.
+            let archive_dir = archive_root.join(format!("{alias}-{ts}"));
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "agent": alias,
+                        "archive": archive_dir.display().to_string(),
+                        "error": error.to_string(),
+                    })),
+                "agent delete: archive directory creation failed"
+            );
+            warnings.push(format!(
+                "archive directory creation failed ({}): {error}",
+                archive_dir.display()
+            ));
+            archive_dir
+        }
+    };
     match workspace.try_exists() {
         Ok(true) => {
             let destination = archive_dir.join("workspace");
@@ -732,6 +779,98 @@ pub async fn cascade_rename_agent(
 mod tests {
     use super::*;
 
+    fn seed_owned_cron_job(config: &Config, alias: &str, prompt: &str) {
+        crate::cron::add_agent_job(
+            config,
+            alias,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            prompt,
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+    }
+
+    /// Two deletes of the same alias inside one clock second must not land in
+    /// the same archive. The cascade exports with truncating writes, so a shared
+    /// leaf lets the second attempt overwrite the first attempt's non-empty
+    /// export with its own post-purge (empty) one, and both requests still
+    /// report success while no recoverable copy is left.
+    #[tokio::test]
+    async fn duplicate_delete_cascades_cannot_share_an_archive_or_truncate_the_first_export() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        // Duplicate requests admitted concurrently, before there is a workspace
+        // to move: each must still reserve a leaf of its own.
+        let workspace = config.agent_workspace_dir("agent_a");
+        let (first_race, second_race) = tokio::join!(
+            archive_agent_workspace(&config, "agent_a", &workspace),
+            archive_agent_workspace(&config, "agent_a", &workspace),
+        );
+        assert!(first_race.warnings.is_empty(), "{:?}", first_race.warnings);
+        assert!(second_race.warnings.is_empty(), "{:?}", second_race.warnings);
+        assert_ne!(
+            first_race.path, second_race.path,
+            "concurrent duplicate deletes must not share an archive directory"
+        );
+
+        seed_owned_cron_job(&config, "agent_a", "duplicate cascade proof");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("owned.txt"), "prior incarnation").unwrap();
+
+        let first = archive_agent_workspace(&config, "agent_a", &workspace).await;
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        assert!(first.path.join("workspace/owned.txt").exists());
+        let first_report = cascade_owned_state(&config, None, None, "agent_a", &first.path).await;
+        assert!(first_report.warnings.is_empty(), "{:?}", first_report.warnings);
+        assert_eq!(first_report.cron_removed, 1);
+        let first_export = std::fs::read_to_string(first.path.join("cascade/cron.json")).unwrap();
+        assert!(first_export.contains("duplicate cascade proof"));
+
+        // The duplicate reaches the cascade after the purge, so its own export
+        // is empty. It must write that into its own leaf.
+        let second = archive_agent_workspace(&config, "agent_a", &workspace).await;
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        assert_ne!(
+            first.path, second.path,
+            "a duplicate delete must not reuse the first attempt's archive directory"
+        );
+        let second_report = cascade_owned_state(&config, None, None, "agent_a", &second.path).await;
+        assert!(
+            second_report.warnings.is_empty(),
+            "{:?}",
+            second_report.warnings
+        );
+        assert_eq!(second_report.cron_removed, 0);
+        let second_export = std::fs::read_to_string(second.path.join("cascade/cron.json")).unwrap();
+        assert_eq!(second_export.trim(), "[]");
+
+        let preserved = std::fs::read_to_string(first.path.join("cascade/cron.json")).unwrap();
+        assert!(
+            preserved.contains("duplicate cascade proof"),
+            "the duplicate truncated the only durable export: {preserved}"
+        );
+        assert!(
+            first.path.join("workspace/owned.txt").exists(),
+            "the duplicate must not disturb the first attempt's archived workspace"
+        );
+    }
+
     #[tokio::test]
     async fn archive_failure_preserves_cron_and_acp_for_retry() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -743,23 +882,7 @@ mod tests {
         config.gateway.session_persistence = false;
         config.channels.session_persistence = false;
 
-        crate::cron::add_agent_job(
-            &config,
-            "agent_a",
-            None,
-            crate::cron::Schedule::Cron {
-                expr: "*/5 * * * *".to_string(),
-                tz: None,
-            },
-            "owned cron proof",
-            crate::cron::SessionTarget::Isolated,
-            None,
-            None,
-            false,
-            None,
-            false,
-        )
-        .unwrap();
+        seed_owned_cron_job(&config, "agent_a", "owned cron proof");
         let acp = AcpSessionStore::new(&config.data_dir).unwrap();
         acp.create_session("owned-acp-proof", "agent_a", "/workspace")
             .unwrap();
