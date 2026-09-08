@@ -514,98 +514,70 @@ impl LogLevel {
 #[cfg(feature = "agent-runtime")]
 #[derive(Subcommand, Debug)]
 enum EvalCalibrateCommands {
-    #[command(
-        about = t(
-            "cli-eval-calibrate-label-about",
-            "Blindly label LLM-judge run records for calibration"
-        )
-    )]
+    // i18n-exempt: clap derive help; built before --config-dir selects the locale
+    #[command(about = "Blindly label LLM-judge run records for calibration")]
     Label {
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "PATH",
-            help = t(
-                "cli-eval-calibrate-label-help-records",
-                "Judge-run JSONL file, or a directory containing judge-runs.jsonl"
-            )
+            help = "Judge-run JSONL file, or a directory containing judge-runs.jsonl"
         )]
         records: PathBuf,
 
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "PATH",
-            help = t(
-                "cli-eval-calibrate-label-help-labels",
-                "Append-only labels JSONL path (defaults under evals/calibration/labels)"
-            )
+            help = "Append-only labels JSONL path (defaults under evals/calibration/labels)"
         )]
         labels: Option<PathBuf>,
 
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "NAME",
-            help = t(
-                "cli-eval-calibrate-label-help-labeler",
-                "Human labeler name (defaults to git config user.name)"
-            )
+            help = "Human labeler name (defaults to git config user.name)"
         )]
         labeler: Option<String>,
 
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "REF",
-            help = t(
-                "cli-eval-calibrate-label-help-judge-ref",
-                "Judge reference to label when records contain multiple judges"
-            )
+            help = "Judge reference to label when records contain multiple judges"
         )]
         judge_ref: Option<String>,
     },
 
-    #[command(
-        about = t(
-            "cli-eval-calibrate-finalize-about",
-            "Finalize labels into an LLM-judge calibration file"
-        )
-    )]
+    // i18n-exempt: clap derive help; built before --config-dir selects the locale
+    #[command(about = "Finalize labels into an LLM-judge calibration file")]
     Finalize {
-        #[arg(
-            long,
-            value_name = "PATH",
-            help = t(
-                "cli-eval-calibrate-finalize-help-labels",
-                "Labels JSONL file to finalize"
-            )
-        )]
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
+        #[arg(long, value_name = "PATH", help = "Labels JSONL file to finalize")]
         labels: PathBuf,
 
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "PATH",
-            help = t(
-                "cli-eval-calibrate-finalize-help-out",
-                "Calibration JSON output path (defaults under evals/calibration)"
-            )
+            help = "Calibration JSON output path (defaults under evals/calibration)"
         )]
         out: Option<PathBuf>,
 
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "FRACTION",
-            help = t(
-                "cli-eval-calibrate-finalize-help-min-agreement",
-                "Refuse to emit when agreement is below this fraction"
-            )
+            help = "Refuse to emit when agreement is below this fraction"
         )]
         min_agreement: Option<f64>,
 
+        // i18n-exempt: clap derive help; built before --config-dir selects the locale
         #[arg(
             long,
             value_name = "NAME",
-            help = t(
-                "cli-eval-calibrate-finalize-help-labeler",
-                "Override the labeler recorded in the calibration file"
-            )
+            help = "Override the labeler recorded in the calibration file"
         )]
         labeler: Option<String>,
     },
@@ -652,12 +624,8 @@ enum EvalCommands {
         suite_kind: Option<String>,
     },
 
-    #[command(
-        about = t(
-            "cli-eval-calibrate-about",
-            "Calibrate an LLM judge against blind human labels"
-        )
-    )]
+    // i18n-exempt: clap derive help; built before --config-dir selects the locale
+    #[command(about = "Calibrate an LLM judge against blind human labels")]
     Calibrate {
         #[command(subcommand)]
         calibrate_command: EvalCalibrateCommands,
@@ -10948,83 +10916,6 @@ mod tests {
         assert_eq!(out, Some(PathBuf::from("calibration/judge.json")));
         assert_eq!(min_agreement, Some(0.91));
         assert_eq!(labeler.as_deref(), Some("Final Reviewer"));
-    }
-
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn eval_calibrate_help_resolves_through_the_cli_fluent_catalogue() {
-        // The calibrate surface takes its help from `cli-*` Fluent keys. A key
-        // that is absent from the catalogue resolves to a `{key}` marker, so
-        // asserting the rendered text catches a typo or a dropped entry that a
-        // parse test would not.
-        let command = Cli::command();
-        let calibrate = command
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "eval")
-            .expect("eval subcommand must exist")
-            .get_subcommands()
-            .find(|subcommand| subcommand.get_name() == "calibrate")
-            .expect("eval calibrate subcommand must exist");
-
-        let mut resolved = vec![(
-            "calibrate".to_string(),
-            calibrate
-                .get_about()
-                .expect("calibrate must carry help")
-                .to_string(),
-        )];
-        for subcommand in calibrate.get_subcommands() {
-            resolved.push((
-                subcommand.get_name().to_string(),
-                subcommand
-                    .get_about()
-                    .unwrap_or_else(|| panic!("{} must carry help", subcommand.get_name()))
-                    .to_string(),
-            ));
-            for argument in subcommand.get_arguments() {
-                let id = argument.get_id().as_str();
-                if id == "help" {
-                    continue;
-                }
-                resolved.push((
-                    format!("{}:{id}", subcommand.get_name()),
-                    argument
-                        .get_help()
-                        .unwrap_or_else(|| panic!("--{id} must carry help"))
-                        .to_string(),
-                ));
-            }
-        }
-
-        let covered = resolved
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            covered,
-            [
-                "calibrate",
-                "finalize",
-                "finalize:labeler",
-                "finalize:labels",
-                "finalize:min_agreement",
-                "finalize:out",
-                "label",
-                "label:judge_ref",
-                "label:labeler",
-                "label:labels",
-                "label:records",
-            ]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
-            "every calibrate help string must be routed through Fluent"
-        );
-        for (name, text) in resolved {
-            assert!(
-                !text.starts_with('{'),
-                "{name} help must resolve to a catalogue entry, got {text:?}"
-            );
-        }
     }
 
     #[test]
