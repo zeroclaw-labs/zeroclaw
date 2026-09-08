@@ -12613,6 +12613,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thinking_only_configure_completes_while_a_turn_holds_the_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("the session has an agent");
+        // A running turn owns this mutex for its whole duration.
+        let turn_guard = agent.lock().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {"thinking_level": "max", "thinking_display": "summarized"}
+            })),
+        )
+        .await
+        .expect("a thinking-only change must not wait for the running turn")
+        .expect("the session takes both values");
+        assert_eq!(result["overrides"]["thinking_level"], "max");
+        assert_eq!(result["overrides"]["thinking_display"], "summarized");
+        assert_eq!(
+            result["thinking_options"]["current_level"], "max",
+            "the echoed options must describe the value that was stored"
+        );
+        assert_eq!(result["thinking_options"]["level_source"], "session");
+        assert_eq!(result["thinking_options"]["current_display"], "summarized");
+        assert_eq!(result["thinking_options"]["display_source"], "session");
+
+        let stored = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("the session is live");
+        assert_eq!(
+            stored.thinking_level,
+            Some(zeroclaw_config::scattered_types::ThinkingLevel::Max)
+        );
+        assert_eq!(
+            stored.thinking_display,
+            Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized)
+        );
+
+        // Clearing them takes the same path and must not block either.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {},
+                "reset": ["thinking_level", "thinking_display"]
+            })),
+        )
+        .await
+        .expect("a reset must not wait for the running turn")
+        .expect("the reset succeeds");
+        assert!(result["overrides"].get("thinking_level").is_none());
+        assert!(result["overrides"].get("thinking_display").is_none());
+        assert_eq!(
+            result["thinking_options"]["level_source"], "profile",
+            "the profile default takes over once the session override is gone"
+        );
+
+        // A model change still needs the Agent, so it keeps waiting for the
+        // turn rather than racing it.
+        let blocked_dispatcher = Arc::new(dispatcher);
+        let blocked_task_dispatcher = Arc::clone(&blocked_dispatcher);
+        let blocked_session_id = session_id.clone();
+        let model_change = zeroclaw_spawn::spawn!(async move {
+            blocked_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": blocked_session_id,
+                    "overrides": {"model": "claude-opus-4-6"}
+                }))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), model_change)
+                .await
+                .is_err(),
+            "a model change must still take the Agent mutex"
+        );
+        drop(turn_guard);
+    }
+
+    #[tokio::test]
     async fn session_thinking_options_follow_a_switch_to_an_older_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_thinking_test_config(&tmp));

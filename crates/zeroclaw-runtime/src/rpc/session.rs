@@ -412,6 +412,14 @@ impl SessionStore {
     /// session entry or its agent. Returns `None` if the session is absent
     /// *or* if it was replaced under the same ID — both cases mean the caller
     /// captured a stale generation and the work must be discarded.
+    ///
+    /// Only a patch that names a model or a temperature touches the Agent.
+    /// The thinking fields are read at turn time, so a patch that carries
+    /// only those commits and returns while a turn holds the Agent mutex
+    /// instead of waiting out the turn and timing out on a value that was
+    /// already stored. The decision reads the incoming patch, not the merged
+    /// state, so an older model or temperature override left on the session
+    /// does not drag a thinking change back behind the running turn.
     pub async fn set_overrides_gated(
         &self,
         id: &str,
@@ -420,6 +428,7 @@ impl SessionStore {
         reset: &[SessionOverrideField],
     ) -> Option<SessionOverrides> {
         let done = self.wait_test_gate().await;
+        let needs_agent = patch.model.is_some() || patch.temperature.is_some();
         let merged = self.preview_overrides(id, &patch, reset).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
@@ -432,12 +441,14 @@ impl SessionStore {
         let overrides = session.overrides.clone();
         let agent = session.agent.clone();
         drop(sessions);
-        let mut guard = agent.lock().await;
-        if let Some(ref m) = overrides.model {
-            guard.set_model_name(m.clone());
-        }
-        if overrides.temperature.is_some() {
-            guard.set_temperature(overrides.temperature);
+        if needs_agent {
+            let mut guard = agent.lock().await;
+            if let Some(ref m) = overrides.model {
+                guard.set_model_name(m.clone());
+            }
+            if overrides.temperature.is_some() {
+                guard.set_temperature(overrides.temperature);
+            }
         }
         self.signal_test_gate_done(done);
         Some(overrides)
