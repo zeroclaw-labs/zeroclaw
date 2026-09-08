@@ -208,6 +208,14 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
     },
 ];
 
+#[cfg(test)]
+pub(crate) fn channel_compile_specs_for_tests()
+-> impl Iterator<Item = (Option<&'static str>, &'static [&'static str], bool)> {
+    CHANNEL_COMPILE_SPECS
+        .iter()
+        .map(|spec| (spec.schema_name, spec.type_keys, spec.compiled))
+}
+
 fn compiled_channel_names() -> impl Iterator<Item = &'static str> {
     CHANNEL_COMPILE_SPECS
         .iter()
