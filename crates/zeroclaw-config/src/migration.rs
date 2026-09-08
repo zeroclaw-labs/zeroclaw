@@ -834,8 +834,15 @@ fn run_chain_until(value: toml::Value, from: u32, target: u32) -> Result<toml::V
     let mut cur = value;
     for step in &MIGRATION_STEPS[from as usize..target as usize] {
         cur = step(cur)?;
+        strip_retired_node_transport(&mut cur);
     }
     Ok(cur)
+}
+
+fn strip_retired_node_transport(value: &mut toml::Value) {
+    if let Some(root) = value.as_table_mut() {
+        let _ = root.remove("node_transport");
+    }
 }
 
 pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
