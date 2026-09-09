@@ -2190,13 +2190,39 @@ fn paircode_recovery_curl_host(host: &str) -> &str {
 // AXUM HANDLERS
 // ══════════════════════════════════════════════════════════════════════════════
 
+fn public_health_snapshot() -> serde_json::Value {
+    let snapshot = zeroclaw_runtime::health::snapshot();
+    let components = snapshot
+        .components
+        .into_iter()
+        .map(|(name, component)| {
+            (
+                name,
+                serde_json::json!({
+                    "status": component.status,
+                    "updated_at": component.updated_at,
+                    "last_ok": component.last_ok,
+                    "restart_count": component.restart_count,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "pid": snapshot.pid,
+        "updated_at": snapshot.updated_at,
+        "uptime_seconds": snapshot.uptime_seconds,
+        "components": components,
+    })
+}
+
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
         "require_pairing": state.pairing.require_pairing(),
-        "runtime": zeroclaw_runtime::health::snapshot_json(),
+        "runtime": public_health_snapshot(),
     });
     Json(body)
 }
@@ -4307,6 +4333,37 @@ mod tests {
         assert_eq!(
             format_paircode_recovery_curl("127.0.0.1", 42617, "/gw"),
             "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_health_omits_component_error_details() {
+        let component = format!("health-public-{}", uuid::Uuid::new_v4());
+        let sensitive_error = "provider failed: token=not-for-public-health";
+        zeroclaw_runtime::health::mark_component_ok(&component);
+        zeroclaw_runtime::health::mark_component_error(&component, sensitive_error);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let response = handle_health(State(admin_paircode_state(&tmp, false, false)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let public_component = &json["runtime"]["components"][&component];
+
+        assert_eq!(public_component["status"], "error");
+        assert!(public_component["updated_at"].is_string());
+        assert!(public_component["last_ok"].is_string());
+        assert_eq!(public_component["restart_count"], 0);
+        assert!(public_component.get("last_error").is_none());
+        assert!(!json.to_string().contains(sensitive_error));
+        assert_eq!(
+            zeroclaw_runtime::health::snapshot().components[&component]
+                .last_error
+                .as_deref(),
+            Some(sensitive_error)
         );
     }
 
