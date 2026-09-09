@@ -353,11 +353,13 @@ fn config_patch_json_missing_value_field_emits_structured_error_envelope() {
     assert_eq!(envelope["code"], "value_type_mismatch");
     assert_eq!(envelope["path"], "gateway.host");
     assert_eq!(envelope["op_index"], 0);
+    // The message is now the shared `zeroclaw_config::patch` phrasing -- the
+    // same envelope the gateway returns for this document, not a CLI-only one.
     assert!(
         envelope["message"]
             .as_str()
             .expect("message")
-            .contains("missing `value` field"),
+            .contains("requires `value` field"),
         "message should describe the missing `value` field: {envelope}"
     );
 }
@@ -406,7 +408,7 @@ fn config_patch_human_missing_value_field_emits_readable_error_without_json_enve
     assert!(
         stderr.contains("op[0]")
             && stderr.contains("gateway.host")
-            && stderr.contains("missing `value` field"),
+            && stderr.contains("requires `value` field"),
         "human stderr should describe the missing `value` field: {stderr}"
     );
     // The structured field names must NOT leak into human output.

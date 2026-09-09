@@ -445,6 +445,7 @@ mod payload_capture_tests {
             draft_reasoning,
             agent_alias: None,
             turn_id: "trace-req-test",
+            tools: &[],
         }
     }
 
@@ -1015,6 +1016,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let outcome = TOOL_LOOP_TURN_USAGE
@@ -1112,6 +1114,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let error = call_provider(
@@ -1174,6 +1177,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let error = call_provider(
@@ -1304,6 +1308,7 @@ mod streaming_fallback_tests {
                 turn_id: "test-turn",
                 agent_alias: None,
                 parent_agent_alias: None,
+                tools: &[],
             };
 
             let error = call_provider(
@@ -1361,6 +1366,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let error = call_provider(
@@ -1426,6 +1432,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let outcome = call_provider(
@@ -1492,6 +1499,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let outcome = call_provider(

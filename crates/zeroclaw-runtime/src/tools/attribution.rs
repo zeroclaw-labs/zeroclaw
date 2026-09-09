@@ -2,6 +2,7 @@ use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
 use crate::tools::ArcToolRef;
+use crate::tools::config_patch::ConfigPatchTool;
 use crate::tools::cron_add::CronAddTool;
 use crate::tools::cron_list::CronListTool;
 use crate::tools::cron_remove::CronRemoveTool;
@@ -28,6 +29,7 @@ use crate::tools::sop_status::SopStatusTool;
 use crate::tools::spawn_subagent::SpawnSubagentTool;
 use crate::tools::verifiable_intent::VerifiableIntentTool;
 
+tool_attribution!(ConfigPatchTool, ToolKind::Plugin);
 tool_attribution!(CronAddTool, ToolKind::Plugin);
 tool_attribution!(CronListTool, ToolKind::Plugin);
 tool_attribution!(CronRemoveTool, ToolKind::Plugin);
