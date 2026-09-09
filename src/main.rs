@@ -5181,7 +5181,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 ta(
                                     "cli-pairing-fetch-failed",
                                     &[("endpoint", &endpoint)],
-                                    &format!(
+                                    format!(
                                         "❌ Failed to fetch pairing code from gateway at {endpoint}"
                                     ),
                                 )
