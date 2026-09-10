@@ -128,14 +128,14 @@ fn t(key: &str, fallback: &str) -> String {
 
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
-fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        fallback.into() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
@@ -516,7 +516,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -1056,8 +1056,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -5108,6 +5108,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     host,
                 }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
+                    let endpoint = format!("{host}:{port}");
 
                     let action = if rotate {
                         PaircodeAction::RotateAll
@@ -5176,7 +5177,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         }
                         Err(e) => {
                             println!(
-                                "❌ Failed to fetch pairing code from gateway at {host}:{port}"
+                                "{}",
+                                ta(
+                                    "cli-pairing-fetch-failed",
+                                    &[("endpoint", &endpoint)],
+                                    format!(
+                                        "❌ Failed to fetch pairing code from gateway at {endpoint}"
+                                    ),
+                                )
                             );
                             println!(
                                 "{}",
@@ -6117,8 +6125,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let summary: Vec<String> = agent_aliases
                     .iter()
                     .map(|alias| match config.risk_profile_for_agent(alias) {
-                        Some(p) => format!("{alias}={:?}", p.level),
-                        None => format!("{alias}=<no risk_profile>"),
+                        Some(p) => {
+                            let level = format!("{:?}", p.level);
+                            let fallback = format!("{alias}={level}");
+                            ta(
+                                "cli-status-agent-risk-profile",
+                                &[("alias", alias), ("level", &level)],
+                                &fallback,
+                            )
+                        }
+                        None => {
+                            let fallback = format!("{alias}=<no risk_profile>");
+                            ta(
+                                "cli-status-agent-no-risk-profile-summary",
+                                &[("alias", alias)],
+                                &fallback,
+                            )
+                        }
                     })
                     .collect();
                 println!(
@@ -6144,6 +6167,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
+            }
+            #[cfg(feature = "gateway")]
+            {
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
+                }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
@@ -6309,6 +6359,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -6358,15 +6466,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 } else {
                     t("cli-status-word-not-configured", "not configured")
                 };
-                println!(
-                    "  {:9} {}",
-                    entry.name,
-                    if entry.configured {
-                        format!("✅ {}", channel_status)
-                    } else {
-                        format!("❌ {}", channel_status)
-                    }
-                );
+                let status = if entry.configured {
+                    ta(
+                        "cli-status-channel-configured",
+                        &[("status", &channel_status)],
+                        format!("✅ {channel_status}"),
+                    )
+                } else {
+                    ta(
+                        "cli-status-channel-not-configured",
+                        &[("status", &channel_status)],
+                        format!("❌ {channel_status}"),
+                    )
+                };
+                println!("  {:9} {}", entry.name, status);
             }
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
@@ -6379,14 +6492,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                 );
                 for entry in &uncompiled {
-                    println!(
-                        "  {:9} {}",
-                        entry.name,
-                        t(
-                            "cli-status-channel-not-compiled",
-                            "🚫 configured, not compiled"
-                        )
+                    let status = t(
+                        "cli-status-channel-not-compiled",
+                        "🚫 configured, not compiled",
                     );
+                    println!("  {:9} {}", entry.name, status);
                 }
                 println!(
                     "{}",
@@ -6970,10 +7080,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
                 }
-                Ok(())
             }
         },
 
@@ -8730,26 +8842,37 @@ fn paircode_no_code_message(
     if let Some(message) = gateway_message.filter(|m| !m.trim().is_empty()) {
         lines.push(format!("⚠️  {message}"));
     } else if require_pairing {
-        lines
-            .push("🔐 Gateway pairing is enabled, but no active pairing code is available.".into());
+        lines.push(t(
+            "cli-pairing-no-code",
+            "🔐 Gateway pairing is enabled, but no active pairing code is available.",
+        ));
     } else {
         lines.push(t(
             "cli-pairing-disabled",
             "⚠️  Gateway pairing is disabled in config.",
         ));
-        lines.push("All requests will be accepted without authentication.".into());
-        lines.push("To enable pairing, set [gateway] require_pairing = true.".into());
+        lines.push(t(
+            "cli-pairing-requests-accepted",
+            "All requests will be accepted without authentication.",
+        ));
+        lines.push(t(
+            "cli-pairing-enable-config",
+            "To enable pairing, set [gateway] require_pairing = true.",
+        ));
         return indent_paircode_lines(lines);
     }
 
     lines.push(String::new());
     match action {
         PaircodeAction::Show => {
-            lines.push(
-                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one."
-                    .into(),
-            );
-            lines.push("To pair another device, run:".into());
+            lines.push(t(
+                "cli-pairing-show-only",
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+            ));
+            lines.push(t(
+                "cli-pairing-pair-another",
+                "To pair another device, run:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8758,7 +8881,10 @@ fn paircode_no_code_message(
                 Some("--new"),
             ));
             lines.push(String::new());
-            lines.push("To revoke existing pairings and mint a replacement code, run:".into());
+            lines.push(t(
+                "cli-pairing-revoke-replace",
+                "To revoke existing pairings and mint a replacement code, run:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8768,14 +8894,14 @@ fn paircode_no_code_message(
             ));
         }
         PaircodeAction::AddClient => {
-            lines.push(
-                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset."
-                    .into(),
-            );
-            lines.push(
-                "Try again shortly, or revoke existing pairings and mint a replacement code:"
-                    .into(),
-            );
+            lines.push(t(
+                "cli-pairing-new-code-unavailable",
+                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+            ));
+            lines.push(t(
+                "cli-pairing-retry-or-rotate",
+                "Try again shortly, or revoke existing pairings and mint a replacement code:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8785,8 +8911,14 @@ fn paircode_no_code_message(
             ));
         }
         PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
-            lines.push("The rotate request completed without returning a replacement code.".into());
-            lines.push("Check whether pairing is enabled, then request a new device code:".into());
+            lines.push(t(
+                "cli-pairing-rotate-no-code",
+                "The rotate request completed without returning a replacement code.",
+            ));
+            lines.push(t(
+                "cli-pairing-check-enabled",
+                "Check whether pairing is enabled, then request a new device code:",
+            ));
             lines.push(paircode_command(
                 host,
                 port,
@@ -8798,7 +8930,7 @@ fn paircode_no_code_message(
     }
 
     lines.push(String::new());
-    lines.push("To inspect the running gateway:".into());
+    lines.push(t("cli-pairing-inspect", "To inspect the running gateway:"));
     lines.push(format!(
         "    open http://{}:{port}",
         gateway_browser_host(host)
@@ -11335,7 +11467,10 @@ mod tests {
             Some("Pairing is active but no new code available (already paired or code expired)"),
         );
 
-        assert!(msg.contains("only displays an existing active code; it does not mint"));
+        assert!(msg.contains(&t(
+            "cli-pairing-show-only",
+            "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+        )));
         assert!(msg.contains("zeroclaw gateway get-paircode --new"));
         assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
         assert!(msg.contains("open http://127.0.0.1:42617"));
@@ -11422,8 +11557,115 @@ mod tests {
             Some("Pairing is active but no new code available (already paired or code expired)"),
         );
 
-        assert!(msg.contains("did not mint a new pairing code"));
+        assert!(msg.contains(&t(
+            "cli-pairing-new-code-unavailable",
+            "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+        )));
         assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_localized_output_for_show_and_disabled_branches() {
+        let default = config::GatewayConfig::default();
+        let show = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+        let expected_show = indent_paircode_lines(vec![
+            t(
+                "cli-pairing-no-code",
+                "🔐 Gateway pairing is enabled, but no active pairing code is available.",
+            ),
+            String::new(),
+            t(
+                "cli-pairing-show-only",
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one.",
+            ),
+            t("cli-pairing-pair-another", "To pair another device, run:"),
+            "    zeroclaw gateway get-paircode --new".into(),
+            String::new(),
+            t(
+                "cli-pairing-revoke-replace",
+                "To revoke existing pairings and mint a replacement code, run:",
+            ),
+            "    zeroclaw gateway get-paircode --rotate".into(),
+            String::new(),
+            t("cli-pairing-inspect", "To inspect the running gateway:"),
+            "    open http://127.0.0.1:42617".into(),
+        ]);
+        assert_eq!(show, expected_show);
+
+        let disabled = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            false,
+            None,
+        );
+        let expected_disabled = indent_paircode_lines(vec![
+            t(
+                "cli-pairing-disabled",
+                "⚠️  Gateway pairing is disabled in config.",
+            ),
+            t(
+                "cli-pairing-requests-accepted",
+                "All requests will be accepted without authentication.",
+            ),
+            t(
+                "cli-pairing-enable-config",
+                "To enable pairing, set [gateway] require_pairing = true.",
+            ),
+        ]);
+        assert_eq!(disabled, expected_disabled);
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_localized_action_recovery_branches() {
+        let default = config::GatewayConfig::default();
+        let add_client = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::AddClient,
+            true,
+            None,
+        );
+        assert!(add_client.contains(&t(
+            "cli-pairing-new-code-unavailable",
+            "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset.",
+        )));
+        assert!(add_client.contains(&t(
+            "cli-pairing-retry-or-rotate",
+            "Try again shortly, or revoke existing pairings and mint a replacement code:",
+        )));
+
+        let rotate = paircode_no_code_message(
+            &default.host,
+            default.port,
+            &default.host,
+            default.port,
+            &PaircodeAction::RotateAll,
+            true,
+            None,
+        );
+        assert!(rotate.contains(&t(
+            "cli-pairing-rotate-no-code",
+            "The rotate request completed without returning a replacement code.",
+        )));
+        assert!(rotate.contains(&t(
+            "cli-pairing-check-enabled",
+            "Check whether pairing is enabled, then request a new device code:",
+        )));
     }
 
     #[test]

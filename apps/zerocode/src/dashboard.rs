@@ -243,6 +243,42 @@ impl Dashboard {
         self.agent_alias_rename_area = None;
     }
 
+    /// Drop data fetched from the daemon as soon as its transport closes.
+    /// Local UI state such as the active tab and search query is preserved.
+    pub(crate) fn invalidate_daemon_data(&mut self) {
+        self.sessions.clear();
+        self.agents.clear();
+        self.cost = None;
+        self.cost_periods.clear();
+        self.cost_org = None;
+        self.cost_org_error = None;
+        self.cron_jobs.clear();
+        self.cron_runs.clear();
+        self.cron_runs_job_id = None;
+        self.cron_runs_error = None;
+        self.cron_trigger_job_id = None;
+        self.cron_trigger_message = None;
+        self.cron_trigger_inflight_job_id = None;
+        self.cron_trigger_rx = None;
+        self.memories.clear();
+        self.memory_error = None;
+        self.cost_error = None;
+        self.sessions_loaded = false;
+        self.memory_detail = None;
+        self.memory_detail_key = None;
+        self.tuis.clear();
+        self.session_messages.clear();
+        self.session_messages_id = None;
+        self.session_messages_total = 0;
+        self.session_messages_start = 0;
+        self.session_state.select(None);
+        self.agent_state.select(None);
+        self.memory_state.select(None);
+        self.cron_state.select(None);
+        self.detail_open = false;
+        self.detail_scroll = 0;
+    }
+
     async fn poll_data(&mut self) {
         self.last_poll = Some(Instant::now());
 
@@ -3265,6 +3301,41 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn disconnect_invalidation_drops_daemon_data() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(
+            crate::jsonrpc::RpcOutbound::new(writer_tx),
+        )));
+        let mut dashboard = Dashboard::new(rpc, "local:/daemon.sock", false);
+        dashboard.sessions.push(SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "key-1".to_string(),
+            created_at: String::new(),
+            last_activity: String::new(),
+            message_count: 1,
+            agent_alias: None,
+            channel_id: None,
+            name: None,
+        });
+        dashboard.agents.push(AgentStatusEntry {
+            alias: "default".to_string(),
+            enabled: true,
+            live_sessions: 1,
+            persisted_sessions: 1,
+            channels: Vec::new(),
+        });
+        dashboard.sessions_loaded = true;
+        dashboard.detail_open = true;
+
+        dashboard.invalidate_daemon_data();
+
+        assert!(dashboard.sessions.is_empty());
+        assert!(dashboard.agents.is_empty());
+        assert!(!dashboard.sessions_loaded);
+        assert!(!dashboard.detail_open);
+    }
 
     fn lines_text(lines: &[Line<'static>]) -> String {
         lines

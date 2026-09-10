@@ -347,6 +347,16 @@ impl Channel for PacedChannel {
         self.inner.health_check().await
     }
 
+    /// Forward the inner channel's passive observation.
+    ///
+    /// Without this the trait default (`None`) answers for the wrapper, and a
+    /// supervisor reads "no signal" for a channel that does have one. Pacing is
+    /// a delivery concern; it says nothing about whether the listener is
+    /// reaching the service.
+    fn listener_health(&self) -> Option<zeroclaw_api::channel::ListenerHealth> {
+        self.inner.listener_health()
+    }
+
     async fn start_typing(&self, recipient: &str) -> Result<()> {
         self.inner.start_typing(recipient).await
     }

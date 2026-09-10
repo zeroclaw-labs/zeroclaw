@@ -650,6 +650,27 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// What a channel can say about its own listener without performing any I/O.
+///
+/// See [`Channel::listener_health`]. The three states exist because a listener
+/// that has not connected yet and a listener that is working are different
+/// claims, and a caller that stamps "healthy" for both reports a channel as
+/// `ok` before it has ever reached the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerHealth {
+    /// No exchange has completed yet, so the channel has nothing to report.
+    /// Not a failure — a listener that has only just started is not yet
+    /// broken — but not evidence of health either.
+    Pending,
+    /// The most recent exchange succeeded, recently enough that it is still
+    /// evidence the channel works.
+    Healthy,
+    /// Either the most recent exchange failed, or the last success is old
+    /// enough that the channel will no longer vouch for it. Both mean a live
+    /// `listen()` is not proof the channel is working.
+    Unhealthy,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -679,6 +700,33 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Listener health as the channel itself last observed it.
+    ///
+    /// `health_check` is an *active* probe: implementations reach the remote
+    /// service to answer it, and some of them send a real message or open a
+    /// broker connection to do so. That makes it safe to call on demand — from
+    /// `channel doctor` — and unsafe to call on a timer, so a recurring caller
+    /// must not use it.
+    ///
+    /// This is the recurring-safe counterpart. It is synchronous and returns
+    /// state the channel recorded while it was already talking to the service,
+    /// so reading it performs no I/O and cannot block, send, or connect.
+    ///
+    /// `None` — the default — means the channel offers no signal at all, and
+    /// the caller should fall back to whatever it knew before asking. A channel
+    /// that *does* implement this reports a [`ListenerHealth`], which is a
+    /// three-state answer rather than a boolean: "I have nothing to say yet" is
+    /// not the same claim as "I am working", and a caller that collapses them
+    /// reports a listener as healthy before it has ever connected.
+    ///
+    /// An implementation owns its own freshness rule, because only the channel
+    /// knows how often a working listener completes an exchange. A success from
+    /// long enough ago that it is no longer evidence must be reported as
+    /// [`ListenerHealth::Unhealthy`], not as `Healthy` forever.
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        None
     }
 
     /// Send a discrete-choice prompt with options.

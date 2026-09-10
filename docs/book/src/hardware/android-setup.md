@@ -93,6 +93,7 @@ adb shell /data/local/tmp/zeroclaw --version
 - **No systemd:** Use Termux's `termux-services` for daemon mode
 - **Storage access:** Requires Termux storage permissions (`termux-setup-storage`)
 - **Network:** Some features may require Android VPN permission for local binding
+- **Artifact contents:** The Android artifact contains `zeroclaw` but not `zerocode`; the terminal dependencies required by `zerocode` are unavailable for this target.
 
 ## Building from Source
 

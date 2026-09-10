@@ -340,7 +340,7 @@ jobs:
 
             # Persist custom domain (#6142) and disable Jekyll on every push, or
             # Pages drops the CNAME and 404s every underscore-prefixed path.
-            echo "docs.zeroclawlabs.ai" > CNAME
+            echo "docs.zeroclaw.com" > CNAME
             touch .nojekyll
 
             # Drop pre-versioned orphan dirs (including any legacy stable/), then
@@ -353,6 +353,11 @@ jobs:
             $MDBOOK_XTASK gen-versions > versions.json
             $MDBOOK_XTASK retrofit-selector
             $MDBOOK_XTASK gen-root-index > index.html
+            # Canonical/hreflang/description/share tags on every page, plus
+            # robots.txt and sitemap.xml at the root. Reads CNAME (written
+            # above) for the site host and stable-version.txt for the copy
+            # that counts; idempotent across deploys.
+            $MDBOOK_XTASK gen-seo
 
             # Guard: a published pointer must always name a present version dir,
             # or the root would silently redirect to a missing path. The flip is

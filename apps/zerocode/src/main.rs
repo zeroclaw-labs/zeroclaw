@@ -17,6 +17,7 @@ use std::time::Duration;
 use clap::Parser;
 
 mod acp;
+mod agent_sidebar;
 mod app;
 mod attachment;
 mod chat;
@@ -210,6 +211,7 @@ pub(crate) enum ActiveLeg {
 /// relay. Connecting prefers the direct path and falls back to the relay tunnel;
 /// once on the relay, a background timer re-probes the direct path and migrates
 /// back when it returns.
+#[derive(Clone)]
 pub(crate) struct WssRoute {
     /// The directly-reachable daemon address (`--connect` / `[wss].uri`). `None`
     /// in relay-only mode, where the daemon is reached solely through the relay.
@@ -321,6 +323,7 @@ impl WssRoute {
 }
 
 /// Where zerocode should connect.
+#[derive(Clone)]
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
     // Boxed: `WssRoute` is much larger than the local-socket variant.
