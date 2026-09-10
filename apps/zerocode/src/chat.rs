@@ -91,18 +91,66 @@ pub(crate) enum PaneKind {
     Acp,
 }
 
+/// Why pinning a local Code session to the launch directory failed.
+///
+/// A local Code session promises that file and shell tools operate on the
+/// project zerocode was launched from. If that directory cannot be captured we
+/// must not silently fall through to an omitted cwd: `session/new` would then
+/// resolve the selected agent's workspace and the session would look healthy
+/// while acting on a different project tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalCodeCwdError {
+    /// `std::env::current_dir()` failed (e.g. the directory was deleted or is
+    /// unreadable). Carries the OS error text.
+    Unavailable(String),
+    /// The launch directory is not valid UTF-8, so it cannot be represented in
+    /// the JSON-RPC `cwd` string. Carries the lossy rendering for diagnosis.
+    NotUtf8(String),
+}
+
+impl LocalCodeCwdError {
+    /// Localized, user-facing text for this capture failure.
+    fn localized(&self) -> String {
+        match self {
+            LocalCodeCwdError::Unavailable(error) => {
+                crate::i18n::t_args("zc-chat-code-cwd-unavailable", &[("error", error.as_str())])
+            }
+            LocalCodeCwdError::NotUtf8(path) => {
+                crate::i18n::t_args("zc-chat-code-cwd-not-utf8", &[("path", path.as_str())])
+            }
+        }
+    }
+}
+
 /// Process cwd for a fresh local Code session. Chat and remote transports
-/// omit cwd so the daemon uses the agent workspace or an explicit picker.
+/// return `Ok(None)` to deliberately omit cwd so the daemon uses the agent
+/// workspace or an explicit picker.
+///
+/// Returns `Err` when a local Code session *should* pin the launch directory
+/// but cannot. Callers must surface that error rather than starting a session
+/// against a different project.
 fn local_code_session_cwd(
     pane_kind: PaneKind,
     transport: crate::client::Transport,
-) -> Option<String> {
+) -> Result<Option<String>, LocalCodeCwdError> {
     if pane_kind == PaneKind::Acp && transport == crate::client::Transport::Local {
-        std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(str::to_string))
+        resolve_local_code_cwd(std::env::current_dir()).map(Some)
     } else {
-        None
+        // Deliberate omission: Chat uses the agent workspace, remote Code uses
+        // the directory picker. Neither is a failure.
+        Ok(None)
+    }
+}
+
+/// Pure capture step, split out so tests can inject both failure modes without
+/// mutating global process state.
+fn resolve_local_code_cwd(
+    current_dir: std::io::Result<std::path::PathBuf>,
+) -> Result<String, LocalCodeCwdError> {
+    let path = current_dir.map_err(|e| LocalCodeCwdError::Unavailable(e.to_string()))?;
+    match path.to_str() {
+        Some(s) => Ok(s.to_string()),
+        None => Err(LocalCodeCwdError::NotUtf8(path.display().to_string())),
     }
 }
 
@@ -508,13 +556,29 @@ impl Chat {
         // workspace. Fresh local Code sessions pin the process cwd so file and
         // shell tools operate on the project zerocode was launched from. An
         // explicit caller-supplied cwd (the remote ACP picker) still wins.
+        //
+        // If a local Code session cannot capture its launch directory we fail
+        // the creation instead of omitting cwd: a silent fallback would start a
+        // healthy-looking session rooted at the agent workspace, letting file
+        // and shell tools act on a different project.
+        let explicit_cwd = cwd_override
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
         let cwd_str: Option<String> = if resume.is_some() {
             None
+        } else if let Some(cwd) = explicit_cwd {
+            Some(cwd)
         } else {
-            cwd_override
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
-                .or_else(|| local_code_session_cwd(self.pane_kind, self.rpc.transport()))
+            match local_code_session_cwd(self.pane_kind, self.rpc.transport()) {
+                Ok(cwd) => cwd,
+                Err(e) => {
+                    self.phase = ChatPhase::Error(crate::i18n::t_args(
+                        "zc-chat-error-create-session",
+                        &[("error", &e.localized())],
+                    ));
+                    return;
+                }
+            }
         };
         let result = if self.pane_kind == PaneKind::Acp {
             self.rpc
@@ -628,7 +692,20 @@ impl Chat {
         // Chat restarts omit cwd so the daemon keeps the agent workspace.
         // Local Code restarts pin the process cwd. Remote ACP re-prompts via
         // the picker above.
-        let cwd_str = local_code_session_cwd(pane_kind, rpc.transport());
+        //
+        // A capture failure aborts the restart and keeps the existing session
+        // rather than minting one rooted at the agent workspace, which would
+        // silently move file and shell tools to a different project.
+        let cwd_str = match local_code_session_cwd(pane_kind, rpc.transport()) {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-restart-error",
+                    &[("error", &e.localized())],
+                ));
+                return None;
+            }
+        };
         let new_session = if pane_kind == PaneKind::Acp {
             rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
         } else {
@@ -10022,15 +10099,15 @@ mod tests {
     fn local_code_session_cwd_only_pins_local_acp() {
         assert_eq!(
             local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Local),
-            None
+            Ok(None)
         );
         assert_eq!(
             local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Wss),
-            None
+            Ok(None)
         );
         assert_eq!(
             local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Wss),
-            None
+            Ok(None)
         );
         let expected = std::env::current_dir()
             .expect("process cwd")
@@ -10039,7 +10116,52 @@ mod tests {
             .to_string();
         assert_eq!(
             local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Local),
-            Some(expected)
+            Ok(Some(expected))
+        );
+    }
+
+    #[test]
+    fn local_code_cwd_capture_failure_is_an_error_not_an_omission() {
+        // A failed capture must never look like the deliberate `None` used by
+        // Chat and remote Code: omitting cwd here would silently root the
+        // session at the agent workspace, i.e. a different project.
+        let err = resolve_local_code_cwd(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file or directory",
+        )))
+        .expect_err("cwd capture failure must be reported");
+        let LocalCodeCwdError::Unavailable(msg) = &err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(msg.contains("no such file or directory"), "got {msg}");
+        // And it renders as real localized text, not a `{key}` placeholder.
+        let shown = err.localized();
+        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+        assert!(shown.contains("no such file or directory"), "got {shown}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_code_cwd_rejects_non_utf8_launch_path() {
+        use std::os::unix::ffi::OsStrExt;
+        // 0xFF is never valid UTF-8, so this models a launch directory that
+        // cannot be sent as a JSON-RPC `cwd` string.
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
+        let err = resolve_local_code_cwd(Ok(std::path::PathBuf::from(raw)))
+            .expect_err("non-UTF-8 cwd must be reported");
+        let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
+            panic!("expected NotUtf8, got {err:?}");
+        };
+        assert!(shown_path.contains("proj-"), "got {shown_path}");
+        let shown = err.localized();
+        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+    }
+
+    #[test]
+    fn local_code_cwd_accepts_utf8_launch_path() {
+        assert_eq!(
+            resolve_local_code_cwd(Ok(std::path::PathBuf::from("/tmp/project"))),
+            Ok("/tmp/project".to_string())
         );
     }
 

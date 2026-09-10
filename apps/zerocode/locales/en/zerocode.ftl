@@ -433,6 +433,8 @@ zc-chat-session-switch-error = Failed to switch session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
+zc-chat-code-cwd-unavailable = Cannot determine the directory zerocode was launched from: { $error }. A local Code session must start in that project, so it was not created.
+zc-chat-code-cwd-not-utf8 = The directory zerocode was launched from is not valid UTF-8 ({ $path }), so a local Code session cannot start there. Relaunch zerocode from a UTF-8 path.
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
