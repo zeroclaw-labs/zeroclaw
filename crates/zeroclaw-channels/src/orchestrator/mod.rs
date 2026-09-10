@@ -6287,7 +6287,8 @@ async fn process_channel_message_body(
         }
     }
 
-    if ctx.sop_engine.is_some() || ctx.sop_audit.is_some() {
+    // Dispatch executes steps even though its result is discarded here.
+    if !msg.passive_context && (ctx.sop_engine.is_some() || ctx.sop_audit.is_some()) {
         let topic = match &msg.channel_alias {
             Some(alias) if !alias.is_empty() => format!("{}/{}", msg.channel, alias),
             _ => msg.channel.clone(),
@@ -19448,6 +19449,108 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             user_history.contains("[Current WhatsApp group message from alice]"),
             "active group turn should preserve current sender attribution, got: {user_history}"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_context_does_not_reach_the_worker_sop_dispatch() {
+        use zeroclaw_runtime::sop::types::{
+            Sop, SopAdmissionPolicy, SopExecutionMode, SopPriority, SopStep, SopTrigger,
+        };
+
+        let sop = Sop {
+            name: "telegram-ingress".into(),
+            description: "Starts on any telegram channel message".into(),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Auto,
+            triggers: vec![SopTrigger::Channel {
+                channel: "telegram".into(),
+                alias: None,
+                condition: None,
+            }],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                ..Default::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 2,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let mut engine =
+            zeroclaw_runtime::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![sop]);
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let provider: Arc<dyn ModelProvider> = Arc::new(HistoryCaptureModelProvider::default());
+        let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            sop_engine: Some(Arc::clone(&engine)),
+            sop_audit: Some(Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(
+                Arc::new(NoopMemory),
+            ))),
+            ..(*base).clone()
+        });
+
+        let passive_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "passive-1".into(),
+            sender: "bob".into(),
+            reply_target: "-1001234567890".into(),
+            content: "the release codename is quartz".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            passive_context: true,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::ReplyTarget,
+            ..Default::default()
+        };
+        process_channel_message(
+            runtime_ctx.clone(),
+            passive_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_runs()
+                .is_empty(),
+            "passive observation must not start an SOP run"
+        );
+
+        let active_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "active-1".into(),
+            sender: "alice".into(),
+            content: "what is the release codename?".into(),
+            timestamp: 2,
+            passive_context: false,
+            ..passive_msg
+        };
+        process_channel_message(runtime_ctx, active_msg, CancellationToken::new()).await;
+
+        assert_eq!(
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_runs()
+                .len(),
+            1,
+            "the addressed turn must still dispatch"
         );
     }
 
