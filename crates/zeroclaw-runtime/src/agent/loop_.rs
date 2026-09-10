@@ -1366,6 +1366,17 @@ pub async fn run(
             sop_engine,
             sop_audit,
             None,
+            // `run` is the entry point that carries a per-run allowlist, so it is
+            // also the one that can hand the scheduler tools the ceiling's value.
+            // Pre-sealed: unlike the bounded delegate assembly — which builds its
+            // tools before the sealed set exists — the list is already known
+            // here, so the handle is filled on construction.
+            allowed_tools.as_deref().map(|list| {
+                let handle: crate::tools::caller_ceiling::CallerCeiling =
+                    std::sync::Arc::new(std::sync::OnceLock::new());
+                let _ = handle.set(list.to_vec());
+                handle
+            }),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         // Route the per-agent tool registry through the one gated seam
@@ -2001,6 +2012,10 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    // `run` is the one entry point with a caller
+                                    // ceiling; forwarding it keeps a re-assembled
+                                    // step agent inside the set this loop received.
+                                    caller_allowed: allowed_tools.as_deref(),
                                 }),
                             }),
                         ),
@@ -2561,6 +2576,11 @@ pub async fn run(
                                     turn_id: &turn_id,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        // Same `run` ceiling as the sibling
+                                        // construction above; both frames of this
+                                        // entry point must forward it or the bound
+                                        // holds on only one of them.
+                                        caller_allowed: allowed_tools.as_deref(),
                                     }),
                                 }),
                             ),
@@ -2980,6 +3000,10 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
+            // `process_message` has no per-run allowlist (its assembly passes
+            // `caller_allowed: None` too), so there is no ceiling to hand the
+            // scheduler tools.
+            None,
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3397,7 +3421,13 @@ pub async fn process_message(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    // `process_message` has no caller allowlist (see the
+                    // assembly call in this same function), so there is no
+                    // ceiling to forward.
+                    Some(SopStepReassembly {
+                        config: &config,
+                        caller_allowed: None,
+                    }),
                 ),
             )
             .await

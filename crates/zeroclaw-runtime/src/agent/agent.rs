@@ -1690,6 +1690,22 @@ impl Agent {
             // whole lifetime. One-shot callers pass `None` and keep the
             // documented snapshot fallback.
             live_config.clone(),
+            // No ceiling here, and the reason is narrower than it first looks.
+            // This surface runs an agent as itself and its assembly passes
+            // `caller_allowed: None`.
+            //
+            // `AgentBuilder` does expose an `allowed_tools` setter, so "this
+            // surface has no per-run allowlist" would be the wrong reason. But that
+            // setter has no production caller — its only uses are the builder's own
+            // unit tests — and `build` applies it as a post-hoc `retain` by name
+            // over already-constructed tools, which cannot re-bind a ceiling into
+            // instances built without one.
+            //
+            // So there is nothing to forward today. If that setter ever gains a
+            // production caller, the allowlist has to be threaded THROUGH here as
+            // the ceiling instead of filtered afterwards, or the scheduler tools it
+            // retains will persist work outside it.
+            None,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -2621,7 +2637,12 @@ impl Agent {
                         .provider_switch_config
                         .as_ref()
                         .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        // The `Agent` surface assembles with no caller allowlist,
+                        // so there is no ceiling to forward into a re-assembly.
+                        .map(|config| crate::agent::turn::SopStepReassembly {
+                            config,
+                            caller_allowed: None,
+                        }),
                 }),
             ),
         );
@@ -3064,7 +3085,12 @@ impl Agent {
                             .provider_switch_config
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            // The `Agent` surface assembles with no caller allowlist,
+                        // so there is no ceiling to forward into a re-assembly.
+                        .map(|config| crate::agent::turn::SopStepReassembly {
+                            config,
+                            caller_allowed: None,
+                        }),
                     }),
                 ),
             );

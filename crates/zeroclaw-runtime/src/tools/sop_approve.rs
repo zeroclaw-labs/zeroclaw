@@ -216,6 +216,58 @@ impl Tool for SopApproveTool {
     }
 }
 
+/// `sop_approve` as handed to a `Bounded` delegate target that crosses an
+/// identity boundary: present, described, and always refusing.
+///
+/// Approval is not attribution. `authorize_checkpoint` resolves the approving
+/// principal from the tool's `agent_alias` and rejects it when that principal
+/// is not in the checkpoint's `required_group`, so reusing the caller's
+/// instance would let a target approve under the CALLER's group membership.
+///
+/// Unlike every other denied tool this one is a stub rather than an omission:
+/// a target that reaches an approval checkpoint should be told it may not
+/// approve, not silently offered no way to proceed. The schema is kept
+/// identical to [`SopApproveTool`] so the model cannot invent a different
+/// call shape for it - if that schema changes, this one must change with it.
+pub struct BoundedSopApproveDenied;
+
+#[async_trait]
+impl Tool for BoundedSopApproveDenied {
+    fn name(&self) -> &str {
+        "sop_approve"
+    }
+
+    fn description(&self) -> &str {
+        "Approve a pending SOP step that is waiting for operator approval. Returns the step instruction to execute. Use sop_status to see which runs are waiting."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "description": "The run ID to approve"
+                }
+            },
+            "required": ["run_id"]
+        })
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Never touches the engine: refusing is the whole behaviour.
+        Ok(ToolResult {
+            success: false,
+            output: ToolOutput::default(),
+            error: Some(
+                "sop_approve is not available to a bounded delegate target: approval \
+                 authority belongs to the calling agent's identity, not the target's."
+                    .to_string(),
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

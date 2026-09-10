@@ -13,6 +13,12 @@ pub struct CronRunTool {
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
+    /// Bounded-delegation ceiling for the registering loop, or `None` when the
+    /// registration is unbounded. Unlike the writing tools, this one launches a
+    /// job whose tool set was stored earlier — possibly by the owning agent with
+    /// no ceiling in force — so there is nothing left to intersect and an
+    /// out-of-ceiling job is refused. See [`crate::tools::caller_ceiling`].
+    caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 impl CronRunTool {
@@ -21,12 +27,14 @@ impl CronRunTool {
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
+        caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
     ) -> Self {
         Self {
             config,
             security,
             agent_alias: agent_alias.into(),
             runtime,
+            caller_ceiling,
         }
     }
 
@@ -40,7 +48,7 @@ impl CronRunTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, agent_alias, runtime)
+        Self::new_with_runtime(config, security, agent_alias, runtime, None)
     }
 }
 
@@ -119,6 +127,39 @@ impl Tool for CronRunTool {
                 });
             }
         };
+
+        // Launching an existing job runs its STORED tool set, which may predate
+        // this bounded turn. Nothing is left to intersect at this point, so a
+        // job that is not already within the ceiling is refused outright.
+        //
+        // The branch is load-bearing, and this is the verb that EXECUTES rather
+        // than writes. A shell job's stored `allowed_tools` does not describe
+        // what it runs — the command does, and the scheduler runs it under the
+        // owning agent's policy with no tool gate anywhere on that path. Asking
+        // `require_within_ceiling` about that list would bound a shell job by a
+        // field it does not own: today such a job usually stores `None` and is
+        // refused for the right outcome by accident, but the column is writable
+        // by any unbounded turn of the owning agent (`cron/store.rs:592-599`
+        // applies an `allowed_tools` patch without consulting `job_type`), so a
+        // harmless-looking list turns the accident into a pass.
+        let bounded = match job.job_type {
+            JobType::Shell => crate::tools::caller_ceiling::require_shell_within_ceiling(
+                "cron_run",
+                self.caller_ceiling.as_ref(),
+            ),
+            JobType::Agent => crate::tools::caller_ceiling::require_within_ceiling(
+                "cron_run",
+                self.caller_ceiling.as_ref(),
+                job.allowed_tools.as_deref(),
+            ),
+        };
+        if let Err(error) = bounded {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
 
         if matches!(job.job_type, JobType::Shell)
             && let Err(reason) = cron::validate_shell_command_with_security(
@@ -219,6 +260,235 @@ mod tests {
         Arc::new(
             SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
         )
+    }
+
+    // ── caller ceiling ──────────────────────────────────────────────────────
+
+    fn sealed_ceiling(names: &[&str]) -> crate::tools::caller_ceiling::CallerCeiling {
+        let handle: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let _ = handle.set(names.iter().map(|n| (*n).to_string()).collect());
+        handle
+    }
+
+    fn bounded_tool(cfg: &Arc<Config>, ceiling: &[&str]) -> CronRunTool {
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&cfg.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        CronRunTool::new_with_runtime(
+            Arc::clone(cfg),
+            test_security(cfg),
+            TEST_AGENT,
+            runtime,
+            Some(sealed_ceiling(ceiling)),
+        )
+    }
+
+    /// `cron_run` is the verb that EXECUTES, and a shell job's stored
+    /// `allowed_tools` does not describe what it runs. Bounding it by that list
+    /// gives the right answer only while the list is empty — and any unbounded
+    /// turn of the owning agent can fill it, which is what this test does first
+    /// through a public API rather than assuming the state.
+    #[tokio::test]
+    async fn a_bounded_caller_without_shell_cannot_force_run_a_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        // The precondition, reached the way an ordinary unbounded turn reaches
+        // it: `allowed_tools` is writable on a shell row, which turns a refusal
+        // that held by accident into a pass.
+        cron::update_shell_job_with_approval(
+            &cfg,
+            TEST_AGENT,
+            &job.id,
+            cron::CronJobPatch {
+                allowed_tools: Some(vec!["cron_run".to_string()]),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        let tool = bounded_tool(&cfg, &["cron_run"]);
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+
+        assert!(
+            !result.success,
+            "a bounded caller without `shell` force-ran a stored shell command: {result:?}"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("shell"),
+            "the refusal must be the shell bound, not the stored-list one: {error}"
+        );
+        assert!(
+            cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty(),
+            "the refusal must not have recorded a run"
+        );
+    }
+
+    /// The positive half: the same job, the same stored list, one difference —
+    /// `shell` is inside the ceiling. Without this the refusal above would be
+    /// satisfied by a `cron_run` that refuses every bounded shell job.
+    #[tokio::test]
+    async fn a_bounded_caller_holding_shell_may_force_run_a_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        // `execute_job_now`'s reverse lookup needs the job on the agent, the
+        // same wiring `force_runs_job_and_records_history` does.
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+
+        let tool = bounded_tool(&cfg, &["cron_run", "shell"]);
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+
+        assert!(
+            result.success,
+            "a caller holding `shell` may still force-run a shell job: {result:?}"
+        );
+    }
+
+    /// A shell job is bounded by `shell`, NOT by whatever sits in its
+    /// `allowed_tools` column — that column does not describe what a shell job
+    /// runs. This is the other half of the branch: the list may reach well
+    /// beyond the ceiling and the run still proceeds, because the caller could
+    /// have run the command itself.
+    ///
+    /// It is also the test that catches the two arms being swapped: under a
+    /// swap this job would be judged by its stored list and refused.
+    #[tokio::test]
+    async fn a_shell_job_is_not_bounded_by_its_stored_list_when_the_caller_held_shell() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+        cron::update_shell_job_with_approval(
+            &cfg,
+            TEST_AGENT,
+            &job.id,
+            cron::CronJobPatch {
+                allowed_tools: Some(vec!["file_write".to_string()]),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        let tool = bounded_tool(&cfg, &["cron_run", "shell"]);
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+
+        assert!(
+            result.success,
+            "a shell job must be judged by `shell`, not by a column it does not \
+             own: {result:?}"
+        );
+    }
+
+    /// The AGENT arm of the same branch, which the shell tests never reach.
+    ///
+    /// The ceiling deliberately contains `shell` here: under a swap of the two
+    /// arms this job would be judged by `require_shell_within_ceiling`, find
+    /// `shell` present and be allowed to run. The refusal below is what makes
+    /// the arms non-interchangeable.
+    ///
+    /// Honest limit: its positive half lives in the unit tests of
+    /// `caller_ceiling` (`launching_a_job_within_the_ceiling_is_allowed`), not
+    /// here — an in-ceiling agent job would start a real agent turn, which
+    /// needs a provider these tool tests do not stand up.
+    #[tokio::test]
+    async fn a_bounded_caller_cannot_force_run_an_agent_job_reaching_beyond_the_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            TEST_AGENT,
+            None,
+            cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "do the scheduled work",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["file_write".to_string()]),
+            true,
+        )
+        .unwrap();
+
+        let tool = bounded_tool(&cfg, &["cron_run", "shell"]);
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+
+        assert!(
+            !result.success,
+            "an agent job storing a tool outside the ceiling must not launch: {result:?}"
+        );
+        let error = result.error.unwrap_or_default();
+        assert!(
+            error.contains("file_write"),
+            "the refusal must name the offending stored tool: {error}"
+        );
+    }
+
+    /// A ceiling in force but never sealed is an error, never an absent bound —
+    /// asserted at the tool, not only at the predicate, because the wiring is
+    /// what decides whether the tool consults it at all.
+    #[tokio::test]
+    async fn an_unsealed_ceiling_refuses_at_cron_run() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&cfg.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        let unsealed: crate::tools::caller_ceiling::CallerCeiling =
+            Arc::new(std::sync::OnceLock::new());
+        let tool = CronRunTool::new_with_runtime(
+            Arc::clone(&cfg),
+            test_security(&cfg),
+            TEST_AGENT,
+            runtime,
+            Some(unsealed),
+        );
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+
+        assert!(!result.success, "{result:?}");
+        assert!(
+            result.error.unwrap_or_default().contains("never sealed"),
+            "an unsealed ceiling must fail closed at the tool"
+        );
+        assert!(
+            cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty(),
+            "the refusal must not have recorded a run"
+        );
     }
 
     #[tokio::test]

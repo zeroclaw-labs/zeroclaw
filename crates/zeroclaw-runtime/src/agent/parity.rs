@@ -379,6 +379,10 @@ async fn parity_l2_sop_live_step_agent_isolation() {
         Arc::clone(&engine),
         None,
         None,
+        // This parity check asserts the step agent's OWN policy is applied; it
+        // models a caller with no ceiling, so the ceiling must not narrow the
+        // set under comparison.
+        None,
     )
     .await
     .expect("assemble_owned_execution must build the restricted step agent's context");
