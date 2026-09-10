@@ -63,14 +63,12 @@ impl ChatMessage {
             content: content.into(),
         }
     }
-
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
             content: content.into(),
         }
     }
-
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
@@ -184,11 +182,11 @@ pub struct ChatResponse {
     pub reasoning_content: Option<String>,
 }
 
-/// A transport-successful provider result that cannot complete a request.
+/// A provider response that cannot be treated as a completed assistant turn.
 ///
 /// The result has neither user-visible final text nor native tool calls.
-/// Reasoning is intentionally not part of this contract because it is opaque
-/// provider round-trip metadata rather than a final answer.
+/// Reasoning is intentionally excluded because it is opaque provider metadata,
+/// not a final answer.
 #[derive(Debug)]
 pub struct SemanticEmptyTerminalCompletion;
 
@@ -199,6 +197,82 @@ impl std::fmt::Display for SemanticEmptyTerminalCompletion {
 }
 
 impl std::error::Error for SemanticEmptyTerminalCompletion {}
+
+/// A semantic-empty terminal failure plus the usage reported by the provider.
+///
+/// The marker remains the error source so delivery surfaces can classify this
+/// failure without parsing diagnostics. The usage is kept separately for the
+/// rejected-attempt accounting owner; it must not become accepted-response
+/// context usage.
+#[derive(Debug)]
+pub struct SemanticEmptyTerminalFailure {
+    pub usage: Option<TokenUsage>,
+    /// Provider-side tool activity occurred before the empty terminal result.
+    /// Replaying this request could duplicate work even though no client tool
+    /// call or final text was returned.
+    pub pre_executed_tool_activity: bool,
+    /// This completed provider response must not be sent again. For example,
+    /// a native-thinking response has already consumed a completed HTTP
+    /// request even when it contains no user-visible final answer.
+    no_replay: bool,
+    cause: SemanticEmptyTerminalCompletion,
+}
+
+impl SemanticEmptyTerminalFailure {
+    #[must_use]
+    pub const fn new(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            pre_executed_tool_activity: false,
+            no_replay: false,
+            cause: SemanticEmptyTerminalCompletion,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_pre_executed_tool_activity(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            pre_executed_tool_activity: true,
+            no_replay: true,
+            cause: SemanticEmptyTerminalCompletion,
+        }
+    }
+
+    /// Marks a completed semantic-empty response as ineligible for replay
+    /// without claiming that provider-side tool work occurred.
+    #[must_use]
+    pub const fn with_no_replay(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            pre_executed_tool_activity: false,
+            no_replay: true,
+            cause: SemanticEmptyTerminalCompletion,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_pre_executed_tool_activity(&self) -> bool {
+        self.pre_executed_tool_activity
+    }
+
+    #[must_use]
+    pub const fn is_replayable(&self) -> bool {
+        !self.no_replay
+    }
+}
+
+impl std::fmt::Display for SemanticEmptyTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for SemanticEmptyTerminalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 impl ChatResponse {
     /// True when the LLM wants to invoke at least one tool.
@@ -218,7 +292,8 @@ impl ChatResponse {
     /// A response containing one or more tool calls remains valid even when
     /// its text is empty.
     pub fn is_semantically_empty_terminal(&self) -> bool {
-        strip_think_tags(self.text_or_empty()).is_empty() && self.tool_calls.is_empty()
+        normalize_terminal_display_text(self.text_or_empty()).is_empty()
+            && self.tool_calls.is_empty()
     }
 }
 
@@ -244,6 +319,48 @@ pub fn strip_think_tags(text: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+/// Canonical vocabulary of terminal markers emitted by providers that must not
+/// appear in final response text.
+///
+/// Order matters: longer spellings precede shorter ones so suffix matching
+/// prefers the most specific marker.
+pub const TERMINAL_MARKERS: [&str; 2] = ["<|eom|>", "<eom>"];
+
+/// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
+///
+/// Handles stacked markers with arbitrary whitespace between them. Whitespace
+/// before a marker is preserved because it belongs to the response text;
+/// whitespace after a recognized marker is protocol suffix material.
+pub fn strip_trailing_terminal_markers(text: &str) -> String {
+    let mut result = text.to_string();
+
+    loop {
+        let trimmed = result.trim_end();
+        let mut stripped = false;
+        for marker in TERMINAL_MARKERS {
+            if let Some(prefix) = trimmed.strip_suffix(marker) {
+                result = prefix.to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Normalize provider text for final user-visible delivery and terminal policy.
+///
+/// Thinking is opaque provider continuation state rather than final user text,
+/// and trailing terminal markers are protocol metadata. All terminal acceptance
+/// boundaries use this helper so marker-only output cannot become a success.
+pub fn normalize_terminal_display_text(text: &str) -> String {
+    strip_trailing_terminal_markers(&strip_think_tags(text))
 }
 
 /// Request payload for model_provider chat calls.
@@ -413,6 +530,66 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Reason a provider completed a response that must not be treated as a final answer.
+///
+/// These are successful provider protocol terminal states, not transport failures. They
+/// intentionally stay distinct from [`StreamError::Http`] so callers can avoid retrying
+/// a request that has already exhausted its output budget or reached a policy terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TerminalCompletionError {
+    /// The provider exhausted the configured output-token budget.
+    #[error("response incomplete: output token limit reached")]
+    OutputTokenLimit,
+    /// The provider stopped because its context window was exhausted while generating.
+    #[error("response incomplete: model context window reached")]
+    ContextWindow,
+    /// The provider paused a long-running turn that requires an explicit continuation.
+    #[error("response incomplete: provider paused the turn")]
+    PausedTurn,
+    /// The provider stopped generation with a refusal rather than a usable completion.
+    #[error("response incomplete: provider refused the request")]
+    Refusal,
+    /// The provider ended a response without a recognized terminal reason.
+    #[error("response incomplete: provider returned an invalid terminal reason")]
+    InvalidTerminalReason,
+}
+
+/// A terminal provider outcome together with the usage billed before that
+/// outcome was rejected.
+///
+/// [`TerminalCompletionError`] classifies why the response is incomplete;
+/// this type preserves the provider-reported usage across the error boundary
+/// so runtime accounting does not lose a billed attempt.
+#[derive(Debug, Clone)]
+pub struct TerminalCompletionFailure {
+    pub reason: TerminalCompletionError,
+    pub usage: Option<TokenUsage>,
+}
+
+impl TerminalCompletionFailure {
+    pub fn new(reason: TerminalCompletionError, usage: Option<TokenUsage>) -> Self {
+        Self { reason, usage }
+    }
+}
+
+impl From<TerminalCompletionError> for TerminalCompletionFailure {
+    fn from(reason: TerminalCompletionError) -> Self {
+        Self::new(reason, None)
+    }
+}
+
+impl std::fmt::Display for TerminalCompletionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+
+impl std::error::Error for TerminalCompletionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -428,8 +605,84 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// The provider reached a terminal state that does not yield a complete answer.
+    #[error(transparent)]
+    TerminalCompletion(#[from] TerminalCompletionFailure),
+
+    /// The provider completed without a final answer. Consumers inspect the
+    /// structured failure to distinguish provider-side tool activity from a
+    /// completed response that is otherwise unsafe to replay.
+    #[error(transparent)]
+    SemanticEmpty(#[from] SemanticEmptyTerminalFailure),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Returns the structured terminal-completion failure carried by an error.
+///
+/// Both streaming and non-streaming provider paths use this helper so retry,
+/// fallback, and delivery layers do not infer terminal state from error text.
+pub fn terminal_completion_failure(error: &anyhow::Error) -> Option<&TerminalCompletionFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TerminalCompletionFailure>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<StreamError>()?
+                    .terminal_completion_failure()
+            })
+    })
+}
+
+pub fn terminal_completion_error(error: &anyhow::Error) -> Option<TerminalCompletionError> {
+    terminal_completion_failure(error)
+        .map(|failure| failure.reason)
+        .or_else(|| error.downcast_ref::<TerminalCompletionError>().copied())
+}
+
+impl StreamError {
+    /// Returns the terminal-delivery failure nested in this stream error, if any.
+    pub fn terminal_completion_failure(&self) -> Option<&TerminalCompletionFailure> {
+        match self {
+            Self::TerminalCompletion(failure) => Some(failure),
+            Self::Http(_)
+            | Self::Json(_)
+            | Self::InvalidSse(_)
+            | Self::ModelProvider(_)
+            | Self::SemanticEmpty(_)
+            | Self::Io(_) => None,
+        }
+    }
+
+    /// Returns the structured semantic-empty failure carried by this stream
+    /// error, if any.
+    pub fn semantic_empty_terminal_failure(&self) -> Option<&SemanticEmptyTerminalFailure> {
+        match self {
+            Self::SemanticEmpty(failure) => Some(failure),
+            Self::Http(_)
+            | Self::Json(_)
+            | Self::InvalidSse(_)
+            | Self::ModelProvider(_)
+            | Self::TerminalCompletion(_)
+            | Self::Io(_) => None,
+        }
+    }
+}
+
+/// Returns the structured semantic-empty failure carried by an error.
+pub fn semantic_empty_terminal_failure(
+    error: &anyhow::Error,
+) -> Option<&SemanticEmptyTerminalFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<SemanticEmptyTerminalFailure>()
+            .or_else(|| {
+                cause
+                    .downcast_ref::<StreamError>()?
+                    .semantic_empty_terminal_failure()
+            })
+    })
 }
 
 /// Structured error returned when a requested capability is not supported.
@@ -722,9 +975,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
                 usage: None,
                 reasoning_content: None,
             };
-            return (!response.is_semantically_empty_terminal())
-                .then_some(response)
-                .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion));
+            if response.is_semantically_empty_terminal() {
+                return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+            }
+            return Ok(response);
         }
 
         let text = self
@@ -736,9 +990,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             usage: None,
             reasoning_content: None,
         };
-        (!response.is_semantically_empty_terminal())
-            .then_some(response)
-            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
+        if response.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+        }
+        Ok(response)
     }
 
     /// Whether model_provider supports native tool calls over API.
@@ -772,9 +1027,10 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
             usage: None,
             reasoning_content: None,
         };
-        (!response.is_semantically_empty_terminal())
-            .then_some(response)
-            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
+        if response.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+        }
+        Ok(response)
     }
 
     /// Whether model_provider supports streaming responses.
@@ -1015,11 +1271,12 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::ModelProvider;
+    use super::{ChatMessage, ChatRequest, ModelProvider, SemanticEmptyTerminalCompletion};
     use crate::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use async_trait::async_trait;
 
     struct NativeAccessorOnlyProvider;
+    struct LegacyTextProvider(&'static str);
 
     impl Attributable for NativeAccessorOnlyProvider {
         fn role(&self) -> Role {
@@ -1028,6 +1285,16 @@ mod capability_tests {
 
         fn alias(&self) -> &str {
             "native_accessor_only"
+        }
+    }
+
+    impl Attributable for LegacyTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "legacy_text"
         }
     }
 
@@ -1048,6 +1315,19 @@ mod capability_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for LegacyTextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
     #[test]
     fn model_capabilities_preserve_native_accessor_overrides() {
         let provider = NativeAccessorOnlyProvider;
@@ -1063,11 +1343,59 @@ mod capability_tests {
             "model-aware capability lookup must preserve legacy supports_native_tools overrides"
         );
     }
+
+    #[tokio::test]
+    async fn default_structured_methods_reject_legacy_semantic_empty_text() {
+        for text in ["", "<think>internal</think>"] {
+            let provider = LegacyTextProvider(text);
+            let messages = [ChatMessage::user("hello")];
+            let request = ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            };
+
+            let error = provider
+                .chat(request, "test", None)
+                .await
+                .expect_err("legacy semantic-empty output must not become a structured success");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+            );
+
+            let error = provider
+                .chat_with_tools(&messages, &[], "test", None)
+                .await
+                .expect_err(
+                    "legacy semantic-empty tool output must not become a structured success",
+                );
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod turn_order_tests {
-    use super::{ChatMessage, ChatResponse, ToolCall};
+    use super::{
+        ChatMessage, ChatResponse, TerminalCompletionError, TerminalCompletionFailure, ToolCall,
+    };
+
+    #[test]
+    fn terminal_completion_failure_retains_two_field_literal_contract() {
+        let TerminalCompletionFailure { reason, usage } = TerminalCompletionFailure {
+            reason: TerminalCompletionError::OutputTokenLimit,
+            usage: None,
+        };
+
+        assert_eq!(reason, TerminalCompletionError::OutputTokenLimit);
+        assert!(usage.is_none());
+    }
 
     #[test]
     fn semantic_empty_terminal_ignores_reasoning_content() {
@@ -1094,9 +1422,38 @@ mod turn_order_tests {
     }
 
     #[test]
-    fn semantic_empty_terminal_keeps_tool_only_response_valid() {
-        let response = ChatResponse {
-            text: None,
+    fn semantic_empty_terminal_uses_canonical_marker_normalization() {
+        for text in [
+            "<eom>",
+            "<|eom|>",
+            "<think>internal reasoning</think><eom><|eom|>",
+        ] {
+            let response = ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            };
+
+            assert!(
+                response.is_semantically_empty_terminal(),
+                "marker-only display text must fail semantic acceptance: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_empty_terminal_preserves_tool_only_and_visible_marker_suffixed_responses() {
+        let visible = ChatResponse {
+            text: Some("done<eom>".to_string()),
+            tool_calls: Vec::new(),
+            usage: None,
+            reasoning_content: None,
+        };
+        assert!(!visible.is_semantically_empty_terminal());
+
+        let tool_only = ChatResponse {
+            text: Some("<eom>".to_string()),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
@@ -1106,8 +1463,7 @@ mod turn_order_tests {
             usage: None,
             reasoning_content: None,
         };
-
-        assert!(!response.is_semantically_empty_terminal());
+        assert!(!tool_only.is_semantically_empty_terminal());
     }
 
     #[test]

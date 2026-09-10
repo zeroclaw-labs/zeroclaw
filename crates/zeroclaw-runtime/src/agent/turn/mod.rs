@@ -895,6 +895,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             provider_request_model,
             &provider_request_messages,
             request_tools,

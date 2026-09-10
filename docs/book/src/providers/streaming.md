@@ -8,8 +8,9 @@ The provider trait emits `StreamEvent` values as the model generates output:
 text deltas, structured tool calls, provider-side pre-executed tool calls and
 their results, token-usage reports, and a final completion marker. The
 authoritative, per-variant definitions live with the type in
-`crates/zeroclaw-api/src/model_provider.rs` (`enum StreamEvent`); reasoning
-tokens arrive as text deltas, not a separate variant.
+`crates/zeroclaw-api/src/model_provider.rs` (`enum StreamEvent`). In addition
+to `TextDelta`, providers can emit `ThinkingDelta` for transient readable
+reasoning progress and `ReasoningFinalized` for opaque or signed replay state.
 
 The runtime consumes these events. The channel orchestrator uses the `Channel` trait's draft-delivery methods and capability flags to surface progressive output where supported.
 
@@ -48,7 +49,13 @@ When both the provider and the channel support streaming, the flow is: provider 
 
 ## Reasoning blocks
 
-`StreamEvent` has no separate `ReasoningDelta` variant. When a provider exposes reasoning during streaming, it uses the `reasoning` field on the `StreamChunk` carried by `TextDelta`; provider and runtime configuration determine whether that content is requested or surfaced. Consumers should follow the `StreamChunk` contract rather than matching a nonexistent event variant.
+`ThinkingDelta` carries optional, human-readable progress. The runtime applies
+its configured visibility policy and never persists it as provider replay
+state. `ReasoningFinalized` carries the completed provider replay payload,
+including signed `thinking` blocks or opaque `redacted_thinking` blocks; the
+runtime appends it to `reasoning_content` and never exposes it as user-visible
+progress. Consumers that implement provider continuation must preserve this
+payload unchanged and in event order.
 
 ## Tool calls mid-stream
 
@@ -66,6 +73,14 @@ The current provider stream is never paused and resumed mid-read; tool
 execution happens after that stream reaches `Final`, and the next turn is a
 fresh streaming call.
 
+Provider-side tools are different: `PreExecutedToolCall` and
+`PreExecutedToolResult` describe work already performed by the provider, not
+client-executable calls. If a stream that reported either event lacks a
+trustworthy final response, it is an explicit non-replayable failure. The
+runtime must not retry the request because that could repeat provider-side
+work. Provider adapters must preserve this boundary on every interrupted
+stream exit, not only on a clean terminal event.
+
 From the user's perspective: text, then a visible indicator that the agent ran a tool (via channel-specific hints), then more text. For channels without typing indicators, the gap between the tool call and the next text chunk is the only signal.
 
 ## Transport completion and timeouts
@@ -73,7 +88,13 @@ From the user's perspective: text, then a visible indicator that the agent ran a
 Streaming transports do not rely on connection close as the success signal.
 OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on
-`message_stop`. Servers may keep the HTTP connection open after those events.
+`message_stop` after a recognized terminal reason. Anthropic's documented
+server-side `fallback` block has no content delta, but it still requires that
+stream-level terminal reason. Until ZeroClaw can preserve fallback state in
+ordered continuation history, it rejects fallback blocks rather than silently
+losing provider state. Missing, malformed, or unrecognized terminal framing is
+an explicit typed terminal failure, never `Final`. Servers may keep the HTTP
+connection open after a valid terminal event.
 
 Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
 OpenAI-compatible providers, and 90 seconds for Anthropic. Each received body

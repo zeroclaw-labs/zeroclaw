@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
-use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+use zeroclaw_tool_call_parser::normalize_terminal_display_text;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
@@ -185,7 +185,7 @@ pub(crate) async fn finish_after_max_iterations(
     // content and trailing terminal markers, then withhold text that looks
     // like an internal tool-protocol envelope. The summary call passes
     // `tools: None`, so the tools-free detector is the matching contract.
-    let display_text = strip_trailing_terminal_markers(&strip_think_tags(&raw_text));
+    let display_text = normalize_terminal_display_text(&raw_text);
     let protocol_suppressed =
         super::protocol_detect::detect_internal_protocol_without_tools(&display_text).is_some();
     if protocol_suppressed {

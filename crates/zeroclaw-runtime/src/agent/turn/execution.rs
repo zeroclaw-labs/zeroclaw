@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::dispatch::with_exact_dispatch_route;
-use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
+use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -27,6 +27,40 @@ pub struct ResolvedModelAccess<'a> {
 }
 
 impl ResolvedModelAccess<'_> {
+    /// Run a text-only system/user query through the canonical structured
+    /// accounting path. Text-only callers must not bypass `run_model_query`,
+    /// because a Reliable recovery can carry rejected-attempt usage.
+    pub async fn run_text_query(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+    ) -> anyhow::Result<String> {
+        let mut messages = Vec::with_capacity(usize::from(system_prompt.is_some()) + 1);
+        if let Some(system_prompt) = system_prompt {
+            messages.push(ChatMessage::system(system_prompt));
+        }
+        messages.push(ChatMessage::user(message));
+
+        let response = self
+            .run_model_query(ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            })
+            .await?;
+        if !response.tool_calls.is_empty() {
+            anyhow::bail!("text-only model query returned unexpected tool calls");
+        }
+        let text = response
+            .text
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))?;
+        let text = zeroclaw_api::model_provider::normalize_terminal_display_text(&text);
+        if text.is_empty() {
+            return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+        }
+        Ok(text)
+    }
+
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.
@@ -43,6 +77,7 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         } = request;
+        let text_only = tools.is_none();
         let sanitized = multimodal::sanitize_audio_markers(messages);
         let request = ChatRequest {
             messages: &sanitized,
@@ -58,7 +93,12 @@ impl ResolvedModelAccess<'_> {
                 dispatcher.chat(request, self.model, self.temperature),
             ))
             .await;
-        if result.is_ok() {
+        if matches!(
+            result.as_ref(),
+            Ok(response)
+                if !response.is_semantically_empty_terminal()
+                    && (!text_only || response.tool_calls.is_empty())
+        ) {
             scope.mark_logical_success();
         }
         let accounting = scope.take();
@@ -79,6 +119,10 @@ impl ResolvedModelAccess<'_> {
                 if response.is_semantically_empty_terminal() {
                     crate::agent::cost::settle_provider_attempts(attempts, None);
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
+                }
+                if text_only && !response.tool_calls.is_empty() {
+                    crate::agent::cost::settle_provider_attempts(attempts, None);
+                    anyhow::bail!("text-only model query returned unexpected tool calls");
                 }
                 zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
                 crate::agent::cost::settle_provider_attempts(
@@ -526,7 +570,13 @@ mod run_model_query_tests {
     #[tokio::test]
     async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
         let messages = [ChatMessage::user("hi")];
-        for text in ["", " \n\t", "<think>internal reasoning</think>"] {
+        for text in [
+            "",
+            " \n\t",
+            "<think>internal reasoning</think>",
+            "<eom>",
+            "<think>internal reasoning</think><eom><|eom|>",
+        ] {
             let provider = DirectResponseProvider {
                 response: ChatResponse {
                     text: Some(text.to_string()),
@@ -567,7 +617,26 @@ mod run_model_query_tests {
     }
 
     #[tokio::test]
-    async fn run_model_query_keeps_direct_tool_only_response_valid() {
+    async fn run_text_query_returns_normalized_terminal_text() {
+        let provider = DirectResponseProvider {
+            response: ChatResponse {
+                text: Some("answer<eom>".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            },
+        };
+
+        let response = direct_access(&provider)
+            .run_text_query(None, "hi")
+            .await
+            .expect("nonempty terminal text must succeed");
+
+        assert_eq!(response, "answer");
+    }
+
+    #[tokio::test]
+    async fn run_model_query_rejects_unexpected_tool_calls_before_accepted_accounting() {
         let provider = DirectResponseProvider {
             response: ChatResponse {
                 text: None,
@@ -589,7 +658,7 @@ mod run_model_query_tests {
         let ctx = ToolLoopCostTrackingContext::usage_only();
         let turn_usage = Arc::clone(&ctx.turn_usage);
 
-        let response = TOOL_LOOP_COST_TRACKING_CONTEXT
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ctx), async {
                 direct_access(&provider)
                     .run_model_query(ChatRequest {
@@ -600,12 +669,12 @@ mod run_model_query_tests {
                     .await
             })
             .await
-            .expect("a direct tool-only response remains valid");
+            .expect_err("a text-only query must reject unexpected tool calls");
 
-        assert!(response.has_tool_calls());
+        assert!(error.to_string().contains("unexpected tool calls"));
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 80);
         assert_eq!(recorded.output_tokens, 5);
-        assert_eq!(recorded.last_input_tokens, 80);
+        assert_eq!(recorded.last_input_tokens, 0);
     }
 }
