@@ -32,6 +32,13 @@
 //! them in a transport adapter is how a plugin and a built-in tool come to
 //! disagree about what is reachable.
 //!
+//! What *is* here is how those verdicts reach the guest as `wasi:http` codes,
+//! and the distinctions that survive translation are load-bearing. A refused
+//! destination is masked to a single message so denial text cannot be used to
+//! map the host's network; a name that would not resolve, and an instance that
+//! has spent its connection ceiling, are neither of them policy decisions about
+//! a destination and are not reported as one.
+//!
 //! Redirects are not followed. A guest that wants to chase one issues a second
 //! request, and that request is authorized on its own from scratch.
 
@@ -64,6 +71,23 @@ pub const DENIED_MESSAGE: &str = "zeroclaw plugin egress policy: destination not
 
 fn denied() -> ErrorCode {
     ErrorCode::InternalError(Some(DENIED_MESSAGE.to_string()))
+}
+
+/// The instance has no free connection slot. Distinct from [`denied`] for the
+/// same reason [`dns_failure`] is, and for a sharper one: reporting a full
+/// budget as a destination denial does not merely lose information, it sends the
+/// author to fix the wrong thing. `wasi:http` has a code for exactly this
+/// condition, so the guest gets a value it can match on rather than a message it
+/// has to read.
+///
+/// Nothing about the host's network leaks through it. The ceiling is the
+/// instance's own, the count is of connections the guest itself opened, and the
+/// code names no host, no address, and no allowlist entry. It is reached only
+/// after the destination has already passed the allowlist and the address-class
+/// check, so an ungranted destination still gets the masked denial and is never
+/// distinguishable from any other refused one.
+fn connection_limit_reached() -> ErrorCode {
+    ErrorCode::ConnectionLimitReached
 }
 
 /// A destination that could not be resolved. Distinct from [`denied`] on
@@ -631,6 +655,7 @@ async fn send(
                 return Err(match error {
                     EgressError::DnsFailed { .. }
                     | EgressError::Network(NetworkGuardError::NoAddresses { .. }) => dns_failure(),
+                    EgressError::ConnectionLimitReached { .. } => connection_limit_reached(),
                     _ => denied(),
                 });
             }
@@ -1047,6 +1072,59 @@ mod tests {
             matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
             "an unrepresentable connect budget must fail closed, got: {outcome:?}"
         );
+    }
+
+    /// A full connection budget is reported as a full connection budget.
+    ///
+    /// The instance's connection ceiling and the operator's destination
+    /// allowlist are different refusals with different fixes, and they used to
+    /// arrive at the guest as the same masked message. A plugin that ran out of
+    /// slots was told its destination was not permitted — an allowlist it could
+    /// edit forever without effect, and the reason a plugin author reading that
+    /// message concludes the host is recycling a stale connection under them.
+    ///
+    /// The allowlist denial must stay masked, which
+    /// `a_store_without_an_egress_service_denies_without_spawning` and the e2e
+    /// deny tests hold; this asserts the other half, that the budget refusal is
+    /// no longer wearing that mask.
+    #[tokio::test]
+    async fn a_full_connection_budget_is_not_reported_as_a_destination_denial() {
+        // Bound, never accepted from: the destination has to be dialable for
+        // the refusal to be about the budget and nothing else.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let port = listener.local_addr().expect("loopback port").port();
+
+        // `loopback_service` grants 127.0.0.1 with a ceiling of one connection.
+        let service = loopback_service();
+        let mut hooks = hooks(Some(service.clone()));
+        let held = service
+            .authorize_addresses(
+                EgressRequest::new(
+                    hooks.scope.clone(),
+                    EgressTransport::Http { encrypted: false },
+                    "127.0.0.1",
+                    port,
+                )
+                .expect("a loopback destination is a valid request"),
+                [SocketAddr::from(([127, 0, 0, 1], port))],
+            )
+            .expect("the first connection takes the instance's only slot");
+
+        let response = hooks
+            .send_request(request(&format!("http://127.0.0.1:{port}/")), config())
+            .expect("a full budget is a guest-visible error, never a trap");
+        let HostFutureIncomingResponse::Pending(handle) = response else {
+            panic!("a granted destination is authorized asynchronously");
+        };
+        let outcome = handle.await.expect("the send task must not trap");
+        assert!(
+            matches!(outcome, Err(ErrorCode::ConnectionLimitReached)),
+            "a full instance budget must be reported as such, got: {outcome:?}"
+        );
+
+        // Held across the assertion on purpose: the slot must still be taken at
+        // the moment the refusal is observed.
+        drop(held);
     }
 
     /// A peer that completes the TCP handshake and then sends nothing.
