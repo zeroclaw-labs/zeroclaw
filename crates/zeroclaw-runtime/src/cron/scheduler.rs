@@ -2219,6 +2219,11 @@ mod tests {
                         }))
                         .into_response();
                     }
+                    let shell_command = if cfg!(windows) {
+                        "type .cron-workspace-marker"
+                    } else {
+                        "cat .cron-workspace-marker"
+                    };
                     Json(serde_json::json!({
                         "choices": [{
                             "message": {
@@ -2228,7 +2233,10 @@ mod tests {
                                     "type": "function",
                                     "function": {
                                         "name": "shell",
-                                        "arguments": "{\"command\":\"pwd\"}"
+                                        "arguments": serde_json::json!({
+                                            "command": shell_command
+                                        })
+                                        .to_string()
                                     }
                                 }]
                             }
@@ -2269,12 +2277,20 @@ mod tests {
         let mut security = test_security(&config);
         let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
         std::fs::create_dir_all(&scheduler_workspace).unwrap();
+        let workspace_marker = "CRON_SCHEDULER_WORKSPACE_MARKER";
+        std::fs::write(
+            scheduler_workspace.join(".cron-workspace-marker"),
+            workspace_marker,
+        )
+        .unwrap();
         security.workspace_dir = scheduler_workspace.clone();
-        let expected_workspace = security.workspace_dir.clone();
-        assert_ne!(expected_workspace, config.agent_workspace_dir(TEST_AGENT));
+        assert_ne!(
+            security.workspace_dir,
+            config.agent_workspace_dir(TEST_AGENT)
+        );
         let mut job = test_job("");
         job.job_type = JobType::Agent;
-        job.prompt = Some("Print the current workspace directory".into());
+        job.prompt = Some("Read the scheduler workspace marker".into());
         job.allowed_tools = Some(vec!["shell".into()]);
         job.uses_memory = false;
 
@@ -2319,9 +2335,8 @@ mod tests {
         );
         for tool_result in tool_results {
             assert!(
-                tool_result.contains(expected_workspace.to_string_lossy().as_ref()),
-                "shell output must come from the scheduler workspace {:?}, got {tool_result:?}",
-                expected_workspace
+                tool_result.contains(workspace_marker),
+                "shell output must contain the scheduler workspace marker, got {tool_result:?}"
             );
         }
 

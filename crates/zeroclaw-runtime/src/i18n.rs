@@ -400,6 +400,59 @@ mod tests {
     }
 
     #[test]
+    fn paircode_cli_strings_format_in_every_builtin_locale() {
+        let endpoint = "gateway.example:49001";
+        let cases = [
+            ("cli-pairing-fetch-failed", &[("endpoint", endpoint)][..]),
+            ("cli-pairing-no-code", &[][..]),
+            ("cli-pairing-requests-accepted", &[][..]),
+            ("cli-pairing-enable-config", &[][..]),
+            ("cli-pairing-show-only", &[][..]),
+            ("cli-pairing-pair-another", &[][..]),
+            ("cli-pairing-revoke-replace", &[][..]),
+            ("cli-pairing-new-code-unavailable", &[][..]),
+            ("cli-pairing-retry-or-rotate", &[][..]),
+            ("cli-pairing-rotate-no-code", &[][..]),
+            ("cli-pairing-check-enabled", &[][..]),
+            ("cli-pairing-inspect", &[][..]),
+        ];
+        let locales = [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ];
+
+        for (source, locale) in locales {
+            for (key, args) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+
+        assert_eq!(
+            format_ftl_message(
+                include_str!("../locales/en/cli.ftl"),
+                "en",
+                "cli-pairing-fetch-failed",
+                &[("endpoint", endpoint)],
+            )
+            .as_deref(),
+            Some("❌ Failed to fetch pairing code from gateway at gateway.example:49001")
+        );
+        let spanish_fetch = format_ftl_message(
+            include_str!("../locales/es/cli.ftl"),
+            "es",
+            "cli-pairing-fetch-failed",
+            &[("endpoint", endpoint)],
+        )
+        .expect("Spanish paircode fetch failure should format");
+        assert!(spanish_fetch.contains(endpoint));
+    }
+
+    #[test]
     fn lifecycle_progress_strings_exist_in_every_builtin_locale() {
         let keys = [
             "channel-runtime-progress-received",
@@ -420,6 +473,60 @@ mod tests {
                 let value = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{key} should format in {locale}"));
                 assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+    }
+
+    #[test]
+    fn status_cli_strings_format_dynamic_entries() {
+        let keys = [
+            (
+                "cli-status-agent-risk-profile",
+                &[("alias", "ops"), ("level", "High")][..],
+                ["ops=High"].as_slice(),
+            ),
+            (
+                "cli-status-agent-no-risk-profile-summary",
+                &[("alias", "ops")][..],
+                ["ops", "risk_profile"].as_slice(),
+            ),
+            (
+                "cli-status-web-ui-found",
+                &[("path", "/srv/zeroclaw/web/dist")][..],
+                ["Web UI", "/srv/zeroclaw/web/dist"].as_slice(),
+            ),
+            ("cli-status-web-ui-missing", &[][..], ["Web UI"].as_slice()),
+            (
+                "cli-status-channel-configured",
+                &[("status", "configured")][..],
+                ["✅ configured"].as_slice(),
+            ),
+            (
+                "cli-status-channel-not-configured",
+                &[("status", "not configured")][..],
+                ["❌ not configured"].as_slice(),
+            ),
+        ];
+
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
+            for (key, args, expected_parts) in keys {
+                let value = format_cli_string_with_args(&sources, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
+                for expected_part in expected_parts {
+                    assert!(
+                        value.contains(expected_part),
+                        "{} in {} should contain {expected_part:?}, got {value:?}",
+                        key,
+                        locale.code
+                    );
+                }
+                assert!(
+                    !value.contains('{'),
+                    "{} in {} should not leak a missing Fluent placeholder: {value:?}",
+                    key,
+                    locale.code
+                );
             }
         }
     }
@@ -887,26 +994,25 @@ mod tests {
             ),
         ];
 
-        for (source, locale) in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
             for (key, args, expected_parts) in cases {
-                let value = format_ftl_message(source, locale, key, args)
-                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                let value = format_cli_string_with_args(&sources, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
                 for expected in expected_parts {
                     assert!(
                         value.contains(expected),
-                        "{key} in {locale} should preserve {expected:?}"
+                        "{} in {} should preserve {expected:?}",
+                        key,
+                        locale.code
                     );
                 }
                 if key == "cli-update-prebuilt-channel-note" {
                     assert!(
                         !value.contains("Discord"),
-                        "{key} in {locale} should not mention Discord because it is in default-channels"
+                        "{} in {} should not mention Discord because it is in default-channels",
+                        key,
+                        locale.code
                     );
                 }
             }
@@ -1598,6 +1704,7 @@ mod tests {
         "channel-telegram-approval-ack-approved",
         "channel-telegram-approval-ack-always-approved",
         "channel-telegram-approval-ack-denied",
+        "channel-telegram-approval-ack-not-accepted",
         "channel-telegram-approval-ack-unknown",
         "channel-discord-approval-btn-allow-once",
         "channel-discord-approval-btn-allow-session",
@@ -1732,6 +1839,11 @@ mod tests {
                 "Always approved",
             ),
             ("channel-telegram-approval-ack-denied", &[], "Denied"),
+            (
+                "channel-telegram-approval-ack-not-accepted",
+                &[],
+                "Approval not accepted",
+            ),
             (
                 "channel-telegram-approval-ack-unknown",
                 &[],

@@ -954,6 +954,10 @@ impl OpenAiCompatibleModelProvider {
         })
     }
 
+    fn models_url(&self) -> String {
+        format!("{}/models", self.base_url)
+    }
+
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
     /// This allows custom model_providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
@@ -2834,7 +2838,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // servers with a public catalog use the same path without an Authorization header.
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
-            let url = format!("{}/models", self.base_url);
+            let url = self.models_url();
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
@@ -2925,7 +2929,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // endpoint — this returns pricing data that we can capture.
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
-            let url = format!("{}/models", self.base_url);
+            let url = self.models_url();
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
@@ -3936,14 +3940,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit the appropriate URL with a GET to prime the connection pool.
-        // The server will likely return 405 Method Not Allowed, which is fine.
-        let url = self.chat_completions_url();
+        // Probe the catalog without invoking inference. Unsupported endpoints are
+        // still useful for connection warmup, so do not reject HTTP error statuses.
+        let url = self.models_url();
         let credential = self.resolve_credential().await?;
-        let _ = self
+        let mut response = self
             .apply_auth_header(self.http_client().get(&url), credential.as_deref())
             .send()
             .await?;
+        // Drain without retaining the catalog so HTTP/1 connections can be reused.
+        while response.chunk().await?.is_some() {}
         Ok(())
     }
 }
@@ -7022,6 +7028,128 @@ mod tests {
         assert_eq!(
             model_provider.reasoning_effort_for_model("llama-3.3-70b"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_uses_models_endpoint_with_existing_auth() {
+        use axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tokio::net::TcpListener;
+
+        for (base_path, status, auth_style, credential, header) in [
+            (
+                "",
+                200,
+                AuthStyle::Bearer,
+                Some("test-key"),
+                Some(("authorization", "Bearer test-key")),
+            ),
+            (
+                "/v1",
+                401,
+                AuthStyle::Bearer,
+                Some("test-key"),
+                Some(("authorization", "Bearer test-key")),
+            ),
+            (
+                "/v1/",
+                404,
+                AuthStyle::XApiKey,
+                Some("test-key"),
+                Some(("x-api-key", "test-key")),
+            ),
+            (
+                "/custom/api",
+                405,
+                AuthStyle::Custom("x-provider-key".into()),
+                Some("test-key"),
+                Some(("x-provider-key", "test-key")),
+            ),
+            ("/v1", 500, AuthStyle::Bearer, None, None),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let app = Router::new().fallback(move |request: Request<Body>| {
+                let tx = tx.clone();
+                async move {
+                    tx.send((
+                        request.method().clone(),
+                        request.uri().path().to_owned(),
+                        request.headers().clone(),
+                    ))
+                    .await
+                    .unwrap();
+                    (StatusCode::from_u16(status).unwrap(), "probe body")
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url(&format!("http://{addr}{base_path}"))
+                .credential(credential)
+                .auth_style(auth_style)
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-probe-test".into(),
+                    "preserved".into(),
+                )]))
+                .api_path((status == 500).then(|| "/inference".to_string()))
+                .build();
+            let result = provider.warmup().await;
+            server.abort();
+            assert!(
+                result.is_ok(),
+                "HTTP {status} must not fail warmup: {result:?}"
+            );
+            let (method, path, headers) = rx.recv().await.unwrap();
+            assert_eq!(method, "GET");
+            assert_eq!(headers.get("x-probe-test").unwrap(), "preserved");
+            assert_eq!(path, format!("{}/models", base_path.trim_end_matches('/')));
+            if let Some((name, value)) = header {
+                assert_eq!(headers.get(name).unwrap(), value);
+            } else {
+                assert!(!headers.contains_key("authorization"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_drains_response_with_configured_timeout() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+        };
+        let app = Router::new().fallback(|| async {
+            Body::from_stream(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok::<_, std::io::Error>(Bytes::from_static(b"catalog"))
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .timeout_secs(1)
+            .build();
+        let result = provider.warmup().await;
+        server.abort();
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<reqwest::Error>()
+                .unwrap()
+                .is_timeout()
         );
     }
 
