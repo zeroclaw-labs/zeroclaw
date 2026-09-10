@@ -1537,6 +1537,11 @@ fn combine_response_usage(response: &mut ChatResponse, prior_attempts: Option<To
 enum ReliableModelProviderEntryProvider {
     Direct(Box<dyn ModelProvider>),
     Pinned(crate::model_pin::ModelPinnedProvider),
+    #[cfg(test)]
+    DispatchObservedPinned {
+        pinned_model: String,
+        provider: Box<dyn ModelProvider>,
+    },
 }
 
 impl ReliableModelProviderEntryProvider {
@@ -1544,6 +1549,8 @@ impl ReliableModelProviderEntryProvider {
         match self {
             Self::Direct(provider) => provider.as_ref(),
             Self::Pinned(provider) => provider,
+            #[cfg(test)]
+            Self::DispatchObservedPinned { provider, .. } => provider.as_ref(),
         }
     }
 
@@ -1551,6 +1558,8 @@ impl ReliableModelProviderEntryProvider {
         match self {
             Self::Direct(_) => requested_model,
             Self::Pinned(provider) => provider.pinned_model(),
+            #[cfg(test)]
+            Self::DispatchObservedPinned { pinned_model, .. } => pinned_model,
         }
     }
 }
@@ -1617,6 +1626,26 @@ impl ReliableModelProviderEntry {
                     .inner(inner)
                     .build(),
             ),
+        }
+    }
+
+    /// Build a test-only pinned entry whose provider observes Reliable's dispatch argument.
+    #[cfg(test)]
+    fn new_dispatch_observed_pinned(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        pinned_model: impl Into<String>,
+        provider: Box<dyn ModelProvider>,
+    ) -> Self {
+        let cooldown_key = cooldown_key.into();
+        Self {
+            display_name: display_name.into(),
+            candidate_name: cooldown_key.clone(),
+            cooldown_key,
+            provider: ReliableModelProviderEntryProvider::DispatchObservedPinned {
+                pinned_model: pinned_model.into(),
+                provider,
+            },
         }
     }
 
@@ -3288,7 +3317,7 @@ impl ModelProvider for ReliableModelProvider {
                 served_model.clone(),
                 ProviderDispatch::from_ref(model_provider).stream_chat(
                     req,
-                    &current_model,
+                    &served_model,
                     temperature,
                     options,
                 ),
@@ -3378,7 +3407,7 @@ impl ModelProvider for ReliableModelProvider {
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_system(
                     system_prompt,
                     message,
-                    &current_model,
+                    &served_model,
                     temperature,
                     options,
                 ),
@@ -3459,7 +3488,7 @@ impl ModelProvider for ReliableModelProvider {
                 served_model.clone(),
                 ProviderDispatch::from_ref(model_provider).stream_chat_with_history(
                     messages,
-                    &current_model,
+                    &served_model,
                     temperature,
                     options,
                 ),
@@ -8821,6 +8850,7 @@ mod tests {
 
     struct StreamingRecordMock {
         stream_calls: Arc<AtomicUsize>,
+        observed_models: Option<Arc<Mutex<Vec<String>>>>,
         supports: bool,
         mode: StreamingRecordMode,
     }
@@ -8899,6 +8929,7 @@ mod tests {
         fn success(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: true,
                 mode: StreamingRecordMode::Success,
             }
@@ -8907,6 +8938,7 @@ mod tests {
         fn unsupported(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: false,
                 mode: StreamingRecordMode::Success,
             }
@@ -8915,6 +8947,7 @@ mod tests {
         fn error(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: true,
                 mode: StreamingRecordMode::Error,
             }
@@ -8923,13 +8956,37 @@ mod tests {
         fn usage_then_error(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
+                observed_models: None,
                 supports: true,
                 mode: StreamingRecordMode::UsageThenError,
             }
         }
 
+        /// Creates a failing stream that records the model received from ProviderDispatch.
+        fn observed_error(
+            stream_calls: Arc<AtomicUsize>,
+            observed_models: Arc<Mutex<Vec<String>>>,
+        ) -> Self {
+            Self {
+                stream_calls,
+                observed_models: Some(observed_models),
+                supports: true,
+                mode: StreamingRecordMode::Error,
+            }
+        }
+
         fn stream_error() -> crate::traits::StreamError {
             crate::traits::StreamError::ModelProvider("stream failed".to_string())
+        }
+
+        /// Records the model argument before the mock emits its configured stream result.
+        fn record_model(&self, model: &str) {
+            if let Some(observed_models) = &self.observed_models {
+                observed_models
+                    .lock()
+                    .expect("observed model lock must remain available")
+                    .push(model.to_string());
+            }
         }
     }
 
@@ -8984,11 +9041,12 @@ mod tests {
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_model(model);
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamEvent::TextDelta(StreamChunk::delta("streamed"))),
@@ -9012,11 +9070,12 @@ mod tests {
             &self,
             _system_prompt: Option<&str>,
             _message: &str,
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_model(model);
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamChunk::delta("streamed")),
@@ -9033,11 +9092,12 @@ mod tests {
         fn stream_chat_with_history(
             &self,
             _messages: &[ChatMessage],
-            _model: &str,
+            model: &str,
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            self.record_model(model);
             match self.mode {
                 StreamingRecordMode::Success => stream::iter(vec![
                     Ok(StreamChunk::delta("streamed")),
@@ -9186,6 +9246,32 @@ mod tests {
                     "fallback",
                     "fallback.key",
                     "fallback-alias",
+                    "model-served",
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        )
+    }
+
+    /// Builds a pinned fallback whose inner mock sees Reliable's dispatch model unchanged.
+    fn reliable_with_dispatch_observed_pinned_fallback(
+        primary_calls: Arc<AtomicUsize>,
+        fallback: StreamingRecordMock,
+    ) -> ReliableModelProvider {
+        ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "primary",
+                    "primary.key",
+                    Box::new(StreamingRecordMock::unsupported(primary_calls))
+                        as Box<dyn ModelProvider>,
+                ),
+                ReliableModelProviderEntry::new_dispatch_observed_pinned(
+                    "fallback",
+                    "fallback.key",
                     "model-served",
                     Box::new(fallback) as Box<dyn ModelProvider>,
                 ),
@@ -9412,6 +9498,56 @@ mod tests {
         assert!(
             fallback.is_none(),
             "usage before a stream error must remain provisional"
+        );
+    }
+
+    /// Protects the Reliable-to-dispatch model handoff for all three stream entry points.
+    #[tokio::test]
+    async fn pinned_stream_failures_dispatch_the_served_model_for_every_entry_point() {
+        let observed_models = Arc::new(Mutex::new(Vec::new()));
+        let model_provider = reliable_with_dispatch_observed_pinned_fallback(
+            Arc::new(AtomicUsize::new(0)),
+            StreamingRecordMock::observed_error(
+                Arc::new(AtomicUsize::new(0)),
+                Arc::clone(&observed_models),
+            ),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let mut structured = model_provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "model-requested",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        assert!(structured.next().await.unwrap().is_err());
+
+        let mut system = model_provider.stream_chat_with_system(
+            Some("system"),
+            "hello",
+            "model-requested",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        assert!(system.next().await.unwrap().is_err());
+
+        let mut history = model_provider.stream_chat_with_history(
+            &messages,
+            "model-requested",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+        assert!(history.next().await.unwrap().is_err());
+
+        assert_eq!(
+            *observed_models
+                .lock()
+                .expect("observed model lock must remain available"),
+            vec!["model-served"; 3],
         );
     }
 

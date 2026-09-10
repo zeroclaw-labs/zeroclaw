@@ -136,14 +136,14 @@ fn t(key: &str, fallback: &str) -> String {
 
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
-fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        fallback.into() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
@@ -5739,7 +5739,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 ta(
                                     "cli-pairing-fetch-failed",
                                     &[("endpoint", &endpoint)],
-                                    &format!(
+                                    format!(
                                         "❌ Failed to fetch pairing code from gateway at {endpoint}"
                                     ),
                                 )
@@ -6683,8 +6683,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let summary: Vec<String> = agent_aliases
                     .iter()
                     .map(|alias| match config.risk_profile_for_agent(alias) {
-                        Some(p) => format!("{alias}={:?}", p.level),
-                        None => format!("{alias}=<no risk_profile>"),
+                        Some(p) => {
+                            let level = format!("{:?}", p.level);
+                            let fallback = format!("{alias}={level}");
+                            ta(
+                                "cli-status-agent-risk-profile",
+                                &[("alias", alias), ("level", &level)],
+                                &fallback,
+                            )
+                        }
+                        None => {
+                            let fallback = format!("{alias}=<no risk_profile>");
+                            ta(
+                                "cli-status-agent-no-risk-profile-summary",
+                                &[("alias", alias)],
+                                &fallback,
+                            )
+                        }
                     })
                     .collect();
                 println!(
@@ -6710,6 +6725,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
+            }
+            #[cfg(feature = "gateway")]
+            {
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
+                }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
@@ -6875,6 +6917,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -6924,15 +7024,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 } else {
                     t("cli-status-word-not-configured", "not configured")
                 };
-                println!(
-                    "  {:9} {}",
-                    entry.name,
-                    if entry.configured {
-                        format!("✅ {}", channel_status)
-                    } else {
-                        format!("❌ {}", channel_status)
-                    }
-                );
+                let status = if entry.configured {
+                    ta(
+                        "cli-status-channel-configured",
+                        &[("status", &channel_status)],
+                        format!("✅ {channel_status}"),
+                    )
+                } else {
+                    ta(
+                        "cli-status-channel-not-configured",
+                        &[("status", &channel_status)],
+                        format!("❌ {channel_status}"),
+                    )
+                };
+                println!("  {:9} {}", entry.name, status);
             }
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
@@ -6945,14 +7050,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                 );
                 for entry in &uncompiled {
-                    println!(
-                        "  {:9} {}",
-                        entry.name,
-                        t(
-                            "cli-status-channel-not-compiled",
-                            "🚫 configured, not compiled"
-                        )
+                    let status = t(
+                        "cli-status-channel-not-compiled",
+                        "🚫 configured, not compiled",
                     );
+                    println!("  {:9} {}", entry.name, status);
                 }
                 println!(
                     "{}",
