@@ -10052,7 +10052,7 @@ path = "{trigger_path}"
     #[cfg(feature = "channel-sendblue")]
     fn sendblue_secret_headers(secret: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("x-sendblue-secret", secret.parse().unwrap());
+        headers.insert("sb-signing-secret", secret.parse().unwrap());
         headers
     }
 

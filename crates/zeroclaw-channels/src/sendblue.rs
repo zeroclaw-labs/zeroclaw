@@ -495,16 +495,23 @@ impl Channel for SendblueChannel {
 
 /// Verify an inbound Sendblue webhook against the configured shared secret.
 ///
-/// Sendblue does not sign webhook deliveries — there is no HMAC scheme and no
-/// timestamp to bind, so unlike Linq or WhatsApp there is nothing to
-/// recompute. The only credential available is a shared secret the operator
-/// configures on both ends, presented in a header. Accept the header names
-/// Sendblue's dashboard can be configured to send, compare in constant time,
-/// and refuse anything else.
+/// Sendblue does not sign message webhooks. Rather than an HMAC over the body,
+/// it **echoes the configured secret verbatim** in the `sb-signing-secret`
+/// header, so unlike Linq or WhatsApp there is nothing to recompute — the only
+/// available check is a constant-time comparison against the secret the
+/// operator registered with the webhook.
 ///
-/// This is weaker than a signature: it does not bind the secret to the request
-/// body, so a captured header can be replayed with a forged body. Deploy the
-/// endpoint over TLS.
+/// (Sendblue's separate Verify product does sign, with
+/// `X-Sendblue-Signature: t=…,v1=HMAC_SHA256(secret, "<t>.<raw body>")`. That
+/// is a different webhook type and is not what a message channel receives.)
+///
+/// This is weaker than a signature: the secret is not bound to the request
+/// body, so a captured header can be replayed with forged content. Sendblue
+/// enforces HTTPS on webhook URLs, which is what keeps the header off the
+/// wire; do not terminate the route on plain HTTP.
+///
+/// `x-webhook-secret` is accepted as a fallback for proxies that rename the
+/// header on the way in.
 pub fn verify_sendblue_secret(secret: &str, headers: &reqwest::header::HeaderMap) -> bool {
     use zeroclaw_config::pairing::constant_time_eq;
 
@@ -512,7 +519,7 @@ pub fn verify_sendblue_secret(secret: &str, headers: &reqwest::header::HeaderMap
         return false;
     }
 
-    const SECRET_HEADERS: &[&str] = &["x-sendblue-secret", "x-webhook-secret"];
+    const SECRET_HEADERS: &[&str] = &["sb-signing-secret", "x-webhook-secret"];
 
     for name in SECRET_HEADERS {
         if let Some(value) = headers.get(*name).and_then(|v| v.to_str().ok()) {
@@ -520,18 +527,6 @@ pub fn verify_sendblue_secret(secret: &str, headers: &reqwest::header::HeaderMap
             if !presented.is_empty() && constant_time_eq(presented, secret) {
                 return true;
             }
-        }
-    }
-
-    // `Authorization: Bearer <secret>` is what Sendblue's dashboard emits when
-    // the webhook is configured with an auth header rather than a custom one.
-    if let Some(value) = headers
-        .get(reqwest::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        let presented = value.trim().strip_prefix("Bearer ").unwrap_or("").trim();
-        if !presented.is_empty() && constant_time_eq(presented, secret) {
-            return true;
         }
     }
 
@@ -685,18 +680,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_custom_secret_header() {
+    fn accepts_sendblues_own_signing_secret_header() {
+        // `sb-signing-secret` is the header Sendblue actually sends; getting
+        // this name wrong rejects every genuine delivery.
         assert!(verify_sendblue_secret(
             "s3cret",
-            &headers_with("x-sendblue-secret", "s3cret")
+            &headers_with("sb-signing-secret", "s3cret")
         ));
     }
 
     #[test]
-    fn accepts_a_bearer_secret() {
+    fn accepts_a_renamed_header_from_a_proxy() {
         assert!(verify_sendblue_secret(
             "s3cret",
-            &headers_with("authorization", "Bearer s3cret")
+            &headers_with("x-webhook-secret", "s3cret")
         ));
     }
 
@@ -704,7 +701,17 @@ mod tests {
     fn rejects_a_wrong_secret() {
         assert!(!verify_sendblue_secret(
             "s3cret",
-            &headers_with("x-sendblue-secret", "nope")
+            &headers_with("sb-signing-secret", "nope")
+        ));
+    }
+
+    #[test]
+    fn rejects_a_bearer_token_that_is_not_the_secret_header() {
+        // Sendblue does not authenticate with `Authorization`; accepting it
+        // would widen the surface for no reason.
+        assert!(!verify_sendblue_secret(
+            "s3cret",
+            &headers_with("authorization", "Bearer s3cret")
         ));
     }
 
@@ -719,7 +726,7 @@ mod tests {
     #[test]
     fn rejects_an_empty_configured_secret() {
         assert!(
-            !verify_sendblue_secret("", &headers_with("x-sendblue-secret", "")),
+            !verify_sendblue_secret("", &headers_with("sb-signing-secret", "")),
             "an unset secret must never authenticate a request"
         );
     }

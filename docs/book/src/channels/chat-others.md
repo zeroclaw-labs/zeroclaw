@@ -48,17 +48,38 @@ inclusive, so the boundary message is de-duplicated on its `message_handle`.
 
 ### Inbound: webhook (opt-in)
 
-Set `poll_interval_secs = 0` and a `signing_secret`, then point the Sendblue
-dashboard at the gateway's `POST /sendblue[/<alias>]` route.
+Set `poll_interval_secs = 0` and a `signing_secret`, then register the
+gateway's `POST /sendblue[/<alias>]` route with Sendblue. Registration is an
+API call, not a dashboard step, and uses the same credentials the channel
+already holds:
 
-> **No signature scheme.** Sendblue does not sign webhook deliveries: there is
-> no HMAC and no timestamp to bind, so the gateway can only compare a shared
-> secret presented in a header (`X-Sendblue-Secret`, `X-Webhook-Secret`, or
-> `Authorization: Bearer …`). That secret is not bound to the request body, so
-> a captured header can be replayed with forged content — terminate the
-> endpoint over TLS. With `signing_secret` unset the route refuses inbound
-> requests with `401` rather than accepting them unauthenticated. Prefer
-> polling unless you need push latency.
+```bash
+curl -X POST https://api.sendblue.com/api/account/webhooks \
+  -H "sb-api-key-id: $SB_API_KEY_ID" \
+  -H "sb-api-secret-key: $SB_API_SECRET_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "receive",
+    "webhooks": [
+      { "url": "https://your-gateway.example.com/sendblue/main",
+        "secret": "<same value as signing_secret>" }
+    ]
+  }'
+```
+
+> **No signature scheme.** Sendblue does not sign message webhooks. Instead of
+> an HMAC over the body it **echoes the configured secret verbatim** in the
+> `sb-signing-secret` header, so the gateway can only compare that value; there
+> is nothing to recompute. Because the secret is not bound to the request body,
+> a captured header can be replayed with forged content. Sendblue enforces
+> HTTPS on webhook URLs, which is what keeps the header off the wire — do not
+> terminate the route on plain HTTP. With `signing_secret` unset the route
+> refuses inbound requests with `401` rather than accepting them
+> unauthenticated. Prefer polling unless you need push latency.
+>
+> Sendblue's separate Verify product *does* sign
+> (`X-Sendblue-Signature: t=…,v1=…`), but that is a different webhook type and
+> is not what a message channel receives.
 
 ### Both modes
 

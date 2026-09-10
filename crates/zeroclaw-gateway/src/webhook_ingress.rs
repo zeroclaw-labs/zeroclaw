@@ -196,7 +196,7 @@ pub(crate) static SENDBLUE_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     credential: CredentialPolicy::Required {
         display: "signing_secret",
     },
-    signature_header: Some("X-Sendblue-Secret"),
+    signature_header: Some("sb-signing-secret"),
     session_key: Some(SessionKeyPolicy::AliasSenderSanitized),
     #[cfg(test)]
     dispatch_routes: &["/sendblue", "/sendblue/{alias}"],
