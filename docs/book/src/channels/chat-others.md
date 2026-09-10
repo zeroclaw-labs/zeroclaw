@@ -20,6 +20,40 @@ iMessage is bridged through the Linq Partner API (`[channels.linq.<alias>]`):
 
 **macOS-only** and requires either Linq as a third-party relay, or direct AppleScript automation (experimental, requires Full Disk Access and Accessibility grants).
 
+## Sendblue (iMessage/SMS, any OS)
+
+Sendblue (`[channels.sendblue.<alias>]`) is a hosted iMessage/SMS relay, so
+unlike the AppleScript bridge it needs no Mac and runs on any host.
+
+```toml
+[channels.sendblue.main]
+enabled = true
+api_key_id = "…"        # sb-api-key-id
+api_secret_key = "…"    # sb-api-secret-key
+from_number = "+15550000000"
+signing_secret = "…"    # shared secret presented by inbound webhooks
+```
+
+Outbound goes to `POST https://api.sendblue.com/api/send-message`. Inbound
+arrives at the gateway's `POST /sendblue[/<alias>]` route; point the webhook at
+that URL in the Sendblue dashboard.
+
+Senders are gated by the channel's peer group, matched literally against the
+E.164 number. A handle arriving without its leading `+` is normalized before
+the check, so both forms match one allowlist entry.
+
+> **No signature scheme.** Sendblue does not sign webhook deliveries: there is
+> no HMAC and no timestamp to bind, so the gateway can only compare a shared
+> secret presented in a header (`X-Sendblue-Secret`, `X-Webhook-Secret`, or
+> `Authorization: Bearer …`). That secret is not bound to the request body, so
+> a captured header can be replayed with forged content — terminate the
+> endpoint over TLS. With `signing_secret` unset the gateway refuses inbound
+> requests with `401` rather than accepting them unauthenticated.
+
+Sendblue posts delivery receipts for the bot's own sends on the same webhook as
+inbound traffic. Those carry `is_outbound: true` and are acknowledged without
+dispatch, so the agent does not answer itself.
+
 ## WeChat personal iLink Bot (微信个人号 iLink)
 
 WeChat personal iLink Bot uses QR-code login against the iLink Bot API for personal WeChat conversations.

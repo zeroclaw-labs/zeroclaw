@@ -145,6 +145,11 @@
           - "src/channels/linq.rs"
           - "crates/zeroclaw-channels/src/linq.rs"
 
+"channel:sendblue":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "crates/zeroclaw-channels/src/sendblue.rs"
+
 "channel:matrix":
   - changed-files:
       - any-glob-to-any-file:

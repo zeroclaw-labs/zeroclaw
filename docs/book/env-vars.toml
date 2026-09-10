@@ -75,6 +75,11 @@ value = "..."
 group = "example"
 
 [[var]]
+path = "channels.sendblue.home.signing_secret"
+value = "..."
+group = "example"
+
+[[var]]
 path = "channels.nextcloud_talk.home.webhook_secret"
 value = "..."
 group = "example"

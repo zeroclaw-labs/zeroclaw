@@ -892,6 +892,20 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             subject: None,
             ..Default::default()
         },
+        "sendblue" => ChannelMessage {
+            id: "sb_1".into(),
+            sender: "+15551112222".into(),
+            reply_target: "+15551112222".into(),
+            content: "hi".into(),
+            channel: "sendblue".into(),
+            channel_alias: None,
+            timestamp: 1700000000,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
             sender: "user".into(),
@@ -925,6 +939,7 @@ const ALL_PLATFORMS: &[&str] = &[
     "dingtalk",
     "qq",
     "linq",
+    "sendblue",
     "cli",
 ];
 
@@ -988,7 +1003,7 @@ fn channel_platforms_have_distinct_sender_and_reply_target() {
 #[test]
 fn dm_platforms_have_same_sender_and_reply_target() {
     let dm_platforms = [
-        "telegram", "imessage", "email", "signal", "whatsapp", "cli", "linq", "wecom",
+        "telegram", "imessage", "email", "signal", "whatsapp", "cli", "linq", "sendblue", "wecom",
     ];
 
     for platform in &dm_platforms {
@@ -1332,6 +1347,7 @@ async fn capability_matrix_spec() {
         "qq",
         "wecom",
         "linq",
+        "sendblue",
         "nextcloud_talk",
     ] {
         let ch = MatrixTestChannel::new(name);

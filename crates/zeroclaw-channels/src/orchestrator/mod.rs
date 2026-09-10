@@ -51,6 +51,8 @@ pub use crate::notion::NotionChannel;
 pub use crate::qq::QQChannel;
 #[cfg(feature = "channel-reddit")]
 pub use crate::reddit::RedditChannel;
+#[cfg(feature = "channel-sendblue")]
+pub use crate::sendblue::SendblueChannel;
 #[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
 #[cfg(feature = "channel-slack")]
@@ -9065,7 +9067,8 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            linq, sendblue, email, gmail_push, git, irc, twitter, mochat, imessage, line, \
+            voice-call"
         )
     }
 }
@@ -9630,6 +9633,54 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-linq"))]
         x if x.starts_with("linq") => {
             anyhow::bail!("Linq channel requires the `channel-linq` feature");
+        }
+        #[cfg(feature = "channel-sendblue")]
+        "sendblue" => {
+            let sb = config
+                .channels
+                .sendblue
+                .get("default")
+                .context("Sendblue channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+            };
+            Ok(Arc::new(SendblueChannel::new(
+                sb.api_key_id.clone(),
+                sb.api_secret_key.clone(),
+                sb.from_number.clone(),
+                alias,
+                peer_resolver,
+            )))
+        }
+        #[cfg(feature = "channel-sendblue")]
+        x if x.starts_with("sendblue.") => {
+            let alias = x
+                .strip_prefix("sendblue.")
+                .context("invalid sendblue channel id")?;
+            let sb = config
+                .channels
+                .sendblue
+                .get(alias)
+                .with_context(|| format!("Sendblue alias '{alias}' not configured"))?;
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.to_string();
+                Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+            };
+            Ok(Arc::new(SendblueChannel::new(
+                sb.api_key_id.clone(),
+                sb.api_secret_key.clone(),
+                sb.from_number.clone(),
+                alias.to_string(),
+                peer_resolver,
+            )))
+        }
+        #[cfg(not(feature = "channel-sendblue"))]
+        x if x.starts_with("sendblue") => {
+            anyhow::bail!("Sendblue channel requires the `channel-sendblue` feature");
         }
         #[cfg(feature = "channel-email")]
         "email" => {
@@ -11003,6 +11054,43 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Linq channel is configured but this build was compiled without \
              `channel-linq`; skipping Linq."
+        );
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    for (alias, sb) in &config.channels.sendblue {
+        if !active_channel_aliases.contains(&format!("sendblue.{alias}")) {
+            continue;
+        }
+        if !sb.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Sendblue",
+            alias: Some(alias.clone()),
+            channel: Arc::new(SendblueChannel::new(
+                sb.api_key_id.clone(),
+                sb.api_secret_key.clone(),
+                sb.from_number.clone(),
+                alias.clone(),
+                peer_resolver,
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-sendblue"))]
+    if !config.channels.sendblue.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Sendblue channel is configured but this build was compiled without \
+             `channel-sendblue`; skipping Sendblue."
         );
     }
 

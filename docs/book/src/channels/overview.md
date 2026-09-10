@@ -40,6 +40,7 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
 | WeCom (Bot Webhook / AI Bot WS) | `channel-wecom`, `channel-wecom-ws` | [Other chat platforms](./chat-others.md) |
+| Sendblue (iMessage/SMS) | `channel-sendblue` | [Other chat platforms](./chat-others.md#sendblue-imessagesms-any-os) |
 | iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
