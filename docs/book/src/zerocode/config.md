@@ -13,6 +13,10 @@ instruction to open the file in an editor. Hand editing is a fallback for
 headless hosts and scripted provisioning, where the docs call it out
 explicitly.
 
+## Keybinding modifiers
+
+Keybindings use canonical modifier names: `control` is literal Control, `primary` is Command on macOS and Control elsewhere, and `super` is literal Super/Command. For example, `control+c`, `primary+r`, and `alt+shift+up` are portable persisted values. Older `ctrl+...` values are migrated once when the config loads and rewritten to the corresponding canonical spelling.
+
 ## Why the pane over the file
 
 - **Validation.** Controls reject malformed values before they reach the
@@ -44,9 +48,25 @@ width = 32               # side-panel target column width (left/right)
 max_height = 5           # bottom-strip maximum height in rows
 ```
 
-Values are re-read at every session boundary, so an edit made in the Config pane
-applies to the next session you start, restart, or switch to, with no zerocode
-restart needed.
+The shell-level agent sidebar is stored in the same file. The default section
+is serialized explicitly so environment overrides have a schema node to
+target:
+
+```toml
+[sidebar]
+visible = true # show the agent/session sidebar at launch
+width = 24     # target width in terminal columns
+```
+
+Press `Ctrl+B` to show or hide the sidebar. Quickstart remains reachable from
+the keyboard mode bar and also appears as a sidebar launcher, including at
+narrow terminal widths. Selecting an existing agent from the sidebar starts a
+new Chat or Code session without replacing the other sessions already tracked
+by that pane.
+
+TodoWrite values are re-read at every session boundary, so an edit made in the
+Config pane applies to the next session you start, restart, or switch to, with
+no zerocode restart needed.
 
 ### Environment overrides
 
@@ -57,6 +77,7 @@ as `__`:
 ```sh
 ZEROCODE_todotracker__enabled=false zerocode
 ZEROCODE_todotracker__location=bottom zerocode
+ZEROCODE_sidebar__visible=false zerocode
 ```
 
 These overrides are process-transient: they affect the running instance only and

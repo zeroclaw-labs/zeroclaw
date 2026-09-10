@@ -74,6 +74,15 @@ pub struct RpcSession {
     pub generation: u64,
 }
 
+/// Canonical live-session data returned when `session/new` reattaches to an
+/// ID that is already present in the process-local session store.
+pub struct ResumedRpcSession {
+    pub agent: Arc<Mutex<Agent>>,
+    pub agent_alias: String,
+    pub workspace_dir: String,
+    pub message_count: usize,
+}
+
 impl RpcSession {
     pub fn new(
         agent: Agent,
@@ -111,6 +120,9 @@ type GatedOpPause = (
     Arc<tokio::sync::Notify>,
 );
 
+#[cfg(test)]
+type PromptRegistrationPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
     #[cfg(test)]
@@ -130,6 +142,43 @@ pub struct SessionStore {
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
+    /// Test-only pause immediately after a prompt registers its cancellation
+    /// token. Removal-race tests use this to issue close/kill/delete while the
+    /// prompt owns admission but before any fallible setup or provider work.
+    #[cfg(test)]
+    test_prompt_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+}
+
+/// Generation-owned handle for the canonical cancellation-token registration.
+///
+/// The token map in [`SessionStore`] remains the source of truth. This handle
+/// only guarantees that the exact generation installed by one admitted prompt
+/// is removed on every exit path, including setup failures before provider
+/// execution starts.
+pub(crate) struct CancelTokenRegistration<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    generation: Option<u64>,
+}
+
+impl CancelTokenRegistration<'_> {
+    /// Drain the turn's cancellation attribution before unregistering the
+    /// token. `remove_cancel_token` intentionally clears any leftover cause.
+    pub(crate) fn finish(mut self) -> Option<CancelCause> {
+        let cause = self.store.take_cancel_cause(self.session_id);
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(self.session_id, generation);
+        }
+        cause
+    }
+}
+
+impl Drop for CancelTokenRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            self.store.remove_cancel_token(self.session_id, generation);
+        }
+    }
 }
 
 impl SessionStore {
@@ -146,6 +195,8 @@ impl SessionStore {
             session_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_prompt_registration_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -161,6 +212,69 @@ impl SessionStore {
         session.generation = generation;
         sessions.insert(id, session);
         Ok(())
+    }
+
+    /// Publish a newly constructed session only when no live incarnation is
+    /// already present. `session/new` uses this at the external boundary so
+    /// two concurrent resume requests cannot replace one another.
+    pub async fn insert_if_absent(
+        &self,
+        id: String,
+        mut session: RpcSession,
+    ) -> Result<(), &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&id) {
+            return Err("session already exists");
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err("session limit reached");
+        }
+        let generation = self
+            .session_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        session.generation = generation;
+        sessions.insert(id, session);
+        Ok(())
+    }
+
+    /// Rebind a caller to the canonical live session without replacing its
+    /// `Agent`. A supplied session ID is a resume selector: when the live
+    /// incarnation already exists, rebuilding it would fork provider history
+    /// from an in-flight predecessor turn.
+    pub async fn resume_existing(
+        &self,
+        id: &str,
+        agent_alias: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        owner_tui_id: Option<String>,
+    ) -> Result<Option<ResumedRpcSession>, &'static str> {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return Ok(None);
+        };
+        if session.agent_alias != agent_alias {
+            return Err("session belongs to a different agent");
+        }
+        if &session.chat_mode != chat_mode {
+            return Err("session uses a different chat mode");
+        }
+
+        if owner_tui_id.is_some() {
+            session.owner_tui_id = owner_tui_id;
+        }
+        session.last_active = Instant::now();
+        let message_count = session
+            .agent
+            .try_lock()
+            .map(|agent| agent.history().len())
+            .unwrap_or_default();
+        Ok(Some(ResumedRpcSession {
+            agent: Arc::clone(&session.agent),
+            agent_alias: session.agent_alias.clone(),
+            workspace_dir: session.workspace_dir.clone(),
+            message_count,
+        }))
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -366,10 +480,11 @@ impl SessionStore {
     /// box from config, keeping model_provider-build logic out of the store.
     ///
     /// `generation` must match the session's current generation (captured
-    /// before the caller built the provider box). If the session was replaced
-    /// under the same ID — e.g. by `session/new` or ACP rehydration — while
-    /// the provider was being built, the generations won't match and this
-    /// call becomes a no-op (returns `false`).
+    /// before the caller built the provider box). If the session was removed
+    /// and recreated or replaced by ACP rehydration while the provider was
+    /// being built, the generations won't match and this call becomes a no-op
+    /// (returns `false`). Live same-ID `session/new` requests resume the
+    /// existing incarnation.
     ///
     /// When `temperature` is `Some(v)`, the captured agent's temperature is
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
@@ -617,6 +732,44 @@ impl SessionStore {
         generation
     }
 
+    pub(crate) fn register_cancel_token_guard<'a>(
+        &'a self,
+        id: &'a str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> CancelTokenRegistration<'a> {
+        CancelTokenRegistration {
+            store: self,
+            session_id: id,
+            generation: Some(self.register_cancel_token(id, token)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {
+        let (entered, release) = {
+            let guard = self.test_prompt_registration_pause.lock().unwrap();
+            match &*guard {
+                Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
+                None => return,
+            }
+        };
+        entered.notify_one();
+        release.notified().await;
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn wait_test_prompt_registration_pause(&self) {}
+
+    #[cfg(test)]
+    pub(crate) fn set_test_prompt_registration_pause(&self) -> PromptRegistrationPause {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.test_prompt_registration_pause.lock().unwrap() =
+            Some((Arc::clone(&entered), Arc::clone(&release)));
+        (entered, release)
+    }
+
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
         {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -634,13 +787,29 @@ impl SessionStore {
     }
 
     pub fn cancel_session(&self, id: &str) -> bool {
-        self.record_cancel_cause(id, CancelCause::ClientRpc);
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.signal_cancellation(id, CancelCause::ClientRpc)
+    }
+
+    /// Signal an in-flight turn before a close/delete handler waits for the
+    /// session admission permit. The handler removes the session only after
+    /// the admitted prompt has finalized under its original incarnation.
+    pub fn signal_session_removal(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::SessionRemoved)
+    }
+
+    /// Signal an in-flight turn before an administrative kill waits for the
+    /// session admission permit.
+    pub fn signal_session_kill(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::AdminKill)
+    }
+
+    fn signal_cancellation(&self, id: &str, cause: CancelCause) -> bool {
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        tokens
             .get(id)
-            .map(|(_, t)| {
-                t.cancel();
+            .map(|(_, token)| {
+                self.record_cancel_cause(id, cause);
+                token.cancel();
                 true
             })
             .unwrap_or(false)
@@ -652,6 +821,17 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(id)
+    }
+
+    /// Generation of the runtime-owned turn currently executing for a
+    /// session. This is the authoritative live-turn identity for RPC status;
+    /// persisted session metadata is not updated on every RPC turn.
+    pub fn inflight_turn_generation(&self, id: &str) -> Option<u64> {
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .map(|(generation, _)| *generation)
     }
 
     pub async fn kill_session(&self, id: &str) -> bool {

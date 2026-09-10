@@ -18,6 +18,12 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     /// Calculated cost in USD
     pub cost_usd: f64,
+    /// Token-bearing dimensions that had no valid resolved price when this
+    /// record was created. This is the canonical exposure count for new rows;
+    /// `pricing_available` remains as a compatibility projection for older
+    /// ledgers written before dimension-level provenance existed.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub unpriced_tokens: u64,
     #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
     pub pricing_available: bool,
     /// Timestamp of the request
@@ -108,6 +114,7 @@ impl TokenUsage {
             cached_input_tokens,
             total_tokens,
             cost_usd,
+            unpriced_tokens: 0,
             pricing_available: true,
             timestamp: chrono::Utc::now(),
         }
@@ -135,8 +142,16 @@ pub struct CostRecord {
     pub id: String,
     /// Token usage details
     pub usage: TokenUsage,
-    /// Session identifier (for grouping)
+    /// Tracker identifier: one random UUID per daemon process, grouping every
+    /// record this daemon emits. This is NOT the chat session — attribute
+    /// per-conversation spend through `conversation_id`.
     pub session_id: String,
+    /// Chat-session identifier (the runtime session key scoped around the
+    /// turn), so per-conversation spend can be separated across the sessions
+    /// one daemon serves. `None` for records persisted before the field
+    /// existed or turns without a chat-session scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     /// Alias of the agent that incurred this cost (HashMap key in
     /// `config.agents`). `None` for records persisted before per-agent
     /// attribution, or when `[cost].track_per_agent = false`.
@@ -158,6 +173,7 @@ impl CostRecord {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            conversation_id: None,
             agent_alias: None,
             task_id: None,
         }
@@ -173,6 +189,7 @@ impl CostRecord {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            conversation_id: None,
             agent_alias,
             task_id: None,
         }
@@ -189,9 +206,18 @@ impl CostRecord {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            conversation_id: None,
             agent_alias,
             task_id,
         }
+    }
+
+    /// Attach the chat-session identifier this spend belongs to. The ledger
+    /// is append-only JSONL, so the field is additive and older rows read
+    /// back as `None`.
+    pub fn with_conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.conversation_id = conversation_id;
+        self
     }
 }
 
@@ -284,6 +310,12 @@ pub struct ModelStats {
     pub output_tokens: u64,
     /// Total tokens for this model
     pub total_tokens: u64,
+    /// Tokens from records that explicitly report unavailable pricing.
+    ///
+    /// Legacy ledger rows omit `pricing_available` and deserialize as priced,
+    /// so they do not contribute to this total.
+    #[serde(default)]
+    pub unpriced_tokens: u64,
     /// Number of LLM responses for this model.
     pub request_count: usize,
 }
@@ -416,5 +448,20 @@ mod tests {
 
         assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
         assert!(parsed.usage.pricing_available);
+        assert_eq!(parsed.usage.unpriced_tokens, 0);
+        // Rows persisted before conversation attribution existed read as None.
+        assert!(parsed.conversation_id.is_none());
+    }
+
+    #[test]
+    fn cost_record_conversation_attribution_roundtrips() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
+        let record =
+            CostRecord::new("tracker-1", usage).with_conversation_id(Some("chat-session-9".into()));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("conversation_id"));
+        let parsed: CostRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session_id, "tracker-1");
+        assert_eq!(parsed.conversation_id.as_deref(), Some("chat-session-9"));
     }
 }
