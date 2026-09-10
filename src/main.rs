@@ -2771,6 +2771,10 @@ enum PluginCommands {
         /// Registry JSON URL used for install-by-name
         #[arg(long)]
         registry: Option<String>,
+        /// Install even if the plugin fails to load against this host's WIT ABI
+        /// (skips the install-time load-check)
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Remove an installed plugin
     Remove {
@@ -2784,6 +2788,53 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// Run the install-time load-check for a plugin source and decide whether the
+/// install may proceed. A plugin that does not instantiate against this host's
+/// WIT world would install cleanly and then be silently skipped at daemon
+/// startup; this surfaces that failure at the CLI with its full diagnostic.
+/// With `--no-verify` the same failure is printed as a warning and the install
+/// proceeds. A source with no WASM component has nothing to instantiate and
+/// passes.
+#[cfg(feature = "plugins-wasm")]
+async fn verify_plugin_loads_or_bail(
+    host: &zeroclaw::plugins::host::PluginHost,
+    source: &str,
+    no_verify: bool,
+) -> Result<()> {
+    let Some((manifest, wasm)) = host.source_component(source)? else {
+        return Ok(());
+    };
+    match zeroclaw::plugins::validate::verify_component_loads(&wasm, &manifest).await {
+        Ok(()) => Ok(()),
+        Err(error) if no_verify => {
+            let detail = format!("{error:#}");
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-install-verify-skipped",
+                    &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                    format!(
+                        "warning: '{}' does not load against this host and will be skipped at startup: {detail}",
+                        manifest.name
+                    ),
+                )
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            bail!(ta(
+                "cli-plugin-install-verify-failed",
+                &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                format!(
+                    "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
+                    manifest.name
+                ),
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -8040,7 +8091,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             }
-            PluginCommands::Install { source, registry } => {
+            PluginCommands::Install {
+                source,
+                registry,
+                no_verify,
+            } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
@@ -8048,6 +8103,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
+                    verify_plugin_loads_or_bail(&host, &source, no_verify).await?;
                     let name = host.install(&source)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
@@ -8076,6 +8132,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    verify_plugin_loads_or_bail(&host, &plugin_dir, no_verify).await?;
                     let name = host.install(&plugin_dir)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(

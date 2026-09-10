@@ -760,6 +760,8 @@ cli-plugin-installed-name-version = プラグイン {$name} v{$version} をイ�
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
 cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
+cli-plugin-install-verify-failed = インストールに失敗しました: '{$name}' はこのホストで読み込めません: {$error} — このホストの WIT（wit/v0 を参照）でプラグインを再ビルドするか、--no-verify を指定して強制的にインストールしてください。
+cli-plugin-install-verify-skipped = 警告: '{$name}' はこのホストで読み込めないため、起動時にスキップされます: {$error}
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-config-section-retired-wati = 警告: 廃止された WATI チャネル設定セクション `{$section}` は、WATI のサポートが削除されたため無視されます。Cloud API または WhatsApp Web を使用して `[channels.whatsapp.<alias>]` に移行し、未使用の WATI API トークンを失効させてください。
 cli-config-section-retired-node-transport = 警告: 廃止された `[node_transport]` 設定は、レガシー HMAC ノードトランスポートが削除されたため無視されます。config.toml からこのセクションを削除してください。

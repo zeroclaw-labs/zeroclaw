@@ -309,6 +309,54 @@ impl PluginHost {
         Ok(installed_name)
     }
 
+    /// Resolve a source's manifest and absolute WASM path for a pre-install
+    /// load-check, without copying, signing, or registering anything.
+    ///
+    /// Returns `Ok(None)` for a plugin that ships no WASM component (there is
+    /// nothing to instantiate). The manifest is validated for shape and the
+    /// WASM file's existence, matching what [`Self::install`] checks before it
+    /// commits, so the caller can instantiate the exact artifact install would
+    /// copy and refuse a plugin that cannot load against this host.
+    pub fn source_component(
+        &self,
+        source: &str,
+    ) -> Result<Option<(PluginManifest, PathBuf)>, PluginError> {
+        let source_path = PathBuf::from(source);
+        let manifest_path = if source_path.is_dir() {
+            source_path.join("manifest.toml")
+        } else {
+            source_path.clone()
+        };
+
+        if !manifest_path.exists() {
+            return Err(PluginError::NotFound(format!(
+                "manifest.toml not found at {}",
+                manifest_path.display()
+            )));
+        }
+
+        let (manifest, _manifest_toml) = self.load_manifest(&manifest_path)?;
+        let source_dir = manifest_path
+            .parent()
+            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
+
+        validate_manifest_shape(&manifest, source_dir)?;
+
+        match manifest.wasm_path.as_deref() {
+            Some(rel) => {
+                let wasm = source_dir.join(rel);
+                if !wasm.exists() {
+                    return Err(PluginError::NotFound(format!(
+                        "WASM file not found: {}",
+                        wasm.display()
+                    )));
+                }
+                Ok(Some((manifest, wasm)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Remove a plugin by name.
     pub fn remove(&mut self, name: &str) -> Result<(), PluginError> {
         if self.loaded.remove(name).is_none() {

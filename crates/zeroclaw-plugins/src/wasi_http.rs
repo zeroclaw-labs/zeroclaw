@@ -83,6 +83,21 @@ fn dns_failure() -> ErrorCode {
 /// instance. The destination host and the boundary's reason are recorded
 /// host-side — the operator needs both to seed a grant — while only the guest's
 /// error is masked.
+/// The operator-facing next step for an egress denial: the exact command that
+/// grants this instance reach to the refused host. `config set` replaces the
+/// whole `egress_hosts` list, so an operator with existing grants should add
+/// this host to them rather than run this verbatim — but naming the key, the
+/// field, and the host turns a bare deny into an actionable fix. Kept separate
+/// from [`record_denial`] so its format is unit-testable without a log capture.
+/// Returns `None` only if the instance identity cannot be encoded (it always
+/// can for an admitted instance).
+fn egress_grant_remedy(id: &PluginInstanceId, host: &str) -> Option<String> {
+    let key = id.config_entry_key().ok()?;
+    Some(format!(
+        "grant reach with: zeroclaw config set plugins.entries.{key}.egress_hosts '[\"{host}\"]'"
+    ))
+}
+
 fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
     ::zeroclaw_log::record!(
         WARN,
@@ -94,6 +109,7 @@ fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
                 "binding": id.binding(),
                 "host": host,
                 "reason": reason,
+                "remedy": egress_grant_remedy(id, host),
                 "error_key": "plugin_egress_denied",
             })),
         "Denied plugin outbound request by egress policy"
@@ -808,6 +824,44 @@ mod tests {
             [PluginPermission::HttpClient],
         );
         PluginEgressHooks::new(scope, egress)
+    }
+
+    #[test]
+    fn egress_grant_remedy_names_the_key_field_and_host() {
+        // A denied instance's operator-facing next step must be a runnable
+        // command that names the exact grant row, the field, and the host —
+        // otherwise the denial is a dead end.
+        let scope = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "main",
+            [PluginPermission::HttpClient],
+        );
+        let id = scope.id();
+        let key = id
+            .config_entry_key()
+            .expect("an admitted instance has a config-entry key");
+        let remedy = egress_grant_remedy(id, "api.example.com")
+            .expect("an admitted instance always yields a remedy");
+        assert!(
+            remedy.contains(&key),
+            "remedy must name the exact config-entry key: {remedy}"
+        );
+        assert!(
+            remedy.contains("plugins.entries."),
+            "remedy must target the plugins.entries path: {remedy}"
+        );
+        assert!(
+            remedy.contains("egress_hosts"),
+            "remedy must name the egress_hosts field: {remedy}"
+        );
+        assert!(
+            remedy.contains("api.example.com"),
+            "remedy must name the denied host: {remedy}"
+        );
+        assert!(
+            remedy.contains("config set"),
+            "remedy must be a runnable config-set command: {remedy}"
+        );
     }
 
     fn request(uri: &str) -> hyper::Request<HyperOutgoingBody> {

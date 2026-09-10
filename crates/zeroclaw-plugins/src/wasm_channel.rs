@@ -201,6 +201,45 @@ impl WasmChannel {
     }
 }
 
+/// Verify a channel component instantiates against this host's `channel-plugin`
+/// world, then discard it. This is the install-time load-check: it runs the
+/// same import/export type-check the daemon runs at startup — the point where a
+/// plugin built against a drifted or wrong WIT ABI actually fails — but stops
+/// **before** `configure()` and every other guest export. `configure()` reads
+/// operator config that need not exist at install time, so running it would
+/// turn "not configured yet" into a spurious load failure; the ABI mismatch we
+/// want to catch surfaces at `instantiate_async` regardless.
+///
+/// The store is built exactly as production channel instantiation builds it
+/// (via [`new_channel_store`], which withholds `wasi:http`), so a channel that
+/// imports `wasi:http` is reported unloadable on a host build where the channel
+/// surface is off — which is the truth for that host.
+pub async fn verify_channel_loads(
+    wasm_path: &Path,
+    scope: &crate::instance::PluginInstanceScope,
+    services: &PluginHostServices,
+    limits: crate::component::PluginLimits,
+) -> Result<()> {
+    scope.require_capability(crate::PluginCapability::Channel)?;
+    let component = load_component(wasm_path)?;
+    let mut store = new_channel_store(
+        scope.clone(),
+        services.clone(),
+        limits,
+        InboundQueue::default(),
+    );
+    let http = store.data().http_enabled();
+    let linker = build_linker(http)?;
+    crate::component::ensure_http_coherent(&store, http)?;
+    call_store!(store, async |store: &mut Store<PluginState>| {
+        wt_instantiate(
+            ChannelPlugin::instantiate_async(store, &component, &linker).await,
+            "failed to instantiate channel plugin",
+        )
+        .map(|_bindings| ())
+    })
+}
+
 impl ChannelInstanceFactory {
     async fn instantiate(
         &self,
