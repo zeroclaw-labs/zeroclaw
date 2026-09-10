@@ -9,9 +9,13 @@
   'use strict';
 
   const READER_SCALE_KEY = 'pc-reader-font-scale';
-  const READER_SCALE_MIN = 0.85;
-  const READER_SCALE_MAX = 1.4;
-  const READER_SCALE_STEP = 0.1;
+  // Explicit ladder: the minimum must be a real rung, so the stored value, the
+  // displayed percentage, and the bounds all describe the same endpoints. An
+  // arithmetic step grid cannot express 0.85 and rounded it away (#10547).
+  const READER_SCALES = [0.85, 0.9, 1, 1.1, 1.2, 1.3, 1.4];
+  const READER_SCALE_MIN = READER_SCALES[0];
+  const READER_SCALE_MAX = READER_SCALES[READER_SCALES.length - 1];
+  const READER_SCALE_DEFAULT = 1;
 
   const LOCALE_TEXT = {
     en: {
@@ -117,15 +121,26 @@
     return Math.min(max, Math.max(min, value));
   }
 
-  function readReaderScale() {
-    let value = 1;
+  // Maps any stored value — including off-ladder ones written by earlier
+  // versions — to the index of the nearest rung.
+  function snapReaderScale(value) {
+    const target = clamp(value, READER_SCALE_MIN, READER_SCALE_MAX);
+    let best = 0;
+    for (let i = 1; i < READER_SCALES.length; i++) {
+      if (Math.abs(READER_SCALES[i] - target) < Math.abs(READER_SCALES[best] - target)) best = i;
+    }
+    return best;
+  }
+
+  function readReaderScaleIndex() {
+    let value = READER_SCALE_DEFAULT;
     try {
       value = Number.parseFloat(localStorage.getItem(READER_SCALE_KEY));
     } catch (e) {
       // Storage can be unavailable in private or embedded browser contexts.
     }
-    if (!Number.isFinite(value)) value = 1;
-    return clamp(Math.round(value * 10) / 10, READER_SCALE_MIN, READER_SCALE_MAX);
+    if (!Number.isFinite(value)) value = READER_SCALE_DEFAULT;
+    return snapReaderScale(value);
   }
 
   function saveReaderScale(value) {
@@ -145,7 +160,7 @@
     const buttons = document.querySelector('#mdbook-menu-bar .left-buttons');
     if (!buttons || document.getElementById('pc-reader-controls')) return;
 
-    let scale = readReaderScale();
+    let scaleIndex = readReaderScaleIndex();
     const wrapper = document.createElement('div');
     wrapper.id = 'pc-reader-controls';
     wrapper.className = 'pc-reader-controls';
@@ -203,12 +218,15 @@
     reset.textContent = localeText('resetText', 'Reset text size');
     reset.title = reset.textContent;
 
-    function applyScale(next) {
-      scale = clamp(Math.round(next * 10) / 10, READER_SCALE_MIN, READER_SCALE_MAX);
+    function applyScale(nextIndex) {
+      scaleIndex = clamp(nextIndex, 0, READER_SCALES.length - 1);
+      const scale = READER_SCALES[scaleIndex];
       document.documentElement.style.setProperty('--pc-reader-scale', String(scale));
       value.textContent = formatPercent(scale);
-      decrease.disabled = scale <= READER_SCALE_MIN;
-      increase.disabled = scale >= READER_SCALE_MAX;
+      decrease.disabled = scaleIndex === 0;
+      increase.disabled = scaleIndex === READER_SCALES.length - 1;
+      // Persist the scale, not the index, so the stored format stays readable
+      // by older builds of this theme.
       saveReaderScale(scale);
     }
 
@@ -219,13 +237,13 @@
     }
 
     decrease.addEventListener('click', function () {
-      applyScale(scale - READER_SCALE_STEP);
+      applyScale(scaleIndex - 1);
     });
     increase.addEventListener('click', function () {
-      applyScale(scale + READER_SCALE_STEP);
+      applyScale(scaleIndex + 1);
     });
     reset.addEventListener('click', function () {
-      applyScale(1);
+      applyScale(snapReaderScale(READER_SCALE_DEFAULT));
     });
     toggle.addEventListener('click', function (e) {
       e.stopPropagation();
@@ -248,7 +266,7 @@
     popup.append(title, label, row, reset);
     wrapper.append(toggle, popup);
     buttons.appendChild(wrapper);
-    applyScale(scale);
+    applyScale(scaleIndex);
   }
 
   // ── Reading progress bar ───────────────────────────────────────────────

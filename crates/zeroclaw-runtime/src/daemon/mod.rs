@@ -582,7 +582,7 @@ pub async fn run(
     }
 
     if crate::control_plane::control_plane().is_none()
-        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+        && let Err(e) = crate::control_plane::ControlPlaneRecoveryOwner::start(&config.data_dir)
             .await
             .map(crate::control_plane::init_control_plane)
     {
@@ -596,8 +596,8 @@ pub async fn run(
     }
     // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
     // boot_id matches what producers stamp via `control_plane()`.
-    if let Some(handle) = crate::control_plane::control_plane() {
-        handle.spawn_reaper(
+    if crate::control_plane::control_plane().is_some() {
+        let _ = crate::control_plane::spawn_control_plane_reaper(
             crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
             channels_cancel.clone(),
         );
@@ -2520,17 +2520,25 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    if !config.channels.is_known_channel(channel) {
+    // A heartbeat target may be a bare channel type ("telegram") or a
+    // configured instance's composite key ("telegram.roy"). The channel
+    // registry (is_known_channel / is_channel_configured / is_channel_deliverable)
+    // is keyed by channel *type*, so validate the type segment. The delivery
+    // path (deliver_announcement) resolves the instance alias at send time,
+    // matching how cron delivery accepts `<type>.<alias>` refs — see
+    // cron_delivery_channel_pattern.
+    let channel_type = channel.split_once('.').map_or(channel, |(ty, _)| ty);
+    if !config.channels.is_known_channel(channel_type) {
         anyhow::bail!("unsupported heartbeat.target channel: {channel}");
     }
-    if !config.channels.is_channel_configured(channel) {
+    if !config.channels.is_channel_configured(channel_type) {
         anyhow::bail!(
-            "heartbeat.target is set to {channel} but channels.{channel} is not configured"
+            "heartbeat.target is set to {channel} but channels.{channel_type} is not configured"
         );
     }
-    if !config.channels.is_channel_deliverable(channel) {
+    if !config.channels.is_channel_deliverable(channel_type) {
         anyhow::bail!(
-            "heartbeat.target is set to {channel} but {channel} is an input-only channel that cannot deliver outbound messages"
+            "heartbeat.target is set to {channel} but {channel_type} is an input-only channel that cannot deliver outbound messages"
         );
     }
     Ok(())
@@ -3361,6 +3369,64 @@ mod tests {
             .channels
             .mqtt
             .insert("default".to_string(), Default::default());
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("input-only channel"),
+            "expected input-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_composite_instance_target() {
+        // review: a heartbeat target may name a specific channel instance
+        // via its `<type>.<alias>` composite key. The delivery path requires
+        // this form to route to a non-default instance in a multi-instance
+        // setup, so validation must accept it rather than rejecting it as an
+        // unknown channel. The composite key is passed through verbatim so the
+        // delivery layer resolves the alias.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram.roy".into());
+        config.heartbeat.to = Some("-1003233270107".into());
+        config
+            .channels
+            .telegram
+            .insert("roy".to_string(), Default::default());
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("telegram.roy".to_string(), "-1003233270107".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_composite_of_unknown_type() {
+        // The type segment of a composite key must still be a known channel;
+        // splitting on '.' must not let an unknown type slip through.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("carrier_pigeon.roy".into());
+        config.heartbeat.to = Some("ops@example.com".into());
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported heartbeat.target channel"),
+            "expected unsupported-channel rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_composite_of_undeliverable_type() {
+        // Deliverability is a property of the channel type, so a composite key
+        // whose type is input-only (mqtt) must be rejected just like the bare
+        // form rather than passing on the alias suffix.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("mqtt.sensors".into());
+        config.heartbeat.to = Some("ops/heartbeat".into());
+        config
+            .channels
+            .mqtt
+            .insert("sensors".to_string(), Default::default());
 
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(

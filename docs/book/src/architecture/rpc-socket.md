@@ -45,7 +45,7 @@ named pipes carry the same byte stream as Unix sockets.
 
 ```
 {"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":1},"id":1}\n
-{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.4"},"id":1}\n
+{"jsonrpc":"2.0","result":{"protocolVersion":1,"serverVersion":"0.8.5"},"id":1}\n
 ```
 
 ## Handshake
@@ -76,10 +76,11 @@ the operating system:
 | Method | Direction | Description |
 |---|---|---|
 | `initialize` | client -> daemon | Authenticate and negotiate protocol version |
-| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
+| `session/new` | client -> daemon | Create an agent session (requires `agentAlias`, optional `cwd`, `sessionId`; an ID that is already live rebinds the caller to that canonical in-memory session instead of replacing its agent history; optional `keep_siblings` suppresses the idle same-mode sibling eviction for multi-session clients that manage sibling lifecycle themselves) |
 | `session/close` | client -> daemon | Close and clean up a session |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
+| `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |

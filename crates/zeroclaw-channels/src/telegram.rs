@@ -6,12 +6,34 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, ProgressEvent, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
+/// How long a successful `getUpdates` exchange stays evidence that the listener
+/// is working.
+///
+/// `getUpdates` long-polls with `timeout: 30`, so even an idle-but-healthy
+/// channel completes an exchange about every 30 seconds. Three times that
+/// leaves room for a slow round trip without letting a blackholed request —
+/// which the default runtime client has no timeout to cut short — keep
+/// reporting the last success indefinitely.
+const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
+
+/// Ceiling on one complete voice-drop notice attempt — both `sendMessage`
+/// requests (HTML and the plaintext fallback), their response-body reads, and
+/// the inter-chunk pauses.
+///
+/// The notice is sent from inside the update-processing path, before the
+/// permanent skip advances the offset, with a client that has no request
+/// timeout. Unbounded, a stalled request or response body would pin the offset
+/// and stop the whole listener — the health monitor can report that state but
+/// cannot cancel the wait. The drop is permanent either way, so on timeout the
+/// notice is abandoned, not retried.
+const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
+
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
@@ -609,6 +631,15 @@ pub struct TelegramChannel {
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
+    /// Outcome of the most recent `getUpdates` exchange and when it completed,
+    /// or `None` before the first one. Read by `listener_health` so a
+    /// supervisor can tell a connected channel from one that is long-polling a
+    /// rejecting endpoint, without issuing a probe of its own.
+    ///
+    /// The timestamp is load-bearing: a success is only evidence for as long as
+    /// [`POLL_HEALTH_STALE_AFTER`], because a request that blackholes leaves the
+    /// previous success sitting here forever.
+    poll_health: Mutex<Option<(bool, tokio::time::Instant)>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -628,12 +659,18 @@ pub struct TelegramChannel {
     proxy_url: Option<String>,
     /// Pre-computed tool command specs (name, description) for bot command registration.
     tool_command_specs: Vec<(String, String)>,
-    /// pending approval requests: callback_data key → pending approval
-    pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
+    /// Pending approval requests: callback_data key → oneshot sender.
+    /// `listen()` resolves these when a matching `callback_query` arrives.
+    pending_approvals:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for the operator to tap an inline-keyboard button on a
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Bound on one complete voice-drop notice attempt. Always
+    /// [`VOICE_DROP_NOTICE_TIMEOUT`] in production; tests shrink it so a
+    /// stalled-notice regression does not have to wait out the real ceiling.
+    voice_drop_notice_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,12 +678,6 @@ enum EditMessageResult {
     Success,
     NotModified,
     Failed(reqwest::StatusCode),
-}
-
-/// a tool approval awaiting an inline-keyboard tap
-struct PendingApproval {
-    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
-    tool_name: String,
 }
 
 /// Outcome of attempting to parse a single incoming Telegram update.
@@ -725,6 +756,54 @@ pub(crate) enum FileLookupFailure {
     /// `error_code` on the terminal allowlist (invalid/expired file id, file
     /// too big, forbidden). Safe to acknowledge and move past.
     Permanent,
+}
+
+/// Why a voice message was dropped for good, and what its sender is told.
+///
+/// A voice note that disappears without a word is indistinguishable, from the
+/// sender's side, from a bot that never heard them: the message was delivered,
+/// no answer came, and no reason was given. Every permanent drop therefore
+/// carries a short human sentence. Transient failures are deliberately absent:
+/// the update is retried from the same offset, so a notice would be sent again
+/// on every attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceDropReason {
+    /// The recording is longer than `transcription.max_duration_secs`.
+    TooLong { limit_secs: u64 },
+    /// Telegram will never hand us this file: expired id, too big, forbidden.
+    FileUnavailable,
+    /// Transcription succeeded but produced nothing usable — silence, noise.
+    EmptyTranscript,
+}
+
+impl VoiceDropReason {
+    /// The sentence the sender sees, resolved through the Fluent catalogue
+    /// like every other user-facing channel string. Vendor and engine
+    /// diagnostics stay in the log: the sender gets the reason, never the
+    /// internals.
+    ///
+    /// The wording is deliberately generic over voice notes and audio
+    /// uploads — this parser accepts both — and the advice has to survive the
+    /// causes it cannot distinguish: a permanent retrieval failure includes
+    /// files Telegram refuses as too big, where "send it again" would invite
+    /// the sender to hit the same wall twice.
+    pub(crate) fn notice(self) -> String {
+        match self {
+            Self::TooLong { limit_secs } => {
+                let limit_secs = limit_secs.to_string();
+                i18n::get_required_cli_string_with_args(
+                    "channel-telegram-voice-drop-too-long",
+                    &[("limit_secs", limit_secs.as_str())],
+                )
+            }
+            Self::FileUnavailable => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-file-unavailable")
+            }
+            Self::EmptyTranscript => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-empty-transcript")
+            }
+        }
+    }
 }
 
 /// A `getFile` failure with the vendor diagnostics preserved.
@@ -889,6 +968,7 @@ impl TelegramChannel {
             mention_only,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
+            poll_health: Mutex::new(None),
             api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             transcription: None,
             transcription_manager: None,
@@ -903,7 +983,17 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
         }
+    }
+
+    /// Shrink the voice-drop notice bound so a stalled-notice test does not
+    /// wait out the production ceiling. Test-only: the ceiling is not
+    /// operator-tunable — it exists to protect the listener, not to be tuned.
+    #[cfg(test)]
+    fn with_voice_drop_notice_timeout(mut self, timeout: Duration) -> Self {
+        self.voice_drop_notice_timeout = timeout;
+        self
     }
 
     /// Set the resolver used to resolve voice-chat peers live (no cached state).
@@ -1716,6 +1806,16 @@ impl TelegramChannel {
         }
     }
 
+    /// Record the outcome of one `getUpdates` exchange.
+    ///
+    /// The poll loop already knows whether the Bot API accepted the call; a bad
+    /// token 404s on every attempt while the loop keeps retrying, so `listen()`
+    /// never returns and liveness alone says nothing. Keeping the last outcome
+    /// here lets `listener_health` answer that question without a second call.
+    fn record_poll_health(&self, ok: bool) {
+        *self.poll_health.lock() = Some((ok, tokio::time::Instant::now()));
+    }
+
     fn is_telegram_username_char(ch: char) -> bool {
         ch.is_ascii_alphanumeric() || ch == '_'
     }
@@ -1836,6 +1936,28 @@ impl TelegramChannel {
         I: IntoIterator<Item = &'a str>,
     {
         identities.into_iter().any(|id| self.is_user_allowed(id))
+    }
+
+    fn approval_callback_context(callback: &serde_json::Value) -> (Vec<String>, Option<String>) {
+        let mut identities = Vec::with_capacity(2);
+        if let Some(username) = callback
+            .pointer("/from/username")
+            .and_then(serde_json::Value::as_str)
+            .filter(|username| !username.is_empty())
+        {
+            identities.push(username.to_string());
+        }
+        if let Some(user_id) = callback
+            .pointer("/from/id")
+            .and_then(serde_json::Value::as_i64)
+        {
+            identities.push(user_id.to_string());
+        }
+        let chat_id = callback
+            .pointer("/message/chat/id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string());
+        (identities, chat_id)
     }
 
     /// True when `message` carries content one of the update parsers
@@ -2484,10 +2606,65 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }))
     }
 
+    /// Tell the sender why their voice message will not be answered.
+    ///
+    /// Best effort by design: if the notice itself cannot be delivered the
+    /// drop is still permanent, so the failure is logged and swallowed rather
+    /// than turned into a retry of the original update.
+    ///
+    /// The whole attempt is bounded by [`VOICE_DROP_NOTICE_TIMEOUT`]. This
+    /// runs before the permanent skip lets the offset advance, and the
+    /// sending client has no request timeout of its own — an unbounded await
+    /// on a stalled request or response body would head-of-line block every
+    /// later update on this listener. Rejections that never touched the
+    /// network before (an over-duration recording) must not start doing so
+    /// just because they now say goodbye.
+    async fn notify_voice_drop(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        reason: VoiceDropReason,
+    ) {
+        let notice = reason.notice();
+        let attempt = self.send_text_chunks(&notice, chat_id, thread_id);
+        match tokio::time::timeout(self.voice_drop_notice_timeout, attempt).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "Failed to notify sender about skipped voice message"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "timeout_secs": self.voice_drop_notice_timeout.as_secs_f64(),
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "Timed out notifying sender about skipped voice message; abandoning the notice"
+                );
+            }
+        }
+    }
+
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
     /// disabled, or the message exceeds duration limits; `RetryTransient` if download or
     /// transcription I/O fails.
+    ///
+    /// Every permanent drop that reaches an allowed sender is announced to them
+    /// (see [`VoiceDropReason`]): silence is indistinguishable from a bot that
+    /// never received the recording. Transient failures stay silent — the same
+    /// update is retried, and a notice per attempt would be spam.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> UpdateDisposition {
         let Some(config) = self.transcription.as_ref() else {
             return UpdateDisposition::SkipPermanent;
@@ -2503,18 +2680,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         };
 
-        if duration > config.max_duration_secs {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Skipping voice message: duration {duration}s exceeds limit {}s",
-                    config.max_duration_secs
-                )
-            );
-            return UpdateDisposition::SkipPermanent;
-        }
-
+        // The duration check used to run here, before the sender was known.
+        // It now runs once the chat is resolved and the sender has passed the
+        // allowlist and mention gate, so the skip can be explained to them —
+        // and so a stranger's oversized recording still costs nothing: the
+        // check stays ahead of every download.
         let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let mut identities = vec![username.as_str()];
@@ -2556,6 +2726,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
+        if duration > config.max_duration_secs {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping voice message: duration {duration}s exceeds limit {}s",
+                    config.max_duration_secs
+                )
+            );
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::TooLong {
+                    limit_secs: config.max_duration_secs,
+                },
+            )
+            .await;
+            return UpdateDisposition::SkipPermanent;
+        }
+
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
             Ok(p) => p,
@@ -2573,7 +2763,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // See the attachment path: a permanent vendor rejection must
                 // not hold the offset, or the batch never drains.
                 return match e.kind {
-                    FileLookupFailure::Permanent => UpdateDisposition::SkipPermanent,
+                    FileLookupFailure::Permanent => {
+                        self.notify_voice_drop(
+                            &chat_id,
+                            thread_id.as_deref(),
+                            VoiceDropReason::FileUnavailable,
+                        )
+                        .await;
+                        UpdateDisposition::SkipPermanent
+                    }
                     FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
                 };
             }
@@ -2619,6 +2817,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "Voice transcription returned empty text, skipping"
             );
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::EmptyTranscript,
+            )
+            .await;
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -3797,6 +4001,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// the buttons
     /// best-effort rewrite, a stale tap is a no-op
     async fn handle_approval_callback(&self, cb: &serde_json::Value) {
+        use crate::util::PendingApprovalResolution;
+
         let cb_id = cb
             .get("id")
             .and_then(serde_json::Value::as_str)
@@ -3829,71 +4035,71 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        // The pending entry is the single resolution claim: removing it wins
-        // the right to decide, and a won claim is only published when the
-        // response actually reaches the waiter on the channel. A lost claim
-        // or a failed send gets an honest already-resolved toast and no card
-        // rewrite, so Telegram can never show an outcome the runtime did not
-        // record.
         let has_response = response.is_some();
-        let resolved_tool = if let Some(resp) = response {
-            match self.pending_approvals.lock().await.remove(approval_id) {
-                Some(pending) => match pending.sender.send(resp) {
-                    Ok(()) => Some(pending.tool_name),
-                    Err(_) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({
-                                "approval_id":
-                                    zeroclaw_runtime::security::scrub(approval_id)
-                            })),
-                            "approval callback lost the resolution race; card left untouched"
-                        );
-                        None
-                    }
-                },
-                None => None,
+        let (identities, callback_chat_id) = Self::approval_callback_context(cb);
+        let responder_allowed = self.is_any_user_allowed(identities.iter().map(String::as_str));
+        let (resolution, resolved_tool) = match (response, callback_chat_id.as_deref()) {
+            (Some(response), Some(chat_id)) => {
+                crate::util::resolve_pending_approval_with_tool(
+                    &self.pending_approvals,
+                    approval_id,
+                    response,
+                    responder_allowed,
+                    chat_id,
+                )
+                .await
             }
-        } else {
-            None
+            _ => (PendingApprovalResolution::NotFound, None),
         };
 
-        // dismiss the client spinner: a won claim acknowledges the tapped
-        // action, anything else gets the already-resolved toast
-        let answer_text = if resolved_tool.is_some() {
-            match action {
-                "approve" => format!(
-                    "✅ {}",
-                    i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
-                ),
-                "always" => format!(
-                    "✅✅ {}",
-                    i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
-                ),
-                "deny" => format!(
-                    "❌ {}",
-                    i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
-                ),
-                _ => format!(
-                    "⚠️ {}",
-                    i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
-                ),
-            }
-        } else if has_response {
-            format!(
+        if matches!(resolution, PendingApprovalResolution::Rejected) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                "Telegram approval callback was not accepted"
+            );
+        } else if matches!(resolution, PendingApprovalResolution::ReceiverClosed) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "approval_id": zeroclaw_runtime::security::scrub(approval_id)
+                    })),
+                "approval callback lost the resolution race; card left untouched"
+            );
+        }
+
+        let answer_text = match (action, resolution) {
+            ("approve", PendingApprovalResolution::Resolved) => format!(
+                "✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
+            ),
+            ("always", PendingApprovalResolution::Resolved) => format!(
+                "✅✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
+            ),
+            ("deny", PendingApprovalResolution::Resolved) => format!(
+                "❌ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
+            ),
+            ("approve" | "always" | "deny", PendingApprovalResolution::Rejected) => format!(
+                "⚠️ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-not-accepted")
+            ),
+            (
+                "approve" | "always" | "deny",
+                PendingApprovalResolution::NotFound | PendingApprovalResolution::ReceiverClosed,
+            ) if has_response => format!(
                 "⏳ {}",
                 i18n::get_required_cli_string("channel-telegram-approval-ack-already-resolved")
-            )
-        } else {
-            format!(
+            ),
+            _ => format!(
                 "⚠️ {}",
                 i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
-            )
+            ),
         };
         let answer_body = serde_json::json!({
             "callback_query_id": cb_id,
@@ -4615,6 +4821,7 @@ impl Channel for TelegramChannel {
                             ),
                         "startup probe error; retrying in 5s"
                     );
+                    self.record_poll_health(false);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Ok(resp) => {
@@ -4630,6 +4837,7 @@ impl Channel for TelegramChannel {
                                 .with_attrs(::serde_json::json!({"e": e.to_string()})),
                                 "startup probe parse error: ; retrying in 5s"
                             );
+                            self.record_poll_health(false);
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                         Ok(data) => {
@@ -4665,9 +4873,11 @@ impl Channel for TelegramChannel {
                                         }
                                     }
                                 }
+                                self.record_poll_health(true);
                                 break; // Probe succeeded; enter the long-poll loop.
                             }
 
+                            self.record_poll_health(false);
                             let error_code = data
                                 .get("error_code")
                                 .and_then(serde_json::Value::as_i64)
@@ -4730,6 +4940,7 @@ impl Channel for TelegramChannel {
                             ),
                         "poll error"
                     );
+                    self.record_poll_health(false);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -4747,6 +4958,7 @@ impl Channel for TelegramChannel {
                             ),
                         "parse error"
                     );
+                    self.record_poll_health(false);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -4756,6 +4968,7 @@ impl Channel for TelegramChannel {
                 .get("ok")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
+            self.record_poll_health(ok);
             if !ok {
                 let error_code = data
                     .get("error_code")
@@ -4807,6 +5020,18 @@ Ensure only one `zeroclaw` process is using this bot token."
                 }
             }
         }
+    }
+
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        Some(match *self.poll_health.lock() {
+            None => ListenerHealth::Pending,
+            Some((false, _)) => ListenerHealth::Unhealthy,
+            Some((true, at)) if at.elapsed() < POLL_HEALTH_STALE_AFTER => ListenerHealth::Healthy,
+            // The last exchange succeeded, but nothing has completed since.
+            // A blackholed request keeps `listen()` alive with no timeout to
+            // end it, so the stale success must stop counting as evidence.
+            Some((true, _)) => ListenerHealth::Unhealthy,
+        })
     }
 
     async fn health_check(&self) -> bool {
@@ -4939,8 +5164,9 @@ Ensure only one `zeroclaw` process is using this bot token."
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         self.pending_approvals.lock().await.insert(
             approval_id.clone(),
-            PendingApproval {
+            crate::util::PendingApproval {
                 sender: tx,
+                destination: chat_id.to_string(),
                 tool_name: request.tool_name.clone(),
             },
         );
@@ -5647,6 +5873,153 @@ mod tests {
         assert_eq!(
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_health_reports_false_while_get_updates_is_rejected() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The reported failure: an invalid bot token 404s every `getUpdates`,
+        // the poll loop absorbs it and retries, and `listen()` never returns.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 404,
+                "description": "Not Found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Pending),
+            "nothing observed yet, so the channel has nothing to report"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _ = tokio::time::timeout(Duration::from_millis(500), channel.listen(tx)).await;
+
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Unhealthy),
+            "a rejected poll must be visible without a second API call"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_health_reports_true_once_get_updates_succeeds() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The delay keeps the long-poll loop from spinning for the whole test.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": [] }))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        // Watch for the observation the test is about rather than racing a
+        // fixed budget: `listen` completes a probe exchange and then a long
+        // poll, and under a loaded parallel run those two round trips overrun
+        // any deadline short enough to keep the test quick. The listen branch
+        // never finishes on its own, so the watcher is what ends the select.
+        let observed = tokio::select! {
+            _ = channel.listen(tx) => channel.listener_health(),
+            health = async {
+                for _ in 0..500 {
+                    let health = channel.listener_health();
+                    if health == Some(ListenerHealth::Healthy) {
+                        return health;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                channel.listener_health()
+            } => health,
+        };
+
+        assert_eq!(
+            observed,
+            Some(ListenerHealth::Healthy),
+            "a channel whose polls are accepted reports itself connected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_health_expires_a_success_that_stops_being_evidence() {
+        // `getUpdates` long-polls with `timeout: 30`, so a working listener
+        // completes an exchange every ~30s even when idle. The default runtime
+        // client has no request timeout, so a blackholed poll leaves the last
+        // success sitting in the channel with nothing to end it. After
+        // POLL_HEALTH_STALE_AFTER that success stops being evidence.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+
+        channel.record_poll_health(true);
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Healthy),
+            "a just-recorded success is evidence"
+        );
+
+        // Still inside the window: one missed long-poll cycle is not a fault.
+        tokio::time::advance(POLL_HEALTH_STALE_AFTER - Duration::from_secs(1)).await;
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Healthy),
+            "a success within the window is still evidence"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Unhealthy),
+            "past the window the channel stops vouching for a stale success"
+        );
+
+        // A completed exchange makes it evidence again.
+        channel.record_poll_health(true);
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Healthy),
+            "a fresh exchange restores the signal"
         );
     }
 
@@ -7946,6 +8319,22 @@ mod tests {
 
     #[tokio::test]
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The skip is announced to the sender: silence would look like the bot
+        // never heard the recording at all.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
             api_key: Some("test_key".to_string()),
@@ -7960,7 +8349,8 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_transcription(tc);
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
         let update = serde_json::json!({
             "message": {
                 "message_id": 2,
@@ -7972,6 +8362,157 @@ mod tests {
 
         let parsed = ch.try_parse_voice_message(&update).await;
         assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1, "the sender is told exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["chat_id"], "456");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("5s limit"), "notice names the limit: {text}");
+    }
+
+    #[tokio::test]
+    async fn oversized_voice_notice_goes_to_the_forum_topic_it_came_from() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 8 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 3,
+                "message_thread_id": 42,
+                "is_topic_message": true,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -1004389982480_i64, "type": "supergroup" }
+            }
+        });
+
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            UpdateDisposition::SkipPermanent
+        ));
+
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["chat_id"], "-1004389982480");
+        assert_eq!(
+            body["message_thread_id"], "42",
+            "a notice in the wrong topic is as good as no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_voice_from_stranger_is_dropped_without_a_word() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // No `expect`: any outgoing call at all is the failure this guards.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 9 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        )
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 4,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            UpdateDisposition::SkipPermanent
+        ));
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "an unauthorized sender learns nothing — not even that a limit exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_drop_notices_name_the_reason_without_internals() {
+        let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
+        assert!(too_long.contains("900s limit"));
+
+        // The parser accepts audio uploads as well as voice notes, and a
+        // permanent retrieval failure includes files that are too big — the
+        // advice must fit both, not steer a music-file sender to a microphone
+        // or tell them to resend a file Telegram just refused.
+        let unavailable = VoiceDropReason::FileUnavailable.notice();
+        assert!(
+            unavailable.contains("smaller or shorter"),
+            "retrieval-failure advice must cover the too-big case: {unavailable}"
+        );
+
+        for notice in [
+            too_long,
+            unavailable,
+            VoiceDropReason::EmptyTranscript.notice(),
+        ] {
+            assert!(
+                !notice.contains("microphone") && !notice.contains("voice"),
+                "wording must fit audio uploads, not just voice notes: {notice}"
+            );
+            assert!(
+                notice.starts_with("⚠️ Audio message skipped:"),
+                "every notice says what happened up front: {notice}"
+            );
+            assert!(
+                !notice.to_lowercase().contains("error")
+                    && !notice.contains("http")
+                    && !notice.contains("api"),
+                "diagnostics belong in the log, not in the chat: {notice}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -8796,6 +9337,7 @@ mod tests {
             "callback_query": {
                 "id": callback_id,
                 "from": {"id": 900_001, "username": "alice"},
+                "message": {"chat": {"id": -2001}},
                 "data": format!("approval:{approval_id}:{action}"),
             }
         })
@@ -8830,7 +9372,7 @@ mod tests {
                 telegram_callback_update(
                     7_000 + i as i64,
                     &format!("cb{i}"),
-                    "11111111-2222-3333-4444-555555555555",
+                    &format!("approval-{i}"),
                     action,
                 )
             })
@@ -8858,6 +9400,23 @@ mod tests {
             )
             .with_api_base(mock_server.uri()),
         );
+
+        // Known approval callbacks must carry a live, same-chat pending entry
+        // so the success acknowledgement exercises the authorized production
+        // path rather than the rejection acknowledgement.
+        let mut approval_receivers = Vec::new();
+        for i in 0..3 {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            ch.pending_approvals.lock().await.insert(
+                format!("approval-{i}"),
+                crate::util::PendingApproval {
+                    sender,
+                    destination: "-2001".to_string(),
+                    tool_name: format!("tool-{i}"),
+                },
+            );
+            approval_receivers.push((i, receiver));
+        }
 
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
@@ -8890,15 +9449,22 @@ mod tests {
 
         // Rebuild the expectation through the catalogue, not from literals:
         // a wiring regression that stops calling i18n, or a typo'd key,
-        // changes this and fails the assertion. These callbacks carry no
-        // pending entry, so every valid action gets the already-resolved
-        // toast and only the unknown action gets its own arm; the won-claim
-        // action acks are pinned by callback_wins_claim and the scanner.
-        let stale = i18n::get_required_cli_string("channel-telegram-approval-ack-already-resolved");
+        // changes this and fails the assertion. The three valid actions carry
+        // authorized, same-chat pending entries; the unknown action exercises
+        // its fallback without consuming a pending approval.
         let expected = vec![
-            format!("⏳ {stale}"),
-            format!("⏳ {stale}"),
-            format!("⏳ {stale}"),
+            format!(
+                "✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
+            ),
+            format!(
+                "✅✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
+            ),
+            format!(
+                "❌ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
+            ),
             format!(
                 "⚠️ {}",
                 i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
@@ -8921,8 +9487,8 @@ mod tests {
     fn callback_ack_source_region() -> &'static str {
         const SRC: &str = include_str!("telegram.rs");
         let start = SRC
-            .find("let answer_text = if resolved_tool.is_some() {")
-            .expect("callback ack arm: `let answer_text = if resolved_tool.is_some() {` not found");
+            .find("let answer_text = match (action, resolution) {")
+            .expect("callback ack arm: `let answer_text = match (action, resolution) {` not found");
         let rest = &SRC[start..];
         let end = rest
             .find("let answer_body")
@@ -8953,6 +9519,7 @@ mod tests {
             "channel-telegram-approval-ack-approved",
             "channel-telegram-approval-ack-always-approved",
             "channel-telegram-approval-ack-denied",
+            "channel-telegram-approval-ack-not-accepted",
             "channel-telegram-approval-ack-unknown",
             "channel-telegram-approval-ack-already-resolved",
         ] {
@@ -8964,9 +9531,8 @@ mod tests {
             );
         }
 
-        // Exactly six lookups across the five arms: the four action acks,
-        // the already-resolved toast, and the unknown-action fallback that
-        // serves both the won-branch fallthrough and the no-response case.
+        // Exactly six lookups: three successful action acks, a rejected
+        // callback, an already-resolved callback, and the unknown fallback.
         // An arm added or converted to a literal breaks this.
         assert_eq!(
             region.matches("i18n::get_required_cli_string").count(),
@@ -9228,6 +9794,85 @@ mod tests {
             uid_good + 1,
             LISTEN_HANG_GUARD,
             "past the permanently rejected update",
+        )
+        .await;
+
+        handle.abort();
+    }
+
+    /// The drop notice is sent from inside the update-processing path, before
+    /// the permanent skip advances the offset, with a client that has no
+    /// request timeout. A `sendMessage` that stalls must not turn one
+    /// dropped recording into a listener-wide stall: the notice attempt is
+    /// bounded, the skip stays permanent, and the update behind it is still
+    /// processed. All three drop reasons share `notify_voice_drop`, so the
+    /// over-duration path exercised here covers the bound for every reason.
+    #[tokio::test]
+    async fn listen_stalled_drop_notice_does_not_block_later_updates() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid_voice = 8_400;
+        let uid_good = 8_401;
+        let mut voice = telegram_voice_update(uid_voice, 90, 555, "alice", "voice_stall");
+        voice["message"]["voice"]["duration"] = serde_json::json!(600);
+        let good =
+            telegram_text_update(uid_good, 91, 555, "alice", "i am behind the stalled notice");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([voice, good])).await;
+        mount_telegram_get_updates(&mock_server, uid_good + 1, serde_json::json!([])).await;
+
+        // The notice request stalls far past the (shrunk) notice bound.
+        // Unbounded, this await would hold the offset at 0 and the text
+        // update behind it would never be delivered.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 10}}))
+                    .set_delay(Duration::from_secs(120)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_transcription(tc)
+            .with_api_base(mock_server.uri())
+            .with_voice_drop_notice_timeout(Duration::from_millis(250)),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update behind the stalled notice must still arrive.
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
+            .await
+            .expect("timed out: a stalled drop notice head-of-line blocked the listener")
+            .expect("channel closed before delivering the update behind the stalled notice");
+        assert_eq!(msg.content, "i am behind the stalled notice");
+
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid_good + 1,
+            LISTEN_HANG_GUARD,
+            "past the voice update whose notice stalled",
         )
         .await;
 
@@ -11639,14 +12284,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_approval_oneshot_delivers_response() {
+    async fn pending_approval_requires_allowed_user_and_origin_chat() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
         let mention_only = false;
         let ch = TelegramChannel::new(
             "token".into(),
             "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
+            Arc::new(|| vec!["operator".into(), "1001".into()]),
             mention_only,
         );
         let approval_id = "test-approval-123".to_string();
@@ -11654,22 +12299,244 @@ mod tests {
 
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
-            PendingApproval {
+            crate::util::PendingApproval {
                 sender: tx,
+                destination: "-2001".to_string(),
                 tool_name: "shell".to_string(),
             },
         );
 
-        // simulate what listen() does when a callback_query arrives
-        if let Some(pending) = ch.pending_approvals.lock().await.remove(&approval_id) {
-            pending
-                .sender
-                .send(ChannelApprovalResponse::Approve)
-                .unwrap();
+        for response in [
+            ChannelApprovalResponse::Approve,
+            ChannelApprovalResponse::Deny,
+            ChannelApprovalResponse::AlwaysApprove,
+        ] {
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &ch.pending_approvals,
+                    &approval_id,
+                    response,
+                    ch.is_any_user_allowed(["other-user", "1002"]),
+                    "-2001",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
         }
 
-        let result = rx.await.unwrap();
-        assert_eq!(result, ChannelApprovalResponse::Approve);
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                &approval_id,
+                ChannelApprovalResponse::Approve,
+                ch.is_any_user_allowed(["operator", "1001"]),
+                "-2002",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Rejected,
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key(&approval_id));
+
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                &approval_id,
+                ChannelApprovalResponse::AlwaysApprove,
+                ch.is_any_user_allowed(["operator", "1001"]),
+                "-2001",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Resolved,
+        );
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+        let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "approve-id".to_string(),
+            crate::util::PendingApproval {
+                sender: approve_tx,
+                destination: "-2001".to_string(),
+                tool_name: "shell".to_string(),
+            },
+        );
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                "approve-id",
+                ChannelApprovalResponse::Approve,
+                ch.is_any_user_allowed(["operator", "1001"]),
+                "-2001",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Resolved,
+        );
+        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn approval_callback_context_reads_username_numeric_id_and_chat() {
+        let callback = serde_json::json!({
+            "from": { "id": 1001, "username": "operator" },
+            "message": { "chat": { "id": -2001 } }
+        });
+        let (identities, chat_id) = TelegramChannel::approval_callback_context(&callback);
+        assert_eq!(identities, vec!["operator", "1001"]);
+        assert_eq!(chat_id.as_deref(), Some("-2001"));
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_known_approval_callbacks_from_wrong_user_or_chat() {
+        use wiremock::matchers::{body_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let get_updates_path = r"/bot[^/]+/getUpdates$";
+        let allowed_updates = serde_json::json!(["message", "callback_query"]);
+
+        Mock::given(method("POST"))
+            .and(path_regex(get_updates_path))
+            .and(body_json(serde_json::json!({
+                "offset": 0,
+                "timeout": 0,
+                "allowed_updates": allowed_updates.clone(),
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [],
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(get_updates_path))
+            .and(body_json(serde_json::json!({
+                "offset": 0,
+                "timeout": 30,
+                "allowed_updates": allowed_updates,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": [
+                    {
+                        "update_id": 1,
+                        "callback_query": {
+                            "id": "wrong-user",
+                            "from": { "id": 1002, "username": "other" },
+                            "message": { "chat": { "id": -2001 } },
+                            "data": "approval:approval-id:approve"
+                        }
+                    },
+                    {
+                        "update_id": 2,
+                        "callback_query": {
+                            "id": "wrong-chat",
+                            "from": { "id": 1001, "username": "operator" },
+                            "message": { "chat": { "id": -2002 } },
+                            "data": "approval:approval-id:deny"
+                        }
+                    }
+                ],
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true,
+            })))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["operator".into(), "1001".into()]),
+                false,
+            )
+            .with_api_base(mock_server.uri()),
+        );
+        let (approval_tx, mut approval_rx) = tokio::sync::oneshot::channel();
+        channel.pending_approvals.lock().await.insert(
+            "approval-id".to_string(),
+            crate::util::PendingApproval {
+                sender: approval_tx,
+                destination: "-2001".to_string(),
+                tool_name: "shell".to_string(),
+            },
+        );
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1);
+        let listener = channel.clone();
+        let listener_task =
+            zeroclaw_spawn::spawn!(async move { listener.listen(message_tx).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let requests = mock_server
+                    .received_requests()
+                    .await
+                    .expect("mock server should record requests");
+                let answers = requests
+                    .iter()
+                    .filter(|request| request.url.path().ends_with("/answerCallbackQuery"))
+                    .count();
+                if answers == 2 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both rejected callbacks should be acknowledged");
+
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("approval-id"),
+            "rejected callbacks must leave the pending approval available to its owner"
+        );
+        assert!(
+            approval_rx.try_recv().is_err(),
+            "no approval decision may be sent"
+        );
+        assert!(
+            message_rx.try_recv().is_err(),
+            "known rejected approval replies must not enter normal message dispatch"
+        );
+
+        let expected_text = format!(
+            "⚠️ {}",
+            i18n::get_required_cli_string("channel-telegram-approval-ack-not-accepted")
+        );
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("mock server should retain callback acknowledgements");
+        let answer_ids: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/answerCallbackQuery"))
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body)
+                    .expect("callback acknowledgement must be JSON");
+                assert_eq!(body["text"], expected_text);
+                body["callback_query_id"]
+                    .as_str()
+                    .expect("callback acknowledgement needs an id")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(answer_ids, vec!["wrong-user", "wrong-chat"]);
+
+        listener_task.abort();
+        let _ = listener_task.await;
     }
 
     #[tokio::test]
@@ -11711,15 +12578,16 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
-            PendingApproval {
+            crate::util::PendingApproval {
                 sender: tx,
+                destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
             },
         );
 
         let callback = serde_json::json!({
             "id": "cb-1",
-            "from": { "first_name": "zeroclaw_operator" },
+            "from": { "id": 1001, "first_name": "zeroclaw_operator" },
             "message": { "message_id": 99, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
@@ -11974,8 +12842,9 @@ mod tests {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             approval_id.clone(),
-            PendingApproval {
+            crate::util::PendingApproval {
                 sender: resp_tx,
+                destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
             },
         );
@@ -11987,7 +12856,7 @@ mod tests {
             "update_id": 41,
             "callback_query": {
                 "id": "cb-route-1",
-                "from": { "first_name": "zeroclaw_operator" },
+                "from": { "id": 1001, "first_name": "zeroclaw_operator" },
                 "message": { "message_id": 77, "chat": { "id": 12345 } },
                 "data": format!("approval:{approval_id}:approve"),
             }
@@ -12093,7 +12962,7 @@ mod tests {
 
         let callback = serde_json::json!({
             "id": "cb-late",
-            "from": { "first_name": "zeroclaw_operator" },
+            "from": { "id": 1001, "first_name": "zeroclaw_operator" },
             "message": { "message_id": 55, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
@@ -12177,7 +13046,7 @@ mod tests {
 
         let callback = serde_json::json!({
             "id": "cb-early",
-            "from": { "first_name": "zeroclaw_operator" },
+            "from": { "id": 1001, "first_name": "zeroclaw_operator" },
             "message": { "message_id": 66, "chat": { "id": 12345 } },
             "data": format!("approval:{approval_id}:approve"),
         });
@@ -12220,8 +13089,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             "a1".to_string(),
-            PendingApproval {
+            crate::util::PendingApproval {
                 sender: tx,
+                destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
             },
         );
@@ -12250,8 +13120,9 @@ mod tests {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
             "a2".to_string(),
-            PendingApproval {
+            crate::util::PendingApproval {
                 sender: tx,
+                destination: "12345".to_string(),
                 tool_name: "shell".to_string(),
             },
         );

@@ -3280,16 +3280,20 @@ impl FamilyEndpoint for KiloModelProviderConfig {
     }
 }
 
-// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ──
+// ── ZeroRouter (LLM gateway — OpenAI-compatible; hosted or self-hosted) ──
 
-/// ZeroRouter endpoint. ZeroRouter is a family of independently operated
-/// routers, so there is no canonical hosted default: the single variant
-/// points at the router container's own bind
-/// (`ZEROROUTER_BIND=0.0.0.0:8080`). A hosted deployment does run at
-/// `https://zerorouter.ai`, but it is one deployment among many rather than
-/// the family default, so operators reaching it — or any other remote
-/// router — set `base.uri`. [`ZEROROUTER_DEFAULT_URL`] is the canonical
-/// family default consumed by both schema and provider construction.
+/// ZeroRouter endpoint. The single variant points at the public hosted
+/// deployment, `https://zerorouter.ai` (currently in beta) — the endpoint a
+/// user who names this provider without further configuration expects, and
+/// the one that works out of the box: its `/v1/models` listing is public, so
+/// discovery succeeds before any key is configured. ZeroRouter is also
+/// self-hostable (AGPL); operators running their own router — locally
+/// (`ZEROROUTER_BIND=0.0.0.0:8080`, so `http://localhost:8080/v1`) or
+/// anywhere else — set `base.uri` to reach it. A localhost default was
+/// considered and rejected: it made the zero-config path a connection
+/// refusal, or worse, a silent partial catalog from a stray dev instance.
+/// [`ZEROROUTER_DEFAULT_URL`] is the canonical default consumed by both
+/// schema and provider construction.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -3300,8 +3304,8 @@ pub enum ZerorouterEndpoint {
     Default,
 }
 
-/// Default API base for a locally running ZeroRouter.
-pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+/// Default API base: the hosted ZeroRouter deployment.
+pub const ZEROROUTER_DEFAULT_URL: &str = "https://zerorouter.ai/v1";
 
 impl ModelEndpoint for ZerorouterEndpoint {
     fn uri(&self) -> &'static str {
@@ -3989,17 +3993,19 @@ impl Config {
     }
 
     /// Return the first concrete `model` string available for use as a
-    /// default. Scans every typed slot's entries (iteration order is
-    /// the macro slot order) for one with `model` set. Returns `None`
-    /// only when no model-provider entry has any model configured at
-    /// all.
+    /// default: the model declared by the first entry that has one, in the
+    /// iteration order of
+    /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
+    /// Returns `None` only when no model-provider entry has any model
+    /// configured at all.
     #[must_use]
     pub fn resolve_default_model(&self) -> Option<String> {
         self.providers
             .models
-            .iter_entries()
-            .filter_map(|(_, _, base)| base.model.as_deref().map(str::trim))
-            .find(|m| !m.is_empty())
+            .first_entry_with_model()
+            .and_then(|(_, _, base)| base.model.as_deref())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
             .map(ToString::to_string)
     }
 
@@ -6843,6 +6849,64 @@ impl CostRatesConfig {
     #[must_use]
     pub fn tool_rates(&self, tool_name: &str) -> Option<&ToolCostRates> {
         self.tools.get(tool_name)
+    }
+
+    /// Reject rate-sheet values that cannot represent a real USD price.
+    /// Deliberate zero-cost entries remain valid and distinguish a configured
+    /// free resource from one whose pricing is unavailable.
+    pub fn validate(&self) -> Result<()> {
+        fn validate_rate(path: String, value: Option<f64>) -> Result<()> {
+            if let Some(value) = value
+                && !crate::cost::is_sane_usd_rate(value)
+            {
+                let max = crate::cost::MAX_SANE_USD_RATE;
+                validation_bail!(
+                    InvalidNumericRange,
+                    path.clone(),
+                    "{path} = {value} is invalid; cost rates must be finite and between 0 and {max} USD per configured unit"
+                );
+            }
+            Ok(())
+        }
+
+        let mut model_rates: Vec<_> = self.providers.models.iter_entries().collect();
+        model_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in model_rates {
+            let prefix = format!("cost.rates.providers.models.{provider}.{model}");
+            validate_rate(format!("{prefix}.input_per_mtok"), rates.input_per_mtok)?;
+            validate_rate(format!("{prefix}.output_per_mtok"), rates.output_per_mtok)?;
+            validate_rate(
+                format!("{prefix}.cached_input_per_mtok"),
+                rates.cached_input_per_mtok,
+            )?;
+        }
+
+        let mut tts_rates: Vec<_> = self.providers.tts.iter_entries().collect();
+        tts_rates.sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, voice, rates) in tts_rates {
+            validate_rate(
+                format!("cost.rates.providers.tts.{provider}.{voice}.per_mchar"),
+                rates.per_mchar,
+            )?;
+        }
+
+        let mut transcription_rates: Vec<_> = self.providers.transcription.iter_entries().collect();
+        transcription_rates
+            .sort_unstable_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+        for (provider, model, rates) in transcription_rates {
+            validate_rate(
+                format!("cost.rates.providers.transcription.{provider}.{model}.per_minute"),
+                rates.per_minute,
+            )?;
+        }
+
+        let mut tool_rates: Vec<_> = self.tools.iter().collect();
+        tool_rates.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        for (tool, rates) in tool_rates {
+            validate_rate(format!("cost.rates.tools.{tool}.per_call"), rates.per_call)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -12050,9 +12114,11 @@ pub fn validate_memory_semantics(
 /// `dm_policy` and `group_policy` are consulted under BOTH modes, so they are
 /// not reported here.
 ///
-/// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
-/// list is empty, so under `group_policy = "allowlist"` an empty list is an
-/// allowlist that admits every group. That holds under both modes.
+/// `allowed_groups` is separate. It is the group-identity gate and is consulted
+/// under both modes, so it is never inert. `is_group_chat_allowed` returns true
+/// for an empty list only under `group_policy = "all"`; under every other policy
+/// an empty list admits no group. That closure is reported below by its own
+/// warning rather than as an inert key.
 ///
 /// Warnings only, no behaviour change to the validator itself. But be precise
 /// about WHICH reliance is reported, because this sentence used to promise more
@@ -12101,29 +12167,32 @@ pub fn validate_whatsapp_semantics(
         }
     }
 
-    // An empty allowed_groups only creates UNINTENDED open access where the
-    // effective policy would otherwise have consulted the list. Two
-    // configurations must stay quiet:
+    // The empty group-identity gate moved from admit-all to policy-selected.
+    // The warning is therefore a migration notice about a capability the
+    // operator is LOSING, not a fail-open alarm, and only `allowlist` loses
+    // anything. Two policies must stay quiet, because neither changed:
     //
-    //   group_policy = "ignore"    the channel gate drops every group message
-    //                              downstream, so nothing is permitted. Warning here
-    //                              also told the operator to set exactly this, and
-    //                              then kept firing after they did.
-    //   group_policy = "all"       an explicit opt-in to open group access. Warning
-    //                              here reports a deliberate choice as unsafe.
+    //   group_policy = "all"      admits every group before and after.
+    //   group_policy = "ignore"   rejects every group before and after. It is
+    //                             mode-independent in the chat-type gate, so
+    //                             this holds for business as well as personal;
+    //                             only the gate doing the rejecting moved.
     //
-    // group_policy is consulted under BOTH modes, so this predicate is
-    // mode-independent: the unintended case is `allowlist`, where an empty list
-    // is an allowlist that admits every group.
-    let empty_list_permits_all = wa.group_policy == WhatsAppChatPolicy::Allowlist;
-
-    if wa.allowed_groups.is_empty() && empty_list_permits_all {
+    // The predicate is shared with the Web transport's startup notice rather
+    // than restated here, so `config validate` and the runtime cannot drift
+    // into disagreeing about which configurations changed.
+    if wa.allowed_groups.is_empty()
+        && whatsapp_empty_group_list_is_newly_closed(&wa.mode, &wa.group_policy)
+    {
+        let remedy = whatsapp_empty_group_list_remedy(&wa.group_policy);
         out.push(crate::validation_warnings::ValidationWarning::new(
-            "whatsapp_empty_group_allowlist_permits_all",
+            "whatsapp_empty_group_list_serves_no_group",
             format!(
-                "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
-                 group the linked account belongs to. List the group JIDs you intend to \
-                 serve, or set group_policy = \"ignore\" to serve no group at all."
+                "channels.whatsapp.{alias}.allowed_groups is empty and \
+                 group_policy is \"allowlist\", so this channel answers NO \
+                 group. An empty list used to admit every group at the \
+                 identity gate; that gate is now decided by group_policy. To \
+                 restore group access, {remedy}."
             ),
             format!("channels.whatsapp.{alias}.allowed_groups"),
         ));
@@ -16124,6 +16193,63 @@ pub enum WhatsAppChatPolicy {
     All,
 }
 
+/// Whether an empty `allowed_groups` is a capability the operator is LOSING.
+///
+/// The change this reports is narrow: the empty group-identity gate moves from
+/// admit-all to policy-selected. Only a configuration that previously reached
+/// the chat-type gate and was admitted there loses anything.
+///
+/// Two policies lose nothing and are therefore never reported:
+///
+/// - `all` admits every group before and after.
+/// - `ignore` rejects every group before and after. It is mode-independent in
+///   the chat-type gate, so a Business channel with `ignore` was already closed
+///   just as a Personal one was. Reporting it would tell an operator their
+///   channel used to answer every group and offer ways to reopen a policy they
+///   set deliberately.
+///
+/// `mode` is accepted so callers need not know that the answer is currently
+/// mode-independent, and so a future policy that IS mode-sensitive has a place
+/// to land without changing every call site.
+///
+/// Shared rather than duplicated: the Web transport emits a startup notice from
+/// this same predicate, so the runtime behavior and the `config validate` warning
+/// cannot drift into disagreeing about which configurations changed.
+pub fn whatsapp_empty_group_list_is_newly_closed(
+    _mode: &WhatsAppWebMode,
+    group_policy: &WhatsAppChatPolicy,
+) -> bool {
+    !matches!(
+        group_policy,
+        WhatsAppChatPolicy::All | WhatsAppChatPolicy::Ignore
+    )
+}
+
+/// How to restore group access, phrased for the policy actually in force.
+///
+/// Shared rather than duplicated for the same reason as the predicate above:
+/// the Web transport's startup notice and the `config validate` warning must
+/// not offer different remedies for the same configuration.
+///
+/// The `ignore` arm exists because naming `allowed_groups` there would be an
+/// INEFFECTIVE remedy. A listed group passes the group-identity gate and is
+/// then dropped by the chat-type gate, so populating the list changes nothing
+/// and the operator has to choose a different policy instead.
+pub fn whatsapp_empty_group_list_remedy(group_policy: &WhatsAppChatPolicy) -> &'static str {
+    match group_policy {
+        WhatsAppChatPolicy::Ignore => {
+            "group_policy = \"ignore\" serves no group by design; set \
+             group_policy = \"all\" to admit every group, or \
+             group_policy = \"allowlist\" together with the group JIDs you \
+             intend to serve"
+        }
+        _ => {
+            "list the group JIDs you intend to serve in allowed_groups, or \
+             set group_policy = \"all\" to admit every group"
+        }
+    }
+}
+
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
@@ -16256,7 +16382,8 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
     /// Allowed group chats by JID (Web mode). An empty list (the default)
-    /// permits all groups; a non-empty list drops every group message whose
+    /// admits NO group unless `group_policy = "all"`, which admits every
+    /// group; a non-empty list drops every group message whose
     /// chat JID matches no entry. Each entry matches either the full group
     /// JID (`123456789012345@g.us`) or the JID user part - the segment before
     /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
@@ -17198,13 +17325,17 @@ pub struct LarkConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_secret: String,
-    /// Encrypt key for webhook message decryption (optional)
+    /// Encrypt key for webhook message decryption and signed event-subscription
+    /// validation (optional when verification_token is configured for plaintext
+    /// callbacks).
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub encrypt_key: Option<String>,
-    /// Verification token for webhook validation (optional)
+    /// Verification token for plaintext webhook validation and URL verification.
+    /// Required in webhook mode unless encrypt_key is configured for signed
+    /// event-subscription callbacks; optional in websocket mode.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
@@ -19159,9 +19290,19 @@ impl Default for SecurityOpsConfig {
 
 impl Default for Config {
     fn default() -> Self {
-        let home =
-            UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
-        let zeroclaw_dir = home.join(".zeroclaw");
+        // `default_config_dir()` is the canonical resolution for "where does
+        // an unspecified config live": it honors `ZEROCLAW_CONFIG_DIR`, then
+        // a `HOME` env override, before falling back to `UserDirs`. Calling
+        // it here, instead of duplicating a `UserDirs`-only computation,
+        // means a `Config::default()` constructed under an isolated test or
+        // deployment never resolves to the real machine's `~/.zeroclaw`, and
+        // so cannot become a save target pointing at an operator's populated
+        // config.toml.
+        let zeroclaw_dir = default_config_dir().unwrap_or_else(|_| {
+            let home =
+                UserDirs::new().map_or_else(|| PathBuf::from("."), |u| u.home_dir().to_path_buf());
+            home.join(".zeroclaw")
+        });
 
         Self {
             data_dir: zeroclaw_dir.join("data"),
@@ -21343,6 +21484,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        self.cost.rates.validate()?;
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -23274,6 +23416,18 @@ impl Config {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| std::ffi::OsStr::new("config.toml"));
         let resolved = zeroclaw_dir.join(file_name);
+        if tokio::fs::try_exists(&resolved).await.with_context(|| {
+            format!(
+                "Failed to check resolved config path {}",
+                resolved.display()
+            )
+        })? {
+            anyhow::bail!(
+                "Config path {} has no parent directory and resolves to {}; refusing to overwrite existing config",
+                self.config_path.display(),
+                resolved.display()
+            );
+        }
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": self.config_path.display().to_string(), "resolved": resolved.display().to_string(), "source": source.as_str()})), "Config path missing parent directory; resolving from runtime environment");
         Ok(resolved)
     }
@@ -31389,6 +31543,84 @@ model = "primary-model"
         let _ = tokio::fs::remove_dir_all(temp_home).await;
     }
 
+    /// `Config::default()` previously computed its `config_path`/`data_dir`
+    /// from `UserDirs::home_dir()` directly, ignoring `ZEROCLAW_CONFIG_DIR`
+    /// entirely -- unlike every other path-resolution entry point in this
+    /// file. A `Config::default()` built under a `ZEROCLAW_CONFIG_DIR`-isolated
+    /// test or deployment therefore still resolved to the real machine's
+    /// `~/.zeroclaw`.
+    #[test]
+    async fn default_config_honors_zeroclaw_config_dir() {
+        let _env_guard = env_override_lock().await;
+        let custom_dir =
+            std::env::temp_dir().join(format!("zeroclaw_test_custom_{}", uuid::Uuid::new_v4()));
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", &custom_dir);
+
+        let config = Config::default();
+
+        assert_eq!(config.config_path, custom_dir.join("config.toml"));
+        assert_eq!(config.data_dir, custom_dir.join("data"));
+    }
+
+    #[test]
+    async fn save_refuses_to_overwrite_existing_runtime_config_from_bare_path() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("workspace");
+        let resolved_config_path = temp_home.join(".zeroclaw").join("config.toml");
+        let original = "schema_version = 5\n\n[operator_only]\nkeep = true\n";
+        tokio::fs::create_dir_all(resolved_config_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&resolved_config_path, original)
+            .await
+            .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: PathBuf::from("config.toml"),
+            ..Default::default()
+        };
+        let save_result = config.save().await;
+        config.mark_dirty("observability.backend");
+        let save_dirty_result = config.save_dirty().await;
+        let written = tokio::fs::read_to_string(&resolved_config_path)
+            .await
+            .unwrap();
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        let _ = tokio::fs::remove_dir_all(temp_home).await;
+
+        assert!(
+            save_result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite existing config"),
+        );
+        assert!(
+            save_dirty_result
+                .unwrap_err()
+                .to_string()
+                .contains("refusing to overwrite existing config"),
+        );
+        assert_eq!(written, original);
+    }
+
     #[test]
     async fn validate_ollama_cloud_model_requires_remote_api_url() {
         let _env_guard = env_override_lock().await;
@@ -33616,6 +33848,129 @@ group_policy = "disabled"
             written.contains("name = \"fs\""),
             "natural-key `name` must survive the incremental save; got:\n{written}"
         );
+    }
+
+    fn validate_config_with_cost_rates(rates: CostRatesConfig) -> Result<()> {
+        let mut config = Config::default();
+        config.cost.rates = rates;
+        config.validate()
+    }
+
+    #[test]
+    async fn cost_rate_validation_rejects_out_of_range_typed_rates() {
+        for (field, value) in [
+            ("input_per_mtok", -0.01),
+            ("output_per_mtok", f64::NAN),
+            ("cached_input_per_mtok", f64::INFINITY),
+            ("input_per_mtok", f64::MAX),
+        ] {
+            let mut rates = CostRatesConfig::default();
+            rates.providers.models.openai.insert(
+                "gpt-test".to_string(),
+                ModelCostRates {
+                    input_per_mtok: (field == "input_per_mtok").then_some(value),
+                    output_per_mtok: (field == "output_per_mtok").then_some(value),
+                    cached_input_per_mtok: (field == "cached_input_per_mtok").then_some(value),
+                },
+            );
+            let error = validate_config_with_cost_rates(rates)
+                .expect_err("invalid model rate must fail canonical config validation");
+            let message = format!("{error:#}");
+            assert!(message.contains("invalid_numeric_range"), "{message}");
+            assert!(message.contains(field), "{message}");
+        }
+
+        let mut rates = CostRatesConfig::default();
+        rates.providers.tts.openai.insert(
+            "voice-test".to_string(),
+            TtsCostRates {
+                per_mchar: Some(f64::NEG_INFINITY),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("non-finite TTS rate must fail canonical config validation")
+        );
+        assert!(message.contains("providers.tts.openai.voice-test.per_mchar"));
+
+        let mut rates = CostRatesConfig::default();
+        rates.providers.transcription.openai.insert(
+            "transcriber-test".to_string(),
+            TranscriptionCostRates {
+                per_minute: Some(-1.0),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("negative transcription rate must fail canonical config validation")
+        );
+        assert!(message.contains("providers.transcription.openai.transcriber-test.per_minute"));
+
+        let mut rates = CostRatesConfig::default();
+        rates.tools.insert(
+            "web_search".to_string(),
+            ToolCostRates {
+                per_call: Some(f64::NAN),
+            },
+        );
+        let message = format!(
+            "{:#}",
+            validate_config_with_cost_rates(rates)
+                .expect_err("non-finite tool rate must fail canonical config validation")
+        );
+        assert!(message.contains("cost.rates.tools.web_search.per_call"));
+    }
+
+    #[test]
+    async fn cost_rate_validation_preserves_deliberate_zero_cost_entries() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "free-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+        );
+        rates.providers.tts.openai.insert(
+            "free-voice".to_string(),
+            TtsCostRates {
+                per_mchar: Some(0.0),
+            },
+        );
+        rates.providers.transcription.openai.insert(
+            "free-transcriber".to_string(),
+            TranscriptionCostRates {
+                per_minute: Some(0.0),
+            },
+        );
+        rates.tools.insert(
+            "free-tool".to_string(),
+            ToolCostRates {
+                per_call: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("0.0 is a deliberate free rate, not missing or invalid pricing");
+    }
+
+    #[test]
+    async fn cost_rate_validation_accepts_the_shared_safety_boundary() {
+        let mut rates = CostRatesConfig::default();
+        rates.providers.models.openai.insert(
+            "boundary-model".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.0),
+            },
+        );
+
+        validate_config_with_cost_rates(rates)
+            .expect("the canonical maximum cost rate must remain valid");
     }
 
     /// `cost.rates.providers.models.<type>` is a
@@ -37144,6 +37499,36 @@ stream_tool_arguments = [
     async fn set_prop_unknown_path_fails() {
         let mut mx = test_matrix_config();
         assert!(mx.set_prop("channels.matrix.nonexistent", "val").is_err());
+    }
+
+    #[test]
+    async fn set_prop_materializes_missing_nested_option_only_on_success() {
+        let mut config = Config::default();
+        assert!(config.gateway.tls.is_none());
+
+        // Probing an absent Option<T> must not leave a phantom section when
+        // the dotted path is unrelated or the target value is invalid.
+        assert!(config.set_prop("gateway.tls.nonexistent", "value").is_err());
+        assert!(config.gateway.tls.is_none());
+        assert!(
+            config
+                .set_prop("gateway.tls.enabled", "not-a-bool")
+                .is_err()
+        );
+        assert!(config.gateway.tls.is_none());
+
+        config
+            .set_prop("gateway.tls.cert_path", "/tmp/zeroclaw-test-cert.pem")
+            .expect("a valid child write should materialize its missing parent");
+        assert_eq!(
+            config
+                .gateway
+                .tls
+                .as_ref()
+                .expect("successful write should commit the parent")
+                .cert_path,
+            "/tmp/zeroclaw-test-cert.pem",
+        );
     }
 
     #[test]
@@ -41614,7 +41999,7 @@ allowed_users = []
     }
 
     const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
-    const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
+    const WA_CLOSED_GROUPS_WARNING: &str = "whatsapp_empty_group_list_serves_no_group";
 
     /// A config carrying both `phone_number_id` and a Web selector runs as
     /// Cloud, and the Cloud transport consults none of the Web chat-policy
@@ -41652,7 +42037,7 @@ allowed_groups = []
             "a Cloud-backed channel must not be diagnosed against the Web chat-policy gate"
         );
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
             "the Web group gate is not in a Cloud channel's path, so an empty \
              allowed_groups grants no group access here"
         );
@@ -41673,8 +42058,8 @@ allowed_groups = []
             "removing the Cloud selector must restore the inert-key diagnostic"
         );
         assert!(
-            !warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
-            "removing the Cloud selector must restore the open-groups diagnostic"
+            !warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "removing the Cloud selector must restore the empty-group diagnostic"
         );
     }
 
@@ -41745,7 +42130,7 @@ phone_number_id = "1234567890"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
-        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty());
     }
 
     /// A disabled channel cannot answer anything, so it must stay quiet.
@@ -41759,11 +42144,12 @@ session_path = "/tmp/wa-session"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(warnings_with_code(&cfg, WA_INERT_WARNING).is_empty());
-        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty());
     }
 
-    /// The group gate runs in BOTH modes and returns true when the list is
-    /// empty, which makes the default the open case.
+    /// The group gate runs in BOTH modes and now returns false when the list is
+    /// empty under any policy but `all`, so the default is the newly-CLOSED
+    /// case and the operator is told which capability they lost.
     #[test]
     async fn whatsapp_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -41773,7 +42159,7 @@ mode = "personal"
 session_path = "/tmp/wa-session"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        let warnings = warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
@@ -41789,14 +42175,13 @@ session_path = "/tmp/wa-session"
 allowed_groups = ["123@g.us"]
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty());
+        assert!(warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty());
     }
 
-    /// The remediation the warning itself recommends must SILENCE the warning.
-    /// Under personal mode the channel gate drops every group message when
-    /// group_policy = "ignore", so an empty list permits nothing. Warning here
-    /// told the operator to set exactly this and then kept firing after they
-    /// did, which is the defect this test pins.
+    /// Personal mode with group_policy = "ignore" ALREADY dropped every group
+    /// message before this change, so nothing closed and the operator lost no
+    /// capability. A migration notice here would report a change that did not
+    /// happen to this configuration.
     #[test]
     async fn whatsapp_personal_ignore_groups_is_not_flagged() {
         let toml = r#"
@@ -41808,9 +42193,9 @@ group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
-            "group_policy = \"ignore\" drops every group message, so an empty \
-             allowed_groups permits nothing and the warning must not fire"
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "personal + \"ignore\" already dropped every group message, so \
+             nothing closed and the migration notice must not fire"
         );
     }
 
@@ -41828,15 +42213,15 @@ group_policy = "all"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
             "group_policy = \"all\" is an explicit opt-in to open groups and must \
              not be reported as an unintended configuration"
         );
     }
 
-    /// The default group_policy is `allowlist`, so an empty list really does
-    /// admit every group. This is the positive case that must survive narrowing
-    /// the warning.
+    /// The default group_policy is `allowlist`, under which an empty list admits
+    /// no group, so business mode with no policy set is the newly-closed case.
+    /// This is the positive case that must survive narrowing the warning.
     #[test]
     async fn whatsapp_business_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -41846,7 +42231,7 @@ mode = "business"
 session_path = "/tmp/wa-session"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let warnings = warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING);
+        let warnings = warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING);
         assert_eq!(
             warnings.len(),
             1,
@@ -41855,11 +42240,15 @@ session_path = "/tmp/wa-session"
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
 
-    /// Business mode now consults group_policy, so `ignore` closes group access
-    /// there exactly as it does under personal mode. Warning that an empty list
-    /// "permits EVERY group" would be false for this configuration.
+    /// Business + `ignore` must NOT warn. The base already contains the merged
+    /// change that made both chat policies apply under both modes, so `ignore`
+    /// rejected every group before this PR and rejects every group after it.
+    /// Only the gate doing the rejecting moved, from the chat-type gate to the
+    /// earlier identity gate. Warning here would tell an operator their channel
+    /// used to answer every group and offer to reopen a policy they set
+    /// deliberately.
     #[test]
-    async fn whatsapp_business_ignore_group_policy_is_not_flagged() {
+    async fn whatsapp_business_ignore_group_policy_is_not_flagged_as_newly_closed() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
@@ -41869,9 +42258,90 @@ group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
-            "group_policy = \"ignore\" drops every group message under both modes, \
-             so the open-groups warning must not fire"
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "business + \"ignore\" was already closed before this change, so nothing              was lost and nothing may be reported"
+        );
+
+        // CONTROL: the same config differing only in group_policy DOES warn, so
+        // the silence above is this policy being excluded rather than the check
+        // never matching this alias at all.
+        let allowlist = toml.replace("group_policy = \"ignore\"", "group_policy = \"allowlist\"");
+        let cfg: Config = toml::from_str(&allowlist).unwrap();
+        assert_eq!(
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).len(),
+            1,
+            "business + \"allowlist\" with an empty list does newly close"
+        );
+    }
+
+    /// The six-cell predicate that BOTH the startup notice and `config validate`
+    /// consume. Asserted directly here so the shared contract is pinned once,
+    /// rather than only observed through whichever surface happens to call it.
+    #[test]
+    async fn whatsapp_empty_group_list_newly_closed_matrix() {
+        use WhatsAppChatPolicy as P;
+        use WhatsAppWebMode as M;
+        let cases = [
+            (M::Business, P::Allowlist, true),
+            (M::Personal, P::Allowlist, true),
+            // `ignore` and `all` are mode-independent in the chat-type gate, so
+            // each pairs with its opposite-mode row. `ignore` rejected every
+            // group before and after; `all` admits every group before and
+            // after. Neither loses a capability, so neither is reported.
+            (M::Business, P::Ignore, false),
+            (M::Personal, P::Ignore, false),
+            (M::Business, P::All, false),
+            (M::Personal, P::All, false),
+        ];
+        for (mode, policy, expected) in cases {
+            assert_eq!(
+                whatsapp_empty_group_list_is_newly_closed(&mode, &policy),
+                expected,
+                "{mode:?} + {policy:?} newly-closed should be {expected}"
+            );
+        }
+    }
+
+    /// The remedy must never tell an `ignore` channel to populate
+    /// `allowed_groups`: a listed group passes the identity gate and the
+    /// chat-type gate drops it anyway, so that advice cannot work.
+    #[test]
+    async fn whatsapp_empty_group_list_remedy_is_policy_aware() {
+        use WhatsAppChatPolicy as P;
+        let ignore = whatsapp_empty_group_list_remedy(&P::Ignore);
+        assert!(
+            ignore.contains("serves no group by design"),
+            "the ignore remedy must explain the policy: {ignore}"
+        );
+        assert!(
+            !ignore.contains("list the group JIDs you intend to serve in allowed_groups"),
+            "the ignore remedy must not offer a list, which cannot reopen it: {ignore}"
+        );
+        for policy in [P::Allowlist, P::All] {
+            let other = whatsapp_empty_group_list_remedy(&policy);
+            assert!(
+                other.contains("allowed_groups"),
+                "{policy:?} is reopened by a list, so the remedy must name it: {other}"
+            );
+        }
+    }
+
+    /// The `all` opt-in still admits every group under BOTH modes, so nothing
+    /// closed and no migration notice is owed. Control for the two rows above:
+    /// without it, a validator that warned unconditionally would still pass them.
+    #[test]
+    async fn whatsapp_business_all_groups_is_not_flagged() {
+        let toml = r#"
+[channels.whatsapp.shop]
+enabled = true
+mode = "business"
+session_path = "/tmp/wa-session"
+group_policy = "all"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(
+            warnings_with_code(&cfg, WA_CLOSED_GROUPS_WARNING).is_empty(),
+            "group_policy = \"all\" still admits every group, so nothing closed"
         );
     }
 
