@@ -124,6 +124,29 @@ fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
     );
 }
 
+/// Emit the structured event for a refusal that is a resource ceiling, not a
+/// policy verdict: the destination was granted and the instance's
+/// `plugins.limits.max_connections_per_instance` connections are all in use.
+/// It carries its own message and `error_key` so an operator grepping for
+/// egress denials does not mistake a budget refusal for a missing grant, the
+/// same distinction the guest now sees in its error code.
+fn record_connection_limit(id: &PluginInstanceId, host: &str, reason: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "plugin": id.package(),
+                "capability": format!("{:?}", id.capability()),
+                "binding": id.binding(),
+                "host": host,
+                "reason": reason,
+                "error_key": "plugin_egress_connection_limit",
+            })),
+        "Refused plugin outbound request: the instance's connection budget is exhausted"
+    );
+}
+
 /// The roots plugin HTTPS verifies against, and what this machine contributed.
 ///
 /// The counts are not decoration. A test asserting that the platform store was
@@ -651,12 +674,22 @@ async fn send(
         match timeout_at(deadline, service.authorize(egress_request)).await {
             Ok(Ok(authorized)) => authorized,
             Ok(Err(error)) => {
-                record_denial(&id, &host, &error.to_string());
                 return Err(match error {
                     EgressError::DnsFailed { .. }
-                    | EgressError::Network(NetworkGuardError::NoAddresses { .. }) => dns_failure(),
-                    EgressError::ConnectionLimitReached { .. } => connection_limit_reached(),
-                    _ => denied(),
+                    | EgressError::Network(NetworkGuardError::NoAddresses { .. }) => {
+                        record_denial(&id, &host, &error.to_string());
+                        dns_failure()
+                    }
+                    // A full budget is a ceiling the guest hit, not a verdict on
+                    // the destination: logged and reported as such on both sides.
+                    EgressError::ConnectionLimitReached { .. } => {
+                        record_connection_limit(&id, &host, &error.to_string());
+                        connection_limit_reached()
+                    }
+                    _ => {
+                        record_denial(&id, &host, &error.to_string());
+                        denied()
+                    }
                 });
             }
             Err(_) => return Err(ErrorCode::ConnectionTimeout),
