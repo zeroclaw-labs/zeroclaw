@@ -1,7 +1,9 @@
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, SendMessage};
 
 pub struct SendblueChannel {
     api_key_id: String,
@@ -13,10 +15,26 @@ pub struct SendblueChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// How often `listen` pulls new messages. `None` disables polling, leaving
+    /// the gateway's `/sendblue` webhook route as the only inbound path.
+    poll_interval: Option<Duration>,
+    /// `(succeeded, at)` for the last completed poll exchange. Read by
+    /// `listener_health`, which must not perform I/O.
+    poll_health: Mutex<Option<(bool, Instant)>>,
     client: reqwest::Client,
 }
 
 const SENDBLUE_API_BASE: &str = "https://api.sendblue.com/api";
+
+/// How long a successful poll stays evidence that the listener works. A
+/// blackholed request keeps `listen()` alive with nothing to end it, so a
+/// stale success must stop counting.
+const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(120);
+
+/// Message handles retained for de-duplication. `created_at_gte` is inclusive
+/// and Sendblue's clock is not ours, so the same message can be returned by
+/// two consecutive polls.
+const SEEN_HANDLE_CAP: usize = 512;
 
 impl SendblueChannel {
     pub fn new(
@@ -26,14 +44,43 @@ impl SendblueChannel {
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
+        Self::with_poll_interval(
+            api_key_id,
+            api_secret_key,
+            from_number,
+            alias,
+            peer_resolver,
+            None,
+        )
+    }
+
+    pub fn with_poll_interval(
+        api_key_id: String,
+        api_secret_key: String,
+        from_number: String,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        poll_interval: Option<Duration>,
+    ) -> Self {
         Self {
             api_key_id,
             api_secret_key,
             from_number,
             alias: alias.into(),
             peer_resolver,
+            poll_interval,
+            poll_health: Mutex::new(None),
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Resolve a configured interval into a listener setting: `0` disables
+    /// polling (leaving the webhook route as the only inbound path), and
+    /// anything below the floor is clamped so a mistyped value cannot hammer
+    /// the API.
+    pub fn poll_interval_from_secs(secs: u64) -> Option<Duration> {
+        const MIN_POLL_SECS: u64 = 5;
+        (secs > 0).then(|| Duration::from_secs(secs.max(MIN_POLL_SECS)))
     }
 
     /// Return the alias under `[channels.sendblue.<alias>]` that this
@@ -97,6 +144,48 @@ impl SendblueChannel {
     /// `data` when the account has the newer envelope format enabled.
     fn message_object(payload: &serde_json::Value) -> &serde_json::Value {
         payload.get("data").unwrap_or(payload)
+    }
+
+    /// Fetch inbound messages Sendblue recorded at or after `since`.
+    ///
+    /// Returns the raw message objects so the caller can reuse
+    /// [`Self::parse_webhook_payload`]: the polling API and the webhook deliver
+    /// the same record shape, so both inbound paths share one parser and one
+    /// allowlist decision.
+    async fn fetch_inbound_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let url = format!("{SENDBLUE_API_BASE}/v2/messages");
+
+        let resp = self
+            .auth_headers(self.client.get(&url))
+            .query(&[
+                ("limit", "50".to_string()),
+                ("created_at_gte", since.to_rfc3339()),
+            ])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let error_body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("API error: {status}: {error_body}");
+        }
+
+        let body = resp.json::<serde_json::Value>().await?;
+
+        Ok(body
+            .get("data")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| !Self::is_outbound(item))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
@@ -259,20 +348,109 @@ impl Channel for SendblueChannel {
         anyhow::bail!("API error: {status}");
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        // Sendblue uses webhooks (push-based), not polling.
-        // Messages are received via the gateway's /sendblue endpoint.
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let Some(interval) = self.poll_interval else {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "channel active (webhook mode). \
+                Configure the Sendblue webhook to POST to your gateway's /sendblue endpoint."
+            );
+
+            // Keep the task alive — it will be cancelled when the channel shuts down
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        };
+
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "channel active (webhook mode). \
-            Configure the Sendblue webhook to POST to your gateway's /sendblue endpoint."
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"interval_secs": interval.as_secs()})),
+            "channel active (polling mode)"
         );
 
-        // Keep the task alive — it will be cancelled when the channel shuts down
+        // Only messages that arrive from now on are ours to answer; replaying
+        // the account's backlog on every restart would re-answer old texts.
+        let mut watermark = chrono::Utc::now();
+        let mut seen: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            tokio::time::sleep(interval).await;
+
+            let fetched = self.fetch_inbound_since(watermark).await;
+            let payloads = match fetched {
+                Ok(payloads) => {
+                    *self.poll_health.lock() = Some((true, Instant::now()));
+                    payloads
+                }
+                Err(err) => {
+                    *self.poll_health.lock() = Some((false, Instant::now()));
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": err.to_string()})),
+                        "poll failed"
+                    );
+                    continue;
+                }
+            };
+
+            let mut newest = watermark;
+
+            for payload in &payloads {
+                if let Some(sent_at) = payload
+                    .get("date_sent")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                {
+                    let sent_at = sent_at.with_timezone(&chrono::Utc);
+                    if sent_at > newest {
+                        newest = sent_at;
+                    }
+                }
+
+                // `created_at_gte` is inclusive, so the boundary message comes
+                // back on the next poll too. De-duplicate on the stable handle.
+                let handle = payload
+                    .get("message_handle")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                if handle.as_ref().is_some_and(|handle| seen.contains(handle)) {
+                    continue;
+                }
+
+                for msg in self.parse_webhook_payload(payload) {
+                    if tx.send(msg).await.is_err() {
+                        // Receiver dropped: the orchestrator is shutting this
+                        // channel down.
+                        return Ok(());
+                    }
+                }
+
+                if let Some(handle) = handle {
+                    seen.push_back(handle);
+                    while seen.len() > SEEN_HANDLE_CAP {
+                        seen.pop_front();
+                    }
+                }
+            }
+
+            watermark = newest;
         }
+    }
+
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        // Webhook mode does no exchange of its own, so it has no signal to
+        // report and must not claim health it cannot observe.
+        self.poll_interval?;
+        Some(match *self.poll_health.lock() {
+            None => ListenerHealth::Pending,
+            Some((false, _)) => ListenerHealth::Unhealthy,
+            Some((true, at)) if at.elapsed() < POLL_HEALTH_STALE_AFTER => ListenerHealth::Healthy,
+            Some((true, _)) => ListenerHealth::Unhealthy,
+        })
     }
 
     async fn health_check(&self) -> bool {
@@ -543,6 +721,53 @@ mod tests {
         assert!(
             !verify_sendblue_secret("", &headers_with("x-sendblue-secret", "")),
             "an unset secret must never authenticate a request"
+        );
+    }
+
+    #[test]
+    fn a_zero_interval_disables_polling() {
+        assert_eq!(SendblueChannel::poll_interval_from_secs(0), None);
+    }
+
+    #[test]
+    fn a_too_small_interval_is_clamped_to_the_floor() {
+        assert_eq!(
+            SendblueChannel::poll_interval_from_secs(1),
+            Some(Duration::from_secs(5)),
+            "a mistyped interval must not be allowed to hammer the API"
+        );
+    }
+
+    #[test]
+    fn a_reasonable_interval_is_used_as_given() {
+        assert_eq!(
+            SendblueChannel::poll_interval_from_secs(30),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn webhook_mode_reports_no_listener_health() {
+        // Webhook mode completes no exchange of its own, so it has nothing to
+        // vouch for and must not claim health it cannot observe.
+        assert_eq!(allowed_channel().listener_health(), None);
+    }
+
+    #[test]
+    fn polling_mode_starts_pending_not_healthy() {
+        let channel = SendblueChannel::with_poll_interval(
+            "key-id".to_string(),
+            "secret-key".to_string(),
+            "+15550001111".to_string(),
+            "main",
+            Arc::new(Vec::new),
+            Some(Duration::from_secs(15)),
+        );
+
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Pending),
+            "a listener that has not yet polled is not evidence of health"
         );
     }
 }

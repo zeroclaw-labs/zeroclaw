@@ -53,6 +53,7 @@ pub use crate::qq::QQChannel;
 pub use crate::reddit::RedditChannel;
 #[cfg(feature = "channel-sendblue")]
 pub use crate::sendblue::SendblueChannel;
+
 #[cfg(feature = "channel-signal")]
 pub use crate::signal::SignalChannel;
 #[cfg(feature = "channel-slack")]
@@ -9647,12 +9648,13 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
             };
-            Ok(Arc::new(SendblueChannel::new(
+            Ok(Arc::new(SendblueChannel::with_poll_interval(
                 sb.api_key_id.clone(),
                 sb.api_secret_key.clone(),
                 sb.from_number.clone(),
                 alias,
                 peer_resolver,
+                SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
             )))
         }
         #[cfg(feature = "channel-sendblue")]
@@ -9670,12 +9672,13 @@ fn build_channel_by_id(
                 let alias = alias.to_string();
                 Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
             };
-            Ok(Arc::new(SendblueChannel::new(
+            Ok(Arc::new(SendblueChannel::with_poll_interval(
                 sb.api_key_id.clone(),
                 sb.api_secret_key.clone(),
                 sb.from_number.clone(),
                 alias.to_string(),
                 peer_resolver,
+                SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
             )))
         }
         #[cfg(not(feature = "channel-sendblue"))]
@@ -11073,12 +11076,13 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Sendblue",
             alias: Some(alias.clone()),
-            channel: Arc::new(SendblueChannel::new(
+            channel: Arc::new(SendblueChannel::with_poll_interval(
                 sb.api_key_id.clone(),
                 sb.api_secret_key.clone(),
                 sb.from_number.clone(),
                 alias.clone(),
                 peer_resolver,
+                SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
             )),
         });
     }

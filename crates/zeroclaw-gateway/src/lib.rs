@@ -1193,6 +1193,7 @@ pub async fn run_gateway(
             };
             (
                 alias.clone(),
+                // Webhook-only: the orchestrator owns the polling listener.
                 Arc::new(SendblueChannel::new(
                     sb.api_key_id.clone(),
                     sb.api_secret_key.clone(),

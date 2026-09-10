@@ -16509,8 +16509,8 @@ impl ChannelConfig for LinqConfig {
     }
 }
 
-/// Sendblue iMessage/SMS configuration (webhook receive + REST send).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// Sendblue iMessage/SMS configuration (polling or webhook receive, REST send).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.sendblue"]
 pub struct SendblueConfig {
@@ -16525,14 +16525,17 @@ pub struct SendblueConfig {
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
     pub api_key_id: String,
     /// Sendblue API secret key, sent as the `sb-api-secret-key` header.
     #[secret]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
     pub api_secret_key: String,
     /// Sendblue phone number to send from (E.164 format).
     #[tab(Advanced)]
+    #[serde(default)]
     pub from_number: String,
     /// Shared secret presented by inbound webhooks.
     ///
@@ -16550,12 +16553,36 @@ pub struct SendblueConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub signing_secret: Option<String>,
+    /// Seconds between polls of Sendblue's message list. Values below 5 are
+    /// clamped to 5. Set to `0` to disable polling and receive only through the
+    /// gateway's `/sendblue` webhook route. Default: `15`.
+    ///
+    /// Polling is the default because it needs nothing but the API credentials
+    /// — no publicly reachable endpoint, and none of the replay exposure that
+    /// comes with Sendblue's unsigned webhooks.
+    #[tab(Advanced)]
+    #[serde(default = "default_sendblue_poll_interval_secs")]
+    pub poll_interval_secs: u64,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+}
+
+fn default_sendblue_poll_interval_secs() -> u64 {
+    15
+}
+
+impl Default for SendblueConfig {
+    /// Derived from the serde defaults rather than restated, so
+    /// `SendblueConfig::default()` and a deserialized empty table cannot drift
+    /// apart on `poll_interval_secs`.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every SendblueConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for SendblueConfig {

@@ -31,28 +31,44 @@ enabled = true
 api_key_id = "…"        # sb-api-key-id
 api_secret_key = "…"    # sb-api-secret-key
 from_number = "+15550000000"
-signing_secret = "…"    # shared secret presented by inbound webhooks
 ```
 
-Outbound goes to `POST https://api.sendblue.com/api/send-message`. Inbound
-arrives at the gateway's `POST /sendblue[/<alias>]` route; point the webhook at
-that URL in the Sendblue dashboard.
+Outbound goes to `POST https://api.sendblue.com/api/send-message`.
 
-Senders are gated by the channel's peer group, matched literally against the
-E.164 number. A handle arriving without its leading `+` is normalized before
-the check, so both forms match one allowlist entry.
+### Inbound: polling (default)
+
+The channel polls `GET /api/v2/messages` every `poll_interval_secs` (default
+`15`, floor `5`). This is the default because it needs nothing but the API
+credentials: no publicly reachable endpoint, no webhook configured in the
+Sendblue dashboard, and none of the replay exposure below.
+
+Only messages that arrive after the listener starts are dispatched, so a
+restart does not re-answer the account's backlog. `created_at_gte` is
+inclusive, so the boundary message is de-duplicated on its `message_handle`.
+
+### Inbound: webhook (opt-in)
+
+Set `poll_interval_secs = 0` and a `signing_secret`, then point the Sendblue
+dashboard at the gateway's `POST /sendblue[/<alias>]` route.
 
 > **No signature scheme.** Sendblue does not sign webhook deliveries: there is
 > no HMAC and no timestamp to bind, so the gateway can only compare a shared
 > secret presented in a header (`X-Sendblue-Secret`, `X-Webhook-Secret`, or
 > `Authorization: Bearer …`). That secret is not bound to the request body, so
 > a captured header can be replayed with forged content — terminate the
-> endpoint over TLS. With `signing_secret` unset the gateway refuses inbound
-> requests with `401` rather than accepting them unauthenticated.
+> endpoint over TLS. With `signing_secret` unset the route refuses inbound
+> requests with `401` rather than accepting them unauthenticated. Prefer
+> polling unless you need push latency.
 
-Sendblue posts delivery receipts for the bot's own sends on the same webhook as
-inbound traffic. Those carry `is_outbound: true` and are acknowledged without
-dispatch, so the agent does not answer itself.
+### Both modes
+
+Senders are gated by the channel's peer group, matched literally against the
+E.164 number. A handle arriving without its leading `+` is normalized before
+the check, so both forms match one allowlist entry.
+
+Sendblue reports the bot's own sends alongside inbound traffic on both paths.
+Those carry `is_outbound: true` and are dropped before dispatch, so the agent
+does not answer itself.
 
 ## WeChat personal iLink Bot (微信个人号 iLink)
 
