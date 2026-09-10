@@ -2755,7 +2755,13 @@ fn which_zerocode_on_path() -> bool {
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
     /// List installed plugins
-    List,
+    List {
+        /// Also load-check each plugin against this host's WIT ABI and
+        /// annotate whether it would actually load (slower: this compiles and
+        /// instantiates every installed component)
+        #[arg(long)]
+        verify: bool,
+    },
     /// Search an installable plugin registry
     Search {
         /// Query to match against plugin names and descriptions
@@ -2771,6 +2777,10 @@ enum PluginCommands {
         /// Registry JSON URL used for install-by-name
         #[arg(long)]
         registry: Option<String>,
+        /// Install even if the plugin fails to load against this host's WIT ABI
+        /// (skips the install-time load-check)
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Remove an installed plugin
     Remove {
@@ -2784,6 +2794,232 @@ enum PluginCommands {
     },
     /// Move plugins from legacy install directories into the configured one
     Migrate,
+}
+
+/// Run the install-time load-check for a plugin source and decide whether the
+/// install may proceed. A plugin that does not instantiate against this host's
+/// WIT world would install cleanly and then be silently skipped at daemon
+/// startup; this surfaces that failure at the CLI with its full diagnostic.
+/// With `--no-verify` the same failure is printed as a warning and the install
+/// proceeds. A source with no WASM component has nothing to instantiate and
+/// passes.
+#[cfg(feature = "plugins-wasm")]
+async fn verify_plugin_loads_or_bail(
+    host: &zeroclaw::plugins::host::PluginHost,
+    source: &str,
+    no_verify: bool,
+) -> Result<()> {
+    let Some((manifest, wasm)) = host.source_component(source)? else {
+        return Ok(());
+    };
+    match zeroclaw::plugins::validate::verify_component_loads(&wasm, &manifest).await {
+        Ok(()) => Ok(()),
+        Err(error) if no_verify => {
+            let detail = format!("{error:#}");
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-install-verify-skipped",
+                    &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                    format!(
+                        "warning: '{}' does not load against this host and will be skipped at startup: {detail}",
+                        manifest.name
+                    ),
+                )
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            bail!(ta(
+                "cli-plugin-install-verify-failed",
+                &[("name", manifest.name.as_str()), ("error", detail.as_str())],
+                format!(
+                    "install failed: '{}' does not load against this host:\n{detail}\nOverride with --no-verify to install anyway.",
+                    manifest.name
+                ),
+            ))
+        }
+    }
+}
+
+/// The load verdict for one *installed* plugin.
+///
+/// `PluginInfo::loaded` only reports that a package was discovered, so a plugin
+/// the daemon will type-check and silently skip still lists as if it worked.
+/// This is the verdict that separates the two, and it comes from the same
+/// `verify_component_loads` check `plugin install` gates on: a plugin that
+/// predates that gate, was installed with `--no-verify`, or outlived a host
+/// upgrade is exactly the case the install gate cannot cover.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+enum PluginLoadStatus {
+    /// The component instantiates against this host's WIT world.
+    Loads,
+    /// It does not. Carries the full wasmtime cause chain, including the
+    /// WIT-drift rebuild hint when instantiation was what failed.
+    Fails(String),
+    /// A skill-only package ships no component, so there is nothing to load.
+    NoComponent,
+}
+
+#[cfg(feature = "plugins-wasm")]
+impl PluginLoadStatus {
+    /// Whether `plugin info` should exit non-zero, so a script can branch on
+    /// it. Only a real load failure qualifies: a skill-only package has
+    /// nothing to instantiate, which is not evidence that anything is broken.
+    const fn is_load_failure(&self) -> bool {
+        matches!(self, Self::Fails(_))
+    }
+}
+
+/// Run the load-check for one installed plugin.
+#[cfg(feature = "plugins-wasm")]
+async fn installed_plugin_load_status(
+    host: &zeroclaw::plugins::host::PluginHost,
+    info: &zeroclaw::plugins::PluginInfo,
+) -> Result<PluginLoadStatus> {
+    let Some(wasm_path) = info.wasm_path.as_deref() else {
+        return Ok(PluginLoadStatus::NoComponent);
+    };
+    let manifest = host
+        .manifest(&info.name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    match zeroclaw::plugins::validate::verify_component_loads(wasm_path, manifest).await {
+        Ok(()) => Ok(PluginLoadStatus::Loads),
+        Err(error) => Ok(PluginLoadStatus::Fails(format!("{error:#}"))),
+    }
+}
+
+/// The first line of a diagnostic. A list row annotates each plugin with just
+/// enough to tell one failure from another; `plugin info` prints the whole
+/// chain.
+#[cfg(feature = "plugins-wasm")]
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text).trim()
+}
+
+/// Render the body of `zeroclaw plugin list`.
+///
+/// Each entry carries its load verdict only when `--verify` ran, so the default
+/// listing stays a directory read and costs no compilation.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_list_lines(
+    entries: &[(zeroclaw::plugins::PluginInfo, Option<PluginLoadStatus>)],
+) -> Vec<String> {
+    if entries.is_empty() {
+        return vec![t("cli-plugins-none", "No plugins installed.")];
+    }
+
+    let mut lines = vec![t("cli-plugins-installed", "Installed plugins:")];
+    for (info, status) in entries {
+        let description = info
+            .description
+            .clone()
+            .unwrap_or_else(|| t("cli-plugin-no-description", "(no description)"));
+        let Some(status) = status else {
+            lines.push(format!("  {} v{} — {description}", info.name, info.version));
+            continue;
+        };
+        // The row is indented in code, not in Fluent: Fluent trims the leading
+        // whitespace of a single-line value, so an indent written there is lost.
+        let identity = format!("{} v{} — {description}", info.name, info.version);
+        let args = [
+            ("name", info.name.as_str()),
+            ("version", info.version.as_str()),
+            ("description", description.as_str()),
+        ];
+        let row = match status {
+            PluginLoadStatus::Loads => ta(
+                "cli-plugin-list-entry-loads",
+                &args,
+                format!("{identity} [loads]"),
+            ),
+            PluginLoadStatus::Fails(error) => {
+                let cause = first_line(error);
+                let mut args = args.to_vec();
+                args.push(("error", cause));
+                ta(
+                    "cli-plugin-list-entry-failed",
+                    &args,
+                    format!("{identity} [does not load: {cause}]"),
+                )
+            }
+            PluginLoadStatus::NoComponent => ta(
+                "cli-plugin-list-entry-no-component",
+                &args,
+                format!("{identity} [no component to load]"),
+            ),
+        };
+        lines.push(format!("  {row}"));
+    }
+    lines
+}
+
+/// Render `zeroclaw plugin info`. The load verdict is always the last line:
+/// "does this plugin work here" is the question the command exists to answer,
+/// and the manifest alone cannot answer it.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_info_lines(
+    info: &zeroclaw::plugins::PluginInfo,
+    config_entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    status: &PluginLoadStatus,
+) -> Vec<String> {
+    let mut lines = vec![ta(
+        "cli-plugin-name-version",
+        &[("name", &info.name), ("version", &info.version)],
+        "Plugin",
+    )];
+    if let Some(desc) = &info.description {
+        lines.push(ta(
+            "cli-plugin-description",
+            &[("desc", desc)],
+            "Description",
+        ));
+    }
+    lines.push(ta(
+        "cli-plugin-capabilities",
+        &[("v", &format!("{:?}", info.capabilities))],
+        "Capabilities",
+    ));
+    lines.push(ta(
+        "cli-plugin-permissions",
+        &[("v", &format!("{:?}", info.permissions))],
+        "Permissions",
+    ));
+    for (capability, key) in config_entries {
+        lines.push(ta(
+            "cli-plugin-config-entry-key",
+            &[("capability", &format!("{capability:?}")), ("key", key)],
+            "Config entry key",
+        ));
+    }
+    match &info.wasm_path {
+        Some(path) => lines.push(ta(
+            "cli-plugin-wasm",
+            &[("path", &path.display().to_string())],
+            "WASM",
+        )),
+        None => lines.push(t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")),
+    }
+    lines.push(match status {
+        PluginLoadStatus::Loads => t(
+            "cli-plugin-info-load-ok",
+            "Loads: yes. The component instantiates against this host's WIT world.",
+        ),
+        PluginLoadStatus::Fails(error) => ta(
+            "cli-plugin-info-load-failed",
+            &[("error", error)],
+            format!(
+                "Loads: no. {error}\nRebuild the plugin against the WIT shipped with this host (see wit/v0) and reinstall it."
+            ),
+        ),
+        PluginLoadStatus::NoComponent => t(
+            "cli-plugin-info-load-not-applicable",
+            "Loads: not applicable. This is a skill-only plugin, so there is no component to instantiate.",
+        ),
+    });
+    lines
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -7958,21 +8194,19 @@ Add pricing to the active provider profile or supply a catalog entry."
 
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
-            PluginCommands::List => {
+            PluginCommands::List { verify } => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
+                let mut entries = Vec::new();
+                for info in host.list_plugins() {
+                    let status = if verify {
+                        Some(installed_plugin_load_status(&host, &info).await?)
+                    } else {
+                        None
+                    };
+                    entries.push((info, status));
+                }
+                for line in plugin_list_lines(&entries) {
+                    println!("{line}");
                 }
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
@@ -8040,7 +8274,11 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 Ok(())
             }
-            PluginCommands::Install { source, registry } => {
+            PluginCommands::Install {
+                source,
+                registry,
+                no_verify,
+            } => {
                 if plugin_registry::looks_like_url(&source) {
                     bail!(
                         "`zeroclaw plugin install <url>` is not supported; use `--registry <url>` with a plugin name, or install a local plugin path"
@@ -8048,6 +8286,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
+                    verify_plugin_loads_or_bail(&host, &source, no_verify).await?;
                     let name = host.install(&source)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
@@ -8076,6 +8315,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
+                    verify_plugin_loads_or_bail(&host, &plugin_dir, no_verify).await?;
                     let name = host.install(&plugin_dir)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
@@ -8106,70 +8346,32 @@ Add pricing to the active provider profile or supply a catalog entry."
                 let host = plugin_host_with_configured_security(&config)?;
                 match host.get_plugin(&name) {
                     Some(info) => {
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-name-version",
-                                &[("name", &info.name), ("version", &info.version)],
-                                "Plugin"
-                            )
-                        );
-                        if let Some(desc) = &info.description {
-                            println!(
-                                "{}",
-                                ta("cli-plugin-description", &[("desc", desc)], "Description")
-                            );
+                        let config_entries = installed_plugin_config_entries(&host, &info.name)?;
+                        // The load-check always runs here. "Why does my plugin
+                        // not show up?" is the question this command is reached
+                        // for, and discovery metadata cannot answer it.
+                        let status = installed_plugin_load_status(&host, &info).await?;
+                        for line in plugin_info_lines(&info, &config_entries, &status) {
+                            println!("{line}");
                         }
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-capabilities",
-                                &[("v", &format!("{:?}", info.capabilities))],
-                                "Capabilities"
-                            )
-                        );
-                        println!(
-                            "{}",
-                            ta(
-                                "cli-plugin-permissions",
-                                &[("v", &format!("{:?}", info.permissions))],
-                                "Permissions"
-                            )
-                        );
-                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
-                        {
-                            println!(
-                                "{}",
-                                ta(
-                                    "cli-plugin-config-entry-key",
-                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
-                                    "Config entry key"
-                                )
-                            );
-                        }
-                        match &info.wasm_path {
-                            Some(path) => println!(
-                                "{}",
-                                ta(
-                                    "cli-plugin-wasm",
-                                    &[("path", &path.display().to_string())],
-                                    "WASM"
-                                )
-                            ),
-                            None => println!(
-                                "{}",
-                                t("cli-plugin-wasm-none", "WASM: (skill-only plugin)")
-                            ),
+                        if status.is_load_failure() {
+                            // The diagnostic is already on stdout; this is the
+                            // non-zero exit a script can branch on.
+                            bail!(ta(
+                                "cli-plugin-info-load-failed-exit",
+                                &[("name", &info.name)],
+                                format!("plugin '{}' does not load against this host", info.name),
+                            ));
                         }
                     }
-                    None => println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-not-found",
-                            &[("name", &name)],
-                            "Plugin not found"
-                        )
-                    ),
+                    // A name that is not installed is an error, not a report:
+                    // a script asking about a plugin must not read exit 0 as
+                    // "it is here and loads".
+                    None => bail!(ta(
+                        "cli-plugin-not-found",
+                        &[("name", &name)],
+                        "Plugin not found"
+                    )),
                 }
                 Ok(())
             }
@@ -12703,5 +12905,332 @@ mod tests {
             msg.contains("No model provider configured"),
             "error must mention missing provider; got: {msg}"
         );
+    }
+
+    /// Runtime load verification for an *already installed* plugin.
+    ///
+    /// The install gate cannot cover a plugin installed before it existed,
+    /// installed through `--no-verify`, or one whose host was upgraded
+    /// underneath it. These are the two surfaces that can: `plugin info`
+    /// always, `plugin list --verify` on demand.
+    ///
+    /// The assertions run against the rendered lines rather than captured
+    /// stdout because those functions *are* the output. That is also what lets
+    /// the plain listing be checked for the absence of the flag's effect.
+    #[cfg(feature = "plugins-wasm-cranelift")]
+    mod plugin_load_check {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+        use std::sync::OnceLock;
+        use zeroclaw::plugins::host::PluginHost;
+
+        /// The wasmtime-independent part of a compile failure's cause chain.
+        /// Asserting on this rather than on translated prose keeps the test
+        /// honest under any locale the process happens to detect.
+        const LOAD_FAILURE_CAUSE: &str = "failed to load WASM component";
+
+        /// The fixture package's manifest, mirroring the one the plugins
+        /// crate's end-to-end test installs.
+        const FIXTURE_MANIFEST: &str = r#"name = "tool-fixture"
+version = "0.0.0"
+wasm_path = "tool-fixture.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties.label]
+type = "string"
+"#;
+
+        /// This test binary sits at `<target>/<profile>/deps/<name>`, so its
+        /// own path is what locates the target directory when
+        /// `CARGO_TARGET_DIR` has moved it.
+        fn cargo_target_dir() -> PathBuf {
+            let exe = std::env::current_exe().expect("test binary path");
+            exe.ancestors()
+                .nth(3)
+                .expect("test binary should sit under <target>/<profile>/deps/")
+                .to_path_buf()
+        }
+
+        /// Build the in-tree tool component once per test binary. There is no
+        /// skip path: a fixture that cannot be built is a test failure, not a
+        /// silently green run.
+        fn tool_fixture() -> PathBuf {
+            static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+            FIXTURE
+                .get_or_init(|| {
+                    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("crates/zeroclaw-plugins/tests/fixtures/tool-fixture");
+                    // Its own target directory, so the nested Cargo invocation
+                    // cannot contend with this test process's build lock.
+                    let target_dir = cargo_target_dir().join("tmp/plugin-load-check-fixture");
+                    let status = Command::new(env!("CARGO"))
+                        .current_dir(&fixture_dir)
+                        .args([
+                            "build",
+                            "--locked",
+                            "--quiet",
+                            "--package",
+                            "zeroclaw-tool-plugin-fixture",
+                            "--target",
+                            "wasm32-wasip2",
+                            "--target-dir",
+                        ])
+                        .arg(&target_dir)
+                        .status()
+                        .expect("run Cargo for the tool component fixture");
+                    assert!(
+                        status.success(),
+                        "tool fixture must build; install the wasm32-wasip2 target"
+                    );
+
+                    let wasm =
+                        target_dir.join("wasm32-wasip2/debug/zeroclaw_tool_plugin_fixture.wasm");
+                    assert!(wasm.is_file(), "tool fixture WASM was not produced");
+                    wasm
+                })
+                .clone()
+        }
+
+        /// Seed a throwaway config directory and install the fixture into it
+        /// through the real `PluginHost::install`, so the package under test is
+        /// laid out exactly as `zeroclaw plugin install` leaves one.
+        fn install_fixture(workspace: &Path) -> PluginHost {
+            let source = workspace.join("source/tool-fixture");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::copy(tool_fixture(), source.join("tool-fixture.wasm")).unwrap();
+            std::fs::write(source.join("manifest.toml"), FIXTURE_MANIFEST).unwrap();
+
+            let mut host = PluginHost::new(workspace).expect("throwaway plugin host");
+            let installed = host
+                .install(source.to_str().expect("utf-8 temp path"))
+                .expect("install the in-tree tool fixture");
+            assert_eq!(installed, "tool-fixture");
+            host
+        }
+
+        #[tokio::test]
+        async fn plugin_info_reports_that_the_installed_fixture_loads() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+            let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
+
+            let status = installed_plugin_load_status(&host, &info).await.unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::Loads),
+                "the in-tree tool fixture must load against this host; got {status:?}"
+            );
+
+            let lines = plugin_info_lines(&info, &config_entries, &status);
+            assert!(
+                lines.iter().any(|line| line.contains("tool-fixture")),
+                "info must name the plugin: {lines:#?}"
+            );
+            assert!(
+                !lines.iter().any(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "a plugin that loads must carry no load failure: {lines:#?}"
+            );
+            // The verdict is a rendered line, not an implied one: the same
+            // plugin under a different verdict must end differently.
+            let other = plugin_info_lines(&info, &config_entries, &PluginLoadStatus::NoComponent);
+            assert_eq!(lines.len(), other.len(), "one verdict line either way");
+            assert_ne!(
+                lines.last(),
+                other.last(),
+                "the last line must be the verdict: {lines:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plugin_info_and_list_verify_expose_a_plugin_that_no_longer_loads() {
+            let workspace = tempfile::tempdir().unwrap();
+            let host = install_fixture(workspace.path());
+            let info = host
+                .get_plugin("tool-fixture")
+                .expect("the installed fixture is discovered");
+            let config_entries = installed_plugin_config_entries(&host, &info.name).unwrap();
+
+            // Replace the installed component with an artifact this host cannot
+            // instantiate. Discovery is unaffected: the manifest is intact and
+            // the file exists, which is the whole reported state a plain
+            // listing has to go on.
+            let wasm = info
+                .wasm_path
+                .clone()
+                .expect("the fixture ships a component");
+            std::fs::write(&wasm, b"not a wasm component").unwrap();
+            assert!(
+                info.loaded,
+                "discovery still calls the package loaded, which is why the check is needed"
+            );
+
+            let status = installed_plugin_load_status(&host, &info).await.unwrap();
+            let PluginLoadStatus::Fails(cause) = &status else {
+                panic!("a non-component artifact must not report as loading; got {status:?}");
+            };
+            assert!(
+                cause.contains(LOAD_FAILURE_CAUSE),
+                "the verdict must carry the cause chain; got: {cause}"
+            );
+
+            let lines = plugin_info_lines(&info, &config_entries, &status);
+            assert!(
+                lines
+                    .last()
+                    .is_some_and(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "plugin info must end on the failure and its cause: {lines:#?}"
+            );
+
+            // `plugin list --verify` annotates the row; plain `plugin list`
+            // renders exactly what it rendered before the flag existed.
+            let verified = plugin_list_lines(&[(info.clone(), Some(status))]);
+            let plain = plugin_list_lines(&[(info.clone(), None)]);
+            assert_eq!(plain.len(), 2, "header plus one row: {plain:#?}");
+            assert_eq!(verified.len(), 2, "header plus one row: {verified:#?}");
+            assert_eq!(plain[0], verified[0], "the header is not verdict-dependent");
+            assert!(
+                plain[1].starts_with("  tool-fixture v0.0.0 — "),
+                "plain row shape is unchanged: {:?}",
+                plain[1]
+            );
+            assert!(
+                !plain[1].contains(LOAD_FAILURE_CAUSE),
+                "plain list must not run the check: {:?}",
+                plain[1]
+            );
+            assert!(
+                verified[1].starts_with("  tool-fixture v0.0.0 — "),
+                "the verified row keeps the same identity prefix: {:?}",
+                verified[1]
+            );
+            assert!(
+                verified[1].contains(LOAD_FAILURE_CAUSE),
+                "the verified row must name the failure: {:?}",
+                verified[1]
+            );
+        }
+
+        #[test]
+        fn plugin_list_verify_reports_a_skill_only_package_as_not_applicable() {
+            // A package with no component is not a failure: there is nothing to
+            // instantiate, and reporting one as broken would train operators to
+            // ignore the column.
+            let info = zeroclaw::plugins::PluginInfo {
+                name: "skills-only".to_string(),
+                version: "1.0.0".to_string(),
+                description: Some("markdown bundle".to_string()),
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Skill],
+                permissions: Vec::new(),
+                wasm_path: None,
+                loaded: true,
+            };
+
+            let lines = plugin_list_lines(&[(info.clone(), Some(PluginLoadStatus::NoComponent))]);
+            assert_eq!(lines.len(), 2, "{lines:#?}");
+            assert!(
+                lines[1].starts_with("  skills-only v1.0.0 — markdown bundle"),
+                "{:?}",
+                lines[1]
+            );
+            assert!(
+                !lines[1].contains(LOAD_FAILURE_CAUSE),
+                "a component-less package must not read as a load failure: {:?}",
+                lines[1]
+            );
+            let plain = plugin_list_lines(&[(info.clone(), None)]);
+            assert_ne!(
+                lines[1], plain[1],
+                "--verify must still say something about a component-less package"
+            );
+
+            let info_lines = plugin_info_lines(&info, &[], &PluginLoadStatus::NoComponent);
+            assert!(
+                !info_lines
+                    .iter()
+                    .any(|line| line.contains(LOAD_FAILURE_CAUSE)),
+                "{info_lines:#?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_skill_only_package_is_not_applicable_rather_than_a_failure() {
+            // A markdown bundle rides the same install machinery but ships no
+            // component. Reporting it as a load failure would train an operator
+            // to ignore the verdict, so the check must short-circuit before it
+            // ever reaches the instantiator.
+            let workspace = tempfile::tempdir().unwrap();
+            let source = workspace.path().join("source/skills-only");
+            std::fs::create_dir_all(source.join("skills/greet")).unwrap();
+            std::fs::write(
+                source.join("manifest.toml"),
+                "name = \"skills-only\"\n\
+                 version = \"1.0.0\"\n\
+                 capabilities = [\"skill\"]\n",
+            )
+            .unwrap();
+            std::fs::write(
+                source.join("skills/greet/SKILL.md"),
+                "---\nname: greet\ndescription: say hello\n---\n\nHello.\n",
+            )
+            .unwrap();
+
+            let mut host = PluginHost::new(workspace.path()).expect("throwaway plugin host");
+            host.install(source.to_str().expect("utf-8 temp path"))
+                .expect("install the skill-only package");
+            let info = host
+                .get_plugin("skills-only")
+                .expect("the skill bundle is discovered");
+            assert!(info.wasm_path.is_none(), "the fixture ships no component");
+
+            let status = installed_plugin_load_status(&host, &info).await.unwrap();
+            assert!(
+                matches!(status, PluginLoadStatus::NoComponent),
+                "a component-less package is not applicable, not broken; got {status:?}"
+            );
+            assert!(!status.is_load_failure(), "and must not fail the exit code");
+        }
+
+        #[test]
+        fn only_a_real_load_failure_makes_plugin_info_exit_non_zero() {
+            // The exit code is the scriptable part of the contract. A package
+            // with no component must not be reported as broken.
+            assert!(PluginLoadStatus::Fails("boom".to_string()).is_load_failure());
+            assert!(!PluginLoadStatus::Loads.is_load_failure());
+            assert!(!PluginLoadStatus::NoComponent.is_load_failure());
+        }
+
+        #[test]
+        fn plugin_list_without_verify_renders_no_verdict() {
+            let info = zeroclaw::plugins::PluginInfo {
+                name: "some-plugin".to_string(),
+                version: "0.2.0".to_string(),
+                description: None,
+                capabilities: vec![zeroclaw::plugins::PluginCapability::Tool],
+                permissions: Vec::new(),
+                wasm_path: Some(PathBuf::from("/nonexistent/some-plugin.wasm")),
+                loaded: false,
+            };
+
+            let plain = plugin_list_lines(&[(info, None)]);
+            assert_eq!(plain.len(), 2, "{plain:#?}");
+            assert!(
+                plain[1].starts_with("  some-plugin v0.2.0 — "),
+                "{:?}",
+                plain[1]
+            );
+            assert!(
+                plugin_list_lines(&[]).len() == 1,
+                "an empty listing is the single 'no plugins' line"
+            );
+        }
     }
 }

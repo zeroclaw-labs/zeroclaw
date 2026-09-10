@@ -22,6 +22,7 @@ pub mod runtime;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod services;
 pub mod signature;
+pub mod validate;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasi_http;
 #[cfg(feature = "plugins-wasmtime")]

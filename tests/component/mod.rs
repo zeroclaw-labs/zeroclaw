@@ -29,3 +29,6 @@ mod skills_bundle_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;
+
+#[cfg(feature = "plugins-wasm")]
+mod plugin_info_cli;

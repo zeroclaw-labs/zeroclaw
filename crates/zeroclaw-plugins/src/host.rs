@@ -207,8 +207,15 @@ impl PluginHost {
     }
 
     /// List all discovered plugins.
+    ///
+    /// Sorted by package name so the listing is stable across runs: the loaded
+    /// set is a hash map, and an operator diffing two `plugin list` outputs, or a
+    /// script reading the verified rows, needs the order to mean nothing.
     pub fn list_plugins(&self) -> Vec<PluginInfo> {
-        self.loaded.values().map(plugin_info_from_loaded).collect()
+        let mut plugins: Vec<PluginInfo> =
+            self.loaded.values().map(plugin_info_from_loaded).collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        plugins
     }
 
     /// Get info about a specific plugin.
@@ -307,6 +314,54 @@ impl PluginHost {
         );
 
         Ok(installed_name)
+    }
+
+    /// Resolve a source's manifest and absolute WASM path for a pre-install
+    /// load-check, without copying, signing, or registering anything.
+    ///
+    /// Returns `Ok(None)` for a plugin that ships no WASM component (there is
+    /// nothing to instantiate). The manifest is validated for shape and the
+    /// WASM file's existence, matching what [`Self::install`] checks before it
+    /// commits, so the caller can instantiate the exact artifact install would
+    /// copy and refuse a plugin that cannot load against this host.
+    pub fn source_component(
+        &self,
+        source: &str,
+    ) -> Result<Option<(PluginManifest, PathBuf)>, PluginError> {
+        let source_path = PathBuf::from(source);
+        let manifest_path = if source_path.is_dir() {
+            source_path.join("manifest.toml")
+        } else {
+            source_path.clone()
+        };
+
+        if !manifest_path.exists() {
+            return Err(PluginError::NotFound(format!(
+                "manifest.toml not found at {}",
+                manifest_path.display()
+            )));
+        }
+
+        let (manifest, _manifest_toml) = self.load_manifest(&manifest_path)?;
+        let source_dir = manifest_path
+            .parent()
+            .ok_or_else(|| PluginError::InvalidManifest("no parent directory".into()))?;
+
+        validate_manifest_shape(&manifest, source_dir)?;
+
+        match manifest.wasm_path.as_deref() {
+            Some(rel) => {
+                let wasm = source_dir.join(rel);
+                if !wasm.exists() {
+                    return Err(PluginError::NotFound(format!(
+                        "WASM file not found: {}",
+                        wasm.display()
+                    )));
+                }
+                Ok(Some((manifest, wasm)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Remove a plugin by name.
@@ -622,6 +677,33 @@ pub fn migrate_plugins_dir(from: &Path, to: &Path) -> Result<usize, PluginError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loaded set is a hash map; the listing must not inherit its order.
+    #[test]
+    fn list_plugins_is_sorted_by_name_regardless_of_discovery_order() {
+        let dir = tempdir().unwrap();
+        for name in ["zeta-plugin", "mid-plugin", "alpha-plugin"] {
+            let plugin_dir = dir.path().join("plugins").join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    r#"
+name = "{name}"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = []
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let names: Vec<String> = host.list_plugins().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["alpha-plugin", "mid-plugin", "zeta-plugin"]);
+    }
     use tempfile::tempdir;
 
     #[test]

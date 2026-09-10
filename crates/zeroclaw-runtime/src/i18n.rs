@@ -1036,6 +1036,95 @@ mod tests {
         }
     }
 
+    /// The `plugin info` / `plugin list --verify` load verdicts.
+    ///
+    /// These strings are the answer to "why does my plugin not show up", so a
+    /// catalogue that omits one ships the raw `{key}` sentinel in its place, and
+    /// a catalogue that copies English ships an untranslated answer. Both fail
+    /// here. Every case also pins the interpolations that must survive
+    /// translation: the plugin's identity, and the wasmtime cause chain that
+    /// carries the WIT-drift rebuild hint.
+    #[test]
+    fn plugin_load_verdict_cli_strings_are_translated_in_every_locale() {
+        const NAME: &str = "tool-fixture";
+        const VERSION: &str = "0.0.0";
+        const DESCRIPTION: &str = "a tool";
+        const ERROR: &str = "failed to instantiate: type mismatch (hint: rebuild against wit/v0)";
+
+        let row = [
+            ("name", NAME),
+            ("version", VERSION),
+            ("description", DESCRIPTION),
+        ];
+        let failed_row = [
+            ("name", NAME),
+            ("version", VERSION),
+            ("description", DESCRIPTION),
+            ("error", ERROR),
+        ];
+        /// One parity case: the Fluent key, its arguments, and the substrings
+        /// every locale's rendering must contain.
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: [ParityCase; 7] = [
+            (
+                "cli-plugin-list-entry-loads",
+                &row,
+                &[NAME, VERSION, DESCRIPTION],
+            ),
+            (
+                "cli-plugin-list-entry-failed",
+                &failed_row,
+                &[NAME, VERSION, DESCRIPTION, ERROR],
+            ),
+            (
+                "cli-plugin-list-entry-no-component",
+                &row,
+                &[NAME, VERSION, DESCRIPTION],
+            ),
+            ("cli-plugin-info-load-ok", &[], &["WIT"]),
+            ("cli-plugin-info-load-failed", &[("error", ERROR)], &[ERROR]),
+            ("cli-plugin-info-load-not-applicable", &[], &[]),
+            (
+                "cli-plugin-info-load-failed-exit",
+                &[("name", NAME)],
+                &[NAME],
+            ),
+        ];
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args, expected_parts) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+            assert!(
+                !english.trim().is_empty(),
+                "{key} must not be empty in en; got {english:?}"
+            );
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn channel_runtime_committed_cli_catalogs_format_from_fluent() {
         let cases = [

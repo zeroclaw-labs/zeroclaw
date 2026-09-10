@@ -765,6 +765,11 @@ cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Clé de configuration ({$capability}) : {$key}
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-install-verify-failed = échec de l'installation : '{$name}' ne se charge pas sur cet hôte : {$error} — recompilez le plugin avec le WIT de cet hôte (voir wit/v0), ou utilisez --no-verify pour l'installer quand même.
+cli-plugin-install-verify-skipped = avertissement : '{$name}' ne se charge pas sur cet hôte et sera ignoré au démarrage : {$error}
+cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [se charge]
+cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [ne se charge pas : {$error}]
+cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [aucun composant à charger]
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-config-section-retired-wati = avertissement : la section de configuration de canal WATI obsolète `{$section}` est ignorée, car la prise en charge de WATI a été supprimée. Migrez vers `[channels.whatsapp.<alias>]` à l’aide de Cloud API ou de WhatsApp Web, puis révoquez le jeton d’API WATI inutilisé.
 cli-config-section-retired-node-transport = avertissement : la section de configuration obsolète `[node_transport]` est ignorée, car le transport de nœuds HMAC hérité a été supprimé. Supprimez la section du fichier config.toml.
@@ -795,6 +800,12 @@ cli-plugin-capabilities = Capacités : { $v }
 cli-plugin-permissions = Permissions : { $v }
 cli-plugin-wasm = WASM : { $path }
 cli-plugin-wasm-none = WASM : (plugin compétence uniquement)
+cli-plugin-info-load-ok = Chargement : oui. Le composant s'instancie avec le monde WIT de cet hôte.
+cli-plugin-info-load-failed =
+    Chargement : non. {$error}
+    Recompilez le plugin avec le WIT fourni par cet hôte (voir wit/v0), puis réinstallez-le.
+cli-plugin-info-load-not-applicable = Chargement : sans objet. Ce plugin ne contient que des compétences, il n'y a donc aucun composant à instancier.
+cli-plugin-info-load-failed-exit = le plugin « {$name} » ne se charge pas sur cet hôte
 cli-estop-domains-none = {"  "}domain_blocks:  (aucun)
 cli-estop-domains = {"  "}domain_blocks:  { $v }
 cli-estop-tools-none = {"  "}tool_freeze:    (aucun)

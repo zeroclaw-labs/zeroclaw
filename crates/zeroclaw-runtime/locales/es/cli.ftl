@@ -762,6 +762,11 @@ cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
 cli-plugin-config-entry-key = Clave de configuración ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-install-verify-failed = la instalación falló: '{$name}' no se carga en este host: {$error} — recompila el complemento con el WIT de este host (consulta wit/v0), o usa --no-verify para instalarlo de todos modos.
+cli-plugin-install-verify-skipped = advertencia: '{$name}' no se carga en este host y se omitirá al iniciar: {$error}
+cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [se carga]
+cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [no se carga: {$error}]
+cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [sin componente que cargar]
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-config-section-retired-wati = advertencia: la sección de configuración de WATI obsoleta `{$section}` se ignora porque se eliminó la compatibilidad con WATI. Migra a `[channels.whatsapp.<alias>]` mediante Cloud API o WhatsApp Web y, después, revoca el token de API de WATI no utilizado.
 cli-config-section-retired-node-transport = advertencia: la configuración obsoleta de `[node_transport]` se ignora porque se eliminó el transporte de nodos HMAC heredado. Elimina la sección de config.toml.
@@ -792,6 +797,12 @@ cli-plugin-capabilities = Capacidades: {$v}
 cli-plugin-permissions = Permisos: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (plugin solo de skill)
+cli-plugin-info-load-ok = Carga: sí. El componente se instancia con el mundo WIT de este host.
+cli-plugin-info-load-failed =
+    Carga: no. {$error}
+    Recompila el complemento con el WIT que incluye este host (consulta wit/v0) y vuelve a instalarlo.
+cli-plugin-info-load-not-applicable = Carga: no aplicable. Es un complemento solo de skill, así que no hay ningún componente que instanciar.
+cli-plugin-info-load-failed-exit = el complemento '{$name}' no se carga en este host
 cli-estop-domains-none = {"  "}domain_blocks:  (ninguno)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (ninguno)
