@@ -228,10 +228,15 @@ pub fn migrate_to_current(input: &str) -> Result<Config> {
 
 /// Versioned TOML → validated V3 `Config`, strict: any defect errors.
 ///
-/// Persistence boundaries use this helper so a config that deserializes but
-/// violates the current validation contract is never reported or saved as valid.
-pub fn migrate_to_current_validated(input: &str) -> Result<Config> {
-    let config = migrate_to_current(input)?;
+/// Persistence boundaries use this helper so validation resolves paths and
+/// environment overrides exactly as a load from `target_path` would.
+pub fn validate_migrated_at_path(input: &str, target_path: &Path) -> Result<Config> {
+    let mut config = migrate_to_current(input)?;
+    config.config_path = target_path.to_path_buf();
+    let overrides = crate::env_overrides::apply_env_overrides(&mut config)
+        .context("failed to apply env overrides to migrated config")?;
+    config.env_overridden_paths = overrides.paths;
+    config.pre_override_snapshots = overrides.snapshots;
     config
         .validate()
         .context("migrated config failed validation")?;
@@ -616,7 +621,7 @@ pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
         Some(s) => s,
         None => return Ok(None),
     };
-    migrate_to_current_validated(&migrated)?;
+    validate_migrated_at_path(&migrated, path)?;
     let parent = path.parent().with_context(|| {
         format!(
             "config path {} has no parent directory",
@@ -919,6 +924,23 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvVarGuard(&'static str);
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            // SAFETY: tests serialize environment access with env_test_lock().
+            unsafe { std::env::set_var(name, value) };
+            Self(name)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize environment access with env_test_lock().
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
 
     #[test]
     fn detect_version_missing_is_v1() {
@@ -2989,6 +3011,8 @@ enabled = "not-a-bool"
 
     #[test]
     fn strict_migration_rejects_deserializable_but_invalid_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
         let raw = format!(
             "schema_version = {CURRENT_SCHEMA_VERSION}\n\
              [gateway]\n\
@@ -2996,7 +3020,7 @@ enabled = "not-a-bool"
             crate::schema::GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1
         );
 
-        let err = migrate_to_current_validated(&raw)
+        let err = validate_migrated_at_path(&raw, &config_path)
             .expect_err("strict migration must run the current config validation contract");
 
         assert!(
@@ -3008,6 +3032,45 @@ enabled = "not-a-bool"
             format!("{err:#}").contains("gateway.websocket_ping_interval_secs"),
             "validation chain must name the invalid field: {err:#}"
         );
+    }
+
+    #[test]
+    fn validated_migration_uses_target_path_for_skill_bundle_validation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let skill_dir = dir.path().join("shared/skills/proof");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let raw = format!(
+            "schema_version = {CURRENT_SCHEMA_VERSION}\n\
+             [skill_bundles.proof]\n\
+             directory = {:?}\n",
+            skill_dir.display().to_string()
+        );
+
+        validate_migrated_at_path(&raw, &config_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn validated_migration_uses_env_only_channel_credential_without_persisting_it() {
+        let _lock = crate::env_overrides::env_test_lock().await;
+        let _token = EnvVarGuard::set("ZEROCLAW_channels__telegram__main__bot_token", "test-token");
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let raw = r#"
+schema_version = 2
+
+[channels.telegram.main]
+enabled = true
+"#;
+        std::fs::write(&config_path, raw).unwrap();
+
+        validate_migrated_at_path(raw, &config_path).unwrap();
+        migrate_file_in_place(&config_path)
+            .expect("env-backed migration must validate")
+            .expect("schema v2 migration must run");
+
+        let migrated = std::fs::read_to_string(config_path).unwrap();
+        assert!(!migrated.contains("test-token"));
     }
 
     #[test]

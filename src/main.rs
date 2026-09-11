@@ -8063,9 +8063,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                         let strict_error = std::fs::read_to_string(&config.config_path)
                             .ok()
                             .and_then(|raw| {
-                                crate::config::migration::migrate_to_current_validated(&raw)
-                                    .err()
-                                    .map(|e| format!("{e:#}"))
+                                crate::config::migration::validate_migrated_at_path(
+                                    &raw,
+                                    &config.config_path,
+                                )
+                                .err()
+                                .map(|e| format!("{e:#}"))
                             });
                         if json {
                             let envelope = serde_json::json!({

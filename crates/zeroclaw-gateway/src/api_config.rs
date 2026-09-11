@@ -351,12 +351,7 @@ fn scoped_validate(
     if let Err(e) = working.validate() {
         let api_err = ConfigApiError::from_validation(e);
         let err_path = api_err.path.as_deref().unwrap_or("");
-        let touches_dirty = !err_path.is_empty()
-            && working.dirty_paths.iter().any(|d| {
-                err_path == d.as_str()
-                    || err_path.starts_with(&format!("{d}."))
-                    || d.starts_with(&format!("{err_path}."))
-            });
+        let touches_dirty = api_err.touches_any_path(&working.dirty_paths);
         if touches_dirty || err_path.is_empty() {
             return Err(api_err);
         }

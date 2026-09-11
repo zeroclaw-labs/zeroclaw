@@ -23427,6 +23427,38 @@ impl Config {
         Ok(())
     }
 
+    fn is_complementary_required_agent_field(
+        edited_path: &str,
+        error: &crate::api_error::ConfigApiError,
+    ) -> bool {
+        use crate::api_error::ConfigApiCode;
+
+        if error.code != ConfigApiCode::RequiredFieldEmpty {
+            return false;
+        }
+        let Some(error_path) = error.path.as_deref() else {
+            return false;
+        };
+        let Some((edited_agent, edited_field)) = Self::agent_required_field(edited_path) else {
+            return false;
+        };
+        let Some((error_agent, error_field)) = Self::agent_required_field(error_path) else {
+            return false;
+        };
+
+        edited_agent == error_agent && edited_field != error_field
+    }
+
+    fn agent_required_field(path: &str) -> Option<(&str, &str)> {
+        let mut parts = path.split('.');
+        let (Some("agents"), Some(agent), Some(field), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        matches!(field, "model_provider" | "risk_profile").then_some((agent, field))
+    }
+
     /// Apply and validate a persistent property update atomically.
     ///
     /// Validation runs on a working copy so a rejected value cannot mutate the
@@ -23434,7 +23466,12 @@ impl Config {
     pub fn set_prop_persistent_validated(&mut self, name: &str, value_str: &str) -> Result<()> {
         let mut candidate = self.clone();
         candidate.set_prop_persistent(name, value_str)?;
-        candidate.validate()?;
+        if let Err(error) = candidate.validate() {
+            let api_error = crate::api_error::ConfigApiError::from_validation(error);
+            if !Self::is_complementary_required_agent_field(name, &api_error) {
+                return Err(anyhow::Error::new(api_error));
+            }
+        }
         *self = candidate;
         Ok(())
     }
@@ -26825,7 +26862,8 @@ enabled = true
     #[test]
     async fn persistent_set_validation_is_atomic() {
         let mut config = Config::default();
-        let original = config.gateway.websocket_ping_interval_secs;
+        let gateway_before = toml::to_string(&config.gateway).unwrap();
+        let dirty_before = config.dirty_paths.clone();
         let path = "gateway.websocket_ping_interval_secs";
 
         let err = config
@@ -26836,8 +26874,140 @@ enabled = true
             .expect_err("out-of-range persistent update must be rejected");
 
         assert!(err.to_string().contains(path));
-        assert_eq!(config.gateway.websocket_ping_interval_secs, original);
-        assert!(!config.dirty_paths.contains(path));
+        assert_eq!(toml::to_string(&config.gateway).unwrap(), gateway_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    fn staged_agent_repair_config() -> Config {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+            "#,
+        )
+        .unwrap();
+        config
+            .agents
+            .insert("worker".to_string(), AliasedAgentConfig::default());
+        config
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_provider_first_agent_repair() {
+        let mut config = staged_agent_repair_config();
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        assert_eq!(config.agents["worker"].model_provider, "openai.primary");
+        assert!(config.validate().is_err());
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_risk_profile_first_agent_repair() {
+        let mut config = staged_agent_repair_config();
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .unwrap();
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
+        assert!(config.validate().is_err());
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_allows_repairing_empty_agent_model_provider() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.worker]
+                enabled = true
+                model_provider = ""
+                risk_profile = "standard"
+            "#,
+        )
+        .unwrap();
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_invalid_agent_array_element() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [risk_profiles.standard]
+                level = "supervised"
+
+                [agents.worker]
+                enabled = true
+                model_provider = "openai.primary"
+                risk_profile = "standard"
+            "#,
+        )
+        .unwrap();
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.channels", r#"["telegram.missing"]"#)
+            .expect_err("an invalid array element at the edited path must be rejected");
+
+        assert!(err.to_string().contains("agents.worker.channels[0]"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_rejects_non_required_cross_field_error() {
+        let mut config: Config = toml::from_str(
+            r#"
+                [providers.models.openai.primary]
+                api_key = "test-key"
+                model = "gpt-test"
+
+                [agents.worker]
+                enabled = false
+                model_provider = "openai.primary"
+                risk_profile = ""
+            "#,
+        )
+        .unwrap();
+        let agents_before = toml::to_string(&config.agents).unwrap();
+        let dirty_before = config.dirty_paths.clone();
+
+        let err = config
+            .set_prop_persistent_validated("agents.worker.enabled", "true")
+            .expect_err("only the two required agent references may be staged");
+
+        assert!(err.to_string().contains("agents.worker.risk_profile"));
+        assert_eq!(toml::to_string(&config.agents).unwrap(), agents_before);
+        assert_eq!(config.dirty_paths, dirty_before);
     }
 
     #[test]
