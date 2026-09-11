@@ -375,8 +375,9 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
                 "SECURITY-CRITICAL config section `{path}` is invalid and was reset to \
                  its default so the daemon can boot; the running posture may be WEAKER \
                  than intended — repair `{path}` and reload before trusting this instance. \
-                 Run `zeroclaw config migrate` to see the precise parse error, or fix it \
-                 via the gateway config editor at `/api/config`"
+                 Use the same executable that started this process with `config migrate` \
+                 to see the precise parse error, or fix it via the gateway config editor \
+                 at `/api/config`"
             )
         );
     }
