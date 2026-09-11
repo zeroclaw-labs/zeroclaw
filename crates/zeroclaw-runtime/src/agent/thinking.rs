@@ -667,6 +667,32 @@ mod tests {
     }
 
     #[test]
+    fn display_mode_propagates_without_native_thinking() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::scattered_types::ThinkingDisplayMode;
+
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: false,
+            display: ThinkingDisplayMode::Summarized,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("a profile display alone should produce native params");
+        assert_eq!(
+            native.profile_display,
+            Some(ThinkingDisplay::Summarized),
+            "the flag gates the budget, not the display"
+        );
+        assert_eq!(
+            native.budget_tokens, None,
+            "the fixed budget stays behind native_thinking"
+        );
+    }
+
+    #[test]
     fn budget_tokens_clamped_to_max_when_above() {
         use std::collections::HashMap;
         use zeroclaw_config::scattered_types::MAX_BUDGET_TOKENS;

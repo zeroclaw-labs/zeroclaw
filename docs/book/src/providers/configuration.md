@@ -112,8 +112,9 @@ used for backward compatibility.
 ## Native thinking display (Anthropic)
 
 `agent.thinking.display` controls how Anthropic extended thinking is
-delivered when native thinking is enabled (`agent.thinking.native_thinking
-= true`). Accepted values:
+delivered. It applies on its own: `agent.thinking.native_thinking = true`
+gates only the fixed token budget on the generations that spend one, not the
+display. Accepted values:
 
 - `off` (default): no `display` field is sent; requests are byte-identical
   to earlier ZeroClaw versions. On the older generations, which spend a

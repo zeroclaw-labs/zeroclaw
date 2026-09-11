@@ -128,8 +128,9 @@ pub struct ThinkingConfig {
     pub native_thinking: bool,
     #[serde(default)]
     pub budget_tokens: HashMap<String, u32>,
-    /// Anthropic `thinking.display` beta control. Only meaningful when
-    /// `native_thinking` is enabled and the provider is Anthropic.
+    /// Anthropic `thinking.display` beta control. Applies independently of
+    /// `native_thinking`, which gates only the fixed token budget; meaningful
+    /// when the provider is Anthropic.
     #[serde(default)]
     pub display: ThinkingDisplayMode,
 }
