@@ -2561,7 +2561,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success, "the probe succeeds against the mock: {result:?}");
+        assert!(
+            result.success,
+            "the probe succeeds against the mock: {result:?}"
+        );
         let requests = server
             .received_requests()
             .await
