@@ -297,6 +297,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_suite_rejects_a_zero_turn_fixture_instead_of_reporting_it_green() {
+        // The turn loop below runs zero times for such a fixture, so the empty
+        // initial response and empty tool record grade `max_tool_calls: 0` as
+        // passed. Admission has to stop the fixture before the suite can
+        // certify a case that never drove the agent.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("zero_turns.json"),
+            r#"{"model_name":"empty-turns","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+
+        let err = run_suite(dir.path(), Mode::Replay)
+            .await
+            .expect_err("a suite holding a zero-turn fixture must not report a pass");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("declares no conversation turns"),
+            "the suite must fail on the zero-turn fixture, got: {rendered}"
+        );
+    }
+
     const MULTI_TURN: &str = r#"{
         "model_name": "test-multi-turn",
         "turns": [
