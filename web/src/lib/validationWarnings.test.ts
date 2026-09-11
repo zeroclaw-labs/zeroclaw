@@ -14,12 +14,13 @@ async function loadValidationWarningMessage() {
 test('known config warnings resolve through the dashboard catalog', async () => {
   const validationWarningMessage = await loadValidationWarningMessage();
   const auditMessage = validationWarningMessage({
-    code: 'security_audit_enabled_has_no_effect',
+    code: 'security_audit_disabled_drops_certificate_record',
     message: 'unlocalized audit fallback',
     path: 'security.audit.enabled',
   });
 
-  assert.match(auditMessage, /audit logging.*not active/i);
+  assert.match(auditMessage, /certificate issuance and renewal are recorded nowhere/i);
+  assert.match(auditMessage, /command execution is not audited/i);
   assert.doesNotMatch(auditMessage, /unlocalized audit fallback/);
 });
 
