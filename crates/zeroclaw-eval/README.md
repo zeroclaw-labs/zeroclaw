@@ -78,7 +78,10 @@ filter it to the effective allowlist; `shell` remains unavailable.
 - `tools` — deterministic built-in tools the replay agent can dispatch.
 - `observer::RecordingObserver` — captures tool-call outcomes and token usage.
 - `grader` — non-panicking `GradeResult` checks: expectations, workspace
-  end state, and run budgets (the `Grader` trait remains the extension point,
-  with the LLM-judge grader still a later phase).
+  end state, run budgets, and the LLM judge (the `Grader` trait remains the
+  extension point).
+- `calibration` — structured judge-run and human-label schemas, JSONL helpers,
+  agreement statistics, and strict calibration-file validation bound to the
+  exact judge prompt and rubric contracts.
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.
