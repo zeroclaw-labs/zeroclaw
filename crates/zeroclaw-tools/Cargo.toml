@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Tool implementations for agent-callable capabilities."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
