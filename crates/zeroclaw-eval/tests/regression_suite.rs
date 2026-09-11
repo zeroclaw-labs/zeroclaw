@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
-use zeroclaw_eval::{Mode, run_suite};
+use zeroclaw_eval::baseline::SuiteKind;
+use zeroclaw_eval::{RunDeps, run_suite};
 
 /// Resolve the gated suite from the shipped config default rather than a second
 /// hardcoded literal, so the directory this gate certifies cannot drift away
@@ -14,7 +15,7 @@ fn regression_dir() -> PathBuf {
 
 #[tokio::test]
 async fn regression_suite_replays_green() {
-    let report = run_suite(&regression_dir(), Mode::Replay)
+    let report = run_suite(&regression_dir(), &RunDeps::replay())
         .await
         .expect("regression suite must load and run");
     assert!(
@@ -22,7 +23,7 @@ async fn regression_suite_replays_green() {
         "regression suite failed:\n{}",
         report.render_table()
     );
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.exit_code(SuiteKind::Regression, None), 0);
 }
 
 #[test]
