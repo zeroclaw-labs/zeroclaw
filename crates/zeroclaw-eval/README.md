@@ -59,8 +59,12 @@ declarative `expects` the run is graded against.
 ```
 
 Supported expectations: `response_contains`, `response_not_contains`,
-`response_matches` (regex), `tools_used`, `tools_not_used`, `max_tool_calls`,
-`all_tools_succeeded`.
+`response_matches` (regex), `response_json` (JSON pointer to expected value),
+`tools_used`, `tools_not_used`, `max_tool_calls`, `all_tools_succeeded`,
+`workspace` (`file_exists`, `file_absent`, `file_contains`), and `budget`
+(`max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_duration_ms`,
+`max_llm_calls`). Fixture loading rejects unknown keys and declarations that
+cannot fail; see the eval-harness book page for the full reference.
 
 Replay fixtures may only call tools the harness registers; Phase 0 ships a
 side-effect-free `echo` tool (see `tools::default_tools`). Live evals assemble
@@ -73,7 +77,8 @@ filter it to the effective allowlist; `shell` remains unavailable.
 - `replay::TraceLlmProvider` — a `ModelProvider` that replays trace steps in FIFO order.
 - `tools` — deterministic built-in tools the replay agent can dispatch.
 - `observer::RecordingObserver` — captures tool-call outcomes and token usage.
-- `grader` — non-panicking `GradeResult` checks (the `Grader` trait is the
-  extension point for side-effect/budget/LLM-judge graders in later phases).
+- `grader` — non-panicking `GradeResult` checks: expectations, workspace
+  end state, and run budgets (the `Grader` trait remains the extension point,
+  with the LLM-judge grader still a later phase).
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.

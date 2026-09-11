@@ -18,7 +18,7 @@ use zeroclaw_runtime::security::Sandbox;
 
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
-use crate::record::RunRecord;
+use crate::record::{RunRecord, duration_millis_saturating};
 use crate::runner::{CaseProvider, RunDeps};
 
 /// The model name `Agent::builder()` falls back to when no `model_name` is set.
@@ -314,6 +314,7 @@ pub async fn run_live_case_with_graders(
     }
     let mut agent = builder.build()?;
 
+    let start = std::time::Instant::now();
     let mut final_response = String::new();
     for (i, turn) in trace.turns.iter().enumerate() {
         match tokio::time::timeout(deps.case_timeout, agent.turn(&turn.user_input)).await {
@@ -327,6 +328,7 @@ pub async fn run_live_case_with_graders(
             }
         }
     }
+    let duration_ms = duration_millis_saturating(start.elapsed());
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {
@@ -336,6 +338,8 @@ pub async fn run_live_case_with_graders(
         all_tools_succeeded: observer.all_tools_succeeded(),
         input_tokens,
         output_tokens,
+        duration_ms,
+        llm_calls: observer.llm_calls(),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = crate::grader::grade_with(&graders, &record, tmp.path()).await;
@@ -982,6 +986,59 @@ mod tests {
         assert!(
             seen.iter().all(|m| m == "model-under-test"),
             "every chat call must carry the configured model: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_grades_read_the_live_case_workspace() {
+        // The workspace grader is the only grader that reads state outside the
+        // `RunRecord`, and the live path is the only production path that seeds
+        // a case workspace. Drive it end to end through `run_live_case` (the
+        // production wrapper, so the default catalog builds the grader) and
+        // include one expectation that must fail, so a grader that never looked
+        // at the directory could not report all-green.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "live-workspace-grades",
+                "setup": { "workspace_files": { "report.txt": "status ok" } },
+                "turns": [{ "user_input": "hi" }],
+                "expects": { "workspace": {
+                    "file_exists": ["report.txt", "never_written.txt"],
+                    "file_absent": ["nope.txt"],
+                    "file_contains": { "report.txt": ["ok", "absent-needle"] }
+                } }
+            }"#,
+        )
+        .unwrap();
+
+        let deps = live_deps(
+            |_trace| {
+                Ok(driver_provider(
+                    r#"{ "model_name": "driver", "turns": [{ "user_input": "x", "steps": [{ "response": { "type": "text", "content": "done" } }] }] }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let grade = |check: &str| -> &crate::grader::GradeResult {
+            outcome
+                .grades
+                .iter()
+                .find(|g| g.check == check)
+                .unwrap_or_else(|| panic!("no grade named {check:?} in {:?}", outcome.grades))
+        };
+        assert!(grade(r#"file_exists("report.txt")"#).passed);
+        assert!(grade(r#"file_absent("nope.txt")"#).passed);
+        assert!(grade(r#"file_contains("report.txt", "ok")"#).passed);
+        assert!(
+            !grade(r#"file_exists("never_written.txt")"#).passed,
+            "a file the case never created must not grade as present"
+        );
+        assert!(
+            !grade(r#"file_contains("report.txt", "absent-needle")"#).passed,
+            "a needle absent from the seeded file must not grade as found"
         );
     }
 
