@@ -54,6 +54,11 @@ const CRON_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 // Bounded admission for background SQLite persistence workers so repeatedly
 // stalled persistence writes or reloads cannot consume unbounded blocking threads.
 const MAX_PERSISTENCE_WORKERS: usize = 16;
+// Bounded contention for results retained past their caller's persistence
+// deadline. A retained result is never dropped; this only caps how many
+// retained owners race for a persistence permit at once, and the wait happens
+// on the owner's own task rather than on the scheduler loop.
+const MAX_RETAINED_RESULT_OWNERS: usize = 16;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -176,6 +181,13 @@ fn best_effort_worker_pool() -> Arc<tokio::sync::Semaphore> {
             }),
         )
     }
+}
+
+fn retained_result_slots() -> Arc<tokio::sync::Semaphore> {
+    static POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    Arc::clone(POOL.get_or_init(|| {
+        Arc::new(tokio::sync::Semaphore::new(MAX_RETAINED_RESULT_OWNERS))
+    }))
 }
 
 fn persistence_worker_pool() -> Arc<tokio::sync::Semaphore> {
@@ -1776,6 +1788,157 @@ async fn run_agent_job_with_timeout(
     }
 }
 
+/// A completed cron result and everything needed to make it durable: the run
+/// history row, the job's reschedule or disable state, and the fenced claim
+/// that write releases. Owned so it can outlive the scheduler task that
+/// produced it.
+struct PendingPersist {
+    config: Config,
+    job: CronJob,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    job_state_at: DateTime<Utc>,
+    status: String,
+    output: String,
+    duration_ms: i64,
+    action: RunCompletionAction,
+    claim: CronClaimToken,
+}
+
+/// Write one completed result durably. Synchronous SQLite work; the caller
+/// drives it on a blocking worker while holding a persistence permit.
+/// Returns whether the combined history and state write committed.
+fn write_pending_persist(pending: PendingPersist) -> bool {
+    if let Err(e) = persist_run_result(
+        &pending.config,
+        &pending.job,
+        pending.started_at,
+        pending.finished_at,
+        pending.job_state_at,
+        &pending.status,
+        Some(pending.output.as_str()),
+        pending.duration_ms,
+        pending.action,
+        &pending.claim,
+    ) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"e": e.to_string()})),
+            "Failed to persist scheduler run result: "
+        );
+
+        if pending.action == RunCompletionAction::Delete {
+            // Best-effort fallback for the legacy behavior: a successful
+            // auto-delete one-shot should not be picked up again if the
+            // combined history+state transaction fails while inserting or
+            // pruning the run row.
+            if let Err(disable_err) = persist_run_completion_state(
+                &pending.config,
+                &pending.job,
+                pending.job_state_at,
+                &pending.status,
+                Some(pending.output.as_str()),
+                RunCompletionAction::Disable,
+                &pending.claim,
+            ) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"disable_err": disable_err.to_string()})
+                        ),
+                    "Failed to disable one-shot cron job after history persistence failure: "
+                );
+            }
+        } else {
+            // For recurring jobs and non-delete one-shots, keep the scheduler
+            // moving even if run-history persistence fails.
+            if let Err(state_err) = persist_run_completion_state(
+                &pending.config,
+                &pending.job,
+                pending.job_state_at,
+                &pending.status,
+                Some(pending.output.as_str()),
+                pending.action,
+                &pending.claim,
+            ) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"state_err": state_err.to_string()})),
+                    "Failed to update cron job state after history persistence failure: "
+                );
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// Keep ownership of a completed, already delivered result that could not be
+/// admitted to the persistence pool before its caller's deadline.
+///
+/// Dropping it would lose the run history and the job's reschedule or disable
+/// state while the fenced claim stays set, so the job would stay claimed until
+/// the next process start clears stale locks. The retained result gets its own
+/// owner task instead: the owner waits for persistence capacity without a
+/// deadline and then performs the same durable write, which releases the claim
+/// under the same token fence. `retained_result_slots` bounds how many owners
+/// contend for capacity at once; the queueing happens on the owner's task, so
+/// the scheduler loop never blocks on it and no completed result is dropped.
+fn retain_pending_persist(pending: PendingPersist, persistence_pool: Arc<tokio::sync::Semaphore>) {
+    let job_id = pending.job.id.clone();
+    let retention_pool = retained_result_slots();
+    zeroclaw_spawn::spawn!(async move {
+        let Ok(_retention) = retention_pool.acquire_owned().await else {
+            return;
+        };
+        let Ok(permit) = persistence_pool.acquire_owned().await else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"job_id": job_id})),
+                "Cron persistence pool closed before a retained result could be written"
+            );
+            return;
+        };
+        let committed = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            write_pending_persist(pending)
+        })
+        .await;
+        match committed {
+            Ok(true) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"job_id": job_id})),
+                "Cron retained result persisted once capacity returned"
+            ),
+            Ok(false) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"job_id": job_id})),
+                "Cron retained result failed to persist"
+            ),
+            Err(join_error) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": job_id, "error": join_error.to_string()})
+                    ),
+                "Cron retained result writer stopped before completion"
+            ),
+        }
+    });
+}
+
 async fn persist_claimed_job_result(
     config: &Config,
     job: &CronJob,
@@ -1804,13 +1967,22 @@ async fn persist_claimed_job_result(
         RunCompletionAction::Reschedule
     };
 
-    let owned_config = config.clone();
-    let owned_job = job.clone();
-    let owned_claim = claim.clone();
     let status = outcome.status;
     let persisted_output = outcome.output;
     let public_output = persisted_output.clone();
     let job_state_at = Utc::now();
+    let pending = PendingPersist {
+        config: config.clone(),
+        job: job.clone(),
+        started_at,
+        finished_at,
+        job_state_at,
+        status,
+        output: persisted_output,
+        duration_ms,
+        action,
+        claim: claim.clone(),
+    };
     #[cfg(test)]
     let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
     #[cfg(test)]
@@ -1827,7 +1999,10 @@ async fn persist_claimed_job_result(
     // to write it. A pool still full at the deadline means persistence itself
     // is wedged, which is the retained-claim case below.
     let persist_deadline = time::Instant::now() + persist_timeout;
-    let admitted = time::timeout_at(persist_deadline, persistence_worker_pool().acquire_owned())
+    // Read the pool inside this task: the test seam is a task-local, and the
+    // retained-result owner below runs on a task that does not inherit it.
+    let persistence_pool = persistence_worker_pool();
+    let admitted = time::timeout_at(persist_deadline, persistence_pool.clone().acquire_owned())
         .await
         .ok()
         .and_then(Result::ok);
@@ -1837,8 +2012,9 @@ async fn persist_claimed_job_result(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": persist_timeout.as_secs_f64()})),
-            "Cron persistence pool stayed at capacity; retaining the fenced claim for recovery"
+            "Cron persistence pool stayed at capacity; retaining the completed result for a later write"
         );
+        retain_pending_persist(pending, persistence_pool);
         return ClaimedJobResult {
             success: false,
             output: crate::i18n::get_required_cli_string("cron-result-persistence-pending"),
@@ -1850,75 +2026,7 @@ async fn persist_claimed_job_result(
         if let Some(duration) = persist_block {
             std::thread::sleep(duration);
         }
-
-        if let Err(e) = persist_run_result(
-            &owned_config,
-            &owned_job,
-            started_at,
-            finished_at,
-            job_state_at,
-            &status,
-            Some(&persisted_output),
-            duration_ms,
-            action,
-            &owned_claim,
-        ) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                "Failed to persist scheduler run result: "
-            );
-
-            if action == RunCompletionAction::Delete {
-                // Best-effort fallback for the legacy behavior: a successful
-                // auto-delete one-shot should not be picked up again if the
-                // combined history+state transaction fails while inserting or
-                // pruning the run row.
-                if let Err(disable_err) = persist_run_completion_state(
-                    &owned_config,
-                    &owned_job,
-                    job_state_at,
-                    &status,
-                    Some(&persisted_output),
-                    RunCompletionAction::Disable,
-                    &owned_claim,
-                ) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"disable_err": disable_err.to_string()})
-                            ),
-                        "Failed to disable one-shot cron job after history persistence failure: "
-                    );
-                }
-            } else {
-                // For recurring jobs and non-delete one-shots, keep the scheduler
-                // moving even if run-history persistence fails.
-                if let Err(state_err) = persist_run_completion_state(
-                    &owned_config,
-                    &owned_job,
-                    job_state_at,
-                    &status,
-                    Some(&persisted_output),
-                    action,
-                    &owned_claim,
-                ) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"state_err": state_err.to_string()})),
-                        "Failed to update cron job state after history persistence failure: "
-                    );
-                }
-            }
-            return false;
-        }
-        true
+        write_pending_persist(pending)
     });
 
     match time::timeout_at(persist_deadline, worker).await {
@@ -5237,6 +5345,104 @@ mod tests {
 
                 // The first job's own write committed on its worker, so both
                 // distinct jobs end durable with neither claim stranded.
+                let first_runs = wait_for_committed_runs(&config, &first_job.id).await;
+                assert_eq!(first_runs.len(), 1);
+                assert!(
+                    crate::cron::store::current_claim_for_test(&config, &first_job.id).is_err(),
+                    "the held write releases its own claim when it finally commits"
+                );
+            })
+            .await;
+    }
+
+    /// The test above covers capacity returning *before* the waiting caller's
+    /// deadline. This one covers the case the caller cannot wait out: the only
+    /// permit stays held through the second job's entire admission deadline,
+    /// so the second caller gives up on admission with a completed, already
+    /// delivered result in hand. That result must not be dropped. Its history,
+    /// its reschedule state and its fenced claim all depend on the write, and
+    /// the only broad stale-lock clearing is at process start, so dropping it
+    /// wedges the job until a restart.
+    #[tokio::test]
+    async fn persist_claimed_job_result_persists_a_result_retained_past_its_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let first_job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo one").unwrap();
+        let second_job = cron::add_job(&config, TEST_AGENT, "*/7 * * * *", "echo two").unwrap();
+        assert_ne!(first_job.id, second_job.id);
+        let started = Utc::now();
+        let first_claim = claim_job_with_token(&config, &first_job.id, started)
+            .unwrap()
+            .expect("first worker claims its job");
+        let second_claim = claim_job_with_token(&config, &second_job.id, started)
+            .unwrap()
+            .expect("second worker claims its job");
+
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        TEST_PERSISTENCE_WORKER_POOL
+            .scope(Arc::clone(&pool), async {
+                // The first job's write takes the only permit and keeps it far
+                // past the second job's admission deadline.
+                let first = TEST_PERSIST_TIMEOUT
+                    .scope(
+                        Duration::from_millis(25),
+                        TEST_PERSIST_BLOCK.scope(
+                            Duration::from_millis(1_500),
+                            persist_claimed_job_result(
+                                &config,
+                                &first_job,
+                                true,
+                                "held result",
+                                started,
+                                started + ChronoDuration::milliseconds(10),
+                                &first_claim,
+                            ),
+                        ),
+                    )
+                    .await;
+                assert_eq!(
+                    first.output,
+                    crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+                );
+
+                // Admission is still full when the second caller's own deadline
+                // expires, so it reports pending rather than blocking the
+                // scheduler loop any longer.
+                let second = TEST_PERSIST_TIMEOUT
+                    .scope(
+                        Duration::from_millis(50),
+                        persist_claimed_job_result(
+                            &config,
+                            &second_job,
+                            true,
+                            "retained past the deadline",
+                            started,
+                            started + ChronoDuration::milliseconds(10),
+                            &second_claim,
+                        ),
+                    )
+                    .await;
+                assert!(!second.success);
+                assert_eq!(
+                    second.output,
+                    crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+                );
+
+                // Reporting pending is only acceptable because something still
+                // owns the result: once the first write frees the permit, the
+                // retained result becomes durable on its own.
+                let runs = wait_for_committed_runs(&config, &second_job.id).await;
+                assert_eq!(runs.len(), 1);
+                assert_eq!(
+                    runs[0].output.as_deref(),
+                    Some("retained past the deadline"),
+                    "the retained result is the one written"
+                );
+                assert!(
+                    crate::cron::store::current_claim_for_test(&config, &second_job.id).is_err(),
+                    "writing the retained result releases its claim without a scheduler restart"
+                );
+
                 let first_runs = wait_for_committed_runs(&config, &first_job.id).await;
                 assert_eq!(first_runs.len(), 1);
                 assert!(
