@@ -804,8 +804,9 @@ impl ModelRoutingConfigTool {
     ///
     /// Returns `Ok(())` if the probe succeeds **or** if no API key or model
     /// resolves for the effective alias (checking the runtime snapshot for the
-    /// key too — see below; an environment override that clears the model
-    /// leaves no model), or the saved config's secrets cannot be
+    /// key too — see below, unless the environment explicitly cleared that
+    /// path; an environment override that clears the model leaves no model),
+    /// or the saved config's secrets cannot be
     /// decrypted. Those skips
     /// let an operator configure an alias while offline without turning an
     /// unrelated auth/decryption condition into a model-validity failure.
@@ -837,15 +838,24 @@ impl ModelRoutingConfigTool {
         // `effective` already carries any env-sourced credential for this
         // alias, so it is the authority. The runtime snapshot remains a
         // fallback for a key this process resolved at boot through a path the
-        // override layer cannot reproduce here.
+        // override layer cannot reproduce here — but only while the
+        // environment has not spoken for this field. The override layer
+        // records every path it applied, and an empty value clears an optional
+        // string, so an explicitly overridden path that resolves to no key
+        // means the reloaded runtime has no credential for this alias. Reviving
+        // the boot snapshot there would construct or dispatch with a credential
+        // the runtime will not use, and could roll a saved update back over
+        // that stale credential's rejection.
         let effective_key = effective
             .providers
             .models
             .find(family, alias)
             .and_then(|e| e.api_key.clone())
             .filter(|key| !key.trim().is_empty());
+        let api_key_path = format!("providers.models.{family}.{alias}.api_key");
         let api_key = match effective_key {
             Some(key) => Some(key),
+            None if effective.prop_is_env_overridden(&api_key_path) => None,
             None => self
                 .config
                 .providers
@@ -1873,6 +1883,47 @@ mod tests {
         );
     }
 
+    /// The same fallback, but with the credential path explicitly cleared by
+    /// the environment: the effective alias then has no credential at all, so
+    /// the probe must take the no-credential skip rather than constructing
+    /// with the boot snapshot's key.
+    #[tokio::test]
+    async fn probe_model_keeps_an_explicitly_cleared_credential_clear() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        let mut runtime_snapshot = (*base).clone();
+        runtime_snapshot
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .api_key = Some("sk-ant-env-sourced-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+
+        let mut saved = (*base).clone();
+        saved
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .model = Some("gpt-test".to_string());
+
+        let _api_key = TestEnvVar::set(
+            &_env_guard,
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "",
+        );
+
+        let result = tool.probe_model(&saved, "openai.default").await;
+        assert!(
+            result.is_ok(),
+            "an explicitly cleared credential must take the no-credential skip instead of \
+             reviving the boot snapshot key: {result:?}"
+        );
+    }
+
     /// `set_default` can create the alias it then probes. On a fatal probe the
     /// rollback must remove that alias: restoring "the previous entry" is a
     /// no-op when there was none, which would persist an alias that just
@@ -2343,6 +2394,182 @@ mod tests {
             persisted.model.as_deref(),
             Some("gpt-disk"),
             "the saved model stays on disk; only the effective view is cleared"
+        );
+    }
+
+    /// An empty `ZEROCLAW_*__api_key` override clears the alias credential the
+    /// same way an empty model override clears the model, so the reloaded
+    /// runtime holds no key for the alias. The probe must take the existing
+    /// no-credential skip instead of reviving the key this process happened to
+    /// resolve at boot: that stale credential is not what the runtime will
+    /// send, and constructing or dispatching with it can fail the update over a
+    /// key that was never going to be used.
+    #[tokio::test]
+    async fn set_default_does_not_probe_with_the_snapshot_key_after_an_explicit_empty_override() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_cleared_api_key_case";
+
+        let server = MockServer::start().await;
+        // Any request that arrives is accepted, so a probe that reached
+        // dispatch is observable only through the request count asserted below.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        // On disk: an alias with an endpoint and no credential of its own.
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        // In this process's boot snapshot: a stale credential for the same
+        // alias, which the environment has since cleared.
+        let mut runtime_snapshot = saved.clone();
+        {
+            let entry = runtime_snapshot
+                .providers
+                .models
+                .ensure("openai", ALIAS)
+                .unwrap();
+            entry.api_key = Some("sk-ant-stale-runtime-snapshot-key".to_string());
+        }
+
+        let api_key_var =
+            "ZEROCLAW_providers__models__openai__probe_env_cleared_api_key_case__api_key";
+        let _api_key = TestEnvVar::set(&_env_guard, api_key_var, "");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-test"
+            }))
+            .await
+            .unwrap();
+
+        // The scenario is real, not vacuous: the effective entry resolves no
+        // credential, exactly as the runtime resolves it, and the path is
+        // recorded as environment-owned.
+        let effective = ModelRoutingConfigTool::build_effective_config_for_probe(
+            tool.load_config_without_env().unwrap(),
+        )
+        .expect("the effective configuration rebuilds from the saved file");
+        let effective_entry = effective
+            .providers
+            .models
+            .find("openai", ALIAS)
+            .expect("the effective configuration keeps the alias");
+        assert_eq!(
+            effective_entry.api_key, None,
+            "an empty override clears the alias credential in the effective configuration"
+        );
+        assert!(
+            effective.prop_is_env_overridden(&format!("providers.models.openai.{ALIAS}.api_key")),
+            "the cleared credential path must be recorded as environment-owned"
+        );
+
+        assert!(
+            result.success,
+            "no effective credential leaves nothing to validate, as when the saved entry has \
+             none: {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert!(
+            requests.is_empty(),
+            "the boot snapshot credential must not be probed once the environment cleared the \
+             effective one; got {} request(s)",
+            requests.len()
+        );
+        let persisted = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("set_default preserves the configured alias");
+        assert_eq!(
+            persisted.model.as_deref(),
+            Some("gpt-test"),
+            "the saved update is retained under the existing no-credential skip"
+        );
+    }
+
+    /// The runtime snapshot stays available when the environment has not
+    /// spoken for the credential path: a key this process resolved at boot
+    /// through a path the override layer cannot reproduce here is still what
+    /// the reloaded runtime will use.
+    #[tokio::test]
+    async fn set_default_still_probes_with_the_snapshot_key_when_the_path_is_not_overridden() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_snapshot_key_kept_case";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let mut runtime_snapshot = saved.clone();
+        {
+            let entry = runtime_snapshot
+                .providers
+                .models
+                .ensure("openai", ALIAS)
+                .unwrap();
+            entry.api_key = Some("sk-test-snapshot-key".to_string());
+        }
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-test"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "the probe succeeds against the mock: {result:?}");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "an unoverridden credential path still falls back to the boot snapshot key"
         );
     }
 
