@@ -402,7 +402,7 @@ pub(crate) struct VerifiedWebhookMessages {
     feature = "channel-whatsapp-cloud"
 ))]
 impl VerifiedWebhookMessages {
-    #[cfg(feature = "channel-linq")]
+    #[cfg(any(feature = "channel-linq", feature = "channel-sendblue"))]
     pub(crate) fn is_empty(&self) -> bool {
         self.messages.is_empty()
     }
@@ -650,7 +650,7 @@ async fn process_verified_message(
     {
         #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
         SessionKeyPolicy::ChannelSender => sender_session_id(spec.channel, msg),
-        #[cfg(feature = "channel-linq")]
+        #[cfg(any(feature = "channel-linq", feature = "channel-sendblue"))]
         SessionKeyPolicy::AliasSenderSanitized => {
             let channel_ref = format!("{}.{}", spec.channel, alias);
             zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg))
