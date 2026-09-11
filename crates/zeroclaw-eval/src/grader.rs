@@ -204,6 +204,7 @@ impl Grader for BudgetGrader {
     }
 
     async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+        let run = run.completion_or_default();
         // A bound is one inclusive check (`actual <= max`), tagged Budget.
         let check = |label: &str, max: u64, actual: u64| {
             GradeResult::new(
@@ -264,7 +265,7 @@ impl Grader for ResponseJsonGrader {
     }
 
     async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
-        let parsed = parse_response_json(&run.final_response);
+        let parsed = parse_response_json(&run.completion_or_default().final_response);
         self.pointers
             .iter()
             .map(|(pointer, expected)| {
@@ -293,6 +294,7 @@ impl Grader for ResponseJsonGrader {
 
 /// Evaluate every declared expectation against the run, one [`GradeResult`] per check.
 pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeResult> {
+    let run = run.completion_or_default();
     let mut out = Vec::new();
     let resp = run.final_response.as_str();
 
@@ -504,14 +506,24 @@ mod tests {
 
     fn run(resp: &str, tools: &[&str], all_ok: bool) -> RunRecord {
         RunRecord {
-            final_response: resp.to_string(),
-            history: Vec::new(),
-            tools_called: tools.iter().map(|s| s.to_string()).collect(),
-            all_tools_succeeded: all_ok,
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
+            provenance: crate::record::CaseProvenance {
+                schema: crate::record::RECORD_SCHEMA.to_string(),
+                mode: crate::Mode::Replay,
+                case_id: "test".to_string(),
+                case_hash: String::new(),
+                provider_ref: "scripted".to_string(),
+                tool_surface: crate::record::ToolSurface::default(),
+                sandbox: crate::record::SandboxStamp {
+                    autonomy: "supervised".to_string(),
+                    workspace_only: false,
+                },
+            },
+            completion: Some(crate::record::RunCompletion {
+                final_response: resp.to_string(),
+                tools_called: tools.iter().map(|s| s.to_string()).collect(),
+                all_tools_succeeded: all_ok,
+                ..crate::record::RunCompletion::default()
+            }),
         }
     }
 
@@ -704,7 +716,7 @@ mod tests {
     #[tokio::test]
     async fn budget_grader_boundary_inclusive() {
         let mut record = run("", &[], true);
-        record.input_tokens = 100;
+        record.completion.as_mut().unwrap().input_tokens = 100;
         let at_limit = BudgetGrader {
             expects: BudgetExpects {
                 max_input_tokens: Some(100),
@@ -730,8 +742,9 @@ mod tests {
     #[tokio::test]
     async fn budget_total_saturates_instead_of_wrapping() {
         let mut record = run("", &[], true);
-        record.input_tokens = u64::MAX;
-        record.output_tokens = 1;
+        let completion = record.completion.as_mut().unwrap();
+        completion.input_tokens = u64::MAX;
+        completion.output_tokens = 1;
         let grades = BudgetGrader {
             expects: BudgetExpects {
                 max_total_tokens: Some(u64::MAX - 1),

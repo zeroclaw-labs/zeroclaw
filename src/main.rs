@@ -529,6 +529,11 @@ enum EvalCommands {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
         format: commands::eval::OutputFormat,
+
+        /// Directory to write a per-case run record (JSON) into.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        dump_records: Option<String>,
     },
 }
 
@@ -7086,13 +7091,47 @@ Add pricing to the active provider profile or supply a catalog entry."
                 suite,
                 mode,
                 format,
+                dump_records,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let report =
+                let (report, artifacts) =
                     commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
+                // Dumps land in this run's private staging dir. Publication moves
+                // that directory into the immutable completed-run area and swaps
+                // the `last-run` pointer while holding the cross-process lock.
+                let dump_result = commands::eval::write_dumps(
+                    &report,
+                    dump_records.as_deref().map(std::path::Path::new),
+                    &artifacts.staged,
+                );
+                let wrote_auto = match dump_result {
+                    Ok(wrote_auto) => wrote_auto,
+                    Err(error) => {
+                        if let Err(cleanup_error) = artifacts.discard() {
+                            return Err(error.context(format!(
+                                "also failed to discard unpublished eval artifacts: {cleanup_error}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                };
+                let published = artifacts.publish()?;
+                // Footer is a table affordance only; never emit it in JSON mode, or
+                // it would corrupt the machine-readable stdout artifact.
+                if wrote_auto && format == commands::eval::OutputFormat::Table {
+                    let dir = published.display().to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-eval-failed-case-records",
+                            &[("dir", dir.as_str())],
+                            &format!("  failed-case records: {dir}/"),
+                        )
+                    );
+                }
                 // Only a failing suite needs the hard exit to carry a non-zero
                 // status; a passing run returns normally so shutdown runs.
                 match report.exit_code() {
