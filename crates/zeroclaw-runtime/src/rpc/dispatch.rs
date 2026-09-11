@@ -508,6 +508,12 @@ pub struct RpcDispatcher {
     /// the same token to observe teardown, and a completing prompt dropping
     /// its handle must not close the connection that is still serving requests.
     owns_connection: bool,
+    /// Liveness token for the accepted connection, shared with every task this
+    /// connection starts. Cloned into each spawned prompt and into the nested
+    /// turn task, so the listener's client count falls to zero only once that
+    /// work has actually finished unwinding. `None` when no listener supplied
+    /// one (direct dispatcher construction outside an accepted connection).
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
     prompt_tasks: Vec<JoinHandle<()>>,
     /// SHA-256 fingerprint of the client certificate presented on the mTLS
     /// handshake (remote WSS plane only; `None` on the local socket). This is the
@@ -538,9 +544,22 @@ impl RpcDispatcher {
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
             connection_cancel,
             owns_connection: true,
+            connection_activity: None,
             prompt_tasks: Vec::new(),
             peer_cert_fingerprint: None,
         }
+    }
+
+    /// Attach the accepted connection's liveness token. Additive builder so the
+    /// listeners can share their client-count token with the tasks this
+    /// dispatcher spawns while other construction sites need no change.
+    #[must_use]
+    pub(crate) fn with_connection_activity(
+        mut self,
+        activity: crate::rpc::ConnectionActivity,
+    ) -> Self {
+        self.connection_activity = Some(activity);
+        self
     }
 
     /// Bind the client certificate fingerprint from the mTLS handshake (WSS).
@@ -600,6 +619,10 @@ impl RpcDispatcher {
             client_elicitation_caps: self.client_elicitation_caps,
             connection_cancel: self.connection_cancel.clone(),
             owns_connection: false,
+            // Shared, not re-created: this handle is moved into the spawned
+            // prompt task, so the clone it carries keeps the connection counted
+            // until that task's future is dropped.
+            connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
             peer_cert_fingerprint: self.peer_cert_fingerprint.clone(),
         }
@@ -2485,6 +2508,7 @@ impl RpcDispatcher {
                 channel: "rpc",
             },
             cost_context,
+            self.connection_activity.clone(),
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();

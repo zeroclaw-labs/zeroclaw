@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -594,17 +594,6 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ScanningStream<S> {
     }
 }
 
-/// Decrements the shared client counter on every exit path of a connection
-/// task. The counter drives `--ephemeral` shutdown, so a missed decrement
-/// would keep an idle daemon alive forever.
-struct ClientCountGuard(Arc<AtomicUsize>);
-
-impl Drop for ClientCountGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// File-descriptor exhaustion errno values, stable across the Unix targets
 /// we support (Linux, macOS, BSD).
 #[cfg(unix)]
@@ -1013,7 +1002,6 @@ pub async fn run_wss_listener(
                 };
 
                 let ctx = ctx.clone();
-                let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
                 let conn_cancel = cancel.child_token();
                 let handshake_timeout = limits.handshake_timeout;
@@ -1025,12 +1013,14 @@ pub async fn run_wss_listener(
                 let max_sessions_per_client = limits.max_sessions_per_client;
                 let incomplete_message_timeout = limits.incomplete_message_timeout;
 
-                count.fetch_add(1, Ordering::Relaxed);
+                // Counted here rather than inside the task so an accepted
+                // connection is visible to the daemon immediately.
+                let activity = crate::rpc::ConnectionActivity::new(client_count.clone());
 
                 connection_tasks.spawn(async move {
                     // Guarantees the `--ephemeral` counter is decremented on
                     // every exit path below, including the new timeout one.
-                    let _count_guard = ClientCountGuard(count);
+                    let _count_guard = activity.clone();
 
                     // ONE absolute deadline over TLS accept AND the WebSocket
                     // upgrade, measured from accept. A fresh per-phase window
@@ -1209,7 +1199,8 @@ pub async fn run_wss_listener(
                         peer,
                         conn_cancel.clone(),
                     )
-                    .with_peer_cert_fingerprint(Some(peer_cert_fp));
+                    .with_peer_cert_fingerprint(Some(peer_cert_fp))
+                    .with_connection_activity(activity);
                     // The concrete dispatcher future carries the full request
                     // state machine. Keep that state heap-backed so an active
                     // WSS request does not depend on the executor worker's
@@ -1993,7 +1984,21 @@ mod accept_error_tests {
         tokio_tungstenite::Connector::Rustls(Arc::new(client_cfg))
     }
 
-    async fn assert_reload_replacement_generation_waits_for_durable_session_prompt_wss() {
+    /// When the retiring generation releases its cleanup, relative to the
+    /// listener's forced-abort deadline (`rpc::CONNECTION_DRAIN_GRACE`).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Gen1Release {
+        /// Cleanup returns while the listener is still draining cooperatively.
+        BeforeForcedDeadline,
+        /// Cleanup is still running when the listener force-aborts the
+        /// connection, so the replacement generation may only be admitted on
+        /// proof that the nested turn task itself has ended.
+        AfterForcedDeadline,
+    }
+
+    async fn assert_reload_replacement_generation_waits_for_durable_session_prompt_wss(
+        release: Gen1Release,
+    ) {
         use crate::rpc::context::RpcContext;
         use crate::rpc::dispatch::connection_test_support::insert_session;
         use crate::rpc::session::SessionStore;
@@ -2123,6 +2128,7 @@ mod accept_error_tests {
         let gen1_is_running = Arc::new(AtomicBool::new(false));
         let gen2_started = Arc::new(Notify::new());
         let overlap_detected = Arc::new(AtomicBool::new(false));
+        let gen1_listener_exited = Arc::new(AtomicBool::new(false));
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let port1 = free_port().await;
@@ -2257,6 +2263,8 @@ mod accept_error_tests {
         let log_clone = Arc::clone(&log);
         let client_cert_pem = client.cert_pem.clone();
         let client_key_pem = client.key_pem.clone();
+        let count1_for_gen2 = Arc::clone(&count1);
+        let gen1_listener_exited_for_gen2 = Arc::clone(&gen1_listener_exited);
 
         let gen2_task = zeroclaw_spawn::spawn!(async move {
             // Gen 2 waits for Gen 1 listener to cleanly shut down
@@ -2264,6 +2272,16 @@ mod accept_error_tests {
                 .await
                 .unwrap()
                 .expect("Gen 1 WSS listener should exit Ok");
+            gen1_listener_exited_for_gen2.store(true, Ordering::SeqCst);
+
+            // The listener returning is not admission: a force-aborted
+            // connection leaves its turn task unwinding. Gate on the daemon's
+            // own reload drain, which is what production waits on.
+            assert_eq!(
+                crate::daemon::await_rpc_connection_drain(&count1_for_gen2).await,
+                crate::daemon::RpcDrain::Complete,
+                "the retiring generation must finish draining within the reload budget"
+            );
 
             let port2 = free_port().await;
             let addr2: std::net::SocketAddr = format!("127.0.0.1:{port2}").parse().unwrap();
@@ -2382,18 +2400,27 @@ mod accept_error_tests {
             drop(client_sink2);
         });
 
-        // While Gen 1 is held in cancellation, verify Gen 2 has not started its prompt
+        // While Gen 1 is held in cancellation, verify Gen 2 has not started its
+        // prompt. Observations are recorded here and asserted after the release
+        // below: the fixture parks a worker thread until it is released, so an
+        // assertion that fails while it is held would hang the run instead of
+        // reporting the failure.
+        let forced_observation = match release {
+            Gen1Release::BeforeForcedDeadline => None,
+            Gen1Release::AfterForcedDeadline => {
+                let exited = tokio::time::timeout(Duration::from_secs(30), async {
+                    while !gen1_listener_exited.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                Some((exited, count1.load(Ordering::Relaxed)))
+            }
+        };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            gen1_is_running.load(Ordering::SeqCst),
-            "Gen 1 prompt must still be held"
-        );
-        let current_log = log.lock().unwrap().clone();
-        assert_eq!(
-            current_log,
-            vec!["gen1_started", "gen1_unwind_start"],
-            "Prompt 2 must not have started yet"
-        );
+        let gen1_held = gen1_is_running.load(Ordering::SeqCst);
+        let log_while_held = log.lock().unwrap().clone();
 
         // Now allow Gen 1 prompt to complete its cooperative cancellation unwind
         {
@@ -2403,8 +2430,25 @@ mod accept_error_tests {
             cvar.notify_all();
         }
 
+        if let Some((exited, counted)) = forced_observation {
+            assert!(
+                exited,
+                "the Gen 1 listener must force-abort its connection and exit"
+            );
+            assert!(
+                counted > 0,
+                "a force-aborted connection must stay counted while its turn task unwinds"
+            );
+        }
+        assert!(gen1_held, "Gen 1 prompt must still be held");
+        assert_eq!(
+            log_while_held,
+            vec!["gen1_started", "gen1_unwind_start"],
+            "Prompt 2 must not have started yet"
+        );
+
         // Gen 2 task should now complete cleanly
-        tokio::time::timeout(Duration::from_secs(5), gen2_task)
+        tokio::time::timeout(Duration::from_secs(10), gen2_task)
             .await
             .expect("Gen 2 reload handoff should finish within timeout")
             .expect("Gen 2 task should not panic");
@@ -2441,12 +2485,40 @@ mod accept_error_tests {
                     .build()
                     .unwrap()
                     .block_on(
-                        assert_reload_replacement_generation_waits_for_durable_session_prompt_wss(),
+                        assert_reload_replacement_generation_waits_for_durable_session_prompt_wss(
+                            Gen1Release::BeforeForcedDeadline,
+                        ),
                     );
             })
             .unwrap()
             .join()
             .expect("WSS reload durable session test thread should not panic");
+    }
+
+    /// The forced half of the same handoff: Gen 1 cleanup is still running when
+    /// the listener force-aborts the connection it accepted. Admission of Gen 2
+    /// must wait for the nested turn task to end, not for the abort to be
+    /// requested.
+    #[test]
+    fn forced_reload_replacement_generation_waits_for_durable_session_prompt_wss() {
+        std::thread::Builder::new()
+            .name("wss-forced-reload-durable-session".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(
+                        assert_reload_replacement_generation_waits_for_durable_session_prompt_wss(
+                            Gen1Release::AfterForcedDeadline,
+                        ),
+                    );
+            })
+            .unwrap()
+            .join()
+            .expect("WSS forced reload durable session test thread should not panic");
     }
 
     #[cfg(unix)]
