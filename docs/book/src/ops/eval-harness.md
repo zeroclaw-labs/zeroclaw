@@ -107,10 +107,17 @@ constructed, so no subprocess is launched, and it covers every way the session
 factory can reach one:
 
 - the `[eval].live_provider` reference itself,
-- any profile reachable through that profile's `fallback` chain, within the
-  factory's own fallback depth limit,
 - any `[[model_routes]]` target, because the router builds every configured
-  route's provider up front.
+  route's provider up front,
+- every profile reachable through the `fallback` chain of either of those.
+
+A `fallback` entry is stored as written and resolved by alias lookup across all
+provider families, so a dotless entry such as `fallback = ["sentinel"]` selects
+whichever family owns that alias. The guard resolves each entry the same way
+before classifying it, so a CLI-backed profile cannot be admitted by naming it
+without its family. The chain walk has no depth limit of its own: the provider
+factory prunes a chain past its own fallback depth, so refusing the whole
+reachable set refuses a superset of what the factory can build.
 
 The run fails with a config error naming the refused profile. Point
 `[eval].live_provider` at an HTTP model provider instead. Supporting CLI-backed
