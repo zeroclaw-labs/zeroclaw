@@ -2698,10 +2698,10 @@ mod tests {
     // live `~/.zeroclaw/config.toml`.
 
     #[tokio::test]
-    async fn prop_get_surfaces_inert_command_audit_warning() {
+    async fn prop_get_surfaces_disabled_audit_warning() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
-        config.security.audit.enabled = true;
+        config.security.audit.enabled = false;
         let state = test_state(config);
 
         let (status, json) = response_json(
@@ -2717,14 +2717,21 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["value"], "true");
+        assert_eq!(json["value"], "false");
         let warning = json["warnings"]
             .as_array()
             .expect("warnings is an array")
             .iter()
-            .find(|warning| warning["code"] == "security_audit_enabled_has_no_effect")
-            .expect("gateway response includes the inert audit warning");
+            .find(|warning| warning["code"] == "security_audit_disabled_drops_certificate_record")
+            .expect("gateway response includes the disabled-audit warning");
         assert_eq!(warning["path"], "security.audit.enabled");
+        assert!(
+            warning["message"]
+                .as_str()
+                .expect("warning message is a string")
+                .contains("Command execution is not audited"),
+            "the structured message must scope the gap to command execution"
+        );
     }
 
     #[tokio::test]

@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 /// and the wording is not.
 pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
 
-/// Stable code for an explicitly enabled but unwired command-audit writer.
-pub const SECURITY_AUDIT_ENABLED_HAS_NO_EFFECT: &str = "security_audit_enabled_has_no_effect";
+/// Stable code for a disabled audit section, which drops the certificate
+/// issuance and renewal trail without adding any command record.
+pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
+    "security_audit_disabled_drops_certificate_record";
 
 /// One non-fatal validation issue surfaced after a successful save.
 ///
@@ -45,9 +47,10 @@ pub const SECURITY_AUDIT_ENABLED_HAS_NO_EFFECT: &str = "security_audit_enabled_h
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
-/// - `security_audit_enabled_has_no_effect`: `security.audit.enabled` is set
-///   to `true`, but command audit logging has no production writer yet, so
-///   the setting currently has no effect.
+/// - `security_audit_disabled_drops_certificate_record`:
+///   `security.audit.enabled` is `false`, so certificate issuance and renewal
+///   are recorded nowhere. Command execution is not audited under either
+///   value, because no production path records tool commands.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently
