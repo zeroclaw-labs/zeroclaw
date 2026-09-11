@@ -20,7 +20,6 @@
 //! persistence with a warning: pairing still works for the process
 //! lifetime, it just isn't durable.
 
-use std::sync::Arc;
 use zeroclaw_config::schema::Config;
 
 /// The conflict message when a matching `ignore` already denies `identity`,
@@ -270,8 +269,15 @@ pub(crate) fn merge_external_peer(
 /// callers may invoke this on every connect/reconnect. `persist = None`
 /// (no handle wired) warns and succeeds without persisting. `match_fn` is the
 /// channel's own admission comparison; see [`merge_external_peer`].
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "channel-line",
+    feature = "channel-wechat",
+    feature = "whatsapp-web",
+    test
+))]
 pub(crate) async fn persist_external_peer(
-    persist: Option<&Arc<parking_lot::RwLock<Config>>>,
+    persist: Option<&std::sync::Arc<parking_lot::RwLock<Config>>>,
     channel_type: &str,
     alias: &str,
     identity: &str,
@@ -317,6 +323,7 @@ pub(crate) async fn persist_external_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// Stands in for a channel whose identities are compared verbatim, for the
     /// group-selection tests where the matcher is not what is under test.

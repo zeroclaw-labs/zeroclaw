@@ -8835,8 +8835,8 @@ pub fn channel_peer_group_key(config: &Config, channel_type: &str, alias: &str) 
 }
 
 /// The `peer_groups` key that already authorizes `identity`, for reporting an
-/// `already_bound` result without guessing a name. See
-/// [`crate::identity_persist::authorizing_group_key`].
+/// `already_bound` result without guessing a name. Delegates to the
+/// crate-private `identity_persist::authorizing_group_key`.
 #[must_use]
 pub fn channel_authorizing_group_key(
     config: &Config,
