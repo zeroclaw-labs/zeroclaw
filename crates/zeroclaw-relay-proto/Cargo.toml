@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Wire protocol (zeroclaw.relay.v1) for the ZeroClaw nominated relay: control frames shared by the relay, the daemon-side bridge, and clients."
 publish = true
 
