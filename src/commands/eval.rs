@@ -78,6 +78,23 @@ fn ensure_no_cli_backed_provider(config: &Config, provider_ref: &str) -> Result<
     Ok(())
 }
 
+/// Reject a zero per-turn timeout before the runner wraps every turn in it.
+///
+/// Schema validation already rejects zero, but `Config::load_or_init` demotes
+/// validation failures to warnings, so the value still reaches this entry point.
+/// A zero duration makes every turn time out, which reads as a provider fault
+/// rather than a configuration mistake, so fail closed with the actionable
+/// message instead.
+fn ensure_case_timeout(case_timeout_secs: u64) -> Result<Duration> {
+    if case_timeout_secs == 0 {
+        anyhow::bail!(
+            "[eval].case_timeout_secs must be greater than zero; a zero per-turn timeout \
+             expires every live turn before the provider can answer"
+        );
+    }
+    Ok(Duration::from_secs(case_timeout_secs))
+}
+
 /// Build the per-run dependencies for the requested mode, threading the loaded
 /// config so live mode can resolve its provider. Replay injects the deterministic
 /// trace-replay provider; live resolves `[eval].live_provider` per case.
@@ -93,6 +110,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             let provider_ref = config.eval.live_provider.as_str().trim().to_string();
             zeroclaw_eval::ensure_live_provider(&provider_ref)?;
             ensure_no_cli_backed_provider(config, &provider_ref)?;
+            let case_timeout = ensure_case_timeout(config.eval.case_timeout_secs)?;
             // The provider closure must be `'static`, so it owns a config clone and
             // builds a fresh provider per case (isolation).
             let cfg = config.clone();
@@ -109,7 +127,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                     })
                 }),
                 live_tools: config.eval.live_allowed_tools.clone(),
-                case_timeout: Duration::from_secs(config.eval.case_timeout_secs),
+                case_timeout,
             })
         }
     }
@@ -239,10 +257,23 @@ mod tests {
     }
 
     #[test]
-    fn replay_ignores_the_live_provider() {
+    fn live_rejects_a_zero_case_timeout() {
+        let mut config = http_live_config();
+        config.eval.case_timeout_secs = 0;
+
+        let message = live_rejection(&config);
+        assert!(
+            message.contains("case_timeout_secs"),
+            "the error must name the offending key: {message}"
+        );
+    }
+
+    #[test]
+    fn replay_ignores_the_live_provider_and_timeout() {
         let mut config = http_live_config();
         insert_cli_profile(&mut config, "default");
         config.eval.live_provider = ModelProviderRef::from("grok_cli.default");
+        config.eval.case_timeout_secs = 0;
 
         assert!(build_run_deps(&config, Mode::Replay).is_ok());
     }

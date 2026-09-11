@@ -66,7 +66,7 @@ Each live case runs inside a sandbox:
 | Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`, then `shell` is dropped unconditionally (see "Shell is excluded" below); empty allowlist yields only the harmless echo tool. |
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
-| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. Zero is refused before the run starts, so a config that slipped past validation cannot expire every turn. |
 | Network | The only egress live mode performs is the configured provider call itself. No tool it can admit opens a network connection, and no OS-level network rule is applied, because none is needed at this tool surface. |
 
 ### What a live case can actually touch
