@@ -126,10 +126,10 @@ max_cpu_time_seconds = 60
 max_subprocesses = 10
 memory_monitoring = true
 
-# Command audit logging ([security.audit]) is intentionally absent: it is
-# scaffolding only, with no production writer yet. Enabling it records
-# nothing beyond a startup warning, so it is omitted rather than shipped
-# as an apparently configurable control.
+# [security.audit] is left at its defaults (enabled), which keeps the
+# certificate issuance and renewal trail. It does not record tool commands:
+# command execution has no audit writer, so this section is not a record of
+# what the agent ran.
 
 [security.otp]
 enabled = true
