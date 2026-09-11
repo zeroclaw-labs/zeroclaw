@@ -17,14 +17,19 @@ pub struct ThinkingParams {
     pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
 }
 
+/// Prefixes that name a reasoning depth for one message. `/effort:` matches
+/// the shared `/effort` command; `/think:` is the older spelling and stays
+/// accepted.
+const THINKING_DIRECTIVE_PREFIXES: &[&str] = &["/effort:", "/think:"];
+
 pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)> {
     let trimmed = message.trim_start();
-    if !trimmed.starts_with("/think:") {
-        return None;
-    }
+    let prefix = THINKING_DIRECTIVE_PREFIXES
+        .iter()
+        .find(|prefix| trimmed.starts_with(*prefix))?;
 
-    // Extract the level token (everything between `/think:` and the next whitespace or end).
-    let after_prefix = &trimmed["/think:".len()..];
+    // Extract the level token (everything between the prefix and the next whitespace or end).
+    let after_prefix = &trimmed[prefix.len()..];
     let level_end = after_prefix
         .find(|c: char| c.is_whitespace())
         .unwrap_or(after_prefix.len());
@@ -78,7 +83,9 @@ pub fn apply_thinking_level(level: ThinkingLevel) -> ThinkingParams {
             system_prompt_prefix: None,
             native_thinking: None,
         },
-        ThinkingLevel::High => ThinkingParams {
+        // `xhigh` is a native depth setting; where only the prompt can carry
+        // the level it reads as `high`.
+        ThinkingLevel::High | ThinkingLevel::XHigh => ThinkingParams {
             temperature_adjustment: 0.05,
             max_tokens_adjustment: 1000,
             system_prompt_prefix: Some(
@@ -136,13 +143,18 @@ pub fn apply_thinking_level_with_config(
     // does not: a level the operator chose should reach the families that read
     // it, and the default level asks for nothing.
     let effort = level.native_effort();
-    let display = config.display.to_display();
-    params.native_thinking = (budget_tokens.is_some() || effort.is_some() || display.is_some())
-        .then_some(zeroclaw_config::scattered_types::NativeThinkingParams {
-            budget_tokens,
-            effort,
-            display,
-        });
+    // The profile's display is the standing default, which the provider alias
+    // and a per-request choice both outrank, so it travels in its own field.
+    let profile_display = config.display.to_display();
+    params.native_thinking = (budget_tokens.is_some()
+        || effort.is_some()
+        || profile_display.is_some())
+    .then_some(zeroclaw_config::scattered_types::NativeThinkingParams {
+        budget_tokens,
+        effort,
+        display: None,
+        profile_display,
+    });
     params
 }
 
@@ -294,6 +306,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_directive_accepts_the_effort_spelling() {
+        let (level, remaining) =
+            parse_thinking_directive("/effort:xhigh plan the migration").expect("directive");
+        assert_eq!(level, ThinkingLevel::XHigh);
+        assert_eq!(remaining, "plan the migration");
+        assert_eq!(
+            strip_thinking_directive("  /effort:low  body"),
+            "body",
+            "the older and newer spellings strip the same way"
+        );
+        assert!(parse_thinking_directive("/effort high").is_none());
+        assert!(parse_thinking_directive("/effort:turbo hi").is_none());
+    }
+
+    #[test]
     fn parse_directive_handles_directive_only() {
         let result = parse_thinking_directive("/think:off");
         assert!(result.is_some());
@@ -426,6 +453,13 @@ mod tests {
     }
 
     #[test]
+    fn apply_thinking_level_xhigh_reads_as_high_outside_native_depth() {
+        let xhigh = apply_thinking_level(ThinkingLevel::XHigh);
+        let high = apply_thinking_level(ThinkingLevel::High);
+        assert_eq!(xhigh, high);
+    }
+
+    #[test]
     fn apply_thinking_level_max_is_most_thorough() {
         let params = apply_thinking_level(ThinkingLevel::Max);
         assert!(params.temperature_adjustment > 0.0);
@@ -528,6 +562,7 @@ mod tests {
             (ThinkingLevel::Minimal, Some(ThinkingEffort::Low)),
             (ThinkingLevel::Low, Some(ThinkingEffort::Low)),
             (ThinkingLevel::High, Some(ThinkingEffort::High)),
+            (ThinkingLevel::XHigh, Some(ThinkingEffort::XHigh)),
             (ThinkingLevel::Max, Some(ThinkingEffort::Max)),
         ] {
             let params = apply_thinking_level_with_config(level, &config);
@@ -607,7 +642,15 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
-        assert_eq!(native.display, Some(ThinkingDisplay::Updates));
+        assert_eq!(
+            native.profile_display,
+            Some(ThinkingDisplay::Updates),
+            "the profile value travels below the provider alias"
+        );
+        assert_eq!(
+            native.display, None,
+            "the profile chose nothing for this request in particular"
+        );
 
         // Default config (`display: off`) must leave the wire field unset.
         let config = ThinkingConfig {
@@ -619,7 +662,34 @@ mod tests {
         let native = params
             .native_thinking
             .expect("native thinking should be set");
+        assert_eq!(native.profile_display, None);
         assert_eq!(native.display, None);
+    }
+
+    #[test]
+    fn display_mode_propagates_without_native_thinking() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::scattered_types::ThinkingDisplayMode;
+
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: false,
+            display: ThinkingDisplayMode::Summarized,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("a profile display alone should produce native params");
+        assert_eq!(
+            native.profile_display,
+            Some(ThinkingDisplay::Summarized),
+            "the flag gates the budget, not the display"
+        );
+        assert_eq!(
+            native.budget_tokens, None,
+            "the fixed budget stays behind native_thinking"
+        );
     }
 
     #[test]
@@ -687,11 +757,12 @@ display = "updates"
 
     #[tokio::test]
     async fn native_thinking_override_round_trips_through_scope() {
-        use zeroclaw_config::scattered_types::NativeThinkingParams;
+        use zeroclaw_config::scattered_types::{NativeThinkingParams, ThinkingDisplay};
         let installed = Some(NativeThinkingParams {
             budget_tokens: Some(32_000),
             effort: None,
-            display: None,
+            display: Some(ThinkingDisplay::Summarized),
+            profile_display: None,
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {
@@ -734,7 +805,7 @@ display = "updates"
         validate_thinking_config(&cfg_default);
 
         let mut cfg_all_valid = ThinkingConfig::default();
-        for level in ["off", "minimal", "low", "medium", "high", "max"] {
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             cfg_all_valid
                 .budget_tokens
                 .insert(level.to_string(), 10_000);

@@ -1225,7 +1225,7 @@ mod tests {
             (
                 "channel-runtime-thinking-set",
                 &[("level", "high")][..],
-                ["high", "/thinking reset"].as_slice(),
+                ["high", "/effort reset"].as_slice(),
             ),
             (
                 "channel-runtime-thinking-cleared",
@@ -1235,16 +1235,16 @@ mod tests {
             (
                 "channel-runtime-thinking-default",
                 &[("default", "medium")][..],
-                ["medium", "/thinking high", "/thinking max", "/thinking off"].as_slice(),
+                ["medium", "/effort high", "/effort max", "/effort off"].as_slice(),
             ),
             (
                 "channel-runtime-thinking-invalid",
                 &[("raw", "banana")][..],
                 [
                     "banana",
-                    "/thinking off|minimal|low|medium|high|max",
-                    "/thinking on",
-                    "/thinking reset",
+                    "/effort off|minimal|low|medium|high|xhigh|max",
+                    "/effort on",
+                    "/effort reset",
                 ]
                 .as_slice(),
             ),

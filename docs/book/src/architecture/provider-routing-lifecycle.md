@@ -20,7 +20,7 @@ Use this page when a change touches `model_routes`, session or in-turn model sel
 
 ## Construction and selection
 
-The runtime starts with an active provider reference and model from the selected agent, a session override, or an in-turn `model_switch`. Provider construction then composes two wrappers:
+The runtime starts with an active provider reference and model from the selected agent, a session override, or an in-turn `model_switch`. A daemon session may also override the reasoning depth and display: those overrides are validated against what the resolved model accepts, cleared by a model or provider switch, and applied as native request parameters only, so they never rewrite the system prompt or rebuild the provider. Provider construction then composes two wrappers:
 
 1. The factory builds a `ReliableModelProvider` for the active provider profile. An effective primary model comes from an explicit construction override or the profile's configured `model`. When one exists, it and the profile's `fallback_models` become pinned entries. Without one, the profile contributes one unpinned entry and its `fallback_models` are not materialized. Recursively referenced `fallback` profiles are still walked. Each referenced profile keeps its own credentials, endpoint, headers, model, and capability overrides.
 2. When `model_routes` are configured, the factory builds a separate reliable provider for the primary route and each unique route target, then wraps them in `RouterModelProvider`.

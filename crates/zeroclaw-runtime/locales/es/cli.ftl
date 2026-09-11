@@ -913,12 +913,12 @@ channel-runtime-scoped-model-switched = Modelo definido en `{ $model }` (model_p
 channel-runtime-shadow-note = ⚠️ Hay una sobrescritura de mayor precedencia activa, por lo que los mensajes usarán `{ $model }` (`{ $provider }`) en su lugar; consulta `/model`.
 channel-runtime-thinking-set =
     Thinking definido en `{ $level }` para esta sesión del remitente.
-    Usa `/thinking reset` para volver al valor predeterminado del agente.
+    Usa `/effort reset` para volver al valor predeterminado del agente.
 channel-runtime-thinking-cleared = Sobrescritura de thinking borrada. Usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
 channel-runtime-thinking-default =
     Thinking ya está usando el valor predeterminado del agente `{ $default }` para esta sesión del remitente.
-    Usa `/thinking high`, `/thinking max` o `/thinking off` para sobrescribirlo.
-channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/thinking off|minimal|low|medium|high|max`, `/thinking on` o `/thinking reset`.
+    Usa `/effort high`, `/effort max` o `/effort off` para sobrescribirlo.
+channel-runtime-thinking-invalid = Nivel de thinking desconocido `{ $raw }`. Usa `/effort off|minimal|low|medium|high|xhigh|max`, `/effort on` o `/effort reset`.
 channel-runtime-provider-turn-init-failed =
     ⚠️ Error al inicializar model_provider `{ $provider }`. Ejecuta `/models` para elegir otro model_provider.
     Detalles: { $error }

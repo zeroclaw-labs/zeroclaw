@@ -1168,15 +1168,21 @@ pub enum AnthropicThinkingDisplay {
     Updates,
 }
 
+impl From<AnthropicThinkingDisplay> for zeroclaw_api::model_provider::ThinkingDisplay {
+    fn from(display: AnthropicThinkingDisplay) -> Self {
+        match display {
+            AnthropicThinkingDisplay::Omitted => Self::Omitted,
+            AnthropicThinkingDisplay::Summarized => Self::Summarized,
+            AnthropicThinkingDisplay::Updates => Self::Updates,
+        }
+    }
+}
+
 impl AnthropicThinkingDisplay {
     /// Wire value, or `None` to let the API apply its own default.
     #[must_use]
     pub fn wire_value(self) -> Option<&'static str> {
-        match self {
-            Self::Omitted => None,
-            Self::Summarized => Some("summarized"),
-            Self::Updates => Some("updates"),
-        }
+        zeroclaw_api::model_provider::ThinkingDisplay::from(self).wire_value()
     }
 }
 
