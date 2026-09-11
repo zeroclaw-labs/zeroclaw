@@ -18,7 +18,10 @@ enum SocketStartupState {
     #[default]
     Pending,
     Ready,
-    Fatal(String),
+    Fatal {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
 #[derive(Clone)]
@@ -50,13 +53,16 @@ impl SocketStartupTracker {
     }
 
     fn record_error(&self, error: &anyhow::Error) {
-        if !is_addr_in_use(error) {
+        let Some(kind) = fatal_socket_startup_kind(error) else {
             return;
-        }
+        };
 
         self.state_tx.send_if_modified(|state| {
             if matches!(state, SocketStartupState::Pending) {
-                *state = SocketStartupState::Fatal(format!("{error:#}"));
+                *state = SocketStartupState::Fatal {
+                    kind,
+                    message: format!("{error:#}"),
+                };
                 true
             } else {
                 false
@@ -65,10 +71,20 @@ impl SocketStartupTracker {
     }
 }
 
-fn is_addr_in_use(error: &anyhow::Error) -> bool {
+/// Startup errors no supervisor restart can recover from: the endpoint is
+/// already owned by another daemon, or the configured path can never be bound
+/// (for example a Unix socket path over the platform `sun_path` limit, which
+/// `std` reports as `InvalidInput` before the syscall).
+fn fatal_socket_startup_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
     error
         .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        .map(std::io::Error::kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::InvalidInput
+            )
+        })
 }
 
 #[derive(Clone)]
@@ -1150,8 +1166,8 @@ async fn await_socket_startup(
         .map(|state| state.clone())
     {
         Ok(SocketStartupState::Ready) => Ok(()),
-        Ok(SocketStartupState::Fatal(message)) => {
-            Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, message).into())
+        Ok(SocketStartupState::Fatal { kind, message }) => {
+            Err(std::io::Error::new(kind, message).into())
         }
         Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
         Err(_) => Ok(()),
@@ -1388,17 +1404,17 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
+                    crate::health::mark_component_error(name, format!("{e:#}"));
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{}", e),
+                                "error": format!("{e:#}"),
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e}")
+                        &format!("Daemon component '{name}' failed: {e:#}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -3853,6 +3869,81 @@ mod tests {
                 "daemon should return the startup socket ownership error with startup_feedback_enabled={startup_feedback_enabled}, got: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn fatal_socket_startup_kind_covers_unbindable_paths_through_context() {
+        use std::io;
+
+        let unbindable = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local IPC socket path is 104 bytes but this platform allows at most 103",
+        ))
+        .context("binding local IPC endpoint");
+        assert_eq!(
+            fatal_socket_startup_kind(&unbindable),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        let owned = anyhow::Error::from(io::Error::from(io::ErrorKind::AddrInUse));
+        assert_eq!(
+            fatal_socket_startup_kind(&owned),
+            Some(io::ErrorKind::AddrInUse)
+        );
+
+        let transient = anyhow::Error::from(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(fatal_socket_startup_kind(&transient), None);
+        assert_eq!(
+            fatal_socket_startup_kind(&anyhow::Error::msg("not an io error")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_socket_invalid_input_fails_daemon_startup() {
+        use std::io;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_socket = attempts.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
+            let attempts = attempts_for_socket.clone();
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "local IPC socket path is 104 bytes but this platform allows at most 103",
+                ))
+                .context("binding local IPC endpoint"))
+            })
+        }));
+
+        let result = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon must not restart-loop an unbindable socket path");
+        let error = result.expect_err("daemon startup should fail on an unbindable socket path");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput),
+            "the startup error should keep the bind error kind, got: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("binding local IPC endpoint"), "{message}");
+        assert!(message.contains("allows at most 103"), "{message}");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an unbindable path must fail closed instead of being retried"
+        );
     }
 
     #[tokio::test]

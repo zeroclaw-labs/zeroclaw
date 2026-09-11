@@ -1470,6 +1470,11 @@ async fn await_spawned_daemon_ready(
     socket: &std::path::Path,
     daemon: &mut SpawnedDaemon,
 ) -> anyhow::Result<client::RpcClient> {
+    eprintln!(
+        "zerocode: waiting for daemon at {} (up to {}s)…",
+        socket.display(),
+        SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
+    );
     let deadline = tokio::time::Instant::now() + SPAWNED_DAEMON_CONNECT_TIMEOUT;
     loop {
         if let Some(exit) = daemon.poll_exit()? {
@@ -1477,7 +1482,8 @@ async fn await_spawned_daemon_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "daemon did not become ready within {}s (socket: {})",
+                "daemon did not become ready within {}s (socket: {}); if the socket path is \
+                 long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir",
                 SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
                 socket.display(),
             );
