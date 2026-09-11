@@ -18,6 +18,8 @@ pub struct SendblueChannel {
     /// How often `listen` pulls new messages. `None` disables polling, leaving
     /// the gateway's `/sendblue` webhook route as the only inbound path.
     poll_interval: Option<Duration>,
+    /// Whether to mark a conversation read once an inbound message is accepted.
+    read_receipts: bool,
     /// `(succeeded, at)` for the last completed poll exchange. Read by
     /// `listener_health`, which must not perform I/O.
     poll_health: Mutex<Option<(bool, Instant)>>,
@@ -69,9 +71,21 @@ impl SendblueChannel {
             alias: alias.into(),
             peer_resolver,
             poll_interval,
+            read_receipts: false,
             poll_health: Mutex::new(None),
             client: reqwest::Client::new(),
         }
+    }
+
+    /// Mark conversations read as inbound messages are accepted.
+    ///
+    /// Off by default: Sendblue gates the endpoint per account (their
+    /// engineering team has to turn it on), so defaulting it on would make
+    /// every accepted message attempt a call most accounts cannot serve.
+    #[must_use]
+    pub fn with_read_receipts(mut self, read_receipts: bool) -> Self {
+        self.read_receipts = read_receipts;
+        self
     }
 
     /// Resolve a configured interval into a listener setting: `0` disables
@@ -144,6 +158,60 @@ impl SendblueChannel {
     /// `data` when the account has the newer envelope format enabled.
     fn message_object(payload: &serde_json::Value) -> &serde_json::Value {
         payload.get("data").unwrap_or(payload)
+    }
+
+    /// Mark the conversation with `recipient` as read, so the sender sees their
+    /// message has landed while the agent is still composing.
+    ///
+    /// Best effort by contract: Sendblue documents no delivery confirmation,
+    /// the endpoint is iMessage/RCS only (SMS carries no read state), and it
+    /// has to be enabled per account. A failure here must never hold up or fail
+    /// the inbound dispatch, so callers ignore the result and this logs at
+    /// debug.
+    pub async fn mark_read(&self, recipient: &str) -> anyhow::Result<()> {
+        if !self.read_receipts {
+            return Ok(());
+        }
+
+        let body = ::serde_json::json!({
+            "number": Self::normalize_e164(recipient),
+            "from_number": self.from_number,
+        });
+
+        let resp = self
+            .auth_headers(self.client.post(format!("{SENDBLUE_API_BASE}/mark-read")))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("mark_read failed: {}", resp.status())
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Send read receipts for every distinct sender in `messages`, ignoring
+    /// failures. One receipt per conversation, not per message, because a
+    /// debounced batch from one sender is a single conversation.
+    pub async fn mark_read_for(&self, messages: &[ChannelMessage]) {
+        if !self.read_receipts {
+            return;
+        }
+
+        let mut marked: Vec<&str> = Vec::new();
+        for msg in messages {
+            if marked.contains(&msg.reply_target.as_str()) {
+                continue;
+            }
+            marked.push(&msg.reply_target);
+            let _ = self.mark_read(&msg.reply_target).await;
+        }
     }
 
     /// Fetch inbound messages Sendblue recorded at or after `since`.
@@ -421,7 +489,13 @@ impl Channel for SendblueChannel {
                     continue;
                 }
 
-                for msg in self.parse_webhook_payload(payload) {
+                let parsed = self.parse_webhook_payload(payload);
+                // Ahead of dispatch: the point of the receipt is that the
+                // sender sees the message landed while the agent is still
+                // working on a reply.
+                self.mark_read_for(&parsed).await;
+
+                for msg in parsed {
                     if tx.send(msg).await.is_err() {
                         // Receiver dropped: the orchestrator is shutting this
                         // channel down.
@@ -519,6 +593,13 @@ pub fn verify_sendblue_secret(secret: &str, headers: &reqwest::header::HeaderMap
         return false;
     }
 
+    // `sb-signing-secret` must stay first and must stay the name in
+    // `SENDBLUE_WEBHOOK.signature_header`: that spec field is what the ingress
+    // layer names when it logs missing-vs-invalid. A request authenticated by
+    // the `x-webhook-secret` proxy fallback alone is accepted here, but a
+    // *failed* one is reported against the primary header. Do not "correct"
+    // this back to a guessed name like `X-Sendblue-Secret`; Sendblue sends
+    // `sb-signing-secret` (docs.sendblue.com/security).
     const SECRET_HEADERS: &[&str] = &["sb-signing-secret", "x-webhook-secret"];
 
     for name in SECRET_HEADERS {
@@ -758,6 +839,27 @@ mod tests {
         // Webhook mode completes no exchange of its own, so it has nothing to
         // vouch for and must not claim health it cannot observe.
         assert_eq!(allowed_channel().listener_health(), None);
+    }
+
+    #[tokio::test]
+    async fn read_receipts_are_off_unless_enabled() {
+        // The endpoint is gated per account, so a channel that was never told
+        // to use receipts must not reach for it. With no HTTP mock in front of
+        // this, a call that did go out would fail the DNS/connect and surface
+        // as an error rather than `Ok`.
+        let channel = allowed_channel();
+
+        assert!(
+            channel.mark_read("+447700900123").await.is_ok(),
+            "receipts disabled must short-circuit before any request"
+        );
+        channel.mark_read_for(&[]).await;
+    }
+
+    #[test]
+    fn enabling_read_receipts_is_opt_in() {
+        assert!(!allowed_channel().read_receipts);
+        assert!(allowed_channel().with_read_receipts(true).read_receipts);
     }
 
     #[test]

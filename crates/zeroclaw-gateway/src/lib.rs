@@ -1194,13 +1194,16 @@ pub async fn run_gateway(
             (
                 alias.clone(),
                 // Webhook-only: the orchestrator owns the polling listener.
-                Arc::new(SendblueChannel::new(
-                    sb.api_key_id.clone(),
-                    sb.api_secret_key.clone(),
-                    sb.from_number.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                )),
+                Arc::new(
+                    SendblueChannel::new(
+                        sb.api_key_id.clone(),
+                        sb.api_secret_key.clone(),
+                        sb.from_number.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    .with_read_receipts(sb.read_receipts),
+                ),
             )
         })
         .collect();
@@ -3707,6 +3710,11 @@ async fn process_sendblue_webhook(
         // Acknowledge status/delivery events before ownership resolution.
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
+
+    // Ahead of ownership resolution and dispatch: the point of the receipt is
+    // that the sender sees the message landed while the agent is still working
+    // on a reply. No-op unless the instance enables read receipts.
+    sendblue.mark_read_for(verified.messages()).await;
 
     let channel_ref = sendblue_channel_ref(alias);
     let (agent_override, has_channel_bindings) = {

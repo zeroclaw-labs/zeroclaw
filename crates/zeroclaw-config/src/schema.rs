@@ -12120,6 +12120,46 @@ pub fn validate_memory_semantics(
 ///
 /// Called from `Config::collect_warnings`, so this reaches the CLI and the
 /// gateway dashboard on the same path as the other warnings.
+/// Warn when a Sendblue instance has both inbound paths armed.
+///
+/// Polling and the webhook are meant to be exclusive: each dispatches every
+/// inbound record on its own, and they share no de-duplication, so an operator
+/// who registers the webhook and leaves the default poll interval in place gets
+/// the same message answered twice.
+///
+/// This warns rather than forcing the modes apart because a configured secret
+/// is not proof a webhook is registered — only Sendblue knows that — and
+/// silently disabling the poller would strand an operator who set a secret
+/// ahead of time and still relies on polling.
+pub fn validate_sendblue_semantics(
+    alias: &str,
+    sb: &SendblueConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    let mut out = Vec::new();
+
+    let secret_set = sb
+        .signing_secret
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|secret| !secret.is_empty());
+
+    if sb.enabled && secret_set && sb.poll_interval_secs > 0 {
+        out.push(crate::validation_warnings::ValidationWarning::new(
+            "sendblue_both_inbound_paths_armed",
+            format!(
+                "channels.sendblue.{alias} has a signing_secret set and polling enabled. \
+                 Those are the two inbound paths and they do not share de-duplication, so \
+                 a registered webhook will deliver the same message the poller also picks \
+                 up, and the agent answers twice. Set poll_interval_secs = 0 for \
+                 webhook-only, or clear signing_secret for polling-only."
+            ),
+            format!("channels.sendblue.{alias}.poll_interval_secs"),
+        ));
+    }
+
+    out
+}
+
 pub fn validate_whatsapp_semantics(
     alias: &str,
     wa: &WhatsAppConfig,
@@ -16563,6 +16603,20 @@ pub struct SendblueConfig {
     #[tab(Advanced)]
     #[serde(default = "default_sendblue_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Mark a conversation read once an inbound message is accepted, so the
+    /// sender sees it landed while the agent is still composing. Default:
+    /// `false`.
+    ///
+    /// Off by default because Sendblue gates the endpoint per account: their
+    /// engineering team has to enable read receipts before
+    /// `POST /api/mark-read` will serve your line. Receipts are also
+    /// best-effort and iMessage/RCS only, since SMS carries no read state.
+    ///
+    /// Sendblue can do the same thing server-side with its account-level
+    /// auto-mark-read setting, which needs no configuration here.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub read_receipts: bool,
 
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
@@ -20882,6 +20936,9 @@ impl Config {
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
+        }
+        for (alias, sb) in &self.channels.sendblue {
+            warnings.extend(validate_sendblue_semantics(alias, sb));
         }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
@@ -35152,6 +35209,46 @@ group_policy = "disabled"
         assert!(
             !warnings.iter().any(|w| w.path.contains("custom.vllm")),
             "custom honors wire_api and must not warn",
+        );
+    }
+
+    fn sendblue(secret: Option<&str>, poll_interval_secs: u64) -> SendblueConfig {
+        SendblueConfig {
+            enabled: true,
+            api_key_id: "key".into(),
+            api_secret_key: "secret".into(),
+            from_number: "+15550000000".into(),
+            signing_secret: secret.map(ToOwned::to_owned),
+            poll_interval_secs,
+            ..SendblueConfig::default()
+        }
+    }
+
+    #[test]
+    async fn sendblue_warns_only_when_both_inbound_paths_are_armed() {
+        // Webhook-only and polling-only are the two intended shapes.
+        assert!(validate_sendblue_semantics("main", &sendblue(Some("s"), 0)).is_empty());
+        assert!(validate_sendblue_semantics("main", &sendblue(None, 15)).is_empty());
+        // A blank secret is not a configured webhook.
+        assert!(validate_sendblue_semantics("main", &sendblue(Some("   "), 15)).is_empty());
+
+        let warnings = validate_sendblue_semantics("main", &sendblue(Some("s"), 15));
+        assert_eq!(warnings.len(), 1, "both paths armed must warn exactly once");
+        assert_eq!(warnings[0].code, "sendblue_both_inbound_paths_armed");
+        assert_eq!(
+            warnings[0].path,
+            "channels.sendblue.main.poll_interval_secs"
+        );
+    }
+
+    #[test]
+    async fn sendblue_does_not_warn_while_the_channel_is_disabled() {
+        let mut config = sendblue(Some("s"), 15);
+        config.enabled = false;
+
+        assert!(
+            validate_sendblue_semantics("main", &config).is_empty(),
+            "a disabled channel dispatches on neither path"
         );
     }
 

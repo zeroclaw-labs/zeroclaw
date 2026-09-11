@@ -9648,14 +9648,17 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
             };
-            Ok(Arc::new(SendblueChannel::with_poll_interval(
-                sb.api_key_id.clone(),
-                sb.api_secret_key.clone(),
-                sb.from_number.clone(),
-                alias,
-                peer_resolver,
-                SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
-            )))
+            Ok(Arc::new(
+                SendblueChannel::with_poll_interval(
+                    sb.api_key_id.clone(),
+                    sb.api_secret_key.clone(),
+                    sb.from_number.clone(),
+                    alias,
+                    peer_resolver,
+                    SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
+                )
+                .with_read_receipts(sb.read_receipts),
+            ))
         }
         #[cfg(feature = "channel-sendblue")]
         x if x.starts_with("sendblue.") => {
@@ -9672,14 +9675,17 @@ fn build_channel_by_id(
                 let alias = alias.to_string();
                 Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
             };
-            Ok(Arc::new(SendblueChannel::with_poll_interval(
-                sb.api_key_id.clone(),
-                sb.api_secret_key.clone(),
-                sb.from_number.clone(),
-                alias.to_string(),
-                peer_resolver,
-                SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
-            )))
+            Ok(Arc::new(
+                SendblueChannel::with_poll_interval(
+                    sb.api_key_id.clone(),
+                    sb.api_secret_key.clone(),
+                    sb.from_number.clone(),
+                    alias.to_string(),
+                    peer_resolver,
+                    SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
+                )
+                .with_read_receipts(sb.read_receipts),
+            ))
         }
         #[cfg(not(feature = "channel-sendblue"))]
         x if x.starts_with("sendblue") => {
@@ -11076,14 +11082,17 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Sendblue",
             alias: Some(alias.clone()),
-            channel: Arc::new(SendblueChannel::with_poll_interval(
-                sb.api_key_id.clone(),
-                sb.api_secret_key.clone(),
-                sb.from_number.clone(),
-                alias.clone(),
-                peer_resolver,
-                SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
-            )),
+            channel: Arc::new(
+                SendblueChannel::with_poll_interval(
+                    sb.api_key_id.clone(),
+                    sb.api_secret_key.clone(),
+                    sb.from_number.clone(),
+                    alias.clone(),
+                    peer_resolver,
+                    SendblueChannel::poll_interval_from_secs(sb.poll_interval_secs),
+                )
+                .with_read_receipts(sb.read_receipts),
+            ),
         });
     }
 

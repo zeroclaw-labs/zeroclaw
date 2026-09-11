@@ -407,6 +407,14 @@ impl VerifiedWebhookMessages {
         self.messages.is_empty()
     }
 
+    /// Read-only view of the verified messages, for adapters that need to act
+    /// on the parsed set before dispatch. Borrowed rather than moved so the
+    /// proof still owns them when it is handed to the dispatcher.
+    #[cfg(feature = "channel-sendblue")]
+    pub(crate) fn messages(&self) -> &[ChannelMessage] {
+        &self.messages
+    }
+
     /// Remove messages handled entirely by the transport adapter, such as
     /// WhatsApp approval replies. This can narrow the parsed set but cannot
     /// introduce content that did not come from the verified body.

@@ -81,7 +81,29 @@ curl -X POST https://api.sendblue.com/api/account/webhooks \
 > (`X-Sendblue-Signature: t=…,v1=…`), but that is a different webhook type and
 > is not what a message channel receives.
 
+### Read receipts
+
+`read_receipts = true` marks the conversation read as soon as an inbound
+message is accepted, on either path, so the sender sees it landed while the
+agent is still composing. One receipt per conversation, not per message.
+
+Off by default, because Sendblue gates `POST /api/mark-read` per account:
+their engineering team has to enable read receipts on your line before it
+serves anything. Receipts are best-effort with no delivery confirmation, and
+iMessage/RCS only, since SMS carries no read state. Failures are logged at
+debug and never hold up the inbound message.
+
+Sendblue can also do this server-side with its account-level auto-mark-read
+setting, which fires on every inbound 1:1 iMessage and needs nothing here.
+Enable one or the other, not both.
+
 ### Both modes
+
+**The two inbound paths are exclusive.** They share no de-duplication, so if
+you register the webhook and leave polling on, the same message arrives twice
+and the agent answers twice. Pick one: `poll_interval_secs = 0` for
+webhook-only, or leave `signing_secret` unset for polling-only. `config
+validate` warns when both are armed.
 
 Senders are gated by the channel's peer group, matched literally against the
 E.164 number. A handle arriving without its leading `+` is normalized before
