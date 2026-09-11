@@ -261,7 +261,7 @@ mod tests {
         output: &str,
         success: bool,
         max_tool_result_chars: usize,
-    ) -> Result<CollectedResults> {
+    ) -> Result<(CollectedResults, Vec<ChatMessage>)> {
         let mut detector = LoopDetector::new(LoopDetectorConfig::default());
         let ignore: HashSet<&str> = HashSet::new();
         let mut history: Vec<ChatMessage> = Vec::new();
@@ -279,7 +279,7 @@ mod tests {
                 outcome(output, success),
             )));
         }
-        collect_tool_results(
+        let collected = collect_tool_results(
             ordered,
             &tool_calls,
             &mut history,
@@ -290,10 +290,11 @@ mod tests {
             "test-model",
             0,
             "turn-test",
-        )
+        )?;
+        Ok((collected, history))
     }
 
-    fn run(n: usize, output: &str, success: bool) -> Result<CollectedResults> {
+    fn run(n: usize, output: &str, success: bool) -> Result<(CollectedResults, Vec<ChatMessage>)> {
         run_with_limit(n, output, success, 10_000)
     }
 
@@ -355,14 +356,27 @@ mod tests {
     }
 
     #[test]
-    fn successful_identical_results_still_trip_no_progress_breaker() {
-        // Identical *successful* output across different args is the genuine
-        // stuck-loop signaland must still hard-abort the turn.
-        let err = match run(8, "byte-identical successful output", true) {
-            Ok(_) => panic!("expected the no-progress circuit breaker to abort the turn"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("loop detector"), "got: {err}");
+    fn successful_identical_results_block_but_do_not_abort_the_turn() {
+        // Identical *successful* output across different args is ambiguous —
+        // empty search results and idempotent reads look exactly like this — so
+        // the detector blocks and feeds the model a system message, but the turn
+        // survives. A genuinely stuck agent still ends at max_tool_iterations.
+        let (_, history) = run(8, "byte-identical successful output", true)
+            .expect("no-progress must not abort the turn");
+        let blocked = history
+            .iter()
+            .filter(|m| m.content.contains("[Loop Detection — BLOCKED]"))
+            .count();
+        assert!(
+            blocked > 0,
+            "expected a BLOCKED system message, got history: {history:?}"
+        );
+    }
+
+    #[test]
+    fn no_progress_never_aborts_however_long_it_runs() {
+        // The Block cap holds well past the old Break threshold.
+        assert!(run(20, "identical successful output", true).is_ok());
     }
 
     fn run_hash_path(n: usize, output: &str, success: bool) -> Result<()> {

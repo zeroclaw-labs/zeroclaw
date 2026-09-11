@@ -201,6 +201,27 @@ impl CostTracker {
         self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, true)
     }
 
+    /// Record a usage event attributed to an agent, a durable task, and the
+    /// chat session that incurred it. `conversation_id` is the runtime
+    /// session key scoped around the turn; `None` keeps the record
+    /// attributable only to the daemon-lifetime tracker id.
+    pub fn record_usage_attributed(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        conversation_id: Option<String>,
+    ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_sync(
+            usage,
+            agent_alias,
+            task_id,
+            conversation_id,
+            true,
+            File::sync_all,
+        )
+    }
+
     pub fn record_scoped_usage_with_owned_task_attribution(
         &self,
         usage: TokenUsage,
@@ -221,6 +242,7 @@ impl CostTracker {
             usage,
             agent_alias,
             task_id,
+            None,
             honor_enabled,
             File::sync_all,
         )
@@ -231,6 +253,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
+        conversation_id: Option<String>,
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<()> {
@@ -261,7 +284,8 @@ impl CostTracker {
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
         let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
+            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
+                .with_conversation_id(conversation_id);
 
         let mut storage = self.lock_storage();
         let append_outcome = storage.add_record_with_sync(record, sync_file)?;
@@ -283,6 +307,30 @@ impl CostTracker {
     /// month's records.
     pub fn get_summary(&self) -> Result<CostSummary> {
         self.get_summary_filtered(None)
+    }
+
+    /// Per-model rollup over every record in the current UTC month.
+    ///
+    /// [`CostSummary::by_model`] stays daily-scoped for dashboard and RPC
+    /// consumers. Operator surfaces that qualify the monthly total, such as
+    /// the `zeroclaw status` pricing-unavailable warning, need the whole
+    /// month's recorded provenance so unpriced usage from an earlier day
+    /// does not disappear at UTC day rollover while the monthly spend still
+    /// omits its cost. Derived from the persisted ledger on demand; nothing
+    /// is cached or duplicated.
+    pub fn get_current_month_model_stats(&self) -> Result<HashMap<String, ModelStats>> {
+        self.get_current_month_model_stats_at_period(ReportingPeriod::current())
+    }
+
+    fn get_current_month_model_stats_at_period(
+        &self,
+        period: ReportingPeriod,
+    ) -> Result<HashMap<String, ModelStats>> {
+        let mut storage = self.lock_storage();
+        storage.ensure_period_cache_current_at(period)?;
+        let period = storage.reporting_period();
+        let records = storage.current_month_records(period)?;
+        Ok(build_model_stats(records.iter()))
     }
 
     pub fn get_summary_in_bounds(
@@ -590,6 +638,7 @@ fn add_model_stats(by_model: &mut HashMap<String, ModelStats>, record: &CostReco
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
+            unpriced_tokens: 0,
             request_count: 0,
         });
     add_usage_to_model_stats(entry, record);
@@ -601,6 +650,18 @@ fn add_usage_to_model_stats(entry: &mut ModelStats, record: &CostRecord) {
     entry.input_tokens += record.usage.input_tokens;
     entry.output_tokens += record.usage.output_tokens;
     entry.cached_input_tokens += record.usage.cached_input_tokens;
+    if record.usage.unpriced_tokens > 0 {
+        entry.unpriced_tokens = entry
+            .unpriced_tokens
+            .saturating_add(record.usage.unpriced_tokens);
+    } else if !record.usage.pricing_available {
+        // Compatibility with rows written by the first provenance format,
+        // which had only a record-level boolean. Rows older than that omit the
+        // boolean too and deserialize as priced by the existing default.
+        entry.unpriced_tokens = entry
+            .unpriced_tokens
+            .saturating_add(record.usage.total_tokens);
+    }
     entry.request_count += 1;
 }
 
@@ -1067,12 +1128,37 @@ mod tests {
             total_tokens: 20,
             cost_usd,
             pricing_available: true,
+            unpriced_tokens: 0,
             timestamp,
         };
         CostRecord::with_attribution(
             "fixture-session",
             Some("fixture-agent".to_string()),
             task_id.map(str::to_string),
+            usage,
+        )
+    }
+
+    fn unpriced_record_at(
+        model: &str,
+        unpriced_tokens: u64,
+        timestamp: DateTime<Utc>,
+    ) -> CostRecord {
+        let usage = TokenUsage {
+            model: model.to_string(),
+            input_tokens: unpriced_tokens,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            total_tokens: unpriced_tokens,
+            cost_usd: 0.0,
+            pricing_available: false,
+            unpriced_tokens,
+            timestamp,
+        };
+        CostRecord::with_attribution(
+            "fixture-session",
+            Some("fixture-agent".to_string()),
+            None,
             usage,
         )
     }
@@ -1187,6 +1273,7 @@ mod tests {
             total_tokens: 20,
             cost_usd: 1.0,
             pricing_available: true,
+            unpriced_tokens: 0,
             timestamp: Utc::now(),
         };
 
@@ -1195,6 +1282,7 @@ mod tests {
                 usage,
                 None,
                 Some("task-a".to_string()),
+                None,
                 true,
                 fail_sync,
             )
@@ -1246,6 +1334,40 @@ mod tests {
         assert_eq!(summary.request_count, 1);
         assert!(summary.session_cost_usd > 0.0);
         assert_eq!(summary.by_model.len(), 1);
+    }
+
+    #[test]
+    fn model_summary_counts_only_explicitly_unpriced_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let configured_free = TokenUsage::new("test/model", 100, 50, 0, 0.0, 0.0, 0.0);
+        let mut unpriced = TokenUsage::new("test/model", 200, 75, 0, 0.0, 0.0, 0.0);
+        unpriced.pricing_available = false;
+
+        tracker.record_usage(configured_free).unwrap();
+        tracker.record_usage(unpriced).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        let model = summary.by_model.get("test/model").unwrap();
+        assert_eq!(model.total_tokens, 425);
+        assert_eq!(model.unpriced_tokens, 275);
+        assert_eq!(model.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn model_summary_prefers_dimension_level_unpriced_count() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let mut partial = TokenUsage::new("test/model", 100, 20, 0, 2.0, 0.0, 0.0);
+        partial.unpriced_tokens = 20;
+        partial.pricing_available = false;
+
+        tracker.record_usage(partial).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        let model = summary.by_model.get("test/model").unwrap();
+        assert_eq!(model.total_tokens, 120);
+        assert_eq!(model.unpriced_tokens, 20);
     }
 
     #[test]
@@ -1551,6 +1673,70 @@ mod tests {
         assert!(filtered.by_model.contains_key("today/model"));
         assert!(!filtered.by_model.contains_key("earlier-month/model"));
         assert!(!filtered.by_model.contains_key("prior-month/model"));
+    }
+
+    #[test]
+    fn current_month_model_stats_keep_earlier_month_unpriced_usage_visible() {
+        let tmp = TempDir::new().unwrap();
+        let storage_path = resolve_storage_path(tmp.path()).unwrap();
+        let period = ReportingPeriod {
+            day: NaiveDate::from_ymd_opt(2025, 6, 15).unwrap(),
+            year: 2025,
+            month: 6,
+        };
+        let month_start = period.day.with_day(1).unwrap();
+        let prior_month = month_start - Duration::days(1);
+        write_records(
+            &storage_path,
+            &[
+                record_at(
+                    "today/model",
+                    1.0,
+                    Utc.from_utc_datetime(&period.day.and_hms_opt(12, 0, 0).unwrap()),
+                    None,
+                ),
+                unpriced_record_at(
+                    "earlier-month/model",
+                    150,
+                    Utc.from_utc_datetime(&month_start.and_hms_opt(0, 0, 0).unwrap()),
+                ),
+                unpriced_record_at(
+                    "prior-month/model",
+                    75,
+                    Utc.from_utc_datetime(&prior_month.and_hms_opt(23, 59, 59).unwrap()),
+                ),
+            ],
+        );
+
+        // A fresh tracker reloads the ledger from disk the same way the
+        // status command does after a restart.
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+
+        let summary = tracker
+            .get_summary_filtered_at_period(None, period)
+            .unwrap();
+        assert_eq!(
+            summary.by_model.len(),
+            1,
+            "the daily by_model contract for other consumers is unchanged"
+        );
+        assert!(summary.by_model.contains_key("today/model"));
+        assert!((summary.monthly_cost_usd - 1.0).abs() < f64::EPSILON);
+
+        let month = tracker
+            .get_current_month_model_stats_at_period(period)
+            .unwrap();
+        assert_eq!(month.len(), 2);
+        assert_eq!(month["today/model"].unpriced_tokens, 0);
+        assert!((month["today/model"].cost_usd - 1.0).abs() < f64::EPSILON);
+        assert_eq!(
+            month["earlier-month/model"].unpriced_tokens, 150,
+            "earlier-this-month unpriced usage must stay visible after day rollover"
+        );
+        assert!(
+            !month.contains_key("prior-month/model"),
+            "previous-month rows are outside the monthly cap window"
+        );
     }
 
     #[test]

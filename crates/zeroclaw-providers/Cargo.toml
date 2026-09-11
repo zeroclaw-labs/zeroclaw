@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "LLM provider implementations, auth services, and multimodal processing."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
@@ -50,3 +51,7 @@ nix = { version = "0.30", default-features = false, features = ["process", "sign
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
+
+[features]
+default = []
+test-helpers = []
