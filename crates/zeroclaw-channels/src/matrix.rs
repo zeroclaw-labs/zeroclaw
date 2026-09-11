@@ -3876,7 +3876,7 @@ mod outbound {
         Voice,
     }
 
-    async fn upload_attachment(
+    pub(super) async fn upload_attachment(
         room: &Room,
         att: &MediaAttachment,
         kind: AttachmentKind,
@@ -3950,9 +3950,18 @@ mod outbound {
                 size,
                 ..Default::default()
             }),
+            // `duration` and `waveform` must both be `Some` for the SDK to emit
+            // an `org.matrix.msc1767.audio` block at all, and without a
+            // duration clients render a voice bubble stuck at `00:00` with no
+            // seek bar. The length is read straight out of the Ogg container by
+            // `opus_duration` -- no decoding, and no length asserted when the
+            // bytes cannot be read with certainty, in which case the previous
+            // zero is still sent. The waveform stays empty: it is optional in
+            // MSC1767 and would need decoded PCM.
             AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                duration: Some(opus_duration(&att.data).unwrap_or(Duration::ZERO)),
                 size,
-                ..Default::default()
+                waveform: Some(Vec::new()),
             }),
             AttachmentKind::File | AttachmentKind::Auto => {
                 AttachmentInfo::File(BaseFileInfo { size })
@@ -3970,6 +3979,222 @@ mod outbound {
             mime_guess::mime::VIDEO => AttachmentKind::Video,
             _ => AttachmentKind::File,
         }
+    }
+
+    /// Playback length of an Ogg-Opus stream, read from the container alone.
+    ///
+    /// Opus always ticks at 48 kHz, so the length is the span the granule
+    /// positions cover, less the priming samples `OpusHead` asks the decoder to
+    /// discard:
+    ///
+    /// ```text
+    /// samples = final_granule - start_granule - pre_skip
+    /// ```
+    ///
+    /// `start_granule` is derived rather than stored. RFC 7845 section 4.5 lets
+    /// the first audio page carry a granule larger than the samples completing
+    /// on it, which is how a clip keeps the timeline of the recording it was cut
+    /// from; taking that page's granule as the origin would report the offset as
+    /// playback time. The origin is the granule minus the samples of the packets
+    /// completing on the page, counted from Opus table-of-contents metadata
+    /// (RFC 6716 section 3.1) without decoding audio.
+    ///
+    /// That page may instead carry a granule *below* those samples, but only
+    /// when it also ends the stream: the tail is trimmed to finish somewhere
+    /// other than a frame boundary, and the timeline starts at zero. The same
+    /// granule on a page that does not end the stream is invalid.
+    ///
+    /// Only a single logical stream is measured. A page whose serial differs
+    /// from the opening stream's, or a second beginning-of-stream page, belongs
+    /// to a chained or multiplexed file, whose length one number cannot honestly
+    /// describe.
+    ///
+    /// Returns `None` -- never a guess -- when the stream cannot be read end to
+    /// end: a bad capture pattern, a first page that is not a lone `OpusHead`
+    /// marked beginning-of-stream, a segment table or page body running past the
+    /// end, an audio page opening mid-packet, a table-of-contents byte that will
+    /// not parse, no page carrying a known granule, or a span shorter than
+    /// `pre_skip`.
+    pub(super) fn opus_duration(bytes: &[u8]) -> Option<Duration> {
+        /// `OggS`, version, header type, granule, serial, sequence, checksum,
+        /// segment count -- the fixed part of a page header.
+        const PAGE_HEADER_LEN: usize = 27;
+        /// `OpusHead`, version, channel count, `pre_skip`.
+        const OPUS_HEAD_LEN: usize = 12;
+        /// Opus granule positions always tick at 48 kHz, whatever the input
+        /// sample rate was.
+        const GRANULE_HZ: u64 = 48_000;
+        /// Header-type bit for a page opening with the tail of a packet carried
+        /// over from the page before it.
+        const CONTINUED: u8 = 0x01;
+        /// Header-type bit for a page that begins a logical stream.
+        const BOS: u8 = 0x02;
+        /// Header-type bit for a page that ends a logical stream.
+        const EOS: u8 = 0x04;
+        /// `OpusHead` then `OpusTags` precede the audio; the latter may span
+        /// pages, so audio begins once both have completed.
+        const HEADER_PACKETS: u32 = 2;
+
+        let mut cursor = 0usize;
+        let mut serial: Option<u32> = None;
+        let mut pre_skip: Option<u64> = None;
+        let mut header_packets = 0u32;
+        let mut start_granule: Option<u64> = None;
+        let mut last_granule: Option<u64> = None;
+
+        while bytes.len() - cursor >= PAGE_HEADER_LEN {
+            let header = bytes.get(cursor..cursor + PAGE_HEADER_LEN)?;
+            if &header[..4] != b"OggS" {
+                return None;
+            }
+            let header_type = header[5];
+            let granule = u64::from_le_bytes(header[6..14].try_into().ok()?);
+            let page_serial = u32::from_le_bytes(header[14..18].try_into().ok()?);
+            let segments = usize::from(header[26]);
+            // The segment table follows the fixed header; its bytes sum to the
+            // page body length.
+            let table_start = cursor.checked_add(PAGE_HEADER_LEN)?;
+            let body_start = table_start.checked_add(segments)?;
+            let table = bytes.get(table_start..body_start)?;
+            let body_len = table.iter().map(|&n| usize::from(n)).sum::<usize>();
+            let body_end = body_start.checked_add(body_len)?;
+            let body = bytes.get(body_start..body_end)?;
+
+            match serial {
+                None => {
+                    // The identification header opens the stream and holds its
+                    // page alone.
+                    if header[4] != 0
+                        || header_type & BOS == 0
+                        || body.len() < OPUS_HEAD_LEN
+                        || &body[..8] != b"OpusHead"
+                        || completed_packets(table) != 1
+                    {
+                        return None;
+                    }
+                    serial = Some(page_serial);
+                    pre_skip = Some(u64::from(u16::from_le_bytes([body[10], body[11]])));
+                }
+                // Another logical stream, concatenated after this one or
+                // interleaved with it. A reused serial still starts a new
+                // stream when the page is marked beginning-of-stream.
+                Some(open) if open != page_serial || header_type & BOS != 0 => return None,
+                Some(_) => {}
+            }
+
+            if header_packets < HEADER_PACKETS {
+                header_packets = header_packets.saturating_add(completed_packets(table));
+                if header_packets > HEADER_PACKETS {
+                    // Audio riding on the page that finishes `OpusTags`. The
+                    // first audio packet opens a page of its own, so there is
+                    // no page whose granule the origin can be derived from.
+                    return None;
+                }
+            } else if start_granule.is_none() {
+                // The first audio page fixes the origin the rest is measured
+                // from, so it has to be whole and timed.
+                if header_type & CONTINUED != 0 || granule == u64::MAX {
+                    return None;
+                }
+                let samples = completed_packet_samples(table, body)?;
+                start_granule = Some(match granule.checked_sub(samples) {
+                    Some(origin) => origin,
+                    // A granule below the samples completing on the page trims
+                    // the tail, which only a page ending the stream may do. The
+                    // timeline then starts at zero rather than being derivable
+                    // by working backwards.
+                    None if header_type & EOS != 0 => 0,
+                    None => return None,
+                });
+            }
+
+            // `u64::MAX` is the "granule not known for this page" marker.
+            if granule != u64::MAX {
+                last_granule = Some(granule);
+            }
+            // Always forward progress: `body_end` is at least one header past
+            // `cursor`, even for a page with no segments.
+            cursor = body_end;
+        }
+        if cursor != bytes.len() {
+            // Trailing bytes that are not a page: the buffer is truncated or
+            // is not what it claims to be.
+            return None;
+        }
+
+        let samples = last_granule?
+            .checked_sub(start_granule?)?
+            .checked_sub(pre_skip?)?;
+        Some(Duration::new(
+            samples / GRANULE_HZ,
+            // Exact, and cannot overflow: the remainder is below 48_000.
+            ((samples % GRANULE_HZ) * 1_000_000_000 / GRANULE_HZ) as u32,
+        ))
+    }
+
+    /// How many packets finish on a page, from its segment table.
+    ///
+    /// A lacing value below 255 ends a packet; a run of 255s carries one onto
+    /// the following page.
+    fn completed_packets(table: &[u8]) -> u32 {
+        u32::try_from(table.iter().filter(|&&lacing| lacing < 255).count()).unwrap_or(u32::MAX)
+    }
+
+    /// Samples carried by the packets that finish on one page.
+    ///
+    /// A trailing run of 255s belongs to a packet continuing onto the next page
+    /// and contributes nothing here, which is what makes this a count of the
+    /// audio the page's granule position accounts for.
+    fn completed_packet_samples(table: &[u8], body: &[u8]) -> Option<u64> {
+        let mut total = 0u64;
+        let mut offset = 0usize;
+        let mut packet_len = 0usize;
+        for &lacing in table {
+            packet_len = packet_len.checked_add(usize::from(lacing))?;
+            if lacing < 255 {
+                let end = offset.checked_add(packet_len)?;
+                total = total.checked_add(opus_packet_samples(body.get(offset..end)?)?)?;
+                offset = end;
+                packet_len = 0;
+            }
+        }
+        Some(total)
+    }
+
+    /// Samples in one Opus packet, on the 48 kHz granule clock.
+    ///
+    /// The first byte is the table of contents (RFC 6716 section 3.1): its top
+    /// five bits select the frame length and its bottom two how many frames the
+    /// packet holds. Length needs nothing further -- the encoded audio itself is
+    /// never touched.
+    fn opus_packet_samples(packet: &[u8]) -> Option<u64> {
+        /// Frame length per table-of-contents configuration, in samples at
+        /// 48 kHz: SILK narrow, medium and wideband run 10/20/40/60 ms, hybrid
+        /// super-wideband and fullband 10/20 ms, and CELT 2.5/5/10/20 ms per
+        /// band. Expressed in samples so the 2.5 ms case stays a whole number.
+        const FRAME_SAMPLES: [u64; 32] = [
+            480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960,
+            120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+        ];
+        /// A packet holds at most 120 ms of audio.
+        const MAX_PACKET_SAMPLES: u64 = 5_760;
+
+        let toc = *packet.first()?;
+        let frame = *FRAME_SAMPLES.get(usize::from(toc >> 3))?;
+        let frames = match toc & 0x03 {
+            0 => 1,
+            1 | 2 => 2,
+            // An arbitrary frame count, in the six low bits of the next byte.
+            _ => u64::from(*packet.get(1)? & 0x3F),
+        };
+        let samples = frame.checked_mul(frames)?;
+        (samples > 0 && samples <= MAX_PACKET_SAMPLES).then_some(samples)
+    }
+
+    /// `opus_duration` in whole milliseconds, the unit both `m.audio`'s `info`
+    /// and `org.matrix.msc1767.audio` use.
+    pub(super) fn opus_duration_ms(bytes: &[u8]) -> Option<u64> {
+        opus_duration(bytes).map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     }
 
     /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
@@ -3996,18 +4221,51 @@ mod outbound {
                 );
                 anyhow::Error::msg(format!("media upload failed: {e}"))
             })?;
+        let event = voice_event_content(
+            &att.file_name,
+            &att.data,
+            mime,
+            mxc.content_uri.as_ref(),
+            thread_anchor,
+        );
+        let resp = room.send_raw("m.room.message", event).await?;
+        Ok(resp.response.event_id)
+    }
+
+    /// The `m.room.message` content of an outbound voice note.
+    ///
+    /// Without a duration the voice bubble renders as `00:00` with no seek bar,
+    /// so the length is read out of the Ogg container the attachment already
+    /// carries. Only a measured length is asserted: `info.duration` is omitted
+    /// when the bytes cannot be read, while `org.matrix.msc1767.audio` keeps the
+    /// zero it has always carried so the block stays well formed. The waveform
+    /// stays empty -- it is optional in MSC1767 and would need decoded PCM.
+    pub(super) fn voice_event_content(
+        file_name: &str,
+        data: &[u8],
+        mime: &mime_guess::Mime,
+        mxc_uri: &str,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> serde_json::Value {
+        let duration_ms = opus_duration_ms(data);
+        let mut info = json!({
+            "mimetype": mime.essence_str(),
+            "size": data.len(),
+        });
+        if let Some(ms) = duration_ms
+            && let Some(obj) = info.as_object_mut()
+        {
+            obj.insert("duration".to_string(), json!(ms));
+        }
         let mut event = json!({
             "msgtype": "m.audio",
-            "body": att.file_name,
-            "filename": att.file_name,
-            "url": mxc.content_uri.to_string(),
-            "info": {
-                "mimetype": mime.essence_str(),
-                "size": att.data.len(),
-            },
+            "body": file_name,
+            "filename": file_name,
+            "url": mxc_uri,
+            "info": info,
             "org.matrix.msc3245.voice": {},
             "org.matrix.msc1767.audio": {
-                "duration": 0u32,
+                "duration": duration_ms.unwrap_or(0),
                 "waveform": Vec::<u32>::new(),
             },
         });
@@ -4024,8 +4282,7 @@ mod outbound {
                 }),
             );
         }
-        let resp = room.send_raw("m.room.message", event).await?;
-        Ok(resp.response.event_id)
+        event
     }
 
     fn derive_file_name(target: &str) -> String {
@@ -10343,6 +10600,662 @@ mod tests {
             assert_eq!(
                 info_size(info),
                 UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
+        }
+    }
+
+    /// A voice note has to carry its own length or clients render it as a
+    /// `00:00` bubble with no seek bar. ZeroClaw reads that length out of the
+    /// Ogg container rather than decoding the audio, so these cover the parse
+    /// itself, the layouts it refuses to guess at, and the event the send path
+    /// actually puts on the wire.
+    mod outbound_voice_duration {
+        use std::time::Duration;
+
+        use matrix_sdk::attachment::AttachmentInfo;
+        use matrix_sdk::ruma::{event_id, mxc_uri, room_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use zeroclaw_api::media::MediaAttachment;
+
+        use super::super::outbound::{
+            AttachmentKind, attachment_config_for, opus_duration, opus_duration_ms,
+            upload_attachment, voice_event_content,
+        };
+
+        /// One second of tone encoded by `opusenc`, so the parser is measured
+        /// against a real encoder rather than against our own idea of the
+        /// format. `opusinfo` reports its playback length as `0m:01.000s`, and
+        /// its `OpusTags` carry only encoder strings.
+        const VOICE_NOTE: &[u8] = include_bytes!("testdata/voice_note.ogg");
+        /// The fixture's length, on the 48 kHz granule clock.
+        const VOICE_NOTE_SAMPLES: u64 = 48_000;
+
+        // ---- helpers over real encoded bytes ------------------------------
+
+        /// Ogg's page checksum: polynomial `0x04c1_1db7`, no reflection, zero
+        /// initial value, no final inversion.
+        fn ogg_crc(page: &[u8]) -> u32 {
+            let mut crc = 0u32;
+            for &byte in page {
+                crc ^= u32::from(byte) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 == 0 {
+                        crc << 1
+                    } else {
+                        (crc << 1) ^ 0x04c1_1db7
+                    };
+                }
+            }
+            crc
+        }
+
+        /// Split a stream into its pages, as `(offset, end)` pairs.
+        fn page_bounds(bytes: &[u8]) -> Vec<(usize, usize)> {
+            let mut bounds = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < bytes.len() {
+                let segments = usize::from(bytes[cursor + 26]);
+                let body_start = cursor + 27 + segments;
+                let body_len: usize = bytes[cursor + 27..body_start]
+                    .iter()
+                    .map(|&n| usize::from(n))
+                    .sum();
+                let end = body_start + body_len;
+                bounds.push((cursor, end));
+                cursor = end;
+            }
+            bounds
+        }
+
+        /// Rebuild every page with a new serial and/or a shifted granule,
+        /// restoring each checksum so the result is a file a decoder would
+        /// accept, not merely one this parser happens to walk.
+        fn rewrite_pages(bytes: &[u8], serial: Option<u32>, granule_offset: u64) -> Vec<u8> {
+            let mut out = Vec::with_capacity(bytes.len());
+            for (start, end) in page_bounds(bytes) {
+                let mut page = bytes[start..end].to_vec();
+                let granule =
+                    u64::from_le_bytes(page[6..14].try_into().expect("eight granule bytes"));
+                if granule != u64::MAX {
+                    page[6..14].copy_from_slice(&(granule + granule_offset).to_le_bytes());
+                }
+                if let Some(serial) = serial {
+                    page[14..18].copy_from_slice(&serial.to_le_bytes());
+                }
+                page[22..26].copy_from_slice(&0u32.to_le_bytes());
+                let crc = ogg_crc(&page);
+                page[22..26].copy_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&page);
+            }
+            out
+        }
+
+        /// Whether every page in a stream carries the checksum of its contents.
+        fn checksums_hold(bytes: &[u8]) -> bool {
+            page_bounds(bytes).into_iter().all(|(start, end)| {
+                let mut page = bytes[start..end].to_vec();
+                let stored =
+                    u32::from_le_bytes(page[22..26].try_into().expect("four checksum bytes"));
+                page[22..26].copy_from_slice(&0u32.to_le_bytes());
+                ogg_crc(&page) == stored
+            })
+        }
+
+        /// Rebuild a stream with all of its audio on one page, keeping the
+        /// final granule and recomputing the checksum.
+        ///
+        /// This is the layout `opusenc` emits for any clip shorter than about a
+        /// second: a single audio page that also ends the stream, whose granule
+        /// trims the tail of the last packet and so sits *below* the samples
+        /// completing on it. `header_type` lets a test build the same page
+        /// without the end-of-stream flag, which is the invalid form.
+        fn repaged_onto_one_audio_page(bytes: &[u8], header_type: u8, granule: u64) -> Vec<u8> {
+            let bounds = page_bounds(bytes);
+            let (headers, audio) = bounds.split_at(2);
+            let mut out: Vec<u8> = headers
+                .iter()
+                .flat_map(|&(start, end)| bytes[start..end].to_vec())
+                .collect();
+
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for &(start, end) in audio {
+                let page = &bytes[start..end];
+                assert_eq!(
+                    page[5] & 0x01,
+                    0,
+                    "a packet spanning pages cannot be merged naively"
+                );
+                let segments = usize::from(page[26]);
+                table.extend_from_slice(&page[27..27 + segments]);
+                body.extend_from_slice(&page[27 + segments..]);
+            }
+            assert!(table.len() <= 255, "one page holds at most 255 segments");
+
+            let first = &bytes[audio[0].0..audio[0].1];
+            let mut page = Vec::from(*b"OggS");
+            page.push(0);
+            page.push(header_type);
+            page.extend_from_slice(&granule.to_le_bytes());
+            page.extend_from_slice(&first[14..22]); // serial and sequence
+            page.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            page.push(u8::try_from(table.len()).expect("segment count below 256"));
+            page.extend_from_slice(&table);
+            page.extend_from_slice(&body);
+            let crc = ogg_crc(&page);
+            page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+            out.extend_from_slice(&page);
+            out
+        }
+
+        // ---- helpers building streams byte by byte ------------------------
+        //
+        // These carry zero checksums. The parser does not read them, and these
+        // fixtures exist to pin down which byte makes a stream unreadable.
+
+        /// Header-type bit for a page opening mid-packet.
+        const CONTINUED: u8 = 0x01;
+        /// Header-type bit for a page beginning a logical stream.
+        const BOS: u8 = 0x02;
+        /// Header-type bit for a page ending a logical stream.
+        const EOS: u8 = 0x04;
+        const PRE_SKIP: u16 = 312;
+        const SERIAL: u32 = 0x5a43_0001;
+        /// Table of contents for 20 ms of SILK wideband, one frame per packet.
+        const AUDIO_TOC: u8 = 0x08;
+        /// Samples one `AUDIO_TOC` packet decodes to at 48 kHz.
+        const PACKET_SAMPLES: u64 = 960;
+
+        /// `OpusHead` identification packet. Only the magic and `pre_skip`
+        /// matter to the parser; the rest is spec-shaped filler.
+        fn opus_head(pre_skip: u16) -> Vec<u8> {
+            let mut head = Vec::from(*b"OpusHead");
+            head.push(1); // version
+            head.push(1); // channel count
+            head.extend_from_slice(&pre_skip.to_le_bytes());
+            head.extend_from_slice(&48_000u32.to_le_bytes()); // input sample rate
+            head.extend_from_slice(&0u16.to_le_bytes()); // output gain
+            head.push(0); // channel mapping family
+            head
+        }
+
+        /// `OpusTags` comment packet with an empty vendor string and no
+        /// comments.
+        fn opus_tags() -> Vec<u8> {
+            let mut tags = Vec::from(*b"OpusTags");
+            tags.extend_from_slice(&0u32.to_le_bytes()); // vendor string length
+            tags.extend_from_slice(&0u32.to_le_bytes()); // user comment count
+            tags
+        }
+
+        /// An audio packet worth `PACKET_SAMPLES`.
+        fn audio_packet() -> Vec<u8> {
+            vec![AUDIO_TOC, 0x00, 0x00, 0x00]
+        }
+
+        /// One Ogg page with a segment table that really describes `packets`.
+        fn page(granule: u64, header_type: u8, packets: &[Vec<u8>]) -> Vec<u8> {
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for packet in packets {
+                let mut remaining = packet.len();
+                while remaining >= 255 {
+                    table.push(255u8);
+                    remaining -= 255;
+                }
+                table.push(u8::try_from(remaining).expect("lacing value below 255"));
+                body.extend_from_slice(packet);
+            }
+            raw_page(granule, header_type, SERIAL, &table, &body)
+        }
+
+        /// A page with an arbitrary segment table, so tests can claim a body
+        /// length the buffer does not actually hold.
+        fn raw_page(
+            granule: u64,
+            header_type: u8,
+            serial: u32,
+            table: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut out = Vec::from(*b"OggS");
+            out.push(0); // stream structure version
+            out.push(header_type);
+            out.extend_from_slice(&granule.to_le_bytes());
+            out.extend_from_slice(&serial.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // page sequence
+            out.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            out.push(u8::try_from(table.len()).expect("segment count below 256"));
+            out.extend_from_slice(table);
+            out.extend_from_slice(body);
+            out
+        }
+
+        /// The two header pages every Opus stream opens with.
+        fn header_pages() -> Vec<u8> {
+            let mut bytes = page(0, BOS, &[opus_head(PRE_SKIP)]);
+            bytes.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            bytes
+        }
+
+        /// A spec-shaped stream running `samples` of audio: `OpusHead` alone on
+        /// a beginning-of-stream page, then `OpusTags`, then audio. The final
+        /// page's granule trims the tail of its packet, which is how an encoder
+        /// expresses a length that does not land on a packet boundary.
+        fn stream(samples: u64) -> Vec<u8> {
+            let final_granule = samples + u64::from(PRE_SKIP);
+            let whole_packets = final_granule / PACKET_SAMPLES;
+            let packets: Vec<Vec<u8>> = (0..whole_packets).map(|_| audio_packet()).collect();
+
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(whole_packets * PACKET_SAMPLES, 0, &packets));
+            bytes.extend_from_slice(&page(final_granule, EOS, &[audio_packet()]));
+            bytes
+        }
+
+        // ---- the parse ----------------------------------------------------
+
+        #[test]
+        fn a_real_encoded_stream_measures_its_playback_length() {
+            assert!(
+                checksums_hold(VOICE_NOTE),
+                "the fixture must be a checksum-valid Ogg stream"
+            );
+            assert_eq!(opus_duration(VOICE_NOTE), Some(Duration::from_secs(1)));
+            assert_eq!(opus_duration_ms(VOICE_NOTE), Some(1_000));
+        }
+
+        #[test]
+        fn elapsed_time_is_measured_from_the_clip_start_not_the_timeline_origin() {
+            // A clip cropped out of a longer recording keeps the granule
+            // positions of its source, so the final granule is a timestamp
+            // rather than a sample count. One minute of origin must not become
+            // one minute of playback.
+            let origin = 60 * 48_000;
+            let cropped = rewrite_pages(VOICE_NOTE, None, origin);
+
+            assert!(
+                checksums_hold(&cropped),
+                "the shifted stream must stay checksum-valid"
+            );
+            assert_eq!(opus_duration(&cropped), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&cropped), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn a_lone_end_of_stream_audio_page_may_trim_below_its_packet_samples() {
+            // `opusenc` emits this for any clip under about a second: one audio
+            // page that also ends the stream, whose granule sits below the
+            // samples completing on it because the tail is trimmed. The origin
+            // is zero rather than something to derive by working backwards.
+            let trimmed = repaged_onto_one_audio_page(VOICE_NOTE, 0x04, 48_312);
+
+            assert!(checksums_hold(&trimmed), "the repaged stream stays valid");
+            assert_eq!(opus_duration(&trimmed), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&trimmed), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn chained_streams_with_distinct_serials_report_no_duration() {
+            // Concatenated logical streams each restart their own granule
+            // timeline, so no single duration describes the result.
+            let mut chained = VOICE_NOTE.to_vec();
+            chained.extend_from_slice(&rewrite_pages(VOICE_NOTE, Some(0x0bad_f00d), 0));
+
+            assert!(checksums_hold(&chained));
+            assert_eq!(opus_duration(&chained), None);
+        }
+
+        /// Kept apart from the distinct-serial case on purpose: with both in
+        /// one test the serial check answers first and this guard is never
+        /// the assertion that fires.
+        #[test]
+        fn a_chain_reusing_the_serial_is_still_a_chain() {
+            let mut chained = VOICE_NOTE.to_vec();
+            chained.extend_from_slice(VOICE_NOTE);
+
+            // Every page carries the opening stream's serial, so only the
+            // second stream's beginning-of-stream page marks the boundary.
+            assert!(checksums_hold(&chained));
+            assert_eq!(opus_duration(&chained), None);
+        }
+
+        #[test]
+        fn duration_spans_the_granule_positions_less_the_priming_samples() {
+            assert_eq!(
+                opus_duration(&stream(144_000)),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                opus_duration(&stream(72_000)),
+                Some(Duration::from_millis(1_500))
+            );
+            assert_eq!(opus_duration(&stream(720)), Some(Duration::from_millis(15)));
+        }
+
+        #[test]
+        fn a_length_between_milliseconds_lands_exactly() {
+            // A lone audio page holds 960 samples, 312 of which are priming:
+            // 648 samples, or 13.5 ms.
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_micros(13_500)));
+        }
+
+        #[test]
+        fn milliseconds_are_what_the_event_carries() {
+            assert_eq!(opus_duration_ms(&stream(144_000)), Some(3_000));
+            assert_eq!(
+                opus_duration_ms(b"not an opus stream at all, honestly"),
+                None
+            );
+        }
+
+        #[test]
+        fn last_page_granule_wins() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(96_312, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(240_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn unknown_granule_pages_are_skipped_but_still_advance() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            // `u64::MAX` means "no granule for this page", not "zero length".
+            bytes.extend_from_slice(&page(u64::MAX, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn empty_body_page_does_not_stall_the_walk() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(u64::MAX, 0, &[]));
+            bytes.extend_from_slice(&raw_page(u64::MAX, 0, SERIAL, &[], b""));
+            bytes.extend_from_slice(&page(96_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(2)));
+        }
+
+        #[test]
+        fn unreadable_streams_report_no_duration_instead_of_guessing() {
+            let valid = stream(144_000);
+
+            let mut short_header = Vec::from(*b"OggS");
+            short_header.extend_from_slice(&[0u8; 8]);
+
+            let mut table_overruns = header_pages();
+            table_overruns.extend_from_slice(&raw_page(48_312, 0, SERIAL, &[255], b"five!"));
+
+            let mut below_pre_skip = header_pages();
+            below_pre_skip.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            below_pre_skip.extend_from_slice(&page(
+                u64::from(PRE_SKIP) - 1,
+                EOS,
+                &[audio_packet()],
+            ));
+
+            let mut head_too_short = page(0, BOS, &[opus_head(PRE_SKIP)[..9].to_vec()]);
+            head_too_short.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            head_too_short.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut opens_mid_packet = header_pages();
+            opens_mid_packet.extend_from_slice(&page(48_312, CONTINUED, &[audio_packet()]));
+
+            let mut first_audio_granule_unknown = header_pages();
+            first_audio_granule_unknown.extend_from_slice(&page(u64::MAX, 0, &[audio_packet()]));
+            first_audio_granule_unknown.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut zero_frame_count = header_pages();
+            // Table-of-contents code 3 reads its frame count from the next
+            // byte, and a packet of no frames has no length.
+            zero_frame_count.extend_from_slice(&page(48_312, EOS, &[vec![AUDIO_TOC | 0x03, 0x00]]));
+
+            let mut packet_too_long = header_pages();
+            // 60 ms frames, 48 of them: four times what a packet may hold.
+            packet_too_long.extend_from_slice(&page(48_312, EOS, &[vec![0x1b, 48]]));
+
+            let mut audio_shares_the_tags_page = page(0, BOS, &[opus_head(PRE_SKIP)]);
+            audio_shares_the_tags_page.extend_from_slice(&page(
+                48_312,
+                EOS,
+                &[opus_tags(), audio_packet()],
+            ));
+
+            // The same trimmed page without the end-of-stream flag: a granule
+            // below the page's samples is only legal on a page ending the
+            // stream.
+            let trims_without_ending_the_stream =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0, 48_312);
+            // Ending the stream does not license a granule below `pre_skip`:
+            // that would skip more samples than the stream contains.
+            let trimmed_below_pre_skip =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0x04, u64::from(PRE_SKIP) - 1);
+
+            let mut head_shares_its_page = page(0, BOS, &[opus_head(PRE_SKIP), opus_tags()]);
+            head_shares_its_page.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut not_beginning_of_stream = page(0, 0, &[opus_head(PRE_SKIP)]);
+            not_beginning_of_stream.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            not_beginning_of_stream.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let cases: [(&str, Vec<u8>); 20] = [
+                ("empty", Vec::new()),
+                ("garbage", b"not an ogg file, just some plain text".to_vec()),
+                ("header shorter than a page header", short_header),
+                ("truncated mid body", valid[..valid.len() - 3].to_vec()),
+                ("trailing junk after the last page", {
+                    let mut b = valid.clone();
+                    b.extend_from_slice(b"tail");
+                    b
+                }),
+                ("first packet is not OpusHead", {
+                    let mut b = page(0, BOS, &[b"VorbisHead padding bytes".to_vec()]);
+                    b.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+                    b
+                }),
+                ("OpusHead truncated before pre_skip", head_too_short),
+                ("OpusHead sharing its page", head_shares_its_page),
+                (
+                    "audio sharing the OpusTags page",
+                    audio_shares_the_tags_page,
+                ),
+                (
+                    "first page not marked beginning-of-stream",
+                    not_beginning_of_stream,
+                ),
+                ("segment table claims more than exists", table_overruns),
+                ("span shorter than pre_skip", below_pre_skip),
+                (
+                    "granule below the page's samples without ending the stream",
+                    trims_without_ending_the_stream,
+                ),
+                (
+                    "end-of-stream granule below pre_skip",
+                    trimmed_below_pre_skip,
+                ),
+                ("first audio page opens mid-packet", opens_mid_packet),
+                (
+                    "first audio page has no granule",
+                    first_audio_granule_unknown,
+                ),
+                ("packet claiming no frames", zero_frame_count),
+                ("packet claiming more than 120 ms", packet_too_long),
+                (
+                    "every granule unknown",
+                    page(u64::MAX, BOS, &[opus_head(PRE_SKIP)]),
+                ),
+                ("header pages but no audio", header_pages()),
+            ];
+
+            for (label, bytes) in cases {
+                assert_eq!(
+                    opus_duration(&bytes),
+                    None,
+                    "{label} must not yield a duration"
+                );
+            }
+        }
+
+        // ---- the event that ships -----------------------------------------
+
+        fn voice_attachment(data: Vec<u8>) -> MediaAttachment {
+            MediaAttachment {
+                file_name: "voice.ogg".to_string(),
+                data,
+                mime_type: Some("audio/ogg".to_string()),
+                marker: None,
+            }
+        }
+
+        fn info_duration(info: AttachmentInfo) -> Option<Duration> {
+            match info {
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.duration,
+                _ => panic!("unexpected attachment info kind {info:?}"),
+            }
+        }
+
+        /// The event `upload_voice` hands to the homeserver, built from the
+        /// same bytes without the network in the way.
+        fn content_for(data: Vec<u8>) -> serde_json::Value {
+            let att = voice_attachment(data);
+            let mime = super::super::outbound::attachment_mime(&att);
+            voice_event_content(
+                &att.file_name,
+                &att.data,
+                &mime,
+                "mxc://localhost/voicenote",
+                None,
+            )
+        }
+
+        #[test]
+        fn both_duration_fields_carry_the_measured_length() {
+            let content = content_for(VOICE_NOTE.to_vec());
+
+            assert_eq!(content["info"]["duration"], serde_json::json!(1_000));
+            assert_eq!(
+                content["org.matrix.msc1767.audio"]["duration"],
+                serde_json::json!(1_000)
+            );
+        }
+
+        #[test]
+        fn an_unmeasurable_stream_asserts_no_length_it_did_not_read() {
+            let content = content_for(b"OggS-fake-opus-payload".to_vec());
+
+            assert!(
+                content["info"].get("duration").is_none(),
+                "an unreadable stream must omit the field rather than claim zero"
+            );
+            // The MSC1767 block keeps the zero it has always carried, so the
+            // block itself stays well formed.
+            assert_eq!(
+                content["org.matrix.msc1767.audio"]["duration"],
+                serde_json::json!(0)
+            );
+        }
+
+        /// The voice arm of `attachment_info_for` is what the SDK send path
+        /// uses once a caller routes voice through it.
+        #[test]
+        fn voice_attachment_info_reports_the_measured_length() {
+            let att = voice_attachment(VOICE_NOTE.to_vec());
+            let mime = super::super::outbound::attachment_mime(&att);
+
+            let config = attachment_config_for(&att, AttachmentKind::Voice, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+
+            assert!(matches!(info, AttachmentInfo::Voice(_)));
+            assert_eq!(info_duration(info), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn unmeasurable_voice_attachment_keeps_the_zero_fallback() {
+            let att = voice_attachment(b"OggS-fake-opus-payload".to_vec());
+            let mime = super::super::outbound::attachment_mime(&att);
+
+            let config = attachment_config_for(&att, AttachmentKind::Voice, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+
+            // Still `Some`: the SDK only emits `org.matrix.msc1767.audio` when
+            // duration and waveform are both present.
+            assert_eq!(info_duration(info), Some(Duration::ZERO));
+        }
+
+        /// Voice attachments leave `upload_attachment` through `upload_voice`
+        /// and its raw JSON, never through `AttachmentConfig`, so the length
+        /// has to be proved on the event that reaches the homeserver.
+        #[tokio::test]
+        async fn the_sent_event_carries_the_measured_length() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+
+            matrix
+                .mock_authenticated_media_config()
+                .ok_default()
+                .mount()
+                .await;
+            matrix
+                .mock_upload()
+                .ok(mxc_uri!("mxc://localhost/voicenote"))
+                .mount()
+                .await;
+            matrix
+                .mock_room_send()
+                .ok(event_id!("$voicenote"))
+                .expect(1)
+                .mount()
+                .await;
+
+            let att = voice_attachment(VOICE_NOTE.to_vec());
+            upload_attachment(&room, &att, AttachmentKind::Voice, None)
+                .await
+                .expect("the voice note is sent");
+
+            let sent = matrix
+                .server()
+                .received_requests()
+                .await
+                .expect("the mock server records requests")
+                .into_iter()
+                .filter(|req| req.url.path().contains("/send/"))
+                .map(|req| req.body_json::<serde_json::Value>().expect("a JSON event"))
+                .next_back()
+                .expect("the voice event reached the homeserver");
+
+            assert_eq!(sent["msgtype"], serde_json::json!("m.audio"));
+            assert!(sent.get("org.matrix.msc3245.voice").is_some());
+            assert_eq!(sent["info"]["duration"], serde_json::json!(1_000));
+            assert_eq!(
+                sent["org.matrix.msc1767.audio"]["duration"],
+                serde_json::json!(1_000)
+            );
+        }
+
+        #[test]
+        fn the_fixture_is_the_length_the_tests_assert() {
+            // Guards the fixture against being replaced by a clip of another
+            // length without the expectations moving with it.
+            assert_eq!(
+                opus_duration(VOICE_NOTE),
+                Some(Duration::new(
+                    VOICE_NOTE_SAMPLES / 48_000,
+                    u32::try_from((VOICE_NOTE_SAMPLES % 48_000) * 1_000_000_000 / 48_000)
+                        .expect("a remainder below one second")
+                ))
             );
         }
     }
