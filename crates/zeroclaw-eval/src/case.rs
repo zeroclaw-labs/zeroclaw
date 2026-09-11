@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
+    /// Optional stable report identity. When set, reports and receipts use this
+    /// instead of `model_name`; readers should go through [`LlmTrace::display_id`].
+    #[serde(default)]
+    pub id: Option<String>,
     /// Conversation turns, replayed in order.
     ///
     /// Must be non-empty. [`LlmTrace::from_file`] rejects a zero-turn fixture,
@@ -22,13 +26,48 @@ pub struct LlmTrace {
     /// Declarative expectations graded against the run.
     #[serde(default)]
     pub expects: TraceExpects,
+    /// Pre-run environment preparation for the case (live mode).
+    #[serde(default)]
+    pub setup: Option<CaseSetup>,
+    /// Tool names this case requests. Live mode only; ignored in replay.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Number of isolated live runs for this case (clamped to 1..=50). In replay
+    /// `repeat > 1` runs once (deterministic). A live case counts as PASSED for
+    /// gating/baselines iff every run passes (pass^k).
+    #[serde(default = "default_repeat")]
+    pub repeat: u32,
+    /// Optional cluster label. Correlated case families sharing a label are
+    /// averaged together before the suite error bar, so resamples of one family do
+    /// not fake precision. Omitting it asserts independence.
+    #[serde(default)]
+    pub cluster: Option<String>,
+}
+
+fn default_repeat() -> u32 {
+    1
+}
+
+/// Pre-run environment preparation for a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseSetup {
+    /// Files written into the case's temp workspace before the run.
+    /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub workspace_files: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
+///
+/// `steps` is optional: replay cases script every LLM round-trip, while live
+/// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceTurn {
     pub user_input: String,
-    pub steps: Vec<TraceStep>,
+    #[serde(default)]
+    pub steps: Option<Vec<TraceStep>>,
 }
 
 /// A single LLM response step within a turn.
@@ -96,23 +135,212 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// Lower bound on the number of tool calls.
+    #[serde(default)]
+    pub min_tool_calls: Option<usize>,
+    /// Exact number of tool calls the run must have made.
+    #[serde(default)]
+    pub exact_tool_calls: Option<usize>,
+    /// Substrings that must appear in arguments dispatched to a tool.
+    #[serde(default)]
+    pub tool_arguments_contain: Vec<ToolPayloadExpect>,
+    /// Substrings that must appear in results returned by a tool.
+    #[serde(default)]
+    pub tool_results_contain: Vec<ToolPayloadExpect>,
+    /// End-state checks against the case workspace after the run.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceExpects>,
+    /// Resource ceilings for the run.
+    #[serde(default)]
+    pub budget: Option<BudgetExpects>,
+    /// JSON-pointer checks against the final response parsed as JSON.
+    #[serde(default)]
+    pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Per-dimension LLM-judge rubrics. Judge grades are diagnostic and must be
+    /// accompanied by at least one deterministic expectation.
+    #[serde(default)]
+    pub judge: Vec<JudgeRubric>,
+}
+
+/// An expectation over one dispatched tool call's argument or result payload.
+///
+/// `call_index` selects one call to the named tool using zero-based dispatch
+/// order. When omitted, any matching call satisfies the expectation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPayloadExpect {
+    pub tool: String,
+    pub needle: String,
+    #[serde(default)]
+    pub call_index: Option<usize>,
+}
+
+fn default_judge_threshold() -> f64 {
+    0.7
+}
+
+/// One judged dimension of a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeRubric {
+    /// Short dimension name, e.g. "helpfulness" — one dimension per entry.
+    pub name: String,
+    /// The rubric for THIS dimension only.
+    pub rubric: String,
+    /// Pass threshold on the judge's 0.0–1.0 score. Uncalibrated default.
+    #[serde(default = "default_judge_threshold")]
+    pub threshold: f64,
+    /// Include a rendered transcript (tool calls + results), not just the final
+    /// response, so state-dependent rubrics can't be gamed by prose.
+    #[serde(default)]
+    pub include_transcript: bool,
+}
+
+/// End-state checks against the case workspace after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceExpects {
+    /// Workspace-relative paths that must exist as a regular file after the run
+    /// (a directory at the path does not satisfy the check).
+    #[serde(default)]
+    pub file_exists: Vec<String>,
+    /// Workspace-relative paths at which nothing (file or directory) may exist
+    /// after the run.
+    #[serde(default)]
+    pub file_absent: Vec<String>,
+    /// Path -> substrings that must appear in that file.
+    #[serde(default)]
+    pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Resource ceilings for the run (all optional; each present bound is one
+/// inclusive check, `actual <= max`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetExpects {
+    /// Max accumulated input tokens reported by the provider.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    /// Max accumulated output tokens reported by the provider.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Max total tokens (input + output).
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Max wall-clock duration of the turns loop, in milliseconds.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+    /// Max number of LLM responses (model round-trips) during the run.
+    #[serde(default)]
+    pub max_llm_calls: Option<u32>,
 }
 
 impl TraceExpects {
     /// True when the fixture declares no effective assertion.
     ///
-    /// `evaluate_expects` produces one grade per declared expectation, and
-    /// `CaseReport::passed()` is vacuously true over zero grades. A case in
-    /// this state exercises the agent but certifies nothing, so a required
-    /// gate must reject it at load time rather than report it green.
+    /// A case in this state exercises the agent but certifies nothing, so a
+    /// required gate must reject it at load time rather than report it green.
     pub fn is_empty(&self) -> bool {
         self.response_contains.is_empty()
             && self.response_not_contains.is_empty()
             && self.tools_used.is_empty()
             && self.tools_not_used.is_empty()
             && self.max_tool_calls.is_none()
+            && self.min_tool_calls.is_none()
+            && self.exact_tool_calls.is_none()
+            && self.tool_arguments_contain.is_empty()
+            && self.tool_results_contain.is_empty()
             && self.all_tools_succeeded.is_none()
             && self.response_matches.is_empty()
+            && self.response_json.is_empty()
+            && self
+                .workspace
+                .as_ref()
+                .is_none_or(WorkspaceExpects::is_empty)
+            && self.budget.as_ref().is_none_or(BudgetExpects::is_empty)
+    }
+
+    /// Reject nested expectation declarations that would produce no useful grade.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (family, entries) in [
+            ("tool_arguments_contain", &self.tool_arguments_contain),
+            ("tool_results_contain", &self.tool_results_contain),
+        ] {
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.tool.trim().is_empty() {
+                    anyhow::bail!("expects.{family}[{index}].tool must not be empty");
+                }
+                if entry.needle.is_empty() {
+                    anyhow::bail!("expects.{family}[{index}].needle must not be empty");
+                }
+            }
+        }
+        if self.min_tool_calls == Some(0) {
+            anyhow::bail!("expects.min_tool_calls must be at least 1");
+        }
+        if let (Some(minimum), Some(maximum)) = (self.min_tool_calls, self.max_tool_calls)
+            && minimum > maximum
+        {
+            anyhow::bail!("expects.min_tool_calls ({minimum}) exceeds max_tool_calls ({maximum})");
+        }
+        if let Some(exact) = self.exact_tool_calls {
+            if let Some(minimum) = self.min_tool_calls
+                && exact < minimum
+            {
+                anyhow::bail!(
+                    "expects.exact_tool_calls ({exact}) is below min_tool_calls ({minimum})"
+                );
+            }
+            if let Some(maximum) = self.max_tool_calls
+                && exact > maximum
+            {
+                anyhow::bail!(
+                    "expects.exact_tool_calls ({exact}) exceeds max_tool_calls ({maximum})"
+                );
+            }
+        }
+        if let Some(workspace) = &self.workspace {
+            if workspace.is_empty() {
+                anyhow::bail!(
+                    "expects.workspace is present but declares no checks; \
+                     remove the block or add file_exists / file_absent / file_contains entries"
+                );
+            }
+            for (rel, needles) in &workspace.file_contains {
+                if needles.is_empty() {
+                    anyhow::bail!(
+                        "expects.workspace.file_contains[{rel:?}] is an empty list; \
+                         remove the entry or add at least one needle"
+                    );
+                }
+                if needles.iter().any(String::is_empty) {
+                    anyhow::bail!(
+                        "expects.workspace.file_contains[{rel:?}] contains an empty needle, \
+                         which every file trivially satisfies"
+                    );
+                }
+            }
+        }
+        if self.budget.as_ref().is_some_and(BudgetExpects::is_empty) {
+            anyhow::bail!(
+                "expects.budget is present but declares no bounds; \
+                 remove the block or set at least one max_* field"
+            );
+        }
+        for (index, judge) in self.judge.iter().enumerate() {
+            if judge.name.trim().is_empty() {
+                anyhow::bail!("expects.judge[{index}].name must not be empty");
+            }
+            if judge.rubric.trim().is_empty() {
+                anyhow::bail!("expects.judge[{index}].rubric must not be empty");
+            }
+            if !judge.threshold.is_finite() || !(0.0..=1.0).contains(&judge.threshold) {
+                anyhow::bail!(
+                    "expects.judge[{index}].threshold must be a finite number between 0.0 and 1.0"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The name of the first string-backed family holding a zero-length entry.
@@ -139,8 +367,34 @@ impl TraceExpects {
     }
 }
 
+impl WorkspaceExpects {
+    fn is_empty(&self) -> bool {
+        self.file_exists.is_empty() && self.file_absent.is_empty() && self.file_contains.is_empty()
+    }
+}
+
+impl BudgetExpects {
+    fn is_empty(&self) -> bool {
+        self.max_input_tokens.is_none()
+            && self.max_output_tokens.is_none()
+            && self.max_total_tokens.is_none()
+            && self.max_duration_ms.is_none()
+            && self.max_llm_calls.is_none()
+    }
+}
+
 impl LlmTrace {
+    /// The identity used in reports and receipts: the explicit `id` when set,
+    /// otherwise `model_name`.
+    pub fn display_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
     /// Load a trace from a JSON file.
+    ///
+    /// Fixture validation is part of loading: unknown keys are rejected by
+    /// `deny_unknown_fields`, and [`TraceExpects::validate`] rejects declarations
+    /// that would grade green without asserting anything.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
@@ -159,6 +413,18 @@ impl LlmTrace {
                  nothing and cannot certify the required regression gate",
                 path.display(),
                 family
+            );
+        }
+        trace
+            .expects
+            .validate()
+            .with_context(|| format!("validating trace fixture {}", path.display()))?;
+        if trace.display_id().is_empty() {
+            anyhow::bail!(
+                "trace fixture {} declares an empty case identity; report rows, receipt \
+                 provenance, and the baseline `case_id` key all join on that identity, and a \
+                 blank one cannot be told apart from another case's",
+                path.display()
             );
         }
         if trace.turns.is_empty() {
@@ -198,6 +464,38 @@ fn collect_fixture_paths(
     Ok(paths)
 }
 
+/// SHA-256 hex of the case's canonical JSON, used as the receipt's comparability
+/// key. `serde_json` emits object keys in sorted (BTreeMap) order because nothing
+/// in this workspace enables `preserve_order`, so the hash is stable across
+/// re-serialization (guarded by `canonical_json_is_key_sorted`).
+pub fn case_hash(trace: &LlmTrace) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(&serde_json::to_value(trace)?)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
+/// and free of any `..` component. Used before writing setup files or grading
+/// workspace paths, so a case cannot read or write outside its sandbox.
+pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("workspace path must not be empty");
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("workspace path {path:?} must not contain a `..` component");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("workspace path {path:?} must be relative, not absolute");
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
@@ -206,8 +504,20 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let paths = collect_fixture_paths(read.map(|entry| entry.map(|e| e.path())), dir)?;
 
     let mut out = Vec::with_capacity(paths.len());
+    let mut identities = std::collections::BTreeMap::new();
     for path in paths {
         let trace = LlmTrace::from_file(&path)?;
+        let identity = trace.display_id().to_string();
+        if let Some(first_path) = identities.insert(identity.clone(), path.clone()) {
+            anyhow::bail!(
+                "eval suite {} declares duplicate case identity {:?} in {} and {}; \
+                 reports, receipts, and baseline joins require unique identities",
+                dir.display(),
+                identity,
+                first_path.display(),
+                path.display()
+            );
+        }
         out.push((path, trace));
     }
     Ok(out)
@@ -368,6 +678,10 @@ mod tests {
             r#"{"max_tool_calls":0}"#,
             r#"{"all_tools_succeeded":false}"#,
             r#"{"response_matches":["^a"]}"#,
+            r#"{"min_tool_calls":1}"#,
+            r#"{"exact_tool_calls":0}"#,
+            r#"{"tool_arguments_contain":[{"tool":"echo","needle":"alpha"}]}"#,
+            r#"{"tool_results_contain":[{"tool":"echo","needle":"alpha"}]}"#,
         ];
         for raw in cases {
             let expects: TraceExpects = serde_json::from_str(raw).unwrap();
@@ -417,6 +731,89 @@ mod tests {
                 "error must name the offending family {family}, got: {rendered}"
             );
             let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn from_file_rejects_empty_dispatch_payload_fields() {
+        // The dispatch-boundary families are nested, so `empty_entry_family`
+        // cannot see them. An empty `tool` matches no dispatched call and an
+        // empty `needle` is contained by every payload, so either one turns the
+        // expectation into a no-op that still reports a grade.
+        let cases = [
+            (
+                "tool_arguments_contain[0].tool",
+                r#"{"tool_arguments_contain":[{"tool":"","needle":"alpha"}]}"#,
+            ),
+            (
+                "tool_arguments_contain[0].needle",
+                r#"{"tool_arguments_contain":[{"tool":"echo","needle":""}]}"#,
+            ),
+            (
+                "tool_results_contain[0].tool",
+                r#"{"tool_results_contain":[{"tool":"","needle":"alpha"}]}"#,
+            ),
+            (
+                "tool_results_contain[0].needle",
+                r#"{"tool_results_contain":[{"tool":"echo","needle":""}]}"#,
+            ),
+        ];
+
+        for (field, expects) in cases {
+            let name = format!("empty_payload_{}", field.replace(['.', '[', ']'], "_"));
+            let err = load_fixture(
+                &name,
+                &format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .expect_err("an empty tool or needle must not load into a required gate");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(field),
+                "error must name the offending field {field}, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_file_rejects_unknown_dispatch_expectation_fields() {
+        // The nested payload expectation denies unknown keys for the same
+        // reason the outer blocks do: a misspelled `needle` would otherwise
+        // drop the substring and leave a check that asserts nothing.
+        let err = load_fixture(
+            "payload_typo",
+            r#"{"model_name":"demo","turns":[],"expects":{"tool_arguments_contain":[{"tool":"echo","nedle":"alpha"}]}}"#,
+        )
+        .expect_err("a typo in a nested expectation must fail loudly");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("nedle"),
+            "error must name the offending nested key, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_file_rejects_vacuous_or_contradictory_tool_call_bounds() {
+        // `min_tool_calls: 0` holds for every run, and a min/max/exact triple
+        // that contradicts itself can never pass. Both shapes are refused at
+        // load rather than graded.
+        let cases = [
+            ("min_tool_calls", r#"{"min_tool_calls":0}"#),
+            ("exceeds", r#"{"min_tool_calls":2,"max_tool_calls":1}"#),
+            ("below", r#"{"min_tool_calls":2,"exact_tool_calls":1}"#),
+            ("exceeds", r#"{"max_tool_calls":1,"exact_tool_calls":2}"#),
+        ];
+
+        for (index, (reason, expects)) in cases.into_iter().enumerate() {
+            let err = load_fixture(
+                &format!("invalid_bounds_{index}"),
+                &format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .expect_err("invalid tool-call bounds must not load into a required gate");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains(reason),
+                "error must explain the {reason} rejection, got: {rendered}"
+            );
         }
     }
 
@@ -472,6 +869,114 @@ mod tests {
     }
 
     #[test]
+    fn from_file_rejects_judge_only_fixture() {
+        let err = load_fixture(
+            "judge_only",
+            r#"{"model_name":"demo","turns":[],"expects":{"judge":[{"name":"quality","rubric":"be correct"}]}}"#,
+        )
+        .expect_err("a diagnostic judge cannot be the fixture's only expectation");
+        assert!(format!("{err:#}").contains("no effective expectation"));
+    }
+
+    #[test]
+    fn judge_rubric_rejects_unknown_fields() {
+        let err = serde_json::from_str::<TraceExpects>(
+            r#"{"max_tool_calls":0,"judge":[{"name":"quality","rubric":"be correct","threshhold":0.9}]}"#,
+        )
+        .expect_err("a misspelled judge key must not be ignored");
+        assert!(err.to_string().contains("threshhold"));
+    }
+
+    #[test]
+    fn judge_rubric_validation_rejects_invalid_content_and_thresholds() {
+        for (name, rubric, threshold) in [
+            (" ", "be correct", 0.7),
+            ("quality", "\t", 0.7),
+            ("quality", "be correct", -0.1),
+            ("quality", "be correct", 1.1),
+            ("quality", "be correct", f64::NAN),
+        ] {
+            let expects = TraceExpects {
+                max_tool_calls: Some(0),
+                judge: vec![JudgeRubric {
+                    name: name.to_string(),
+                    rubric: rubric.to_string(),
+                    threshold,
+                    include_transcript: false,
+                }],
+                ..TraceExpects::default()
+            };
+            assert!(expects.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn display_id_prefers_id_then_falls_back_to_model_name() {
+        let with_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","id":"case-7","turns":[]}"#).unwrap();
+        assert_eq!(with_id.display_id(), "case-7");
+        let without_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(without_id.display_id(), "m");
+    }
+
+    #[test]
+    fn turn_steps_default_to_none_when_omitted() {
+        let t: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn canonical_json_is_key_sorted() {
+        // Guard: if anyone enables serde_json's `preserve_order`, this fails,
+        // alerting that case_hash would stop being canonical.
+        let v = serde_json::json!({ "b": 1, "a": 2 });
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn case_hash_stable_across_reserialization() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        // Re-parse from a re-serialized form; the hash must be identical.
+        let reserialized: LlmTrace =
+            serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+        assert_eq!(
+            case_hash(&trace).unwrap(),
+            case_hash(&reserialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn case_hash_changes_on_case_edit() {
+        let a: LlmTrace = serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        let b: LlmTrace = serde_json::from_str(r#"{"model_name":"m2","turns":[]}"#).unwrap();
+        assert_ne!(case_hash(&a).unwrap(), case_hash(&b).unwrap());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_absolute() {
+        assert!(validate_workspace_rel_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_empty() {
+        assert!(validate_workspace_rel_path("").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_parent_component() {
+        assert!(validate_workspace_rel_path("../secret").is_err());
+        assert!(validate_workspace_rel_path("sub/../../secret").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_accepts_nested_relative() {
+        assert!(validate_workspace_rel_path("sub/dir/file.txt").is_ok());
+    }
+
+    #[test]
     fn load_suite_filters_json_and_sorts_by_path() {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -484,6 +989,197 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_duplicate_display_ids() {
+        // Both fixtures are otherwise admissible (a real turn, a real
+        // expectation), so the duplicate identity is the only reason the load
+        // can fail. A zero-turn stand-in would be rejected earlier and let this
+        // regression pass without ever reaching the identity check.
+        let duplicate = |model: &str| {
+            format!(
+                r#"{{"model_name":"{model}","id":"same","turns":[{{"user_input":"hi","steps":[{{"response":{{"type":"text","content":"ok"}}}}]}}],"expects":{{"max_tool_calls":0}}}}"#
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.json"), duplicate("first")).unwrap();
+        std::fs::write(dir.path().join("b.json"), duplicate("second")).unwrap();
+
+        let err = load_suite(dir.path()).expect_err("duplicate receipt identities must fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("duplicate case identity \"same\""));
+        assert!(rendered.contains("a.json"));
+        assert!(rendered.contains("b.json"));
+    }
+
+    /// Write `body` to a fixture file and load it, returning the loader result.
+    fn load_fixture(name: &str, body: &str) -> anyhow::Result<LlmTrace> {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_fixture_validation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, body).unwrap();
+        let out = LlmTrace::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn unknown_expectation_key_is_rejected() {
+        // A one-character typo (`workspce`) used to be silently ignored, turning
+        // a real regression check into permanent green.
+        let err = load_fixture(
+            "unknown_key",
+            r#"{"model_name":"m","turns":[],"expects":{"response_contains":["hi"],"workspce":{"file_exists":["out.txt"]}}}"#,
+        )
+        .expect_err("an unknown expects key must be a load error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("workspce"),
+            "error must name the unknown key: {chain}"
+        );
+        assert!(
+            chain.contains("unknown_key.json"),
+            "error must name the fixture path: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_workspace_block_is_rejected() {
+        let err = load_fixture(
+            "empty_workspace",
+            r#"{"model_name":"m","turns":[],"expects":{"response_contains":["hi"],"workspace":{}}}"#,
+        )
+        .expect_err("a present-but-empty workspace block must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("expects.workspace"),
+            "error must name the vacuous block: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_budget_block_is_rejected() {
+        let err = load_fixture(
+            "empty_budget",
+            r#"{"model_name":"m","turns":[],"expects":{"response_contains":["hi"],"budget":{}}}"#,
+        )
+        .expect_err("a present-but-empty budget block must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("expects.budget"),
+            "error must name the vacuous block: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_expectation_list_is_rejected() {
+        let err = load_fixture(
+            "empty_list",
+            r#"{"model_name":"m","turns":[],"expects":{"workspace":{"file_contains":{"out.txt":[]}}}}"#,
+        )
+        .expect_err("an empty file_contains list must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty list"),
+            "error must explain the empty list: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_file_contains_needle_is_rejected() {
+        // `String::contains("")` is always true, so an empty needle always passes.
+        let err = load_fixture(
+            "empty_needle",
+            r#"{"model_name":"m","turns":[],"expects":{"workspace":{"file_contains":{"out.txt":[""]}}}}"#,
+        )
+        .expect_err("an empty file_contains needle must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty needle"),
+            "error must explain the empty needle: {chain}"
+        );
+    }
+
+    #[test]
+    fn expects_declaring_no_effective_checks_is_rejected() {
+        let err = load_fixture("no_checks", r#"{"model_name":"m","turns":[],"expects":{}}"#)
+            .expect_err("a case that asserts nothing must be rejected at load time");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("no effective expectation"),
+            "error must explain the vacuous case: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_display_id_is_rejected_at_load() {
+        // A blank identity is not a name: every downstream join (report rows,
+        // receipt provenance, the baseline `case_id` key) collapses on it, and
+        // the baseline parser already refuses to read an entry whose `case_id`
+        // is empty. Rejecting the fixture at load keeps one invariant instead
+        // of writing a baseline that can never be read back.
+        let blank_model = load_fixture(
+            "blank_model",
+            r#"{"model_name":"","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"ok"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .expect_err("an empty model_name leaves the case with no display identity");
+        let chain = format!("{blank_model:#}");
+        assert!(
+            chain.contains("empty case identity"),
+            "error must name the empty identity: {chain}"
+        );
+        assert!(
+            chain.contains("blank_model.json"),
+            "error must name the fixture path: {chain}"
+        );
+
+        // The explicit `id` override is the other way to reach the same blank
+        // identity, and a non-empty `model_name` must not excuse it.
+        let blank_id = load_fixture(
+            "blank_id",
+            r#"{"model_name":"m","id":"","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"ok"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .expect_err("an empty id override leaves the case with no display identity");
+        assert!(
+            format!("{blank_id:#}").contains("empty case identity"),
+            "an empty `id` must be rejected even when model_name is set: {blank_id:#}"
+        );
+    }
+
+    #[test]
+    fn load_suite_rejects_a_fixture_with_an_empty_display_id() {
+        // The suite boundary is where reports, receipts, and baseline joins are
+        // built, so a blank identity must not survive it even when it is the
+        // only fixture (a second blank case would be caught as a duplicate).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("blank.json"),
+            r#"{"model_name":"","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"ok"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("named.json"), admissible_fixture("named")).unwrap();
+
+        let err = load_suite(dir.path()).expect_err("a blank case identity must fail the suite");
+        assert!(
+            format!("{err:#}").contains("empty case identity"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_single_real_check_is_enough_to_load() {
+        // Anti-vacuity for the rejections above: the validator is not simply
+        // refusing every fixture. The turn is what separates this fixture from
+        // the zero-turn rejection, which carries the same expectation.
+        let trace = load_fixture(
+            "one_check",
+            r#"{"model_name":"m","turns":[{"user_input":"hi","steps":[{"response":{"type":"text","content":"hi"}}]}],"expects":{"max_tool_calls":0}}"#,
+        )
+        .expect("a case with one real check must load");
+        assert_eq!(trace.expects.max_tool_calls, Some(0));
+        assert!(!trace.expects.is_empty());
+        assert_eq!(trace.turns.len(), 1);
     }
 
     #[test]

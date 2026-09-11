@@ -13802,6 +13802,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "proc-macro2",
+ "quick-xml",
  "rcgen",
  "regex",
  "reqwest 0.12.28",
@@ -14042,14 +14043,18 @@ version = "0.8.5"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
+ "quick-xml",
  "regex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-memory",
+ "zeroclaw-providers",
  "zeroclaw-runtime",
 ]
 
