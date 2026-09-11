@@ -2655,6 +2655,8 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
                     text.clone(),
+                    req.client_turn_generation,
+                    message_count,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -13925,21 +13927,94 @@ mod tests {
             .expect("typed context exhaustion returns a terminal RPC result");
         assert_eq!(result["stop_reason"], "context_exhausted");
 
-        let reported = dispatcher
-            .handle_session_state(&json!({ "session_id": sid }))
-            .await
-            .expect("session/state must resolve the rpc_ row");
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
         assert_ne!(
-            reported["state"], "running",
+            after.state, "running",
             "a returned context-exhausted turn must not still report as running"
         );
         assert_eq!(
-            reported["state"], "error",
+            after.state, "error",
             "context exhaustion is a failed turn, so it records the error state"
         );
         assert!(
-            reported["turn_id"].is_string(),
+            after.turn_id.is_some(),
             "the terminal state must carry the turn id it failed under"
+        );
+
+        let reported = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await
+            .expect("a live session resolves its state from the runtime actor");
+        assert_ne!(
+            reported["state"], "running",
+            "the live view must not keep the finished turn in flight either"
+        );
+    }
+
+    /// The context-exhausted arm is a terminal turn arm like Completed,
+    /// Cancelled, and the generic error, so its `TurnComplete` has to carry the
+    /// same turn identity. A client that filters terminal events by
+    /// `client_turn_generation` drops an unattributed one and stays stuck in
+    /// the working state, and a missing `message_count` leaves the client's
+    /// projected history count behind after the failed turn.
+    #[tokio::test]
+    async fn context_exhausted_turn_complete_carries_turn_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-turn-complete-context-exhausted";
+        install_state_test_session(&sessions, &chat_backend, sid, PartialThenContextProvider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher =
+            RpcDispatcher::new(ctx, tx, "test-peer-context-exhausted-identity:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "large request",
+                "client_turn_generation": 77,
+            }))
+            .await
+            .expect("typed context exhaustion returns a terminal RPC result");
+        assert_eq!(result["stop_reason"], "context_exhausted");
+
+        let mut turn_complete = None;
+        while let Ok(raw) = rx.try_recv() {
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).expect("notification must be JSON");
+            if value["params"]["type"] == "turn_complete" {
+                turn_complete = Some(value);
+            }
+        }
+        let turn_complete =
+            turn_complete.expect("context exhaustion must emit a terminal TurnComplete");
+        assert_eq!(turn_complete["params"]["outcome"], "failed");
+        assert_eq!(
+            turn_complete["params"]["client_turn_generation"], 77,
+            "the terminal event must echo the caller's turn generation, or a \
+             generation-filtering client discards it and never leaves the \
+             working state"
+        );
+        assert!(
+            turn_complete["params"]["message_count"].is_number(),
+            "the terminal event must report the projected conversation-entry \
+             count like every other terminal arm"
         );
     }
 
