@@ -206,3 +206,15 @@ empty, one holding a zero-length entry in a string-backed expectation family
 (`response_contains`, `response_not_contains`, `response_matches`,
 `tools_used`, `tools_not_used`), and one carrying an unknown top-level or
 expectation key. Every rejection names the offending fixture and field.
+
+Report aggregation independently requires at least one grade, so an in-memory
+caller cannot manufacture a green case from an empty grade vector.
+
+### Grader catalog
+
+Graders implement the async, workspace-aware `Grader` trait. The runner awaits
+them before it drops each case's temporary workspace, allowing later
+side-effect graders to inspect real case state. Production builds the catalog
+once through `grader::default_graders`; `run_case_with_graders` and
+`live::run_live_case_with_graders` accept an injected catalog so tests exercise
+that same grade-before-teardown path instead of calling a grader directly.

@@ -12,7 +12,7 @@ use zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher;
 
 use crate::Mode;
 use crate::case::{LlmTrace, load_suite};
-use crate::grader::evaluate_expects;
+use crate::grader::{GradeResult, Grader, default_graders, grade_with};
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
 use crate::report::{CaseReport, SuiteReport};
@@ -54,6 +54,15 @@ impl CaseProvider {
 /// Factory that builds a fresh model provider (plus metadata) for one case run.
 /// Injected so replay, live, and deterministic tests share one runner code path.
 pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<CaseProvider> + Send + Sync>;
+
+/// A completed case run plus its grades, produced while the case's temp
+/// workspace is still alive. The workspace itself is intentionally not carried
+/// here (it is dropped once grading finishes).
+#[derive(Debug)]
+pub struct CaseOutcome {
+    pub record: RunRecord,
+    pub grades: Vec<GradeResult>,
+}
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -122,10 +131,10 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
             .to_string();
 
         let report = match run_case(&trace, deps).await {
-            Ok(record) => CaseReport {
+            Ok(outcome) => CaseReport {
                 name,
                 source,
-                grades: evaluate_expects(&trace.expects, &record),
+                grades: outcome.grades,
                 error: None,
             },
             Err(e) => CaseReport {
@@ -141,18 +150,42 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
     Ok(SuiteReport { cases })
 }
 
-/// Run a single trace through a freshly built, isolated agent and capture the run,
-/// dispatching on the mode in `deps`.
-pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
+/// Run a single trace through a freshly built, isolated agent, grade it while its
+/// workspace is still alive, and return the outcome. Dispatches on `deps.mode`.
+pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
+    run_case_with_graders(trace, deps, default_graders(trace)).await
+}
+
+/// Injection seam: the caller supplies the grader catalog instead of the runner
+/// building it internally.
+///
+/// [`run_case`] is the thin wrapper that passes [`default_graders`], so both go
+/// through this one body. The point is testability of the *ordering contract*:
+/// the whole reason [`Grader::grade`] is async is that a grader may inspect the
+/// case's temp workspace, which is only valid because the runner awaits grading
+/// before dropping the workspace. A test can inject a workspace-probing grader
+/// here and observe that ordering from inside a real run — proving the runner
+/// honours it, which a test that calls `Grader::grade` directly cannot do.
+///
+/// [`Grader::grade`]: crate::grader::Grader::grade
+pub async fn run_case_with_graders(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    graders: Vec<Box<dyn Grader>>,
+) -> anyhow::Result<CaseOutcome> {
     match deps.mode {
-        Mode::Replay => run_replay_case(trace, deps).await,
-        Mode::Live => crate::live::run_live_case(trace, deps).await,
+        Mode::Replay => run_replay_case(trace, deps, graders).await,
+        Mode::Live => crate::live::run_live_case_with_graders(trace, deps, graders).await,
     }
 }
 
 /// Replay a scripted trace through the Phase 0 deterministic agent (echo tools,
 /// native dispatcher, no network).
-async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
+async fn run_replay_case(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    graders: Vec<Box<dyn Grader>>,
+) -> anyhow::Result<CaseOutcome> {
     // Each case gets an isolated temp workspace and an ephemeral "none" memory
     // backend so cases cannot observe one another.
     let tmp = tempfile::tempdir()?;
@@ -218,19 +251,129 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Run
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
-    Ok(RunRecord {
+    let record = RunRecord {
         final_response,
         history: agent.history().to_vec(),
         tools_called: observer.tool_names(),
         all_tools_succeeded: observer.all_tools_succeeded(),
         input_tokens,
         output_tokens,
-    })
+    };
+    // Grade while the temp workspace is still alive, then let `tmp` drop.
+    let grades = grade_with(&graders, &record, tmp.path()).await;
+    Ok(CaseOutcome { record, grades })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::grader::{GradeCategory, GradeContext, GradeResult};
+    use crate::record::RunRecord;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A grader that records, from *inside* a real run, whether the case
+    /// workspace still existed when the runner called it.
+    ///
+    /// The assertion happens after the runner returns, so what it observes is
+    /// the runner's grade-then-drop ordering rather than the test's own setup.
+    /// A test that constructs a `GradeContext` by hand and calls `Grader::grade`
+    /// directly cannot observe that — it would stay green if the production
+    /// await moved after the workspace drop.
+    pub(crate) struct WorkspaceProbe {
+        pub(crate) seen_alive: Arc<AtomicBool>,
+        pub(crate) calls: Arc<AtomicUsize>,
+    }
+
+    impl WorkspaceProbe {
+        pub(crate) fn new() -> (Self, Arc<AtomicBool>, Arc<AtomicUsize>) {
+            let seen_alive = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    seen_alive: Arc::clone(&seen_alive),
+                    calls: Arc::clone(&calls),
+                },
+                seen_alive,
+                calls,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Grader for WorkspaceProbe {
+        fn name(&self) -> &str {
+            "workspace_probe"
+        }
+
+        async fn grade(&self, _run: &RunRecord, ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+            let alive = ctx.workspace.exists();
+            self.seen_alive.store(alive, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            vec![GradeResult::new(
+                "workspace_live".to_string(),
+                alive,
+                if alive {
+                    "workspace present at grade time"
+                } else {
+                    "workspace already torn down at grade time"
+                },
+                GradeCategory::SideEffect,
+            )]
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_grades_before_dropping_the_case_workspace() {
+        // The contract the async `Grader` trait exists to provide: a grader can
+        // inspect the case's temp workspace, because the runner awaits grading
+        // before that workspace is dropped. Driven through `run_case_with_graders`
+        // so the ordering under test is the runner's, not the test's.
+        let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
+        let (probe, seen_alive, calls) = WorkspaceProbe::new();
+        let outcome = run_case_with_graders(&trace, &RunDeps::replay(), vec![Box::new(probe)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the injected grader must actually run on the real runner path"
+        );
+        assert!(
+            seen_alive.load(Ordering::SeqCst),
+            "case workspace was torn down before the runner awaited grading"
+        );
+        assert!(
+            outcome.grades.iter().all(|g| g.passed),
+            "grades: {:?}",
+            outcome.grades
+        );
+    }
+
+    #[tokio::test]
+    async fn run_case_uses_the_default_grader_catalog() {
+        // `run_case` must remain a thin wrapper over the seam: if it drifted to a
+        // different catalog, the seam-based regression above would be testing a
+        // path production does not use.
+        let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
+        let via_wrapper = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        let via_seam = run_case_with_graders(
+            &trace,
+            &RunDeps::replay(),
+            crate::grader::default_graders(&trace),
+        )
+        .await
+        .unwrap();
+
+        let checks =
+            |o: &CaseOutcome| -> Vec<String> { o.grades.iter().map(|g| g.check.clone()).collect() };
+        assert_eq!(checks(&via_wrapper), checks(&via_seam));
+        assert!(
+            checks(&via_wrapper).contains(&r#"response_contains("Hello")"#.to_string()),
+            "default catalog must include the fixture's expectation grades: {:?}",
+            checks(&via_wrapper)
+        );
+    }
 
     const SMOKE: &str = r#"{
         "model_name": "test-smoke-greeting",
@@ -256,21 +399,27 @@ mod tests {
     #[tokio::test]
     async fn replays_text_only_trace() {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
-        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert!(record.final_response.contains("Hello"));
-        assert!(record.tools_called.is_empty());
-        let grades = evaluate_expects(&trace.expects, &record);
-        assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        assert!(outcome.record.final_response.contains("Hello"));
+        assert!(outcome.record.tools_called.is_empty());
+        assert!(
+            outcome.grades.iter().all(|g| g.passed),
+            "grades: {:?}",
+            outcome.grades
+        );
     }
 
     #[tokio::test]
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
-        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert_eq!(record.tools_called, vec!["echo".to_string()]);
-        assert!(record.all_tools_succeeded);
-        let grades = evaluate_expects(&trace.expects, &record);
-        assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        assert_eq!(outcome.record.tools_called, vec!["echo".to_string()]);
+        assert!(outcome.record.all_tools_succeeded);
+        assert!(
+            outcome.grades.iter().all(|g| g.passed),
+            "grades: {:?}",
+            outcome.grades
+        );
     }
 
     #[tokio::test]
@@ -309,12 +458,12 @@ mod tests {
     #[tokio::test]
     async fn replays_multi_turn_trace_in_order() {
         let trace: LlmTrace = serde_json::from_str(MULTI_TURN).unwrap();
-        let record = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
         // The final response comes from the *last* turn, proving turns replay in order.
         assert!(
-            record.final_response.contains("Goodbye"),
+            outcome.record.final_response.contains("Goodbye"),
             "final response: {:?}",
-            record.final_response
+            outcome.record.final_response
         );
     }
 
