@@ -7128,7 +7128,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                         ta(
                             "cli-eval-failed-case-records",
                             &[("dir", dir.as_str())],
-                            &format!("  failed-case records: {dir}/"),
+                            format!("  failed-case records: {dir}/"),
                         )
                     );
                 }
