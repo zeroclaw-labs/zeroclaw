@@ -3,10 +3,11 @@
 ZeroClaw has exactly one logging surface: the `zeroclaw_log::record!` macro. Every emission in the workspace, agent loop activity, channel I/O, cron runs, tool calls, memory ops, session lifecycle, errors, flows through it. The macro fires a `tracing` event that the installed subscriber feeds to two sibling layers: the stderr fmt layer (terminal output) and the `LogCaptureLayer`. The fmt layer prints colored, alias-prefixed lines on stderr (muted unless `--verbose`). The `LogCaptureLayer` materializes a structured `LogEvent` and fans it out, via `writer::record_event`, to:
 
 1. The optional Observer bridge (`observer_bridge::forward`) for the subset of actions that map to typed Prometheus / OTel events, but only when a caller has installed a binding with `set_observer_bridge`. The current production bootstrap does not install one.
-2. The process-wide broadcast channel for live subscribers such as the dashboard's SSE stream.
-3. The asynchronous JSONL writer for `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"`, `"full"`, or `"rotating"`).
+2. The optional native OTLP log exporter (`export_bridge` plus runtime `otel_logs`) when an `observability-otel` build runs with `backend = "otel"`.
+3. The process-wide broadcast channel for live subscribers such as the dashboard's SSE stream.
+4. The asynchronous JSONL writer for `<workspace>/state/runtime-trace.jsonl` (when `[observability] log_persistence` is `"rolling"`, `"full"`, or `"rotating"`).
 
-When the Observer bridge is bound, its projection and the broadcast send happen before the persistence enqueue attempt. Those three destinations have different completeness and durability guarantees; sharing one `LogEvent` does not make them interchangeable.
+When configured, the Observer projection, OTLP queue, and broadcast send happen before the persistence enqueue attempt. Those four destinations have different completeness and durability guarantees; sharing one `LogEvent` does not make them interchangeable.
 
 ## Read this first: attribution is not attrs
 
@@ -102,6 +103,10 @@ zeroclaw_log::scope!(
 ).await
 ```
 
+SOP step execution uses the same mechanism with `sop_run_id`. Unlike a turn's
+`trace_id`, this attribution is stable across every nested step turn in the run,
+so the gateway, CLI, and TUI can all query one durable correlation key.
+
 `scope!` straddles the attribution/attrs line deliberately: field keys that match the alias-bound `ATTRIBUTION_FIELDS` / `COMPOSITE_PREFIXES` (in `crates/zeroclaw-log/src/event.rs`) land in the typed `zeroclaw.*` attribution slot; everything else lands in the event `attributes` map for every descendant emission. Either way the value rides on every nested `record!` without being a call-site argument.
 
 ## The `record!` macro and its call-site contract
@@ -186,6 +191,7 @@ The layer in `crates/zeroclaw-log/src/layer.rs` is a `tracing-subscriber` Layer 
 2. On span creation/record with target `"zeroclaw_log_internal_scope"` (`scope!`-opened): parses ad-hoc kvps and stashes them similarly.
 3. On event emission with target `"zeroclaw_log_event"` (the target the `record!` macro fires through): builds a `LogEvent` from the `zc_*` field set, walks the span scope leaf→root merging every attribution snapshot it finds, parses the `zc_attrs` JSON blob into the event `attributes`, attaches `_file`/`_line` from auto-captured source location, and hands the final event to `writer::record_event`, which fans out in this order:
    - Observer bridge (`observer_bridge.rs`) for mapped Prometheus / OTel typed events when an Observer is bound.
+   - Native structured-log bridge (`export_bridge.rs`) for every canonical event when an exporter is installed; the `observability-otel` runtime maps it to an SDK LogRecord and queues OTLP/HTTP protobuf export.
    - Broadcast hook (`broadcast.rs`) for current SSE/dashboard subscribers when a sender is installed.
    - JSONL persistence (`writer.rs`), offered last to the asynchronous writer queue only when `log_persistence` is enabled.
 
@@ -226,10 +232,11 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 | Destination | Owner | Contract and loss boundary |
 |---|---|---|
 | Optional typed Observer bridge | `observer_bridge.rs` | `forward` is a no-op until an Observer is explicitly bound, and the current production bootstrap does not bind one. When bound, it forwards synchronously but projects only actions recognized by `project`; the current mapping may omit actions or default fields. Treat it as a selective metrics/tracing projection, not a complete event ledger, and inspect `project` for the current field mapping. |
+| Native OTLP logs | `export_bridge.rs` + `observability/otel_logs.rs` | Present only in an `observability-otel` build with `backend = "otel"`. Every canonical event is synchronously handed to the OpenTelemetry SDK's nonblocking batch queue, then exported as OTLP/HTTP protobuf. Queue/export failures do not block or disable JSONL/broadcast. Reconfiguration and Observer flush request a batch flush, but an abrupt process death can still lose queued records. Ephemeral broadcast attributes never reach this bridge. |
 | Live broadcast | `broadcast.rs` and its consumer | Sends the structured event to current in-process subscribers. A subscriber only sees events emitted after it subscribes, bounded receivers can lag, and the gateway SSE adapter skips lagged frames. Broadcast-only ephemeral attributes may appear in an authenticated live frame but are excluded from persisted JSONL. This is a live notification path, not replayable evidence. |
 | Persisted JSONL | `writer.rs` | Enqueues the serialized event without blocking the runtime. The bounded queue can drop an event when full, worker write failures are warnings, and periodic `sync_all` covers only the current active file. Daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. Persistence mode then decides whether the active file is trimmed, retained indefinitely, or rotated. This is best-effort operational history, not a transactional audit log. |
 
-Do not use Observer output or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
+Do not use Observer, OTLP, or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached OTLP or live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
 
 ## Reader cursors belong to one active file
 
@@ -248,7 +255,7 @@ After one of those boundaries, restart pagination from the newest page. Reusing 
 
 ## Persistence policy owns rewrites and retention
 
-`StoragePolicy` in `config.rs` controls only the JSONL destination. Observer and broadcast delivery remain independent of it.
+`StoragePolicy` in `config.rs` controls only the JSONL destination. Observer, OTLP, and broadcast delivery remain independent of it.
 
 | Policy | Active-file behavior | Retention owner |
 |---|---|---|

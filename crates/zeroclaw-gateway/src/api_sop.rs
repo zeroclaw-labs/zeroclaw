@@ -1,6 +1,7 @@
 //! Out-of-band SOP approval surface (EPIC C, C6; EPIC G broker).
 //!
-//! `GET /admin/sop/pending`, `POST /admin/sop/approve`, `POST /admin/sop/deny`.
+//! `GET /admin/sop/pending`, `GET /admin/sop/logs`, `POST /admin/sop/approve`,
+//! `POST /admin/sop/deny`.
 //! Auth reuses the vetted `/admin/reload` gate: loopback is always allowed and
 //! attributed as `cli` UNLESS pairing is required and it also presents a valid
 //! bearer token, in which case it is attributed as `http` (the authenticated
@@ -15,7 +16,7 @@
 use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -34,6 +35,15 @@ pub struct SopResolveBody {
     run_id: String,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SopLogsQuery {
+    run_id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    until_line_offset: Option<u64>,
 }
 
 fn sop_disabled() -> JsonErr {
@@ -165,6 +175,39 @@ pub async fn handle_sop_pending(
         StatusCode::OK,
         Json(serde_json::json!({ "pending": pending })),
     ))
+}
+
+/// GET /admin/sop/logs - read one run-filtered page from the same persisted,
+/// scrubbed event store used by `/api/logs`. This route exists so the local CLI
+/// can use the established admin transport policy without needing a dashboard
+/// bearer token.
+pub async fn handle_sop_logs(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<SopLogsQuery>,
+) -> Result<impl IntoResponse, JsonErr> {
+    authorize(&state, &peer, &headers)?;
+    if query.run_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "run_id must not be empty" })),
+        ));
+    }
+
+    let filter = zeroclaw_log::LogFilter {
+        until_line_offset: query.until_line_offset,
+        field_eq: std::collections::BTreeMap::from([("sop_run_id".to_string(), query.run_id)]),
+        ..Default::default()
+    };
+    let response = crate::api_logs::load_logs_response(&filter, query.limit.unwrap_or(200))
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("log read failed: {err:#}") })),
+            )
+        })?;
+    Ok((StatusCode::OK, Json(response)))
 }
 
 /// POST /admin/sop/approve - clear a waiting gate out-of-band.

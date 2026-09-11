@@ -47,6 +47,9 @@ pub struct LogsResponse {
     pub next_cursor_line_offset: Option<u64>,
     /// True when the file was fully scanned for this filter.
     pub at_end: bool,
+    /// Whether this daemon is persisting the runtime trace. An empty event list
+    /// is otherwise ambiguous between "no matches" and "logging disabled".
+    pub persistence_enabled: bool,
     /// Daemon start time so callers can implement "since daemon start"
     /// without an extra `/api/status` round-trip.
     pub daemon_started_at: String,
@@ -70,6 +73,53 @@ fn attribution_keys_for_response() -> Vec<String> {
     keys
 }
 
+/// Read one page from the canonical persisted log store. Gateway surfaces with
+/// different authorization policies (the dashboard and localhost admin CLI)
+/// share this helper so filtering, pagination, and retention behavior cannot
+/// drift between them.
+#[allow(deprecated)] // we still forward the legacy cursor for backwards compat
+pub(crate) fn load_logs_response(filter: &LogFilter, limit: usize) -> anyhow::Result<LogsResponse> {
+    // The storage-aware accessor, not the configured one. `current_log_path`
+    // reports the path the writer was configured with whatever the storage
+    // mode, so a daemon running `log_persistence = "none"` would answer
+    // `persistence_enabled: true` and then serve whatever stale file happened
+    // to sit at that path. The RPC twin already reads `active_log_path`; this
+    // is the same question, so it reads the same source of truth.
+    let Some(path) = zeroclaw_log::active_log_path() else {
+        return Ok(LogsResponse {
+            events: Vec::new(),
+            next_cursor: None,
+            next_cursor_line_offset: None,
+            at_end: true,
+            persistence_enabled: false,
+            daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
+            attribution_keys: attribution_keys_for_response(),
+        });
+    };
+
+    let LogPage {
+        events,
+        next_cursor,
+        next_cursor_line_offset,
+        at_end,
+    } = zeroclaw_log::load_page(&path, filter, limit)?;
+
+    let events = events
+        .into_iter()
+        .filter_map(|event| serde_json::to_value(event).ok())
+        .collect();
+
+    Ok(LogsResponse {
+        events,
+        next_cursor,
+        next_cursor_line_offset,
+        at_end,
+        persistence_enabled: true,
+        daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
+        attribution_keys: attribution_keys_for_response(),
+    })
+}
+
 #[allow(deprecated)] // we still forward the legacy cursor for backwards compat
 pub async fn handle_api_logs(
     State(state): State<AppState>,
@@ -79,18 +129,6 @@ pub async fn handle_api_logs(
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
-
-    let Some(path) = zeroclaw_log::current_log_path() else {
-        return Json(LogsResponse {
-            events: Vec::new(),
-            next_cursor: None,
-            next_cursor_line_offset: None,
-            at_end: true,
-            daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
-            attribution_keys: attribution_keys_for_response(),
-        })
-        .into_response();
-    };
 
     let take = |key: &str| -> Option<String> {
         params.get(key).map(String::from).filter(|s| !s.is_empty())
@@ -146,36 +184,28 @@ pub async fn handle_api_logs(
         field_eq,
     };
 
-    let LogPage {
-        events,
-        next_cursor,
-        next_cursor_line_offset,
-        at_end,
-    } = match zeroclaw_log::load_page(&path, &filter, limit) {
-        Ok(page) => page,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("log read failed: {err:#}"),
-                })),
-            )
-                .into_response();
-        }
-    };
+    match load_logs_response(&filter, limit) {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("log read failed: {err:#}"),
+            })),
+        )
+            .into_response(),
+    }
+}
 
-    let events_json: Vec<serde_json::Value> = events
-        .into_iter()
-        .filter_map(|event| serde_json::to_value(event).ok())
-        .collect();
+#[cfg(test)]
+mod tests {
+    use super::attribution_keys_for_response;
 
-    Json(LogsResponse {
-        events: events_json,
-        next_cursor,
-        next_cursor_line_offset,
-        at_end,
-        daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
-        attribution_keys: attribution_keys_for_response(),
-    })
-    .into_response()
+    #[test]
+    fn attribution_keys_expose_sop_run_id_to_dynamic_clients() {
+        assert!(
+            attribution_keys_for_response()
+                .iter()
+                .any(|key| key == "sop_run_id")
+        );
+    }
 }

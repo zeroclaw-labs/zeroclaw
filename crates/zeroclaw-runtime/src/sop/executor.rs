@@ -312,23 +312,32 @@ async fn drive_headless_run(
                 let started_at = crate::sop::engine::now_iso8601();
                 let session_path =
                     std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
-                let run_result = Box::pin(crate::agent::run(
-                    config.clone(),
-                    &agent_alias,
-                    Some(context),
-                    None,
-                    None,
-                    config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path),
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
-                ))
+                let step_call_sink = new_step_call_sink();
+                let run_result = zeroclaw_log::scope!(
+                    sop_run_id: run_id.as_str(),
+                    =>
+                    scope_step_call_sink(
+                        step_call_sink.clone(),
+                        Box::pin(crate::agent::run(
+                            config.clone(),
+                            &agent_alias,
+                            Some(context),
+                            None,
+                            None,
+                            config
+                                .model_provider_for_agent(&agent_alias)
+                                .and_then(|e| e.temperature),
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::Daemon,
+                            crate::agent::loop_::AgentRunOverrides::default(),
+                        )),
+                    )
+                )
                 .await;
+                let tool_calls = drain_step_calls(&step_call_sink);
                 let completed_at = crate::sop::engine::now_iso8601();
                 let step_result = match run_result {
                     Ok(output) => SopStepResult {
@@ -338,7 +347,7 @@ async fn drive_headless_run(
                         started_at,
                         completed_at: Some(completed_at),
                         effective_agent: Some(agent_alias.clone()),
-                        tool_calls: Vec::new(),
+                        tool_calls,
                     },
                     Err(e) => SopStepResult {
                         step_number: step.number,
@@ -347,7 +356,7 @@ async fn drive_headless_run(
                         started_at,
                         completed_at: Some(completed_at),
                         effective_agent: Some(agent_alias.clone()),
-                        tool_calls: Vec::new(),
+                        tool_calls,
                     },
                 };
                 match advance_sop_step(&engine, &run_id, step_result.clone()) {
@@ -530,6 +539,29 @@ pub(crate) async fn audit_sop_step(
     let Some(audit) = audit else {
         return;
     };
+    // Emitted inside the run's scope, because canonical attribution is
+    // span-derived: an event recorded outside it carries the run id only as
+    // `attributes.run_id`. The JSONL reader bridges that legacy shape, so a
+    // run-filtered query still finds these rows — but the OTLP exporter builds
+    // its `zeroclaw.*` attributes from the canonical struct alone, so a
+    // collector would never see the step result or the terminal row under
+    // `zeroclaw.sop_run_id`. These are exactly the two events a run timeline is
+    // read by, so they carry the canonical field like the model and tool events
+    // around them already do.
+    zeroclaw_log::scope!(
+        sop_run_id: run_id,
+        =>
+        audit_sop_step_emit(audit, run_id, result, finished_run)
+    )
+    .await;
+}
+
+async fn audit_sop_step_emit(
+    audit: &SopAuditLogger,
+    run_id: &str,
+    result: &SopStepResult,
+    finished_run: Option<&SopRun>,
+) {
     if let Err(e) = audit.log_step_result(run_id, result).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -602,6 +634,73 @@ mod tests {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
         }
+    }
+
+    /// The step result and the terminal row must carry canonical
+    /// `zeroclaw.sop_run_id`, not just `attributes.run_id`.
+    ///
+    /// The JSONL reader bridges the legacy shape, so a run-filtered query finds
+    /// these rows either way — which is exactly why the gap is easy to miss. The
+    /// OTLP exporter does not bridge: it builds its `zeroclaw.*` attributes from
+    /// the canonical struct alone, so an event emitted outside the run's scope
+    /// reaches a collector with no queryable run id at all.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn audit_events_carry_the_canonical_run_id_not_only_the_legacy_one() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let logger = SopAuditLogger::new(memory);
+
+        let run_id = "run-canonical-attribution-0001";
+        let step = SopStepResult {
+            step_number: 7,
+            status: SopStepStatus::Completed,
+            output: "the step did its work".to_string(),
+            started_at: "2026-09-03T00:00:00Z".to_string(),
+            completed_at: Some("2026-09-03T00:00:01Z".to_string()),
+            effective_agent: Some("tester".to_string()),
+            tool_calls: Vec::new(),
+        };
+
+        audit_sop_step(Some(&logger), run_id, &step, None).await;
+
+        let mut selected = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while selected.is_none() && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(value)
+                    if value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|m| m.starts_with("SOP audit: step 7 completed")) =>
+                {
+                    selected = Some(value);
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+
+        let event = selected.expect("the step-result event must be emitted");
+        assert_eq!(
+            event
+                .pointer("/zeroclaw/sop_run_id")
+                .and_then(serde_json::Value::as_str),
+            Some(run_id),
+            "the step result must carry canonical attribution, or OTLP consumers \
+             cannot filter it by run: {event:?}"
+        );
     }
 
     #[tokio::test]

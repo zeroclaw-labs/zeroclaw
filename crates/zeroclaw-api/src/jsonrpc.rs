@@ -501,6 +501,10 @@ pub struct SopRunRequest {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
+    /// Optional semantic work-item key shared with another trigger producer.
+    /// Dispatch coalesces matching keys only while the first run remains active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_key: Option<String>,
 }
 
 /// Response payload for `sops/run`: the id of the run that was started, which

@@ -218,7 +218,7 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
         return false;
     }
     for (key, want) in &filter.field_eq {
-        if event.zeroclaw.get(key) != Some(want.as_str()) {
+        if !matches_attribution_field(event, key, want) {
             return false;
         }
     }
@@ -235,6 +235,34 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
         }
     }
     true
+}
+
+/// Match a canonical attribution field, with a narrow compatibility bridge for
+/// SOP events written before `zeroclaw.sop_run_id` existed. Older transition
+/// events stored the run id in `attributes.run_id`; the audit start/finish rows
+/// only included it in their fixed-format message. Keeping this compatibility
+/// here means every consumer (gateway, CLI, web, and TUI) sees the same history.
+fn matches_attribution_field(event: &LogEvent, key: &str, want: &str) -> bool {
+    if event.zeroclaw.get(key) == Some(want) {
+        return true;
+    }
+    if key != "sop_run_id" {
+        return false;
+    }
+    if event
+        .attributes
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(want)
+    {
+        return true;
+    }
+
+    let Some(message) = event.message.as_deref() else {
+        return false;
+    };
+    let audit_prefix = format!("SOP audit: run {want} ");
+    message.starts_with(&audit_prefix)
 }
 
 /// Find a single event by id. Scans the file backwards from the end.
@@ -339,6 +367,40 @@ mod tests {
         };
         let page = load_page(&path, &filter, 10).unwrap();
         assert_eq!(page.events.len(), 2);
+    }
+
+    #[test]
+    fn filter_by_sop_run_id_includes_canonical_and_legacy_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let run_id = "run-123-0001";
+
+        let mut canonical = make_event("invoke", None);
+        canonical.zeroclaw.set("sop_run_id", run_id);
+        let mut legacy_attributes = make_event("complete", None);
+        legacy_attributes.attributes = serde_json::json!({ "run_id": run_id, "step": 1 });
+        let mut legacy_audit = make_event("note", None);
+        legacy_audit.message = Some(format!(
+            "SOP audit: run {run_id} finished with status completed"
+        ));
+        let unrelated = make_event("unrelated", None);
+        write_jsonl(
+            &path,
+            &[canonical, legacy_attributes, legacy_audit, unrelated],
+        );
+
+        let filter = LogFilter {
+            field_eq: BTreeMap::from([("sop_run_id".into(), run_id.into())]),
+            ..Default::default()
+        };
+        let page = load_page(&path, &filter, 10).unwrap();
+        assert_eq!(page.events.len(), 3);
+
+        let missing = LogFilter {
+            field_eq: BTreeMap::from([("sop_run_id".into(), "run-missing".into())]),
+            ..Default::default()
+        };
+        assert!(load_page(&path, &missing, 10).unwrap().events.is_empty());
     }
 
     #[test]
