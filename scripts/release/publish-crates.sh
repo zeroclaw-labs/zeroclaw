@@ -264,6 +264,49 @@ if [[ $EXECUTE -eq 1 && -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
   exit 1
 fi
 
+# Topological order over the publishable set, so each crate's dependencies are
+# already on the registry when it uploads. Compute this during the dry run too:
+# the tokenless preflight must exercise every operation needed before the first
+# irreversible upload. Cargo metadata is too large for one argv entry on the
+# full workspace, so pass it on a dedicated file descriptor instead.
+ORDER="$(python3 - "$VERSION" 3<<<"$META" <<'PY'
+import json
+import os
+import sys
+
+with os.fdopen(3) as metadata:
+    meta = json.load(metadata)
+version = sys.argv[1]
+pkgs = {p["name"]: p for p in meta["packages"]}
+pub = {
+    n for n, p in pkgs.items()
+    if p["publish"] is None and p["version"] == version
+}
+deps = {
+    n: sorted({d["name"] for d in p["dependencies"]
+               if d["name"] in pub and d["kind"] in (None, "build")})
+    for n, p in pkgs.items()
+}
+order, state = [], {}
+def visit(n, trail=()):
+    if state.get(n) == "done":
+        return
+    if state.get(n) == "visiting":
+        sys.exit("dependency cycle: " + " -> ".join(trail + (n,)))
+    state[n] = "visiting"
+    for d in deps[n]:
+        visit(d, trail + (n,))
+    state[n] = "done"
+    order.append(n)
+for n in sorted(pub):
+    visit(n)
+print("\n".join(order))
+PY
+)" || {
+  echo "error: could not compute publish order." >&2
+  exit 1
+}
+
 if [[ $EXECUTE -eq 0 ]]; then
   echo "── Dry run: packaging and verifying every crate (no upload) ──"
   # Cargo builds an ephemeral local registry for a multi-package dry run, so
@@ -316,43 +359,6 @@ is_creation() {
     [[ "$c" == "$needle" ]] && return 0
   done
   return 1
-}
-
-# Topological order over the publishable set, so each crate's dependencies are
-# already on the registry when it uploads. Derived from cargo metadata, never
-# hand-maintained.
-ORDER="$(python3 - "$META" "$VERSION" <<'PY'
-import json, sys
-meta = json.loads(sys.argv[1])
-version = sys.argv[2]
-pkgs = {p["name"]: p for p in meta["packages"]}
-pub = {
-    n for n, p in pkgs.items()
-    if p["publish"] is None and p["version"] == version
-}
-deps = {
-    n: sorted({d["name"] for d in p["dependencies"]
-               if d["name"] in pub and d["kind"] in (None, "build")})
-    for n, p in pkgs.items()
-}
-order, state = [], {}
-def visit(n, trail=()):
-    if state.get(n) == "done":
-        return
-    if state.get(n) == "visiting":
-        sys.exit("dependency cycle: " + " -> ".join(trail + (n,)))
-    state[n] = "visiting"
-    for d in deps[n]:
-        visit(d, trail + (n,))
-    state[n] = "done"
-    order.append(n)
-for n in sorted(pub):
-    visit(n)
-print("\n".join(order))
-PY
-)" || {
-  echo "error: could not compute publish order." >&2
-  exit 1
 }
 
 published=0

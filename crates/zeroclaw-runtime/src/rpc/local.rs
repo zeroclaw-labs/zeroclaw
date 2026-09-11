@@ -534,7 +534,41 @@ mod platform {
         ))
     }
 
+    /// Longest socket path `bind(2)` accepts on this platform, in bytes.
+    ///
+    /// `sun_path` is the trailing field of `sockaddr_un` (104 bytes on macOS
+    /// and the BSDs, 108 on Linux) and one byte is reserved for the
+    /// terminating NUL, matching the check `std` performs before the syscall.
+    pub(super) const MAX_SOCKET_PATH_BYTES: usize = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        - 1;
+
+    /// Rejects a path `bind(2)` cannot address before any lifecycle state exists.
+    ///
+    /// `std` reports the same condition as a bare `InvalidInput` that names
+    /// neither the path nor the limit, and by then the sibling lock file
+    /// would already have been created for an endpoint that can never exist.
+    pub(super) fn require_bindable_path(path: &Path) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let len = path.as_os_str().as_bytes().len();
+        if len > MAX_SOCKET_PATH_BYTES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "local IPC socket path {} is {len} bytes but this platform allows at most \
+                     {MAX_SOCKET_PATH_BYTES}; set ZEROCLAW_SOCKET to a shorter path or use a \
+                     shorter --config-dir",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     pub async fn bind(path: &Path) -> Result<(LocalListener, EndpointGuard)> {
+        require_bindable_path(path)?;
         let lock = EndpointLock::acquire(path)?;
         bind_locked(path, lock).await
     }
@@ -963,6 +997,74 @@ mod tests {
 
         drop(listener);
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_length_check_matches_the_platform_bind_limit() {
+        use std::os::unix::net::SocketAddr;
+
+        let longest = PathBuf::from(format!(
+            "/{}",
+            "s".repeat(platform::MAX_SOCKET_PATH_BYTES - 1)
+        ));
+        assert_eq!(longest.as_os_str().len(), platform::MAX_SOCKET_PATH_BYTES);
+        platform::require_bindable_path(&longest).expect("a path at the limit must pass");
+        SocketAddr::from_pathname(&longest).expect("std must accept a path at the limit");
+
+        let over = PathBuf::from(format!("/{}", "s".repeat(platform::MAX_SOCKET_PATH_BYTES)));
+        let over_len = over.as_os_str().len();
+        let error = platform::require_bindable_path(&over)
+            .expect_err("a path one byte over the limit must be rejected");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(ErrorKind::InvalidInput)
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("{over_len} bytes")), "{message}");
+        assert!(message.contains(&over.display().to_string()), "{message}");
+        assert!(message.contains("ZEROCLAW_SOCKET"), "{message}");
+        assert!(message.contains("--config-dir"), "{message}");
+        assert_eq!(
+            SocketAddr::from_pathname(&over)
+                .map(|_| ())
+                .map_err(|error| error.kind()),
+            Err(ErrorKind::InvalidInput),
+            "std must reject the same path, so the check is no stricter than bind(2)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_rejects_an_overlong_socket_path_before_creating_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base_len = tmp.path().as_os_str().len() + 1;
+        let padding = (platform::MAX_SOCKET_PATH_BYTES + 1)
+            .saturating_sub(base_len)
+            .max(1);
+        let sock_path = tmp.path().join("s".repeat(padding));
+
+        let error = match platform::bind(&sock_path).await {
+            Ok(_) => panic!("an overlong socket path must not bind"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(ErrorKind::InvalidInput)
+        );
+        assert!(format!("{error:#}").contains("ZEROCLAW_SOCKET"));
+
+        let mut lock_name = sock_path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        assert!(
+            !PathBuf::from(lock_name).exists(),
+            "a rejected path must not leave a lifecycle lock behind"
+        );
+        assert!(!sock_path.exists());
     }
 
     #[cfg(unix)]

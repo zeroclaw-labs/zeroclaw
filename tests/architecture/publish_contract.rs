@@ -14,6 +14,9 @@
 //!   which packages fine and then fails to compile from the tarball. Feature
 //!   gated ones are the dangerous case: `cargo publish --dry-run` verifies
 //!   default features only, so they pass preflight and ship broken
+//! * publish-order calculation hidden behind the dry-run return and fed the
+//!   full workspace metadata through argv, which exceeded Linux `ARG_MAX`
+//!   only after the irreversible job was approved
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -377,6 +380,28 @@ fn root_package_is_the_installable_crate() {
         root.publishable,
         "the root package must remain publishable; `publish = false` here silently \
          removes ZeroClaw from crates.io"
+    );
+}
+
+#[test]
+fn publish_order_is_streamed_and_exercised_by_preflight() {
+    let script = fs::read_to_string(repo_root().join("scripts/release/publish-crates.sh"))
+        .expect("read crates.io publisher");
+
+    assert!(
+        !script.contains("python3 - \"$META\""),
+        "cargo metadata must not be passed as one argv entry; the full workspace exceeds ARG_MAX"
+    );
+
+    let order = script
+        .find("ORDER=\"$(python3 - \"$VERSION\" 3<<<\"$META\"")
+        .expect("publisher streams metadata into its order helper");
+    let dry_run = script
+        .find("if [[ $EXECUTE -eq 0 ]]")
+        .expect("publisher has a tokenless dry-run branch");
+    assert!(
+        order < dry_run,
+        "tokenless preflight must compute publish order before returning"
     );
 }
 

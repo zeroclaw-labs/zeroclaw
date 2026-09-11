@@ -18,7 +18,10 @@ enum SocketStartupState {
     #[default]
     Pending,
     Ready,
-    Fatal(String),
+    Fatal {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
 }
 
 #[derive(Clone)]
@@ -50,13 +53,16 @@ impl SocketStartupTracker {
     }
 
     fn record_error(&self, error: &anyhow::Error) {
-        if !is_addr_in_use(error) {
+        let Some(kind) = fatal_socket_startup_kind(error) else {
             return;
-        }
+        };
 
         self.state_tx.send_if_modified(|state| {
             if matches!(state, SocketStartupState::Pending) {
-                *state = SocketStartupState::Fatal(format!("{error:#}"));
+                *state = SocketStartupState::Fatal {
+                    kind,
+                    message: format!("{error:#}"),
+                };
                 true
             } else {
                 false
@@ -65,10 +71,20 @@ impl SocketStartupTracker {
     }
 }
 
-fn is_addr_in_use(error: &anyhow::Error) -> bool {
+/// Startup errors no supervisor restart can recover from: the endpoint is
+/// already owned by another daemon, or the configured path can never be bound
+/// (for example a Unix socket path over the platform `sun_path` limit, which
+/// `std` reports as `InvalidInput` before the syscall).
+fn fatal_socket_startup_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
     error
         .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        .map(std::io::Error::kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::InvalidInput
+            )
+        })
 }
 
 #[derive(Clone)]
@@ -582,7 +598,7 @@ pub async fn run(
     }
 
     if crate::control_plane::control_plane().is_none()
-        && let Err(e) = crate::control_plane::ControlPlaneHandle::start(&config.data_dir)
+        && let Err(e) = crate::control_plane::ControlPlaneRecoveryOwner::start(&config.data_dir)
             .await
             .map(crate::control_plane::init_control_plane)
     {
@@ -596,8 +612,8 @@ pub async fn run(
     }
     // Respawn the reaper for THIS run iteration against the INSTALLED handle, so its
     // boot_id matches what producers stamp via `control_plane()`.
-    if let Some(handle) = crate::control_plane::control_plane() {
-        handle.spawn_reaper(
+    if crate::control_plane::control_plane().is_some() {
+        let _ = crate::control_plane::spawn_control_plane_reaper(
             crate::control_plane::reaper::DEFAULT_MAX_RUNTIME_SECS,
             channels_cancel.clone(),
         );
@@ -1133,8 +1149,8 @@ async fn await_socket_startup(
         .map(|state| state.clone())
     {
         Ok(SocketStartupState::Ready) => Ok(()),
-        Ok(SocketStartupState::Fatal(message)) => {
-            Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, message).into())
+        Ok(SocketStartupState::Fatal { kind, message }) => {
+            Err(std::io::Error::new(kind, message).into())
         }
         Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
         Err(_) => Ok(()),
@@ -1297,17 +1313,17 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
+                    crate::health::mark_component_error(name, format!("{e:#}"));
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{}", e),
+                                "error": format!("{e:#}"),
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e}")
+                        &format!("Daemon component '{name}' failed: {e:#}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -2520,17 +2536,25 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    if !config.channels.is_known_channel(channel) {
+    // A heartbeat target may be a bare channel type ("telegram") or a
+    // configured instance's composite key ("telegram.roy"). The channel
+    // registry (is_known_channel / is_channel_configured / is_channel_deliverable)
+    // is keyed by channel *type*, so validate the type segment. The delivery
+    // path (deliver_announcement) resolves the instance alias at send time,
+    // matching how cron delivery accepts `<type>.<alias>` refs — see
+    // cron_delivery_channel_pattern.
+    let channel_type = channel.split_once('.').map_or(channel, |(ty, _)| ty);
+    if !config.channels.is_known_channel(channel_type) {
         anyhow::bail!("unsupported heartbeat.target channel: {channel}");
     }
-    if !config.channels.is_channel_configured(channel) {
+    if !config.channels.is_channel_configured(channel_type) {
         anyhow::bail!(
-            "heartbeat.target is set to {channel} but channels.{channel} is not configured"
+            "heartbeat.target is set to {channel} but channels.{channel_type} is not configured"
         );
     }
-    if !config.channels.is_channel_deliverable(channel) {
+    if !config.channels.is_channel_deliverable(channel_type) {
         anyhow::bail!(
-            "heartbeat.target is set to {channel} but {channel} is an input-only channel that cannot deliver outbound messages"
+            "heartbeat.target is set to {channel} but {channel_type} is an input-only channel that cannot deliver outbound messages"
         );
     }
     Ok(())
@@ -3371,6 +3395,64 @@ mod tests {
     }
 
     #[test]
+    fn resolve_delivery_accepts_composite_instance_target() {
+        // review: a heartbeat target may name a specific channel instance
+        // via its `<type>.<alias>` composite key. The delivery path requires
+        // this form to route to a non-default instance in a multi-instance
+        // setup, so validation must accept it rather than rejecting it as an
+        // unknown channel. The composite key is passed through verbatim so the
+        // delivery layer resolves the alias.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("telegram.roy".into());
+        config.heartbeat.to = Some("-1003233270107".into());
+        config
+            .channels
+            .telegram
+            .insert("roy".to_string(), Default::default());
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("telegram.roy".to_string(), "-1003233270107".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_composite_of_unknown_type() {
+        // The type segment of a composite key must still be a known channel;
+        // splitting on '.' must not let an unknown type slip through.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("carrier_pigeon.roy".into());
+        config.heartbeat.to = Some("ops@example.com".into());
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported heartbeat.target channel"),
+            "expected unsupported-channel rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_rejects_composite_of_undeliverable_type() {
+        // Deliverability is a property of the channel type, so a composite key
+        // whose type is input-only (mqtt) must be rejected just like the bare
+        // form rather than passing on the alias suffix.
+        let mut config = Config::default();
+        config.heartbeat.target = Some("mqtt.sensors".into());
+        config.heartbeat.to = Some("ops/heartbeat".into());
+        config
+            .channels
+            .mqtt
+            .insert("sensors".to_string(), Default::default());
+
+        let err = resolve_heartbeat_delivery(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("input-only channel"),
+            "expected input-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_delivery_rejects_voice_duplex_target() {
         // review: voice_duplex has a configured table and a WebSocket
         // event protocol but no Channel::send outbound path, so a heartbeat
@@ -3650,6 +3732,81 @@ mod tests {
                 "daemon should return the startup socket ownership error with startup_feedback_enabled={startup_feedback_enabled}, got: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn fatal_socket_startup_kind_covers_unbindable_paths_through_context() {
+        use std::io;
+
+        let unbindable = anyhow::Error::from(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "local IPC socket path is 104 bytes but this platform allows at most 103",
+        ))
+        .context("binding local IPC endpoint");
+        assert_eq!(
+            fatal_socket_startup_kind(&unbindable),
+            Some(io::ErrorKind::InvalidInput)
+        );
+
+        let owned = anyhow::Error::from(io::Error::from(io::ErrorKind::AddrInUse));
+        assert_eq!(
+            fatal_socket_startup_kind(&owned),
+            Some(io::ErrorKind::AddrInUse)
+        );
+
+        let transient = anyhow::Error::from(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(fatal_socket_startup_kind(&transient), None);
+        assert_eq!(
+            fatal_socket_startup_kind(&anyhow::Error::msg("not an io error")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_socket_invalid_input_fails_daemon_startup() {
+        use std::io;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_socket = attempts.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
+            let attempts = attempts_for_socket.clone();
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::from(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "local IPC socket path is 104 bytes but this platform allows at most 103",
+                ))
+                .context("binding local IPC endpoint"))
+            })
+        }));
+
+        let result = tokio::time::timeout(
+            DAEMON_DEADLOCK_GUARD,
+            run(config, "127.0.0.1".to_string(), 0, registry, false, false),
+        )
+        .await
+        .expect("daemon must not restart-loop an unbindable socket path");
+        let error = result.expect_err("daemon startup should fail on an unbindable socket path");
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidInput),
+            "the startup error should keep the bind error kind, got: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("binding local IPC endpoint"), "{message}");
+        assert!(message.contains("allows at most 103"), "{message}");
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "an unbindable path must fail closed instead of being retried"
+        );
     }
 
     #[tokio::test]
