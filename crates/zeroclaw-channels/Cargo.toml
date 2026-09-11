@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Channel implementations for messaging platform integrations."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
