@@ -2310,6 +2310,8 @@ impl RpcDispatcher {
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
                         "turn cancelled by daemon: thinking_level_unsupported".to_string(),
+                        req.client_turn_generation,
+                        None,
                     )
                     .await;
                     return Err(err);
