@@ -142,8 +142,16 @@ pub struct CostRecord {
     pub id: String,
     /// Token usage details
     pub usage: TokenUsage,
-    /// Session identifier (for grouping)
+    /// Tracker identifier: one random UUID per daemon process, grouping every
+    /// record this daemon emits. This is NOT the chat session — attribute
+    /// per-conversation spend through `conversation_id`.
     pub session_id: String,
+    /// Chat-session identifier (the runtime session key scoped around the
+    /// turn), so per-conversation spend can be separated across the sessions
+    /// one daemon serves. `None` for records persisted before the field
+    /// existed or turns without a chat-session scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
     /// Alias of the agent that incurred this cost (HashMap key in
     /// `config.agents`). `None` for records persisted before per-agent
     /// attribution, or when `[cost].track_per_agent = false`.
@@ -165,6 +173,7 @@ impl CostRecord {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            conversation_id: None,
             agent_alias: None,
             task_id: None,
         }
@@ -180,6 +189,7 @@ impl CostRecord {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            conversation_id: None,
             agent_alias,
             task_id: None,
         }
@@ -196,9 +206,18 @@ impl CostRecord {
             id: uuid::Uuid::new_v4().to_string(),
             usage,
             session_id: session_id.into(),
+            conversation_id: None,
             agent_alias,
             task_id,
         }
+    }
+
+    /// Attach the chat-session identifier this spend belongs to. The ledger
+    /// is append-only JSONL, so the field is additive and older rows read
+    /// back as `None`.
+    pub fn with_conversation_id(mut self, conversation_id: Option<String>) -> Self {
+        self.conversation_id = conversation_id;
+        self
     }
 }
 
@@ -430,5 +449,19 @@ mod tests {
         assert_eq!(parsed.task_id.as_deref(), Some("task-123"));
         assert!(parsed.usage.pricing_available);
         assert_eq!(parsed.usage.unpriced_tokens, 0);
+        // Rows persisted before conversation attribution existed read as None.
+        assert!(parsed.conversation_id.is_none());
+    }
+
+    #[test]
+    fn cost_record_conversation_attribution_roundtrips() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 1.0, 2.0, 0.0);
+        let record =
+            CostRecord::new("tracker-1", usage).with_conversation_id(Some("chat-session-9".into()));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("conversation_id"));
+        let parsed: CostRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.session_id, "tracker-1");
+        assert_eq!(parsed.conversation_id.as_deref(), Some("chat-session-9"));
     }
 }
