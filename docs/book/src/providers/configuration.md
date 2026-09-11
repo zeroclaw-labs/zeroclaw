@@ -194,8 +194,6 @@ Reasoning depth comes from the thinking level. The runtime profile setting `[run
 
 Signed reasoning is replayed only within the tool round that produced it, because these models reject reasoning whose conversation prefix has since changed.
 
-When Anthropic's safety classifiers decline a request, ZeroClaw does not retry that model and moves on to `fallback_models` and then `fallback`. See [Fallback on failure](#fallback-on-failure).
-
 ### Ollama
 
 Ollama defaults to the local endpoint, so a local alias only needs the model name:

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Channel infrastructure: session backends, debouncing, stall watchdog."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]

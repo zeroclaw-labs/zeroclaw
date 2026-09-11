@@ -249,6 +249,10 @@ rpc_type! {
     pub struct SessionPromptParams {
         pub session_id: String,
         pub prompt: String,
+        /// Optional client-local turn identity echoed by `TurnComplete`.
+        /// Older clients omit this field and retain session-scoped behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client_turn_generation: Option<u64>,
         /// Inline file attachments. Processed identically to `file/attach`
         /// entries — markers are appended to the prompt before the turn runs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -405,6 +409,10 @@ rpc_type! {
         pub turn_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub turn_started_at: Option<String>,
+        /// Authoritative live-session TodoWrite plan. Older/persisted
+        /// sessions omit this field because they have no runtime plan owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plan: Option<Vec<zeroclaw_api::plan::PlanEntry>>,
     }
 }
 
@@ -1443,6 +1451,14 @@ pub enum SessionUpdateEvent {
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
+        /// Optional client-local turn identity, echoed from `session/prompt`.
+        /// Absent for legacy callers that do not send one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_turn_generation: Option<u64>,
+        /// Authoritative projected conversation-entry count after this turn.
+        /// Absent for legacy or missing-session terminal events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_count: Option<usize>,
     },
     /// Emitted whenever older whole turns were dropped from structured history
     /// to fit a token budget or message cap. Surfaces a user-visible "context
@@ -1657,6 +1673,34 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_turn_generation_is_optional_and_wire_stable() {
+        let legacy: SessionPromptParams = serde_json::from_value(json!({
+            "session_id": "s",
+            "prompt": "hello",
+        }))
+        .unwrap();
+        assert_eq!(legacy.client_turn_generation, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("client_turn_generation")
+                .is_none()
+        );
+
+        let current: SessionPromptParams = serde_json::from_value(json!({
+            "session_id": "s",
+            "prompt": "hello",
+            "client_turn_generation": 9,
+        }))
+        .unwrap();
+        assert_eq!(current.client_turn_generation, Some(9));
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["client_turn_generation"],
+            json!(9)
+        );
+    }
+
+    #[test]
     fn file_source_default_is_file() {
         // `FileSource` does not derive `PartialEq`; assert via the wire
         // spelling instead. Default is `File` per the `#[default]`
@@ -1719,6 +1763,18 @@ mod tests {
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("approval_request"));
         assert!(v.get("tool_name").is_some(), "got: {v}");
+
+        let evt = SessionUpdateEvent::TurnComplete {
+            session_id: "s".into(),
+            outcome: TurnCompletionOutcome::Cancelled,
+            content: "cancelled".into(),
+            client_turn_generation: Some(9),
+            message_count: Some(4),
+        };
+        let v = serde_json::to_value(evt).unwrap();
+        assert_eq!(v["type"], json!("turn_complete"));
+        assert_eq!(v["client_turn_generation"], json!(9));
+        assert_eq!(v["message_count"], json!(4));
     }
 
     #[test]
