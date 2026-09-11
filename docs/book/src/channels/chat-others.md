@@ -72,8 +72,8 @@ curl -X POST https://api.sendblue.com/api/account/webhooks \
 > `sb-signing-secret` header, so the gateway can only compare that value; there
 > is nothing to recompute. Because the secret is not bound to the request body,
 > a captured header can be replayed with forged content. Sendblue enforces
-> HTTPS on webhook URLs, which is what keeps the header off the wire — do not
-> terminate the route on plain HTTP. With `signing_secret` unset the route
+> HTTPS on webhook URLs, which is what keeps the header off the wire, so do
+> not terminate the route on plain HTTP. With `signing_secret` unset the route
 > refuses inbound requests with `401` rather than accepting them
 > unauthenticated. Prefer polling unless you need push latency.
 >

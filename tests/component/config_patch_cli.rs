@@ -95,6 +95,10 @@ fn test_state(config: Config) -> AppState {
         linq: HashMap::new(),
         #[cfg(feature = "channel-linq")]
         linq_signing_secrets: HashMap::new(),
+        #[cfg(feature = "channel-sendblue")]
+        sendblue: HashMap::new(),
+        #[cfg(feature = "channel-sendblue")]
+        sendblue_signing_secrets: HashMap::new(),
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk: HashMap::new(),
         #[cfg(feature = "channel-nextcloud")]
