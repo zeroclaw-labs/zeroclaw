@@ -307,7 +307,7 @@ mod tests {
     /// `external_peers = [""]` parses, and Telegram, LINE and WeChat build a
     /// pairing guard only when `grants_anyone` is false. Counting the blank as
     /// authorization left every real sender rejected with no recovery code
-    /// on offer, which is the pairing dead end #9428 documents the opposite of.
+    /// on offer, which is a pairing dead end.
     #[test]
     fn grants_anyone_ignores_blank_and_whitespace_grants() {
         assert!(!grants_anyone(&[String::new()]));
