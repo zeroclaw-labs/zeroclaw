@@ -1671,7 +1671,9 @@ async fn rename_config_cascade(
 /// unreadable source is an `Err`, never a "nothing to move": collapsing a
 /// metadata failure into absence would let a committed rename report a clean
 /// result while the retired workspace is still on disk, and recreating the old
-/// alias would then resolve to the previous incarnation's files.
+/// alias would then resolve to the previous incarnation's files. The shared
+/// runtime probe decides which of the three answers applies, so the distinction
+/// does not depend on how a given platform spells a metadata failure.
 async fn move_renamed_workspace(
     old_ws: &std::path::Path,
     new_ws: &std::path::Path,
@@ -1679,9 +1681,9 @@ async fn move_renamed_workspace(
     if old_ws == new_ws {
         return Ok(false);
     }
-    match tokio::fs::try_exists(old_ws).await {
-        Ok(false) => return Ok(false),
-        Err(err) => {
+    match zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(old_ws).await {
+        zeroclaw_runtime::agent_owned_state::PathPresence::Absent => return Ok(false),
+        zeroclaw_runtime::agent_owned_state::PathPresence::Uninspectable(err) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1689,7 +1691,7 @@ async fn move_renamed_workspace(
                     .with_attrs(::serde_json::json!({
                         "old": old_ws.display().to_string(),
                         "new": new_ws.display().to_string(),
-                        "err": err.to_string()
+                        "err": err.clone()
                     })),
                 "agent rename: workspace inspection failed"
             );
@@ -1698,7 +1700,7 @@ async fn move_renamed_workspace(
                 old_ws.display()
             ));
         }
-        Ok(true) => {}
+        zeroclaw_runtime::agent_owned_state::PathPresence::Present => {}
     }
     if let Some(parent) = new_ws.parent()
         && let Err(err) = tokio::fs::create_dir_all(parent).await
@@ -3275,7 +3277,12 @@ mod tests {
         let unreadable_parent = tmp.path().join("unreadable-parent");
         std::fs::write(&unreadable_parent, b"blocks child metadata").unwrap();
         let unreadable = unreadable_parent.join("from-ws");
-        assert!(unreadable.try_exists().is_err());
+        assert!(
+            zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(&unreadable)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the source uninspectable, not absent"
+        );
         let inspection = move_renamed_workspace(&unreadable, &new_ws)
             .await
             .expect_err("an unreadable source must surface a warning");
@@ -3600,7 +3607,12 @@ mod tests {
         let saved_workspace_root = workspace_root.with_extension("saved");
         std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
         std::fs::write(&workspace_root, b"blocks child metadata").unwrap();
-        assert!(old_ws.try_exists().is_err());
+        assert!(
+            zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(&old_ws)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the workspace uninspectable, not absent"
+        );
 
         let state = crate::api::test_state(config.clone());
         let body = RenameMapKeyBody {

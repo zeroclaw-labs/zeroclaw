@@ -654,9 +654,10 @@ async fn agent_rename_owned_state(
         // An unreadable source is residue, not absence: reporting a metadata
         // failure as "nothing to move" would leave the retired workspace on
         // disk while the rename looks clean, and recreating the old alias would
-        // resolve to the previous incarnation's files.
-        match tokio::fs::try_exists(old_ws).await {
-            Ok(true) => {
+        // resolve to the previous incarnation's files. The shared runtime probe
+        // makes that distinction the same way on every supported platform.
+        match zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(old_ws).await {
+            zeroclaw_runtime::agent_owned_state::PathPresence::Present => {
                 if let Some(parent) = new_ws.parent() {
                     tokio::fs::create_dir_all(parent).await.ok();
                 }
@@ -672,8 +673,8 @@ async fn agent_rename_owned_state(
                     );
                 }
             }
-            Ok(false) => {}
-            Err(e) => {
+            zeroclaw_runtime::agent_owned_state::PathPresence::Absent => {}
+            zeroclaw_runtime::agent_owned_state::PathPresence::Uninspectable(e) => {
                 let es = format!("workspace inspection failed for {}: {e}", old_ws.display());
                 eprintln!(
                     "{}",
@@ -1136,7 +1137,12 @@ mod tests {
         let saved_agent_root = agent_root.with_extension("saved");
         std::fs::rename(&agent_root, &saved_agent_root).unwrap();
         std::fs::write(&agent_root, b"blocks child metadata").unwrap();
-        assert!(workspace.try_exists().is_err());
+        assert!(
+            zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(&workspace)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the workspace uninspectable, not absent"
+        );
 
         let (archive, _report) = run_agent_delete_cascade(&config, "victim", &workspace)
             .await

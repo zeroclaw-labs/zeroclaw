@@ -75,6 +75,101 @@ fn resolve_session_backend_for_owned_state(
         .map(Some)
 }
 
+/// What a filesystem probe could establish about a lifecycle path.
+///
+/// The alias lifecycle needs three answers, not two. "Exists" and "does not
+/// exist" both let a cascade proceed; "cannot tell" must fail toward residue so
+/// the surface stays retryable instead of reporting convergence over state that
+/// is still on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathPresence {
+    /// The path exists.
+    Present,
+    /// The path is genuinely absent and every component leading to it was
+    /// inspectable.
+    Absent,
+    /// The path could not be inspected. The payload is the operator-visible
+    /// reason.
+    Uninspectable(String),
+}
+
+impl PathPresence {
+    /// Is this the fail-toward-residue answer?
+    #[must_use]
+    pub fn is_uninspectable(&self) -> bool {
+        matches!(self, Self::Uninspectable(_))
+    }
+
+    /// The operator-visible reason, when the path could not be inspected.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Uninspectable(reason) => Some(reason.as_str()),
+            Self::Present | Self::Absent => None,
+        }
+    }
+}
+
+/// Find the component of `path` that stands between the caller and an answer.
+///
+/// Walks upward from the parent to the first ancestor that exists. A directory
+/// there means `path` is genuinely absent. Anything else - a file standing
+/// where a directory must be, or an ancestor that cannot be inspected either -
+/// means the probe never reached `path` at all.
+async fn obstructing_ancestor(path: &Path) -> Option<String> {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        match tokio::fs::metadata(ancestor).await {
+            Ok(metadata) if metadata.is_dir() => return None,
+            Ok(_) => {
+                return Some(format!("{} is not a directory", ancestor.display()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Some(format!(
+                    "{} could not be inspected: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Turn one `try_exists` result into a [`PathPresence`], identically on every
+/// supported platform.
+///
+/// `Ok(false)` is not proof of absence. When a component of the path is a file
+/// rather than a directory, Unix surfaces `ENOTDIR` as an `Err` while Windows
+/// reports the same shape as an ordinary "not found", so a predicate written
+/// against the error shape silently flips meaning between platforms. Re-walking
+/// the ancestors of a negative probe is what makes the recovery contract the
+/// same everywhere: an uninspectable workspace is residue on Windows too.
+///
+/// Kept separate from [`inspect_lifecycle_path`] so both probe shapes can be
+/// driven explicitly from a single host's unit tests.
+async fn classify_presence(path: &Path, probe: std::io::Result<bool>) -> PathPresence {
+    match probe {
+        Ok(true) => PathPresence::Present,
+        Err(error) => PathPresence::Uninspectable(error.to_string()),
+        Ok(false) => match obstructing_ancestor(path).await {
+            Some(reason) => PathPresence::Uninspectable(reason),
+            None => PathPresence::Absent,
+        },
+    }
+}
+
+/// Canonical presence probe for every alias-lifecycle path.
+///
+/// Gateway, CLI and RPC all answer "is this workspace still there" through this
+/// one function so that a metadata failure can never be read as absence on one
+/// platform and as residue on another.
+pub async fn inspect_lifecycle_path(path: &Path) -> PathPresence {
+    classify_presence(path, tokio::fs::try_exists(path).await).await
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CommittedLifecycle {
     Delete,
@@ -96,9 +191,9 @@ async fn committed_residue_exists(
     alias: &str,
     lifecycle: CommittedLifecycle,
 ) -> bool {
-    match config.agent_workspace_dir(alias).try_exists() {
-        Ok(true) | Err(_) => return true,
-        Ok(false) => {}
+    match inspect_lifecycle_path(&config.agent_workspace_dir(alias)).await {
+        PathPresence::Present | PathPresence::Uninspectable(_) => return true,
+        PathPresence::Absent => {}
     }
 
     if crate::cron::list_jobs_by_agent(config, alias)
@@ -141,8 +236,8 @@ async fn committed_residue_exists(
     }
 
     let knowledge_path = config.knowledge.resolved_db_path();
-    match knowledge_path.try_exists() {
-        Ok(true) => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+    match inspect_lifecycle_path(&knowledge_path).await {
+        PathPresence::Present => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
@@ -150,8 +245,8 @@ async fn committed_residue_exists(
             Err(_) => return true,
             Ok(_) => {}
         },
-        Err(_) => return true,
-        Ok(false) => {}
+        PathPresence::Uninspectable(_) => return true,
+        PathPresence::Absent => {}
     }
 
     match resolve_session_backend_for_owned_state(config, session_backend) {
@@ -297,8 +392,8 @@ pub async fn archive_agent_workspace(
             archive_dir
         }
     };
-    match workspace.try_exists() {
-        Ok(true) => {
+    match inspect_lifecycle_path(workspace).await {
+        PathPresence::Present => {
             let destination = archive_dir.join("workspace");
             if let Err(error) = tokio::fs::rename(workspace, &destination).await {
                 ::zeroclaw_log::record!(
@@ -320,8 +415,8 @@ pub async fn archive_agent_workspace(
                 ));
             }
         }
-        Ok(false) => {}
-        Err(error) => {
+        PathPresence::Absent => {}
+        PathPresence::Uninspectable(error) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -329,7 +424,7 @@ pub async fn archive_agent_workspace(
                     .with_attrs(::serde_json::json!({
                         "agent": alias,
                         "workspace": workspace.display().to_string(),
-                        "error": error.to_string(),
+                        "error": error.clone(),
                     })),
                 "agent delete: workspace inspection failed"
             );
@@ -787,6 +882,106 @@ pub async fn cascade_rename_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lifecycle probe must answer the same way whichever shape the host
+    /// reports a blocked path in. Unix returns `ENOTDIR` from `try_exists`,
+    /// Windows returns an ordinary `Ok(false)`; both are driven explicitly here
+    /// so the contract is proven on a single host rather than only on the
+    /// platform this suite happens to run on.
+    #[tokio::test]
+    async fn a_blocked_path_is_uninspectable_in_both_probe_shapes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "stands where a directory must be").unwrap();
+        let blocked = blocker.join("agents").join("alpha").join("workspace");
+
+        // The Windows shape: the platform reports plain absence.
+        assert!(
+            classify_presence(&blocked, Ok(false))
+                .await
+                .is_uninspectable(),
+            "a negative probe over a non-directory ancestor is not absence"
+        );
+
+        // The Unix shape: the platform reports a metadata error.
+        let unix_shape = std::io::Error::from_raw_os_error(20);
+        assert!(
+            classify_presence(&blocked, Err(unix_shape))
+                .await
+                .is_uninspectable(),
+            "a metadata failure is not absence either"
+        );
+
+        // And the live probe agrees with both, whichever shape this host used.
+        let live = inspect_lifecycle_path(&blocked).await;
+        assert!(
+            live.is_uninspectable(),
+            "the live probe must fail toward residue: {live:?}"
+        );
+        assert!(live.reason().is_some());
+    }
+
+    /// Failing toward residue must not swallow genuine absence: a missing path
+    /// under a real directory is still absent in both probe shapes, so an
+    /// ordinary delete or rename is not turned into a permanent retry.
+    #[tokio::test]
+    async fn a_missing_path_under_a_real_directory_is_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("agents").join("alpha").join("workspace");
+
+        assert_eq!(
+            classify_presence(&missing, Ok(false)).await,
+            PathPresence::Absent
+        );
+        assert_eq!(inspect_lifecycle_path(&missing).await, PathPresence::Absent);
+
+        let present = tmp.path().join("present");
+        std::fs::create_dir_all(&present).unwrap();
+        assert_eq!(
+            inspect_lifecycle_path(&present).await,
+            PathPresence::Present
+        );
+    }
+
+    /// The residue contract is what the surfaces actually consult, so pin it to
+    /// the platform-independent answer rather than to the probe shape: a
+    /// workspace that cannot be inspected keeps a committed delete retryable.
+    #[tokio::test]
+    async fn committed_delete_residue_covers_an_uninspectable_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("install").join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        // Nothing owned anywhere: the alias is converged.
+        std::fs::create_dir_all(config.install_root_dir()).unwrap();
+        assert!(!committed_delete_residue_exists(&config, None, None, "victim").await);
+
+        // Now block the workspace's ancestors with a file. Whether this host
+        // reports that as an error or as plain absence, it is residue.
+        let agents_root = config.install_root_dir().join("agents");
+        std::fs::write(&agents_root, "blocks child metadata").unwrap();
+        let workspace = config.agent_workspace_dir("victim");
+        assert!(
+            inspect_lifecycle_path(&workspace).await.is_uninspectable(),
+            "fixture must block the workspace probe"
+        );
+        assert!(
+            committed_delete_residue_exists(&config, None, None, "victim").await,
+            "an uninspectable workspace is residue the retry must see"
+        );
+    }
 
     fn seed_owned_cron_job(config: &Config, alias: &str, prompt: &str) {
         crate::cron::add_agent_job(

@@ -465,15 +465,18 @@ async fn move_renamed_agent_workspace(
     if old_workspace == new_workspace {
         return None;
     }
-    match tokio::fs::try_exists(old_workspace).await {
-        Ok(false) => return None,
-        Err(err) => {
+    // An unreadable source is residue, not absence, on every platform: the
+    // shared probe re-checks the ancestors of a negative answer so a file
+    // standing in for a directory reads the same way here as it does on Unix.
+    match crate::agent_owned_state::inspect_lifecycle_path(old_workspace).await {
+        crate::agent_owned_state::PathPresence::Absent => return None,
+        crate::agent_owned_state::PathPresence::Uninspectable(err) => {
             return Some(format!(
                 "workspace inspection failed for {}: {err}",
                 old_workspace.display()
             ));
         }
-        Ok(true) => {}
+        crate::agent_owned_state::PathPresence::Present => {}
     }
     if let Some(parent) = new_workspace.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -10256,7 +10259,12 @@ mod tests {
         let saved_workspace_root = workspace_root.with_extension("saved");
         std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
         std::fs::write(&workspace_root, "blocks child metadata").unwrap();
-        assert!(old_workspace.try_exists().is_err());
+        assert!(
+            crate::agent_owned_state::inspect_lifecycle_path(&old_workspace)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the workspace uninspectable, not absent"
+        );
 
         let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
         let blocked_retry = dispatcher
@@ -10558,8 +10566,10 @@ mod tests {
         std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
         std::fs::write(&workspace_root, "blocks child metadata").unwrap();
         assert!(
-            workspace.try_exists().is_err(),
-            "the test must exercise metadata failure, not ordinary absence"
+            crate::agent_owned_state::inspect_lifecycle_path(&workspace)
+                .await
+                .is_uninspectable(),
+            "the test must exercise an uninspectable workspace, not ordinary absence"
         );
 
         let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
