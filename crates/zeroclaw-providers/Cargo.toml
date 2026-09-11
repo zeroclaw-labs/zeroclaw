@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "LLM provider implementations, auth services, and multimodal processing."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
