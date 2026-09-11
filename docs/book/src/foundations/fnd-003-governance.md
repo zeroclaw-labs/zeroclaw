@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 16
+> Starting v0.7.0 · Type: Governance · Rev. 17
 >
-> **Canonical reference** · Ratified by the team · Rev. 16
+> **Canonical reference** · Ratified by the team · Rev. 17
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -34,6 +34,7 @@
 | 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
 | 15 | 2026-08-10 | Narrowed the RFC trigger to four project-level categories and named the ordinary work that does not require an RFC; replaced the seven-day discussion period with 48h ordinary / 72h exceptional; defined the 72-hour vote against an immutable snapshot, the 30-day active electorate, two-ballot quorum, silence-as-approval after quorum, non-vetoing `REVISE`, and outcome precedence; made two-thirds the default threshold and reserved unanimity for expensive or irreversible decisions; retired the nonexistent parallel `rfc:*` label family; added the GitHub bridge record for Core meeting decisions ([#9499](https://github.com/zeroclaw-labs/zeroclaw/pull/9499)) |
 | 16 | 2026-08-22 | Calibrated consequence-based PR risk routing, retained `risk:manual` as an automation freeze, and required two independent Core Team approvals for `risk:high` or `domain:security` PRs ([#10192](https://github.com/zeroclaw-labs/zeroclaw/pull/10192)) |
+| 17 | 2026-09-08 | Added the accepted five-business-day expedited merge lane for bounded PRs with one non-author Core approval, clean exact-head advisory evidence, green required CI, and no unresolved holds or findings ([#10366](https://github.com/zeroclaw-labs/zeroclaw/issues/10366)) |
 
 ---
 
@@ -444,7 +445,7 @@ Configure the following branch protection rules for `master`:
 | Rule | Setting | Reason |
 |---|---|---|
 | Require a pull request before merging | Enabled | No direct pushes to master, ever |
-| Require approvals | At least 1 GitHub approval; `risk:high` or `domain:security` requires 2 independent Core Team approvals before merge | CODEOWNERS routes review; the conditional two-approval rule is an explicit merge requirement |
+| Require approvals | At least 1 GitHub approval; `risk:high` or `domain:security` defaults to 2 independent Core Team approvals before merge, with only the accepted expedited exception below | CODEOWNERS routes review; the conditional two-approval rule and its narrow exception are explicit merge requirements |
 | Require status checks to pass | `cargo fmt`, `cargo clippy`, `cargo test` | CI must be green before merge |
 | Require branches to be up to date | Enabled | Prevents merging stale code |
 | Require conversation resolution | Enabled | All review comments must be resolved |
@@ -453,6 +454,8 @@ Configure the following branch protection rules for `master`:
 | Allow deletions | Disabled | Protect the branch |
 
 **Why admins cannot bypass:** One of the most common mistakes in small team projects is treating branch protection as "for other people." When an admin can bypass, they will, under time pressure, in an emergency, "just this once." Then it becomes the norm. The rule must apply to everyone for it to mean anything. If there is a genuine emergency, the right response is to follow the process faster, not to skip it.
+
+The accepted [expedited merge lane](../maintainers/pr-workflow.md#expedited-second-review-lane) is the only standing exception to the two-Core default. It combines #10366's evidence-based exception with this document's existing five-business-day review target. The lane is not automatic, automated review is not an approval, and broad governance, security-floor, release, migration, and irreversible architecture changes continue to default to two human approvals. The maintainer PR workflow owns the full eligibility and accountability rules.
 
 GitHub's native approval count is configured per protected branch or ruleset target, not conditionally by PR label. Until a separately approved technical enforcement design has a machine-readable authority for Core Team approval, maintainers must apply the `risk:high OR domain:security` requirement through the documented merge checklist and retain an auditable review record. `risk:manual` freezes future automatic risk replacement only; it cannot lower this requirement.
 
@@ -705,7 +708,7 @@ Use `#f1f5f9` (light gray) for all component labels to distinguish them visually
 |---|---|---|
 | `risk:low` | `#dcfce7` | Documentation, fixtures, generated references, and mechanical metadata with no production, compatibility, build, release, or governance effect |
 | `risk:medium` | `#fef9c3` | Ordinary behavioral production work, including most runtime, gateway, provider, channel, tool, config, application, and CI changes |
-| `risk:high` | `#fee2e2` | Concrete trust, credential, compatibility, governance, or release-authority boundary requiring deep review and two independent Core Team approvals |
+| `risk:high` | `#fee2e2` | Concrete trust, credential, compatibility, governance, or release-authority boundary requiring deep review and defaulting to two independent Core Team approvals; see the [expedited second-review lane](../maintainers/pr-workflow.md#expedited-second-review-lane) |
 
 ### `status:` Where is this in the process?
 
