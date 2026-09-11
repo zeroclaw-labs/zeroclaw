@@ -2693,7 +2693,7 @@ mod tests {
             "a shutdown is unaffected by the drain verdict"
         );
         assert!(
-            settle_exit_against_drain(Err(anyhow::anyhow!("boom")), RpcDrain::Outstanding(1))
+            settle_exit_against_drain(Err(anyhow::Error::msg("boom")), RpcDrain::Outstanding(1))
                 .is_err(),
             "a failed daemon run must keep reporting its failure"
         );
