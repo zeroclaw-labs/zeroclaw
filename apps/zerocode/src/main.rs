@@ -17,6 +17,7 @@ use std::time::Duration;
 use clap::Parser;
 
 mod acp;
+mod agent_sidebar;
 mod app;
 mod attachment;
 mod chat;
