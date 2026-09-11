@@ -221,7 +221,7 @@ pub struct SlackChannel {
     lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     cancel_reaction: Option<String>,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<AsyncMutex<HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -1356,7 +1356,7 @@ impl SlackChannel {
     async fn get_bot_user_id(&self) -> Option<String> {
         let resp: serde_json::Value = self
             .http_client()
-            .get("https://slack.com/api/auth.test")
+            .get(self.slack_api_url("auth.test"))
             .bearer_auth(&self.bot_token)
             .send()
             .await
@@ -3870,15 +3870,24 @@ impl SlackChannel {
     }
 
     /// Try to parse a Socket Mode `interactive` envelope as an approval button tap.
-    /// Returns `Some((token, response))` when the first action's `action_id` matches
-    /// `"approval_{TOKEN}_{approve|deny|always}"`, `None` otherwise.
+    /// Returns the token, response, responder, and channel when the first
+    /// action matches `"approval_{TOKEN}_{approve|deny|always}"`.
     fn try_parse_approval_block_action(
         envelope: &serde_json::Value,
-    ) -> Option<(String, ChannelApprovalResponse)> {
+    ) -> Option<(String, ChannelApprovalResponse, String, String)> {
         let payload = envelope.get("payload")?;
         if payload.get("type").and_then(|v| v.as_str())? != "block_actions" {
             return None;
         }
+        let responder = payload
+            .pointer("/user/id")
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())?;
+        let channel = payload
+            .pointer("/channel/id")
+            .or_else(|| payload.pointer("/container/channel_id"))
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())?;
         let action_id = payload
             .get("actions")
             .and_then(|a| a.as_array())
@@ -3896,7 +3905,41 @@ impl SlackChannel {
             "always" => ChannelApprovalResponse::AlwaysApprove,
             _ => return None,
         };
-        Some((token.to_string(), response))
+        Some((
+            token.to_string(),
+            response,
+            responder.to_string(),
+            channel.to_string(),
+        ))
+    }
+
+    async fn handle_socket_mode_interactive(
+        &self,
+        envelope: &serde_json::Value,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        bot_user_id: &str,
+    ) -> bool {
+        if let Some((token, response, responder, channel)) =
+            Self::try_parse_approval_block_action(envelope)
+        {
+            crate::util::resolve_pending_approval(
+                &self.pending_approvals,
+                &token,
+                response,
+                self.is_user_allowed(&responder),
+                &channel,
+            )
+            .await;
+            return true;
+        }
+
+        if let Some(msg) = Self::parse_block_action_as_command(envelope, bot_user_id, &self.alias)
+            && tx.send(msg).await.is_err()
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Parse a Socket Mode `interactive` envelope containing a `block_actions`
@@ -4205,18 +4248,9 @@ impl SlackChannel {
 
                 // Handle interactive payloads (block_actions from /config UI or approval buttons).
                 if envelope_type == "interactive" {
-                    if let Some((token, response)) =
-                        Self::try_parse_approval_block_action(&envelope)
-                    {
-                        let mut map = self.pending_approvals.lock().await;
-                        if let Some(sender) = map.remove(&token) {
-                            let _ = sender.send(response);
-                        }
-                        continue;
-                    }
-                    if let Some(msg) =
-                        Self::parse_block_action_as_command(&envelope, bot_user_id, &self.alias)
-                        && tx.send(msg).await.is_err()
+                    if !self
+                        .handle_socket_mode_interactive(&envelope, &tx, bot_user_id)
+                        .await
                     {
                         return Ok(());
                     }
@@ -4396,12 +4430,17 @@ impl SlackChannel {
                 };
 
                 if let Some((token, response)) = crate::util::parse_approval_reply(&normalized_text)
+                    && crate::util::resolve_pending_approval(
+                        &self.pending_approvals,
+                        &token,
+                        response,
+                        self.is_user_allowed(user),
+                        &channel_id,
+                    )
+                    .await
+                    .suppresses_message()
                 {
-                    let mut map = self.pending_approvals.lock().await;
-                    if let Some(ap_sender) = map.remove(&token) {
-                        let _ = ap_sender.send(response);
-                        continue;
-                    }
+                    continue;
                 }
 
                 let sender = self.resolve_sender_identity(user).await;
@@ -4553,7 +4592,7 @@ impl SlackChannel {
         for attempt in 0..=SLACK_HISTORY_MAX_RETRIES {
             let resp = match self
                 .http_client()
-                .get("https://slack.com/api/conversations.history")
+                .get(self.slack_api_url("conversations.history"))
                 .bearer_auth(&self.bot_token)
                 .query(params)
                 .send()
@@ -5772,12 +5811,17 @@ impl Channel for SlackChannel {
 
                         if let Some((token, response)) =
                             crate::util::parse_approval_reply(&normalized_text)
+                            && crate::util::resolve_pending_approval(
+                                &self.pending_approvals,
+                                &token,
+                                response,
+                                self.is_user_allowed(user),
+                                &channel_id,
+                            )
+                            .await
+                            .suppresses_message()
                         {
-                            let mut map = self.pending_approvals.lock().await;
-                            if let Some(ap_sender) = map.remove(&token) {
-                                let _ = ap_sender.send(response);
-                                continue;
-                            }
+                            continue;
                         }
 
                         let channel_msg = ChannelMessage {
@@ -5874,12 +5918,17 @@ impl Channel for SlackChannel {
 
                     if let Some((token, response)) =
                         crate::util::parse_approval_reply(&normalized_text)
+                        && crate::util::resolve_pending_approval(
+                            &self.pending_approvals,
+                            &token,
+                            response,
+                            self.is_user_allowed(user),
+                            &thread_channel_id,
+                        )
+                        .await
+                        .suppresses_message()
                     {
-                        let mut map = self.pending_approvals.lock().await;
-                        if let Some(ap_sender) = map.remove(&token) {
-                            let _ = ap_sender.send(response);
-                            continue;
-                        }
+                        continue;
                     }
 
                     let channel_msg = ChannelMessage {
@@ -5962,10 +6011,14 @@ impl Channel for SlackChannel {
         let token = crate::util::new_approval_token();
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: recipient.to_string(),
+                tool_name: request.tool_name.clone(),
+            },
+        );
 
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
@@ -8757,22 +8810,285 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_approval_oneshot_delivers_response() {
+    async fn pending_approval_requires_allowed_user_and_origin_channel() {
         let ch = SlackChannel::new(
             "xoxb-token".into(),
             None,
             vec![],
             "slack_test_alias",
-            Arc::new(Vec::new),
+            Arc::new(|| vec!["U_OPERATOR".into()]),
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::AlwaysApprove).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "C_ORIGIN".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        for response in [
+            ChannelApprovalResponse::Approve,
+            ChannelApprovalResponse::Deny,
+            ChannelApprovalResponse::AlwaysApprove,
+        ] {
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &ch.pending_approvals,
+                    "abc123",
+                    response,
+                    ch.is_user_allowed("U_OTHER"),
+                    "C_ORIGIN",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+        }
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                "abc123",
+                ChannelApprovalResponse::Approve,
+                ch.is_user_allowed("U_OPERATOR"),
+                "C_OTHER",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Rejected,
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                "abc123",
+                ChannelApprovalResponse::AlwaysApprove,
+                ch.is_user_allowed("U_OPERATOR"),
+                "C_ORIGIN",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Resolved,
+        );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+        let (approve_tx, approve_rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "def456".to_string(),
+            crate::util::PendingApproval {
+                sender: approve_tx,
+                destination: "C_ORIGIN".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        assert_eq!(
+            crate::util::resolve_pending_approval(
+                &ch.pending_approvals,
+                "def456",
+                ChannelApprovalResponse::Approve,
+                ch.is_user_allowed("U_OPERATOR"),
+                "C_ORIGIN",
+            )
+            .await,
+            crate::util::PendingApprovalResolution::Resolved,
+        );
+        assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn polling_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth.test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "user_id": "U_BOT" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/conversations.history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "messages": [
+                    { "ts": "9999999999.000003", "user": "U_OTHER", "text": "other1 deny" },
+                    { "ts": "9999999999.000002", "user": "U_OPERATOR", "text": "wrong1 deny" },
+                    { "ts": "9999999999.000001", "user": "U_OPERATOR", "text": "auth01 approve" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = SlackChannel::new(
+            "xoxb-token".into(),
+            None,
+            vec!["C_ORIGIN".into()],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_OPERATOR".into()]),
+        )
+        .with_api_base_url(server.uri());
+        let pending = Arc::clone(&channel.pending_approvals);
+        let (approved_tx, approved_rx) = oneshot::channel();
+        let (wrong_tx, _wrong_rx) = oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+        {
+            let mut approvals = pending.lock().await;
+            approvals.insert(
+                "auth01".into(),
+                crate::util::PendingApproval {
+                    sender: approved_tx,
+                    destination: "C_ORIGIN".into(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            approvals.insert(
+                "wrong1".into(),
+                crate::util::PendingApproval {
+                    sender: wrong_tx,
+                    destination: "C_OTHER".into(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            approvals.insert(
+                "other1".into(),
+                crate::util::PendingApproval {
+                    sender: unauthorized_tx,
+                    destination: "C_ORIGIN".into(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+        }
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(4);
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(6), approved_rx)
+                .await
+                .expect("polling ingress should resolve the authorized approval")
+                .expect("approval manager sender should stay open"),
+            ChannelApprovalResponse::Approve
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+                .await
+                .is_err(),
+            "approval-shaped messages must not reach agent dispatch"
+        );
+        let approvals = pending.lock().await;
+        assert!(approvals.contains_key("wrong1"));
+        assert!(approvals.contains_key("other1"));
+        drop(approvals);
+
+        listener.abort();
+        let _ = listener.await;
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path() == "/conversations.history"),
+            "test must drive the production polling ingress"
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_mode_interactive_ingress_suppresses_rejected_approval_replies() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let channel = SlackChannel::new(
+            "xoxb-token".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_OPERATOR".into()]),
+        );
+        let pending = Arc::clone(&channel.pending_approvals);
+        let (approved_tx, approved_rx) = oneshot::channel();
+        let (wrong_tx, _wrong_rx) = oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+        {
+            let mut approvals = pending.lock().await;
+            approvals.insert(
+                "auth01".into(),
+                crate::util::PendingApproval {
+                    sender: approved_tx,
+                    destination: "C_ORIGIN".into(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            approvals.insert(
+                "wrong1".into(),
+                crate::util::PendingApproval {
+                    sender: wrong_tx,
+                    destination: "C_ORIGIN".into(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            approvals.insert(
+                "other1".into(),
+                crate::util::PendingApproval {
+                    sender: unauthorized_tx,
+                    destination: "C_ORIGIN".into(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+        }
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(4);
+        let envelopes = [
+            serde_json::json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "user": { "id": "U_OTHER" },
+                    "channel": { "id": "C_ORIGIN" },
+                    "actions": [{ "action_id": "approval_other1_deny" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "user": { "id": "U_OPERATOR" },
+                    "channel": { "id": "C_OTHER" },
+                    "actions": [{ "action_id": "approval_wrong1_deny" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "user": { "id": "U_OPERATOR" },
+                    "channel": { "id": "C_ORIGIN" },
+                    "actions": [{ "action_id": "approval_auth01_approve" }]
+                }
+            }),
+        ];
+
+        for envelope in &envelopes {
+            assert!(
+                channel
+                    .handle_socket_mode_interactive(envelope, &tx, "U_BOT")
+                    .await,
+                "the live Socket Mode loop must continue after each interactive payload"
+            );
+        }
+
+        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbound_rx.recv())
+                .await
+                .is_err(),
+            "approval-shaped Socket Mode payloads must not reach agent dispatch"
+        );
+        let approvals = pending.lock().await;
+        assert!(approvals.contains_key("wrong1"));
+        assert!(approvals.contains_key("other1"));
     }
 
     #[test]
@@ -8780,12 +9096,17 @@ mod tests {
         let envelope = serde_json::json!({
             "payload": {
                 "type": "block_actions",
+                "user": { "id": "U_OPERATOR" },
+                "channel": { "id": "C_ORIGIN" },
                 "actions": [{ "action_id": "approval_abc123_approve" }]
             }
         });
-        let (token, response) = SlackChannel::try_parse_approval_block_action(&envelope).unwrap();
+        let (token, response, responder, channel) =
+            SlackChannel::try_parse_approval_block_action(&envelope).unwrap();
         assert_eq!(token, "abc123");
         assert_eq!(response, ChannelApprovalResponse::Approve);
+        assert_eq!(responder, "U_OPERATOR");
+        assert_eq!(channel, "C_ORIGIN");
     }
 
     #[test]
@@ -8793,12 +9114,17 @@ mod tests {
         let envelope = serde_json::json!({
             "payload": {
                 "type": "block_actions",
+                "user": { "id": "U_OPERATOR" },
+                "container": { "channel_id": "C_ORIGIN" },
                 "actions": [{ "action_id": "approval_xz9q1w_deny" }]
             }
         });
-        let (token, response) = SlackChannel::try_parse_approval_block_action(&envelope).unwrap();
+        let (token, response, responder, channel) =
+            SlackChannel::try_parse_approval_block_action(&envelope).unwrap();
         assert_eq!(token, "xz9q1w");
         assert_eq!(response, ChannelApprovalResponse::Deny);
+        assert_eq!(responder, "U_OPERATOR");
+        assert_eq!(channel, "C_ORIGIN");
     }
 
     #[test]
@@ -8810,6 +9136,29 @@ mod tests {
             }
         });
         assert!(SlackChannel::try_parse_approval_block_action(&envelope).is_none());
+    }
+
+    #[test]
+    fn approval_block_action_requires_non_empty_responder_and_channel() {
+        let empty_responder = serde_json::json!({
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "" },
+                "channel": { "id": "C_ORIGIN" },
+                "actions": [{ "action_id": "approval_abc123_approve" }]
+            }
+        });
+        assert!(SlackChannel::try_parse_approval_block_action(&empty_responder).is_none());
+
+        let empty_channel = serde_json::json!({
+            "payload": {
+                "type": "block_actions",
+                "user": { "id": "U_OPERATOR" },
+                "channel": { "id": "" },
+                "actions": [{ "action_id": "approval_abc123_approve" }]
+            }
+        });
+        assert!(SlackChannel::try_parse_approval_block_action(&empty_channel).is_none());
     }
 
     // --- Thread-context backfill tests ---

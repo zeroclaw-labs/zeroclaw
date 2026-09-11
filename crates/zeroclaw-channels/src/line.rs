@@ -1089,11 +1089,7 @@ impl LineChannel {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Reply API failed ({status}): {err}");
-            }
+            crate::util::ensure_success(resp, "Reply API").await?;
         }
         Ok(())
     }
@@ -1129,11 +1125,7 @@ impl LineChannel {
                 .send()
                 .await?;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Push API failed ({status}): {err}");
-            }
+            crate::util::ensure_success(resp, "Push API").await?;
         }
         Ok(())
     }

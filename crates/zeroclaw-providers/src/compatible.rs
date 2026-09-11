@@ -18,9 +18,11 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use zeroclaw_config::schema::ToolResultImagePolicy;
 
 /// Maximum silence between body reads for OpenAI-compatible SSE streams.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
 /// A model_provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -41,6 +43,10 @@ pub struct OpenAiCompatibleModelProvider {
     auth_profile_override: Option<String>,
     pub auth_header: AuthStyle,
     supports_vision: bool,
+    tool_result_image_policy: ToolResultImagePolicy,
+    /// Operator `[multimodal]` policy for this provider's image-marker
+    /// expansion pass. Resolved once at build time.
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
@@ -403,6 +409,8 @@ pub struct OpenAiCompatibleBuilder {
     credential: Option<String>,
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
+    tool_result_image_policy: ToolResultImagePolicy,
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user`] — the
     /// combined "merge + drop native tool calling" preset. Distinct from
@@ -478,6 +486,20 @@ impl OpenAiCompatibleBuilder {
     /// Enable OpenAI-style multimodal (image) inputs on this provider.
     pub fn vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Set the policy for image markers in native role=`tool` results.
+    pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
+        self.tool_result_image_policy = policy;
+        self
+    }
+
+    /// Set the root `[multimodal]` policy used when expanding `[IMAGE:...]`
+    /// markers into inline data URIs. Without this the provider falls back to
+    /// library defaults and operator limits never reach the outbound request.
+    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
         self
     }
 
@@ -673,6 +695,8 @@ impl OpenAiCompatibleBuilder {
             auth_profile_override: self.auth_profile_override,
             auth_header: auth_style,
             supports_vision: self.supports_vision,
+            tool_result_image_policy: self.tool_result_image_policy,
+            multimodal: self.multimodal,
             user_agent: self.user_agent,
             native_tool_calling,
             merge_system_into_user,
@@ -710,6 +734,8 @@ impl OpenAiCompatibleModelProvider {
             credential: None,
             auth_style: None,
             supports_vision: false,
+            tool_result_image_policy: ToolResultImagePolicy::default(),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             user_agent: None,
             merge_system_into_user: false,
             merge_system_into_user_preserve_native: false,
@@ -940,6 +966,10 @@ impl OpenAiCompatibleModelProvider {
             );
             Client::new()
         })
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.base_url)
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -2310,9 +2340,29 @@ impl OpenAiCompatibleModelProvider {
     }
 
     async fn normalize_messages_for_upstream(
+        &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let config = self.multimodal.clone();
+        let sanitized;
+        let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
+            sanitized = messages
+                .iter()
+                .map(|message| {
+                    if message.role == "tool" {
+                        ChatMessage {
+                            role: message.role.clone(),
+                            content: Self::sanitize_tool_result_message(&message.content),
+                        }
+                    } else {
+                        message.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            sanitized.as_slice()
+        } else {
+            messages
+        };
         let prepared = multimodal::prepare_messages_for_provider(messages, &config).await?;
         Ok(prepared.messages)
     }
@@ -2349,6 +2399,76 @@ impl OpenAiCompatibleModelProvider {
         }
 
         MessageContent::Parts(parts)
+    }
+
+    fn sanitize_tool_result_content(content: &str) -> String {
+        let mut cleaned = String::with_capacity(content.len());
+        let mut cursor = 0;
+        let mut removed_image_marker = false;
+
+        while let Some(relative_start) = content[cursor..].find("[IMAGE:") {
+            let start = cursor + relative_start;
+            cleaned.push_str(&content[cursor..start]);
+            removed_image_marker = true;
+
+            let after_prefix = start + "[IMAGE:".len();
+            cursor = content[after_prefix..]
+                .find(']')
+                .map(|relative_end| after_prefix + relative_end + 1)
+                .unwrap_or(content.len());
+            if cursor == content.len() {
+                break;
+            }
+        }
+
+        cleaned.push_str(&content[cursor..]);
+        if !removed_image_marker {
+            return content.to_string();
+        }
+
+        if !cleaned.is_empty() {
+            cleaned.push_str("\n\n");
+        }
+        cleaned.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
+        cleaned
+    }
+
+    fn sanitize_tool_result_message(content: &str) -> String {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content)
+            && let Some(tool_content) = value.get_mut("content")
+        {
+            let raw_content = tool_content
+                .as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| tool_content.to_string());
+            let sanitized_content = Self::sanitize_tool_result_content(&raw_content);
+            if sanitized_content == raw_content {
+                return content.to_string();
+            }
+            *tool_content = serde_json::Value::String(sanitized_content);
+            return value.to_string();
+        }
+
+        Self::sanitize_tool_result_content(content)
+    }
+
+    fn message_content_for_role(
+        &self,
+        role: &str,
+        content: &str,
+        allow_user_image_parts: bool,
+        allow_tool_image_parts: bool,
+    ) -> MessageContent {
+        if role == "tool" {
+            if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
+                return MessageContent::Text(Self::sanitize_tool_result_content(content));
+            }
+            if allow_tool_image_parts && allow_user_image_parts {
+                return Self::content_with_image_parts(content);
+            }
+            return MessageContent::Text(content.to_string());
+        }
+        Self::to_message_content(role, content, allow_user_image_parts)
     }
 
     fn convert_messages_for_native(
@@ -2483,13 +2603,21 @@ impl OpenAiCompatibleModelProvider {
                         .get("content")
                         .and_then(serde_json::Value::as_str)
                         .map(|value| {
-                            if allow_user_image_parts {
-                                Self::content_with_image_parts(value)
-                            } else {
-                                MessageContent::Text(value.to_string())
-                            }
+                            self.message_content_for_role(
+                                "tool",
+                                value,
+                                allow_user_image_parts,
+                                true,
+                            )
                         })
-                        .or_else(|| Some(MessageContent::Text(message.content.clone())));
+                        .or_else(|| {
+                            Some(self.message_content_for_role(
+                                "tool",
+                                &message.content,
+                                allow_user_image_parts,
+                                false,
+                            ))
+                        });
 
                     // Groq native tool calling requires the tool `name` on
                     // every role-tool message; look it up from the paired
@@ -2519,10 +2647,11 @@ impl OpenAiCompatibleModelProvider {
 
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(Self::to_message_content(
+                    content: Some(self.message_content_for_role(
                         &message.role,
                         &message.content,
                         allow_user_image_parts,
+                        false,
                     )),
                     tool_call_id: None,
                     tool_calls: None,
@@ -2723,7 +2852,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // servers with a public catalog use the same path without an Authorization header.
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
-            let url = format!("{}/models", self.base_url);
+            let url = self.models_url();
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
@@ -2814,7 +2943,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // endpoint — this returns pricing data that we can capture.
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
-            let url = format!("{}/models", self.base_url);
+            let url = self.models_url();
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
@@ -2917,11 +3046,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             role: "user".to_string(),
             content: message.to_string(),
         };
-        let normalized_user =
-            Self::normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
-                .await?
-                .pop()
-                .unwrap_or(user_msg);
+        let normalized_user = self
+            .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
+            .await?
+            .pop()
+            .unwrap_or(user_msg);
         let normalized_message = normalized_user.content;
 
         let merge = self.effective_merge_system(model);
@@ -3026,7 +3155,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<String> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(messages).await?;
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
         // Strip native tool constructs for non-native-tool model_providers.
@@ -3035,7 +3164,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             .iter()
             .map(|m| Message {
                 role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
+                content: self.message_content_for_role(&m.role, &m.content, !merge, false),
             })
             .collect();
 
@@ -3111,7 +3240,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(messages).await?;
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
@@ -3223,7 +3352,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
+        let normalized = self
+            .normalize_messages_for_upstream(request.messages)
+            .await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
@@ -3391,7 +3522,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
+            let normalized = match provider
+                .normalize_messages_for_upstream(&messages_owned)
+                .await
+            {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = tx
@@ -3427,7 +3561,12 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     .iter()
                     .map(|message| Message {
                         role: message.role.clone(),
-                        content: Self::to_message_content(&message.role, &message.content, !merge),
+                        content: provider.message_content_for_role(
+                            &message.role,
+                            &message.content,
+                            !merge,
+                            false,
+                        ),
                     })
                     .collect();
 
@@ -3591,10 +3730,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 role: "user".to_string(),
                 content: message_owned,
             };
-            let normalized_user = match Self::normalize_messages_for_upstream(std::slice::from_ref(
-                &user_msg,
-            ))
-            .await
+            let normalized_user = match provider
+                .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
+                .await
             {
                 Ok(mut msgs) => msgs.pop().unwrap_or(user_msg),
                 Err(err) => {
@@ -3723,7 +3861,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
+            let normalized = match provider
+                .normalize_messages_for_upstream(&messages_owned)
+                .await
+            {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = tx
@@ -3740,7 +3881,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 .iter()
                 .map(|m| Message {
                     role: m.role.clone(),
-                    content: Self::to_message_content(&m.role, &m.content, !merge),
+                    content: provider.message_content_for_role(&m.role, &m.content, !merge, false),
                 })
                 .collect();
 
@@ -3813,14 +3954,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit the appropriate URL with a GET to prime the connection pool.
-        // The server will likely return 405 Method Not Allowed, which is fine.
-        let url = self.chat_completions_url();
+        // Probe the catalog without invoking inference. Unsupported endpoints are
+        // still useful for connection warmup, so do not reject HTTP error statuses.
+        let url = self.models_url();
         let credential = self.resolve_credential().await?;
-        let _ = self
+        let mut response = self
             .apply_auth_header(self.http_client().get(&url), credential.as_deref())
             .send()
             .await?;
+        // Drain without retaining the catalog so HTTP/1 connections can be reused.
+        while response.chunk().await?.is_some() {}
         Ok(())
     }
 }
@@ -6160,6 +6303,77 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn operator_max_images_bounds_the_outbound_request() {
+        // Behaviour boundary: the number of images that survive into the
+        // messages this provider is about to send upstream. Asserting the
+        // config field alone would still pass if the expansion pass kept
+        // using library defaults.
+        let temp = tempfile::tempdir().unwrap();
+        // Minimal PNG signature bytes are enough for MIME detection.
+        let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        std::fs::write(&first, png).unwrap();
+        std::fs::write(&second, png).unwrap();
+
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both in a single message would exercise that eviction
+        // granularity rather than whether the operator's cap is honoured.
+        let messages = vec![
+            ChatMessage::user(format!("first [IMAGE:{}]", first.display())),
+            ChatMessage::user(format!("second [IMAGE:{}]", second.display())),
+        ];
+
+        let build = |multimodal| {
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url("https://example.com")
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .multimodal(multimodal)
+                .build()
+        };
+
+        let permissive = build(zeroclaw_config::schema::MultimodalConfig::default());
+        let prepared = permissive
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("default policy prepares both images");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            2,
+            "default policy admits both images"
+        );
+
+        let capped = build(zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        });
+        let prepared = capped
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("capped policy still prepares the message");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            1,
+            "an operator capping max_images must bound the outbound request"
+        );
+    }
+
+    #[test]
+    fn builder_without_multimodal_falls_back_to_library_defaults() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let defaults = zeroclaw_config::schema::MultimodalConfig::default();
+        assert_eq!(provider.multimodal.max_images, defaults.max_images);
+    }
+
     #[test]
     fn convert_messages_for_native_promotes_tool_result_image_markers() {
         // A tool result carrying an inline base64 image marker (e.g. a snapshot
@@ -6171,6 +6385,10 @@ mod tests {
         )];
 
         let provider = make_model_provider("test", "https://example.com", None);
+        assert_eq!(
+            provider.tool_result_image_policy,
+            ToolResultImagePolicy::ImageUrl
+        );
         let converted = provider.convert_messages_for_native(&input, true);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "tool");
@@ -6194,6 +6412,341 @@ mod tests {
             parts[1]["image_url"]["url"],
             "data:image/jpeg;base64,/9j/4AAQ"
         );
+    }
+
+    #[test]
+    fn convert_messages_for_native_omits_tool_result_image_payloads() {
+        let input = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_img",
+                "content": "before [IMAGE:data:image/jpeg;base64,/9j/4AAQ] middle [IMAGE:https://example.com/secret.png] after"
+            })
+            .to_string(),
+        )];
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+        let converted = provider.convert_messages_for_native(&input, false);
+        let content = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("tool message should carry content"),
+        )
+        .unwrap();
+        let content = content.as_str().expect("omitted tool content is text");
+
+        assert_eq!(
+            content,
+            "before  middle  after\n\n[tool-result image omitted by provider policy]"
+        );
+        assert_eq!(
+            content
+                .matches("[tool-result image omitted by provider policy]")
+                .count(),
+            1
+        );
+        assert!(!content.contains("data:image"));
+        assert!(!content.contains("https://example.com/secret.png"));
+        assert!(!content.contains("/9j/4AAQ"));
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_img"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_sanitizes_malformed_tool_result_json() {
+        let input = vec![ChatMessage::tool(
+            "malformed result [IMAGE:/tmp/secret.png]",
+        )];
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+
+        let converted = provider.convert_messages_for_native(&input, true);
+        let content = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("malformed tool message should carry content"),
+        )
+        .unwrap();
+        let content = content.as_str().expect("sanitized fallback should be text");
+
+        assert_eq!(converted[0].role, "tool");
+        assert_eq!(
+            content,
+            "malformed result \n\n[tool-result image omitted by provider policy]"
+        );
+        assert_eq!(converted[0].tool_call_id, None);
+        assert_eq!(converted[0].name, None);
+        assert!(!content.contains("[IMAGE:"));
+        assert!(!content.contains("/tmp/secret.png"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_sanitizes_non_string_tool_result_content() {
+        let input = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_obj",
+                "name": "read",
+                "content": {"payload": "[IMAGE:/tmp/secret.png]"}
+            })
+            .to_string(),
+        )];
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+
+        let converted = provider.convert_messages_for_native(&input, true);
+        let content = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("non-string tool message should carry content"),
+        )
+        .unwrap();
+        let content = content.as_str().expect("sanitized fallback should be text");
+
+        assert_eq!(converted[0].tool_call_id.as_deref(), Some("call_obj"));
+        assert_eq!(converted[0].name.as_deref(), Some("read"));
+        assert!(content.contains("\"payload\":\""));
+        assert!(content.contains(TOOL_RESULT_IMAGE_OMITTED_NOTICE));
+        assert_eq!(content.matches(TOOL_RESULT_IMAGE_OMITTED_NOTICE).count(), 1);
+        assert!(!content.contains("[IMAGE:"));
+        assert!(!content.contains("/tmp/secret.png"));
+    }
+
+    #[test]
+    fn convert_messages_for_native_sanitizes_unterminated_tool_result_marker() {
+        let input = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_unterminated",
+                "content": "prefix [IMAGE:/tmp/secret.png"
+            })
+            .to_string(),
+        )];
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+
+        let converted = provider.convert_messages_for_native(&input, true);
+        let content = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("unterminated tool message should carry content"),
+        )
+        .unwrap();
+        let content = content
+            .as_str()
+            .expect("sanitized tool content should be text");
+
+        assert_eq!(
+            content,
+            "prefix \n\n[tool-result image omitted by provider policy]"
+        );
+        assert_eq!(
+            converted[0].tool_call_id.as_deref(),
+            Some("call_unterminated")
+        );
+        assert!(!content.contains("[IMAGE:"));
+        assert!(!content.contains("/tmp/secret.png"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_no_tools_sanitizes_tool_result_request_content() {
+        let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        }))
+        .await;
+        provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
+
+        let messages = vec![ChatMessage::tool(
+            "history [IMAGE:data:image/png;base64,SECRET] tail",
+        )];
+        let response = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await
+            .expect("chat history should succeed");
+        assert_eq!(response, "ok");
+
+        let request = captured
+            .lock()
+            .expect("capture lock poisoned")
+            .pop()
+            .expect("server should capture request");
+        let content = request["messages"][0]["content"]
+            .as_str()
+            .expect("tool content should serialize as a string");
+        assert_eq!(
+            content,
+            "history  tail\n\n[tool-result image omitted by provider policy]"
+        );
+        assert!(!content.contains("[IMAGE:"));
+        assert!(!content.contains("data:image"));
+        assert!(!content.contains("SECRET"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_no_tools_sanitizes_escaped_tool_result_marker() {
+        let (mut provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}]
+        }))
+        .await;
+        provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
+
+        let messages = vec![ChatMessage::tool(
+            r#"{"tool_call_id":"call_escaped","name":"inspect","content":"before \u005bIMAGE:data:image/png;base64,SECRET] after"}"#,
+        )];
+        provider
+            .chat_with_history(&messages, "test-model", None)
+            .await
+            .expect("chat history should succeed");
+
+        let request = captured
+            .lock()
+            .expect("capture lock poisoned")
+            .pop()
+            .expect("server should capture request");
+        let envelope: serde_json::Value = serde_json::from_str(
+            request["messages"][0]["content"]
+                .as_str()
+                .expect("tool envelope should serialize as a string"),
+        )
+        .expect("tool envelope remains valid JSON");
+
+        assert_eq!(envelope["tool_call_id"], "call_escaped");
+        assert_eq!(envelope["name"], "inspect");
+        assert_eq!(
+            envelope["content"],
+            "before  after\n\n[tool-result image omitted by provider policy]"
+        );
+        let serialized = envelope.to_string();
+        assert!(!serialized.contains("[IMAGE:"));
+        assert!(!serialized.contains("data:image"));
+        assert!(!serialized.contains("SECRET"));
+        server.abort();
+    }
+
+    #[test]
+    fn convert_messages_for_native_omits_older_tool_results_across_rounds() {
+        let messages = vec![
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_old",
+                        "name": "first",
+                        "arguments": "{}"
+                    }]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_old",
+                    "content": "old result [IMAGE:/tmp/old.png]"
+                })
+                .to_string(),
+            ),
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_new",
+                        "name": "second",
+                        "arguments": "{}"
+                    }]
+                })
+                .to_string(),
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_new",
+                    "content": "new result [IMAGE:data:image/png;base64,NEW]"
+                })
+                .to_string(),
+            ),
+        ];
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+        let converted = provider.convert_messages_for_native(&messages, true);
+
+        assert_eq!(converted.len(), 4);
+        for (index, expected_id) in [(1, "call_old"), (3, "call_new")] {
+            assert_eq!(converted[index].role, "tool");
+            assert_eq!(converted[index].tool_call_id.as_deref(), Some(expected_id));
+            assert_eq!(
+                converted[index].name.as_deref(),
+                Some(if index == 1 { "first" } else { "second" })
+            );
+            let content = serde_json::to_value(
+                converted[index]
+                    .content
+                    .as_ref()
+                    .expect("historical tool result should carry content"),
+            )
+            .unwrap();
+            let content = content.as_str().expect("omitted tool content is text");
+            assert!(content.ends_with("[tool-result image omitted by provider policy]"));
+            assert!(!content.contains("[IMAGE:"));
+            assert!(!content.contains("data:image"));
+            assert!(!content.contains("/tmp/old.png"));
+            assert!(!content.contains("base64,NEW"));
+        }
+    }
+
+    #[test]
+    fn convert_messages_for_native_keeps_direct_user_images_under_omit_policy() {
+        let input = vec![ChatMessage::user(
+            "describe this [IMAGE:data:image/png;base64,USER]",
+        )];
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+
+        let converted = provider.convert_messages_for_native(&input, true);
+        let content = serde_json::to_value(
+            converted[0]
+                .content
+                .as_ref()
+                .expect("user message should carry content"),
+        )
+        .unwrap();
+        let parts = content
+            .as_array()
+            .expect("direct user image should remain structured");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,USER");
     }
 
     #[test]
@@ -6564,6 +7117,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warmup_uses_models_endpoint_with_existing_auth() {
+        use axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tokio::net::TcpListener;
+
+        for (base_path, status, auth_style, credential, header) in [
+            (
+                "",
+                200,
+                AuthStyle::Bearer,
+                Some("test-key"),
+                Some(("authorization", "Bearer test-key")),
+            ),
+            (
+                "/v1",
+                401,
+                AuthStyle::Bearer,
+                Some("test-key"),
+                Some(("authorization", "Bearer test-key")),
+            ),
+            (
+                "/v1/",
+                404,
+                AuthStyle::XApiKey,
+                Some("test-key"),
+                Some(("x-api-key", "test-key")),
+            ),
+            (
+                "/custom/api",
+                405,
+                AuthStyle::Custom("x-provider-key".into()),
+                Some("test-key"),
+                Some(("x-provider-key", "test-key")),
+            ),
+            ("/v1", 500, AuthStyle::Bearer, None, None),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let app = Router::new().fallback(move |request: Request<Body>| {
+                let tx = tx.clone();
+                async move {
+                    tx.send((
+                        request.method().clone(),
+                        request.uri().path().to_owned(),
+                        request.headers().clone(),
+                    ))
+                    .await
+                    .unwrap();
+                    (StatusCode::from_u16(status).unwrap(), "probe body")
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url(&format!("http://{addr}{base_path}"))
+                .credential(credential)
+                .auth_style(auth_style)
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-probe-test".into(),
+                    "preserved".into(),
+                )]))
+                .api_path((status == 500).then(|| "/inference".to_string()))
+                .build();
+            let result = provider.warmup().await;
+            server.abort();
+            assert!(
+                result.is_ok(),
+                "HTTP {status} must not fail warmup: {result:?}"
+            );
+            let (method, path, headers) = rx.recv().await.unwrap();
+            assert_eq!(method, "GET");
+            assert_eq!(headers.get("x-probe-test").unwrap(), "preserved");
+            assert_eq!(path, format!("{}/models", base_path.trim_end_matches('/')));
+            if let Some((name, value)) = header {
+                assert_eq!(headers.get(name).unwrap(), value);
+            } else {
+                assert!(!headers.contains_key("authorization"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_drains_response_with_configured_timeout() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+        };
+        let app = Router::new().fallback(|| async {
+            Body::from_stream(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok::<_, std::io::Error>(Bytes::from_static(b"catalog"))
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .timeout_secs(1)
+            .build();
+        let result = provider.warmup().await;
+        server.abort();
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<reqwest::Error>()
+                .unwrap()
+                .is_timeout()
+        );
+    }
+
+    #[tokio::test]
     async fn warmup_without_key_attempts_connection() {
         let model_provider = make_model_provider("test", "http://127.0.0.1:1", None);
         let result = model_provider.warmup().await;
@@ -6840,11 +7515,12 @@ mod tests {
             content: format!("Caption please [IMAGE:{}]", path_str),
         };
 
-        let normalized = OpenAiCompatibleModelProvider::normalize_messages_for_upstream(
-            std::slice::from_ref(&msg),
-        )
-        .await
-        .expect("normalize ok");
+        let mut provider = make_model_provider("test", "https://example.com", None);
+        provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalize ok");
 
         assert_eq!(normalized.len(), 1);
         let content = &normalized[0].content;
@@ -6856,6 +7532,36 @@ mod tests {
             !content.contains(&path_str),
             "raw local path must not leak to upstream, got: {content}"
         );
+    }
+
+    #[tokio::test]
+    async fn normalize_messages_for_upstream_omit_preserves_tool_envelope() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .tool_result_image_policy(ToolResultImagePolicy::Omit)
+            .build();
+        let message = ChatMessage::tool(
+            r#"{"tool_call_id":"call_image","name":"inspect","content":"before \u005bIMAGE:/tmp/secret.png] after"}"#,
+        );
+
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&message))
+            .await
+            .expect("normalize ok");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&normalized[0].content).expect("tool envelope remains valid JSON");
+
+        assert_eq!(envelope["tool_call_id"], "call_image");
+        assert_eq!(envelope["name"], "inspect");
+        assert_eq!(
+            envelope["content"],
+            "before  after\n\n[tool-result image omitted by provider policy]"
+        );
+        assert!(!normalized[0].content.contains("[IMAGE:"));
+        assert!(!normalized[0].content.contains("/tmp/secret.png"));
     }
 
     #[test]

@@ -287,3 +287,19 @@ chooses to call: a tool with the `http_client` grant and the tool adapter's HTTP
 surface can send whatever the model passes it to wherever its code decides.
 Signature policy exists because "which code do I load" is the decision that
 matters most; make it deliberately.
+
+### Certificate trust for plugin HTTPS
+
+A plugin request over HTTPS verifies against the bundled webpki root program
+plus the roots this machine already trusts. An endpoint whose certificate chains
+to a locally installed CA, such as an enterprise MDM root or a private PKI,
+therefore works for plugins exactly as it already works for provider requests.
+Verification itself is unchanged: chain building and hostname matching stay in
+force, and the egress policy still decides which destinations a guest may reach.
+
+Those roots are read once per process. Rewriting the certificate file at the same
+path, or changing the operating system store, does not reach a running daemon;
+restart it before expecting plugin HTTPS to see the change. The same applies to
+an unlucky first read: a machine whose store was briefly unreadable serves
+bundled-only trust until the process restarts, and the
+`plugin_egress_trust_anchors` log line is what says which of the two happened.

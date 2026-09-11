@@ -1,7 +1,7 @@
 //! Thinking/Reasoning Level Control
 
 // Re-exported from zeroclaw-config.
-pub use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
+pub use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingDisplayMode, ThinkingLevel};
 
 /// Parameters derived from a thinking level, applied to the LLM request.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +130,7 @@ pub fn apply_thinking_level_with_config(
         }
         params.native_thinking = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: clamped,
+            display: config.display.to_display(),
         });
     }
     params
@@ -494,6 +495,7 @@ mod tests {
             default_level: ThinkingLevel::High,
             native_thinking: true,
             budget_tokens: overrides,
+            ..ThinkingConfig::default()
         };
         let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
         let native = params
@@ -511,12 +513,43 @@ mod tests {
             default_level: ThinkingLevel::High,
             native_thinking: true,
             budget_tokens: overrides,
+            ..ThinkingConfig::default()
         };
         let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
         let native = params
             .native_thinking
             .expect("native thinking should be set");
         assert_eq!(native.budget_tokens, 8_000);
+    }
+
+    #[test]
+    fn display_mode_propagates_into_native_params() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::scattered_types::ThinkingDisplayMode;
+
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: true,
+            display: ThinkingDisplayMode::Updates,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("native thinking should be set");
+        assert_eq!(native.display, Some(ThinkingDisplay::Updates));
+
+        // Default config (`display: off`) must leave the wire field unset.
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("native thinking should be set");
+        assert_eq!(native.display, None);
     }
 
     #[test]
@@ -529,6 +562,7 @@ mod tests {
             default_level: ThinkingLevel::High,
             native_thinking: true,
             budget_tokens: overrides,
+            ..ThinkingConfig::default()
         };
         let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
         let native = params
@@ -543,7 +577,28 @@ mod tests {
     fn thinking_config_deserializes_from_toml() {
         let toml_str = r#"default_level = "high""#;
         let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.display, ThinkingDisplayMode::Off);
+
+        let toml_str = r#"
+default_level = "high"
+native_thinking = true
+display = "updates"
+"#;
+        let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_level, ThinkingLevel::High);
+        assert!(config.native_thinking);
+        assert_eq!(config.display, ThinkingDisplayMode::Updates);
+        assert_eq!(
+            config.display.to_display(),
+            Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates)
+        );
+
+        // Round-trip: serialization keeps the knob settable again.
+        let serialized = toml::to_string(&config).expect("ThinkingConfig must serialize");
+        let reparsed: ThinkingConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.display, ThinkingDisplayMode::Updates);
+        assert_eq!(reparsed.default_level, ThinkingLevel::High);
+        assert!(reparsed.native_thinking);
     }
 
     #[test]
@@ -565,6 +620,7 @@ mod tests {
         use zeroclaw_config::scattered_types::NativeThinkingParams;
         let installed = Some(NativeThinkingParams {
             budget_tokens: 32_000,
+            display: None,
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {

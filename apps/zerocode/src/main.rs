@@ -17,6 +17,7 @@ use std::time::Duration;
 use clap::Parser;
 
 mod acp;
+mod agent_sidebar;
 mod app;
 mod attachment;
 mod chat;
@@ -210,6 +211,7 @@ pub(crate) enum ActiveLeg {
 /// relay. Connecting prefers the direct path and falls back to the relay tunnel;
 /// once on the relay, a background timer re-probes the direct path and migrates
 /// back when it returns.
+#[derive(Clone)]
 pub(crate) struct WssRoute {
     /// The directly-reachable daemon address (`--connect` / `[wss].uri`). `None`
     /// in relay-only mode, where the daemon is reached solely through the relay.
@@ -321,6 +323,7 @@ impl WssRoute {
 }
 
 /// Where zerocode should connect.
+#[derive(Clone)]
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
     // Boxed: `WssRoute` is much larger than the local-socket variant.
@@ -928,10 +931,11 @@ async fn run() -> anyhow::Result<()> {
     let mut shutdown_signals = None;
 
     // Initial connection (before the terminal is initialized).
-    // `owns_ephemeral` records whether THIS process spawned the daemon
-    // (initial connect failed → we started one). Only an owned ephemeral
-    // daemon may be respawned on disconnect, and then exactly once.
-    let mut owns_ephemeral = false;
+    // `owned_daemon_pid` records the spawned daemon's PID when THIS process
+    // started it (initial connect failed → we started one). Only an owned
+    // ephemeral daemon may be respawned on disconnect, and then exactly once,
+    // gated on the liveness/grace check in app.rs.
+    let mut owned_daemon_pid: Option<u32> = None;
     let (rpc, initial_leg) = match &target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
@@ -962,10 +966,11 @@ async fn run() -> anyhow::Result<()> {
 
                     match readiness {
                         Ok(client) => {
-                            owns_ephemeral =
+                            let owns_ephemeral =
                                 reconcile_spawned_daemon_identity(client.server_pid, &mut daemon)?;
                             if owns_ephemeral {
                                 daemon.detach();
+                                owned_daemon_pid = client.server_pid;
                             }
                             client
                         }
@@ -1039,7 +1044,7 @@ async fn run() -> anyhow::Result<()> {
         &mut term,
         &target,
         &local_config_dir,
-        owns_ephemeral,
+        owned_daemon_pid,
         initial_leg,
         #[cfg(unix)]
         shutdown_signals
@@ -1062,7 +1067,7 @@ async fn run_until_exit(
     term: &mut config_manager::Term,
     target: &ConnectTarget,
     config_dir: &std::path::Path,
-    owns_ephemeral: bool,
+    owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
@@ -1078,7 +1083,7 @@ async fn run_until_exit(
     #[cfg(unix)]
     {
         tokio::select! {
-            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral, initial_leg) => r.map(|_| ()),
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owned_daemon_pid, initial_leg) => r.map(|_| ()),
             _ = shutdown_signals.recv() => Ok(()),
         }
     }
@@ -1092,7 +1097,7 @@ async fn run_until_exit(
             reconnect_state,
             config_dir,
             target,
-            owns_ephemeral,
+            owned_daemon_pid,
             initial_leg,
         )
         .await
@@ -1100,18 +1105,7 @@ async fn run_until_exit(
     }
 }
 
-pub(crate) fn spawn_ephemeral_daemon(
-    config_dir: &std::path::Path,
-    socket: &std::path::Path,
-) -> anyhow::Result<()> {
-    let mut cmd = ephemeral_daemon_command(config_dir, socket);
-    cmd.stderr(std::process::Stdio::null());
-    cmd.spawn()
-        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
-    Ok(())
-}
-
-fn spawn_owned_ephemeral_daemon(
+pub(crate) fn spawn_owned_ephemeral_daemon(
     config_dir: &std::path::Path,
     socket: &std::path::Path,
 ) -> anyhow::Result<SpawnedDaemon> {
@@ -1161,7 +1155,7 @@ fn configure_ephemeral_daemon_command(
         .env("ZEROCLAW_SOCKET", socket);
 }
 
-struct SpawnedDaemon {
+pub(crate) struct SpawnedDaemon {
     child: std::process::Child,
     stderr: Arc<Mutex<std::collections::VecDeque<u8>>>,
     capture_stderr: Arc<AtomicBool>,
@@ -1248,8 +1242,12 @@ impl SpawnedDaemon {
         self.child.try_wait()
     }
 
-    fn id(&self) -> u32 {
+    pub(crate) fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    pub(crate) fn has_exited(&mut self) -> anyhow::Result<bool> {
+        Ok(self.poll_exit()?.is_some())
     }
 
     fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
@@ -1283,7 +1281,7 @@ impl SpawnedDaemon {
         sanitize_daemon_stderr(&bytes)
     }
 
-    fn detach(mut self) {
+    pub(crate) fn detach(mut self) {
         self.cleanup_on_drop = false;
         self.capture_stderr.store(false, Ordering::Release);
         self.stderr_done.take();
@@ -1472,6 +1470,11 @@ async fn await_spawned_daemon_ready(
     socket: &std::path::Path,
     daemon: &mut SpawnedDaemon,
 ) -> anyhow::Result<client::RpcClient> {
+    eprintln!(
+        "zerocode: waiting for daemon at {} (up to {}s)…",
+        socket.display(),
+        SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
+    );
     let deadline = tokio::time::Instant::now() + SPAWNED_DAEMON_CONNECT_TIMEOUT;
     loop {
         if let Some(exit) = daemon.poll_exit()? {
@@ -1479,7 +1482,8 @@ async fn await_spawned_daemon_ready(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "daemon did not become ready within {}s (socket: {})",
+                "daemon did not become ready within {}s (socket: {}); if the socket path is \
+                 long, set ZEROCLAW_SOCKET to a shorter path or use a shorter --config-dir",
                 SPAWNED_DAEMON_CONNECT_TIMEOUT.as_secs(),
                 socket.display(),
             );
@@ -1534,6 +1538,26 @@ mod connection_tests {
 
         assert!(!exit.status.success());
         assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    #[test]
+    fn reconnect_identity_uses_the_actual_spawned_child_pid() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+        let spawned_pid = daemon.id();
+
+        assert!(crate::app::reconnect_matches_owned_daemon(
+            Some(spawned_pid.wrapping_add(1)),
+            Some(spawned_pid),
+            Some(spawned_pid),
+        ));
+        assert!(!crate::app::reconnect_matches_owned_daemon(
+            Some(spawned_pid.wrapping_add(1)),
+            Some(spawned_pid),
+            Some(spawned_pid.wrapping_add(2)),
+        ));
+
+        daemon.terminate_and_wait().expect("terminate helper");
     }
 
     #[test]

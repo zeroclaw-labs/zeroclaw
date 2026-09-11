@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Tool implementations for agent-callable capabilities."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true
@@ -72,6 +74,7 @@ test-helpers = []
 
 [dev-dependencies]
 zeroclaw-infra.workspace = true
+zeroclaw-providers = { workspace = true, features = ["test-helpers"] }
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

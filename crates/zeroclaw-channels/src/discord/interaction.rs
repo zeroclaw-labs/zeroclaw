@@ -42,11 +42,7 @@ pub(crate) async fn discord_defer_interaction(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction defer failed ({status}): {err}");
-    }
+    crate::util::ensure_success(resp, "interaction defer").await?;
     Ok(())
 }
 
@@ -75,11 +71,7 @@ pub(crate) async fn discord_open_modal(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("modal open failed ({status}): {err}");
-    }
+    crate::util::ensure_success(resp, "modal open").await?;
     Ok(())
 }
 
@@ -106,11 +98,7 @@ pub(crate) async fn discord_answer_autocomplete(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction autocomplete answer failed ({status}): {err}");
-    }
+    crate::util::ensure_success(resp, "interaction autocomplete answer").await?;
     Ok(())
 }
 
@@ -157,11 +145,7 @@ pub(crate) async fn discord_reject_interaction(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction reject failed ({status}): {err}");
-    }
+    crate::util::ensure_success(resp, "interaction reject").await?;
     Ok(())
 }
 
@@ -192,11 +176,7 @@ pub(crate) async fn discord_edit_interaction_response(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction followup edit failed ({status}): {err}");
-    }
+    crate::util::ensure_success(resp, "interaction followup edit").await?;
     Ok(())
 }
 
@@ -217,11 +197,7 @@ pub(crate) async fn discord_post_interaction_followup(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction followup post failed ({status}): {err}");
-    }
+    crate::util::ensure_success(resp, "interaction followup post").await?;
     Ok(())
 }
 
