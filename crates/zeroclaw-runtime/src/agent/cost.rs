@@ -476,9 +476,19 @@ fn record_tool_loop_cost_usage_inner(
         }
     }
 
+    // The session key scoped around this turn is the chat conversation the
+    // spend belongs to; the tracker's own id is daemon-lifetime scoped.
+    let conversation_id = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
     if let Some(tracker) = &ctx.tracker
-        && let Err(error) =
-            tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
+        && let Err(error) = tracker.record_usage_attributed(
+            cost_usage.clone(),
+            ctx.agent_alias.as_deref(),
+            None,
+            conversation_id,
+        )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
@@ -1329,6 +1339,60 @@ mod tests {
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cached_input_tokens, 4_000);
         assert_eq!(record.usage.billable_input_tokens(), 1_000);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_attributes_records_to_the_chat_session() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "deepseek".to_string(),
+                pricing_with_cache("deepseek-chat", 0.27, 0.027, 1.10),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for session in ["chat-session-a", "chat-session-b"] {
+            let ctx = ctx.clone();
+            let usage = usage.clone();
+            let session = session.to_string();
+            runtime.block_on(zeroclaw_api::TOOL_LOOP_SESSION_KEY.scope(
+                Some(session),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                    record_tool_loop_cost_usage("deepseek", "deepseek-chat", &usage)
+                        .expect("cost usage")
+                }),
+            ));
+        }
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let mut conversation_ids = Vec::new();
+        for line in stored.lines() {
+            let record: zeroclaw_config::cost::types::CostRecord =
+                serde_json::from_str(line).unwrap();
+            assert_eq!(record.session_id, tracker.session_id());
+            conversation_ids.push(record.conversation_id.expect("conversation id"));
+        }
+        conversation_ids.sort();
+        assert_eq!(
+            conversation_ids,
+            vec!["chat-session-a".to_string(), "chat-session-b".to_string()],
+            "two chat sessions on one daemon must stay separable in the ledger"
+        );
     }
 
     #[test]
