@@ -1537,7 +1537,8 @@ pub async fn run_gateway(
     }
     #[cfg(feature = "channel-sendblue")]
     if !sendblue_channels.is_empty() {
-        println!("  POST {pfx}/sendblue[/<alias>]  — Sendblue message webhook (iMessage/SMS)");
+        // i18n-exempt: route inventory, printed as a literal like every other webhook path in this banner
+        println!("  POST {pfx}/sendblue[/<alias>]  - Sendblue message webhook (iMessage/SMS)");
     }
     #[cfg(feature = "channel-nextcloud")]
     if !nextcloud_talk_channel.is_empty() {
