@@ -23,6 +23,10 @@ FULL_PATHS = {
     "scripts/ci/windows_test_scope.test.sh",
     "Cargo.toml",
 }
+IRRELEVANT_WORKFLOW_PATHS = {
+    ".github/workflows/pr-size-labeler.yml",
+}
+FULL_PATH_PREFIXES = (".github/actions/", "wit/")
 PLUGIN_HOST_PATH_PREFIXES = (
     "crates/zeroclaw-plugins/",
     "crates/zeroclaw-runtime/",
@@ -58,10 +62,21 @@ class Selection:
     packages: tuple[str, ...]
     reason: str
     needs_plugin_host: bool
+    diagnostics: tuple[str, ...] = ()
 
 
-def full(reason: str, needs_plugin_host: bool = False) -> Selection:
-    return Selection("full", (), reason, needs_plugin_host)
+@dataclass(frozen=True)
+class PathClassification:
+    disposition: str
+    rule: str
+
+
+def full(
+    reason: str,
+    needs_plugin_host: bool = False,
+    diagnostics: tuple[str, ...] = (),
+) -> Selection:
+    return Selection("full", (), reason, needs_plugin_host, diagnostics)
 
 
 def requires_plugin_host(changed_paths: list[str]) -> bool:
@@ -204,17 +219,34 @@ def package_for(path: str, repo_root: Path, packages: list[Package]) -> Package 
     return matches[0]
 
 
-def is_package_test_path(path: str, package: Package, repo_root: Path) -> bool:
+def classify_package_path(path: str, package: Package, repo_root: Path) -> PathClassification:
+    if package.name == DESKTOP_PACKAGE:
+        return PathClassification("irrelevant", "desktop-package-excluded")
     absolute_path = (repo_root / PurePosixPath(path)).resolve()
     try:
         relative_path = absolute_path.relative_to(package.root)
     except ValueError:
-        return False
+        return PathClassification("unclassified", "outside-package-root")
     if relative_path == Path("Cargo.toml"):
-        return True
+        return PathClassification("scoped", "package-manifest")
+    if relative_path == Path("build.rs"):
+        if package.root == repo_root:
+            return PathClassification("full", "root-build-script")
+        return PathClassification("scoped", "package-build-script")
     if relative_path.parts and relative_path.parts[0] in {"src", "tests", "benches", "examples"}:
-        return True
-    return package.root != repo_root and relative_path.suffix.lower() == ".rs"
+        return PathClassification("scoped", "package-rust-tree")
+    if package.root != repo_root and relative_path.parts and relative_path.parts[0] == "locales":
+        return PathClassification("scoped", "package-locales")
+    if package.root == repo_root and relative_path.parts and relative_path.parts[0] == "locales":
+        return PathClassification("full", "root-locales")
+    return PathClassification("unclassified", "unclassified-package-path")
+
+
+def unclassified_diagnostic(path: str, rule: str) -> str:
+    return (
+        f"Unclassified changed path '{path}' selected the full Windows suite "
+        f"(rule: {rule}). Add an explicit selector rule before narrowing it."
+    )
 
 
 def is_obviously_irrelevant(path: str) -> bool:
@@ -267,11 +299,18 @@ def select_pull_request(
         if path == "Cargo.lock":
             lockfile_changed = True
             continue
-        if path in FULL_PATHS or path == ".cargo" or path.startswith(".cargo/"):
+        if (
+            path in FULL_PATHS
+            or path.startswith(FULL_PATH_PREFIXES)
+            or path == ".cargo"
+            or path.startswith(".cargo/")
+        ):
             return full(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
                 needs_plugin_host,
             )
+        if path in IRRELEVANT_WORKFLOW_PATHS:
+            continue
         if path.startswith(".github/workflows/") or path.startswith("scripts/ci/"):
             return full(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
@@ -295,13 +334,21 @@ def select_pull_request(
             return full(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
                 needs_plugin_host,
+                (unclassified_diagnostic(path, "no-workspace-package"),),
             )
-        if package.name == DESKTOP_PACKAGE:
+        classification = classify_package_path(path, package, repo_root)
+        if classification.disposition == "irrelevant":
             continue
-        if not is_package_test_path(path, package, repo_root):
+        if classification.disposition == "full":
             return full(
                 "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
                 needs_plugin_host,
+            )
+        if classification.disposition == "unclassified":
+            return full(
+                "Workspace-wide or ambiguous Rust-affecting change requires the full suite.",
+                needs_plugin_host,
+                (unclassified_diagnostic(path, classification.rule),),
             )
         selected.add(package.name)
 
@@ -335,6 +382,8 @@ def select(event: str, changed_file: Path | None, metadata_file: Path | None, re
 
 
 def emit(selection: Selection) -> None:
+    for diagnostic in selection.diagnostics:
+        print(f"warning: {diagnostic}", file=sys.stderr)
     print(f"mode={selection.mode}")
     print(f"packages={json.dumps(list(selection.packages), ensure_ascii=True, separators=(',', ':'))}")
     print(f"reason={selection.reason}")
@@ -352,9 +401,8 @@ def emit_package_args(raw_packages: str) -> int:
         return 2
     if len(set(packages)) != len(packages):
         return 2
-    for package in packages:
-        print("-p")
-        print(package)
+    args = [argument for package in packages for argument in ("-p", package)]
+    sys.stdout.buffer.write(("\n".join(args) + "\n").encode("ascii"))
     return 0
 
 

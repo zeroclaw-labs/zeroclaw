@@ -781,7 +781,11 @@ cli-status-model = {"   "}Model:         {$model}
 cli-status-observability = 📊 Observability:  {$v}
 cli-status-trace-storage = 🧾 Trace storage:  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<no risk_profile>
 cli-status-runtime = ⚙️  Runtime:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        FOUND ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        MISSING
 cli-status-heartbeat = 💓 Heartbeat:      {$v}
 cli-status-heartbeat-every-minutes = every {$minutes}min
 cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
@@ -810,6 +814,8 @@ cli-status-word-off = off
 cli-status-word-none = (none)
 cli-status-word-configured = configured
 cli-status-word-not-configured = not configured
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
 cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
@@ -1224,6 +1230,9 @@ channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
 channel-telegram-approval-ack-already-resolved = Approval already resolved
+channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longer than the { $limit_secs }s limit. Send a shorter recording or split it into parts.
+channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
+channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow
