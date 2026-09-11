@@ -11151,6 +11151,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_set_allows_staged_agent_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("providers.models.openai", "primary")
+            .expect("create openai.primary");
+        cfg.create_map_key("risk_profiles", "standard")
+            .expect("create standard risk profile");
+        cfg.save().await.expect("seed config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "agents",
+                "key": "worker"
+            }))
+            .await
+            .unwrap();
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.worker.model_provider",
+                "value": "openai.primary"
+            }))
+            .await
+            .unwrap();
+
+        let staged = dispatcher.ctx.config.read().clone();
+        assert_eq!(staged.agents["worker"].model_provider, "openai.primary");
+        assert!(staged.validate().is_err());
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.worker.risk_profile",
+                "value": "standard"
+            }))
+            .await
+            .unwrap();
+        dispatcher.ctx.config.read().validate().unwrap();
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.agents["worker"].model_provider, "openai.primary");
+        assert_eq!(reloaded.agents["worker"].risk_profile, "standard");
+    }
+
+    #[tokio::test]
     async fn config_set_does_not_materialize_resource_keyed_rate_alias() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));

@@ -224,6 +224,55 @@ fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serd
     serde_json::from_str(&stdout).expect("stdout should be JSON success envelope")
 }
 
+fn seed_agent_repair_dependencies(config_dir: &std::path::Path) {
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+schema_version = {}
+
+[providers.models.openai.primary]
+api_key = "test-key"
+model = "gpt-test"
+
+[risk_profiles.standard]
+level = "supervised"
+"#,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        ),
+    )
+    .expect("seed config");
+}
+
+fn assert_cli_set_completes_agent_in_order(first: (&str, &str), second: (&str, &str)) {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    seed_agent_repair_dependencies(config_dir.path());
+
+    run_cli_set(config_dir.path(), first.0, first.1);
+    run_cli_set(config_dir.path(), second.0, second.1);
+
+    let raw = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read completed config");
+    let config: Config = toml::from_str(&raw).expect("parse completed config");
+    config.validate().expect("completed agent must validate");
+}
+
+#[test]
+fn config_set_completes_agent_provider_first() {
+    assert_cli_set_completes_agent_in_order(
+        ("agents.worker.model_provider", "openai.primary"),
+        ("agents.worker.risk_profile", "standard"),
+    );
+}
+
+#[test]
+fn config_set_completes_agent_risk_profile_first() {
+    assert_cli_set_completes_agent_in_order(
+        ("agents.worker.risk_profile", "standard"),
+        ("agents.worker.model_provider", "openai.primary"),
+    );
+}
+
 #[cfg(feature = "gateway")]
 async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
     let config = Config {
