@@ -1781,7 +1781,15 @@ impl Agent {
         let provider_ref = format!("{provider_name}.{provider_alias}");
         let model_provider: Box<dyn ModelProvider> = match live_config.as_ref() {
             Some(live_config) => {
-                zeroclaw_providers::create_routed_model_provider_with_live_config_options(
+                // `config` is the one generation this whole construction reads
+                // for the agent profile, security policy, route metadata and
+                // model. The provider must be built from that same generation:
+                // a reload during the asynchronous setup above would otherwise
+                // give this Agent an endpoint, auth mode and route graph from a
+                // newer generation than everything else it holds. The live
+                // handle still travels with it for per-request credentials.
+                zeroclaw_providers::create_routed_model_provider_for_live_generation(
+                    config,
                     Arc::clone(live_config),
                     &provider_ref,
                     &model_name,
@@ -3756,6 +3764,183 @@ mod tests {
     #[tokio::test]
     async fn live_config_agent_streamed_turn_reassembles_cross_agent_sop_step() {
         assert_live_agent_runs_cross_agent_sop(LiveSopTurnKind::Streamed).await;
+    }
+
+    /// A live Agent must be assembled from exactly one configuration
+    /// generation. The construction snapshot is taken before the asynchronous
+    /// setup runs; a reload that lands while it runs must not move the
+    /// provider's endpoint, credential pool or failover graph out from under
+    /// the model, route metadata and policy state read from that snapshot.
+    #[tokio::test]
+    async fn live_agent_construction_builds_the_provider_from_the_snapshot_generation() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use tempfile::TempDir;
+        use zeroclaw_config::{
+            autonomy::AutonomyLevel,
+            providers::ModelProviderRef,
+            schema::{
+                AliasedAgentConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+                RiskProfileConfig,
+            },
+        };
+
+        async fn fail_chat_request(
+            State(calls): State<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<Value>) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": {"message": "boom"}})),
+            )
+        }
+
+        async fn ok_chat_request(
+            State(calls): State<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<Value>) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})),
+            )
+        }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary provider");
+        let primary_addr = primary_listener.local_addr().expect("primary address");
+        let primary_app = Router::new()
+            .route("/v1/chat/completions", post(fail_chat_request))
+            .with_state(Arc::clone(&primary_calls));
+        let primary_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(primary_listener, primary_app)
+                .await
+                .expect("serve primary provider");
+        });
+
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backup provider");
+        let backup_addr = backup_listener.local_addr().expect("backup address");
+        let backup_app = Router::new()
+            .route("/v1/chat/completions", post(ok_chat_request))
+            .with_state(Arc::clone(&backup_calls));
+        let backup_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(backup_listener, backup_app)
+                .await
+                .expect("serve backup provider");
+        });
+
+        let temp = TempDir::new().expect("temp dir");
+        let mut generation_a = Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
+        generation_a.memory.backend = "none".into();
+        generation_a.memory.auto_save = false;
+        generation_a.reliability.provider_retries = 0;
+        generation_a.reliability.provider_backoff_ms = 1;
+        generation_a.providers.models.openai.insert(
+            "backup".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".into()),
+                    api_key: Some("sk-backup".into()),
+                    uri: Some(format!("http://{backup_addr}/v1")),
+                    model: Some("test-model".into()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        generation_a.providers.models.openai.insert(
+            "test".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".into()),
+                    api_key: Some("sk-primary".into()),
+                    uri: Some(format!("http://{primary_addr}/v1")),
+                    model: Some("test-model".into()),
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        generation_a.risk_profiles.insert(
+            "test".into(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        generation_a.agents.insert(
+            "solo".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: ModelProviderRef::new("openai.test"),
+                risk_profile: "test".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        // Generation B is what a reload publishes while the asynchronous Agent
+        // setup is still running: the same aliases and credentials, but the
+        // agent's provider no longer declares a fallback.
+        let mut generation_b = generation_a.clone();
+        generation_b.providers.models.openai.insert(
+            "test".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".into()),
+                    api_key: Some("sk-primary".into()),
+                    uri: Some(format!("http://{primary_addr}/v1")),
+                    model: Some("test-model".into()),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(generation_b));
+
+        let agent = Agent::from_config_with_session_cwd_and_mcp_approval_mode(
+            &generation_a,
+            "solo",
+            None,
+            false,
+            true,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&live_config)),
+        )
+        .await
+        .expect("live agent construction");
+
+        assert_eq!(
+            agent
+                .model_provider
+                .simple_chat("hello", "test-model", None)
+                .await
+                .expect("the construction generation declares a fallback"),
+            "ok"
+        );
+        assert!(
+            primary_calls.load(Ordering::SeqCst) >= 1,
+            "the agent must attempt its configured primary endpoint first"
+        );
+        assert_eq!(
+            backup_calls.load(Ordering::SeqCst),
+            1,
+            "the agent's provider must be built from the same configuration \
+             generation as its model, route metadata and policy state"
+        );
+
+        primary_server.abort();
+        backup_server.abort();
     }
 
     #[tokio::test]

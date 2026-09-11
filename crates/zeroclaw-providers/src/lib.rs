@@ -2262,12 +2262,41 @@ pub fn create_routed_model_provider_with_options(
 
 /// Build a routed provider whose API-key pool is resolved from the shared
 /// canonical config before every request.
+///
+/// This reads the canonical handle once, here. Callers that have already
+/// captured a configuration generation for the rest of their construction must
+/// use [`create_routed_model_provider_for_live_generation`] instead so the
+/// provider cannot be built from a newer generation than its owner.
 pub fn create_routed_model_provider_with_live_config_options(
     live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
     primary_name: &str,
     default_model: &str,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let config = live_config.read().clone();
+    create_routed_model_provider_for_live_generation(
+        &config,
+        live_config,
+        primary_name,
+        default_model,
+    )
+}
+
+/// Build a routed provider from an already-captured configuration generation
+/// while keeping the canonical handle for per-request credential resolution.
+///
+/// Everything the provider fixes at construction time - endpoint, auth mode,
+/// runtime options, reliability settings, and the route graph - comes from
+/// `config`. Only the credential pool follows the live handle afterwards,
+/// which is the documented live-rotation contract. Passing the same generation
+/// the caller used for its own state is what keeps an owner such as `Agent`
+/// from combining a provider built from one generation with model, route, and
+/// policy state read from another.
+pub fn create_routed_model_provider_for_live_generation(
+    config: &zeroclaw_config::schema::Config,
+    live_config: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    primary_name: &str,
+    default_model: &str,
+) -> anyhow::Result<Box<dyn ModelProvider>> {
     let (api_key, api_url, options) = match primary_name.split_once('.') {
         Some((family, alias)) => {
             let entry = config.providers.models.find(family, alias).ok_or_else(|| {
@@ -2278,13 +2307,13 @@ pub fn create_routed_model_provider_with_live_config_options(
             (
                 entry.api_key.as_deref(),
                 entry.uri.as_deref(),
-                provider_runtime_options_for_alias(&config, family, alias),
+                provider_runtime_options_for_alias(config, family, alias),
             )
         }
         None => (None, None, ModelProviderRuntimeOptions::default()),
     };
     create_routed_model_provider_with_options_and_live(
-        &config,
+        config,
         primary_name,
         api_key,
         api_url,
@@ -3821,6 +3850,143 @@ mod tests {
             "a global reliability key must never reach a route-scoped credential"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn routed_live_generation_builds_from_the_supplied_snapshot_not_a_later_read() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use zeroclaw_config::{
+            providers::ModelProviderRef,
+            schema::{ModelProviderConfig, OpenAIModelProviderConfig},
+        };
+
+        async fn fail_chat_request(
+            State(calls): State<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<Value>) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": {"message": "boom"}})),
+            )
+        }
+
+        async fn ok_chat_request(
+            State(calls): State<Arc<AtomicUsize>>,
+        ) -> (StatusCode, Json<Value>) {
+            calls.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})),
+            )
+        }
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let primary_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind primary server");
+        let primary_addr = primary_listener.local_addr().expect("primary addr");
+        let primary_app = Router::new()
+            .route("/v1/chat/completions", post(fail_chat_request))
+            .with_state(Arc::clone(&primary_calls));
+        let primary_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(primary_listener, primary_app)
+                .await
+                .expect("serve primary server");
+        });
+
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backup server");
+        let backup_addr = backup_listener.local_addr().expect("backup addr");
+        let backup_app = Router::new()
+            .route("/v1/chat/completions", post(ok_chat_request))
+            .with_state(Arc::clone(&backup_calls));
+        let backup_server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(backup_listener, backup_app)
+                .await
+                .expect("serve backup server");
+        });
+
+        let mut generation_a = zeroclaw_config::schema::Config::default();
+        generation_a.reliability.provider_retries = 0;
+        generation_a.reliability.provider_backoff_ms = 1;
+        generation_a.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some(format!("http://{backup_addr}/v1")),
+                    api_key: Some("sk-backup".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        generation_a.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some(format!("http://{primary_addr}/v1")),
+                    api_key: Some("sk-primary".to_string()),
+                    fallback: vec![ModelProviderRef::new("openai.backup")],
+                    ..Default::default()
+                },
+            },
+        );
+
+        // Generation B is what a reload publishes after the caller captured
+        // generation A: same aliases and credentials, but the primary no longer
+        // declares a fallback. Building from that later generation would hand
+        // the caller a provider whose failover graph disagrees with the
+        // configuration the rest of its state came from.
+        let mut generation_b = generation_a.clone();
+        generation_b.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some(format!("http://{primary_addr}/v1")),
+                    api_key: Some("sk-primary".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let live_config = Arc::new(parking_lot::RwLock::new(generation_b));
+
+        let provider = create_routed_model_provider_for_live_generation(
+            &generation_a,
+            Arc::clone(&live_config),
+            "openai.primary",
+            "default-model",
+        )
+        .expect("provider should build from the supplied generation");
+
+        assert_eq!(
+            provider
+                .simple_chat("hello", "default-model", None)
+                .await
+                .expect("the captured generation declares a fallback"),
+            "ok"
+        );
+        assert!(
+            primary_calls.load(Ordering::SeqCst) >= 1,
+            "the primary endpoint must be attempted first"
+        );
+        assert_eq!(
+            backup_calls.load(Ordering::SeqCst),
+            1,
+            "the failover graph must come from the configuration generation the \
+             provider was built from, not from a later canonical read"
+        );
+
+        primary_server.abort();
+        backup_server.abort();
     }
 
     #[tokio::test]
