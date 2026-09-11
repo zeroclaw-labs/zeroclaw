@@ -816,7 +816,13 @@ mod tests {
     #[tokio::test]
     async fn duplicate_delete_cascades_cannot_share_an_archive_or_truncate_the_first_export() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // `config_path` belongs under the same temporary root as `data_dir`:
+        // `agent_workspace_dir` derives the workspace from the install root, so
+        // leaving it at its default would archive a directory from the runner's
+        // home into the temporary tree and fail with a cross-device link
+        // wherever those two are separate mounts.
         let mut config = Config {
+            config_path: tmp.path().join("install").join("config.toml"),
             data_dir: tmp.path().join("data"),
             ..Default::default()
         };
@@ -885,6 +891,62 @@ mod tests {
         assert!(
             first.path.join("workspace/owned.txt").exists(),
             "the duplicate must not disturb the first attempt's archived workspace"
+        );
+    }
+
+    /// A refused workspace move leaves the directory on its original mount. The
+    /// cascade still runs against the owned stores, so the alias-reuse
+    /// consequence has to be stated explicitly: the workspace stays where it
+    /// was, the failure is reported rather than swallowed, and the committed
+    /// delete still reads as residue so a retry re-enters instead of letting a
+    /// recreated alias resolve to the previous incarnation's files.
+    ///
+    /// The move is refused here by nesting the archive root inside the
+    /// workspace, which every supported platform rejects. That stands in for
+    /// any refusal an operator's layout can produce, a cross-device link being
+    /// the one the review environment hit.
+    #[tokio::test]
+    async fn a_refused_workspace_move_stays_put_and_keeps_the_delete_retryable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        let workspace = install.join("agents").join("agent_a").join("workspace");
+        let mut config = Config {
+            config_path: install.join("config.toml"),
+            data_dir: workspace.join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(config.agent_workspace_dir("agent_a"), workspace);
+
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        std::fs::write(workspace.join("retired-marker.txt"), "prior incarnation").unwrap();
+
+        let archive = archive_agent_workspace(&config, "agent_a", &workspace).await;
+        assert!(
+            archive
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("workspace archive failed")),
+            "a refused move must be reported: {:?}",
+            archive.warnings
+        );
+        assert!(
+            workspace.join("retired-marker.txt").exists(),
+            "the workspace stays on its original mount when the move is refused"
+        );
+
+        let report = cascade_owned_state(&config, None, None, "agent_a", &archive.path).await;
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            committed_delete_residue_exists(&config, None, None, "agent_a").await,
+            "a workspace left in place is residue: the delete must stay retryable"
         );
     }
 
