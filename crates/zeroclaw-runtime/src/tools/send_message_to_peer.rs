@@ -231,15 +231,33 @@ impl Tool for SendMessageToPeerTool {
                 // The recipient stays on its own task rather than being awaited
                 // in place so this tool's future does not carry a whole agent
                 // turn's state.
+                //
+                // Re-scope the run owner on that task: a detached task does not
+                // inherit the caller's task-locals, and `process_message`
+                // rebuilds the recipient's own tool registry. Without the owner
+                // in scope the recipient's `delegate` and
+                // `send_message_to_peer` would be built with ordinary local
+                // cancellation, so a child spawned from the recipient's
+                // registry could still be running after this run releases its
+                // claim and its private runtime is dropped.
+                //
+                // `process_message` is a very large future. Keep it boxed so
+                // the delivery task holds a pointer rather than a whole agent
+                // turn's state inline, which a debug build otherwise moves
+                // across this task's stack.
+                let scoped_run_token = run_token.clone();
                 let mut delivery = zeroclaw_spawn::spawn!(async move {
-                    let turn = crate::agent::loop_::process_message(
-                        cfg,
-                        &recipient_alias,
-                        &body,
-                        None,
-                        zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                    );
-                    deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
+                    crate::agent::loop_::scope_run_cancellation(scoped_run_token, async move {
+                        let turn = Box::pin(crate::agent::loop_::process_message(
+                            cfg,
+                            &recipient_alias,
+                            &body,
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                        ));
+                        deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
+                    })
+                    .await
                 });
                 let joined = tokio::select! {
                     biased;
@@ -286,13 +304,14 @@ impl Tool for SendMessageToPeerTool {
 
             let sender = self.sender_alias.clone();
             zeroclaw_spawn::spawn!(async move {
-                let turn = crate::agent::loop_::process_message(
+                // Boxed for the same reason as the run-owned branch above.
+                let turn = Box::pin(crate::agent::loop_::process_message(
                     cfg,
                     &recipient_alias,
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
-                );
+                ));
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"sender": sender, "recipient": recipient_alias, "error": format!("{}", e)})), "peer-message in-process delivery failed");
@@ -1311,6 +1330,187 @@ mod tests {
             1,
             "the slow recipient turn must have finished before the private runtime was dropped; \
              a detached recipient would have been aborted with the send already accepted"
+        );
+
+        server.abort();
+    }
+    /// The test above proves the run-owned send waits for the recipient's own
+    /// turn. That is only half the ownership boundary: the recipient rebuilds
+    /// its own tool registry inside `process_message`, and a registry built
+    /// without the run's token hands the recipient a `delegate` tool with
+    /// ordinary local cancellation. The recipient could then detach a
+    /// background child that outlives the cron claim the parent releases on
+    /// return. This drives the whole nested path against a real (mocked at the
+    /// HTTP layer) provider: the recipient asks for `background=true`
+    /// delegation, and the run-owned contract must refuse it at the
+    /// recipient's own tool boundary, with the refusal visible on the wire in
+    /// the next provider request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_owned_peer_send_fences_background_delegation_inside_the_recipient() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            DelegateExecutionMode, DelegateTargetConfig, ModelProviderConfig,
+            OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        // Every request body the recipient's turn puts on the wire. The first
+        // carries the tool catalogue the recipient was built with; the second
+        // carries the tool result its `delegate` call produced.
+        type CapturedRequests = Arc<Mutex<Vec<String>>>;
+        async fn delegating_chat(
+            State(captured): State<CapturedRequests>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let call_index = {
+                let mut captured = captured.lock();
+                captured.push(body.to_string());
+                captured.len()
+            };
+            if call_index == 1 {
+                return Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "delegate",
+                                    "arguments": "{\"agent\":\"child\",\"prompt\":\"keep working after I return\",\"background\":true}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "recipient turn complete"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            }))
+        }
+
+        let captured: CapturedRequests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock provider listener should bind");
+        let mock_addr = listener.local_addr().expect("mock provider addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(delegating_chat))
+            .with_state(captured.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock provider server should run");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "delegating".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                // Non-interactive turns deny anything that needs an operator
+                // decision, which would stop the call before it reaches the
+                // ownership boundary under test.
+                auto_approve: vec!["delegate".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "delegating".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "child".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "child".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "delegating".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let run_token = CancellationToken::new();
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .with_run_owned_cancellation_token(run_token);
+
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "status please"
+            }))
+            .await
+            .expect("execute should return a tool result");
+        assert!(
+            result.success,
+            "the run-owned send must carry the recipient to completion: {result:?}"
+        );
+
+        let requests = captured.lock().clone();
+        assert!(
+            requests.len() >= 2,
+            "the recipient must have issued its delegate call and then reported back; \
+             observed {} provider request(s)",
+            requests.len()
+        );
+        assert!(
+            requests[0].contains("unavailable for supervised cron runs"),
+            "the recipient's registry must advertise the run-owned delegate contract; \
+             without the owning token it advertises ordinary background delegation"
+        );
+        assert!(
+            requests[1].contains(
+                "Background delegation is unavailable for supervised cron runs"
+            ),
+            "the recipient's delegate tool must refuse background delegation under the \
+             owning run; without the owning token it detaches a child that outlives the \
+             claim. Second request body: {}",
+            requests[1]
         );
 
         server.abort();

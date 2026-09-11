@@ -2913,6 +2913,13 @@ pub async fn process_message(
         let agent_alias: &str = __zc_alias.as_str();
         let message: &str = __zc_message.as_str();
         let session_id: Option<&str> = __zc_session_id.as_deref();
+        // Same owner seam `run` uses. A supervised run that reaches this entry
+        // point (an agent-to-agent peer message delivered under a cron run)
+        // owns the turn this builds, so its registry must be built with the
+        // run's token: without it the rebuilt `delegate` and
+        // `send_message_to_peer` tools get ordinary local cancellation and a
+        // spawned child can outlive the claim the run releases on return.
+        let run_cancellation = AGENT_RUN_CANCELLATION.try_with(Clone::clone).ok();
 
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
@@ -3006,7 +3013,7 @@ pub async fn process_message(
             sop_engine,
             sop_audit,
             None,
-            None,
+            run_cancellation.clone(),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -3426,7 +3433,7 @@ pub async fn process_message(
                     Some(&turn_id),
                     Some(SopStepReassembly {
                         config: &config,
-                        run_cancellation: None,
+                        run_cancellation: run_cancellation.as_ref(),
                     }),
                 ),
             )
