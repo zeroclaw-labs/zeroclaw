@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Unified log emission surface: structured event schema, JSONL persistence, broadcast hook, and the record! macro every other crate emits through."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]
