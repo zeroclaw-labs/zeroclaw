@@ -661,11 +661,12 @@ fn ensure_case_timeout(case_timeout_secs: u64) -> Result<Duration> {
 /// config so live mode can resolve its provider. Replay injects the deterministic
 /// trace-replay provider; live resolves `[eval].live_provider` per case.
 fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
-    match mode {
+    let judge = build_judge_deps(config)?;
+    let mut deps = match mode {
         // Replay's provider wiring is owned by `RunDeps::replay()`; delegate so the
         // trace-replay factory has a single definition. Replay ignores the live-only
         // tool allowlist and timeout.
-        Mode::Replay => Ok(RunDeps::replay()),
+        Mode::Replay => RunDeps::replay(),
         Mode::Live => {
             // Trim so validation (which trims) and runtime resolution agree: a
             // whitespace-padded ref must not pass `Config::validate` then miss here.
@@ -679,8 +680,14 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             let (_, _provider_type, resolved_model) =
                 build_session_model_provider(config, &provider_ref, None)?;
             let receipt_ref = format!("{provider_ref}:{resolved_model}");
+            if judge
+                .as_ref()
+                .is_some_and(|item| item.judge_ref.split(':').next() == Some(provider_ref.as_str()))
+            {
+                println!("{}", get_required_cli_string("cli-eval-self-judge-warning"));
+            }
             let cfg = config.clone();
-            Ok(RunDeps {
+            RunDeps {
                 mode,
                 provider: Box::new(move |_trace: &LlmTrace| {
                     let (provider, provider_type, resolved_model) =
@@ -695,9 +702,56 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 provider_ref: receipt_ref,
                 live_tools: config.eval.live_allowed_tools.clone(),
                 case_timeout,
-            })
+                judge: None,
+            }
         }
+    };
+    deps.judge = judge;
+    Ok(deps)
+}
+
+fn fixed_identity_judge_config(config: &Config, provider_ref: &str) -> Result<Config> {
+    let (family, alias) = provider_ref.split_once('.').ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "model_provider reference `{provider_ref}` must be `<type>.<alias>`"
+        ))
+    })?;
+    let mut judge_config = config.clone();
+    judge_config.model_routes.clear();
+    let profile = judge_config
+        .providers
+        .models
+        .iter_entries_mut()
+        .find(|(entry_family, entry_alias, _)| *entry_family == family && *entry_alias == alias)
+        .map(|(_, _, profile)| profile)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("unknown model_provider reference `{provider_ref}`"))
+        })?;
+    profile.fallback.clear();
+    profile.fallback_models.clear();
+    Ok(judge_config)
+}
+
+/// Resolve optional diagnostic judge dependencies. Fallback models, aliases,
+/// and routes are disabled on a per-run config clone so `judge_ref` names the
+/// model actually queried rather than only the first candidate in a resilient
+/// chain.
+fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
+    let provider_ref = config.eval.judge_provider.as_str().trim().to_string();
+    if provider_ref.is_empty() {
+        return Ok(None);
     }
+
+    let judge_config = fixed_identity_judge_config(config, &provider_ref)?;
+    let (provider, _provider_type, model) =
+        build_session_model_provider(&judge_config, &provider_ref, None)?;
+    let judge_ref = format!("{provider_ref}:{model}");
+
+    Ok(Some(zeroclaw_eval::grader::JudgeDeps {
+        provider: std::sync::Arc::from(provider),
+        model,
+        judge_ref,
+    }))
 }
 
 /// One run's artifact lifecycle: a private, uniquely named directory that is
@@ -923,6 +977,7 @@ mod tests {
                 autonomy: "supervised".to_string(),
                 workspace_only: false,
             },
+            judge_ref: None,
         }
     }
 
@@ -1048,6 +1103,38 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("baseline.json")]);
+    }
+
+    #[test]
+    fn fixed_identity_judge_config_removes_every_alternate_dispatch_path() {
+        let config: Config = toml::from_str(
+            r#"
+                [providers.models.custom.judge]
+                model = "primary"
+                fallback_models = ["backup-model"]
+                fallback = ["custom.backup"]
+
+                [providers.models.custom.backup]
+                model = "other"
+
+                [[model_routes]]
+                hint = "primary"
+                model_provider = "custom.backup"
+                model = "routed"
+            "#,
+        )
+        .unwrap();
+
+        let isolated = fixed_identity_judge_config(&config, "custom.judge").unwrap();
+        let profile = isolated.providers.models.find("custom", "judge").unwrap();
+        assert!(profile.fallback.is_empty());
+        assert!(profile.fallback_models.is_empty());
+        assert!(isolated.model_routes.is_empty());
+
+        let original = config.providers.models.find("custom", "judge").unwrap();
+        assert_eq!(original.fallback_models, ["backup-model"]);
+        assert_eq!(original.fallback[0].as_str(), "custom.backup");
+        assert_eq!(config.model_routes.len(), 1);
     }
 
     #[tokio::test]

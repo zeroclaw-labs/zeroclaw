@@ -73,17 +73,22 @@ pub struct BaselineEntry {
     pub checks: BTreeMap<String, bool>,
     pub total_tokens: u64,
     pub score: f64,
+    /// Judge identity for judged cases. A different judge makes two runs
+    /// unverifiable instead of silently comparable.
+    #[serde(default)]
+    pub judge_ref: Option<String>,
 }
 
 impl BaselineEntry {
     /// The comparability key: two entries are comparable only when these agree.
-    fn key(&self) -> (&str, Mode, &str, &ToolSurface, &SandboxStamp) {
+    fn key(&self) -> (&str, Mode, &str, &ToolSurface, &SandboxStamp, Option<&str>) {
         (
             self.case_hash.as_str(),
             self.mode,
             self.provider_ref.as_str(),
             &self.tool_surface,
             &self.sandbox,
+            self.judge_ref.as_deref(),
         )
     }
 }
@@ -212,6 +217,7 @@ fn entry_from_case(case: &CaseReport) -> anyhow::Result<BaselineEntry> {
             .input_tokens
             .saturating_add(completion.output_tokens),
         score,
+        judge_ref: rec.provenance.judge_ref.clone(),
     })
 }
 
@@ -331,13 +337,16 @@ impl BaselineComparison {
     }
 }
 
-fn current_key(rec: &crate::record::RunRecord) -> (&str, Mode, &str, &ToolSurface, &SandboxStamp) {
+fn current_key(
+    rec: &crate::record::RunRecord,
+) -> (&str, Mode, &str, &ToolSurface, &SandboxStamp, Option<&str>) {
     (
         rec.provenance.case_hash.as_str(),
         rec.provenance.mode,
         rec.provenance.provider_ref.as_str(),
         &rec.provenance.tool_surface,
         &rec.provenance.sandbox,
+        rec.provenance.judge_ref.as_deref(),
     )
 }
 
@@ -486,6 +495,7 @@ mod tests {
                     autonomy: "supervised".to_string(),
                     workspace_only: false,
                 },
+                judge_ref: None,
             },
             completion: Some(RunCompletion {
                 input_tokens: tokens,
@@ -500,6 +510,7 @@ mod tests {
             passed,
             detail: String::new(),
             category,
+            diagnostic: false,
         }
     }
 
@@ -741,6 +752,26 @@ mod tests {
         let flaky2 = downgrade_flaky_regressions(&mut cmp2, Mode::Replay, &rerun);
         assert!(flaky2.is_empty());
         assert_eq!(cmp2.confirmed_regressions(), 1);
+    }
+
+    #[test]
+    fn judge_ref_joins_comparability_key() {
+        let mut base_case = case("a", vec![grade("c", true, GradeCategory::Response)], 10);
+        base_case.record.as_mut().unwrap().provenance.judge_ref = Some("judge.v1:m".to_string());
+        let baseline = baseline_of(&SuiteReport {
+            cases: vec![base_case],
+        });
+        let mut current = case("a", vec![grade("c", true, GradeCategory::Response)], 10);
+        current.record.as_mut().unwrap().provenance.judge_ref = Some("judge.v2:m".to_string());
+
+        let comparison = compare(
+            &SuiteReport {
+                cases: vec![current],
+            },
+            &baseline,
+        )
+        .unwrap();
+        assert_eq!(comparison.per_case["a"], CaseComparison::Unverifiable);
     }
 
     #[test]

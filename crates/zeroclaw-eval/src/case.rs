@@ -130,6 +130,31 @@ pub struct TraceExpects {
     /// JSON-pointer checks against the final response parsed as JSON.
     #[serde(default)]
     pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Per-dimension LLM-judge rubrics. Judge grades are diagnostic and must be
+    /// accompanied by at least one deterministic expectation.
+    #[serde(default)]
+    pub judge: Vec<JudgeRubric>,
+}
+
+fn default_judge_threshold() -> f64 {
+    0.7
+}
+
+/// One judged dimension of a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JudgeRubric {
+    /// Short dimension name, e.g. "helpfulness" — one dimension per entry.
+    pub name: String,
+    /// The rubric for THIS dimension only.
+    pub rubric: String,
+    /// Pass threshold on the judge's 0.0–1.0 score. Uncalibrated default.
+    #[serde(default = "default_judge_threshold")]
+    pub threshold: f64,
+    /// Include a rendered transcript (tool calls + results), not just the final
+    /// response, so state-dependent rubrics can't be gamed by prose.
+    #[serde(default)]
+    pub include_transcript: bool,
 }
 
 /// End-state checks against the case workspace after the run.
@@ -221,6 +246,19 @@ impl TraceExpects {
                 "expects.budget is present but declares no bounds; \
                  remove the block or set at least one max_* field"
             );
+        }
+        for (index, judge) in self.judge.iter().enumerate() {
+            if judge.name.trim().is_empty() {
+                anyhow::bail!("expects.judge[{index}].name must not be empty");
+            }
+            if judge.rubric.trim().is_empty() {
+                anyhow::bail!("expects.judge[{index}].rubric must not be empty");
+            }
+            if !judge.threshold.is_finite() || !(0.0..=1.0).contains(&judge.threshold) {
+                anyhow::bail!(
+                    "expects.judge[{index}].threshold must be a finite number between 0.0 and 1.0"
+                );
+            }
         }
         Ok(())
     }
@@ -661,6 +699,48 @@ mod tests {
         )
         .unwrap();
         assert!(expects.empty_entry_family().is_none());
+    }
+
+    #[test]
+    fn from_file_rejects_judge_only_fixture() {
+        let err = load_fixture(
+            "judge_only",
+            r#"{"model_name":"demo","turns":[],"expects":{"judge":[{"name":"quality","rubric":"be correct"}]}}"#,
+        )
+        .expect_err("a diagnostic judge cannot be the fixture's only expectation");
+        assert!(format!("{err:#}").contains("no effective expectation"));
+    }
+
+    #[test]
+    fn judge_rubric_rejects_unknown_fields() {
+        let err = serde_json::from_str::<TraceExpects>(
+            r#"{"max_tool_calls":0,"judge":[{"name":"quality","rubric":"be correct","threshhold":0.9}]}"#,
+        )
+        .expect_err("a misspelled judge key must not be ignored");
+        assert!(err.to_string().contains("threshhold"));
+    }
+
+    #[test]
+    fn judge_rubric_validation_rejects_invalid_content_and_thresholds() {
+        for (name, rubric, threshold) in [
+            (" ", "be correct", 0.7),
+            ("quality", "\t", 0.7),
+            ("quality", "be correct", -0.1),
+            ("quality", "be correct", 1.1),
+            ("quality", "be correct", f64::NAN),
+        ] {
+            let expects = TraceExpects {
+                max_tool_calls: Some(0),
+                judge: vec![JudgeRubric {
+                    name: name.to_string(),
+                    rubric: rubric.to_string(),
+                    threshold,
+                    include_transcript: false,
+                }],
+                ..TraceExpects::default()
+            };
+            assert!(expects.validate().is_err());
+        }
     }
 
     #[test]

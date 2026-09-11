@@ -12,7 +12,7 @@ use zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher;
 
 use crate::Mode;
 use crate::case::{LlmTrace, load_suite};
-use crate::grader::{GradeResult, Grader, default_graders, grade_with};
+use crate::grader::{GradeResult, Grader, grade_with, graders_for_case};
 use crate::observer::RecordingObserver;
 use crate::record::{
     CaseProvenance, RunCompletion, RunRecord, ToolSurface, duration_millis_saturating,
@@ -83,6 +83,8 @@ pub struct RunDeps {
     pub live_tools: Vec<String>,
     /// Wall-clock timeout applied per conversation turn in live mode.
     pub case_timeout: Duration,
+    /// Judge provider dependencies when `[eval].judge_provider` is configured.
+    pub judge: Option<crate::grader::JudgeDeps>,
 }
 
 impl RunDeps {
@@ -104,6 +106,7 @@ impl RunDeps {
             provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(120),
+            judge: None,
         }
     }
 }
@@ -141,6 +144,7 @@ pub fn case_provenance(
             autonomy: "supervised".to_string(),
             workspace_only: matches!(deps.mode, Mode::Live),
         },
+        judge_ref: judge_ref_for(trace, deps),
     })
 }
 
@@ -197,13 +201,13 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
 /// Run a single trace through a freshly built, isolated agent, grade it while its
 /// workspace is still alive, and return the outcome. Dispatches on `deps.mode`.
 pub async fn run_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<CaseOutcome> {
-    run_case_with_graders(trace, deps, default_graders(trace)).await
+    run_case_with_graders(trace, deps, graders_for_case(trace, deps.judge.as_ref())).await
 }
 
 /// Injection seam: the caller supplies the grader catalog instead of the runner
 /// building it internally.
 ///
-/// [`run_case`] is the thin wrapper that passes [`default_graders`], so both go
+/// [`run_case`] is the thin wrapper that passes the canonical grader catalog, so both go
 /// through this one body. The point is testability of the *ordering contract*:
 /// the whole reason [`Grader::grade`] is async is that a grader may inspect the
 /// case's temp workspace, which is only valid because the runner awaits grading
@@ -226,8 +230,13 @@ pub async fn run_case_recording_provenance(
     deps: &RunDeps,
     provenance_out: &mut Option<CaseProvenance>,
 ) -> anyhow::Result<CaseOutcome> {
-    run_case_with_graders_recording_provenance(trace, deps, default_graders(trace), provenance_out)
-        .await
+    run_case_with_graders_recording_provenance(
+        trace,
+        deps,
+        graders_for_case(trace, deps.judge.as_ref()),
+        provenance_out,
+    )
+    .await
 }
 
 async fn run_case_with_graders_recording_provenance(
@@ -352,6 +361,15 @@ async fn run_replay_case(
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = grade_with(&graders, &record, tmp.path()).await;
     Ok(CaseOutcome { record, grades })
+}
+
+/// The judge identity stamped into immutable provenance. This is `Some` exactly
+/// when the case declares judge rubrics and a judge provider is configured.
+pub(crate) fn judge_ref_for(trace: &LlmTrace, deps: &RunDeps) -> Option<String> {
+    if trace.expects.judge.is_empty() {
+        return None;
+    }
+    deps.judge.as_ref().map(|judge| judge.judge_ref.clone())
 }
 
 #[cfg(test)]
@@ -724,6 +742,42 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn judge_tokens_are_excluded_from_case_budget() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "jt",
+                "turns": [{ "user_input": "hi", "steps": [
+                    { "response": { "type": "text", "content": "done", "input_tokens": 20, "output_tokens": 5 } }
+                ] }],
+                "expects": { "judge": [{ "name": "h", "rubric": "grade it" }] }
+            }"#,
+        )
+        .unwrap();
+        let judge_trace: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"j","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"{\"score\":0.9,\"unknown\":false,\"reason\":\"ok\"}"}}]}]}"#,
+        )
+        .unwrap();
+        let mut deps = RunDeps::replay();
+        deps.judge = Some(crate::grader::JudgeDeps {
+            provider: Arc::new(
+                crate::replay::TraceLlmProvider::try_from_trace(&judge_trace).unwrap(),
+            ),
+            model: "m".to_string(),
+            judge_ref: "judge.m:x".to_string(),
+        });
+
+        let outcome = run_case(&trace, &deps).await.unwrap();
+        let completion = outcome.record.completion.as_ref().unwrap();
+        assert_eq!(completion.input_tokens, 20);
+        assert_eq!(completion.output_tokens, 5);
+        assert_eq!(
+            outcome.record.provenance.judge_ref.as_deref(),
+            Some("judge.m:x")
+        );
+        assert!(outcome.grades.iter().any(|grade| grade.check == "judge:h"));
+    }
+
+    #[tokio::test]
     async fn live_mode_without_provider_config_errors() {
         // Empty [eval].live_provider is rejected before any case runs, with an
         // error that names the config key the operator must set.
@@ -744,6 +798,7 @@ pub(crate) mod tests {
             provider_ref: "test.model:m".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(5),
+            judge: None,
         }
     }
 

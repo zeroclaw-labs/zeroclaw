@@ -222,7 +222,7 @@ pub async fn run_live_case(
     trace: &LlmTrace,
     deps: &RunDeps,
 ) -> anyhow::Result<crate::runner::CaseOutcome> {
-    let graders = crate::grader::default_graders(trace);
+    let graders = crate::grader::graders_for_case(trace, deps.judge.as_ref());
     run_live_case_with_graders_recording_provenance(trace, deps, graders, &mut None).await
 }
 
@@ -406,6 +406,7 @@ mod tests {
             provider_ref: "test.model:test".to_string(),
             live_tools,
             case_timeout: timeout,
+            judge: None,
         }
     }
 
@@ -1017,6 +1018,7 @@ mod tests {
             provider_ref: "testprov.model-under-test".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(5),
+            judge: None,
         };
 
         run_live_case(&trace, &deps).await.unwrap();

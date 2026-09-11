@@ -195,9 +195,10 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface, sandbox)`. The tool surface records requested, effective, and
-registered tools, and the sandbox posture is part of the key, so runs with
-different actual capabilities are never called comparable:
+tool_surface, sandbox, judge_ref)`. The tool surface records requested,
+effective, and registered tools, and the sandbox posture and configured judge
+identity are part of the key, so runs with different actual capabilities or
+judges are never called comparable:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
   compared or gated.
@@ -243,6 +244,46 @@ does not gate. Replay flips the gate directly with no retry (it is deterministic
 Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never a
 gate. To refresh a baseline after an intentional behavior change, re-run with
 `--write-baseline` and commit the updated file.
+
+## LLM judge (diagnostic only)
+
+A case can declare `expects.judge`: a list of rubrics, one per dimension. Each
+rubric has a `name`, a `rubric` string, a pass `threshold` (default 0.7 on the
+judge's 0.0 to 1.0 score), and an optional `include_transcript` flag. Configure a
+judge with `[eval].judge_provider` (a dotted `providers.models` reference); prefer
+a different provider reference than the one under test, since self-judging is
+biased (the harness warns when the exact configured references match).
+
+Each rubric is graded by one isolated judge call at temperature 0.0. The judge's
+0.0 to 1.0 score is reported against the threshold, but every judge grade is
+diagnostic: it never affects the case verdict or process exit code. An `unknown`
+verdict, a reply that does not exactly match the required JSON schema, an
+out-of-range score, or a transport error is reported as `UNKNOWN (diagnostic)`.
+Authoritative judge gating is intentionally unavailable until a calibration
+workflow can bind a result to the exact judge, prompt, rubric, and scoring
+contract.
+
+Provider fallbacks, model fallbacks, and model-route overrides are disabled for
+judge calls. The model-inclusive
+`judge_ref` (`<type>.<alias>:<model>`) therefore identifies the model actually
+queried and joins the baseline comparability key; changing judges makes cases
+unverifiable rather than silently comparable. Judge token usage is never added
+to the case's own totals because the judge runs outside the agent.
+
+The judge receives the case's task turns, final response, and, when
+`include_transcript` is true, the full conversation history including tool
+arguments and results. This data is sent to the configured external provider,
+can contain sensitive workspace or model output, and is explicitly framed as
+untrusted evidence so instructions inside it are not part of the rubric. The
+serialized evidence is capped at 16,000 characters; oversized evidence is
+replaced by a bounded serialized prefix, and structural marker characters in
+the evidence are escaped so the data cannot forge the prompt boundary. Use only
+a judge provider trusted to receive that data.
+
+Authoring rules: use one dimension per rubric entry; keep `name` and `rubric`
+nonempty; set a finite threshold from 0.0 through 1.0; and declare at least one
+deterministic check (response, workspace, tool, or budget) so the case is not
+judge-only.
 
 ## Exit-code contract
 
@@ -299,8 +340,9 @@ from the document.
 Every case run produces a receipt: a schema tag, the mode, the case id, a
 SHA-256 `case_hash` of the case's canonical JSON, the `provider_ref`
 (`scripted` for replay, `<type>.<alias>:<model>` for live), the `tool_surface`,
-and a `sandbox` stamp. These fields appear per case in the JSON report and make
-runs comparable across time (the baseline workflow builds on them).
+a `sandbox` stamp, and an optional model-inclusive `judge_ref`. These fields
+appear per case in the JSON report and make runs comparable across time (the
+baseline workflow builds on them).
 
 The receipt is built before the fallible work starts, so a case that errors,
 times out, or never reaches the provider still carries every field above.

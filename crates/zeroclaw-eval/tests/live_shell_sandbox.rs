@@ -142,6 +142,7 @@ async fn live_shell_cannot_write_outside_workspace_because_it_never_runs() {
         provider_ref: "test.model:test".to_string(),
         live_tools: vec!["file_write".to_string(), "shell".to_string()],
         case_timeout: Duration::from_secs(10),
+        judge: None,
     };
 
     let record = run_live_case(&trace, &deps).await.unwrap().record;
@@ -204,6 +205,7 @@ async fn live_shell_cannot_reach_external_network_because_it_never_runs() {
         provider_ref: "test.model:test".to_string(),
         live_tools: vec!["file_write".to_string(), "shell".to_string()],
         case_timeout: Duration::from_secs(10),
+        judge: None,
     };
 
     let record = run_live_case(&trace, &deps).await.unwrap().record;

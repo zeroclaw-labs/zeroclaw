@@ -1255,4 +1255,5 @@ cli-eval-comparison-unchanged = unchanged
 cli-eval-capability-pass-rate = pass rate {$rate}%
 cli-eval-capability-pass-rate-was = pass rate {$rate}% (was {$baseline_rate}%)
 cli-eval-capability-saturation-warning = {"  "}saturation warning: >=95% - consider graduating to regression/
+cli-eval-self-judge-warning = {"  "}warning: judge and live provider use the same configured provider reference (self-judging bias)
 cli-eval-unknown-suite-kind = unknown --suite-kind '{$kind}' (expected 'regression' or 'capability')

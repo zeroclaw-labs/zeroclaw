@@ -78,6 +78,11 @@ pub struct CaseProvenance {
     pub tool_surface: ToolSurface,
     /// The sandbox posture the case ran under.
     pub sandbox: SandboxStamp,
+    /// Judge provider reference when this case declares judge rubrics and a
+    /// judge is configured. Part of immutable run provenance and baseline
+    /// comparability, so changing the judge makes the run unverifiable.
+    #[serde(default)]
+    pub judge_ref: Option<String>,
 }
 
 /// The data that only exists once a run finishes: the transcript, the tool
@@ -186,6 +191,7 @@ mod tests {
                 autonomy: "supervised".to_string(),
                 workspace_only: true,
             },
+            judge_ref: None,
         }
     }
 
