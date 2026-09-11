@@ -338,6 +338,17 @@ fn collect_fixture_paths(
     Ok(paths)
 }
 
+/// SHA-256 hex of the case's canonical JSON, used as the receipt's comparability
+/// key. `serde_json` emits object keys in sorted (BTreeMap) order because nothing
+/// in this workspace enables `preserve_order`, so the hash is stable across
+/// re-serialization (guarded by `canonical_json_is_key_sorted`).
+pub fn case_hash(trace: &LlmTrace) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(&serde_json::to_value(trace)?)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
 /// and free of any `..` component. Used before writing setup files or grading
 /// workspace paths, so a case cannot read or write outside its sandbox.
@@ -367,8 +378,20 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let paths = collect_fixture_paths(read.map(|entry| entry.map(|e| e.path())), dir)?;
 
     let mut out = Vec::with_capacity(paths.len());
+    let mut identities = std::collections::BTreeMap::new();
     for path in paths {
         let trace = LlmTrace::from_file(&path)?;
+        let identity = trace.display_id().to_string();
+        if let Some(first_path) = identities.insert(identity.clone(), path.clone()) {
+            anyhow::bail!(
+                "eval suite {} declares duplicate case identity {:?} in {} and {}; \
+                 reports, receipts, and baseline joins require unique identities",
+                dir.display(),
+                identity,
+                first_path.display(),
+                path.display()
+            );
+        }
         out.push((path, trace));
     }
     Ok(out)
@@ -650,6 +673,34 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_is_key_sorted() {
+        // Guard: if anyone enables serde_json's `preserve_order`, this fails,
+        // alerting that case_hash would stop being canonical.
+        let v = serde_json::json!({ "b": 1, "a": 2 });
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn case_hash_stable_across_reserialization() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        // Re-parse from a re-serialized form; the hash must be identical.
+        let reserialized: LlmTrace =
+            serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+        assert_eq!(
+            case_hash(&trace).unwrap(),
+            case_hash(&reserialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn case_hash_changes_on_case_edit() {
+        let a: LlmTrace = serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        let b: LlmTrace = serde_json::from_str(r#"{"model_name":"m2","turns":[]}"#).unwrap();
+        assert_ne!(case_hash(&a).unwrap(), case_hash(&b).unwrap());
+    }
+
+    #[test]
     fn validate_workspace_rel_path_rejects_absolute() {
         assert!(validate_workspace_rel_path("/etc/passwd").is_err());
     }
@@ -683,6 +734,28 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_duplicate_display_ids() {
+        // Both fixtures are otherwise admissible (a real turn, a real
+        // expectation), so the duplicate identity is the only reason the load
+        // can fail. A zero-turn stand-in would be rejected earlier and let this
+        // regression pass without ever reaching the identity check.
+        let duplicate = |model: &str| {
+            format!(
+                r#"{{"model_name":"{model}","id":"same","turns":[{{"user_input":"hi","steps":[{{"response":{{"type":"text","content":"ok"}}}}]}}],"expects":{{"max_tool_calls":0}}}}"#
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.json"), duplicate("first")).unwrap();
+        std::fs::write(dir.path().join("b.json"), duplicate("second")).unwrap();
+
+        let err = load_suite(dir.path()).expect_err("duplicate receipt identities must fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("duplicate case identity \"same\""));
+        assert!(rendered.contains("a.json"));
+        assert!(rendered.contains("b.json"));
     }
 
     /// Write `body` to a fixture file and load it, returning the loader result.

@@ -188,6 +188,77 @@ failed check or run error). This is the CI gate: the process exit code is the
 signal. The same decision is exposed as the pure function
 `SuiteReport::exit_code()` so it can be tested at its real boundary.
 
+## Run receipts and record dumps
+
+Every case run produces a receipt: a schema tag, the mode, the case id, a
+SHA-256 `case_hash` of the case's canonical JSON, the `provider_ref`
+(`scripted` for replay, `<type>.<alias>:<model>` for live), the `tool_surface`,
+and a `sandbox` stamp. These fields appear per case in the JSON report and make
+runs comparable across time (the baseline workflow builds on them).
+
+The receipt is built before the fallible work starts, so a case that errors,
+times out, or never reaches the provider still carries every field above.
+Completion-only data (the transcript and `total_tokens`) is absent for such a
+case rather than reported as a real zero.
+
+`tool_surface` records three sorted stages, because the pre-registry request
+list alone describes neither run faithfully:
+
+- `requested`: the case's `tools` intersected with `[eval].live_allowed_tools`,
+  verbatim.
+- `effective`: what survives eval-side filtering, including the unconditional
+  live `shell` denial.
+- `registered`: the names the assembled registry actually hands to the agent.
+  This includes implicit built-ins such as `echo` (which an empty `effective`
+  list still exposes) and excludes an allowlisted name that matches no runtime
+  tool.
+
+Records can be dumped as JSON:
+
+- `--dump-records <dir>` writes `<dir>/<case_id>.json` (record plus grades) for
+  every case.
+- On every completed run, failed or errored cases are auto-dumped under
+  `<install>/eval-artifacts/runs/<run-id>/`. The table footer prints the exact
+  directory when any failed-case records exist. The
+  `<install>/eval-artifacts/last-run` pointer names that completed run.
+
+Dump files are published complete: the payload is written to a sibling temporary
+file, synced, and then renamed into a name that did not previously exist, so a
+reader never sees a partial transcript and a colliding case id never overwrites
+an earlier dump.
+
+### Artifact location, permissions, and retention
+
+Automatic artifacts live under the configured install root, never under the
+process working directory, so running the harness from a nested directory cannot
+drop an unredacted transcript into a tracked path. On Unix, every directory this
+harness creates is `0700` and every file it writes is `0600`, for the automatic
+location and for a `--dump-records <dir>` you name yourself; an existing dump
+directory is tightened to `0700` rather than inheriting a looser prior mode.
+
+The retention contract is exactly one completed run:
+
+- A run stages into its own `<install>/eval-artifacts/staging/<run-id>/`, which
+  no other process reads or removes.
+- On completion the staging directory is renamed to
+  `<install>/eval-artifacts/runs/<run-id>/` and the `last-run` pointer file is
+  replaced atomically to name it.
+- The previously completed run under `runs/` is then removed. Nothing else is
+  retained, and a removal failure other than "already gone" is reported instead
+  of being swallowed.
+- An OS file lock (`<install>/eval-artifacts/.publish.lock`) serializes those
+  three steps, so concurrent runs select one complete run and never mix or erase
+  each other's records.
+
+A run that is rejected before it finishes (bad provider config, missing suite
+directory) leaves the previous completed run and its pointer untouched.
+
+Dumps are debugging artifacts, not fixtures. A live transcript can embed
+workspace file content and model output, so **never commit a dump**. Promoting
+one into a suite fixture requires the same privacy placeholder pass as any other
+fixture (see the privacy contract): no real names, transcripts, hostnames, or
+credentials.
+
 ## Case format
 
 Each fixture is an `LlmTrace`: a `model_name`, a list of conversation `turns`

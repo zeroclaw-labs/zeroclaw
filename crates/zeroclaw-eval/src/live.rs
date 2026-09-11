@@ -18,7 +18,9 @@ use zeroclaw_runtime::security::Sandbox;
 
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
-use crate::record::{RunRecord, duration_millis_saturating};
+use crate::record::{
+    CaseProvenance, RunCompletion, RunRecord, ToolSurface, duration_millis_saturating,
+};
 use crate::runner::{CaseProvider, RunDeps};
 
 /// The model name `Agent::builder()` falls back to when no `model_name` is set.
@@ -69,22 +71,28 @@ const UNCONFIGURED_MODEL: &str = "<unconfigured>";
 const LIVE_TOOL_DENYLIST: &[&str] = &["shell"];
 
 /// Intersect a case's requested tools with the config allowlist, preserving the
-/// allowlist's order and de-duplicating, then drop anything in
-/// `LIVE_TOOL_DENYLIST`. Deny always wins: a tool present in both a case's
-/// `tools` and `[eval].live_allowed_tools` is still excluded when
-/// denylisted. An empty allowlist yields no tools.
-pub fn effective_live_tools(requested: Option<&[String]>, allowed: &[String]) -> Vec<String> {
+/// allowlist's order and de-duplicating.
+pub fn requested_live_tools(requested: Option<&[String]>, allowed: &[String]) -> Vec<String> {
     let requested = requested.unwrap_or(&[]);
-    let mut out: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     for tool in allowed {
-        if LIVE_TOOL_DENYLIST.contains(&tool.as_str()) {
-            continue;
-        }
-        if requested.iter().any(|r| r == tool) && !out.iter().any(|o| o == tool) {
+        if requested.iter().any(|item| item == tool) && !out.contains(tool) {
             out.push(tool.clone());
         }
     }
     out
+}
+
+/// Apply the unconditional denylist to [`requested_live_tools`].
+///
+/// Deny always wins: a tool present in both a case's `tools` and
+/// `[eval].live_allowed_tools` is still excluded when denylisted. An empty
+/// allowlist yields no tools.
+pub fn effective_live_tools(requested: Option<&[String]>, allowed: &[String]) -> Vec<String> {
+    requested_live_tools(requested, allowed)
+        .into_iter()
+        .filter(|tool| !LIVE_TOOL_DENYLIST.contains(&tool.as_str()))
+        .collect()
 }
 
 /// Reject live cases that script LLM steps: the real provider produces responses,
@@ -215,7 +223,7 @@ pub async fn run_live_case(
     deps: &RunDeps,
 ) -> anyhow::Result<crate::runner::CaseOutcome> {
     let graders = crate::grader::default_graders(trace);
-    run_live_case_with_graders(trace, deps, graders).await
+    run_live_case_with_graders_recording_provenance(trace, deps, graders, &mut None).await
 }
 
 /// Injection seam for the live path, mirroring
@@ -227,9 +235,25 @@ pub async fn run_live_case_with_graders(
     deps: &RunDeps,
     graders: Vec<Box<dyn crate::grader::Grader>>,
 ) -> anyhow::Result<crate::runner::CaseOutcome> {
+    run_live_case_with_graders_recording_provenance(trace, deps, graders, &mut None).await
+}
+
+pub(crate) async fn run_live_case_with_graders_recording_provenance(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    graders: Vec<Box<dyn crate::grader::Grader>>,
+    provenance_out: &mut Option<CaseProvenance>,
+) -> anyhow::Result<crate::runner::CaseOutcome> {
     ensure_no_scripted_steps(trace)?;
 
+    let requested = requested_live_tools(trace.tools.as_deref(), &deps.live_tools);
     let effective = effective_live_tools(trace.tools.as_deref(), &deps.live_tools);
+    let mut provenance = crate::runner::case_provenance(
+        trace,
+        deps,
+        ToolSurface::new(requested.clone(), effective.clone(), Vec::new()),
+    )?;
+    *provenance_out = Some(provenance.clone());
 
     let tmp = tempfile::tempdir()?;
     if let Some(setup) = &trace.setup {
@@ -258,6 +282,10 @@ pub async fn run_live_case_with_graders(
         ..RiskProfileConfig::default()
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
+
+    let registered = tools.iter().map(|tool| tool.name().to_string()).collect();
+    provenance.tool_surface = ToolSurface::new(requested, effective, registered);
+    *provenance_out = Some(provenance.clone());
 
     // The policy is the source of truth for both assembly and the agent's
     // defense-in-depth gate. `None` keeps the echo-only empty-allowlist
@@ -332,14 +360,17 @@ pub async fn run_live_case_with_graders(
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {
-        final_response,
-        history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
-        input_tokens,
-        output_tokens,
-        duration_ms,
-        llm_calls: observer.llm_calls(),
+        provenance,
+        completion: Some(RunCompletion {
+            final_response,
+            history: agent.history().to_vec(),
+            tools_called: observer.tool_names(),
+            all_tools_succeeded: observer.all_tools_succeeded(),
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            llm_calls: observer.llm_calls(),
+        }),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
     let grades = crate::grader::grade_with(&graders, &record, tmp.path()).await;
@@ -372,6 +403,7 @@ mod tests {
         RunDeps {
             mode: Mode::Live,
             provider: Box::new(move |trace| Ok(CaseProvider::from_provider(provider(trace)?))),
+            provider_ref: "test.model:test".to_string(),
             live_tools,
             case_timeout: timeout,
         }
@@ -427,9 +459,9 @@ mod tests {
         // list "shell", a scripted `shell` tool call must never actually
         // execute.
         //
-        // Because `shell` is excluded from `effective`, it is also excluded
-        // from `risk.auto_approve` (both are built from the same
-        // `effective.clone()` in `run_live_case`), so the approval gate
+        // Because `shell` is excluded from the assembled registry, it is also
+        // excluded from `risk.auto_approve`, which is derived from that same
+        // registry. The approval gate therefore
         // resolves its requirement to `Prompt` and auto-denies it - no
         // interactive/channel backchannel is wired here - *before* the call
         // ever reaches tool dispatch. That means it never shows up in
@@ -456,13 +488,14 @@ mod tests {
         );
 
         let record = run_live_case(&trace, &deps).await.unwrap().record;
+        let completion = record.completion_or_default();
         assert!(
-            !record.tools_called.contains(&"shell".to_string()),
+            !completion.tools_called.contains(&"shell".to_string()),
             "shell must be auto-denied before it ever reaches tool \
              dispatch, so it must not appear as a dispatched tool call: {:?}",
-            record.tools_called
+            completion.tools_called
         );
-        let denied = record.history.iter().any(|msg| {
+        let denied = completion.history.iter().any(|msg| {
             matches!(
                 msg,
                 ConversationMessage::ToolResults(results)
@@ -477,7 +510,7 @@ mod tests {
             "the shell call must be auto-denied by the approval gate \
              (proving it never actually ran), but no denial was recorded \
              in history: {:?}",
-            record.history
+            completion.history
         );
     }
 
@@ -560,8 +593,9 @@ mod tests {
         );
 
         let outcome = run_live_case(&trace, &deps).await.unwrap();
-        assert_eq!(outcome.record.tools_called, vec!["echo"]);
-        assert!(outcome.record.all_tools_succeeded);
+        let completion = outcome.record.completion_or_default();
+        assert_eq!(completion.tools_called, vec!["echo"]);
+        assert!(completion.all_tools_succeeded);
     }
 
     #[test]
@@ -756,7 +790,7 @@ mod tests {
             canary_parent.display()
         );
         assert!(
-            !outcome.record.all_tools_succeeded,
+            !outcome.record.completion_or_default().all_tools_succeeded,
             "the out-of-workspace file_write must not report success"
         );
     }
@@ -859,20 +893,25 @@ mod tests {
         let sent_for_factory = sent.clone();
         let read_path = host_file.to_string_lossy().to_string();
 
-        let deps = RunDeps {
-            mode: Mode::Live,
-            provider: Box::new(move |_trace: &LlmTrace| {
-                Ok(CaseProvider::from_provider(Box::new(ReadEscapeProvider {
+        let deps = live_deps(
+            move |_trace: &LlmTrace| {
+                Ok(Box::new(ReadEscapeProvider {
                     read_path: read_path.clone(),
                     sent: sent_for_factory.clone(),
                     calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                })))
-            }),
-            live_tools: vec!["file_read".to_string()],
-            case_timeout: Duration::from_secs(5),
-        };
+                }) as Box<dyn ModelProvider>)
+            },
+            vec!["file_read".to_string()],
+            Duration::from_secs(5),
+        );
 
         let record = run_live_case(&trace, &deps).await.unwrap().record;
+        assert!(
+            record.is_complete(),
+            "the run must have completed, or the transcript assertions below \
+             would pass against an empty stand-in: {record:?}"
+        );
+        let completion = record.completion_or_default();
 
         let sent = sent.lock().unwrap();
         assert!(
@@ -888,13 +927,13 @@ mod tests {
             );
         }
         assert!(
-            !format!("{:?}", record.history).contains(MARKER),
+            !format!("{:?}", completion.history).contains(MARKER),
             "confidentiality breach: host file contents reached the fed-back \
              conversation: {:?}",
-            record.history
+            completion.history
         );
         assert!(
-            !record.all_tools_succeeded,
+            !completion.all_tools_succeeded,
             "the out-of-workspace file_read must not report success"
         );
     }
@@ -975,6 +1014,7 @@ mod tests {
                     finish_turn: None,
                 })
             }),
+            provider_ref: "testprov.model-under-test".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(5),
         };
@@ -1087,5 +1127,130 @@ mod tests {
             "grades: {:?}",
             outcome.grades
         );
+    }
+    #[tokio::test]
+    async fn live_empty_tool_list_records_echo_in_registered_surface() {
+        // No allowlisted tools -> the built-in echo registry is substituted. The
+        // receipt must say `["echo"]`, not `[]`: reporting an empty surface hides
+        // a capability the run genuinely had.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "echo-surface", "turns": [{ "user_input": "hi" }] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                ))
+            },
+            Vec::new(),
+            std::time::Duration::from_secs(5),
+        );
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let surface = &outcome.record.provenance.tool_surface;
+        assert_eq!(
+            surface.registered,
+            vec!["echo".to_string()],
+            "the implicit echo registry must be reported, not hidden behind []"
+        );
+        assert!(surface.effective.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_unknown_allowlisted_tool_absent_from_registered_surface() {
+        // A name present in both the case and the config allowlist but matching no
+        // runtime tool must not be reported as available.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "unknown-tool", "turns": [{ "user_input": "hi" }], "tools": ["definitely_not_a_tool"] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                ))
+            },
+            vec!["definitely_not_a_tool".to_string()],
+            std::time::Duration::from_secs(5),
+        );
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let surface = &outcome.record.provenance.tool_surface;
+        assert!(
+            surface
+                .requested
+                .contains(&"definitely_not_a_tool".to_string()),
+            "the request must be recorded verbatim: {surface:?}"
+        );
+        assert!(
+            !surface
+                .registered
+                .contains(&"definitely_not_a_tool".to_string()),
+            "a tool no registry exposes must not be reported as available: {surface:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_surface_matches_agent_builder_registry() {
+        // The recorded `registered` list must equal the names the registry hands to
+        // `Agent::builder` — derived from the registry handle, not the request path.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "registry-match", "turns": [{ "user_input": "hi" }], "tools": ["file_read", "definitely_not_a_tool"] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| {
+                Ok(driver_provider(
+                    r#"{"model_name":"d","turns":[{"user_input":"","steps":[{"response":{"type":"text","content":"ok"}}]}]}"#,
+                ))
+            },
+            vec!["file_read".to_string(), "definitely_not_a_tool".to_string()],
+            std::time::Duration::from_secs(5),
+        );
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        let surface = &outcome.record.provenance.tool_surface;
+
+        let effective = effective_live_tools(trace.tools.as_deref(), &deps.live_tools);
+        let policy = Arc::new(SecurityPolicy::default());
+        let mut expected: Vec<String> = live_tool_registry(&effective, policy)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            surface.registered, expected,
+            "recorded surface must equal the registry actually built"
+        );
+        assert_eq!(surface.registered, vec!["file_read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn timed_out_live_case_publishes_provenance_before_execution() {
+        // A timeout aborts before any record is assembled; provenance must already
+        // have been published so the caller can still build a receipt.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "slow-prov", "turns": [{ "user_input": "hang" }] }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            |_| Ok(Box::new(SleepProvider) as Box<dyn ModelProvider>),
+            Vec::new(),
+            std::time::Duration::from_millis(50),
+        );
+        let mut provenance = None;
+        let err = run_live_case_with_graders_recording_provenance(
+            &trace,
+            &deps,
+            crate::grader::default_graders(&trace),
+            &mut provenance,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"), "unexpected: {err}");
+        let p = provenance.expect("provenance must be published before the turns loop");
+        assert_eq!(p.case_id, "slow-prov");
+        assert!(!p.case_hash.is_empty(), "case hash must survive a timeout");
+        assert_eq!(p.tool_surface.registered, vec!["echo".to_string()]);
     }
 }

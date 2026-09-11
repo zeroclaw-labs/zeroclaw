@@ -139,11 +139,13 @@ async fn live_shell_cannot_write_outside_workspace_because_it_never_runs() {
     let deps = RunDeps {
         mode: Mode::Live,
         provider: Box::new(move |_trace: &LlmTrace| driver_provider(&driver)),
+        provider_ref: "test.model:test".to_string(),
         live_tools: vec!["file_write".to_string(), "shell".to_string()],
         case_timeout: Duration::from_secs(10),
     };
 
     let record = run_live_case(&trace, &deps).await.unwrap().record;
+    let completion = record.completion_or_default();
 
     assert!(
         !canary.exists(),
@@ -152,25 +154,26 @@ async fn live_shell_cannot_write_outside_workspace_because_it_never_runs() {
         canary.display()
     );
     assert!(
-        !record.tools_called.contains(&"shell".to_string()),
+        !completion.tools_called.contains(&"shell".to_string()),
         "shell must be auto-denied before it ever reaches tool dispatch, so \
          it must not appear as a dispatched tool call: {:?}",
-        record.tools_called
+        completion.tools_called
     );
     // Anti-vacuity: the in-workspace `file_write` step (writing the escape
     // script `shell` would have run) did dispatch and succeed, so the
     // absence of the shell call above isn't just the whole case failing to
     // run anything.
     assert!(
-        record.tools_called.contains(&"file_write".to_string()) && record.all_tools_succeeded,
+        completion.tools_called.contains(&"file_write".to_string())
+            && completion.all_tools_succeeded,
         "the in-workspace file_write step must still dispatch and succeed: {:?}",
         record
     );
     assert!(
-        history_shows_a_denial(&record.history),
+        history_shows_a_denial(&completion.history),
         "the shell call must be auto-denied by the approval gate (proving \
          it never actually ran), but no denial was recorded in history: {:?}",
-        record.history
+        completion.history
     );
 }
 
@@ -198,26 +201,29 @@ async fn live_shell_cannot_reach_external_network_because_it_never_runs() {
     let deps = RunDeps {
         mode: Mode::Live,
         provider: Box::new(move |_trace: &LlmTrace| driver_provider(&driver)),
+        provider_ref: "test.model:test".to_string(),
         live_tools: vec!["file_write".to_string(), "shell".to_string()],
         case_timeout: Duration::from_secs(10),
     };
 
     let record = run_live_case(&trace, &deps).await.unwrap().record;
+    let completion = record.completion_or_default();
     assert!(
-        !record.tools_called.contains(&"shell".to_string()),
+        !completion.tools_called.contains(&"shell".to_string()),
         "shell must be auto-denied before it ever reaches tool dispatch, so \
          it must not appear as a dispatched tool call: {:?}",
-        record.tools_called
+        completion.tools_called
     );
     assert!(
-        record.tools_called.contains(&"file_write".to_string()) && record.all_tools_succeeded,
+        completion.tools_called.contains(&"file_write".to_string())
+            && completion.all_tools_succeeded,
         "the in-workspace file_write step must still dispatch and succeed: {:?}",
         record
     );
     assert!(
-        history_shows_a_denial(&record.history),
+        history_shows_a_denial(&completion.history),
         "the shell call must be auto-denied by the approval gate rather \
          than reaching the network, but no denial was recorded in history: {:?}",
-        record.history
+        completion.history
     );
 }
