@@ -131,7 +131,9 @@ where
         DrainOutcome::Completed => {
             let joined = {
                 let handle = turn_handle_guard.handle()?;
-                handle.await.map_err(|e| TurnError::Panicked(format!("{e}")))?
+                handle
+                    .await
+                    .map_err(|e| TurnError::Panicked(format!("{e}")))?
             };
             outcome_from_task_result(joined, accumulated_text)
         }
@@ -834,9 +836,10 @@ mod tests {
             cvar.notify_all();
         }
 
-        wait_for("the connection must be released once cleanup returns", || {
-            connections.load(Ordering::Relaxed) == 0
-        })
+        wait_for(
+            "the connection must be released once cleanup returns",
+            || connections.load(Ordering::Relaxed) == 0,
+        )
         .await;
         assert!(
             unwind_ended.load(Ordering::SeqCst),

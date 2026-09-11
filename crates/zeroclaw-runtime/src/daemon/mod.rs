@@ -1274,9 +1274,7 @@ pub(crate) enum RpcDrain {
 /// (`rpc::CONNECTION_DRAIN_GRACE`), the point at which a connection that
 /// ignored cancellation is aborted. Returns immediately when no connection was
 /// accepted, which is also the case when no RPC listener is running at all.
-pub(crate) async fn await_rpc_connection_drain(
-    count: &std::sync::atomic::AtomicUsize,
-) -> RpcDrain {
+pub(crate) async fn await_rpc_connection_drain(count: &std::sync::atomic::AtomicUsize) -> RpcDrain {
     use std::sync::atomic::Ordering;
 
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
