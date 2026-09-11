@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description = "Pure serde projection types for the ZeroClaw SOP Blueprint graph, shared by the runtime, gateway schema, and the zerocode TUI so every surface reads one wire shape."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]

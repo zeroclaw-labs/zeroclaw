@@ -9,6 +9,7 @@
 
 mod client_crypto;
 mod color_depth;
+mod display_width;
 mod relay_proto;
 
 #[cfg(test)]
