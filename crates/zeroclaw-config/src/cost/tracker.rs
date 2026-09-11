@@ -201,6 +201,27 @@ impl CostTracker {
         self.record_usage_with_owned_task_attribution_inner(usage, agent_alias, task_id, true)
     }
 
+    /// Record a usage event attributed to an agent, a durable task, and the
+    /// chat session that incurred it. `conversation_id` is the runtime
+    /// session key scoped around the turn; `None` keeps the record
+    /// attributable only to the daemon-lifetime tracker id.
+    pub fn record_usage_attributed(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        conversation_id: Option<String>,
+    ) -> Result<()> {
+        self.record_usage_with_owned_task_attribution_inner_with_sync(
+            usage,
+            agent_alias,
+            task_id,
+            conversation_id,
+            true,
+            File::sync_all,
+        )
+    }
+
     pub fn record_scoped_usage_with_owned_task_attribution(
         &self,
         usage: TokenUsage,
@@ -221,6 +242,7 @@ impl CostTracker {
             usage,
             agent_alias,
             task_id,
+            None,
             honor_enabled,
             File::sync_all,
         )
@@ -231,6 +253,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
         task_id: Option<String>,
+        conversation_id: Option<String>,
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
     ) -> Result<()> {
@@ -261,7 +284,8 @@ impl CostTracker {
         let cost_usd = usage.cost_usd;
         let total_tokens = usage.total_tokens;
         let record =
-            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage);
+            CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
+                .with_conversation_id(conversation_id);
 
         let mut storage = self.lock_storage();
         let append_outcome = storage.add_record_with_sync(record, sync_file)?;
@@ -1258,6 +1282,7 @@ mod tests {
                 usage,
                 None,
                 Some("task-a".to_string()),
+                None,
                 true,
                 fail_sync,
             )
