@@ -129,3 +129,88 @@ case_timeout_secs = 30
         "the configured model must reach the provider: {body}"
     );
 }
+
+/// The provider guard must reject a CLI-backed `[eval].live_provider` before
+/// anything is constructed, so the CLI binary is never executed. The sentinel
+/// script records its own invocation, so a regression that moves the check
+/// after provider construction leaves the marker behind and fails here.
+#[cfg(unix)]
+#[test]
+fn eval_run_live_rejects_a_cli_backed_provider_without_launching_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sentinel_dir = tempfile::tempdir().expect("temporary sentinel directory");
+    let marker = sentinel_dir.path().join("launched");
+    let binary = sentinel_dir.path().join("grok");
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    )
+    .expect("write sentinel binary");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("make the sentinel executable");
+
+    let suite = tempfile::tempdir().expect("temporary suite directory");
+    std::fs::write(suite.path().join("live_echo.json"), ECHO_CASE).expect("write live case");
+
+    let config_dir = tempfile::tempdir().expect("temporary config directory");
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        format!(
+            r#"schema_version = 3
+
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+
+[risk_profiles.default]
+
+[runtime_profiles.default]
+
+[providers.models.grok_cli.sentinel]
+binary_path = "{}"
+working_directory = "{}"
+model = "grok-code-fast-1"
+
+[eval]
+live_provider = "grok_cli.sentinel"
+case_timeout_secs = 30
+"#,
+            binary.display(),
+            sentinel_dir.path().display()
+        ),
+    )
+    .expect("write test config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("RUST_LOG", "off")
+        .args([
+            "--config-dir",
+            config_dir.path().to_str().expect("UTF-8 config path"),
+            "eval",
+            "run",
+            "--suite",
+            suite.path().to_str().expect("UTF-8 suite path"),
+            "--mode",
+            "live",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("run zeroclaw eval");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a CLI-backed live provider must fail the run\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !marker.exists(),
+        "the CLI-backed provider must be refused before its binary is launched"
+    );
+    assert!(
+        stderr.contains("live eval refuses the CLI-backed provider `grok_cli.sentinel`"),
+        "the operator must be told which profile was refused and why\nstderr:\n{stderr}"
+    );
+}

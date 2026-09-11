@@ -48,7 +48,8 @@ Live mode (`--mode live`) runs each case against a real configured provider, so 
 costs real tokens and produces non-deterministic output. It is opt-in and never
 runs in CI by default. Enable it by setting `[eval].live_provider` to a dotted
 `providers.models` reference (e.g. `"anthropic.sonnet"`); an empty value keeps live
-mode disabled.
+mode disabled. The reference must name an HTTP model provider: CLI-backed families
+are refused (see "CLI-backed providers are excluded" below).
 
 A live case omits scripted `steps` (the provider produces the responses) and may
 declare `tools` it needs and a `setup.workspace_files` map to seed the workspace.
@@ -60,6 +61,7 @@ Each live case runs inside a sandbox:
 
 | Control | Behavior |
 |---|---|
+| Provider | Must be an HTTP model provider. CLI-backed families are rejected before any provider is constructed (see "CLI-backed providers are excluded" below). |
 | Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
 | Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`, then `shell` is dropped unconditionally (see "Shell is excluded" below); empty allowlist yields only the harmless echo tool. |
 | Autonomy | `Supervised`, never `Full`. |
@@ -88,6 +90,33 @@ model-directed `file_read` at a host path outside the workspace and asserts the
 host content reaches neither the fed-back tool result nor the next provider
 request. The residual exposure is therefore what a case deliberately puts in its
 own workspace and sends to the configured provider.
+
+### CLI-backed providers are excluded
+
+The confinement above bounds the *native* tool surface. A CLI-backed provider
+family (`grok_cli`, `gemini_cli`, `kilocli`) does not go through it: it launches
+its own coding agent as a subprocess, which brings that profile's own tools,
+permission mode, and configured working directory, and which ignores the tools
+carried on the chat request. A live case could then ask that agent to read a host
+file without ever making a native eval tool call, even with an empty
+`[eval].live_allowed_tools`.
+
+Live mode therefore refuses CLI-backed providers outright. The check runs in
+`ensure_no_cli_backed_provider` (`src/commands/eval.rs`) before any provider is
+constructed, so no subprocess is launched, and it covers every way the session
+factory can reach one:
+
+- the `[eval].live_provider` reference itself,
+- any profile reachable through that profile's `fallback` chain, within the
+  factory's own fallback depth limit,
+- any `[[model_routes]]` target, because the router builds every configured
+  route's provider up front.
+
+The run fails with a config error naming the refused profile. Point
+`[eval].live_provider` at an HTTP model provider instead. Supporting CLI-backed
+agents under the eval boundary is separate work: it needs those providers to
+honor the case workspace and the eval allowlist, which is not something live mode
+can impose from the outside.
 
 ### Shell is excluded
 
