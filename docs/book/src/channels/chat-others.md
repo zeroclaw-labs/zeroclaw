@@ -67,19 +67,34 @@ curl -X POST https://api.sendblue.com/api/account/webhooks \
   }'
 ```
 
-> **No signature scheme.** Sendblue does not sign message webhooks. Instead of
-> an HMAC over the body it **echoes the configured secret verbatim** in the
-> `sb-signing-secret` header, so the gateway can only compare that value; there
-> is nothing to recompute. Because the secret is not bound to the request body,
-> a captured header can be replayed with forged content. Sendblue enforces
-> HTTPS on webhook URLs, which is what keeps the header off the wire, so do
-> not terminate the route on plain HTTP. With `signing_secret` unset the route
-> refuses inbound requests with `401` rather than accepting them
-> unauthenticated. Prefer polling unless you need push latency.
->
-> Sendblue's separate Verify product *does* sign
-> (`X-Sendblue-Signature: t=…,v1=…`), but that is a different webhook type and
-> is not what a message channel receives.
+Both of Sendblue's authentication mechanisms are accepted, and which one you
+get depends on the webhook type:
+
+- **Signature.** `X-Sendblue-Signature: t=<unix>,v1=<hex>`, where the signature
+  is `HMAC_SHA256(secret, "<t>.<raw body>")`. This binds the secret to the body
+  and carries a timestamp, so it resists replay. Signatures older than five
+  minutes are refused. When this header is present it is authoritative: a bad
+  signature is refused rather than falling through to the weaker check, so an
+  attacker cannot downgrade by sending a deliberately broken one.
+- **Secret echo.** `sb-signing-secret` carrying the configured secret verbatim,
+  which is what Sendblue's message-webhook documentation describes.
+  `x-webhook-secret` is accepted too, for proxies that rename the header.
+
+> **The echo is weaker than a signature.** Nothing binds it to the request
+> body, so a captured header can be replayed with forged content. Sendblue
+> enforces HTTPS on webhook URLs, which is what keeps the header off the wire,
+> so do not terminate the route on plain HTTP. With `signing_secret` unset the
+> route refuses inbound requests with `401` rather than accepting them
+> unauthenticated.
+
+Sendblue re-delivers any webhook it did not get a 2xx for, so deliveries are
+de-duplicated on `message_handle` before dispatch. That record is shared with
+the poller, so switching modes or running a retry cannot double-answer.
+
+Group messages (`group_id` set) and delivery-status callbacks (`status` other
+than `RECEIVED`) are acknowledged without dispatch. Replying to a group would
+have to target the group rather than whoever spoke, and group sends are not
+implemented.
 
 ### Read receipts
 

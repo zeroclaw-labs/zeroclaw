@@ -186,9 +186,16 @@ pub(crate) static LINQ_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     dispatch_routes: &["/linq", "/linq/{alias}"],
 };
 
-/// Sendblue has no signature scheme: it posts the message object with no HMAC
-/// and no timestamp to bind, so `signature_header` names the shared-secret
-/// header the verifier compares rather than a signature it recomputes.
+/// Sendblue authenticates a webhook one of two ways, and which one arrives
+/// depends on the webhook type. A signed delivery carries
+/// `X-Sendblue-Signature: t=…,v1=HMAC_SHA256(secret, "<t>.<raw body>")`; a
+/// message webhook instead echoes the configured secret verbatim in
+/// `sb-signing-secret`, with nothing binding it to the body.
+///
+/// `signature_header` names the echo header because that is the one a message
+/// channel is documented to receive; it only selects the "missing" vs "invalid"
+/// wording in refusal logs. The verifier accepts either mechanism and treats a
+/// present signature as authoritative.
 #[cfg(feature = "channel-sendblue")]
 pub(crate) static SENDBLUE_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     channel: "sendblue",

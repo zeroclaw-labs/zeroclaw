@@ -3685,8 +3685,8 @@ async fn process_sendblue_webhook(
         signing_secret,
         &headers,
         body,
-        |secret, headers, _body| {
-            zeroclaw_channels::sendblue::verify_sendblue_secret(secret, headers)
+        |secret, headers, body| {
+            zeroclaw_channels::sendblue::verify_sendblue_secret(secret, headers, body)
         },
     ) {
         Ok(verified) => verified,
@@ -3700,7 +3700,11 @@ async fn process_sendblue_webhook(
                 Json(serde_json::json!({"error": "Invalid JSON payload"})),
             )
         })?;
-        Ok::<_, (StatusCode, Json<serde_json::Value>)>(sendblue.parse_webhook_payload(&payload))
+        // Sendblue re-delivers anything it did not get a 2xx for, so the
+        // same message can arrive more than once.
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+            sendblue.claim_unseen(sendblue.parse_webhook_payload(&payload)),
+        )
     }) {
         Ok(verified) => verified,
         Err(response) => return response,
@@ -10173,6 +10177,101 @@ path = "{trigger_path}"
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_accepts_an_hmac_signed_delivery() {
+        // Proves the ingress layer hands the verifier the raw, unparsed body:
+        // the signature is computed over those exact bytes, so any re-encoding
+        // between receipt and verification would break it.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let state = sendblue_test_state("main", Some("correct-secret"));
+        let body = sendblue_webhook_body("+15551234567", "hello");
+        let timestamp = chrono::Utc::now().timestamp();
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"correct-secret").unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body.as_bytes());
+        let signature = format!(
+            "t={timestamp},v1={}",
+            hex::encode(mac.finalize().into_bytes())
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sendblue-signature", signature.parse().unwrap());
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_rejects_a_signature_over_a_different_body() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let state = sendblue_test_state("main", Some("correct-secret"));
+        let timestamp = chrono::Utc::now().timestamp();
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"correct-secret").unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(sendblue_webhook_body("+15551234567", "hello").as_bytes());
+        let signature = format!(
+            "t={timestamp},v1={}",
+            hex::encode(mac.finalize().into_bytes())
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sendblue-signature", signature.parse().unwrap());
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            headers,
+            Bytes::from(sendblue_webhook_body("+15551234567", "tampered")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_does_not_dispatch_a_redelivery_twice() {
+        // Sendblue re-delivers anything it did not get a 2xx for.
+        let state = sendblue_test_state("main", Some("correct-secret"));
+        let body = sendblue_webhook_body("+15551234567", "hello");
+
+        for _ in 0..2 {
+            let response = Box::pin(handle_sendblue_webhook_alias(
+                State(state.clone()),
+                Path("main".to_string()),
+                sendblue_secret_headers("correct-secret"),
+                Bytes::from(body.clone()),
+            ))
+            .await
+            .into_response();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a retry must still be acknowledged so Sendblue stops retrying"
+            );
+        }
     }
 
     #[cfg(feature = "channel-sendblue")]

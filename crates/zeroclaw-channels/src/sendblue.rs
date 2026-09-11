@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -20,6 +21,13 @@ pub struct SendblueChannel {
     poll_interval: Option<Duration>,
     /// Whether to mark a conversation read once an inbound message is accepted.
     read_receipts: bool,
+    /// Recently accepted `message_handle`s, oldest first.
+    ///
+    /// Sendblue asks endpoints to be idempotent because it re-delivers on a
+    /// non-2xx or a timeout, and the polling watermark is inclusive so the
+    /// boundary message comes back on the next sweep. One shared record keeps
+    /// both inbound paths from answering the same message twice.
+    seen_handles: Mutex<VecDeque<String>>,
     /// `(succeeded, at)` for the last completed poll exchange. Read by
     /// `listener_health`, which must not perform I/O.
     poll_health: Mutex<Option<(bool, Instant)>>,
@@ -72,6 +80,7 @@ impl SendblueChannel {
             peer_resolver,
             poll_interval,
             read_receipts: false,
+            seen_handles: Mutex::new(VecDeque::new()),
             poll_health: Mutex::new(None),
             client: reqwest::Client::new(),
         }
@@ -158,6 +167,36 @@ impl SendblueChannel {
     /// `data` when the account has the newer envelope format enabled.
     fn message_object(payload: &serde_json::Value) -> &serde_json::Value {
         payload.get("data").unwrap_or(payload)
+    }
+
+    /// Drop messages whose `message_handle` this channel has already accepted,
+    /// and record the rest.
+    ///
+    /// Sendblue re-delivers a webhook that did not get a 2xx and returns the
+    /// boundary message again on the next poll, so without this the agent
+    /// answers some messages twice. Both inbound paths share one record.
+    pub fn claim_unseen(&self, messages: Vec<ChannelMessage>) -> Vec<ChannelMessage> {
+        let mut seen = self.seen_handles.lock();
+        let mut fresh = Vec::with_capacity(messages.len());
+
+        for msg in messages {
+            if seen.contains(&msg.id) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"message_handle": msg.id})),
+                    "skipping already-accepted message"
+                );
+                continue;
+            }
+            seen.push_back(msg.id.clone());
+            while seen.len() > SEEN_HANDLE_CAP {
+                seen.pop_front();
+            }
+            fresh.push(msg);
+        }
+
+        fresh
     }
 
     /// Mark the conversation with `recipient` as read, so the sender sees their
@@ -267,6 +306,39 @@ impl SendblueChannel {
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "skipping outbound message receipt"
+            );
+            return messages;
+        }
+
+        // The same endpoint carries delivery-status updates for earlier
+        // messages. Only a genuine inbound is ours to answer.
+        if let Some(status) = data
+            .get("status")
+            .and_then(|value| value.as_str())
+            .filter(|status| !status.eq_ignore_ascii_case("RECEIVED"))
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"status": status})),
+                "skipping non-received message event"
+            );
+            return messages;
+        }
+
+        // Group chats carry `group_id`, and a reply has to go to the group, not
+        // to whoever spoke. Answering `from_number` would quietly turn a group
+        // question into a private message. Group sends are not implemented, so
+        // skip rather than misroute.
+        if data
+            .get("group_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|group_id| !group_id.trim().is_empty())
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "skipping group message: group replies are not supported"
             );
             return messages;
         }
@@ -441,7 +513,6 @@ impl Channel for SendblueChannel {
         // Only messages that arrive from now on are ours to answer; replaying
         // the account's backlog on every restart would re-answer old texts.
         let mut watermark = chrono::Utc::now();
-        let mut seen: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
         loop {
             tokio::time::sleep(interval).await;
@@ -480,16 +551,12 @@ impl Channel for SendblueChannel {
                 }
 
                 // `created_at_gte` is inclusive, so the boundary message comes
-                // back on the next poll too. De-duplicate on the stable handle.
-                let handle = payload
-                    .get("message_handle")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string);
-                if handle.as_ref().is_some_and(|handle| seen.contains(handle)) {
+                // back on the next poll. `claim_unseen` drops it on the handle.
+                let parsed = self.claim_unseen(self.parse_webhook_payload(payload));
+                if parsed.is_empty() {
                     continue;
                 }
 
-                let parsed = self.parse_webhook_payload(payload);
                 // Ahead of dispatch: the point of the receipt is that the
                 // sender sees the message landed while the agent is still
                 // working on a reply.
@@ -500,13 +567,6 @@ impl Channel for SendblueChannel {
                         // Receiver dropped: the orchestrator is shutting this
                         // channel down.
                         return Ok(());
-                    }
-                }
-
-                if let Some(handle) = handle {
-                    seen.push_back(handle);
-                    while seen.len() > SEEN_HANDLE_CAP {
-                        seen.pop_front();
                     }
                 }
             }
@@ -567,30 +627,48 @@ impl Channel for SendblueChannel {
     }
 }
 
-/// Verify an inbound Sendblue webhook against the configured shared secret.
+/// Header carrying Sendblue's HMAC signature, when the account sends one.
+const SIGNATURE_HEADER: &str = "x-sendblue-signature";
+
+/// Reject signatures older than this. Sendblue's own guidance is five minutes.
+const SIGNATURE_MAX_AGE_SECS: i64 = 300;
+
+/// Verify an inbound Sendblue webhook.
 ///
-/// Sendblue does not sign message webhooks. Rather than an HMAC over the body,
-/// it **echoes the configured secret verbatim** in the `sb-signing-secret`
-/// header, so unlike Linq or WhatsApp there is nothing to recompute — the only
-/// available check is a constant-time comparison against the secret the
-/// operator registered with the webhook.
+/// Sendblue has two mechanisms and which one arrives depends on the webhook
+/// type, so both are accepted:
 ///
-/// (Sendblue's separate Verify product does sign, with
-/// `X-Sendblue-Signature: t=…,v1=HMAC_SHA256(secret, "<t>.<raw body>")`. That
-/// is a different webhook type and is not what a message channel receives.)
+/// 1. **Signature** — `X-Sendblue-Signature: t=<unix>,v1=<hex>`, where the
+///    signature is `HMAC_SHA256(secret, "<t>.<raw body>")`. This binds the
+///    secret to the body and carries a timestamp, so it is replay-resistant and
+///    is the strictly better check. Documented for Verify webhooks.
+/// 2. **Secret echo** — `sb-signing-secret` carrying the configured secret
+///    verbatim. This is what the message-webhook docs describe, and it is
+///    weaker: nothing binds it to the body, so a captured header can be
+///    replayed with forged content. Sendblue enforces HTTPS on webhook URLs,
+///    which is what keeps the header off the wire; do not terminate the route
+///    on plain HTTP.
 ///
-/// This is weaker than a signature: the secret is not bound to the request
-/// body, so a captured header can be replayed with forged content. Sendblue
-/// enforces HTTPS on webhook URLs, which is what keeps the header off the
-/// wire; do not terminate the route on plain HTTP.
+/// When a signature is present it is authoritative: a bad one is refused rather
+/// than falling through to the weaker check, so an attacker cannot downgrade to
+/// the echo by sending a deliberately broken signature.
 ///
-/// `x-webhook-secret` is accepted as a fallback for proxies that rename the
-/// header on the way in.
-pub fn verify_sendblue_secret(secret: &str, headers: &reqwest::header::HeaderMap) -> bool {
+/// `x-webhook-secret` is accepted as an echo fallback for proxies that rename
+/// the header on the way in.
+pub fn verify_sendblue_secret(
+    secret: &str,
+    headers: &reqwest::header::HeaderMap,
+    body: &[u8],
+) -> bool {
     use zeroclaw_config::pairing::constant_time_eq;
 
     if secret.is_empty() {
         return false;
+    }
+
+    if let Some(header) = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok()) {
+        // Present means it is the contract for this delivery. Do not fall back.
+        return verify_sendblue_signature(secret, header, body);
     }
 
     // `sb-signing-secret` must stay first and must stay the name in
@@ -618,6 +696,75 @@ pub fn verify_sendblue_secret(secret: &str, headers: &reqwest::header::HeaderMap
         "rejecting webhook with missing or invalid shared secret"
     );
     false
+}
+
+/// Verify an `X-Sendblue-Signature: t=<unix>,v1=<hex>` header against the raw
+/// body. Exposed for callers that already know they hold a signed delivery.
+pub fn verify_sendblue_signature(secret: &str, header: &str, body: &[u8]) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut timestamp: Option<&str> = None;
+    let mut signature: Option<&str> = None;
+    for part in header.split(',') {
+        match part.trim().split_once('=') {
+            Some(("t", value)) => timestamp = Some(value.trim()),
+            Some(("v1", value)) => signature = Some(value.trim()),
+            _ => {}
+        }
+    }
+
+    let (Some(timestamp), Some(signature)) = (timestamp, signature) else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "webhook signature header is missing its t= or v1= field"
+        );
+        return false;
+    };
+
+    let Ok(sent_at) = timestamp.parse::<i64>() else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "webhook signature timestamp is not a unix time"
+        );
+        return false;
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if (now - sent_at).unsigned_abs() > SIGNATURE_MAX_AGE_SECS.unsigned_abs() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "rejecting stale webhook signature timestamp"
+        );
+        return false;
+    }
+
+    // Signed over the raw bytes, so this must run before any JSON round trip.
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(timestamp.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+
+    let Ok(provided) = hex::decode(signature) else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "webhook signature is not hex"
+        );
+        return false;
+    };
+
+    // Constant-time comparison via HMAC verify.
+    mac.verify_slice(&provided).is_ok()
 }
 
 #[cfg(test)]
@@ -766,7 +913,8 @@ mod tests {
         // this name wrong rejects every genuine delivery.
         assert!(verify_sendblue_secret(
             "s3cret",
-            &headers_with("sb-signing-secret", "s3cret")
+            &headers_with("sb-signing-secret", "s3cret"),
+            b"{}"
         ));
     }
 
@@ -774,7 +922,8 @@ mod tests {
     fn accepts_a_renamed_header_from_a_proxy() {
         assert!(verify_sendblue_secret(
             "s3cret",
-            &headers_with("x-webhook-secret", "s3cret")
+            &headers_with("x-webhook-secret", "s3cret"),
+            b"{}"
         ));
     }
 
@@ -782,7 +931,8 @@ mod tests {
     fn rejects_a_wrong_secret() {
         assert!(!verify_sendblue_secret(
             "s3cret",
-            &headers_with("sb-signing-secret", "nope")
+            &headers_with("sb-signing-secret", "nope"),
+            b"{}"
         ));
     }
 
@@ -792,7 +942,8 @@ mod tests {
         // would widen the surface for no reason.
         assert!(!verify_sendblue_secret(
             "s3cret",
-            &headers_with("authorization", "Bearer s3cret")
+            &headers_with("authorization", "Bearer s3cret"),
+            b"{}"
         ));
     }
 
@@ -800,16 +951,161 @@ mod tests {
     fn rejects_a_missing_header() {
         assert!(!verify_sendblue_secret(
             "s3cret",
-            &reqwest::header::HeaderMap::new()
+            &reqwest::header::HeaderMap::new(),
+            b"{}"
         ));
     }
 
     #[test]
     fn rejects_an_empty_configured_secret() {
         assert!(
-            !verify_sendblue_secret("", &headers_with("sb-signing-secret", "")),
+            !verify_sendblue_secret("", &headers_with("sb-signing-secret", ""), b"{}"),
             "an unset secret must never authenticate a request"
         );
+    }
+
+    fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body);
+        format!(
+            "t={timestamp},v1={}",
+            hex::encode(mac.finalize().into_bytes())
+        )
+    }
+
+    #[test]
+    fn accepts_a_valid_hmac_signature() {
+        let body = br#"{"message_handle":"m1"}"#;
+        let now = chrono::Utc::now().timestamp();
+
+        assert!(verify_sendblue_secret(
+            "s3cret",
+            &headers_with("x-sendblue-signature", &sign("s3cret", now, body)),
+            body
+        ));
+    }
+
+    #[test]
+    fn rejects_a_signature_over_a_different_body() {
+        let now = chrono::Utc::now().timestamp();
+        let header = sign("s3cret", now, br#"{"message_handle":"m1"}"#);
+
+        assert!(
+            !verify_sendblue_secret(
+                "s3cret",
+                &headers_with("x-sendblue-signature", &header),
+                br#"{"message_handle":"tampered"}"#
+            ),
+            "the signature binds the body; a swapped body must not verify"
+        );
+    }
+
+    #[test]
+    fn rejects_a_stale_signature() {
+        let body = br#"{"message_handle":"m1"}"#;
+        let stale = chrono::Utc::now().timestamp() - (SIGNATURE_MAX_AGE_SECS + 60);
+
+        assert!(
+            !verify_sendblue_secret(
+                "s3cret",
+                &headers_with("x-sendblue-signature", &sign("s3cret", stale, body)),
+                body
+            ),
+            "an old signature is replayable and must be refused"
+        );
+    }
+
+    #[test]
+    fn a_bad_signature_does_not_fall_back_to_the_secret_echo() {
+        // Otherwise an attacker could downgrade to the weaker check by sending
+        // a deliberately broken signature alongside a stolen secret.
+        let body = br#"{"message_handle":"m1"}"#;
+        let mut headers = headers_with("x-sendblue-signature", "t=1,v1=deadbeef");
+        headers.insert("sb-signing-secret", "s3cret".parse().unwrap());
+
+        assert!(!verify_sendblue_secret("s3cret", &headers, body));
+    }
+
+    #[test]
+    fn rejects_a_malformed_signature_header() {
+        let body = br#"{"message_handle":"m1"}"#;
+        for header in ["", "garbage", "t=1", "v1=abc", "t=notatime,v1=abc"] {
+            assert!(
+                !verify_sendblue_secret(
+                    "s3cret",
+                    &headers_with("x-sendblue-signature", header),
+                    body
+                ),
+                "malformed signature {header:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn claims_each_handle_once_across_both_paths() {
+        let channel = allowed_channel();
+
+        let first = channel.claim_unseen(channel.parse_webhook_payload(&inbound("hello")));
+        assert_eq!(first.len(), 1);
+
+        // Same handle again: a webhook retry, or the inclusive poll boundary.
+        let second = channel.claim_unseen(channel.parse_webhook_payload(&inbound("hello")));
+        assert!(
+            second.is_empty(),
+            "a re-delivered message must not dispatch twice"
+        );
+    }
+
+    #[test]
+    fn a_different_handle_is_still_accepted() {
+        let channel = allowed_channel();
+        channel.claim_unseen(channel.parse_webhook_payload(&inbound("first")));
+
+        let mut payload = inbound("second");
+        payload["message_handle"] = serde_json::json!("abc-456");
+
+        assert_eq!(
+            channel
+                .claim_unseen(channel.parse_webhook_payload(&payload))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn drops_a_delivery_status_update() {
+        let mut payload = inbound("hello");
+        payload["status"] = serde_json::json!("DELIVERED");
+
+        assert!(
+            allowed_channel().parse_webhook_payload(&payload).is_empty(),
+            "a status update for an earlier message is not a new inbound"
+        );
+    }
+
+    #[test]
+    fn drops_a_group_message_rather_than_replying_privately() {
+        let mut payload = inbound("hello everyone");
+        payload["group_id"] = serde_json::json!("group-123");
+
+        assert!(
+            allowed_channel().parse_webhook_payload(&payload).is_empty(),
+            "group replies are unsupported; answering from_number would turn a \
+             group question into a private message"
+        );
+    }
+
+    #[test]
+    fn an_empty_group_id_is_not_a_group() {
+        let mut payload = inbound("hello");
+        payload["group_id"] = serde_json::json!("");
+
+        assert_eq!(allowed_channel().parse_webhook_payload(&payload).len(), 1);
     }
 
     #[test]
