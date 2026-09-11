@@ -1358,6 +1358,10 @@ pub async fn run(
             // A direct-path probe belongs to the relay session that started it.
             // Do not retain a candidate across a disconnect or transport change.
             direct_reprobe_attempt = None;
+            // Transport loss terminates ownership of active-turn clipboard
+            // temporaries without touching the composer or queued messages, so
+            // the cached pane stays live for reconnect.
+            chat_pane.cleanup_active_turn_on_disconnect();
             if owns_ephemeral && !ephemeral_respawn_done {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(socket) = target {

@@ -1179,6 +1179,17 @@ impl Chat {
         }
     }
 
+    /// On transport loss, remove active-turn clipboard temporaries without
+    /// touching the composer or queued messages, so the cached pane stays
+    /// live across a reconnect. Surfaces any bounded cleanup failures on the
+    /// still-active pane.
+    pub(crate) fn cleanup_active_turn_on_disconnect(&mut self) {
+        if let ChatPhase::Active(state) = &mut self.phase {
+            let report = state.cleanup_active_turn_attachments();
+            state.surface_cleanup_report(report);
+        }
+    }
+
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
     /// show the CWD picker first on WSS ACP connections).
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
