@@ -48,7 +48,8 @@ Live mode (`--mode live`) runs each case against a real configured provider, so 
 costs real tokens and produces non-deterministic output. It is opt-in and never
 runs in CI by default. Enable it by setting `[eval].live_provider` to a dotted
 `providers.models` reference (e.g. `"anthropic.sonnet"`); an empty value keeps live
-mode disabled.
+mode disabled. The reference must name an HTTP model provider: CLI-backed families
+are refused (see "CLI-backed providers are excluded" below).
 
 A live case omits scripted `steps` (the provider produces the responses) and may
 declare `tools` it needs. Its `setup` can seed workspace files with
@@ -88,11 +89,12 @@ Each live case runs inside a constrained execution envelope:
 
 | Control | Behavior |
 |---|---|
+| Provider | Must be an HTTP model provider. CLI-backed families are rejected before any provider is constructed (see "CLI-backed providers are excluded" below). |
 | Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
 | Tool registry | Runtime default and memory tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`, then `shell` is dropped unconditionally (see "Shell is excluded" below); empty allowlist yields only the harmless echo tool. |
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
-| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
+| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. Zero is refused before the run starts, so a config that slipped past validation cannot expire every turn. |
 | Network | The only egress live mode performs is the configured provider call itself. No tool it can admit opens a network connection, and no OS-level network rule is applied, because none is needed at this tool surface. |
 
 ### What a live case can actually touch
@@ -116,6 +118,40 @@ model-directed `file_read` at a host path outside the workspace and asserts the
 host content reaches neither the fed-back tool result nor the next provider
 request. The residual exposure is therefore what a case deliberately puts in its
 own workspace and sends to the configured provider.
+
+### CLI-backed providers are excluded
+
+The confinement above bounds the *native* tool surface. A CLI-backed provider
+family (`grok_cli`, `gemini_cli`, `kilocli`) does not go through it: it launches
+its own coding agent as a subprocess, which brings that profile's own tools,
+permission mode, and configured working directory, and which ignores the tools
+carried on the chat request. A live case could then ask that agent to read a host
+file without ever making a native eval tool call, even with an empty
+`[eval].live_allowed_tools`.
+
+Live mode therefore refuses CLI-backed providers outright. The check runs in
+`ensure_no_cli_backed_provider` (`src/commands/eval.rs`) before any provider is
+constructed, so no subprocess is launched, and it covers every way the session
+factory can reach one:
+
+- the `[eval].live_provider` reference itself,
+- any `[[model_routes]]` target, because the router builds every configured
+  route's provider up front,
+- every profile reachable through the `fallback` chain of either of those.
+
+A `fallback` entry is stored as written and resolved by alias lookup across all
+provider families, so a dotless entry such as `fallback = ["sentinel"]` selects
+whichever family owns that alias. The guard resolves each entry the same way
+before classifying it, so a CLI-backed profile cannot be admitted by naming it
+without its family. The chain walk has no depth limit of its own: the provider
+factory prunes a chain past its own fallback depth, so refusing the whole
+reachable set refuses a superset of what the factory can build.
+
+The run fails with a config error naming the refused profile. Point
+`[eval].live_provider` at an HTTP model provider instead. Supporting CLI-backed
+agents under the eval boundary is separate work: it needs those providers to
+honor the case workspace and the eval allowlist, which is not something live mode
+can impose from the outside.
 
 ### Shell is excluded
 
