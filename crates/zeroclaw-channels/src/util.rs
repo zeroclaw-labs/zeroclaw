@@ -613,9 +613,68 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     }
 }
 
+/// Fail with the vendor's status and body when an HTTP response is not a
+/// success, otherwise hand the response back so the caller can read it.
+///
+/// This is the one shape twenty-nine hand-written checks shared: a status
+/// test, the status captured, the body read best-effort, and
+/// `"<what> failed (<status>): <body>"`. Keeping the message byte-identical
+/// means callers migrate without changing what an operator sees in a log.
+/// Sites that need something else, such as a typed error, a sanitized body, a
+/// status-specific retry, or a body that must stay unread so it can be
+/// streamed — keep their own check on purpose.
+#[cfg(any(
+    feature = "channel-dingtalk",
+    feature = "channel-discord",
+    feature = "channel-line",
+    feature = "channel-mochat",
+    feature = "channel-qq",
+    feature = "channel-twitter",
+    feature = "channel-wechat",
+    feature = "channel-wecom"
+))]
+pub(crate) async fn ensure_success(
+    resp: reqwest::Response,
+    what: &str,
+) -> anyhow::Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let err = resp.text().await.unwrap_or_default();
+    anyhow::bail!("{what} failed ({status}): {err}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "channel-qq")]
+    #[tokio::test]
+    async fn ensure_success_passes_a_success_through_and_reports_status_and_body_otherwise() {
+        let (url, server) = spawn_raw_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+            false,
+        )
+        .await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let resp = ensure_success(resp, "QQ sendMessage").await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "ok");
+        server.await.unwrap();
+
+        let (url, server) = spawn_raw_http_response(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nboom!".to_vec(),
+            false,
+        )
+        .await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = ensure_success(resp, "QQ sendMessage").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "QQ sendMessage failed (500 Internal Server Error): boom!"
+        );
+        server.await.unwrap();
+    }
 
     /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
     #[allow(deprecated)]

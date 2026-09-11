@@ -26,16 +26,56 @@ static LAUNCH: OnceLock<LaunchCommand> = OnceLock::new();
 #[derive(Clone)]
 struct LaunchCommand {
     exe: PathBuf,
+    exe_resolved: bool,
     args: Vec<OsString>,
+}
+
+fn launch_command_from_resolved_exe(
+    resolved_exe: Option<PathBuf>,
+    args: Vec<OsString>,
+) -> LaunchCommand {
+    match resolved_exe {
+        Some(exe) => LaunchCommand {
+            exe,
+            exe_resolved: true,
+            args,
+        },
+        None => LaunchCommand {
+            exe: PathBuf::from("zeroclaw"),
+            exe_resolved: false,
+            args,
+        },
+    }
+}
+
+fn remediation_executable(command: &LaunchCommand) -> Option<&std::path::Path> {
+    command.exe_resolved.then_some(command.exe.as_path())
 }
 
 /// Capture the launch executable + args once, at startup (before any upgrade
 /// swaps the binary). Idempotent — later calls are ignored.
 pub fn record_launch() {
-    let _ = LAUNCH.set(LaunchCommand {
-        exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zeroclaw")),
-        args: std::env::args_os().skip(1).collect(),
-    });
+    let _ = LAUNCH.set(launch_command_from_resolved_exe(
+        std::env::current_exe().ok(),
+        std::env::args_os().skip(1).collect(),
+    ));
+}
+
+/// Return the resolved launch executable when it is safe to use for remediation.
+///
+/// The respawn command may retain a bare `zeroclaw` fallback when executable
+/// resolution failed, but that PATH-dependent fallback is intentionally excluded
+/// here. A successfully resolved path remains stable across an in-app binary swap.
+pub fn recorded_launch_executable() -> Option<&'static std::path::Path> {
+    LAUNCH.get().and_then(remediation_executable)
+}
+
+/// Whether the daemon launch command has already been captured.
+///
+/// This distinguishes startup before capture from a captured command whose
+/// executable could not be resolved.
+pub fn launch_command_recorded() -> bool {
+    LAUNCH.get().is_some()
 }
 
 /// Request a self-respawn after the daemon shuts down. The caller is expected to
@@ -139,6 +179,29 @@ pub fn respawn_if_requested() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_launch_keeps_respawn_fallback_but_not_remediation_path() {
+        let command = launch_command_from_resolved_exe(None, Vec::new());
+
+        assert_eq!(command.exe, PathBuf::from("zeroclaw"));
+        assert!(
+            remediation_executable(&command).is_none(),
+            "bare PATH-dependent fallback must not be used for remediation"
+        );
+    }
+
+    #[test]
+    fn resolved_launch_is_available_for_remediation() {
+        let path = PathBuf::from("/resolved/zeroclaw");
+        let command = launch_command_from_resolved_exe(Some(path.clone()), Vec::new());
+
+        assert_eq!(command.exe, path);
+        assert_eq!(
+            remediation_executable(&command),
+            Some(command.exe.as_path())
+        );
+    }
 
     #[test]
     fn respawn_flag_defaults_false_until_requested() {

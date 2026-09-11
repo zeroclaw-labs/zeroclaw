@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, Ordering},
@@ -96,6 +97,69 @@ enum ChatPhase {
 pub(crate) enum PaneKind {
     Chat,
     Acp,
+}
+
+/// Why pinning a local Code session to the launch directory failed.
+///
+/// A local Code session promises that file and shell tools operate on the
+/// project zerocode was launched from. If that directory cannot be captured we
+/// must not silently fall through to an omitted cwd: `session/new` would then
+/// resolve the selected agent's workspace and the session would look healthy
+/// while acting on a different project tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalCodeCwdError {
+    /// `std::env::current_dir()` failed (e.g. the directory was deleted or is
+    /// unreadable). Carries the OS error text.
+    Unavailable(String),
+    /// The launch directory is not valid UTF-8, so it cannot be represented in
+    /// the JSON-RPC `cwd` string. Carries the lossy rendering for diagnosis.
+    NotUtf8(String),
+}
+
+impl LocalCodeCwdError {
+    /// Localized, user-facing text for this capture failure.
+    fn localized(&self) -> String {
+        match self {
+            LocalCodeCwdError::Unavailable(error) => {
+                crate::i18n::t_args("zc-chat-code-cwd-unavailable", &[("error", error.as_str())])
+            }
+            LocalCodeCwdError::NotUtf8(path) => {
+                crate::i18n::t_args("zc-chat-code-cwd-not-utf8", &[("path", path.as_str())])
+            }
+        }
+    }
+}
+
+/// Process cwd for a fresh local Code session. Chat and remote transports
+/// return `Ok(None)` to deliberately omit cwd so the daemon uses the agent
+/// workspace or an explicit picker.
+///
+/// Returns `Err` when a local Code session *should* pin the launch directory
+/// but cannot. Callers must surface that error rather than starting a session
+/// against a different project.
+fn local_code_session_cwd(
+    pane_kind: PaneKind,
+    transport: crate::client::Transport,
+) -> Result<Option<String>, LocalCodeCwdError> {
+    if pane_kind == PaneKind::Acp && transport == crate::client::Transport::Local {
+        resolve_local_code_cwd(std::env::current_dir()).map(Some)
+    } else {
+        // Deliberate omission: Chat uses the agent workspace, remote Code uses
+        // the directory picker. Neither is a failure.
+        Ok(None)
+    }
+}
+
+/// Pure capture step, split out so tests can inject both failure modes without
+/// mutating global process state.
+fn resolve_local_code_cwd(
+    current_dir: std::io::Result<std::path::PathBuf>,
+) -> Result<String, LocalCodeCwdError> {
+    let path = current_dir.map_err(|e| LocalCodeCwdError::Unavailable(e.to_string()))?;
+    match path.to_str() {
+        Some(s) => Ok(s.to_string()),
+        None => Err(LocalCodeCwdError::NotUtf8(path.display().to_string())),
+    }
 }
 
 impl PaneKind {
@@ -1116,7 +1180,10 @@ impl Chat {
     }
 
     /// Fetch agent list. If exactly one enabled agent, auto-start a session (or
-    /// show the CWD picker first on WSS ACP connections).
+    /// show the CWD picker first on WSS ACP connections) — except on the Code
+    /// (ACP) pane with no resumable history, where the single-item agent
+    /// picker is shown first so the memory-isolation disclosure is visible
+    /// before the session starts.
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
         self.init_with_cancel(None, None).await.map(|_| ())
     }
@@ -1184,6 +1251,17 @@ impl Chat {
                 return Ok(ChatInitOutcome::Other);
             }
             if self.try_show_recent_acp_session_picker(&agents).await {
+                return Ok(ChatInitOutcome::Other);
+            }
+            if self.pane_kind == PaneKind::Acp {
+                // No resumable ACP history: route through the same
+                // disclosure-bearing agent picker as the multi-agent
+                // no-history path (below) instead of starting straight into
+                // a session, so a first-time Code user still sees the
+                // history-vs-persistent-memory note before any fresh
+                // `session/new` request goes out. Chat has no such note and
+                // keeps auto-starting.
+                self.show_agent_picker(agents);
                 return Ok(ChatInitOutcome::Other);
             }
             self.pick_or_start_session_inner(&agents[0], cancellation, phase)
@@ -1556,17 +1634,33 @@ impl Chat {
         // A resume must not re-point the session at the TUI's launch directory:
         // pass no cwd so the daemon keeps the retained session's own cwd.
         //
-        // A fresh session also passes no cwd unless the user explicitly picked
-        // one (the remote ACP CWD picker). That lets the daemon resolve the
-        // selected agent's configured workspace instead of forcing the TUI's
-        // launch directory — for Local and WSS alike. An explicit
-        // caller-supplied cwd still wins over that default.
+        // Fresh Chat sessions omit cwd so the daemon uses the selected agent's
+        // workspace. Fresh local Code sessions pin the process cwd so file and
+        // shell tools operate on the project zerocode was launched from. An
+        // explicit caller-supplied cwd (the remote ACP picker) still wins.
+        //
+        // If a local Code session cannot capture its launch directory we fail
+        // the creation instead of omitting cwd: a silent fallback would start a
+        // healthy-looking session rooted at the agent workspace, letting file
+        // and shell tools act on a different project.
+        let explicit_cwd = cwd_override
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
         let cwd_str: Option<String> = if resume_id.is_some() {
             None
+        } else if let Some(cwd) = explicit_cwd {
+            Some(cwd)
         } else {
-            cwd_override
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_string)
+            match local_code_session_cwd(self.pane_kind, self.rpc.transport()) {
+                Ok(cwd) => cwd,
+                Err(e) => {
+                    self.phase = ChatPhase::Error(crate::i18n::t_args(
+                        "zc-chat-error-create-session",
+                        &[("error", &e.localized())],
+                    ));
+                    return;
+                }
+            }
         };
         if is_cancelled(cancellation) {
             return;
@@ -1932,14 +2026,27 @@ impl Chat {
             });
         }
 
-        // A restart mints a fresh session: pass no cwd so the daemon resolves
-        // the selected agent's configured workspace rather than the TUI's
-        // launch directory. The remote ACP path above re-prompts via the CWD
-        // picker, so only that explicit choice overrides the agent workspace.
+        // Chat restarts omit cwd so the daemon keeps the agent workspace.
+        // Local Code restarts pin the process cwd. Remote ACP re-prompts via
+        // the picker above.
+        //
+        // A capture failure aborts the restart and keeps the existing session
+        // rather than minting one rooted at the agent workspace, which would
+        // silently move file and shell tools to a different project.
+        let cwd_str = match local_code_session_cwd(pane_kind, rpc.transport()) {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-restart-error",
+                    &[("error", &e.localized())],
+                ));
+                return None;
+            }
+        };
         let new_session = if pane_kind == PaneKind::Acp {
-            rpc.session_new_acp(&alias, None, None).await
+            rpc.session_new_acp(&alias, cwd_str.as_deref(), None).await
         } else {
-            rpc.session_new(&alias, None).await
+            rpc.session_new(&alias, cwd_str.as_deref()).await
         };
         match new_session {
             Ok(s) => {
@@ -2735,6 +2842,8 @@ impl Chat {
                     list_state,
                     *loading,
                     &self.pane_kind.name(),
+                    (self.pane_kind == PaneKind::Acp)
+                        .then(|| crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
                 );
                 self.pick_agent_list_area = list_area;
             }
@@ -2749,6 +2858,7 @@ impl Chat {
                     sessions,
                     list_state,
                     crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
                 );
             }
             ChatPhase::PickCwd { explorer, .. } => {
@@ -3959,13 +4069,18 @@ impl Chat {
             } = &mut self.phase
             {
                 let overlay_area = session_list_overlay_area(area);
+                // The resume picker renders the memory-isolation note in its
+                // footer; clicks there must not resolve to (possibly hidden)
+                // session rows, so hit-test against the note-free list rect.
+                let note = crate::i18n::t("zc-chat-session-list-resume-note");
+                let click_area = session_list_click_area(overlay_area, Some(&note));
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
                         if mouse::in_rect(mouse.column, mouse.row, overlay_area) =>
                     {
                         if let Some(idx) = mouse::list_click_index(
                             mouse.row,
-                            overlay_area,
+                            click_area,
                             list_state.offset(),
                             sessions.len(),
                         ) {
@@ -4566,7 +4681,7 @@ impl crate::widgets::HelpContext for Chat {
                         .chain(action_key_labels(C::BrowseDown))
                         .chain(action_key_labels(C::BrowseUpVim))
                         .chain(action_key_labels(C::BrowseDownVim));
-                    HelpNode::entries(vec![
+                    let mut entries = vec![
                         E::new(nav, crate::i18n::t("zc-chat-help-navigate")),
                         E::new(
                             action_key_labels(ModalAction::Confirm),
@@ -4576,7 +4691,15 @@ impl crate::widgets::HelpContext for Chat {
                             action_key_labels(GlobalAction::Quit),
                             crate::i18n::t("zc-chat-help-quit"),
                         ),
-                    ])
+                    ];
+                    // On the ACP (Code) pane the agent picker is the
+                    // no-saved-session entry point, so include the
+                    // history-vs-persistent-memory disclosure here too. Kept out
+                    // of the Chat pane's picker.
+                    if self.pane_kind == PaneKind::Acp {
+                        entries.push(E::desc(crate::i18n::t("zc-chat-help-acp-memory")));
+                    }
+                    HelpNode::entries(entries)
                 }
             }
             ChatPhase::PickCwd { explorer, .. } => explorer.help_context(),
@@ -4597,6 +4720,7 @@ impl crate::widgets::HelpContext for Chat {
                             .chain(action_key_labels(C::NewSession)),
                         crate::i18n::t("zc-chat-help-new-session"),
                     ),
+                    E::desc(crate::i18n::t("zc-chat-help-acp-memory")),
                 ])
             }
             ChatPhase::Error(_) => {
@@ -4808,6 +4932,7 @@ fn draw_agent_picker(
     list_state: &mut ListState,
     loading: bool,
     tab_title: &str,
+    acp_memory_note: Option<String>,
 ) -> Rect {
     let block = Block::default()
         .title(Span::styled(format!(" {tab_title} "), theme::title_style()))
@@ -4833,12 +4958,16 @@ fn draw_agent_picker(
         return Rect::default();
     }
 
+    let note_rows = acp_memory_note
+        .as_deref()
+        .map(|note| note_reserved_rows(note, inner.width))
+        .unwrap_or(1);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(note_rows),
         ])
         .split(inner);
 
@@ -4863,6 +4992,18 @@ fn draw_agent_picker(
         .collect();
     let list = List::new(items).highlight_style(theme::list_highlight_style());
     frame.render_stateful_widget(list, chunks[1], list_state);
+
+    // On the ACP no-saved-session path (a fresh Code start with nothing to
+    // resume) the resume picker never appears, so surface the same
+    // history-vs-persistent-memory disclosure in the agent picker's footer
+    // slot. Only rendered for the Code (ACP) pane — Chat passes `None` — so the
+    // Code-specific copy stays out of the Chat picker.
+    if let Some(note) = acp_memory_note {
+        let note_line =
+            Paragraph::new(Span::styled(note, theme::dim_style())).wrap(Wrap { trim: true });
+        frame.render_widget(note_line, chunks[2]);
+    }
+
     // The list rect is unbordered, but `mouse::list_click_index` assumes a
     // 1-cell top border. Hand back a rect shifted up one row (and one taller) so
     // the helper's border compensation lands on the true first item.
@@ -5054,6 +5195,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect, pane_kind: PaneKind)
                 sessions,
                 list_state,
                 crate::i18n::t("zc-chat-session-list-switch-title"),
+                None,
             );
         }
         SessionOverlay::None => {}
@@ -5643,7 +5785,7 @@ fn copy_region(
     cells: u16,
     scroll: u16,
     body: Rect,
-    text: &str,
+    text: &Arc<str>,
     group: usize,
 ) -> Option<CopyHitRegion> {
     if global_row < scroll || global_row >= scroll + body.height {
@@ -5651,7 +5793,7 @@ fn copy_region(
     }
     Some(CopyHitRegion {
         rect: Rect::new(body.x + col, body.y + (global_row - scroll), cells, 1),
-        text: text.to_string(),
+        text: Arc::clone(text),
         kind: CopyHitKind::Code,
         group,
     })
@@ -5662,7 +5804,7 @@ fn code_context_region(
     global_end: u16,
     scroll: u16,
     body: Rect,
-    text: &str,
+    text: &Arc<str>,
     group: usize,
 ) -> Option<CopyHitRegion> {
     let visible_start = global_start.max(scroll);
@@ -5677,7 +5819,7 @@ fn code_context_region(
             body.width,
             visible_end - visible_start,
         ),
-        text: text.to_string(),
+        text: Arc::clone(text),
         kind: CopyHitKind::Code,
         group,
     })
@@ -5714,7 +5856,32 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     Some(Rect::new(x, anchor.y, cells, 1))
 }
 
-fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConversationRenderWork {
+    visible_cached_entries: usize,
+    transcript_cached_lines: usize,
+    copy_cached_blocks: usize,
+    entry_rect_candidates: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VisibleCachedWindow {
+    entries: Range<usize>,
+    lines: Range<usize>,
+    screen_lo: u16,
+}
+
+#[cfg(test)]
+type ConversationRenderResult = ConversationRenderWork;
+#[cfg(not(test))]
+type ConversationRenderResult = ();
+
+fn render_conversation(
+    f: &mut Frame,
+    state: &mut ChatState,
+    area: Rect,
+) -> ConversationRenderResult {
     state.refresh_title_hit_rects(area);
     state.expire_copy_feedback();
 
@@ -5728,8 +5895,9 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     // Determine transient overlays (live streaming / approval) up front from
-    // cheap state reads. Transient frames append uncached lines and must use
-    // the full-buffer path; idle/scroll frames render only the viewport slice.
+    // cheap state reads. Both frame kinds render only a viewport slice;
+    // transient frames additionally append the uncached overlay lines when
+    // the window reaches past the cached history.
     let has_stream_text = !state.streaming_text.is_empty();
     let has_stream_thought = state.show_thoughts && !state.streaming_thought.is_empty();
     let has_approval = state.pending_approval().is_some();
@@ -5764,43 +5932,27 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         inner.height.saturating_sub(first_row_h),
     );
 
-    // Build the full line buffer (history + transient overlays) only on
-    // transient frames; idle/scroll frames never materialize the whole
-    // history and instead slice the viewport below.
-    let transient_lines: Vec<Line<'static>> = if transient {
-        let mut lines: Vec<Line<'static>> = state.cached_lines.clone();
-        if has_stream_text {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-                theme::agent_label_style(),
-            )]));
-            lines.extend(markdown_to_lines(&state.streaming_text, inner_width));
-        }
-        if has_stream_thought {
-            lines.push(Line::from(vec![
-                Span::styled("(thinking) ", theme::thought_style()),
-                Span::styled(state.streaming_thought.clone(), theme::dim_style()),
-            ]));
-        }
-        if has_approval {
-            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
-                lines.push(Line::default());
-            }
-        }
-        lines
+    // Build the overlay-only line buffer (streaming text / thinking /
+    // approval padding) on transient frames. History is never cloned here —
+    // `visible_transient_slice` slices the cached history the same bounded
+    // way idle frames do and appends this small overlay only once the
+    // viewport window reaches it.
+    let overlay_lines: Vec<Line<'static>> = if transient {
+        state.build_overlay_lines(inner_width)
     } else {
         Vec::new()
     };
     let transient_row_breaks = if transient {
-        row_breaks_for_lines(&transient_lines[state.cached_lines.len()..], inner_width)
+        row_breaks_for_lines(&overlay_lines, inner_width)
     } else {
         Vec::new()
     };
 
     let total_rows = if transient {
-        Paragraph::new(transient_lines.clone())
+        let overlay_rows = Paragraph::new(overlay_lines.iter().map(borrow_line).collect::<Vec<_>>())
             .wrap(Wrap { trim: false })
-            .line_count(inner_width) as u16
+            .line_count(inner_width) as u16;
+        state.cached_total_rows.saturating_add(overlay_rows)
     } else {
         state.cached_total_rows
     };
@@ -5810,15 +5962,21 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     } else {
         state.scroll_offset.min(max_scroll)
     };
+    // Resolve the ordered cached window once at both entry and line
+    // granularity. Overlays remain a separate on-demand segment and never
+    // create a second transcript source.
+    let visible_cached_window = state.visible_cached_window(scroll, inner_height);
+    #[cfg(test)]
+    let transcript_cached_lines = visible_cached_window.lines.len();
 
-    // Non-transient frames (idle, scrolling) render only the viewport slice so
-    // per-frame work stays O(visible) instead of O(history). Transient frames
-    // (live streaming, approval overlay) append uncached lines and keep the
-    // full-buffer path.
+    // Both branches now render only the viewport slice, so cached-history
+    // work stays O(log history + visible) instead of O(history), including
+    // on transient frames (live streaming, approval overlay) where only the
+    // small overlay buffer above is materialized in full.
     let (render_lines, render_scroll) = if transient {
-        (transient_lines, scroll)
+        state.visible_transient_slice(scroll, inner_height, &visible_cached_window, overlay_lines)
     } else {
-        state.visible_line_slice(scroll, inner_height)
+        state.visible_line_slice(scroll, &visible_cached_window)
     };
 
     let row_breaks = state
@@ -5850,12 +6008,12 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
+    for &(entry_idx, screen_lo, screen_hi, content_width) in
+        &state.cached_screen_ranges[visible_cached_window.entries.clone()]
+    {
         let visible_lo = screen_lo.max(scroll);
-        let visible_hi = screen_hi.min(scroll + body_h);
-        if visible_hi <= visible_lo {
-            continue;
-        }
+        let visible_hi = screen_hi.min(scroll.saturating_add(body_h));
+        debug_assert!(visible_hi > visible_lo);
         // Width follows the entry's rendered text, not the full panel, so a
         // click in the blank margin beside a short message misses every rect
         // and clears the highlight.
@@ -5869,7 +6027,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
-    state.rebuild_copy_regions(inner_width, scroll, body_rect);
+    let copy_cached_blocks = state.rebuild_copy_regions(scroll, body_rect);
     if state.in_browse_mode() {
         state.rebuild_message_copy_region(body_rect);
     } else {
@@ -5898,6 +6056,20 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
         ));
     } else {
         state.scrollbar_track_rect = None;
+    }
+
+    #[cfg(test)]
+    {
+        ConversationRenderWork {
+            visible_cached_entries: visible_cached_window.entries.len(),
+            transcript_cached_lines,
+            copy_cached_blocks,
+            entry_rect_candidates: visible_cached_window.entries.len(),
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = copy_cached_blocks;
     }
 }
 
@@ -5943,7 +6115,7 @@ fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
 
     state.copy_hit_regions.push(CopyHitRegion {
         rect,
-        text,
+        text: text.into(),
         kind: CopyHitKind::Transcript,
         group: 0,
     });
@@ -6247,12 +6419,63 @@ fn session_list_overlay_area(area: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+/// Shrink the session-list overlay rect to the rows that actually render
+/// list items when a footer `note` is present, mirroring the carve-out in
+/// [`render_session_list_overlay`]. `mouse::list_click_index` treats every
+/// row inside the border as list content, so hit-testing against the full
+/// overlay rect would map clicks on the note rows to (possibly scrolled
+/// off-screen) session indices. Keeping this next to
+/// [`session_list_overlay_area`] preserves the "same geometry, no stored
+/// state" contract for mouse handling.
+fn session_list_click_area(overlay_area: Rect, note: Option<&str>) -> Rect {
+    let Some(note) = note else {
+        return overlay_area;
+    };
+    let inner_width = overlay_area.width.saturating_sub(2);
+    let inner_height = overlay_area.height.saturating_sub(2);
+    let reserved = note_reserved_rows(note, inner_width);
+    if inner_height > reserved {
+        Rect::new(
+            overlay_area.x,
+            overlay_area.y,
+            overlay_area.width,
+            overlay_area.height - reserved,
+        )
+    } else {
+        // The render path keeps the full inner rect for the list when the
+        // note cannot fit; mirror that here.
+        overlay_area
+    }
+}
+
+/// Rows to reserve for the dim footer `note` so it renders in full when
+/// wrapped at `inner_width`. ratatui's `Wrap { trim: true }` breaks on word
+/// boundaries, so the row count is *not* `ceil(display_width / inner_width)` —
+/// a word that would overflow the current line is pushed whole to the next one,
+/// which can cost an extra row. We mirror that word-boundary packing here so a
+/// narrow inner width (e.g. the 80x24 default) reserves enough rows for every
+/// wrapped line. The disclosure is short, fixed catalogue copy, so its full
+/// wrapped height is authoritative: clipping it would hide the persistent-
+/// memory isolation half of the contract on narrow Code panes.
+fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
+    if inner_width == 0 {
+        return 1;
+    }
+    Paragraph::new(note)
+        .wrap(Wrap { trim: true })
+        .line_count(inner_width)
+        .try_into()
+        .unwrap_or(u16::MAX)
+        .max(1)
+}
+
 fn render_session_list_overlay(
     f: &mut Frame,
     area: Rect,
     sessions: &[SessionEntry],
     list_state: &mut ListState,
     title: String,
+    note: Option<String>,
 ) {
     let overlay_area = session_list_overlay_area(area);
 
@@ -6266,6 +6489,26 @@ fn render_session_list_overlay(
 
     let inner = block.inner(overlay_area);
     f.render_widget(block, overlay_area);
+
+    // Reserve enough dim footer rows for the note (if any) to render in full at
+    // the current inner width, so narrow terminals (e.g. the 80x24 default)
+    // don't silently drop the second wrapped line of the memory-isolation
+    // disclosure. It is only carved out when at least one list row survives.
+    let (list_area, note_area) = match &note {
+        Some(text) => {
+            let reserved = note_reserved_rows(text, inner.width);
+            if inner.height > reserved {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(reserved)])
+                    .split(inner);
+                (chunks[0], Some(chunks[1]))
+            } else {
+                (inner, None)
+            }
+        }
+        None => (inner, None),
+    };
 
     let items: Vec<ListItem> = sessions
         .iter()
@@ -6281,8 +6524,16 @@ fn render_session_list_overlay(
     // Render through the caller's state so the scroll offset ratatui computes
     // to keep the selection visible is retained. Mouse hit-testing later reads
     // `list_state.offset()`, so a discarded offset would make clicks after a
-    // scroll resolve to the wrong row.
-    f.render_stateful_widget(list, inner, list_state);
+    // scroll resolve to the wrong row. `list_area` is `inner` minus any
+    // reserved note rows, so the offset stays consistent with the rows the
+    // user can actually see.
+    f.render_stateful_widget(list, list_area, list_state);
+
+    if let (Some(text), Some(note_area)) = (note, note_area) {
+        let note_line =
+            Paragraph::new(Span::styled(text, theme::dim_style())).wrap(Wrap { trim: true });
+        f.render_widget(note_line, note_area);
+    }
 }
 
 fn emit_code_block_body(lines: &mut Vec<Line<'static>>, text: &str, lang: Option<&str>) {
@@ -6964,8 +7215,19 @@ enum CopyHitKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CopyHitRegion {
     rect: Rect,
-    text: String,
+    text: Arc<str>,
     kind: CopyHitKind,
+    group: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedCodeBlock {
+    header_row: u16,
+    block_end: u16,
+    header_label: (u16, u16),
+    footer_row: u16,
+    footer_label: Option<(u16, u16)>,
+    text: Arc<str>,
     group: usize,
 }
 
@@ -7181,6 +7443,10 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
+    /// Per-line wrapped screen-row spans derived from `cached_lines` at
+    /// `cached_render_width`. This is the line-level index for viewport
+    /// slicing; it is rebuilt atomically with the rendered-line cache.
+    cached_line_screen_ranges: Vec<(u16, u16)>,
     /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
     /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
     /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
@@ -7190,6 +7456,10 @@ pub struct ChatState {
     /// beside short messages — a click there dismisses the highlight instead of
     /// re-selecting the entry.
     cached_screen_ranges: Vec<(usize, u16, u16, u16)>,
+    /// Copy projections derived from fenced regions in `cached_lines`.
+    /// Keeping their full copy text in the render cache avoids rescanning a
+    /// large visible fence on every steady-state draw.
+    cached_code_blocks: Vec<CachedCodeBlock>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -7305,7 +7575,9 @@ impl ChatState {
             cached_lines: Vec::new(),
             cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
+            cached_line_screen_ranges: Vec::new(),
             cached_screen_ranges: Vec::new(),
+            cached_code_blocks: Vec::new(),
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
             cached_render_start: 0,
@@ -7552,7 +7824,7 @@ impl ChatState {
                 };
                 Some(CopyHitRegion {
                     rect,
-                    text,
+                    text: text.into(),
                     kind: CopyHitKind::Transcript,
                     group: 0,
                 })
@@ -7575,7 +7847,7 @@ impl ChatState {
                             let text = self.yank_single_entry(*idx);
                             (!text.is_empty()).then_some(CopyHitRegion {
                                 rect: *rect,
-                                text,
+                                text: text.into(),
                                 kind: CopyHitKind::Message,
                                 group: *idx,
                             })
@@ -7855,17 +8127,12 @@ impl ChatState {
                     new_ranges.push((abs_idx, base + before, base + after));
                 }
             }
-            let appended_rows =
-                Paragraph::new(new_lines.iter().map(borrow_line).collect::<Vec<_>>())
-                    .wrap(Wrap { trim: false })
-                    .line_count(width) as u16;
             self.cached_row_breaks
                 .extend(row_breaks_for_lines(&new_lines, width));
             self.cached_lines.extend(new_lines);
             self.cached_line_ranges.extend(new_ranges);
             self.cached_entry_count = end - start;
             self.dirty = LinesDirty::Clean;
-            self.cached_total_rows = self.cached_total_rows.saturating_add(appended_rows);
             self.rebuild_screen_ranges(width);
             return;
         }
@@ -7895,73 +8162,182 @@ impl ChatState {
         self.cached_entry_count = end - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
-        self.cached_total_rows = self.compute_cached_rows(width);
         self.rebuild_screen_ranges(width);
     }
 
-    fn visible_line_slice(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
-        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
-            return (self.cached_lines.clone(), scroll);
+    /// Resolve the ordered cached-entry indices whose screen rows overlap the
+    /// viewport.
+    fn visible_cached_entry_range(&self, scroll: u16, height: u16) -> Range<usize> {
+        if height == 0 {
+            return 0..0;
         }
         let view_end = scroll.saturating_add(height);
-        let mut first: Option<usize> = None;
-        let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
-            if screen_hi > scroll && screen_lo < view_end {
-                if first.is_none() {
-                    first = Some(i);
-                }
-                last = i;
-            }
-        }
-        let Some(first) = first else {
-            return (self.cached_lines.clone(), scroll);
-        };
-        let line_lo = self.cached_line_ranges[first].1;
-        let line_hi = self.cached_line_ranges[last].2;
-        let local_scroll = scroll.saturating_sub(self.cached_screen_ranges[first].1);
-        (self.cached_lines[line_lo..line_hi].to_vec(), local_scroll)
+        let first = self
+            .cached_screen_ranges
+            .partition_point(|&(_, _, screen_hi, _)| screen_hi <= scroll);
+        let end = self
+            .cached_screen_ranges
+            .partition_point(|&(_, screen_lo, _, _)| screen_lo < view_end);
+        first.min(end)..end
     }
 
-    fn visible_copy_scan(&self, scroll: u16, height: u16) -> (Vec<Line<'static>>, u16) {
-        if self.cached_screen_ranges.is_empty() || self.cached_line_ranges.is_empty() {
-            return (self.cached_lines.clone(), 0);
+    /// Resolve the complete cached viewport once at entry and line granularity.
+    /// Both indexes are generated from `cached_lines` during cache rebuilds;
+    /// steady-state draws only perform ordered lookups plus visible work.
+    fn visible_cached_window(&self, scroll: u16, height: u16) -> VisibleCachedWindow {
+        let entries = self.visible_cached_entry_range(scroll, height);
+        if height == 0 {
+            return VisibleCachedWindow {
+                entries,
+                lines: 0..0,
+                screen_lo: 0,
+            };
         }
+
         let view_end = scroll.saturating_add(height);
-        let mut first: Option<usize> = None;
-        let mut last: usize = 0;
-        for (i, &(_, screen_lo, screen_hi, _)) in self.cached_screen_ranges.iter().enumerate() {
-            if screen_hi > scroll && screen_lo < view_end {
-                if first.is_none() {
-                    first = Some(i);
-                }
-                last = i;
-            }
+        let first = self
+            .cached_line_screen_ranges
+            .partition_point(|&(_, screen_hi)| screen_hi <= scroll);
+        let end = self
+            .cached_line_screen_ranges
+            .partition_point(|&(screen_lo, _)| screen_lo < view_end);
+        let lines = first.min(end)..end;
+        let screen_lo = self
+            .cached_line_screen_ranges
+            .get(lines.start)
+            .map_or(0, |&(screen_lo, _)| screen_lo);
+        VisibleCachedWindow {
+            entries,
+            lines,
+            screen_lo,
         }
-        let Some(first) = first else {
-            return (self.cached_lines.clone(), 0);
-        };
-        let line_lo = self.cached_line_ranges[first].1;
-        let line_hi = self.cached_line_ranges[last].2;
+    }
+
+    fn visible_line_slice(
+        &self,
+        scroll: u16,
+        window: &VisibleCachedWindow,
+    ) -> (Vec<Line<'static>>, u16) {
+        if window.lines.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let local_scroll = scroll.saturating_sub(window.screen_lo);
         (
-            self.cached_lines[line_lo..line_hi].to_vec(),
-            self.cached_screen_ranges[first].1,
+            self.cached_lines[window.lines.clone()].to_vec(),
+            local_scroll,
         )
     }
 
-    /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
-    /// each entry's `Line`s individually, so screen row positions reflect
-    /// markdown wrapping (code blocks, tables, etc.). Called after every
-    /// cache rebuild so mouse hit-testing in `entry_rects` stays accurate.
+    /// Builds the transient overlay lines — the live streaming text (with
+    /// its agent label), the thinking line, and the approval padding rows —
+    /// exactly as they are appended below the committed history on transient
+    /// frames. Rebuilt fresh every frame by design; never cached.
+    fn build_overlay_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if !self.streaming_text.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+                theme::agent_label_style(),
+            )]));
+            lines.extend(markdown_to_lines(&self.streaming_text, width));
+        }
+        if self.show_thoughts && !self.streaming_thought.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("(thinking) ", theme::thought_style()),
+                Span::styled(self.streaming_thought.clone(), theme::dim_style()),
+            ]));
+        }
+        if self.pending_approval.is_some() {
+            for _ in 0..APPROVAL_OVERLAY_HEIGHT {
+                lines.push(Line::default());
+            }
+        }
+        lines
+    }
+
+    /// Like `visible_line_slice`, but the virtual buffer is cached history
+    /// rows (`0..cached_total_rows`) followed by `overlay` rows — the
+    /// transient streaming/thinking/approval lines, which are rebuilt fresh
+    /// every frame and never cached. Slices the history the same bounded way
+    /// `visible_line_slice` does, and appends the (small) overlay in full
+    /// once the viewport window reaches it, letting the `Paragraph`'s local
+    /// scroll handle any partial visibility.
+    fn visible_transient_slice(
+        &self,
+        scroll: u16,
+        height: u16,
+        window: &VisibleCachedWindow,
+        overlay: Vec<Line<'static>>,
+    ) -> (Vec<Line<'static>>, u16) {
+        let cached_total_rows = self.cached_total_rows;
+        if scroll >= cached_total_rows {
+            // Window is entirely within the overlay (includes the empty
+            // history case, where cached_total_rows is 0).
+            return (overlay, scroll - cached_total_rows);
+        }
+        let (mut lines, local_scroll) = self.visible_line_slice(scroll, window);
+        if scroll.saturating_add(height) > cached_total_rows {
+            lines.extend(overlay);
+        }
+        (lines, local_scroll)
+    }
+
+    /// Recompute every screen-space index derived from `cached_lines`.
+    /// Cache rebuilds may remain history-sized; steady-state frames use these
+    /// ordered indexes without rescanning committed entries or lines.
     fn rebuild_screen_ranges(&mut self, width: u16) {
+        self.cached_line_screen_ranges.clear();
         self.cached_screen_ranges.clear();
+        self.cached_code_blocks.clear();
         let mut screen_cursor = 0u16;
+        let mut pending_fence: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
+
+        for line in &self.cached_lines {
+            let line_start = screen_cursor;
+            screen_cursor = screen_cursor.saturating_add(wrapped_rows(line, width));
+            self.cached_line_screen_ranges
+                .push((line_start, screen_cursor));
+
+            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
+            if first.starts_with('\u{250c}') {
+                let lang = header_fence_lang(line);
+                pending_fence = label_cells(line, " [Copy] ").map(|(col, cells)| {
+                    (
+                        line_start,
+                        col,
+                        cells,
+                        line_start as usize,
+                        lang,
+                        String::new(),
+                    )
+                });
+            } else if first.starts_with('\u{2514}') {
+                if let Some((header_row, header_col, header_cells, group, lang, body)) =
+                    pending_fence.take()
+                {
+                    self.cached_code_blocks.push(CachedCodeBlock {
+                        header_row,
+                        block_end: screen_cursor,
+                        header_label: (header_col, header_cells),
+                        footer_row: line_start,
+                        footer_label: label_cells(line, " [Copy] "),
+                        text: Arc::<str>::from(fenced_text(lang.as_deref(), &body)),
+                        group,
+                    });
+                }
+            } else if let Some((_, _, _, _, _, body)) = pending_fence.as_mut() {
+                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let body_text = full.strip_prefix("  ").unwrap_or(&full);
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(body_text);
+            }
+        }
+
+        self.cached_total_rows = screen_cursor;
         for &(entry_idx, lo, hi) in &self.cached_line_ranges {
-            let entry_lines = self.cached_lines[lo..hi]
-                .iter()
-                .map(borrow_line)
-                .collect::<Vec<_>>();
-            if entry_lines.is_empty() {
+            if lo >= hi {
                 continue;
             }
             // Widest rendered column extent of the entry, clamped to the
@@ -7969,91 +8345,74 @@ impl ChatState {
             // clamp yields the true on-screen extent. Hit-testing uses this so
             // the blank space beside a short message is treated as outside the
             // entry.
-            let content_width = entry_lines
+            let content_width = self.cached_lines[lo..hi]
                 .iter()
                 .map(|l| l.width() as u16)
                 .max()
                 .unwrap_or(0)
                 .min(width);
-            let wrapped = Paragraph::new(entry_lines)
-                .wrap(Wrap { trim: false })
-                .line_count(width) as u16;
-            let screen_lo = screen_cursor;
-            screen_cursor += wrapped;
+            let Some(&(screen_lo, _)) = self.cached_line_screen_ranges.get(lo) else {
+                continue;
+            };
+            let Some(&(_, screen_hi)) = self.cached_line_screen_ranges.get(hi - 1) else {
+                continue;
+            };
             self.cached_screen_ranges
-                .push((entry_idx, screen_lo, screen_cursor, content_width));
+                .push((entry_idx, screen_lo, screen_hi, content_width));
         }
     }
 
-    fn rebuild_copy_regions(&mut self, width: u16, scroll: u16, body: Rect) {
-        let copy_lbl = " [Copy] ";
+    fn rebuild_copy_regions(&mut self, scroll: u16, body: Rect) -> usize {
         let mut regions: Vec<CopyHitRegion> = Vec::new();
         let mut context_regions: Vec<CopyHitRegion> = Vec::new();
-        let (lines, mut screen_cursor) = self.visible_copy_scan(scroll, body.height);
-        let mut pending: Option<(u16, u16, u16, usize, Option<String>, String)> = None;
-        for line in &lines {
-            let first = line.spans.first().map(|s| s.content.as_ref()).unwrap_or("");
-            if first.starts_with('\u{250c}') {
-                let lang = header_fence_lang(line);
-                pending = label_cells(line, copy_lbl).map(|(col, cells)| {
-                    (
-                        screen_cursor,
-                        col,
-                        cells,
-                        screen_cursor as usize,
-                        lang,
-                        String::new(),
-                    )
-                });
-            } else if first.starts_with('\u{2514}') {
-                if let Some((header_row, header_col, header_cells, group, lang, acc)) =
-                    pending.take()
-                {
-                    let text = fenced_text(lang.as_deref(), &acc);
-                    let block_end = screen_cursor.saturating_add(wrapped_rows(line, width));
-                    if let Some(region) =
-                        code_context_region(header_row, block_end, scroll, body, &text, group)
-                    {
-                        context_regions.push(region);
-                    }
-                    if let Some(r) = copy_region(
-                        header_row,
-                        header_col,
-                        header_cells,
-                        scroll,
-                        body,
-                        &text,
-                        group,
-                    ) {
-                        regions.push(r);
-                    }
-                    if let Some((footer_col, footer_cells)) = label_cells(line, copy_lbl)
-                        && let Some(r) = copy_region(
-                            screen_cursor,
-                            footer_col,
-                            footer_cells,
-                            scroll,
-                            body,
-                            &text,
-                            group,
-                        )
-                    {
-                        regions.push(r);
-                    }
-                }
-            } else if let Some((_, _, _, _, _, acc)) = pending.as_mut() {
-                let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                let body_text = full.strip_prefix("  ").unwrap_or(&full).to_string();
-                if !acc.is_empty() {
-                    acc.push('\n');
-                }
-                acc.push_str(&body_text);
+        let view_end = scroll.saturating_add(body.height);
+        let first = self
+            .cached_code_blocks
+            .partition_point(|block| block.block_end <= scroll);
+        let visible_blocks = self.cached_code_blocks[first..]
+            .iter()
+            .take_while(|block| block.header_row < view_end);
+        let mut visited_blocks = 0;
+        for block in visible_blocks {
+            visited_blocks += 1;
+            if let Some(region) = code_context_region(
+                block.header_row,
+                block.block_end,
+                scroll,
+                body,
+                &block.text,
+                block.group,
+            ) {
+                context_regions.push(region);
             }
-
-            screen_cursor += wrapped_rows(line, width);
+            if let Some(region) = copy_region(
+                block.header_row,
+                block.header_label.0,
+                block.header_label.1,
+                scroll,
+                body,
+                &block.text,
+                block.group,
+            ) {
+                regions.push(region);
+            }
+            if let Some((footer_col, footer_cells)) = block.footer_label
+                && let Some(region) = copy_region(
+                    block.footer_row,
+                    footer_col,
+                    footer_cells,
+                    scroll,
+                    body,
+                    &block.text,
+                    block.group,
+                )
+            {
+                regions.push(region);
+            }
         }
         self.copy_hit_regions = regions;
         self.context_copy_regions = context_regions;
+        visited_blocks
     }
 
     fn message_copy_region(&self, body: Rect) -> Option<CopyHitRegion> {
@@ -8077,7 +8436,7 @@ impl ChatState {
         let label = message_copy_label();
         Some(CopyHitRegion {
             rect: centered_message_copy_rect(&label, *rect, body)?,
-            text,
+            text: text.into(),
             kind: CopyHitKind::Message,
             group: idx,
         })
@@ -8087,17 +8446,6 @@ impl ChatState {
         if let Some(region) = self.message_copy_region(body) {
             self.copy_hit_regions.push(region);
         }
-    }
-
-    fn compute_cached_rows(&self, width: u16) -> u16 {
-        Paragraph::new(
-            self.cached_lines
-                .iter()
-                .map(borrow_line)
-                .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
     }
 
     fn render_window_end(&self) -> usize {
@@ -9273,6 +9621,10 @@ impl ChatState {
         self.streaming_thought.clear();
         self.cached_lines.clear();
         self.cached_row_breaks.clear();
+        self.cached_line_ranges.clear();
+        self.cached_line_screen_ranges.clear();
+        self.cached_screen_ranges.clear();
+        self.cached_code_blocks.clear();
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
@@ -9861,7 +10213,9 @@ mod tests {
             let backend = TestBackend::new(area.width, area.height);
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
-                .draw(|frame| render_conversation(frame, &mut state, area))
+                .draw(|frame| {
+                    let _ = render_conversation(frame, &mut state, area);
+                })
                 .expect("draw conversation");
 
             let snapshot = state
@@ -9958,7 +10312,7 @@ mod tests {
             panic!("transcript target");
         };
         assert_eq!(target.kind, CopyHitKind::Message);
-        assert_eq!(target.text, "hello");
+        assert_eq!(target.text.as_ref(), "hello");
     }
 
     #[test]
@@ -9981,7 +10335,7 @@ mod tests {
             panic!("transcript target");
         };
         assert_eq!(target.kind, CopyHitKind::Transcript);
-        assert_eq!(target.text, "ell");
+        assert_eq!(target.text.as_ref(), "ell");
 
         state.dismiss_context_menu();
         assert!(state.open_transcript_context_menu(10, 5));
@@ -9990,7 +10344,7 @@ mod tests {
             panic!("transcript target");
         };
         assert_eq!(target.kind, CopyHitKind::Transcript);
-        assert_eq!(target.text, "ell");
+        assert_eq!(target.text.as_ref(), "ell");
 
         state.dismiss_context_menu();
         state.clear_transcript_selection();
@@ -10000,7 +10354,7 @@ mod tests {
             panic!("transcript target");
         };
         assert_eq!(target.kind, CopyHitKind::Message);
-        assert_eq!(target.text, "hello");
+        assert_eq!(target.text.as_ref(), "hello");
     }
 
     #[test]
@@ -10039,7 +10393,7 @@ mod tests {
         state.entry_rects.push((0, Rect::new(0, 0, 20, 5)));
         state.context_copy_regions.push(CopyHitRegion {
             rect: Rect::new(0, 1, 40, 3),
-            text: "echo hi".to_string(),
+            text: Arc::<str>::from("echo hi"),
             kind: CopyHitKind::Code,
             group: 7,
         });
@@ -10050,7 +10404,7 @@ mod tests {
             panic!("transcript target");
         };
         assert_eq!(target.kind, CopyHitKind::Code);
-        assert_eq!(target.text, "echo hi");
+        assert_eq!(target.text.as_ref(), "echo hi");
         assert_eq!(target.group, 7);
     }
 
@@ -10096,7 +10450,7 @@ mod tests {
             rect: Rect::new(0, 0, 8, 3),
             target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
-                text: "hello".to_string(),
+                text: Arc::<str>::from("hello"),
                 kind: CopyHitKind::Message,
                 group: 0,
             }),
@@ -10111,7 +10465,7 @@ mod tests {
                 kind: CopyHitKind::Message,
                 text,
                 ..
-            }) if text == "hello"
+            }) if text.as_ref() == "hello"
         ));
     }
 
@@ -10173,7 +10527,7 @@ mod tests {
         state.dirty = LinesDirty::Clean;
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(0, 0, 8, 1),
-            text: "whole message".to_string(),
+            text: Arc::<str>::from("whole message"),
             kind: CopyHitKind::Message,
             group: 0,
         });
@@ -10380,7 +10734,7 @@ mod tests {
             assert!(state.update_transcript_drag(1, 0));
             state.copy_hit_regions.push(CopyHitRegion {
                 rect: Rect::new(0, 0, 2, 1),
-                text: "he".to_string(),
+                text: Arc::<str>::from("he"),
                 kind: CopyHitKind::Transcript,
                 group: 0,
             });
@@ -10498,7 +10852,7 @@ mod tests {
             .find(|region| region.kind == CopyHitKind::Transcript)
             .cloned()
             .expect("selection exposes transcript copy action");
-        assert_eq!(region.text, "he");
+        assert_eq!(region.text.as_ref(), "he");
         assert_eq!(state.copy_feedback, None);
 
         chat.phase = ChatPhase::Active(Box::new(state));
@@ -10830,6 +11184,110 @@ mod tests {
         );
     }
 
+    /// B1 risk #2, automated: a bounded-range off-by-one can still satisfy the
+    /// line-count assertions the other tests make, and would surface only as
+    /// mis-aimed clicks and wrong copy regions in a real terminal.
+    ///
+    /// This sweeps EVERY scroll offset over a wrapped history (prose plus code
+    /// fences) and pins the coordinate invariants that scrolling, bottom
+    /// anchoring, copy targets and `entry_rects` all read:
+    ///   1. the resolved entry range covers the whole viewport window, so no
+    ///      visible row is projected from outside the range;
+    ///   2. the line-level window covers the viewport and `local_scroll`
+    ///      indexes a real row of the slice;
+    ///   3. the materialized line count is exactly the resolved line window.
+    #[test]
+    fn visible_range_coordinate_invariants_hold_at_every_scroll_offset() {
+        let mut s = state();
+        for i in 0..120 {
+            if i % 5 == 0 {
+                s.entries
+                    .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                        "entry {i} with a deliberately long prose line that must wrap across \
+                         several screen rows at this width so screen and line coordinates diverge"
+                    ))));
+            } else if i % 5 == 1 {
+                s.entries
+                    .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                        "```rust\nfn generated_{i}() -> usize {{\n    {i}\n}}\n```"
+                    ))));
+            } else {
+                s.entries
+                    .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                        "short {i}"
+                    ))));
+            }
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+
+        let total_rows = s.cached_total_rows;
+        assert!(
+            total_rows > 200,
+            "expected a history far deeper than one viewport, got {total_rows} rows"
+        );
+
+        for height in [1u16, 7, 20, 41] {
+            for scroll in 0..=total_rows {
+                let window = s.visible_cached_window(scroll, height);
+                let (slice, local_scroll) = s.visible_line_slice(scroll, &window);
+
+                if window.entries.is_empty() {
+                    assert!(
+                        slice.is_empty(),
+                        "empty entry range must project no lines \
+                         (height={height}, scroll={scroll})"
+                    );
+                    continue;
+                }
+
+                // 1. The range must cover the viewport window it was resolved for.
+                let screen_lo = s.cached_screen_ranges[window.entries.start].1;
+                let screen_hi = s.cached_screen_ranges[window.entries.end - 1].2;
+                let view_end = scroll.saturating_add(height).min(total_rows);
+                assert!(
+                    screen_lo <= scroll,
+                    "range starts below the viewport top: screen_lo={screen_lo} > scroll={scroll} \
+                     (height={height})"
+                );
+                assert!(
+                    screen_hi >= view_end,
+                    "range ends above the viewport bottom: screen_hi={screen_hi} < \
+                     view_end={view_end} (height={height}, scroll={scroll})"
+                );
+
+                // 2. The line-level range and local scroll must cover the same
+                // viewport without materializing the complete boundary entry.
+                let line_screen_hi = s.cached_line_screen_ranges[window.lines.end - 1].1;
+                assert!(window.screen_lo <= scroll);
+                assert!(line_screen_hi >= view_end);
+                assert!(
+                    (local_scroll as usize) <= slice.len(),
+                    "local_scroll={local_scroll} outside slice of {} rows \
+                     (height={height}, scroll={scroll})",
+                    slice.len()
+                );
+                assert_eq!(
+                    local_scroll,
+                    scroll - window.screen_lo,
+                    "local_scroll must be the offset of the viewport into the first visible line \
+                     (height={height}, scroll={scroll})"
+                );
+
+                // 3. Materialization must match the resolved line range.
+                assert_eq!(
+                    window.lines.len(),
+                    slice.len(),
+                    "line window spans {} lines but the renderer drew {} \
+                     (height={height}, scroll={scroll})",
+                    window.lines.len(),
+                    slice.len()
+                );
+            }
+        }
+    }
+
     async fn apply_next_reattach_result(chat: &mut Chat, reason: &str) {
         let update = tokio::time::timeout(Duration::from_secs(2), chat.session_reattach_rx.recv())
             .await
@@ -10858,7 +11316,8 @@ mod tests {
         let max_scroll = s.cached_total_rows.saturating_sub(height);
         let mid_scroll = max_scroll / 2;
 
-        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, height);
+        let window = s.visible_cached_window(mid_scroll, height);
+        let (slice, local_scroll) = s.visible_line_slice(mid_scroll, &window);
 
         assert!(
             slice.len() < total,
@@ -10889,13 +11348,398 @@ mod tests {
         s.rebuild_lines(80);
         let height = 12u16;
 
-        let (top, top_local) = s.visible_line_slice(0, height);
+        let top_window = s.visible_cached_window(0, height);
+        let (top, top_local) = s.visible_line_slice(0, &top_window);
         assert_eq!(top_local, 0, "scroll 0 keeps the first entry aligned");
         assert!(!top.is_empty());
 
         let max_scroll = s.cached_total_rows.saturating_sub(height);
-        let (bottom, _) = s.visible_line_slice(max_scroll, height);
+        let bottom_window = s.visible_cached_window(max_scroll, height);
+        let (bottom, _) = s.visible_line_slice(max_scroll, &bottom_window);
         assert!(!bottom.is_empty(), "bottom extent must still yield lines");
+    }
+
+    /// Transient-inclusive total row count (`cached_total_rows +
+    /// overlay_rows`), computed the same way the transient branch of
+    /// `render_conversation` does.
+    fn transient_total_rows(s: &ChatState, overlay: &[Line<'static>], width: u16) -> u16 {
+        let overlay_rows = Paragraph::new(overlay.iter().map(borrow_line).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .line_count(width) as u16;
+        s.cached_total_rows.saturating_add(overlay_rows)
+    }
+
+    fn approval() -> PendingApproval {
+        PendingApproval {
+            request_id: "req-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls".to_string(),
+            timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn visible_transient_slice_bounded_not_o_of_history() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "streaming reply in progress".to_string();
+        s.pending_approval = Some(approval());
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        let height = 20u16;
+        let max_scroll = total_rows.saturating_sub(height);
+        let mid_scroll = max_scroll / 2;
+
+        let window = s.visible_cached_window(mid_scroll, height);
+        let (slice, local_scroll) = s.visible_transient_slice(mid_scroll, height, &window, overlay);
+
+        assert!(
+            slice.len() <= (height as usize) + 8,
+            "transient slice ({}) should be bounded near the viewport height ({height}), not the history",
+            slice.len()
+        );
+        assert!(
+            local_scroll < height + APPROVAL_OVERLAY_HEIGHT,
+            "local scroll ({local_scroll}) must land inside the visible window"
+        );
+    }
+
+    #[test]
+    fn visible_transient_slice_bottom_anchored_includes_overlay() {
+        let mut s = state();
+        for i in 0..30 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "entry {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "unique-streaming-marker currently in flight".to_string();
+        s.pinned_to_bottom = true;
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        let height = 12u16;
+        let max_scroll = total_rows.saturating_sub(height);
+
+        let window = s.visible_cached_window(max_scroll, height);
+        let (slice, local_scroll) = s.visible_transient_slice(max_scroll, height, &window, overlay);
+
+        let joined: String = slice
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("unique-streaming-marker"),
+            "bottom-anchored slice must contain the streaming overlay text, got: {joined:?}"
+        );
+        assert!(
+            (local_scroll as usize) < slice.len() + height as usize,
+            "local scroll ({local_scroll}) must position the overlay's tail within the viewport"
+        );
+    }
+
+    #[test]
+    fn visible_transient_slice_mid_history_scroll_matches_idle_slice() {
+        let mut s = state();
+        for i in 0..400 {
+            s.entries
+                .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                    "line entry number {i}"
+                ))));
+        }
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "should-not-appear-mid-history streaming text".to_string();
+        s.pinned_to_bottom = false;
+
+        let overlay = s.build_overlay_lines(width);
+        let height = 20u16;
+        // Scroll far above the bottom so the window sits entirely in history.
+        let scroll = 10u16;
+
+        let window = s.visible_cached_window(scroll, height);
+        let (transient_slice, transient_local) =
+            s.visible_transient_slice(scroll, height, &window, overlay);
+        let (idle_slice, idle_local) = s.visible_line_slice(scroll, &window);
+
+        assert_eq!(
+            transient_slice, idle_slice,
+            "a window entirely within history must match the idle-path slice"
+        );
+        assert_eq!(transient_local, idle_local);
+
+        let joined: String = transient_slice
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(
+            !joined.contains("should-not-appear-mid-history"),
+            "a window entirely within history must not include overlay content"
+        );
+    }
+
+    #[test]
+    fn transient_total_rows_matches_full_concatenation() {
+        let width_cases = [80u16, 24u16];
+        for width in width_cases {
+            for (streaming, thinking, approve) in [
+                (true, false, false),
+                (false, false, true),
+                (true, true, true),
+            ] {
+                let mut s = state();
+                for i in 0..10 {
+                    s.entries
+                        .push(ChatEntry::AgentMessage(Arc::<str>::from(format!(
+                            "entry {i}"
+                        ))));
+                }
+                s.mark_dirty_full();
+                s.rebuild_lines(width);
+                if streaming {
+                    s.streaming_text = "a long streaming reply that should wrap across a narrow column width when the terminal is small".to_string();
+                }
+                if thinking {
+                    s.streaming_thought = "pondering the right approach".to_string();
+                }
+                if approve {
+                    s.pending_approval = Some(approval());
+                }
+
+                let overlay = s.build_overlay_lines(width);
+                let total_rows = transient_total_rows(&s, &overlay, width);
+
+                let mut full: Vec<Line<'static>> = s.cached_lines.clone();
+                full.extend(overlay);
+                let authoritative = Paragraph::new(full)
+                    .wrap(Wrap { trim: false })
+                    .line_count(width) as u16;
+
+                assert_eq!(
+                    total_rows, authoritative,
+                    "cached_total_rows + overlay_rows must equal the full concatenation's line_count \
+                     (width={width}, streaming={streaming}, thinking={thinking}, approve={approve})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visible_transient_slice_empty_history_overlay_only() {
+        let mut s = state();
+        s.pending_approval = Some(approval());
+        let width = 80u16;
+        s.rebuild_lines(width);
+        assert_eq!(s.cached_total_rows, 0, "no entries means no history rows");
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        let height = 5u16;
+
+        let window = s.visible_cached_window(0, height);
+        let (slice, local_scroll) = s.visible_transient_slice(0, height, &window, overlay.clone());
+        assert_eq!(
+            slice, overlay,
+            "overlay-only history renders the overlay verbatim"
+        );
+        assert_eq!(local_scroll, 0);
+        assert!(total_rows >= APPROVAL_OVERLAY_HEIGHT);
+    }
+
+    #[test]
+    fn visible_transient_slice_tiny_history_large_overlay() {
+        let mut s = state();
+        s.entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("one line")));
+        s.mark_dirty_full();
+        let width = 80u16;
+        s.rebuild_lines(width);
+        s.streaming_text = "overlay-marker some streaming reply text".to_string();
+        s.pending_approval = Some(approval());
+
+        let overlay = s.build_overlay_lines(width);
+        let total_rows = transient_total_rows(&s, &overlay, width);
+        assert!(
+            total_rows > s.cached_total_rows,
+            "overlay must contribute rows beyond the tiny history"
+        );
+
+        // Window starting past the tiny history sits entirely in the overlay.
+        let height = 6u16;
+        let scroll = s.cached_total_rows;
+        let window = s.visible_cached_window(scroll, height);
+        let (slice, local_scroll) = s.visible_transient_slice(scroll, height, &window, overlay);
+        assert_eq!(local_scroll, 0);
+        let joined: String = slice
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(joined.contains("overlay-marker"));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CompleteFrameCase {
+        Idle,
+        Streaming,
+        VisibleThinking,
+        Approval,
+        OverlayOnly,
+    }
+
+    fn complete_frame_work(
+        history_entries: usize,
+        case: CompleteFrameCase,
+    ) -> ConversationRenderWork {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut s = state();
+        for _ in 0..history_entries {
+            s.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+                "history entry with stable width",
+            )));
+        }
+        s.mark_dirty_full();
+        s.pinned_to_bottom = true;
+        match case {
+            CompleteFrameCase::Idle => {}
+            CompleteFrameCase::Streaming => {
+                s.streaming_text = "streaming reply in progress".to_string();
+            }
+            CompleteFrameCase::VisibleThinking => {
+                s.show_thoughts = true;
+                s.streaming_thought = "considering the next step".to_string();
+            }
+            CompleteFrameCase::Approval => {
+                s.pending_approval = Some(approval());
+            }
+            CompleteFrameCase::OverlayOnly => {
+                s.streaming_text = "overlay row ".repeat(500);
+            }
+        }
+
+        let area = Rect::new(0, 0, 80, 24);
+        // The steady-state draw contract starts with the authoritative caches
+        // already clean; rebuilding them after transcript mutation is
+        // intentionally history-sized and is not per-frame work.
+        s.rebuild_lines(area.width.saturating_sub(2));
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut work = None;
+        terminal
+            .draw(|frame| {
+                work = Some(render_conversation(frame, &mut s, area));
+            })
+            .expect("render complete conversation frame");
+        work.expect("render records complete-frame work")
+    }
+
+    #[test]
+    fn complete_frame_history_work_is_bounded_for_all_transient_modes() {
+        for case in [
+            CompleteFrameCase::Idle,
+            CompleteFrameCase::Streaming,
+            CompleteFrameCase::VisibleThinking,
+            CompleteFrameCase::Approval,
+            CompleteFrameCase::OverlayOnly,
+        ] {
+            let small = complete_frame_work(64, case);
+            let large = complete_frame_work(1_000, case);
+
+            assert_eq!(
+                large, small,
+                "{case:?} must visit and materialize the same committed-history window with 64 and 1,000 entries"
+            );
+            assert_eq!(
+                large.visible_cached_entries, large.entry_rect_candidates,
+                "{case:?} entry rectangles must reuse the single resolved range"
+            );
+            assert!(
+                large.visible_cached_entries <= 24,
+                "{case:?} cached entry work must stay bounded by the viewport, got {large:?}"
+            );
+        }
+
+        let overlay_only = complete_frame_work(1_000, CompleteFrameCase::OverlayOnly);
+        assert_eq!(
+            overlay_only,
+            ConversationRenderWork {
+                visible_cached_entries: 0,
+                transcript_cached_lines: 0,
+                copy_cached_blocks: 0,
+                entry_rect_candidates: 0,
+            },
+            "an overlay-only viewport must not visit, clone, or wrap committed history"
+        );
+    }
+
+    #[test]
+    fn complete_frame_slices_one_large_committed_fence_by_visible_lines() {
+        use std::fmt::Write as _;
+
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut response = String::from("```rust\n");
+        for line in 0..2_000 {
+            writeln!(&mut response, "let line_{line} = {line};").expect("write fixture line");
+        }
+        response.push_str("```\n");
+
+        let mut s = state();
+        s.entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from(response)));
+        s.mark_dirty_full();
+        s.streaming_text = "streaming reply in progress".to_string();
+        s.pinned_to_bottom = false;
+
+        let area = Rect::new(0, 0, 80, 24);
+        s.rebuild_lines(area.width.saturating_sub(2));
+        s.scroll_offset = s.cached_total_rows / 2;
+        let cached_copy_text = Arc::clone(&s.cached_code_blocks[0].text);
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut work = None;
+        terminal
+            .draw(|frame| {
+                work = Some(render_conversation(frame, &mut s, area));
+            })
+            .expect("render large committed entry");
+
+        let work = work.expect("render work");
+        assert_eq!(work.visible_cached_entries, 1);
+        assert!(
+            work.transcript_cached_lines <= usize::from(area.height.saturating_sub(2)),
+            "one large entry must materialize only viewport lines: {work:?}"
+        );
+        assert_eq!(work.copy_cached_blocks, 1);
+        assert_eq!(work.entry_rect_candidates, 1);
+
+        let context = s
+            .context_copy_regions
+            .first()
+            .expect("visible fence keeps its context-copy target");
+        assert!(
+            Arc::ptr_eq(&cached_copy_text, &context.text),
+            "steady-state copy projection must share cached text"
+        );
+        assert!(context.text.contains("let line_0 = 0;"));
+        assert!(context.text.contains("let line_1999 = 1999;"));
     }
 
     #[test]
@@ -13509,6 +14353,76 @@ mod tests {
         assert!(matches!(chat.phase, ChatPhase::Error(_)));
     }
 
+    #[test]
+    fn local_code_session_cwd_only_pins_local_acp() {
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Local),
+            Ok(None)
+        );
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Chat, crate::client::Transport::Wss),
+            Ok(None)
+        );
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Wss),
+            Ok(None)
+        );
+        let expected = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
+        assert_eq!(
+            local_code_session_cwd(PaneKind::Acp, crate::client::Transport::Local),
+            Ok(Some(expected))
+        );
+    }
+
+    #[test]
+    fn local_code_cwd_capture_failure_is_an_error_not_an_omission() {
+        // A failed capture must never look like the deliberate `None` used by
+        // Chat and remote Code: omitting cwd here would silently root the
+        // session at the agent workspace, i.e. a different project.
+        let err = resolve_local_code_cwd(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file or directory",
+        )))
+        .expect_err("cwd capture failure must be reported");
+        let LocalCodeCwdError::Unavailable(msg) = &err else {
+            panic!("expected Unavailable, got {err:?}");
+        };
+        assert!(msg.contains("no such file or directory"), "got {msg}");
+        // And it renders as real localized text, not a `{key}` placeholder.
+        let shown = err.localized();
+        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+        assert!(shown.contains("no such file or directory"), "got {shown}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_code_cwd_rejects_non_utf8_launch_path() {
+        use std::os::unix::ffi::OsStrExt;
+        // 0xFF is never valid UTF-8, so this models a launch directory that
+        // cannot be sent as a JSON-RPC `cwd` string.
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/proj-\xFF");
+        let err = resolve_local_code_cwd(Ok(std::path::PathBuf::from(raw)))
+            .expect_err("non-UTF-8 cwd must be reported");
+        let LocalCodeCwdError::NotUtf8(shown_path) = &err else {
+            panic!("expected NotUtf8, got {err:?}");
+        };
+        assert!(shown_path.contains("proj-"), "got {shown_path}");
+        let shown = err.localized();
+        assert!(!shown.starts_with('{'), "unlocalized error text: {shown}");
+    }
+
+    #[test]
+    fn local_code_cwd_accepts_utf8_launch_path() {
+        assert_eq!(
+            resolve_local_code_cwd(Ok(std::path::PathBuf::from("/tmp/project"))),
+            Ok("/tmp/project".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn fresh_local_chat_session_omits_cwd_so_agent_workspace_wins() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
@@ -13549,11 +14463,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_local_acp_session_omits_cwd_so_agent_workspace_wins() {
+    async fn fresh_local_acp_session_sends_process_cwd() {
         let (tx, mut rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
+        let expected_cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
 
         let init = tokio::spawn(async move {
             let _ = chat.init().await;
@@ -13576,15 +14495,28 @@ mod tests {
         assert_eq!(request["method"], method::SESSION_LIST_ACP);
         respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
 
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        assert!(matches!(chat.phase, ChatPhase::PickAgent { .. }));
+
+        let start = tokio::spawn(async move {
+            chat.pick_or_start_session("alpha").await;
+            chat
+        });
+
         let request = next_rpc_request(&mut rx, "fresh ACP should start a session").await;
         assert_eq!(request["method"], method::SESSION_NEW);
         let params = &request["params"];
         assert_eq!(params["agent_alias"], "alpha");
         assert!(params["session_id"].is_null());
         assert_eq!(params["chat_mode"], "acp");
-        assert!(params["cwd"].is_null());
+        // Code sessions pin the directory zerocode was launched from so file
+        // and shell tools operate on that project, not the agent workspace.
+        assert_eq!(params["cwd"], expected_cwd);
 
-        init.abort();
+        start.abort();
     }
 
     #[tokio::test]
@@ -13614,6 +14546,55 @@ mod tests {
             &rpc,
             &request,
             serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": "/tmp/alpha" }),
+        );
+
+        let request = next_rpc_request(&mut rx, "restart should close the old session").await;
+        assert_eq!(request["method"], method::SESSION_CLOSE);
+        assert_eq!(request["params"]["session_id"], "sess-old");
+        respond_ok(&rpc, &request, serde_json::json!({}));
+
+        let request = next_rpc_request(&mut rx, "restart should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let phase = tokio::time::timeout(Duration::from_secs(2), restart)
+            .await
+            .expect("restart should finish")
+            .unwrap();
+        assert!(phase.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_local_acp_session_sends_process_cwd() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let expected_cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_string();
+        let mut state = ChatState::new(
+            "sess-old".to_string(),
+            "alpha".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let restart = tokio::spawn(async move {
+            Chat::restart_session_for_state(&client, PaneKind::Acp, &mut state).await
+        });
+
+        let request = next_rpc_request(&mut rx, "restart should start a fresh ACP session").await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        let params = &request["params"];
+        assert_eq!(params["agent_alias"], "alpha");
+        assert!(params["session_id"].is_null());
+        assert_eq!(params["chat_mode"], "acp");
+        assert_eq!(params["cwd"], expected_cwd);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({ "session_id": "sess-fresh", "workspace_dir": expected_cwd }),
         );
 
         let request = next_rpc_request(&mut rx, "restart should close the old session").await;
@@ -13824,7 +14805,7 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
         let mut chat = Chat::new(client, PaneKind::Acp);
-        let area = Rect::new(0, 0, 100, 30);
+        let area = Rect::new(0, 0, 35, 30);
         let overlay_area = session_list_overlay_area(area);
         let mut state = ChatState::new(
             "sess-old".to_string(),
@@ -14678,7 +15659,7 @@ mod tests {
         let copy_rect = state
             .copy_hit_regions
             .iter()
-            .find(|region| region.text == "hello")
+            .find(|region| region.text.as_ref() == "hello")
             .expect("browse-mode selected message copy action should be rendered")
             .rect;
         assert_eq!(
@@ -14960,7 +15941,7 @@ mod tests {
         let code_regions: Vec<CopyHitRegion> = state
             .copy_hit_regions
             .iter()
-            .filter(|region| region.text == "echo hello")
+            .filter(|region| region.text.as_ref() == "echo hello")
             .cloned()
             .collect();
         assert_eq!(
@@ -15014,7 +15995,7 @@ mod tests {
         state.browse_cursor = Some(0);
         state.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(2, 2, 6, 1),
-            text: "echo hi".to_string(),
+            text: Arc::<str>::from("echo hi"),
             kind: CopyHitKind::Code,
             group: 0,
         });
@@ -16113,6 +17094,7 @@ mod tests {
                     &sessions,
                     &mut list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
                 );
             })
             .expect("draw session list overlay");
@@ -16136,6 +17118,512 @@ mod tests {
             Some(expected_bg),
             "selected session row must keep the themed fill background"
         );
+    }
+
+    /// Collects every row of `area` in `terminal`'s buffer into a single
+    /// newline-joined string, for substring assertions on rendered text.
+    fn overlay_text(
+        terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        area: Rect,
+    ) -> String {
+        let buf = terminal.backend().buffer();
+        (area.y..area.y + area.height)
+            .map(|y| {
+                (area.x..area.x + area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn session_list_overlay_renders_memory_isolation_note() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // Mirrors the Code (ACP) pre-session picker call site: the
+                // resume title plus the memory-isolation note.
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
+                );
+            })
+            .expect("draw session list overlay with note");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            text.contains("resumable"),
+            "Code session picker must state history is saved & resumable: {text:?}"
+        );
+        assert!(
+            text.contains("isolated"),
+            "Code session picker must state persistent memory is isolated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_list_overlay_renders_full_memory_note_on_narrow_terminal() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Regression guard: at the ubiquitous 80-column default the centered
+        // overlay is narrow enough that the note wraps to a second line. A
+        // single reserved row would drop the "isolated" half; the reservation
+        // must grow to keep the full disclosure visible.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(crate::i18n::t("zc-chat-session-list-resume-note")),
+                );
+            })
+            .expect("draw session list overlay with note at 80 cols");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            text.contains("resumable"),
+            "80-col Code session picker must state history is saved & resumable: {text:?}"
+        );
+        assert!(
+            text.contains("isolated"),
+            "80-col Code session picker must show the full note incl. persistent \
+             memory isolation (second wrapped line must not be dropped): {text:?}"
+        );
+    }
+
+    #[test]
+    fn session_switch_overlay_omits_memory_isolation_note() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let sessions = vec![SessionEntry {
+            session_id: "session-1".to_string(),
+            session_key: "session-1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_activity: "2026-01-01T00:00:00Z".to_string(),
+            agent_alias: Some("agent".to_string()),
+            channel_id: None,
+            name: Some("first prompt".to_string()),
+            message_count: 1,
+        }];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let overlay_area = session_list_overlay_area(area);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                // Mirrors the in-session switch overlay call site (shared by
+                // both panes): no `note`, so the Code-only copy must not
+                // leak into this Chat-reachable path.
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
+                );
+            })
+            .expect("draw session switch overlay without note");
+
+        let text = overlay_text(&terminal, overlay_area);
+        assert!(
+            !text.contains("resumable") && !text.contains("isolated"),
+            "in-session switch overlay must not render the Code memory-isolation note: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_session_help_context_states_memory_isolation() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickSession {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+            agents: Vec::new(),
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help
+            .entries
+            .iter()
+            .any(|e| e.action.contains("resumable") && e.action.contains("isolated"));
+        assert!(
+            has_memory_note,
+            "Code session picker help must explain history is saved & resumable while \
+             persistent memory is isolated: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_agent_help_context_omits_memory_isolation_note() {
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        // Default phase is PickAgent — not the Code session picker — for
+        // both Chat and Acp panes, so the memory-isolation entry must not
+        // appear here. Force a non-loading PickAgent so this exercises the
+        // real (non-loading) help branch and genuinely proves the pane gate.
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["agent-a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
+        assert!(
+            !has_memory_note,
+            "non-PickSession help (e.g. Chat pane) must not surface the Code-only \
+             memory-isolation note: {help:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_agent_help_context_states_memory_isolation_on_acp_pane() {
+        // No-saved-session boundary from the linked issue: a first-time Code
+        // user (or any user with no resumable ACP history) lands in the *agent*
+        // picker, not the resume picker, so the disclosure must be reachable
+        // there too — but only on the Code (ACP) pane.
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["agent-a".to_string()],
+            list_state: ListState::default(),
+            loading: false,
+        };
+
+        let help = crate::widgets::HelpContext::help_context(&chat);
+        let has_memory_note = help.entries.iter().any(|e| e.action.contains("isolated"));
+        assert!(
+            has_memory_note,
+            "ACP agent picker (no-saved-session path) help must surface the \
+             history-vs-persistent-memory disclosure: {help:?}"
+        );
+    }
+
+    #[test]
+    fn agent_picker_renders_memory_isolation_note_on_acp_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The multi-agent no-saved-session path renders the agent picker; on the
+        // Code (ACP) pane it must carry the memory-isolation disclosure in its
+        // footer so the distinction is visible before starting Code work.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Acp.name(),
+                    Some(crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
+                );
+            })
+            .expect("draw agent picker with acp note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "ACP agent picker must render the full memory-isolation note: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_picker_keeps_full_memory_note_and_footer_non_clickable_when_narrow() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Regression guard for a 22-cell pane (20-cell bordered inner width):
+        // the catalogue copy needs more than three wrapped rows, so a fixed
+        // three-row footer clips the word "isolated" and makes the disclosure
+        // materially false at this width.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 22, 16);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut list_area = Rect::default();
+        terminal
+            .draw(|frame| {
+                list_area = draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Acp.name(),
+                    Some(crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
+                );
+            })
+            .expect("draw narrow agent picker with acp note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "narrow ACP picker must render the complete disclosure: {text:?}"
+        );
+
+        let footer_row = area.y + area.height - 2;
+        assert!(
+            crate::mouse::list_click_index(footer_row, list_area, 0, agents.len()).is_none(),
+            "the disclosure footer must remain outside agent-list hit testing"
+        );
+    }
+
+    #[test]
+    fn agent_picker_omits_memory_isolation_note_on_chat_pane() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The Chat pane reaches the same PickAgent phase but must NOT surface the
+        // Code-only disclosure — the render call site passes `None`.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Chat.name(),
+                    None,
+                );
+            })
+            .expect("draw agent picker without note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            !text.contains("isolated"),
+            "Chat pane agent picker must not render the Code memory-isolation note: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_init_single_agent_no_history_shows_disclosure_before_session_start() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // The single-agent counterpart of the no-saved-session boundary above:
+        // with exactly one enabled agent, `init` skips `show_agent_picker` and
+        // `try_show_recent_acp_session_picker` finds nothing to resume, so the
+        // old fall-through called `pick_or_start_session()` directly and never
+        // showed the disclosure. It must now land on the same
+        // disclosure-bearing agent picker as the multi-agent path, and it must
+        // do so *before* any `session/new` request goes out.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Acp);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "single-agent init should check for saved sessions").await;
+        assert_eq!(request["method"], method::SESSION_LIST_ACP);
+        respond_ok(&rpc, &request, serde_json::json!({ "sessions": [] }));
+
+        // `init` must finish here without a `config/list` or `session/new`
+        // request ever going out: neither response was supplied above, so if
+        // `init` tried to start a session first this join would time out.
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect(
+                "single-agent no-history ACP init must land on the disclosure surface \
+                 without starting a session first",
+            )
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, loading, ..
+        } = &chat.phase
+        else {
+            panic!("single-agent no-history ACP start must land in the agent picker");
+        };
+        assert_eq!(agents, &vec!["alpha".to_string()]);
+        assert!(!loading);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| chat.draw(frame, area))
+            .expect("draw single-agent no-history agent picker");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "single-agent Code start with no saved session must render the \
+             history-vs-persistent-memory disclosure before any session starts: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_init_single_agent_no_history_skips_disclosure_and_autostarts() {
+        // Companion to the ACP case above: the Chat pane must keep the
+        // original no-saved-session behavior unchanged — straight into the
+        // session, no agent-picker detour, and no Code-only disclosure ever
+        // in the picture, since Chat has no session history to disclose.
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+
+        let init = tokio::spawn(async move {
+            let _ = chat.init().await;
+            chat
+        });
+
+        let request = next_rpc_request(&mut rx, "init should request agents/status").await;
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
+                ]
+            }),
+        );
+
+        // Chat never checks for ACP session history, so the very next request
+        // must mint the session directly — never a `session/list_acp` request
+        // and never a detour through the agent picker. TodoTracker settings are
+        // resolved from the local ZeroCode config before this RPC boundary.
+        let request = next_rpc_request(
+            &mut rx,
+            "Chat single-agent start should mint a fresh session",
+        )
+        .await;
+        assert_eq!(request["method"], method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "alpha");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({
+                "session_id": "sess-chat",
+                "workspace_dir": "/tmp/chat"
+            }),
+        );
+
+        let request =
+            next_rpc_request(&mut rx, "fresh Chat session should refresh model identity").await;
+        assert_eq!(request["method"], method::CONFIG_LIST);
+        respond_ok(&rpc, &request, serde_json::json!([]));
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), init)
+            .await
+            .expect("init should finish")
+            .unwrap();
+        let ChatPhase::Active(state) = chat.phase else {
+            panic!("Chat single-agent no-history start must go straight to an active session");
+        };
+        assert_eq!(state.session_id, "sess-chat");
+        assert_eq!(state.agent_alias, "alpha");
+    }
+
+    #[test]
+    fn note_reserved_rows_accounts_for_word_boundary_wrapping() {
+        let note = crate::i18n::t("zc-chat-agent-picker-acp-memory-note");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(note.as_str()) > 31,
+            "test copy must exceed the narrow inner width to exercise wrapping"
+        );
+        assert!(
+            note_reserved_rows(&note, 31) >= 3,
+            "31-cell inner width must reserve 3 rows for the word-wrapped note, \
+             not the 2 a naive ceil would give"
+        );
+        // Wide terminal: fits on one line.
+        assert_eq!(note_reserved_rows(&note, 200), 1);
+        // The full disclosure remains reserved even at very narrow widths.
+        assert!(note_reserved_rows(&note, 20) > 3);
+    }
+
+    #[test]
+    fn note_reserved_rows_uses_paragraph_hard_wrapping_for_long_words() {
+        assert_eq!(note_reserved_rows("abcdefghijkl", 5), 3);
+        assert_eq!(note_reserved_rows("", 10), 1);
+        assert_eq!(note_reserved_rows("word", 10), 1);
     }
 
     #[test]
@@ -16173,6 +17661,7 @@ mod tests {
                     &sessions,
                     &mut list_state,
                     crate::i18n::t("zc-chat-session-list-switch-title"),
+                    None,
                 );
             })
             .expect("draw session list overlay");
@@ -16195,6 +17684,86 @@ mod tests {
             idx,
             offset + 2,
             "clicked row must map to offset + visible row, not the unscrolled index"
+        );
+    }
+
+    #[test]
+    fn resume_picker_footer_clicks_do_not_select_hidden_sessions() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+
+        // Enough saved sessions to overflow the visible list, so the rows
+        // hidden behind the footer note correspond to real (off-screen)
+        // session indices — the exact shape where a footer click used to
+        // move the selection to a hidden session.
+        let sessions: Vec<SessionEntry> = (0..40)
+            .map(|i| SessionEntry {
+                session_id: format!("sess-{i}"),
+                session_key: format!("sess-{i}"),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                agent_alias: Some("agent".to_string()),
+                channel_id: None,
+                name: Some(format!("prompt {i}")),
+                message_count: 1,
+            })
+            .collect();
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+
+        // 80x24 default terminal: narrow enough that the resume note wraps.
+        let area = Rect::new(0, 0, 80, 24);
+        let overlay_area = session_list_overlay_area(area);
+        let note = crate::i18n::t("zc-chat-session-list-resume-note");
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_session_list_overlay(
+                    frame,
+                    area,
+                    &sessions,
+                    &mut list_state,
+                    crate::i18n::t("zc-chat-session-list-resume-title"),
+                    Some(note.clone()),
+                );
+            })
+            .expect("draw resume overlay");
+
+        let click_area = session_list_click_area(overlay_area, Some(&note));
+        let reserved = note_reserved_rows(&note, overlay_area.width.saturating_sub(2));
+        assert_eq!(
+            click_area.height,
+            overlay_area.height - reserved,
+            "click area must exclude exactly the reserved note rows"
+        );
+
+        // Every reserved footer row (the note area sits directly above the
+        // bottom border) must be dead for list hit-testing, while the same
+        // rows against the full overlay rect would have resolved to a session.
+        let offset = list_state.offset();
+        for row_from_bottom in 0..reserved {
+            let note_row = overlay_area.y + overlay_area.height - 2 - row_from_bottom;
+            assert!(
+                crate::mouse::list_click_index(note_row, click_area, offset, sessions.len())
+                    .is_none(),
+                "footer note row {note_row} must not resolve to a session index"
+            );
+            assert!(
+                crate::mouse::list_click_index(note_row, overlay_area, offset, sessions.len())
+                    .is_some(),
+                "regression precondition: the full overlay rect maps row {note_row} to a session"
+            );
+        }
+
+        // The last true list row must still be clickable through the shrunken rect.
+        let last_list_row = overlay_area.y + click_area.height - 2;
+        assert!(
+            crate::mouse::list_click_index(last_list_row, click_area, offset, sessions.len())
+                .is_some(),
+            "the final visible list row must remain clickable"
         );
     }
 
@@ -16695,15 +18264,20 @@ mod tests {
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         );
-        state.cached_lines = markdown_to_lines("```rust\nfn main() {}\nlet y = 2;\n```\n", 60);
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```rust\nfn main() {}\nlet y = 2;\n```\n",
+        )));
+        state.mark_dirty_full();
+        state.rebuild_lines(60);
         let body = Rect::new(0, 0, 60, 20);
-        state.rebuild_copy_regions(60, 0, body);
+        state.rebuild_copy_regions(0, body);
         assert!(
             !state.copy_hit_regions.is_empty(),
             "a highlighted fence must still register copy regions"
         );
         assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}\nlet y = 2;",
+            state.copy_hit_regions[0].text.as_ref(),
+            "fn main() {}\nlet y = 2;",
             "copy text contains only the code body without markdown fences"
         );
     }
@@ -16715,11 +18289,16 @@ mod tests {
             "agent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         );
-        state.cached_lines = markdown_to_lines("```\nplain text\n```\n", 60);
+        state.entries.push(ChatEntry::AgentMessage(Arc::<str>::from(
+            "```\nplain text\n```\n",
+        )));
+        state.mark_dirty_full();
+        state.rebuild_lines(60);
         let body = Rect::new(0, 0, 60, 20);
-        state.rebuild_copy_regions(60, 0, body);
+        state.rebuild_copy_regions(0, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "plain text",
+            state.copy_hit_regions[0].text.as_ref(),
+            "plain text",
             "copy text contains only the code body without fences"
         );
     }
@@ -16747,13 +18326,14 @@ mod tests {
         let fence_entry = state.cached_screen_ranges.last().copied().expect("fence");
         let body = Rect::new(0, 0, 60, 20);
 
-        state.rebuild_copy_regions(60, fence_entry.1, body);
+        state.rebuild_copy_regions(fence_entry.1, body);
         assert_eq!(
-            state.copy_hit_regions[0].text, "fn main() {}",
+            state.copy_hit_regions[0].text.as_ref(),
+            "fn main() {}",
             "scrolled-to fence registers a copy region with body only"
         );
 
-        state.rebuild_copy_regions(60, 0, body);
+        state.rebuild_copy_regions(0, body);
         assert!(
             state.copy_hit_regions.is_empty(),
             "fence far below the viewport registers nothing"
@@ -17896,7 +19476,7 @@ mod tests {
         s.queue_paused = true;
         s.copy_hit_regions.push(CopyHitRegion {
             rect: Rect::new(1, 1, 6, 1),
-            text: "stale".to_string(),
+            text: Arc::<str>::from("stale"),
             kind: CopyHitKind::Message,
             group: 0,
         });
