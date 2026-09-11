@@ -149,6 +149,93 @@ pub fn materialize_resource_blob(
     materialize_bytes(workspace_dir, &bytes, &filename, &mime)
 }
 
+/// Materialize an MCP `type: "image"` payload, which carries a base64 `data`
+/// field and no source URI. The on-disk extension must match the bytes: the
+/// multimodal loader prefers a path's extension over the decoded bytes' magic,
+/// so a wrong extension would mislabel the image to the provider.
+///
+/// The supported raster type is resolved in this order: the declared `mimeType`,
+/// canonicalized to its RFC 6838 essence (lowercased, parameters stripped) and
+/// only when it names a type the vision pipeline accepts; otherwise the decoded
+/// bytes are sniffed. If neither yields a supported raster type, this degrades
+/// with an error and writes nothing — a declared but unsupported/parameterized
+/// `image/*` (e.g. `image/bmp`, `image/jpeg; charset=binary`) is never trusted
+/// to name the extension, and a case variant like `IMAGE/JPEG` resolves to
+/// `.jpg` rather than a `.bin` document.
+///
+/// Kept separate from [`materialize_resource_blob`] so this URI-absent
+/// MIME-to-extension behavior stays confined to the MCP image entry point and
+/// does not change the ACP embedded-resource path, whose blobs may also omit a
+/// URI.
+fn materialize_mcp_image(
+    workspace_dir: &Path,
+    declared_mime: Option<&str>,
+    data_b64: &str,
+) -> Result<MaterializedResource, EmbeddedResourceError> {
+    let bytes = decode_embedded_blob(data_b64)?;
+    // Canonical media-type essence: lowercase, drop any `;`-parameters, trim.
+    let declared_essence = declared_mime
+        .map(|m| {
+            m.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|m| !m.is_empty());
+    // Prefer a declared type only when it maps to a supported raster extension;
+    // otherwise sniff the bytes. Neither → degrade without writing.
+    let mime: String = match declared_essence
+        .as_deref()
+        .filter(|m| supported_image_ext(m).is_some())
+    {
+        Some(m) => m.to_string(),
+        None => match sniff_image_mime(&bytes) {
+            Some(m) => m.to_string(),
+            None => {
+                return Err(EmbeddedResourceError(
+                    "unsupported image media type: no PNG/JPEG/WebP/GIF identified".into(),
+                ));
+            }
+        },
+    };
+    let ext = supported_image_ext(&mime).expect("mime is supported by construction");
+    let filename = format!("upload.{ext}");
+    materialize_bytes(workspace_dir, &bytes, &filename, &mime)
+}
+
+/// Canonical file extension for the raster image types the vision pipeline
+/// accepts (`PROVIDER_IMAGE_MIME_TYPES`: PNG, JPEG, WebP, GIF). `None` for any
+/// other media type, so the caller sniffs the bytes or degrades rather than
+/// writing a mislabelled file. `mime` must already be the lowercased essence.
+fn supported_image_ext(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+/// Identify a raster image from its leading magic bytes, for MCP image items
+/// whose declared `mimeType` is absent or not a supported raster type. Returns
+/// one of the vision-accepted `image/*` types, or `None` when the bytes match no
+/// supported signature (the caller then degrades without writing).
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 /// Persist already-read `bytes` as a content-addressed file under
 /// `{workspace}/uploads/<sha16>.<safe-ext>` and return where it landed. The
 /// on-disk name is the content hash (never a caller-supplied filename), the
@@ -333,16 +420,52 @@ pub(crate) fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
             .is_some()
 }
 
+/// Whether an MCP tools/call content item is `type: "image"` with a non-empty
+/// base64 `data` field — a separate MCP content shape from `resource`+`blob`.
+pub(crate) fn content_item_has_mcp_image(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(|t| t.as_str()) == Some("image")
+        && item
+            .get("data")
+            .and_then(|d| d.as_str())
+            .is_some_and(|s| !s.is_empty())
+}
+
+/// The base64 payload a content item will decode, hash, and write to disk, if
+/// any: a `resource` with a string `blob`, or a valid `type: "image"` item with
+/// non-empty string `data`. Items that will NOT be materialized — audio
+/// placeholders, malformed or empty media, and non-binary content — return
+/// `None`.
+///
+/// The aggregate preflight folds over this so its item count and byte estimate
+/// cover exactly the items materialized below, and no untrusted content shape
+/// can slip past the per-call decode/hash/write budget.
+fn materializable_base64(item: &serde_json::Value) -> Option<&str> {
+    if content_item_has_resource_blob(item) {
+        item.get("resource")
+            .and_then(|r| r.get("blob"))
+            .and_then(|b| b.as_str())
+    } else if content_item_has_mcp_image(item) {
+        item.get("data").and_then(|d| d.as_str())
+    } else {
+        None
+    }
+}
+
 /// Format an MCP `tools/call` result for the model.
 ///
-/// When `content` contains any `type: "resource"` item with `blob`, materialize
-/// each blob under `{workspace}/uploads/` and return the full result as JSON with
-/// only the binary payloads redacted: a resource `blob` is replaced by a
-/// Document/IMAGE `materialized` marker, and image/audio `data` by a concise
-/// marker — never raw base64. Every non-binary field (text, `resource_link`,
+/// When `content` contains any `resource` blob or `type: "image"`/`"audio"`
+/// item, return the full result as JSON with only the binary payloads redacted:
+/// a resource `blob` becomes a Document/IMAGE `materialized` marker; a valid
+/// `type: "image"` item is materialized under `{workspace}/uploads/` and
+/// rewritten to a text item carrying its `[IMAGE:<path>]` marker, with the item's
+/// `annotations`/`_meta` and other non-binary fields preserved; a `type: "audio"`
+/// item is redacted to a non-materializing `[audio attachment: <mime>]`
+/// placeholder (audio is not materialized in this slice). Raw base64 never
+/// survives — a malformed image/audio payload (empty or non-string `data`) is
+/// stripped just like a valid one. Every non-binary field (text, `resource_link`,
 /// unknown content types, per-item `annotations`, and top-level
-/// `structuredContent`/`_meta`/`isError`) is preserved verbatim. Results without a
-/// resource blob keep the existing pretty-printed JSON shape.
+/// `structuredContent`/`_meta`/`isError`) is preserved. Results without any
+/// binary item keep the existing pretty-printed JSON shape.
 ///
 /// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
 /// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
@@ -351,38 +474,53 @@ pub(crate) fn format_mcp_tool_result_for_model(
     mut result: serde_json::Value,
     workspace_dir: &Path,
 ) -> Result<String, EmbeddedResourceError> {
-    // Preflight over an immutable borrow: count resource blobs and estimate their
-    // aggregate decoded size WITHOUT decoding. Two independent per-call bounds
-    // guard the untrusted result: the item count (bounds decode/hash/write
-    // attempts, which a byte budget alone does not — empty blobs estimate zero)
-    // and the estimated aggregate bytes. Nothing is cloned; the owned `result` is
-    // mutated in place below.
-    let (blob_count, aggregate_estimate): (usize, u64) =
+    // Preflight over an immutable borrow: count every binary item that WILL be
+    // decoded, hashed, and written — resource blobs AND valid image `data` — and
+    // estimate their aggregate decoded size WITHOUT decoding. Two independent
+    // per-call bounds guard the untrusted result regardless of content shape: the
+    // item count (bounds decode/hash/write attempts, which a byte budget alone
+    // does not — empty payloads estimate zero) and the estimated aggregate bytes.
+    // No untrusted item shape can bypass this budget. Nothing is cloned; the owned
+    // `result` is mutated in place below.
+    let (binary_count, aggregate_estimate): (usize, u64) =
         match result.get("content").and_then(|c| c.as_array()) {
-            Some(content) => content
-                .iter()
-                .filter(|i| content_item_has_resource_blob(i))
-                .fold((0usize, 0u64), |(count, bytes), item| {
-                    let blob = item
-                        .get("resource")
-                        .and_then(|r| r.get("blob"))
-                        .and_then(|b| b.as_str())
-                        .unwrap_or("");
-                    (
+            Some(content) => content.iter().fold((0usize, 0u64), |(count, bytes), item| {
+                match materializable_base64(item) {
+                    Some(b64) => (
                         count + 1,
-                        bytes.saturating_add(estimated_decoded_blob_len(blob)),
-                    )
-                }),
+                        bytes.saturating_add(estimated_decoded_blob_len(b64)),
+                    ),
+                    None => (count, bytes),
+                }
+            }),
             None => (0, 0),
         };
 
-    if blob_count == 0 {
+    // Process the result if it carries any binary content that must be redacted:
+    // a `resource` blob, or a `type: "image"`/`"audio"` item. Image and audio are
+    // matched by type alone (not by valid `data`) so a malformed sibling — whose
+    // `data` is empty or a non-string — is still stripped rather than passing
+    // through with its raw payload intact.
+    let has_binary = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|content| {
+            content.iter().any(|i| {
+                content_item_has_resource_blob(i)
+                    || matches!(
+                        i.get("type").and_then(|t| t.as_str()),
+                        Some("image") | Some("audio")
+                    )
+            })
+        });
+    if !has_binary {
         return Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
     }
 
-    // Which per-call bound was exceeded, if any. When set, every resource blob is
-    // degraded with this marker and nothing is decoded, hashed, or written.
-    let over_budget_marker: Option<&str> = if blob_count > MAX_AGGREGATE_BLOB_ITEMS {
+    // Which per-call bound was exceeded, if any. When set, every materializable
+    // binary item (resource blob or image) is degraded with this marker and
+    // nothing is decoded, hashed, or written.
+    let over_budget_marker: Option<&str> = if binary_count > MAX_AGGREGATE_BLOB_ITEMS {
         Some("[attachment unavailable: too many embedded blobs in one result]")
     } else if aggregate_estimate > MAX_AGGREGATE_BLOB_BYTES {
         Some("[attachment unavailable: aggregate blob size exceeds limit]")
@@ -449,7 +587,53 @@ pub(crate) fn format_mcp_tool_result_for_model(
                     serde_json::Value::String(marker),
                 );
             }
-            "image" | "audio" => {
+            "image" => {
+                // An MCP image item. Redact the base64 `data` UNCONDITIONALLY —
+                // empty, absent, or non-string payloads must never survive into
+                // model-facing JSON — and drop the now-superseded `mimeType`. Every
+                // other non-binary field (annotations, _meta, and unknown extension
+                // fields) is preserved by mutating the object in place.
+                let Some(obj) = item.as_object_mut() else {
+                    continue;
+                };
+                let data = match obj.remove("data") {
+                    Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+                    // Missing / empty / non-string: nothing materializable, and
+                    // `data` is already removed so no raw payload can leak.
+                    _ => None,
+                };
+                let declared_mime = obj
+                    .remove("mimeType")
+                    .and_then(|v| v.as_str().map(str::to_string));
+                let marker = if let Some(m) = over_budget_marker {
+                    m.to_string()
+                } else if let Some(data) = data {
+                    match materialize_mcp_image(workspace_dir, declared_mime.as_deref(), &data) {
+                        Ok(materialized) => materialized.marker,
+                        Err(e) => format!("[attachment unavailable: {e}]"),
+                    }
+                } else {
+                    "[attachment unavailable: malformed image item]".to_string()
+                };
+                // Convert in place to a text item carrying the marker so the
+                // multimodal pipeline (parse_image_markers) lifts [IMAGE:<path>]
+                // into a native provider image part. The preserved metadata
+                // (annotations, _meta) stays alongside it.
+                obj.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("text".to_string()),
+                );
+                obj.insert("text".to_string(), serde_json::Value::String(marker));
+            }
+            "audio" => {
+                // Audio is intentionally NOT materialized in this slice: the image
+                // intake is split from audio per the accepted issue scope, and no
+                // provider resolves an audio path into content parts today — the
+                // provider layer rewrites a loadable [AUDIO:<path>] to a
+                // placeholder before dispatch, so writing the file delivers
+                // nothing. Restore the non-materializing placeholder: strip the
+                // base64 `data` and replace it with a concise marker, never
+                // touching disk. Other non-binary fields carry through.
                 let mime = item
                     .get("mimeType")
                     .and_then(|v| v.as_str())
@@ -460,7 +644,7 @@ pub(crate) fn format_mcp_tool_result_for_model(
                 {
                     obj.insert(
                         "materialized".to_string(),
-                        serde_json::Value::String(format!("[{typ} attachment: {mime}]")),
+                        serde_json::Value::String(format!("[audio attachment: {mime}]")),
                     );
                 }
             }
@@ -880,7 +1064,9 @@ mod tests {
 
     #[test]
     fn mcp_intake_image_item_yields_marker_not_base64() {
-        // A non-resource `image` block emits a marker, never its base64 data.
+        // A non-resource `image` block materializes and emits `[IMAGE:...]` as
+        // a text item, never its base64 data. The old MCP fields (mimeType,
+        // materialized) must NOT leak into the model-facing JSON.
         let dir = tempdir().unwrap();
         let doc_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
         let img_b64 = base64::Engine::encode(
@@ -905,11 +1091,18 @@ mod tests {
             ]
         });
         let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[image attachment: image/png]"));
+        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
         assert!(
             !out.contains(&img_b64),
             "raw image base64 must not reach the model: {out}"
         );
+        // Image item must be replaced with a clean text marker, not leftover MCP fields.
+        assert!(
+            out.contains(r#""type": "text""#),
+            "image item should become text item: {out}"
+        );
+        assert!(!out.contains("image/png"), "mimeType must not leak: {out}");
+        assert!(dir.path().join("uploads").exists());
     }
 
     #[test]
@@ -1010,6 +1203,17 @@ mod tests {
         assert!(!content_item_has_resource_blob(&json!({
             "type": "text",
             "text": "hi"
+        })));
+
+        // Shape gate for MCP `type: "image"` items.
+        assert!(content_item_has_mcp_image(&json!({
+            "type": "image", "data": "YQ==", "mimeType": "image/png"
+        })));
+        assert!(!content_item_has_mcp_image(&json!({
+            "type": "image", "data": "", "mimeType": "image/png"
+        })));
+        assert!(!content_item_has_mcp_image(&json!({
+            "type": "text", "data": "YQ=="
         })));
     }
 
@@ -1153,5 +1357,361 @@ mod tests {
         );
         assert!(out.contains("aggregate blob size exceeds limit"));
         assert!(!out.contains("[Document:"));
+    }
+
+    #[test]
+    fn mcp_intake_image_only_without_resource_blobs() {
+        // Result with only `type: "image"` items (no resource blobs) still
+        // materializes and emits IMAGE markers.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img-data");
+        let result = json!({
+            "content": [
+                { "type": "image", "data": b64, "mimeType": "image/jpeg" }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        // A declared image/jpeg type names the file .jpg so the multimodal
+        // loader — which prefers a path's extension over the bytes' magic —
+        // reports image/jpeg to the provider.
+        assert!(
+            out.contains(".jpg"),
+            "jpeg image should be stored with a .jpg extension: {out}"
+        );
+        assert!(dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_image_without_mimetype_sniffs_jpeg_extension() {
+        // A JPEG that arrives without a mimeType must be stored as .jpg (sniffed
+        // from the magic bytes), not mislabelled .png by the default — otherwise
+        // the extension-first loader would report image/png for JPEG bytes.
+        let dir = tempdir().unwrap();
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpeg);
+        let result = json!({
+            "content": [ { "type": "image", "data": b64 } ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        assert!(
+            out.contains(".jpg") && !out.contains(".png"),
+            "sniffed JPEG should be stored as .jpg, not .png: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_audio_degrades_to_placeholder_without_writing() {
+        // Audio is NOT materialized in this slice: the base64 `data` is stripped
+        // and replaced with a non-materializing `[audio attachment: <mime>]`
+        // placeholder, and nothing is written to disk.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"audio-data");
+        let result = json!({
+            "content": [
+                { "type": "audio", "data": b64, "mimeType": "audio/wav" }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("[audio attachment: audio/wav]"),
+            "missing audio placeholder: {out}"
+        );
+        assert!(
+            !out.contains("[AUDIO:"),
+            "audio must not materialize: {out}"
+        );
+        assert!(!out.contains(&b64), "raw audio base64 leaked: {out}");
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "audio must not write a file: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_image_bad_base64_degrades() {
+        // Invalid base64 in an `image` item must degrade per-item, not fail.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [
+                { "type": "image", "data": "%%%", "mimeType": "image/png" },
+                { "type": "text", "text": "survivor" }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[attachment unavailable:"));
+        assert!(out.contains("survivor"));
+    }
+
+    #[test]
+    fn mcp_intake_image_oversized_degrades() {
+        // Oversized image data must degrade per-item.
+        let dir = tempdir().unwrap();
+        let big = vec![0u8; (MAX_EMBEDDED_FILE_BYTES as usize) + 1];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &big);
+        let result = json!({
+            "content": [
+                { "type": "image", "data": b64, "mimeType": "image/png" }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[attachment unavailable:"));
+    }
+
+    #[test]
+    fn mcp_intake_image_only_exceeds_item_budget_writes_nothing() {
+        // The aggregate item budget covers image items too: past the limit every
+        // image degrades and nothing is decoded, hashed, or written.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"x");
+        let items: Vec<_> = (0..=MAX_AGGREGATE_BLOB_ITEMS)
+            .map(|_| json!({ "type": "image", "data": b64, "mimeType": "image/png" }))
+            .collect();
+        let result = json!({ "content": items });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("too many embedded blobs"),
+            "expected item-budget marker: {out}"
+        );
+        assert!(
+            !out.contains("[IMAGE:"),
+            "no image may materialize over budget: {out}"
+        );
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "nothing may be written over budget: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_mixed_resource_and_image_exceeds_byte_budget_writes_nothing() {
+        // The aggregate BYTE budget spans resource blobs and image data together:
+        // a resource blob plus an image whose combined estimate exceeds the limit
+        // degrades both, writing nothing.
+        let dir = tempdir().unwrap();
+        let half = vec![0u8; (MAX_AGGREGATE_BLOB_BYTES as usize) / 2 + 1024];
+        let blob = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &half);
+        let img = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &half);
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///a.bin", "blob": blob }
+                },
+                { "type": "image", "data": img, "mimeType": "image/png" }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("aggregate blob size exceeds limit"),
+            "expected byte-budget marker: {out}"
+        );
+        assert!(
+            !out.contains("[IMAGE:"),
+            "image must not materialize over budget: {out}"
+        );
+        assert!(
+            !out.contains("[Document:"),
+            "blob must not materialize over budget: {out}"
+        );
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "nothing may be written over budget: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_malformed_image_sibling_cannot_retain_data() {
+        // A valid image activates formatting; malformed image siblings (non-string
+        // or empty `data`) must be stripped to a payload-free marker, never
+        // passing through with their raw payload.
+        let dir = tempdir().unwrap();
+        let good =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"good-image");
+        let result = json!({
+            "content": [
+                { "type": "image", "data": good, "mimeType": "image/png" },
+                { "type": "image", "data": { "nested": "leak-me" }, "mimeType": "image/png" },
+                { "type": "image", "data": "", "mimeType": "image/png" }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("[IMAGE:"),
+            "valid image should materialize: {out}"
+        );
+        assert!(
+            !out.contains("leak-me"),
+            "non-string data on a malformed sibling leaked: {out}"
+        );
+        assert!(
+            out.contains("malformed image item"),
+            "malformed sibling should degrade to a payload-free marker: {out}"
+        );
+        assert!(
+            !out.contains("image/png"),
+            "mimeType must not survive on any image item: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_image_conversion_preserves_annotations_and_meta() {
+        // Converting an image item to its text marker must keep the item's
+        // non-binary metadata (annotations, _meta) while dropping only the binary
+        // `data` and superseded `mimeType`.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img");
+        let result = json!({
+            "content": [
+                {
+                    "type": "image",
+                    "data": b64,
+                    "mimeType": "image/png",
+                    "annotations": { "audience": ["user"] },
+                    "_meta": { "source": "tool-x" }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[IMAGE:"), "missing IMAGE marker: {out}");
+        assert!(
+            out.contains(r#""type": "text""#),
+            "image should convert to a text item: {out}"
+        );
+        assert!(
+            out.contains("annotations") && out.contains("audience"),
+            "annotations dropped: {out}"
+        );
+        assert!(
+            out.contains("_meta") && out.contains("tool-x"),
+            "_meta dropped: {out}"
+        );
+        assert!(
+            !out.contains("image/png"),
+            "mimeType must not survive: {out}"
+        );
+        assert!(!out.contains(&b64), "raw data leaked: {out}");
+    }
+
+    #[test]
+    fn acp_uri_absent_blob_keeps_master_filename_semantics() {
+        // The MIME-to-extension behavior is confined to the MCP image entry
+        // point. The shared materialize_resource_blob (used by ACP) keeps its
+        // master semantics for a URI-less blob: a non-image is a Document named
+        // upload.bin, and an image still resolves to an [IMAGE:] marker so ACP
+        // image delivery is unaffected.
+        let dir = tempdir().unwrap();
+        let pdf =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"%PDF-1.7 body");
+        let doc =
+            materialize_resource_blob(dir.path(), None, Some("application/pdf"), &pdf).unwrap();
+        assert!(
+            doc.marker.contains("[Document:"),
+            "uri-less non-image should be a Document: {}",
+            doc.marker
+        );
+        assert!(
+            doc.abs_path.to_string_lossy().ends_with(".bin"),
+            "uri-less blob keeps the .bin name, not a MIME-derived extension: {:?}",
+            doc.abs_path
+        );
+
+        let img = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img-bytes");
+        let out = materialize_resource_blob(dir.path(), None, Some("image/png"), &img).unwrap();
+        assert!(
+            out.marker.starts_with("[IMAGE:"),
+            "ACP image blob still materializes as IMAGE: {}",
+            out.marker
+        );
+    }
+
+    #[test]
+    fn mcp_intake_image_uppercase_mime_normalized_to_jpg() {
+        // RFC 6838 media types are case-insensitive: IMAGE/JPEG must resolve to a
+        // .jpg IMAGE marker, not a .bin document.
+        let dir = tempdir().unwrap();
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpeg);
+        let result = json!({
+            "content": [ { "type": "image", "data": b64, "mimeType": "IMAGE/JPEG" } ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("[IMAGE:"),
+            "uppercase mime should still be an image: {out}"
+        );
+        assert!(
+            out.contains(".jpg") && !out.contains(".bin"),
+            "IMAGE/JPEG should normalize to .jpg: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_image_parameterized_mime_uses_essence() {
+        // A `; charset=…` parameter is not part of the media-type essence.
+        let dir = tempdir().unwrap();
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
+        let result = json!({
+            "content": [ { "type": "image", "data": b64, "mimeType": "image/png; charset=binary" } ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("[IMAGE:"),
+            "parameterized mime should still be an image: {out}"
+        );
+        assert!(
+            out.contains(".png") && !out.contains(".bin"),
+            "parameterized image/png should resolve to .png: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_image_untabled_mime_falls_back_to_sniff() {
+        // A declared but unsupported image type (image/bmp) must not name the
+        // extension; the real PNG bytes are sniffed and stored as .png.
+        let dir = tempdir().unwrap();
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
+        let result = json!({
+            "content": [ { "type": "image", "data": b64, "mimeType": "image/bmp" } ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("[IMAGE:"),
+            "sniffed PNG should be an image: {out}"
+        );
+        assert!(
+            out.contains(".png") && !out.contains(".bin"),
+            "untabled declaration should fall back to sniffed .png: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_image_unsupported_and_unsniffable_degrades_without_write() {
+        // Declared type has no supported extension AND the bytes match no known
+        // raster signature: degrade to an unavailable marker, write nothing.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"this is not a raster image",
+        );
+        let result = json!({
+            "content": [ { "type": "image", "data": b64, "mimeType": "image/bmp" } ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("[attachment unavailable:"),
+            "unsupported unidentifiable image should degrade: {out}"
+        );
+        assert!(
+            !out.contains("[IMAGE:"),
+            "must not emit an image marker: {out}"
+        );
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "must not write a mislabelled file: {out}"
+        );
     }
 }
