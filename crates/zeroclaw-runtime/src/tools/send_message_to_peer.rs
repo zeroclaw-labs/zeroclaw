@@ -1504,9 +1504,7 @@ mod tests {
              without the owning token it advertises ordinary background delegation"
         );
         assert!(
-            requests[1].contains(
-                "Background delegation is unavailable for supervised cron runs"
-            ),
+            requests[1].contains("Background delegation is unavailable for supervised cron runs"),
             "the recipient's delegate tool must refuse background delegation under the \
              owning run; without the owning token it detaches a child that outlives the \
              claim. Second request body: {}",

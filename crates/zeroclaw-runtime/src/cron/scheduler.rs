@@ -185,9 +185,9 @@ fn best_effort_worker_pool() -> Arc<tokio::sync::Semaphore> {
 
 fn retained_result_slots() -> Arc<tokio::sync::Semaphore> {
     static POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    Arc::clone(POOL.get_or_init(|| {
-        Arc::new(tokio::sync::Semaphore::new(MAX_RETAINED_RESULT_OWNERS))
-    }))
+    Arc::clone(
+        POOL.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_RETAINED_RESULT_OWNERS))),
+    )
 }
 
 fn persistence_worker_pool() -> Arc<tokio::sync::Semaphore> {
@@ -1847,9 +1847,7 @@ fn write_pending_persist(pending: PendingPersist) -> bool {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"disable_err": disable_err.to_string()})
-                        ),
+                        .with_attrs(::serde_json::json!({"disable_err": disable_err.to_string()})),
                     "Failed to disable one-shot cron job after history persistence failure: "
                 );
             }
