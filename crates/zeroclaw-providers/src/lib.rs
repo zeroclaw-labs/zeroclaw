@@ -1386,6 +1386,12 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
+        // The Codex provider reads its endpoint from the runtime options only,
+        // so an endpoint passed through the separate `api_url` parameter has to
+        // be folded in here. Otherwise a caller-supplied gateway would be built
+        // against the default subscription endpoint while the rotation
+        // predicate judged the same construction by that default.
+        let options = &options_with_supplied_api_url(options, api_url);
         return Ok(apply_factory_leaf_metadata(
             Box::new(openai_codex::OpenAiCodexModelProvider::new(
                 alias, options, api_key,
@@ -1577,6 +1583,31 @@ fn create_resilient_model_provider_for_alias_with_model_override(
     Ok(Box::new(reliable))
 }
 
+/// Fold an endpoint supplied through the separate `api_url` parameter into the
+/// runtime options, so construction and credential eligibility judge one
+/// effective endpoint. An endpoint already carried by the options wins, since
+/// that is the alias-resolved value.
+fn options_with_supplied_api_url(
+    options: &ModelProviderRuntimeOptions,
+    api_url: Option<&str>,
+) -> ModelProviderRuntimeOptions {
+    let already_set = options
+        .provider_api_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty());
+    if already_set {
+        return options.clone();
+    }
+    let Some(url) = api_url.map(str::trim).filter(|url| !url.is_empty()) else {
+        return options.clone();
+    };
+    ModelProviderRuntimeOptions {
+        provider_api_url: Some(url.to_string()),
+        ..options.clone()
+    }
+}
+
 fn credential_rotation_for_bare_provider(
     provider_name: &str,
     primary_key: Option<&str>,
@@ -1588,6 +1619,10 @@ fn credential_rotation_for_bare_provider(
         .map(str::trim)
         .filter(|key| !key.is_empty())?
         .to_string();
+    // Judge eligibility against the endpoint the rebuild below actually dials,
+    // which includes an endpoint passed through the separate `api_url`.
+    let options = options_with_supplied_api_url(options, api_url);
+    let options = &options;
     // Bare providers dispatch on family defaults, so eligibility is judged the
     // same way: the selected key must be the credential the factory sends.
     if !factory::rotation_credential_eligible(
@@ -6702,6 +6737,42 @@ mod tests {
         assert!(
             gateway.primary_has_credential_rotation(),
             "a custom Codex gateway must retain API-key rotation"
+        );
+    }
+
+    #[test]
+    fn bare_codex_gateway_supplied_through_api_url_keeps_key_rotation() {
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            api_keys: vec!["extra-key".to_string()],
+            ..Default::default()
+        };
+
+        let gateway = build_resilient_model_provider_with_options(
+            "openai-codex",
+            Some("gateway-api-key"),
+            Some("https://gateway.example.com/v1"),
+            &reliability,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("custom Codex gateway construction must succeed");
+        assert!(
+            gateway.primary_has_credential_rotation(),
+            "a custom Codex gateway named by the api_url parameter must rotate \
+             its supplied key, exactly like one named through the options"
+        );
+
+        let subscription = build_resilient_model_provider_with_options(
+            "openai-codex",
+            Some("stored-oauth-token"),
+            Some("https://chatgpt.com/backend-api/codex/responses"),
+            &reliability,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("default Codex endpoint construction must succeed");
+        assert!(
+            !subscription.primary_has_credential_rotation(),
+            "naming the default Codex endpoint through api_url must stay \
+             subscription OAuth, with no API-key rotation"
         );
     }
 
