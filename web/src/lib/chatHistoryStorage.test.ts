@@ -290,3 +290,53 @@ test('an enriched local anchor from a previous hydration still matches its serve
     [enriched, NOTICE, 'later request', 'later response'],
   );
 });
+
+test('two anchorless failed turns keep their original order after reload', () => {
+  // Neither failed turn reached the server, so both sequences are inserted at
+  // the same position. Prepending each one there would replay the transcript
+  // newest-first and tell the operator the later failure happened first.
+  const server: PersistedChatBubble[] = [];
+  const local = [
+    { ...bubble('local-user-1', 'user', 'first request'), local: true },
+    bubble('local-notice-1', 'agent', NOTICE, true),
+    { ...bubble('local-user-2', 'user', 'second request'), local: true },
+    bubble('local-notice-2', 'agent', NOTICE, true),
+  ];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.deepEqual(
+    merged.map(({ id, content }) => ({ id, content })),
+    [
+      { id: 'local-user-1', content: 'first request' },
+      { id: 'local-notice-1', content: NOTICE },
+      { id: 'local-user-2', content: 'second request' },
+      { id: 'local-notice-2', content: NOTICE },
+    ],
+  );
+});
+
+test('an anchored failed turn stays ahead of a later anchorless one', () => {
+  // The first prompt survived the partial gateway append, the second did not.
+  // Both terminal sequences land past the end of the server transcript, so the
+  // anchored one must still precede the sequence that follows it locally.
+  const server = [bubble('server-user-1', 'user', 'first request')];
+  const local = [
+    { ...bubble('local-user-1', 'user', 'first request'), local: true },
+    bubble('local-notice-1', 'agent', NOTICE, true),
+    { ...bubble('local-user-2', 'user', 'second request'), local: true },
+    bubble('local-notice-2', 'agent', NOTICE, true),
+  ];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.deepEqual(
+    merged.map(({ id, content }) => ({ id, content })),
+    [
+      { id: 'server-user-1', content: 'first request' },
+      { id: 'local-notice-1', content: NOTICE },
+      { id: 'local-user-2', content: 'second request' },
+      { id: 'local-notice-2', content: NOTICE },
+    ],
+  );
+});

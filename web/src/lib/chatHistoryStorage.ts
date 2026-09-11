@@ -307,6 +307,12 @@ export function mergeServerHistoryWithLocalNotices(
     const retained = local
       .slice(terminalStart, localIndex + 1)
       .filter(isRetainedTerminalMessage);
+    // Prepending is correct only within one sequence. Two failed turns that
+    // share an insertion point (both anchorless, or an anchored one whose turn
+    // is already last on the server) would otherwise replay newest-first, so
+    // each sequence is collected on its own and appended after the sequences
+    // that precede it locally.
+    const sequenceInsertions = new Map<number, PersistedChatBubble[]>();
     let beforeIndex = nextTurnIndex;
     const serverRangeStart = serverAnchorIndex < 0 ? 0 : serverAnchorIndex + 1;
     for (let retainedIndex = retained.length - 1; retainedIndex >= 0; retainedIndex -= 1) {
@@ -343,7 +349,10 @@ export function mergeServerHistoryWithLocalNotices(
         beforeIndex = persistedIndex;
         continue;
       }
-      insertions.set(beforeIndex, [retainedMessage, ...(insertions.get(beforeIndex) ?? [])]);
+      sequenceInsertions.set(
+        beforeIndex,
+        [retainedMessage, ...(sequenceInsertions.get(beforeIndex) ?? [])],
+      );
     }
 
     // Gateway appends are per-message and keep going after one of them fails,
@@ -355,7 +364,14 @@ export function mergeServerHistoryWithLocalNotices(
     // sequence is restored, and only when the server has no copy of it.
     if (localAnchor && serverAnchorIndex < 0 && !restoredLocalAnchors.has(localAnchorIndex)) {
       restoredLocalAnchors.add(localAnchorIndex);
-      insertions.set(beforeIndex, [localAnchor, ...(insertions.get(beforeIndex) ?? [])]);
+      sequenceInsertions.set(
+        beforeIndex,
+        [localAnchor, ...(sequenceInsertions.get(beforeIndex) ?? [])],
+      );
+    }
+
+    for (const [insertionIndex, sequence] of sequenceInsertions) {
+      insertions.set(insertionIndex, [...(insertions.get(insertionIndex) ?? []), ...sequence]);
     }
   }
 
