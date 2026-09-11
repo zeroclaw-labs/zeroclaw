@@ -534,6 +534,21 @@ enum EvalCommands {
         // i18n-exempt: clap derive help — framework requires a compile-time literal
         #[arg(long)]
         dump_records: Option<String>,
+
+        /// Compare the run against a baseline file (JSON) and gate on regressions.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long, conflicts_with = "write_baseline")]
+        baseline: Option<String>,
+
+        /// Write the run's results as a baseline file (JSON), then exit.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long, conflicts_with = "baseline")]
+        write_baseline: Option<String>,
+
+        /// Override the suite kind: `regression` (gating) or `capability` (tracked).
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        suite_kind: Option<String>,
     },
 }
 
@@ -7092,49 +7107,45 @@ Add pricing to the active provider profile or supply a catalog entry."
                 mode,
                 format,
                 dump_records,
+                baseline,
+                write_baseline,
+                suite_kind,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let (report, artifacts) =
-                    commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
-                commands::eval::print_report(&report, format);
-                // Dumps land in this run's private staging dir. Publication moves
-                // that directory into the immutable completed-run area and swaps
-                // the `last-run` pointer while holding the cross-process lock.
-                let dump_result = commands::eval::write_dumps(
-                    &report,
-                    dump_records.as_deref().map(std::path::Path::new),
-                    &artifacts.staged,
-                );
-                let wrote_auto = match dump_result {
-                    Ok(wrote_auto) => wrote_auto,
-                    Err(error) => {
-                        if let Err(cleanup_error) = artifacts.discard() {
-                            return Err(error.context(format!(
-                                "also failed to discard unpublished eval artifacts: {cleanup_error}"
-                            )));
-                        }
-                        return Err(error);
+                let suite_path = std::path::PathBuf::from(suite_dir);
+                let kind = match suite_kind.as_deref() {
+                    None => None,
+                    Some("regression") => Some(zeroclaw_eval::baseline::SuiteKind::Regression),
+                    Some("capability") => Some(zeroclaw_eval::baseline::SuiteKind::Capability),
+                    Some(other) => {
+                        anyhow::bail!(ta(
+                            "cli-eval-unknown-suite-kind",
+                            &[("kind", other)],
+                            "unknown --suite-kind (expected 'regression' or 'capability')"
+                        ))
                     }
                 };
-                let published = artifacts.publish()?;
-                // Footer is a table affordance only; never emit it in JSON mode, or
-                // it would corrupt the machine-readable stdout artifact.
-                if wrote_auto && format == commands::eval::OutputFormat::Table {
-                    let dir = published.display().to_string();
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-eval-failed-case-records",
-                            &[("dir", dir.as_str())],
-                            &format!("  failed-case records: {dir}/"),
-                        )
-                    );
-                }
-                // Only a failing suite needs the hard exit to carry a non-zero
-                // status; a passing run returns normally so shutdown runs.
-                match report.exit_code() {
+                let (report, artifacts) =
+                    commands::eval::run(&config, suite_path.clone(), mode).await?;
+                let opts = commands::eval::FinalizeOpts {
+                    format,
+                    dump_records: dump_records.map(std::path::PathBuf::from),
+                    baseline: baseline.map(std::path::PathBuf::from),
+                    write_baseline: write_baseline.map(std::path::PathBuf::from),
+                    suite_kind: kind,
+                };
+                let code = Box::pin(commands::eval::finalize(
+                    &config,
+                    mode,
+                    &suite_path,
+                    report,
+                    artifacts,
+                    opts,
+                ))
+                .await?;
+                match code {
                     0 => Ok(()),
                     code => std::process::exit(code),
                 }

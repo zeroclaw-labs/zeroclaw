@@ -1,14 +1,17 @@
 //! `zeroclaw eval` — run the agent evaluation harness.
 
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::providers::ModelProviderRef;
 use zeroclaw_config::schema::Config;
+use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
 use zeroclaw_eval::{CaseProvider, CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_providers::factory::{ProviderEndpoint, endpoint_for_family};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -281,6 +284,224 @@ pub fn publish_run(root: &Path, staged: &Path) -> Result<PathBuf> {
         (Ok(path), Ok(())) => Ok(path),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(unlock_error)) => Err(error.context(unlock_error.to_string())),
+    }
+}
+
+/// Post-run options gathered from the `eval run` flags.
+pub struct FinalizeOpts {
+    pub format: OutputFormat,
+    pub dump_records: Option<PathBuf>,
+    pub baseline: Option<PathBuf>,
+    pub write_baseline: Option<PathBuf>,
+    pub suite_kind: Option<SuiteKind>,
+}
+
+/// Handle the post-run flow (dumps, baselines, comparison, printing) and return
+/// the process exit code. Kept together so `main` only wires flags.
+pub async fn finalize(
+    config: &Config,
+    mode: Mode,
+    suite_path: &Path,
+    report: SuiteReport,
+    artifacts: RunArtifacts,
+    opts: FinalizeOpts,
+) -> Result<i32> {
+    let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
+    // Table mode prints incrementally; JSON is one complete document, so it is
+    // deferred until after the baseline comparison (when any) so the artifact
+    // can carry the gate outcome.
+    if opts.format == OutputFormat::Table {
+        println!("{}", report.render_table());
+    }
+
+    let dump_result = write_dumps(&report, opts.dump_records.as_deref(), &artifacts.staged);
+    let wrote_auto = match dump_result {
+        Ok(wrote_auto) => wrote_auto,
+        Err(error) => {
+            if let Err(cleanup_error) = artifacts.discard() {
+                return Err(error.context(format!(
+                    "also failed to discard unpublished eval artifacts: {cleanup_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    let published = artifacts.publish()?;
+    if wrote_auto && opts.format == OutputFormat::Table {
+        let dir = published.display().to_string();
+        println!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-failed-case-records",
+                &[("dir", dir.as_str())],
+            )
+        );
+    }
+
+    // --write-baseline: persist the run and exit with its normal code.
+    if let Some(path) = &opts.write_baseline {
+        // Fail closed before touching the baseline target: an incomplete run must
+        // neither create a baseline nor replace an existing good one. The run's own
+        // exit code is carried in the error context so it is reported alongside the
+        // write failure rather than replaced by it.
+        let run_code = report.exit_code(kind, None);
+        let baseline = Baseline::from_report(&report)
+            .with_context(|| format!("--write-baseline aborted (run exit code {run_code})"))?;
+        write_baseline_atomically(path, &baseline.to_json()?)?;
+        if opts.format == OutputFormat::Json {
+            println!("{}", report.to_json(kind, None));
+        }
+        return Ok(run_code);
+    }
+
+    // --baseline: compare, apply the live flakiness rule, and report.
+    let comparison = match &opts.baseline {
+        Some(path) => {
+            let baseline = Baseline::from_json(&std::fs::read_to_string(path)?)?;
+            let mut cmp = baseline::compare(&report, &baseline)?;
+            if mode == Mode::Live {
+                let rerun_passed =
+                    Box::pin(rerun_live_regressions(config, suite_path, &cmp)).await?;
+                let flaky = baseline::downgrade_flaky_regressions(&mut cmp, mode, &rerun_passed);
+                if opts.format == OutputFormat::Table {
+                    for id in &flaky {
+                        println!(
+                            "{}",
+                            get_required_cli_string_with_args(
+                                "cli-eval-flaky-unconfirmed-regression",
+                                &[("id", id)],
+                            )
+                        );
+                    }
+                }
+            }
+            if opts.format == OutputFormat::Table {
+                print_comparison(&cmp, kind, &report, &baseline);
+            }
+            Some(cmp)
+        }
+        None => {
+            if kind == SuiteKind::Capability && opts.format == OutputFormat::Table {
+                print_capability_summary(&report, None);
+            }
+            None
+        }
+    };
+
+    if opts.format == OutputFormat::Json {
+        println!("{}", report.to_json(kind, comparison.as_ref()));
+    }
+    Ok(report.exit_code(kind, comparison.as_ref()))
+}
+
+/// Re-run each regressed case once against the same config, returning whether the
+/// single re-run passed, keyed by case id. Used only for live suites.
+async fn rerun_live_regressions(
+    config: &Config,
+    suite_path: &Path,
+    comparison: &baseline::BaselineComparison,
+) -> Result<BTreeMap<String, bool>> {
+    let regressed: Vec<&str> = comparison
+        .per_case
+        .iter()
+        .filter(|(_, c)| matches!(c, CaseComparison::Regression { .. }))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut out = BTreeMap::new();
+    if regressed.is_empty() {
+        return Ok(out);
+    }
+    let traces = zeroclaw_eval::case::load_suite(suite_path)?;
+    let deps = build_run_deps(config, Mode::Live)?;
+    for (_, trace) in &traces {
+        let id = trace.display_id();
+        if regressed.contains(&id) {
+            let passed = matches!(
+                Box::pin(zeroclaw_eval::run_case(trace, &deps)).await,
+                Ok(outcome) if outcome.grades.iter().all(|g| g.passed)
+            );
+            out.insert(id.to_string(), passed);
+        }
+    }
+    Ok(out)
+}
+
+/// Print a compact per-case comparison summary.
+fn print_comparison(
+    comparison: &baseline::BaselineComparison,
+    kind: SuiteKind,
+    report: &SuiteReport,
+    baseline: &Baseline,
+) {
+    println!();
+    println!(
+        "{}",
+        get_required_cli_string("cli-eval-baseline-comparison")
+    );
+    for (id, c) in &comparison.per_case {
+        let line = match c {
+            CaseComparison::New => get_required_cli_string("cli-eval-comparison-new"),
+            CaseComparison::Removed => get_required_cli_string("cli-eval-comparison-removed"),
+            CaseComparison::Unverifiable => {
+                get_required_cli_string("cli-eval-comparison-unverifiable")
+            }
+            CaseComparison::CurrentError => {
+                get_required_cli_string("cli-eval-comparison-current-error")
+            }
+            CaseComparison::Improvement => {
+                get_required_cli_string("cli-eval-comparison-improvement")
+            }
+            CaseComparison::FlakyUnconfirmed => {
+                get_required_cli_string("cli-eval-comparison-flaky-unconfirmed")
+            }
+            CaseComparison::Regression { categories } => {
+                let cats: Vec<&str> = categories.iter().map(|c| c.as_str()).collect();
+                let categories = cats.join(", ");
+                get_required_cli_string_with_args(
+                    "cli-eval-comparison-regression",
+                    &[("categories", categories.as_str())],
+                )
+            }
+            CaseComparison::Unchanged { token_delta_pct } => match token_delta_pct {
+                Some(pct) => {
+                    let pct = format!("{pct:+.0}");
+                    get_required_cli_string_with_args(
+                        "cli-eval-comparison-unchanged-tokens",
+                        &[("pct", pct.as_str())],
+                    )
+                }
+                None => get_required_cli_string("cli-eval-comparison-unchanged"),
+            },
+        };
+        println!("    {id}: {line}");
+    }
+    if kind == SuiteKind::Capability {
+        print_capability_summary(report, Some(baseline));
+    }
+}
+
+/// Print the localized capability summary (pass rate, trend, saturation).
+fn print_capability_summary(report: &SuiteReport, baseline: Option<&Baseline>) {
+    let stats = report.capability_stats(baseline);
+    let rate = format!("{:.0}", stats.pass_rate);
+    let line = match stats.baseline_rate {
+        Some(brate) => {
+            let brate = format!("{brate:.0}");
+            get_required_cli_string_with_args(
+                "cli-eval-capability-pass-rate-was",
+                &[("rate", rate.as_str()), ("baseline_rate", brate.as_str())],
+            )
+        }
+        None => {
+            get_required_cli_string_with_args("cli-eval-capability-pass-rate", &[("rate", &rate)])
+        }
+    };
+    println!("  {line}");
+    if stats.saturated {
+        println!(
+            "{}",
+            get_required_cli_string("cli-eval-capability-saturation-warning")
+        );
     }
 }
 
@@ -652,6 +873,26 @@ pub fn write_dumps(
     Ok(any_auto)
 }
 
+/// Write `contents` to `path` via a unique sibling temp file plus atomic persist,
+/// so the target is either the old file or the complete new one, never a truncated
+/// intermediate. A failed write leaves any existing baseline untouched.
+fn write_baseline_atomically(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".zeroclaw-baseline-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Output format for the eval report.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -659,14 +900,6 @@ pub enum OutputFormat {
     Table,
     /// Machine-readable JSON, for CI artifacts.
     Json,
-}
-
-/// Render a suite report in the requested format.
-pub fn print_report(report: &SuiteReport, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => println!("{}", report.to_json()),
-        OutputFormat::Table => println!("{}", report.render_table()),
-    }
 }
 
 #[cfg(test)]
@@ -771,6 +1004,138 @@ mod tests {
         write_dumps(&report, Some(explicit.path()), auto.path()).unwrap();
         let count = std::fs::read_dir(explicit.path()).unwrap().count();
         assert_eq!(count, 2, "colliding ids must produce two files, not one");
+    }
+
+    /// An errored case with provenance but no completion data: the shape the
+    /// runner now preserves and `--write-baseline` must refuse to serialize.
+    fn errored_case(name: &str) -> CaseReport {
+        let mut c = case_report(name, false);
+        c.record = Some(RunRecord::from_provenance(provenance(name)));
+        c
+    }
+
+    fn test_artifacts(root: &Path) -> RunArtifacts {
+        let root = root.join("eval-artifacts");
+        create_private_dir(&root).unwrap();
+        let staged = stage_run_dir(&root).unwrap();
+        RunArtifacts { root, staged }
+    }
+
+    fn write_baseline_opts(path: &Path) -> FinalizeOpts {
+        FinalizeOpts {
+            format: OutputFormat::Table,
+            dump_records: None,
+            baseline: None,
+            write_baseline: Some(path.to_path_buf()),
+            suite_kind: None,
+        }
+    }
+
+    #[test]
+    fn atomic_baseline_write_replaces_existing_file_without_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("baseline.json");
+        std::fs::write(&target, "old").unwrap();
+
+        write_baseline_atomically(&target, "complete-new-baseline").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "complete-new-baseline"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("baseline.json")]);
+    }
+
+    #[tokio::test]
+    async fn write_baseline_does_not_create_file_on_run_error() {
+        // A case errored after producing provenance but before completion. The
+        // baseline would be untrustworthy, so the write must be refused outright.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("baseline.json");
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let report = SuiteReport {
+            cases: vec![case_report("ok", true), errored_case("boom-case")],
+        };
+
+        let err = finalize(
+            &Config::default(),
+            Mode::Replay,
+            Path::new("evals/regression"),
+            report,
+            test_artifacts(artifact_dir.path()),
+            write_baseline_opts(&target),
+        )
+        .await
+        .expect_err("an errored report must fail --write-baseline");
+        assert!(
+            format!("{err:#}").contains("boom-case"),
+            "the failure must name the errored case: {err:#}"
+        );
+        assert!(
+            !target.exists(),
+            "no partial baseline may be left behind at {}",
+            target.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_baseline_preserves_existing_file_on_run_error() {
+        // An existing good baseline must survive a failed run byte-for-byte: the
+        // refusal happens before the target is created, truncated, or replaced.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("baseline.json");
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let good = SuiteReport {
+            cases: vec![case_report("ok", true)],
+        };
+        finalize(
+            &Config::default(),
+            Mode::Replay,
+            Path::new("evals/regression"),
+            good,
+            test_artifacts(artifact_dir.path()),
+            write_baseline_opts(&target),
+        )
+        .await
+        .expect("a complete report writes a baseline");
+        let before = std::fs::read(&target).unwrap();
+        assert!(!before.is_empty());
+
+        let broken = SuiteReport {
+            cases: vec![case_report("ok", true), errored_case("boom-case")],
+        };
+        let err = finalize(
+            &Config::default(),
+            Mode::Replay,
+            Path::new("evals/regression"),
+            broken,
+            test_artifacts(artifact_dir.path()),
+            write_baseline_opts(&target),
+        )
+        .await
+        .expect_err("an errored report must fail --write-baseline");
+        assert!(format!("{err:#}").contains("boom-case"));
+
+        let after = std::fs::read(&target).unwrap();
+        assert_eq!(
+            before, after,
+            "the existing baseline must be byte-identical after a failed run"
+        );
+        // The atomic write must not leave its scratch file behind either.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "baseline.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray files left behind: {leftovers:?}"
+        );
     }
 
     #[test]

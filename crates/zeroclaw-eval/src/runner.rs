@@ -773,7 +773,9 @@ pub(crate) mod tests {
         assert_eq!(record.provenance.mode, Mode::Replay);
 
         // ...and it survives serialization: the JSON report must not emit `null`.
-        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json(crate::baseline::SuiteKind::Regression, None))
+                .unwrap();
         let c = &json["cases"][0];
         assert!(c["case_hash"].is_string() && !c["case_hash"].as_str().unwrap().is_empty());
         assert_eq!(c["mode"], "replay");
@@ -818,7 +820,9 @@ pub(crate) mod tests {
         let report = run_suite(tmp.path(), &failing_deps()).await.unwrap();
         assert_eq!(report.cases[0].score(), None);
 
-        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json(crate::baseline::SuiteKind::Regression, None))
+                .unwrap();
         assert_eq!(json["cases"][0]["passed"], false);
         assert!(
             json["cases"][0]["score"].is_null(),
@@ -845,7 +849,9 @@ pub(crate) mod tests {
                 .final_response
                 .contains("Hello")
         );
-        let json: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&report.to_json(crate::baseline::SuiteKind::Regression, None))
+                .unwrap();
         assert_eq!(json["cases"][0]["score"], 1.0);
         assert!(json["cases"][0]["total_tokens"].is_number());
     }

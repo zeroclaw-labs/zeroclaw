@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use zeroclaw_config::scattered_types::EvalHarnessConfig;
+use zeroclaw_eval::baseline::SuiteKind;
 use zeroclaw_eval::{RunDeps, run_suite};
 
 /// Resolve the gated suite from the shipped config default rather than a second
@@ -22,7 +23,7 @@ async fn regression_suite_replays_green() {
         "regression suite failed:\n{}",
         report.render_table()
     );
-    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.exit_code(SuiteKind::Regression, None), 0);
 }
 
 #[test]

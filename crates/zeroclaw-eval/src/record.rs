@@ -1,13 +1,14 @@
 //! The artifact produced by running one eval case — what graders score.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::ConversationMessage;
 
 /// The schema tag stamped on every serialized run record.
 pub const RECORD_SCHEMA: &str = "zeroclaw-eval/record/v1";
 
 /// Informational stamp of the sandbox posture a case ran under.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxStamp {
     pub autonomy: String,
     pub workspace_only: bool,
@@ -22,7 +23,8 @@ pub struct SandboxStamp {
 /// yet would still be listed as available (over-report). Two runs whose surfaces
 /// genuinely differed would then compare as identical, silently corrupting any
 /// baseline built on these receipts.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolSurface {
     /// Names from the case ∩ config allowlist, verbatim — before any eval-side
     /// filtering. Sorted.

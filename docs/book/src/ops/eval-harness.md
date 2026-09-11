@@ -181,12 +181,118 @@ here. `live_shell_sandbox`/`ensure_real_sandbox` (the OS-sandbox construction
 Because live output is non-deterministic and can embed workspace content, live runs
 belong in the planned `evals/live/` suite, not the gating regression suite.
 
+## Baselines and regression gating
+
+Suites have a kind, resolved from the directory name (or the `--suite-kind`
+override): a `capability` suite is tracked but never gating; everything else has
+**regression** semantics (must stay green).
+
+A **baseline** file (`zeroclaw-eval/baseline/v1`, stored under `evals/baselines/`)
+records each case's verdict and comparability key from a prior run:
+
+- `--write-baseline <file>` writes the current run as a baseline and exits with the
+  run's normal code.
+- `--baseline <file>` compares the current run against it, per case id.
+
+Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
+tool_surface, sandbox)`. The tool surface records requested, effective, and
+registered tools, and the sandbox posture is part of the key, so runs with
+different actual capabilities are never called comparable:
+
+- A changed key reports `changed - refresh baseline` (Unverifiable) and is never
+  compared or gated.
+- Baseline pass and current fail on a comparable case is a **regression**,
+  classified by which categories flipped (response / tool / side-effect / budget).
+- Current pass and baseline fail is an **improvement** (reported, never gates); a
+  case only in the current run is **new**; a case only in the baseline is
+  **removed** (warned). Per-case token deltas are reported as a percentage and are
+  never gated.
+- A current case that errored is reported as a **run error** (`CurrentError`),
+  never `removed`, and always gates. Its record retains pre-run provenance but
+  has no completion data.
+
+Baseline inputs fail closed: a baseline file with an unrecognized `schema` tag,
+unknown fields, an empty case id, or duplicate case ids is rejected at parse
+time, and a current run with duplicate case ids is rejected at comparison time,
+so malformed or ambiguous inputs can never produce a trusted gate result.
+
+Baseline *writes* fail closed too. A baseline must describe every case in the
+suite, so `--write-baseline` refuses to write at all when any case errored or did
+not produce grades and completion data; the error names the offending case ids. This is deliberate:
+an omitted case would be classified merely `new` on the next run, and a failing
+`new` case never gates, so a silently shortened baseline would convert a hard
+regression into a permanently excused case. The check runs before touching the
+baseline target and the write itself is atomic, so a failed run neither creates a
+new baseline nor replaces an existing one. A case that completed but *failed its
+checks* is still recorded normally.
+
+### Baseline schema compatibility
+
+Baseline entries carry a three-stage `tool_surface` and a `sandbox` stamp, both
+of which are part of the comparability key. These widen the
+`zeroclaw-eval/baseline/v1` entry schema, and the parser is strict: **baseline
+files written before this change are rejected and must be regenerated once**
+with `--write-baseline`. This is a one-time migration:
+regenerate on a known-green run so the new reference is trustworthy, and commit
+the refreshed file.
+
+**Live flakiness rule:** in live mode, a comparable case that regressed is re-run
+once; if the re-run passes it is reported as `flaky (unconfirmed regression)` and
+does not gate. Replay flips the gate directly with no retry (it is deterministic).
+
+Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never a
+gate. To refresh a baseline after an intentional behavior change, re-run with
+`--write-baseline` and commit the updated file.
+
 ## Exit-code contract
 
-`zeroclaw eval run` exits `0` iff every case passed, and `1` otherwise (any
-failed check or run error). This is the CI gate: the process exit code is the
-signal. The same decision is exposed as the pure function
-`SuiteReport::exit_code()` so it can be tested at its real boundary.
+The process exit code is the CI gate, and it is suite-kind aware:
+
+- **Regression suite, no baseline:** `0` iff every case passed, else `1`.
+- **Regression suite, with `--baseline`:** the per-case comparison is the single
+  gating authority. `1` iff there is at least one confirmed Pass to Fail flip on
+  a comparable case, or a case ERRORED (a run error has no trustworthy
+  comparison). Failures classified `new`, `unchanged` (failed in both runs),
+  `unverifiable` (comparability key changed), or `flaky (unconfirmed
+  regression)` are reported but never gate; aggregate score or token deltas
+  never do either. A new or still-failing case gates on the next run without
+  `--baseline`, or once a refreshed baseline records it as passing.
+- **Capability suite:** always `0` unless a case ERRORED (a run error, not a check
+  failure), which still exits `1`.
+
+The decision is the pure function
+`SuiteReport::exit_code(kind, comparison)` so it can be tested at its real boundary.
+
+## Machine-readable output (`--format json`)
+
+`--format json` emits one complete JSON document on stdout. Every document
+carries `suite_kind` and the `exit_code` the process exits with. When
+`--baseline` was given, a top-level `baseline` section explains the gate:
+
+```json
+{
+  "passed": 5, "failed": 1, "total": 6, "all_passed": false,
+  "suite_kind": "regression", "exit_code": 1,
+  "cases": [ ... ],
+  "baseline": {
+    "per_case": {
+      "case-a": { "classification": "regression", "categories": ["tool"] },
+      "case-b": { "classification": "unchanged", "token_delta_pct": 2.0 }
+    },
+    "confirmed_regressions": 1,
+    "current_errors": 0,
+    "flaky_unconfirmed": 0,
+    "gates": true
+  }
+}
+```
+
+`per_case` classifications are `new`, `removed`, `current_error`,
+`unverifiable`, `regression` (with flipped `categories`),
+`flaky_unconfirmed`, `improvement`, and `unchanged` (with
+`token_delta_pct` when comparable). A failing CI artifact therefore always
+states why the gate failed; the exit code never encodes information missing
+from the document.
 
 ## Run receipts and record dumps
 
@@ -280,6 +386,13 @@ expectation key. The nested blocks follow the same rule: a present-but-empty
 `workspace` or `budget` block, an empty `file_contains` list, and an empty
 `file_contains` needle (every file trivially contains the empty string) are all
 load errors. Every rejection names the offending fixture and field.
+
+Case identity is part of that admission. A fixture whose display id is empty
+(no `id` and an empty `model_name`, or an explicit `"id": ""`) is rejected at
+load, and a suite whose fixtures declare the same display id twice is rejected
+before any case runs, naming both fixture paths. Report rows, receipts, and the
+baseline `case_id` key all join on that identity, so a blank or shared one lets
+one result mask another.
 
 Report aggregation independently requires at least one grade, so an in-memory
 caller cannot manufacture a green case from an empty grade vector.
