@@ -3,6 +3,7 @@
 use zeroclaw_api::model_provider::ConversationMessage;
 
 /// Everything captured from a single agent run, ready for grading.
+#[derive(Debug)]
 pub struct RunRecord {
     /// The agent's final text response for the case.
     pub final_response: String,

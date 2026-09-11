@@ -14,7 +14,7 @@ harness is configured under `[eval]` and invoked as a CLI subcommand.
 | Mode | What it does | Cost | CI |
 |---|---|---|---|
 | `replay` | Replays scripted LLM responses from the fixture through the agent loop. Fully deterministic, no network. | Free | Gated (default) |
-| `live` | Executes cases against a real provider (planned; see the live-mode section once it lands). | Real tokens | Never by default |
+| `live` | Executes cases against a real provider inside a per-case sandbox (see "Live mode"). | Real tokens | Never by default |
 
 ## Suite taxonomy
 
@@ -41,6 +41,145 @@ zeroclaw eval run --suite evals/regression --format json
 `--suite` overrides `[eval].suite_dir`; `--mode` overrides `[eval].mode`. Suite
 loading is non-recursive: only direct `*.json` children of the suite directory
 are cases.
+
+## Live mode
+
+Live mode (`--mode live`) runs each case against a real configured provider, so it
+costs real tokens and produces non-deterministic output. It is opt-in and never
+runs in CI by default. Enable it by setting `[eval].live_provider` to a dotted
+`providers.models` reference (e.g. `"anthropic.sonnet"`); an empty value keeps live
+mode disabled. The reference must name an HTTP model provider: CLI-backed families
+are refused (see "CLI-backed providers are excluded" below).
+
+A live case omits scripted `steps` (the provider produces the responses) and may
+declare `tools` it needs and a `setup.workspace_files` map to seed the workspace.
+The requested tools are intersected with `[eval].live_allowed_tools`; the default
+(empty) allows no real tools, so a case that needs tools requires the operator to
+opt in explicitly.
+
+Each live case runs inside a sandbox:
+
+| Control | Behavior |
+|---|---|
+| Provider | Must be an HTTP model provider. CLI-backed families are rejected before any provider is constructed (see "CLI-backed providers are excluded" below). |
+| Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
+| Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`, then `shell` is dropped unconditionally (see "Shell is excluded" below); empty allowlist yields only the harmless echo tool. |
+| Autonomy | `Supervised`, never `Full`. |
+| Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
+| Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. Zero is refused before the run starts, so a config that slipped past validation cannot expire every turn. |
+| Network | The only egress live mode performs is the configured provider call itself. No tool it can admit opens a network connection, and no OS-level network rule is applied, because none is needed at this tool surface. |
+
+### What a live case can actually touch
+
+The controls above bound the surface to a closed set. After the allowlist
+intersection and the `shell` denylist, the only tools live mode can admit from
+the runtime defaults are `file_read`, `file_write`, `file_edit`, `glob_search`,
+and `content_search`. Each is wrapped in the generic path guard and resolves its
+target against the per-case workspace root before touching disk, so the
+filesystem confinement is application-layer path canonicalization plus
+`workspace_only`, not an OS sandbox: with `shell` excluded, live mode constructs
+no OS sandbox at all. `deliver_file` is dropped by the assembly context because
+live mode delivers nothing, and an empty allowlist leaves only the in-process
+echo tool.
+
+That closed set is what makes the confidentiality claim checkable rather than
+aspirational, and it is pinned by regressions in
+`crates/zeroclaw-eval/src/live.rs`: one asserts the admitted set itself (so a
+future runtime default tool cannot widen live mode silently), and one drives a
+model-directed `file_read` at a host path outside the workspace and asserts the
+host content reaches neither the fed-back tool result nor the next provider
+request. The residual exposure is therefore what a case deliberately puts in its
+own workspace and sends to the configured provider.
+
+### CLI-backed providers are excluded
+
+The confinement above bounds the *native* tool surface. A CLI-backed provider
+family (`grok_cli`, `gemini_cli`, `kilocli`) does not go through it: it launches
+its own coding agent as a subprocess, which brings that profile's own tools,
+permission mode, and configured working directory, and which ignores the tools
+carried on the chat request. A live case could then ask that agent to read a host
+file without ever making a native eval tool call, even with an empty
+`[eval].live_allowed_tools`.
+
+Live mode therefore refuses CLI-backed providers outright. The check runs in
+`ensure_no_cli_backed_provider` (`src/commands/eval.rs`) before any provider is
+constructed, so no subprocess is launched, and it covers every way the session
+factory can reach one:
+
+- the `[eval].live_provider` reference itself,
+- any `[[model_routes]]` target, because the router builds every configured
+  route's provider up front,
+- every profile reachable through the `fallback` chain of either of those.
+
+A `fallback` entry is stored as written and resolved by alias lookup across all
+provider families, so a dotless entry such as `fallback = ["sentinel"]` selects
+whichever family owns that alias. The guard resolves each entry the same way
+before classifying it, so a CLI-backed profile cannot be admitted by naming it
+without its family. The chain walk has no depth limit of its own: the provider
+factory prunes a chain past its own fallback depth, so refusing the whole
+reachable set refuses a superset of what the factory can build.
+
+The run fails with a config error naming the refused profile. Point
+`[eval].live_provider` at an HTTP model provider instead. Supporting CLI-backed
+agents under the eval boundary is separate work: it needs those providers to
+honor the case workspace and the eval allowlist, which is not something live mode
+can impose from the outside.
+
+### Shell is excluded
+
+`shell` can never be part of the live tool surface, even when a case's `tools`
+and `[eval].live_allowed_tools` both request it. `effective_live_tools`
+(`crates/zeroclaw-eval/src/live.rs`) applies a hard denylist to the allowlist
+intersection, so deny always wins.
+
+A scripted `shell` tool call in a live case is stopped *before* tool dispatch,
+by the approval gate. Because `shell` is excluded from the effective tool set,
+it is also excluded from `risk.auto_approve` (both are built from the same set
+in `run_live_case`), so its approval requirement resolves to `Prompt`. Live
+mode wires a non-interactive backchannel, so there is no operator to ask and
+the runtime denies the call by policy. What the model sees fed back is a
+runtime-policy denial, not shell output and not a "tool not available"
+dispatch error:
+
+```text
+Tool call not executed: 'shell' requires approval and no operator decision was
+available, so the runtime denied it by policy. This was not a user's decision.
+```
+
+Operators debugging a live case that expected `shell` should therefore look for
+the approval-gate denial (a WARN record with `denied_by_runtime`), not for a
+tool-registry lookup failure.
+
+This is the ship-safe interim posture. An
+earlier version of this harness wrapped `shell`'s subprocesses in a real OS
+sandbox backend (Landlock, Firejail, or `sandbox-exec`) instead of excluding
+it outright, but every accepted backend still permitted host *reads* wide
+enough to leak host data back into the conversation sent to a real provider:
+
+- Linux, Landlock (`sandbox-landlock` feature): the child process's filesystem
+  access was confined to the case workspace plus a blanket `/tmp` allowance,
+  with `/usr` and `/bin` readable. Network was NOT restricted (no `AccessNet`
+  rule); a sandboxed shell command could still reach the network freely.
+- macOS, `sandbox-exec` (Seatbelt): deny-by-default for writes, but reads were
+  allowed broadly: system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
+  `/System`, `/etc`, `/opt`, and others) and the invoking user's dotfile
+  directories under `$HOME`.
+- Firejail (Linux, no `sandbox-landlock` feature): `--private=home` with
+  `--noprofile` added no workspace whitelist, read-only host-root rule, or
+  network restriction beyond that.
+
+Confining the *writes* (which those backends do well; see
+`crates/zeroclaw-eval/tests/live_shell_sandbox.rs`'s history for the escape
+tests this proved) was not sufficient, because live-mode tool output becomes
+part of the conversation sent to the configured provider, making it a
+confidentiality boundary and not just an integrity one. Re-admitting `shell` needs an
+eval-specific sandbox contract that also denies sensitive host reads on every
+accepted backend; that is a deliberate, tracked follow-up, not implemented
+here. `live_shell_sandbox`/`ensure_real_sandbox` (the OS-sandbox construction
+`shell` used to run under) remain in `live.rs` as building blocks for it.
+
+Because live output is non-deterministic and can embed workspace content, live runs
+belong in the planned `evals/live/` suite, not the gating regression suite.
 
 ## Exit-code contract
 

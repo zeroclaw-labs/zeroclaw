@@ -106,6 +106,11 @@ impl BubblewrapSandbox {
             .get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect();
+        // Preserve the working directory across the rebuild below: replacing
+        // `*cmd` with a fresh `Command::new("bwrap")` would otherwise silently
+        // drop it, so a workspace-relative command would resolve against the
+        // daemon's actual cwd instead of the intended per-case workspace.
+        let cwd = cmd.get_current_dir().map(std::path::Path::to_path_buf);
 
         let mut bwrap_cmd = Command::new("bwrap");
         bwrap_cmd.args([
@@ -139,6 +144,9 @@ impl BubblewrapSandbox {
         }
         bwrap_cmd.arg(&program);
         bwrap_cmd.args(&args);
+        if let Some(dir) = cwd {
+            bwrap_cmd.current_dir(dir);
+        }
 
         *cmd = bwrap_cmd;
         Ok(())

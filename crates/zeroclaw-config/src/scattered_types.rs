@@ -253,6 +253,9 @@ fn default_eval_suite_dir() -> String {
 fn default_eval_mode() -> String {
     "replay".to_string()
 }
+fn default_eval_case_timeout_secs() -> u64 {
+    120
+}
 
 /// Configuration for the agent evaluation harness (`[eval]`), surfaced via the
 /// `zeroclaw eval` command. Distinct from `[agent.eval]`, which is the in-loop
@@ -270,6 +273,22 @@ pub struct EvalHarnessConfig {
     /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
     #[serde(default = "default_eval_mode")]
     pub mode: String,
+    /// Provider used for `--mode live`, as a dotted `providers.models` reference
+    /// (`"<type>.<alias>"`), e.g. `"anthropic.sonnet"`. Empty disables live mode.
+    #[serde(default)]
+    pub live_provider: crate::providers::ModelProviderRef,
+    /// Tool names live-mode cases may use. A case's requested tools are
+    /// intersected with this list; the default (empty) allows no real tools.
+    /// `shell` can never actually be admitted this way: `zeroclaw-eval`'s
+    /// live tool surface hard-denies it (see
+    /// `zeroclaw_eval::live::LIVE_TOOL_DENYLIST`) regardless of what this
+    /// list contains, because live output reaches a real provider and no
+    /// accepted OS sandbox backend confines what `shell` can read.
+    #[serde(default)]
+    pub live_allowed_tools: Vec<String>,
+    /// Wall-clock timeout per conversation turn in live mode, seconds.
+    #[serde(default = "default_eval_case_timeout_secs")]
+    pub case_timeout_secs: u64,
 }
 
 impl Default for EvalHarnessConfig {
@@ -277,6 +296,9 @@ impl Default for EvalHarnessConfig {
         Self {
             suite_dir: default_eval_suite_dir(),
             mode: default_eval_mode(),
+            live_provider: crate::providers::ModelProviderRef::default(),
+            live_allowed_tools: Vec::new(),
+            case_timeout_secs: default_eval_case_timeout_secs(),
         }
     }
 }
