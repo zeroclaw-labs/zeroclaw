@@ -4618,10 +4618,10 @@ impl Config {
 
     /// On-demand view of every populated `[channels.<type>.<alias>]` block.
     ///
-    /// The typed `ChannelsConfig` is serialized only to walk its map-shaped
-    /// fields generically; the returned enabled bit therefore comes from the
-    /// live config value rather than schema metadata. Adding a new channel map
-    /// surfaces here without a parallel channel-type lookup table.
+    /// The typed `ChannelsConfig` maps are read in place, so the returned
+    /// enabled bit comes from the live config value rather than schema
+    /// metadata. Adding a new channel map surfaces here without a parallel
+    /// channel-type lookup table.
     #[must_use]
     pub fn channels_by_alias(&self) -> Vec<ChannelAliasInfo> {
         let bindings = self.active_agent_channel_bindings();
@@ -4634,33 +4634,30 @@ impl Config {
     }
 
     /// Enumerate configured channel blocks without materializing their secret-bearing
-    /// structs. The generated property surface already projects each live `enabled`
-    /// value while redacting credential fields, so it is the canonical safe view for
-    /// generic channel discovery.
+    /// structs. The derive's typed alias walk reads each `[channels.<type>.<alias>]`
+    /// map and that block's live `enabled` switch in place, so new channel maps still
+    /// surface here without a parallel channel-type lookup table.
     ///
-    /// Read the property surface of the `channels` section rather than the whole
-    /// config: `prop_fields` serializes its receiver to build that surface, and
-    /// this runs while tool registration holds the RPC `session/new` frame, whose
-    /// stack budget a regression test pins. The section carries the same
-    /// `channels.<type>.<alias>` names, so the projection is unchanged.
+    /// The walk deliberately avoids the generated property surface: `prop_fields`
+    /// starts by serializing its whole receiver, and this runs while per-agent tool
+    /// registration holds the RPC `session/new` frame, whose stack budget a regression
+    /// test pins. Reading the maps directly keeps the enumeration off that stack and
+    /// never touches credential fields at all.
     fn configured_channel_aliases(&self) -> Vec<ChannelAliasInfo> {
         let mut aliases = Vec::new();
-        for field in self.channels.prop_fields() {
-            let Some(rest) = field.name.strip_prefix("channels.") else {
+        for entry in self.channels.map_alias_entries() {
+            let Some(channel_type) = entry.section.strip_prefix("channels.") else {
                 continue;
             };
-            let mut parts = rest.split('.');
-            let (Some(channel_type), Some(alias), Some("enabled"), None) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
+            if channel_type.contains('.') {
                 continue;
-            };
-            let Ok(enabled) = field.display_value.parse::<bool>() else {
+            }
+            let Some(enabled) = entry.enabled else {
                 continue;
             };
             aliases.push(ChannelAliasInfo {
                 channel_type: channel_type.to_string(),
-                alias: alias.to_string(),
+                alias: entry.alias,
                 owning_agent: None,
                 enabled,
             });
@@ -40939,6 +40936,52 @@ allowed_users = []
                 .into_iter()
                 .find(|channel| channel.channel_type == "telegram" && channel.alias == "draft")
                 .is_some_and(|channel| channel.owning_agent.is_none())
+        );
+    }
+
+    #[test]
+    async fn channel_alias_view_enumerates_maps_on_a_bounded_stack() {
+        let mut config = multi_agent_test_config();
+        config.channels.telegram.get_mut("draft").unwrap().enabled = true;
+        config.channels.discord.insert(
+            "guild".to_string(),
+            DiscordConfig {
+                enabled: true,
+                ..DiscordConfig::default()
+            },
+        );
+        config
+            .channels
+            .webhook
+            .insert("intake".to_string(), WebhookConfig::default());
+
+        // Per-agent tool registration enumerates channel aliases while the RPC
+        // `session/new` frame is live, so this walk has to stay off the stack.
+        // Reading the generated property surface cannot: it serializes its
+        // whole receiver before it can report a single field, which needs more
+        // than this budget even for the three blocks below. The config is boxed
+        // so the budget covers the walk rather than the moved struct.
+        let config = Box::new(config);
+        let view = std::thread::Builder::new()
+            .name("channel-alias-view-stack".into())
+            .stack_size(48 * 1024)
+            .spawn(move || config.channels_by_alias())
+            .expect("alias view thread should spawn")
+            .join()
+            .expect("enumerating channel aliases must not exhaust a small stack");
+
+        let enumerated: Vec<(String, String, bool)> = view
+            .into_iter()
+            .map(|channel| (channel.channel_type, channel.alias, channel.enabled))
+            .collect();
+        assert_eq!(
+            enumerated,
+            vec![
+                ("discord".to_string(), "guild".to_string(), true),
+                ("telegram".to_string(), "draft".to_string(), true),
+                ("webhook".to_string(), "intake".to_string(), false),
+            ],
+            "every configured channel map must surface with its live enabled switch"
         );
     }
 

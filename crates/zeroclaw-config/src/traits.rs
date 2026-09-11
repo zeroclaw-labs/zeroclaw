@@ -826,6 +826,25 @@ pub struct MapKeySection {
     pub resource_key: bool,
 }
 
+/// One populated `[<section>.<alias>]` block, discovered by walking a
+/// `Configurable`'s map-keyed fields in place.
+///
+/// This is the serialization-free counterpart to `prop_fields()`: the derive
+/// reads the typed maps and the block's own `enabled` switch directly, so a
+/// caller running on a bounded stack can enumerate aliases without the
+/// recursive `toml::Value::try_from(self)` that builds the property surface.
+/// Auto-discovered by the `Configurable` derive.
+#[derive(Debug, Clone)]
+pub struct MapAliasEntry {
+    /// Dotted section path of the owning map, e.g. `channels.telegram`.
+    pub section: String,
+    /// Map key identifying this block, e.g. `default`.
+    pub alias: String,
+    /// Live value of the block's `enabled` switch, or `None` when its value
+    /// type declares no `enabled: bool` field.
+    pub enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConfigFieldEntry {
     pub path: String,
