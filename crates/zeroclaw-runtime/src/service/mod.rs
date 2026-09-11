@@ -964,7 +964,11 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    let targets = service_log_targets(&stdout_log, &stderr_log);
+    let targets = if follow {
+        follow_log_targets(&stdout_log, &stderr_log)
+    } else {
+        service_log_targets(&stdout_log, &stderr_log)
+    };
     if targets.is_empty() {
         bail!(
             "No log files found in {}. Is the service installed?",
@@ -991,7 +995,11 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             let log_dir = linux_openrc_log_dir(config);
             let access_log = log_dir.join("access.log");
             let error_log = log_dir.join("error.log");
-            let targets = service_log_targets(&access_log, &error_log);
+            let targets = if follow {
+                follow_log_targets(&access_log, &error_log)
+            } else {
+                service_log_targets(&access_log, &error_log)
+            };
             if targets.is_empty() {
                 bail!(
                     "No log files found at {}. Is the service installed?",
@@ -1081,6 +1089,15 @@ fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn follow_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    // A follower keeps the empty stream too: it is where a later failure lands.
+    [primary, secondary]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
 fn has_content(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
 }
@@ -1099,17 +1116,21 @@ fn report_empty_capture(targets: &[PathBuf], logs_dir: &Path, follow: bool) {
     }
 }
 
+fn tail_command(paths: &[PathBuf], lines: usize, follow: bool) -> Command {
+    let mut command = Command::new("tail");
+    command.arg("-n").arg(lines.to_string());
+    if follow {
+        command.arg("-f");
+    }
+    command.args(paths);
+    command
+}
+
 fn tail_files(paths: &[PathBuf], lines: usize, follow: bool) -> Result<()> {
     if paths.is_empty() {
         bail!("No log files to tail");
     }
-    let mut args = vec!["-n".to_string(), lines.to_string()];
-    if follow {
-        args.push("-f".to_string());
-    }
-    let status = Command::new("tail")
-        .args(&args)
-        .args(paths)
+    let status = tail_command(paths, lines, follow)
         .status()
         .context("Failed to run tail")?;
     if !status.success() {
@@ -2988,6 +3009,63 @@ mod service_helper_tests {
         assert_eq!(
             command,
             "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Tail 50"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn follow_sees_a_failure_written_to_stderr_after_startup() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        let targets = follow_log_targets(&stdout_log, &stderr_log);
+        let mut viewer = tail_command(&targets, 10, true)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("tail should start");
+        let output = viewer.stdout.take().expect("tail stdout is piped");
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let saw = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match line_rx.recv_timeout(left) {
+                    Ok(line) if line.contains(needle) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+
+        let attached = saw("daemon.stderr.log <==");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&stderr_log)
+            .unwrap()
+            .write_all(b"launchd capture failed: child exited\n")
+            .unwrap();
+        let delivered = saw("launchd capture failed");
+        let _ = viewer.kill();
+        let _ = viewer.wait();
+
+        assert!(attached, "the follower must open the empty stderr file");
+        assert!(
+            delivered,
+            "a failure appended to stderr must reach the running viewer"
         );
     }
 }
