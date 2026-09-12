@@ -93,9 +93,9 @@ Build with `channel-lark` for either Lark or Feishu. The root `channel-feishu` f
 
 Tencent's consumer messenger. Bot API access requires developer registration; `[channels.qq.<alias>]` takes the console's `app_id` and `app_secret`.
 
-Inbound senders are the platform's opaque IDs — `user_openid` on single-chat messages, `member_openid` on group `@`-messages. Authorize them through a [peer group](./peer-groups.md) (`external_peers`); an empty peer set denies everyone, so a connected bot that never answers usually has no peer-group entry for the sender.
+Inbound senders are the platform's opaque IDs: `user_openid` on single-chat messages, `member_openid` on group `@`-messages. Authorize them through a [peer group](./peer-groups.md) (`external_peers`); an empty peer set denies everyone, so a connected bot that never answers usually has no peer-group entry for the sender.
 
-Replies to an inbound message are passive (the triggering `msg_id` is echoed), so they need no extra permission. Sends that are not a reply — cron delivery, `zeroclaw channel send` — are active messages and draw on the bot's active-message quota. Address the instance explicitly as `qq.<alias>`; a bare `--channel-id qq` resolves a `default` alias only.
+Replies to an inbound message are passive (the triggering `msg_id` is echoed), so they need no extra permission. Sends that are not a reply (cron delivery, `zeroclaw channel send`) are active messages and draw on the bot's active-message quota. Address the instance as `qq.<alias>` and the destination as `user:<user_openid>` for a single chat or `group:<group_openid>` for a group, where the group ID comes from the message's `group_openid` rather than the sender's `member_openid`. A bare `--channel-id qq` resolves a `default` alias only.
 
 `zeroclaw channel doctor` probes the bot's own identity (`GET /users/@me`) with the channel's credentials, so a healthy verdict means the API accepts the same token the send and listen paths use, not merely that the app secret still mints one. The probe cannot vet a recipient: the platform exposes no lookup for single-chat peer IDs, so an unusable address surfaces only when a send is attempted.
 
