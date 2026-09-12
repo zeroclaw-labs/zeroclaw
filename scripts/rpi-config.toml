@@ -126,11 +126,10 @@ max_cpu_time_seconds = 60
 max_subprocesses = 10
 memory_monitoring = true
 
-[security.audit]
-enabled = true
-log_path = "audit.log"
-max_size_mb = 100
-sign_events = false
+# [security.audit] is left at its defaults (enabled), which keeps the
+# certificate issuance and renewal trail. It does not record tool commands:
+# command execution has no audit writer, so this section is not a record of
+# what the agent ran.
 
 [security.otp]
 enabled = true

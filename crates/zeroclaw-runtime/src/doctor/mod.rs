@@ -1488,14 +1488,19 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 /// mapping for the CLI.
 ///
 /// An earlier version of this helper existed for the skills prompt-injection
-/// deprecation and was removed with that warning, so the withheld-capability
-/// notice is currently its only entry.
+/// deprecation and was removed with that warning. The withheld-capability
+/// notice and the disabled-audit notice are its current entries.
 fn localized_validation_warning_message(
     warning: &zeroclaw_config::validation_warnings::ValidationWarning,
 ) -> String {
     match warning.code.as_str() {
         zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD => {
             crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld")
+        }
+        zeroclaw_config::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD => {
+            crate::i18n::get_required_cli_string(
+                "cli-doctor-security-audit-disabled-drops-certificate-record",
+            )
         }
         _ => warning.message.clone(),
     }
@@ -3269,6 +3274,30 @@ mod tests {
         // The diagnostic path is what an operator edits, so it stays the
         // config key rather than being folded into the localized sentence.
         assert_eq!(warning.path, "verifiable_intent.enabled");
+    }
+
+    #[test]
+    fn disabled_security_audit_warning_uses_fluent() {
+        let structured_message = "structured API fallback";
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            zeroclaw_config::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+            structured_message,
+            "security.audit.enabled",
+        );
+
+        let expected = crate::i18n::get_required_cli_string(
+            "cli-doctor-security-audit-disabled-drops-certificate-record",
+        );
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(expected, structured_message);
+        assert_ne!(
+            expected, "{cli-doctor-security-audit-disabled-drops-certificate-record}",
+            "the Fluent key must resolve; a marker means it is absent from every catalog"
+        );
+        assert!(
+            expected.contains("Command execution is not audited"),
+            "the operator line must scope the gap to command execution: {expected}"
+        );
     }
 
     #[test]
