@@ -3,6 +3,7 @@ import { AlertTriangle, XCircle, Loader2, Plus, Save, Trash2, X } from 'lucide-r
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Badge, Card, PageHeader, HelpTip } from '@/components/ui';
 import SopCanvas from './SopCanvas';
+import { planSopSave, sopErrorText } from './sopSavePlan';
 import MarkdownEditor from '@/components/MarkdownEditor';
 import ToolPicker from '@/components/ToolPicker';
 import { PlannedCallsEditor } from '@/components/SopCalls';
@@ -18,6 +19,7 @@ import {
   runSop,
   createSop,
   saveSop,
+  renameSop,
   deleteSop,
   wireDraft,
   graphDraft,
@@ -1910,20 +1912,37 @@ export function SopEditor() {
     //   - new draft (no editing name): create, 409 if the name already exists,
     //     so a new SOP can never silently overwrite an existing one.
     //   - edit under the same name: upsert via PUT (never 409s on itself).
-    //   - rename (name diverged from the editing name): rejected. A rename is
-    //     not a save; it must be an explicit operation so it cannot fork or
-    //     clobber an unrelated SOP through a swallowed delete.
-    const isNew = editingName === null;
-    if (!isNew && draft.name !== editingName) {
-      setSaving(false);
-      setSaveError(`rename not supported: '${editingName}' cannot be saved as '${draft.name}'`);
+    //   - rename: save the edits against the name they were made under, then
+    //     ask the daemon to move the SOP. Saving under the new name instead
+    //     would write a second SOP and strand the original, and moving first
+    //     would leave a renamed SOP holding unsaved edits if the save failed.
+    const plan = planSopSave(editingName, draft.name);
+    const message = sopErrorText;
+
+    if (plan.kind === 'save-then-rename') {
+      saveSop({ ...draft, name: plan.from })
+        .then(
+          () =>
+            renameSop(plan.from, plan.to).then(
+              () => close(plan.to),
+              // The edits are on disk under the old name. Say so, rather than
+              // reporting a bare failure the author would read as losing them.
+              (e: unknown) =>
+                setSaveError(
+                  `${t('sops.rename_failed').replace('{name}', plan.from)} ${message(e)}`,
+                ),
+            ),
+          (e: unknown) => setSaveError(message(e)),
+        )
+        .finally(() => setSaving(false));
       return;
     }
-    const write = isNew ? createSop(draft) : saveSop(draft);
+
+    const write = plan.kind === 'create' ? createSop(draft) : saveSop(draft);
     const savedName = draft.name;
     write
       .then(() => close(savedName))
-      .catch((e: unknown) => setSaveError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setSaveError(message(e)))
       .finally(() => setSaving(false));
   }, [draft, editingName, close]);
 
