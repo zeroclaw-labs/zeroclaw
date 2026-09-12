@@ -38,6 +38,10 @@ export type TurnStreamFrame =
   // `hadToolCall` (issue #7151).
   | { type: 'tool_call'; hasName: boolean }
   | { type: 'done' | 'message'; full_response?: string; content?: string }
+  // Context exhaustion is terminal but has no authoritative response body in
+  // its frame. Commit any already-visible stream, never invent a no-output
+  // diagnostic, then reset the turn like every other terminal boundary.
+  | { type: 'context_exhausted' }
   // Every terminal/non-completion boundary resets the same canonical state.
   // `turn_start` is emitted locally after a new message is sent.
   | { type: 'turn_start' | 'aborted' | 'error' | 'reset' };
@@ -118,6 +122,14 @@ export function reduceTurnFrame(
     case 'message': {
       const completion = classifyCompletion(state, frame);
       // Turn is over: hand back fresh state so the next turn starts clean.
+      return { state: initialTurnStreamState(), completion };
+    }
+    case 'context_exhausted': {
+      const content = state.pendingContent.trim();
+      const thinking = state.capturedThinking || state.pendingThinking || undefined;
+      const completion: CompletionOutcome = content || thinking
+        ? { kind: 'commit', content, thinking }
+        : { kind: 'skip' };
       return { state: initialTurnStreamState(), completion };
     }
     case 'turn_start':
