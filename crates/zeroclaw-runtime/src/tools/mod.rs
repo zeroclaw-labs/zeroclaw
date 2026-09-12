@@ -168,6 +168,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -626,6 +627,7 @@ pub fn all_tools(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -836,6 +838,9 @@ pub fn all_tools_with_runtime(
     // channel daemon (so reloads take effect); `None` for one-shot / non-channel
     // callers, which fall back to a snapshot of `root_config`.
     live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    // Per-run cancellation owner. Cron supplies its supervised run token so
+    // spawned background and parallel delegates cannot outlive the claim.
+    run_cancellation: Option<CancellationToken>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -938,10 +943,13 @@ pub fn all_tools_with_runtime(
             SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
                 .with_subagent_caller(is_subagent_caller),
         ),
-        Arc::new(SendMessageToPeerTool::new(
-            Arc::new(root_config.clone()),
-            agent_alias,
-        )),
+        Arc::new({
+            let peer_tool = SendMessageToPeerTool::new(Arc::new(root_config.clone()), agent_alias);
+            match run_cancellation.clone() {
+                Some(token) => peer_tool.with_run_owned_cancellation_token(token),
+                None => peer_tool,
+            }
+        }),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
             security.clone(),
@@ -1755,7 +1763,7 @@ pub fn all_tools_with_runtime(
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
         let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
-        let delegate_tool = DelegateTool::new_with_options(
+        let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_global_credential.clone(),
             security.clone(),
@@ -1790,6 +1798,9 @@ pub fn all_tools_with_runtime(
         // `live_config` argument this function received.
         .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
+        if let Some(cancellation) = run_cancellation {
+            delegate_tool = delegate_tool.with_run_owned_cancellation_token(cancellation);
+        }
         let delegate_tool = Arc::new(delegate_tool);
         #[cfg(test)]
         {
@@ -2898,6 +2909,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .tools;
 
@@ -2957,6 +2969,7 @@ permissions = ["http_client"]
             false,
             None,
             Some(engine),
+            None,
             None,
             None,
         )
@@ -3106,6 +3119,7 @@ permissions = ["http_client"]
                 None,
                 None,
                 None,
+                None,
             )
             .tools;
             let tool = tools
@@ -3195,6 +3209,7 @@ permissions = ["http_client"]
             None,
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
@@ -3258,6 +3273,7 @@ permissions = ["http_client"]
             Some(engine),
             None,
             None,
+            None,
         )
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -3315,6 +3331,7 @@ permissions = ["http_client"]
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
             None,
+            None,
         );
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
@@ -3337,6 +3354,7 @@ permissions = ["http_client"]
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
+            None,
             None,
         );
 
@@ -3464,6 +3482,7 @@ permissions = ["http_client"]
                 Some(shared_engine.clone()),
                 None,
                 None,
+                None,
             )
             .tools
         };
@@ -3556,6 +3575,7 @@ permissions = ["http_client"]
             &root_config,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -3878,6 +3898,7 @@ permissions = ["http_client"]
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
+                None,
                 None,
             )
             .tools

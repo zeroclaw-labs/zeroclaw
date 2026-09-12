@@ -105,6 +105,7 @@ pub(crate) async fn prepare_tool_calls(
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
+        ctx.ensure_not_cancelled()?;
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
@@ -163,6 +164,7 @@ pub(crate) async fn prepare_tool_calls(
                     tool_args = args;
                 }
             }
+            ctx.ensure_not_cancelled()?;
         }
 
         maybe_inject_channel_delivery_defaults(
@@ -222,6 +224,7 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
+        ctx.ensure_not_cancelled()?;
         let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
             ApprovalGateOutcome::Proceed { approved } => approved,
             ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
@@ -237,6 +240,7 @@ pub(crate) async fn prepare_tool_calls(
             }
             ApprovalGateOutcome::Cancelled => return Err(ToolLoopCancelled.into()),
         };
+        ctx.ensure_not_cancelled()?;
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
         let signature = tool_call_signature(&tool_name, &tool_args);

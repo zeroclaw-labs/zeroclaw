@@ -5,18 +5,43 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+// Keep lock acquisition bounded below the scheduler's persistence deadline.
+// Immediate write transactions then serialize benign concurrent completions
+// instead of failing while upgrading a deferred read transaction.
+const CRON_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
     Reschedule,
     Disable,
     Delete,
+}
+
+/// Opaque ownership proof for one cron execution claim.
+///
+/// `locked_at` records that a run is active, while this token is the canonical
+/// identity that fences every release and scheduled-result write. Claims do
+/// not expire inside a live process: only the owner may release them, and
+/// startup recovery clears claims left by a dead process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CronClaimToken(String);
+
+impl CronClaimToken {
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test() -> Self {
+        Self("synthetic-test-claim".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -810,22 +835,51 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
     }
 }
 
-pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
+pub(crate) fn claim_job_with_token(
+    config: &Config,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<CronClaimToken>> {
+    let token = Uuid::new_v4().to_string();
     with_initialized_connection(config, |conn| {
         let claimed = conn
             .execute(
-                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
-                params![now.to_rfc3339(), job_id],
+                "UPDATE cron_jobs
+                 SET locked_at = ?1, claim_token = ?2
+                 WHERE id = ?3 AND locked_at IS NULL",
+                params![now.to_rfc3339(), token, job_id],
             )
             .context("Failed to claim cron job for execution")?;
-        Ok(claimed == 1)
+        Ok((claimed == 1).then_some(CronClaimToken(token)))
     })
 }
 
+pub(crate) fn release_claim(config: &Config, job_id: &str, claim: &CronClaimToken) -> Result<bool> {
+    with_initialized_connection(config, |conn| {
+        let released = conn
+            .execute(
+                "UPDATE cron_jobs
+             SET locked_at = NULL, claim_token = NULL
+             WHERE id = ?1 AND claim_token = ?2",
+                params![job_id, claim.0.as_str()],
+            )
+            .context("Failed to release cron job lock")?;
+        Ok(released == 1)
+    })
+}
+
+#[cfg(test)]
+pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
+    claim_job_with_token(config, job_id, now).map(|claim| claim.is_some())
+}
+
+#[cfg(test)]
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs
+             SET locked_at = NULL, claim_token = NULL
+             WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -833,10 +887,26 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn current_claim_for_test(config: &Config, job_id: &str) -> Result<CronClaimToken> {
+    let claim = with_read_connection(config, |conn| {
+        conn.query_row(
+            "SELECT claim_token FROM cron_jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .map(CronClaimToken)
+        .ok_or_else(|| anyhow::Error::msg(format!("cron job '{job_id}' is not claimed")))
+    })?;
+    claim.ok_or_else(|| anyhow::Error::msg(format!("cron job '{job_id}' is not claimed")))
+}
+
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
+            "UPDATE cron_jobs
+             SET locked_at = NULL, claim_token = NULL
+             WHERE locked_at IS NOT NULL",
             [],
         )
         .context("Failed to clear stale cron job locks")
@@ -858,7 +928,7 @@ pub fn record_run(
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
         // if the DELETE fails, the INSERT is rolled back and the run table
         // cannot grow unboundedly.
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
         insert_run_and_prune(
             &tx,
@@ -890,7 +960,7 @@ pub(crate) fn persist_manual_run_result(
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
 
         insert_run_and_prune(
             &tx,
@@ -928,11 +998,14 @@ pub(crate) fn persist_run_result(
     output: Option<&str>,
     duration_ms: i64,
     action: RunCompletionAction,
+    claim: &CronClaimToken,
 ) -> Result<()> {
     let bounded_output = output.map(truncate_cron_output);
 
     with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = immediate_write_transaction(conn)?;
+
+        ensure_claim_is_current(&tx, &job.id, claim)?;
 
         insert_run_and_prune(
             &tx,
@@ -954,6 +1027,8 @@ pub(crate) fn persist_run_result(
             action,
         )?;
 
+        release_claim_in_transaction(&tx, &job.id, action, claim)?;
+
         tx.commit()
             .context("Failed to commit cron run result transaction")?;
         Ok(())
@@ -967,10 +1042,57 @@ pub(crate) fn persist_run_completion_state(
     status: &str,
     output: Option<&str>,
     action: RunCompletionAction,
+    claim: &CronClaimToken,
 ) -> Result<()> {
     with_initialized_connection(config, |conn| {
-        apply_run_completion_state(conn, job, job_state_at, status, output, action)
+        let tx = immediate_write_transaction(conn)?;
+        ensure_claim_is_current(&tx, &job.id, claim)?;
+        apply_run_completion_state(&tx, job, job_state_at, status, output, action)?;
+        release_claim_in_transaction(&tx, &job.id, action, claim)?;
+        tx.commit()
+            .context("Failed to commit cron completion-state transaction")
     })
+}
+
+fn ensure_claim_is_current(conn: &Connection, job_id: &str, claim: &CronClaimToken) -> Result<()> {
+    let current = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM cron_jobs WHERE id = ?1 AND claim_token = ?2
+         )",
+        params![job_id, claim.0.as_str()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !current {
+        anyhow::bail!("cron claim for job '{job_id}' is stale");
+    }
+    Ok(())
+}
+
+fn immediate_write_transaction(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+}
+
+fn release_claim_in_transaction(
+    conn: &Connection,
+    job_id: &str,
+    action: RunCompletionAction,
+    claim: &CronClaimToken,
+) -> Result<()> {
+    if action == RunCompletionAction::Delete {
+        // A successful auto-delete removed the claimed row in this same
+        // transaction, so there is no lock left to clear.
+        return Ok(());
+    }
+    let released = conn.execute(
+        "UPDATE cron_jobs
+         SET locked_at = NULL, claim_token = NULL
+         WHERE id = ?1 AND claim_token = ?2",
+        params![job_id, claim.0.as_str()],
+    )?;
+    if released != 1 {
+        anyhow::bail!("cron claim for job '{job_id}' changed before release");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1588,7 +1710,7 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
     }
 }
 
-fn cron_db_path(config: &Config) -> std::path::PathBuf {
+pub(crate) fn cron_db_path(config: &Config) -> std::path::PathBuf {
     config.data_dir.join("cron").join("jobs.db")
 }
 
@@ -1621,6 +1743,8 @@ fn with_existing_initialized_connection<T>(
             db_path.display().to_string()
         )
     })?;
+    conn.busy_timeout(CRON_DB_BUSY_TIMEOUT)
+        .context("Failed to configure cron DB busy timeout")?;
 
     initialize_schema(&conn)?;
 
@@ -1653,6 +1777,8 @@ fn with_initialized_connection<T>(
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open cron DB: {}", db_path.display().to_string()))?;
+    conn.busy_timeout(CRON_DB_BUSY_TIMEOUT)
+        .context("Failed to configure cron DB busy timeout")?;
 
     initialize_schema(&conn)?;
 
@@ -1783,6 +1909,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    add_column_if_missing(conn, "claim_token", "TEXT")?;
     add_column_if_missing(
         conn,
         "shell_output_format",
@@ -2166,6 +2293,65 @@ mod tests {
             0,
             "clearing again when idle releases nothing"
         );
+    }
+
+    #[test]
+    fn active_claim_cannot_expire_or_be_replaced_in_process() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        let started = Utc::now();
+        let old_claim = claim_job_with_token(&config, &job.id, started)
+            .unwrap()
+            .expect("first worker claims the job");
+
+        assert!(
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::days(365))
+                .unwrap()
+                .is_none(),
+            "wall-clock age must not erase ownership while the process is live"
+        );
+        assert!(release_claim(&config, &job.id, &old_claim).unwrap());
+        let replacement_claim =
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::seconds(2))
+                .unwrap()
+                .expect("replacement worker claims only after the owner releases");
+        assert_ne!(old_claim.as_str(), replacement_claim.as_str());
+
+        let finished = started + ChronoDuration::seconds(3);
+        let stale_error = persist_run_result(
+            &config,
+            &job,
+            started,
+            finished,
+            finished,
+            "ok",
+            Some("late old result"),
+            3_000,
+            RunCompletionAction::Reschedule,
+            &old_claim,
+        )
+        .expect_err("the released owner must not write through the replacement claim");
+        assert!(stale_error.to_string().contains("stale"));
+        assert!(list_runs(&config, &job.id, 10).unwrap().is_empty());
+
+        persist_run_result(
+            &config,
+            &job,
+            started + ChronoDuration::seconds(2),
+            finished,
+            finished,
+            "ok",
+            Some("replacement result"),
+            1_000,
+            RunCompletionAction::Reschedule,
+            &replacement_claim,
+        )
+        .expect("the current claim persists and releases atomically");
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some("replacement result"));
+        assert!(current_claim_for_test(&config, &job.id).is_err());
     }
 
     #[test]
