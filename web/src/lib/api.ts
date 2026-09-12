@@ -12,6 +12,7 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  SessionStateResponse,
   TuiEntry,
 } from "../types/api";
 import type { components } from "./api-generated";
@@ -23,11 +24,14 @@ import { apiOrigin, basePath } from "./basePath";
 // ---------------------------------------------------------------------------
 
 export class UnauthorizedError extends Error {
+  public readonly status = 401;
+
   constructor() {
     super("Unauthorized");
     this.name = "UnauthorizedError";
   }
 }
+
 
 /**
  * Thrown when the gateway returns a structured `ConfigApiError` response body.
@@ -2139,6 +2143,13 @@ export function getSessionMessages(
 ): Promise<SessionMessagesResponse> {
   return apiFetch<SessionMessagesResponse>(
     `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+/** Resolve the canonical lifecycle state for a gateway chat session. */
+export function getSessionState(id: string): Promise<SessionStateResponse> {
+  return apiFetch<SessionStateResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/state`,
   );
 }
 
