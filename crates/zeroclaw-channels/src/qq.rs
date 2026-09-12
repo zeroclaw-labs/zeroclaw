@@ -556,6 +556,74 @@ impl QQChannel {
         Ok(url)
     }
 
+    /// [`Channel::health_check`] against an explicit API base.
+    ///
+    /// Split out so a test can drive the whole check — the request shape it
+    /// issues and the verdict it reaches — against a stub server without
+    /// reaching the real API; production passes [`QQ_API_BASE`].
+    ///
+    /// The check has two steps because minting a token is not evidence the
+    /// credential works. `getAppAccessToken` succeeds for a bot the
+    /// platform has since disabled and for a token revoked before its
+    /// expiry, while every send and the gateway handshake then fail, so
+    /// the minted token is followed by `GET /users/@me` with the same
+    /// `QQBot <token>` header the send and listen paths use.
+    ///
+    /// A cached token is reused when one is live, rather than re-minting:
+    /// the probe is what establishes it still works, and re-minting would
+    /// spend the auth retry budget (four attempts with backoff) inside the
+    /// caller's own 10s timeout. QQ exposes no endpoint that validates a
+    /// *recipient*, so the check stops at the bot's identity by design —
+    /// an unusable peer ID surfaces only at send time.
+    async fn health_check_at(&self, api_base: &str) -> bool {
+        let token = match self.get_token().await {
+            Ok(token) => token,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "getAppAccessToken",
+                            "error": format!("{}", e),
+                        })),
+                    "qq: health check could not obtain an access token"
+                );
+                return false;
+            }
+        };
+
+        let probe = match self
+            .http_client()
+            .get(format!("{api_base}/users/@me"))
+            .header("Authorization", format!("QQBot {token}"))
+            .send()
+            .await
+        {
+            Err(e) => Err(anyhow::Error::from(e)),
+            Ok(resp) => crate::util::ensure_success(resp, "QQ health probe (/users/@me)")
+                .await
+                .map(|_| ()),
+        };
+
+        match probe {
+            Ok(()) => true,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "phase": "probeBotIdentity",
+                            "error": format!("{}", e),
+                        })),
+                    "qq: health check rejected by the API"
+                );
+                false
+            }
+        }
+    }
+
     async fn record_dedup_key(&self, key: String) -> bool {
         let mut dedup = self.dedup.write().await;
 
@@ -1807,8 +1875,11 @@ impl Channel for QQChannel {
         }
     }
 
+    /// Probe the configured credentials against the live API. See
+    /// `health_check_at` for what the probe establishes and what it
+    /// deliberately cannot.
     async fn health_check(&self) -> bool {
-        self.fetch_access_token_with_retry().await.is_ok()
+        self.health_check_at(QQ_API_BASE).await
     }
 
     async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
@@ -2779,6 +2850,79 @@ allowed_users = ["user1"]
         assert!(
             result.is_err(),
             "should fail when token expired and no server available"
+        );
+    }
+
+    // --- Health probe tests ---
+    //
+    // Every case seeds the token cache with a live-expiry token so the
+    // check exercises the probe rather than the auth endpoint: no network
+    // beyond the stub, and a failure can only come from the probe itself.
+
+    #[tokio::test]
+    async fn health_check_accepts_a_live_token() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/@me"))
+            // The API accepts the credential only in this exact scheme; a
+            // mismatch would 401 in production and report the channel down.
+            .and(header("Authorization", "QQBot tok_abc"))
+            // The probe reads only the verdict, so this body is a shape
+            // placeholder, not a captured response.
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "zeroclaw_bot",
+                "username": "ZEROCLAW",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+        *ch.token_cache.write().await = Some(("tok_abc".to_string(), now_secs() + 3600));
+
+        assert!(
+            ch.health_check_at(&mock_server.uri()).await,
+            "an accepted identity response must report the channel healthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_a_rejected_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/users/@me"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "message": "invalid or expired access token",
+                "code": 11244,
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+        // Minting succeeded, so the app secret is fine; only the token is
+        // rejected. That is the case the auth-only check used to report
+        // healthy.
+        *ch.token_cache.write().await = Some(("revoked".to_string(), now_secs() + 3600));
+
+        assert!(
+            !ch.health_check_at(&mock_server.uri()).await,
+            "a rejected token must report the channel unhealthy"
         );
     }
 
