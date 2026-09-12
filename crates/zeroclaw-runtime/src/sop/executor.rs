@@ -234,9 +234,70 @@ pub fn spawn_headless_run_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) {
+    let lease = match driven_run_id(&first_action) {
+        Some(run_id) => match HeadlessDriverLease::acquire(&engine, run_id) {
+            Some(lease) => Some(lease),
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "run_id": run_id })),
+                    "SOP headless driver: run already has a driver; refusing a second one"
+                );
+                return;
+            }
+        },
+        None => None,
+    };
     zeroclaw_spawn::spawn!(async move {
+        // Held for the driver's whole life so every exit path (parked,
+        // terminal, advance failure, budget exhausted) releases it.
+        let _lease = lease;
         drive_headless_run(config, engine, audit, first_action).await;
     });
+}
+
+/// The run an action would execute steps for. Parked and terminal actions
+/// drive nothing, so they need no lease.
+fn driven_run_id(action: &SopRunAction) -> Option<&str> {
+    match action {
+        SopRunAction::ExecuteStep { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. } => Some(run_id),
+        _ => None,
+    }
+}
+
+/// Process-local ownership of a run's headless driver. One resumed action can
+/// be scheduled from several surfaces (HTTP approve, WS, channel, RPC); two
+/// drivers over the same run execute the same step twice and hand the engine
+/// two results for it. The lease lives in the engine and is released on drop.
+struct HeadlessDriverLease {
+    engine: Arc<Mutex<SopEngine>>,
+    run_id: String,
+}
+
+impl HeadlessDriverLease {
+    fn acquire(engine: &Arc<Mutex<SopEngine>>, run_id: &str) -> Option<Self> {
+        let mut guard = match engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.try_lease_headless_driver(run_id).then(|| Self {
+            engine: Arc::clone(engine),
+            run_id: run_id.to_string(),
+        })
+    }
+}
+
+impl Drop for HeadlessDriverLease {
+    fn drop(&mut self) {
+        let mut guard = match self.engine.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.release_headless_driver(&self.run_id);
+    }
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -602,6 +663,51 @@ mod tests {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
         }
+    }
+
+    /// Two surfaces scheduling the same resumed action must not both drive it:
+    /// the second driver would execute the same step again and hand the
+    /// engine a second result for it. The lease is held for the driver's life
+    /// and released on drop, whichever way the driver exits.
+    #[test]
+    fn headless_driver_lease_refuses_a_second_driver_until_the_first_ends() {
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+        let first = HeadlessDriverLease::acquire(&engine, "run-1")
+            .expect("the first driver takes the lease");
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-1").is_none(),
+            "a second driver for the same run is refused while the first is alive"
+        );
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-2").is_some(),
+            "the lease is per run"
+        );
+        drop(first);
+        assert!(
+            HeadlessDriverLease::acquire(&engine, "run-1").is_some(),
+            "the lease is released when the driver ends"
+        );
+    }
+
+    #[test]
+    fn only_actions_with_steps_to_execute_need_a_driver_lease() {
+        let step_action = SopRunAction::ExecuteStep {
+            run_id: "run-1".to_string(),
+            step: SopStep::default(),
+            context: String::new(),
+        };
+        assert_eq!(driven_run_id(&step_action), Some("run-1"));
+        let deterministic = SopRunAction::DeterministicStep {
+            run_id: "run-2".to_string(),
+            step: SopStep::default(),
+            input: json!({}),
+        };
+        assert_eq!(driven_run_id(&deterministic), Some("run-2"));
+        let terminal = SopRunAction::Completed {
+            run_id: "run-3".to_string(),
+            sop_name: "sop".to_string(),
+        };
+        assert_eq!(driven_run_id(&terminal), None);
     }
 
     #[tokio::test]
