@@ -687,8 +687,12 @@ impl Channel for WasmChannel {
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
-        self.capabilities
-            .contains(ChannelCapabilities::SUPPORTS_MULTI_MESSAGE_STREAMING)
+        // WASM plugins only advertise a rendering capability; the ABI has no
+        // confirmed-delivery coordinate to reconcile against a sanitized final
+        // response. Keep the generic finalizer on the canonical-response path
+        // until that contract exists rather than treating attempted updates as
+        // confirmed paragraphs.
+        false
     }
 
     fn multi_message_delay_ms(&self) -> u64 {

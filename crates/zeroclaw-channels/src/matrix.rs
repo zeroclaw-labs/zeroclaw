@@ -445,12 +445,15 @@ mod streaming {
     /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
     /// with the accumulated agent output; we send each `\n\n`-bounded paragraph
     /// as its own room message, threaded under `thread_anchor` when present.
-    /// `sent_so_far` is a byte counter into the accumulated text — everything
-    /// before that index has already been emitted.
+    /// `confirmed_prefix` holds the exact frame prefix already emitted — the
+    /// confirmed byte offset is `confirmed_prefix.len()`. Keeping the bytes
+    /// (not just a count) lets `multi_update` detect and remap the offset when
+    /// a later sanitizer pass rewrites the frame before it (see
+    /// [`crate::orchestrator::remap_confirmed_offset`]).
     #[derive(Debug, Clone)]
     pub(super) struct MultiDraft {
         pub thread_anchor: Option<OwnedEventId>,
-        pub sent_so_far: usize,
+        pub confirmed_prefix: String,
     }
 
     /// Live draft storage for the Matrix stream mode selected at channel
@@ -579,6 +582,14 @@ mod streaming {
     pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
         match state {
             State::Multi(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    /// Read-only confirmed-delivery offset for a live MultiMessage draft.
+    pub(super) fn multi_sent_so_far(state: &State, key: &DraftKey) -> Option<usize> {
+        match state {
+            State::Multi(drafts) => drafts.get(key).map(|d| d.confirmed_prefix.len()),
             _ => None,
         }
     }
@@ -4603,43 +4614,58 @@ impl MatrixChannel {
         let key = streaming_key(recipient, message_id)?;
         let delay = Duration::from_millis(self.config.multi_message_delay_ms);
         loop {
-            let (paragraph, thread_anchor) = {
+            let (paragraph, new_confirmed, thread_anchor) = {
                 let mut state = self.streaming_state.write().await;
                 let Some(multi) = streaming::multi_for_update(&mut state, &key) else {
                     return Ok(());
                 };
-                // Detect a buffer reset (e.g. DraftEvent::Clear) and re-anchor
-                // to the new shorter text.
-                if text.len() < multi.sent_so_far {
-                    multi.sent_so_far = 0;
+                if !text
+                    .as_bytes()
+                    .starts_with(multi.confirmed_prefix.as_bytes())
+                {
+                    // The frame no longer starts with the confirmed bytes:
+                    // either a later sanitizer pass (e.g. a redaction span
+                    // completing on this delta) rewrote text before the
+                    // confirmed offset, or a DraftEvent::Clear restarted the
+                    // accumulation. Remap the offset onto the new frame before
+                    // slicing anything with it; a restart remaps to 0.
+                    let remapped =
+                        crate::orchestrator::remap_confirmed_offset(&multi.confirmed_prefix, text);
+                    multi.confirmed_prefix = text[..remapped].to_string();
+                }
+                let sent_so_far = multi.confirmed_prefix.len();
+                if text.len() == sent_so_far {
                     return Ok(());
                 }
-                if text.len() == multi.sent_so_far {
-                    return Ok(());
-                }
-                let unsent = &text[multi.sent_so_far..];
+                // `sent_so_far` is a byte-verified prefix of `text` (or a
+                // remap result on a `\n\n` boundary), so this slice cannot
+                // split a UTF-8 character.
+                let unsent = &text[sent_so_far..];
                 let Some(break_at) = streaming::next_paragraph_break(unsent) else {
                     return Ok(());
                 };
                 let paragraph = unsent[..break_at].trim().to_string();
-                multi.sent_so_far += break_at + 2; // +2 for the consumed "\n\n"
-                (paragraph, multi.thread_anchor.clone())
+                (
+                    paragraph,
+                    sent_so_far + break_at + 2,
+                    multi.thread_anchor.clone(),
+                )
             };
             if !paragraph.is_empty() {
                 let mut msg = SendMessage::new(paragraph, recipient);
                 msg.thread_ts = thread_anchor.as_ref().map(|e| e.to_string());
-                if let Err(e) = outbound::send(&self.outbox(client), &msg).await {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "matrix: multi-message paragraph send failed"
-                    );
-                }
+                outbound::send(&self.outbox(client), &msg).await?;
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
+            }
+            // The confirmed prefix is a confirmed-delivery coordinate, not an
+            // attempted-send coordinate. Empty paragraphs have no transport
+            // content, so their delimiter can advance immediately; a failed
+            // non-empty send returns above and remains eligible for finalization.
+            let mut state = self.streaming_state.write().await;
+            if let Some(multi) = streaming::multi_for_update(&mut state, &key) {
+                multi.confirmed_prefix = text[..new_confirmed].to_string();
             }
         }
     }
@@ -4773,6 +4799,17 @@ impl Channel for MatrixChannel {
         self.config.multi_message_delay_ms
     }
 
+    async fn multi_message_confirmed_offset(&self, recipient: &str, message_id: &str) -> usize {
+        if !matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage) {
+            return 0;
+        }
+        let Ok(key) = streaming_key(recipient, message_id) else {
+            return 0;
+        };
+        let state = self.streaming_state.read().await;
+        streaming::multi_sent_so_far(&state, &key).unwrap_or(0)
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         let client = self.ensure_client().await?;
         let room_id = streaming_room(&message.recipient)?;
@@ -4838,7 +4875,7 @@ impl Channel for MatrixChannel {
                     key,
                     streaming::MultiDraft {
                         thread_anchor,
-                        sent_so_far: 0,
+                        confirmed_prefix: String::new(),
                     },
                 )?;
                 Ok(Some(draft_id))
@@ -5151,8 +5188,19 @@ impl Channel for MatrixChannel {
                 let Some(state) = multi else {
                     return Ok(());
                 };
-                let remainder = if text.len() > state.sent_so_far {
-                    text[state.sent_so_far..].trim().to_string()
+                // The reconciled final text is built to preserve the confirmed
+                // prefix byte-for-byte; remap defensively so a divergent frame
+                // degrades to re-sending whole paragraphs, never a corrupt slice.
+                let sent_so_far = if text
+                    .as_bytes()
+                    .starts_with(state.confirmed_prefix.as_bytes())
+                {
+                    state.confirmed_prefix.len()
+                } else {
+                    crate::orchestrator::remap_confirmed_offset(&state.confirmed_prefix, text)
+                };
+                let remainder = if text.len() > sent_so_far {
+                    text[sent_so_far..].trim().to_string()
                 } else {
                     String::new()
                 };
@@ -8715,7 +8763,7 @@ mod tests {
                 first.clone(),
                 MultiDraft {
                     thread_anchor: None,
-                    sent_so_far: 5,
+                    confirmed_prefix: "one\n\n".to_string(),
                 },
             )
             .expect("multi state accepts first draft");
@@ -8724,25 +8772,25 @@ mod tests {
                 second.clone(),
                 MultiDraft {
                     thread_anchor: None,
-                    sent_so_far: 0,
+                    confirmed_prefix: String::new(),
                 },
             )
             .expect("multi state accepts second draft");
 
             streaming::multi_for_update(&mut state, &second)
                 .expect("second multi-message draft remains addressable")
-                .sent_so_far = 12;
+                .confirmed_prefix = "second one\n\n".to_string();
 
             assert_eq!(
                 streaming::multi_for_update(&mut state, &first)
                     .expect("first multi-message draft remains isolated")
-                    .sent_so_far,
-                5
+                    .confirmed_prefix,
+                "one\n\n"
             );
 
             let finalized = streaming::take_multi(&mut state, &second)
                 .expect("finalize removes only the addressed multi-message draft");
-            assert_eq!(finalized.sent_so_far, 12);
+            assert_eq!(finalized.confirmed_prefix, "second one\n\n");
             assert!(multi_contains(&state, &first));
             assert!(!multi_contains(&state, &second));
 
@@ -8751,13 +8799,13 @@ mod tests {
                 canceled.clone(),
                 MultiDraft {
                     thread_anchor: None,
-                    sent_so_far: 3,
+                    confirmed_prefix: "c\n\n".to_string(),
                 },
             )
             .expect("multi state accepts canceled draft");
             let canceled_draft = streaming::take_multi(&mut state, &canceled)
                 .expect("cancel removes only the addressed multi-message draft");
-            assert_eq!(canceled_draft.sent_so_far, 3);
+            assert_eq!(canceled_draft.confirmed_prefix, "c\n\n");
             assert!(multi_contains(&state, &first));
             assert!(!multi_contains(&state, &canceled));
         }

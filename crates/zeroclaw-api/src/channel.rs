@@ -877,6 +877,20 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         800
     }
 
+    /// Confirmed-delivery byte offset for a MultiMessage draft: how many bytes
+    /// of the cumulative visible text previously handed to `update_draft` have
+    /// already been emitted on the transport as paragraph messages (including
+    /// their trailing `\n\n` delimiters).
+    ///
+    /// The orchestrator reads this before `finalize_draft` so it can reconcile
+    /// a sanitized final response against the paragraphs that are already on
+    /// the wire without stranding or replaying content. Channels that do not
+    /// support multi-message streaming keep the default of `0` (nothing
+    /// confirmed).
+    async fn multi_message_confirmed_offset(&self, _recipient: &str, _message_id: &str) -> usize {
+        0
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
