@@ -6,6 +6,48 @@ use crate::channel::ChannelMessage;
 use crate::model_provider::{ChatMessage, ChatResponse};
 use crate::tool::ToolResult;
 
+/// Opaque runtime context for one tool-call hook phase.
+///
+/// Correlated contexts carry one stable identity across the before and after
+/// phases. Uncorrelated contexts are phase-local and must not be used to pair
+/// callbacks or retain attribution-sensitive state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ToolCallHookContext {
+    invocation_id: String,
+    correlated: bool,
+}
+
+impl ToolCallHookContext {
+    /// Create a correlated context.
+    ///
+    /// The caller must provide a process-unique identity and reuse it for both
+    /// phases of the same tool invocation.
+    pub fn new(invocation_id: impl Into<String>) -> Self {
+        Self {
+            invocation_id: invocation_id.into(),
+            correlated: true,
+        }
+    }
+
+    /// Create a phase-local context when cross-phase identity is unavailable.
+    pub fn uncorrelated(invocation_id: impl Into<String>) -> Self {
+        Self {
+            invocation_id: invocation_id.into(),
+            correlated: false,
+        }
+    }
+
+    /// Return the opaque phase or invocation identity.
+    pub fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+
+    /// Whether this identity is stable across the before and after phases.
+    pub fn is_correlated(&self) -> bool {
+        self.correlated
+    }
+}
+
 /// Result of a modifying hook — continue with (possibly modified) data, or cancel.
 #[derive(Debug, Clone)]
 pub enum HookResult<T> {
@@ -36,6 +78,56 @@ pub trait HookHandler: Send + Sync {
     async fn on_llm_input(&self, _messages: &[ChatMessage], _model: &str) {}
     async fn on_llm_output(&self, _response: &ChatResponse) {}
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
+    /// Observe tool completion with explicit correlation context.
+    ///
+    /// When `context.is_correlated()` is false, handlers must not use its
+    /// phase-local identity to pair callbacks or retain attributed state.
+    async fn on_after_tool_call_with_context(
+        &self,
+        _context: &ToolCallHookContext,
+        tool: &str,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        self.on_after_tool_call(tool, result, duration).await;
+    }
+    /// Observe tool completion with explicit correlation context and the
+    /// arguments that were actually dispatched.
+    ///
+    /// Runners that know the final prepared arguments dispatch this variant
+    /// instead of [`HookHandler::on_after_tool_call_with_context`]; the
+    /// default delegates there, dropping the arguments. Handlers that audit
+    /// arguments should override this variant so their export reflects what
+    /// was dispatched — and so they never need to retain arguments between
+    /// the before and after phases.
+    async fn on_after_tool_call_with_context_and_args(
+        &self,
+        context: &ToolCallHookContext,
+        tool: &str,
+        _args: &Value,
+        result: &ToolResult,
+        duration: Duration,
+    ) {
+        self.on_after_tool_call_with_context(context, tool, result, duration)
+            .await;
+    }
+    /// Observe that a tool-call context will never reach its after phase.
+    ///
+    /// Fired exactly once per correlated context whose before phase ran, when
+    /// the call cannot complete: the before hook chain cancelled it, approval
+    /// denied or replaced it, duplicate suppression skipped it, or execution
+    /// failed or was interrupted before post-execution handling. Abandonment
+    /// is NOT execution completion — handlers must never synthesize a tool
+    /// result from it.
+    ///
+    /// Best-effort by nature: the runner dispatches abandonment on every
+    /// awaited non-completion path, but a turn future dropped outright (an
+    /// outer timeout, outer cancellation, or hard task abort) cannot run any
+    /// async callback, abandonment included. Handlers must therefore avoid
+    /// retaining safety-critical state between the before and after phases in
+    /// the first place, and treat abandonment as a best-effort release signal
+    /// rather than a guarantee.
+    async fn on_tool_call_abandoned(&self, _context: &ToolCallHookContext, _tool: &str) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
 
@@ -62,6 +154,19 @@ pub trait HookHandler: Send + Sync {
 
     async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {
         HookResult::Continue((name, args))
+    }
+
+    /// Inspect or modify a tool call with explicit correlation context.
+    ///
+    /// When `context.is_correlated()` is false, handlers must not retain state
+    /// that assumes the after phase will receive the same identity.
+    async fn before_tool_call_with_context(
+        &self,
+        _context: &ToolCallHookContext,
+        name: String,
+        args: Value,
+    ) -> HookResult<(String, Value)> {
+        self.before_tool_call(name, args).await
     }
 
     async fn on_message_received(&self, message: ChannelMessage) -> HookResult<ChannelMessage> {
@@ -136,5 +241,152 @@ mod tests {
             HookResult::Continue((name, _args)) => assert_eq!(name, "shell"),
             HookResult::Cancel(_) => panic!("should not cancel"),
         }
+    }
+
+    #[tokio::test]
+    async fn context_aware_defaults_delegate_to_legacy_tool_hooks() {
+        use std::sync::{Arc, Mutex};
+
+        struct LegacyHook {
+            after: Arc<Mutex<Option<(String, bool, Duration)>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for LegacyHook {
+            fn name(&self) -> &str {
+                "legacy"
+            }
+
+            async fn before_tool_call(
+                &self,
+                name: String,
+                args: Value,
+            ) -> HookResult<(String, Value)> {
+                HookResult::Continue((format!("{name}_legacy"), args))
+            }
+
+            async fn on_after_tool_call(
+                &self,
+                tool: &str,
+                result: &ToolResult,
+                duration: Duration,
+            ) {
+                *self.after.lock().unwrap() = Some((tool.to_string(), result.success, duration));
+            }
+        }
+
+        let after = Arc::new(Mutex::new(None));
+        let hook = LegacyHook {
+            after: Arc::clone(&after),
+        };
+        let context = ToolCallHookContext::new("opaque-id");
+        let args = serde_json::json!({"cmd": "ls"});
+
+        let before = hook
+            .before_tool_call_with_context(&context, "shell".into(), args.clone())
+            .await;
+        match before {
+            HookResult::Continue((name, actual_args)) => {
+                assert_eq!(name, "shell_legacy");
+                assert_eq!(actual_args, args);
+            }
+            HookResult::Cancel(_) => panic!("legacy hook should continue"),
+        }
+
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        let duration = Duration::from_millis(12);
+        hook.on_after_tool_call_with_context(&context, "shell", &result, duration)
+            .await;
+
+        assert_eq!(
+            *after.lock().unwrap(),
+            Some(("shell".to_string(), true, duration))
+        );
+    }
+
+    #[test]
+    fn tool_call_context_marks_unavailable_correlation() {
+        let exact = ToolCallHookContext::new("exact");
+        let unavailable = ToolCallHookContext::uncorrelated("legacy");
+
+        assert!(exact.is_correlated());
+        assert!(!unavailable.is_correlated());
+        assert_eq!(unavailable.invocation_id(), "legacy");
+    }
+
+    #[tokio::test]
+    async fn args_carrying_after_variant_defaults_to_context_variant() {
+        use std::sync::{Arc, Mutex};
+
+        struct ContextOnlyHook {
+            seen: Arc<Mutex<Option<(String, String, bool)>>>,
+        }
+
+        #[async_trait]
+        impl HookHandler for ContextOnlyHook {
+            fn name(&self) -> &str {
+                "context-only"
+            }
+
+            async fn on_after_tool_call_with_context(
+                &self,
+                context: &ToolCallHookContext,
+                tool: &str,
+                result: &ToolResult,
+                _duration: Duration,
+            ) {
+                *self.seen.lock().unwrap() = Some((
+                    context.invocation_id().to_string(),
+                    tool.to_string(),
+                    result.success,
+                ));
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let hook = ContextOnlyHook {
+            seen: Arc::clone(&seen),
+        };
+        let result = ToolResult {
+            success: true,
+            output: "ok".into(),
+            error: None,
+        };
+        hook.on_after_tool_call_with_context_and_args(
+            &ToolCallHookContext::new("invocation"),
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            &result,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(("invocation".to_string(), "shell".to_string(), true)),
+            "the args-carrying default must land in the context-aware variant"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_abandonment_hook_compiles_and_is_a_noop() {
+        // A pre-existing handler shape: implements only `name`. It must keep
+        // compiling unchanged and the default abandonment must be a no-op.
+        struct MinimalHook;
+        #[async_trait]
+        impl HookHandler for MinimalHook {
+            fn name(&self) -> &str {
+                "minimal"
+            }
+        }
+
+        let hook = MinimalHook;
+        hook.on_tool_call_abandoned(&ToolCallHookContext::new("invocation"), "shell")
+            .await;
+        hook.on_tool_call_abandoned(&ToolCallHookContext::uncorrelated("legacy"), "shell")
+            .await;
     }
 }
