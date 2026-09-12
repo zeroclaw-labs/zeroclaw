@@ -4279,7 +4279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_context_window_forwards_api_key() {
+    async fn refresh_context_window_allows_slow_response_and_forwards_api_key() {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
         use wiremock::matchers::{header, method, path};
@@ -4290,12 +4290,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .and(header("authorization", "Bearer test-api-key-123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{
-                    "id": "llama-3.1-70b",
-                    "context_length": 4096
-                }]
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(3_100))
+                    .set_body_json(serde_json::json!({
+                        "data": [{
+                            "id": "llama-3.1-70b",
+                            "context_length": 4096
+                        }]
+                    })),
+            )
             .expect(1)
             .mount(&mock)
             .await;

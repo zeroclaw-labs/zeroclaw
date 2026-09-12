@@ -44,6 +44,9 @@ pub struct OpenAiCompatibleModelProvider {
     pub auth_header: AuthStyle,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
+    /// Operator `[multimodal]` policy for this provider's image-marker
+    /// expansion pass. Resolved once at build time.
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// When true, collect all `system` messages and prepend their content
     /// to the first `user` message, then drop the system messages.
@@ -407,6 +410,7 @@ pub struct OpenAiCompatibleBuilder {
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
     tool_result_image_policy: ToolResultImagePolicy,
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     user_agent: Option<String>,
     /// Set via [`OpenAiCompatibleBuilder::merge_system_into_user`] — the
     /// combined "merge + drop native tool calling" preset. Distinct from
@@ -488,6 +492,14 @@ impl OpenAiCompatibleBuilder {
     /// Set the policy for image markers in native role=`tool` results.
     pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
         self.tool_result_image_policy = policy;
+        self
+    }
+
+    /// Set the root `[multimodal]` policy used when expanding `[IMAGE:...]`
+    /// markers into inline data URIs. Without this the provider falls back to
+    /// library defaults and operator limits never reach the outbound request.
+    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
         self
     }
 
@@ -684,6 +696,7 @@ impl OpenAiCompatibleBuilder {
             auth_header: auth_style,
             supports_vision: self.supports_vision,
             tool_result_image_policy: self.tool_result_image_policy,
+            multimodal: self.multimodal,
             user_agent: self.user_agent,
             native_tool_calling,
             merge_system_into_user,
@@ -722,6 +735,7 @@ impl OpenAiCompatibleModelProvider {
             auth_style: None,
             supports_vision: false,
             tool_result_image_policy: ToolResultImagePolicy::default(),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             user_agent: None,
             merge_system_into_user: false,
             merge_system_into_user_preserve_native: false,
@@ -952,6 +966,10 @@ impl OpenAiCompatibleModelProvider {
             );
             Client::new()
         })
+    }
+
+    fn models_url(&self) -> String {
+        format!("{}/models", self.base_url)
     }
 
     /// Build the full URL for chat completions, detecting if base_url already includes the path.
@@ -1196,6 +1214,10 @@ struct UsageInfo {
 struct PromptTokensDetails {
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     cached_tokens: Option<u64>,
+    /// Cache-write tokens reported by translating gateways that forward
+    /// Anthropic usage (`prompt_tokens_details.cache_creation_input_tokens`).
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 impl UsageInfo {
@@ -1207,12 +1229,20 @@ impl UsageInfo {
         })
     }
 
+    fn cache_creation_input_tokens(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_creation_input_tokens)
+    }
+
     fn into_provider_usage(self) -> zeroclaw_api::model_provider::TokenUsage {
         let cached_input_tokens = self.cached_input_tokens();
+        let cache_creation_input_tokens = self.cache_creation_input_tokens();
         zeroclaw_api::model_provider::TokenUsage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
         }
     }
 }
@@ -2325,7 +2355,7 @@ impl OpenAiCompatibleModelProvider {
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
+        let config = self.multimodal.clone();
         let sanitized;
         let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
             sanitized = messages
@@ -2834,7 +2864,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // servers with a public catalog use the same path without an Authorization header.
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
-            let url = format!("{}/models", self.base_url);
+            let url = self.models_url();
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
@@ -2925,7 +2955,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // endpoint — this returns pricing data that we can capture.
         let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
-            let url = format!("{}/models", self.base_url);
+            let url = self.models_url();
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential.as_deref())
                 .send()
@@ -3936,14 +3966,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        // Hit the appropriate URL with a GET to prime the connection pool.
-        // The server will likely return 405 Method Not Allowed, which is fine.
-        let url = self.chat_completions_url();
+        // Probe the catalog without invoking inference. Unsupported endpoints are
+        // still useful for connection warmup, so do not reject HTTP error statuses.
+        let url = self.models_url();
         let credential = self.resolve_credential().await?;
-        let _ = self
+        let mut response = self
             .apply_auth_header(self.http_client().get(&url), credential.as_deref())
             .send()
             .await?;
+        // Drain without retaining the catalog so HTTP/1 connections can be reused.
+        while response.chunk().await?.is_some() {}
         Ok(())
     }
 }
@@ -6283,6 +6315,77 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn operator_max_images_bounds_the_outbound_request() {
+        // Behaviour boundary: the number of images that survive into the
+        // messages this provider is about to send upstream. Asserting the
+        // config field alone would still pass if the expansion pass kept
+        // using library defaults.
+        let temp = tempfile::tempdir().unwrap();
+        // Minimal PNG signature bytes are enough for MIME detection.
+        let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let first = temp.path().join("first.png");
+        let second = temp.path().join("second.png");
+        std::fs::write(&first, png).unwrap();
+        std::fs::write(&second, png).unwrap();
+
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both in a single message would exercise that eviction
+        // granularity rather than whether the operator's cap is honoured.
+        let messages = vec![
+            ChatMessage::user(format!("first [IMAGE:{}]", first.display())),
+            ChatMessage::user(format!("second [IMAGE:{}]", second.display())),
+        ];
+
+        let build = |multimodal| {
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url("https://example.com")
+                .credential(None)
+                .auth_style(AuthStyle::Bearer)
+                .multimodal(multimodal)
+                .build()
+        };
+
+        let permissive = build(zeroclaw_config::schema::MultimodalConfig::default());
+        let prepared = permissive
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("default policy prepares both images");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            2,
+            "default policy admits both images"
+        );
+
+        let capped = build(zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        });
+        let prepared = capped
+            .normalize_messages_for_upstream(&messages)
+            .await
+            .expect("capped policy still prepares the message");
+        assert_eq!(
+            crate::multimodal::count_image_markers(&prepared),
+            1,
+            "an operator capping max_images must bound the outbound request"
+        );
+    }
+
+    #[test]
+    fn builder_without_multimodal_falls_back_to_library_defaults() {
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url("https://example.com")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let defaults = zeroclaw_config::schema::MultimodalConfig::default();
+        assert_eq!(provider.multimodal.max_images, defaults.max_images);
+    }
+
     #[test]
     fn convert_messages_for_native_promotes_tool_result_image_markers() {
         // A tool result carrying an inline base64 image marker (e.g. a snapshot
@@ -7022,6 +7125,128 @@ mod tests {
         assert_eq!(
             model_provider.reasoning_effort_for_model("llama-3.3-70b"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_uses_models_endpoint_with_existing_auth() {
+        use axum::{
+            Router,
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tokio::net::TcpListener;
+
+        for (base_path, status, auth_style, credential, header) in [
+            (
+                "",
+                200,
+                AuthStyle::Bearer,
+                Some("test-key"),
+                Some(("authorization", "Bearer test-key")),
+            ),
+            (
+                "/v1",
+                401,
+                AuthStyle::Bearer,
+                Some("test-key"),
+                Some(("authorization", "Bearer test-key")),
+            ),
+            (
+                "/v1/",
+                404,
+                AuthStyle::XApiKey,
+                Some("test-key"),
+                Some(("x-api-key", "test-key")),
+            ),
+            (
+                "/custom/api",
+                405,
+                AuthStyle::Custom("x-provider-key".into()),
+                Some("test-key"),
+                Some(("x-provider-key", "test-key")),
+            ),
+            ("/v1", 500, AuthStyle::Bearer, None, None),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            let app = Router::new().fallback(move |request: Request<Body>| {
+                let tx = tx.clone();
+                async move {
+                    tx.send((
+                        request.method().clone(),
+                        request.uri().path().to_owned(),
+                        request.headers().clone(),
+                    ))
+                    .await
+                    .unwrap();
+                    (StatusCode::from_u16(status).unwrap(), "probe body")
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = OpenAiCompatibleModelProvider::builder("test")
+                .display_name("test")
+                .base_url(&format!("http://{addr}{base_path}"))
+                .credential(credential)
+                .auth_style(auth_style)
+                .extra_headers(std::collections::HashMap::from([(
+                    "x-probe-test".into(),
+                    "preserved".into(),
+                )]))
+                .api_path((status == 500).then(|| "/inference".to_string()))
+                .build();
+            let result = provider.warmup().await;
+            server.abort();
+            assert!(
+                result.is_ok(),
+                "HTTP {status} must not fail warmup: {result:?}"
+            );
+            let (method, path, headers) = rx.recv().await.unwrap();
+            assert_eq!(method, "GET");
+            assert_eq!(headers.get("x-probe-test").unwrap(), "preserved");
+            assert_eq!(path, format!("{}/models", base_path.trim_end_matches('/')));
+            if let Some((name, value)) = header {
+                assert_eq!(headers.get(name).unwrap(), value);
+            } else {
+                assert!(!headers.contains_key("authorization"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_drains_response_with_configured_timeout() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+        };
+        let app = Router::new().fallback(|| async {
+            Body::from_stream(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok::<_, std::io::Error>(Bytes::from_static(b"catalog"))
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("test")
+            .base_url(&format!("http://{addr}"))
+            .auth_style(AuthStyle::Bearer)
+            .timeout_secs(1)
+            .build();
+        let result = provider.warmup().await;
+        server.abort();
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<reqwest::Error>()
+                .unwrap()
+                .is_timeout()
         );
     }
 
@@ -8117,6 +8342,27 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(150));
         assert_eq!(usage.output_tokens, Some(60));
         assert_eq!(usage.cached_input_tokens, Some(120));
+    }
+
+    #[test]
+    fn api_response_parses_gateway_cache_creation_tokens() {
+        // Translating gateways forward Anthropic's cache-write counter inside
+        // `prompt_tokens_details` when providers include that usage detail.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_tokens_details": {
+                    "cached_tokens": 120,
+                    "cache_creation_input_tokens": 25
+                }
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(120));
+        assert_eq!(usage.cache_creation_input_tokens, Some(25));
     }
 
     #[test]

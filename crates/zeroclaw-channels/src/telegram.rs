@@ -5,7 +5,7 @@ use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
@@ -22,12 +22,113 @@ use zeroclaw_runtime::security::pairing::PairingGuard;
 /// reporting the last success indefinitely.
 const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 
+/// Ceiling on one complete voice-drop notice attempt — both `sendMessage`
+/// requests (HTML and the plaintext fallback), their response-body reads, and
+/// the inter-chunk pauses.
+///
+/// The notice is sent from inside the update-processing path, before the
+/// permanent skip advances the offset, with a client that has no request
+/// timeout. Unbounded, a stalled request or response body would pin the offset
+/// and stop the whole listener — the health monitor can report that state but
+/// cannot cancel the wait. The drop is permanent either way, so on timeout the
+/// notice is abandoned, not retried.
+const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
+
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
 const TELEGRAM_FENCE_REOPEN: &str = "```\n";
 const TELEGRAM_FENCE_CLOSE: &str = "```";
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
+const TELEGRAM_MEDIA_GROUP_SETTLE_DELAY: Duration = Duration::from_millis(700);
+const TELEGRAM_IDLE_POLL_TIMEOUT_SECS: u64 = 30;
+const TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS: u64 = 1;
+const TELEGRAM_POLL_LIMIT: usize = 100;
+
+type MediaGroupKey = (i64, String);
+
+/// Raw, not-yet-dispatched updates for one Telegram media group.
+///
+/// The map that owns these values is deliberately local to `listen`: it is
+/// the canonical transient state only while an album is waiting to settle.
+#[derive(Debug)]
+struct PendingMediaGroup {
+    updates: Vec<serde_json::Value>,
+    /// Caption/mention context from album members we will never materialize
+    /// (for example a video in a photo/video album). These are deliberately
+    /// kept out of `updates` so they cannot drive downloads or image markers,
+    /// but their captions still participate in aggregation and the mention
+    /// gate -- otherwise an album can lose the user's only caption, or be
+    /// silently rejected under `mention_only`.
+    unsupported: Vec<UnsupportedMember>,
+    last_seen: Instant,
+    last_seen_poll_generation: u64,
+    /// Set while `getUpdates` returned a full page and an older update is still
+    /// unacknowledged, so the offset cannot reach past that page and a later
+    /// member of this album cannot be observed yet. Settling here would split
+    /// the album into two turns.
+    saturated_page_blocked: bool,
+}
+
+/// The text-only residue of an album member that will never be downloaded.
+///
+/// Only what caption aggregation, the mention gate, and album scope validation
+/// need is retained; the full `message` object is intentionally dropped so
+/// this can never reach `parse_attachment_metadata()` or `getFile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsupportedMember {
+    /// Telegram update identity used to preserve acknowledgement ordering.
+    update_id: i64,
+    /// Kept so unsupported captions interleave with supported ones in the
+    /// album's real `message_id` order rather than being appended at the end.
+    message_id: i64,
+    caption: Option<String>,
+    scope: MediaGroupScope,
+}
+
+/// Security-relevant scope shared by every member of one Telegram album.
+///
+/// Optional fields are retained instead of dropping malformed members so the
+/// settled batch can fail closed before any attachment download.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MediaGroupScope {
+    chat_id: Option<i64>,
+    media_group_id: Option<String>,
+    thread_id: Option<i64>,
+    sender: Option<String>,
+}
+
+/// One settled album ready for dispatch: the materializable updates plus the
+/// text-only context of its unsupported members.
+#[derive(Debug, Clone)]
+struct MediaGroupBatch {
+    key: MediaGroupKey,
+    updates: Vec<serde_json::Value>,
+    unsupported: Vec<UnsupportedMember>,
+    last_seen: Instant,
+    last_seen_poll_generation: u64,
+    /// Carried through dispatch so a transient failure restores the album with
+    /// the same page-boundary state it had while pending.
+    saturated_page_blocked: bool,
+}
+
+/// One unacknowledged update in Telegram's global delivery order.
+///
+/// Ordinary updates own their raw payload here. Media-group members instead
+/// reference the listener-local group map, which remains the sole owner of
+/// album payloads while they settle.
+#[derive(Debug, Clone)]
+struct QueuedTelegramUpdate {
+    update_id: Option<i64>,
+    payload: QueuedTelegramUpdatePayload,
+    delivered: bool,
+}
+
+#[derive(Debug, Clone)]
+enum QueuedTelegramUpdatePayload {
+    Ordinary(serde_json::Value),
+    MediaGroup(MediaGroupKey),
+}
 
 /// Metadata for an incoming document or photo attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +574,23 @@ fn format_attachment_content(
     }
 }
 
+fn safe_attachment_filename(raw: &str) -> String {
+    Path::new(raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("document")
+        .to_string()
+}
+
+fn media_group_document_storage_filename(
+    display_filename: &str,
+    chat_id: &str,
+    message_id: i64,
+) -> String {
+    format!("document_{chat_id}_{message_id}_{display_filename}")
+}
+
 fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
@@ -655,6 +773,10 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Bound on one complete voice-drop notice attempt. Always
+    /// [`VOICE_DROP_NOTICE_TIMEOUT`] in production; tests shrink it so a
+    /// stalled-notice regression does not have to wait out the real ceiling.
+    voice_drop_notice_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,9 +797,8 @@ enum EditMessageResult {
 /// attachment), so a `SkipPermanent` that falls out of the *last* parser is
 /// always a genuine permanent skip.
 ///
-/// Whether an update is acknowledged is therefore decided by
-/// [`TelegramChannel::process_update`] together with [`UpdateOutcome`] — read
-/// those two to reason about offset advancement, not this enum alone.
+/// Whether an update is acknowledged is therefore decided by the listener's
+/// ordered acknowledgement queue together with [`UpdateOutcome`].
 /// `RetryTransient` is reserved for fallible I/O (file download,
 /// transcription, disk writes) so the caller can leave the update
 /// unacknowledged and retry it on the next poll instead of silently dropping
@@ -692,17 +813,30 @@ pub(crate) enum UpdateDisposition {
     RetryTransient,
 }
 
-/// Result of routing a single update through [`TelegramChannel::process_update`].
+enum AttachmentMaterialization {
+    Ready {
+        content: String,
+        attachment: zeroclaw_api::media::MediaAttachment,
+    },
+    SkipPermanent,
+    RetryTransient,
+}
+
+enum MediaGroupDispatchOutcome {
+    Delivered(MediaGroupKey),
+    Retry(MediaGroupBatch),
+    ReceiverClosed,
+}
+
+/// Result of routing one queued update through its delivery path.
 ///
-/// Both the startup/restart probe and the main long-poll loop drive their
-/// batches of updates through the same per-update path so a queued update
-/// seen at startup gets exactly the same offset-advance discipline as one
-/// seen mid-run: the offset only moves past an update once it has been
-/// delivered or permanently skipped, never while a transient failure or a
-/// dropped receiver could still cause it to be lost.
+/// Both the startup/restart probe and the main long-poll loop use the same
+/// queue. The offset moves only across its delivered prefix, never while a
+/// transient failure or dropped receiver could still cause an update to be
+/// lost.
 enum UpdateOutcome {
-    /// The update was delivered or permanently skipped; the offset has been
-    /// advanced past it and the caller should keep processing the batch.
+    /// The update was delivered or permanently skipped; the queue may mark it
+    /// complete and keep processing the batch.
     Advanced,
     /// A transient failure occurred. The caller should stop processing the
     /// rest of this batch so the next poll retries starting at the
@@ -740,6 +874,54 @@ pub(crate) enum FileLookupFailure {
     /// `error_code` on the terminal allowlist (invalid/expired file id, file
     /// too big, forbidden). Safe to acknowledge and move past.
     Permanent,
+}
+
+/// Why a voice message was dropped for good, and what its sender is told.
+///
+/// A voice note that disappears without a word is indistinguishable, from the
+/// sender's side, from a bot that never heard them: the message was delivered,
+/// no answer came, and no reason was given. Every permanent drop therefore
+/// carries a short human sentence. Transient failures are deliberately absent:
+/// the update is retried from the same offset, so a notice would be sent again
+/// on every attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceDropReason {
+    /// The recording is longer than `transcription.max_duration_secs`.
+    TooLong { limit_secs: u64 },
+    /// Telegram will never hand us this file: expired id, too big, forbidden.
+    FileUnavailable,
+    /// Transcription succeeded but produced nothing usable — silence, noise.
+    EmptyTranscript,
+}
+
+impl VoiceDropReason {
+    /// The sentence the sender sees, resolved through the Fluent catalogue
+    /// like every other user-facing channel string. Vendor and engine
+    /// diagnostics stay in the log: the sender gets the reason, never the
+    /// internals.
+    ///
+    /// The wording is deliberately generic over voice notes and audio
+    /// uploads — this parser accepts both — and the advice has to survive the
+    /// causes it cannot distinguish: a permanent retrieval failure includes
+    /// files Telegram refuses as too big, where "send it again" would invite
+    /// the sender to hit the same wall twice.
+    pub(crate) fn notice(self) -> String {
+        match self {
+            Self::TooLong { limit_secs } => {
+                let limit_secs = limit_secs.to_string();
+                i18n::get_required_cli_string_with_args(
+                    "channel-telegram-voice-drop-too-long",
+                    &[("limit_secs", limit_secs.as_str())],
+                )
+            }
+            Self::FileUnavailable => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-file-unavailable")
+            }
+            Self::EmptyTranscript => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-empty-transcript")
+            }
+        }
+    }
 }
 
 /// A `getFile` failure with the vendor diagnostics preserved.
@@ -919,7 +1101,17 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
         }
+    }
+
+    /// Shrink the voice-drop notice bound so a stalled-notice test does not
+    /// wait out the production ceiling. Test-only: the ceiling is not
+    /// operator-tunable — it exists to protect the listener, not to be tuned.
+    #[cfg(test)]
+    fn with_voice_drop_notice_timeout(mut self, timeout: Duration) -> Self {
+        self.voice_drop_notice_timeout = timeout;
+        self
     }
 
     /// Set the resolver used to resolve voice-chat peers live (no cached state).
@@ -1111,6 +1303,337 @@ impl TelegramChannel {
             .get("message_id")
             .and_then(serde_json::Value::as_i64)?;
         Some((chat_id, message_id))
+    }
+
+    fn extract_media_group_key(update: &serde_json::Value) -> Option<MediaGroupKey> {
+        let message = update.get("message")?;
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)?;
+        let media_group_id = message
+            .get("media_group_id")
+            .and_then(serde_json::Value::as_str)?
+            .to_string();
+        Some((chat_id, media_group_id))
+    }
+
+    fn update_id(update: &serde_json::Value) -> Option<i64> {
+        update.get("update_id").and_then(serde_json::Value::as_i64)
+    }
+
+    fn update_message_id(update: &serde_json::Value) -> Option<i64> {
+        update
+            .get("message")
+            .and_then(|message| message.get("message_id"))
+            .and_then(serde_json::Value::as_i64)
+    }
+
+    fn is_supported_media_group_update(update: &serde_json::Value) -> bool {
+        update
+            .get("message")
+            .and_then(Self::parse_attachment_metadata)
+            .is_some()
+    }
+
+    fn is_context_only_media_group_update(update: &serde_json::Value) -> bool {
+        update
+            .get("message")
+            .and_then(|message| message.get("video"))
+            .is_some()
+    }
+
+    fn should_defer_media_group_update(
+        pending: &std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        update: &serde_json::Value,
+    ) -> bool {
+        let Some(key) = Self::extract_media_group_key(update) else {
+            return false;
+        };
+        Self::is_supported_media_group_update(update) || pending.contains_key(&key)
+    }
+
+    fn is_duplicate_media_group_member(
+        existing: &serde_json::Value,
+        candidate: &serde_json::Value,
+    ) -> bool {
+        let same_update_id = Self::update_id(existing)
+            .zip(Self::update_id(candidate))
+            .is_some_and(|(existing, candidate)| existing == candidate);
+        let same_message_id = Self::update_message_id(existing)
+            .zip(Self::update_message_id(candidate))
+            .is_some_and(|(existing, candidate)| existing == candidate);
+        same_update_id || same_message_id
+    }
+
+    /// Record the caption and security scope of an album member that will
+    /// never be downloaded. Deduplicated by `message_id` so a member repeated
+    /// across polls cannot duplicate its context in the aggregate.
+    fn retain_unsupported_member(
+        group: &mut PendingMediaGroup,
+        update: &serde_json::Value,
+    ) -> bool {
+        let Some(update_id) = Self::update_id(update) else {
+            return false;
+        };
+        let Some(message_id) = Self::update_message_id(update) else {
+            return false;
+        };
+        if group
+            .unsupported
+            .iter()
+            .any(|member| member.message_id == message_id)
+        {
+            return false;
+        }
+        // A member already retained as materializable must never be
+        // double-counted as text-only.
+        if group
+            .updates
+            .iter()
+            .any(|existing| Self::is_duplicate_media_group_member(existing, update))
+        {
+            return false;
+        }
+        let caption = update
+            .get("message")
+            .and_then(|message| message.get("caption"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let scope = update
+            .get("message")
+            .map(Self::media_group_scope)
+            .unwrap_or_default();
+        group.unsupported.push(UnsupportedMember {
+            update_id,
+            message_id,
+            caption,
+            scope,
+        });
+        true
+    }
+
+    fn buffer_media_group_update(
+        pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        update: &serde_json::Value,
+        now: Instant,
+        poll_generation: u64,
+    ) -> bool {
+        let Some(key) = Self::extract_media_group_key(update) else {
+            return false;
+        };
+
+        // Videos are context-only members of photo/video albums: retain them
+        // even when one arrives before the first materializable sibling. The
+        // existing listener-local map remains the single owner of transient
+        // album state. Grouped audio keeps its independent parser behavior.
+        if !Self::is_supported_media_group_update(update) {
+            if !Self::is_context_only_media_group_update(update) {
+                return true;
+            }
+
+            let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
+                updates: Vec::new(),
+                unsupported: Vec::new(),
+                last_seen: now,
+                last_seen_poll_generation: poll_generation,
+                saturated_page_blocked: false,
+            });
+            if Self::retain_unsupported_member(group, update) {
+                group.last_seen = now;
+                group.last_seen_poll_generation = poll_generation;
+            }
+            return true;
+        }
+
+        let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
+            updates: Vec::new(),
+            unsupported: Vec::new(),
+            last_seen: now,
+            last_seen_poll_generation: poll_generation,
+            saturated_page_blocked: false,
+        });
+        if group
+            .updates
+            .iter()
+            .any(|existing| Self::is_duplicate_media_group_member(existing, update))
+        {
+            return true;
+        }
+
+        group.updates.push(update.clone());
+        group.last_seen = now;
+        group.last_seen_poll_generation = poll_generation;
+        true
+    }
+
+    fn take_settled_media_groups(
+        pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        now: Instant,
+        completed_poll_generation: u64,
+    ) -> Vec<MediaGroupBatch> {
+        Self::take_media_groups_matching(pending, |_, group| {
+            !group.saturated_page_blocked
+                && now.saturating_duration_since(group.last_seen)
+                    >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
+                && group.last_seen_poll_generation < completed_poll_generation
+        })
+    }
+
+    fn take_prior_media_groups_for_update(
+        pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        update: &serde_json::Value,
+        now: Instant,
+        completed_poll_generation: u64,
+    ) -> Vec<MediaGroupBatch> {
+        let Some(message) = update.get("message") else {
+            return Vec::new();
+        };
+        let Some(chat_id) = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return Vec::new();
+        };
+        let Some(message_id) = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return Vec::new();
+        };
+        let Some(update_id) = Self::update_id(update) else {
+            return Vec::new();
+        };
+
+        Self::take_media_groups_matching(pending, |key, group| {
+            !group.saturated_page_blocked
+                && key.0 == chat_id
+                && !group.updates.is_empty()
+                && now.saturating_duration_since(group.last_seen)
+                    >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
+                && group.last_seen_poll_generation < completed_poll_generation
+                && group.updates.iter().all(|member| {
+                    Self::update_id(member).is_some_and(|id| id < update_id)
+                        && Self::update_message_id(member).is_some_and(|id| id < message_id)
+                })
+                // Retained text-only members carry their own ordering identity,
+                // so a later unsupported sibling must hold the group pending
+                // just like a later materializable one.
+                && group
+                    .unsupported
+                    .iter()
+                    .all(|member| member.update_id < update_id && member.message_id < message_id)
+        })
+    }
+
+    fn take_media_groups_matching(
+        pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        mut should_take: impl FnMut(&MediaGroupKey, &PendingMediaGroup) -> bool,
+    ) -> Vec<MediaGroupBatch> {
+        let mut matching_keys: Vec<(MediaGroupKey, i64)> = pending
+            .iter()
+            .filter(|(key, group)| !group.saturated_page_blocked && should_take(key, group))
+            .map(|(key, group)| {
+                let earliest_update_id = group
+                    .updates
+                    .iter()
+                    .filter_map(Self::update_id)
+                    .chain(group.unsupported.iter().map(|member| member.update_id))
+                    .min()
+                    .unwrap_or(i64::MAX);
+                (key.clone(), earliest_update_id)
+            })
+            .collect();
+        matching_keys.sort_by(|(left_key, left_id), (right_key, right_id)| {
+            left_id.cmp(right_id).then_with(|| left_key.cmp(right_key))
+        });
+
+        matching_keys
+            .into_iter()
+            .filter_map(|(key, _)| pending.remove_entry(&key))
+            .map(|(key, mut group)| {
+                group
+                    .updates
+                    .sort_by_key(|update| Self::update_message_id(update).unwrap_or(i64::MAX));
+                MediaGroupBatch {
+                    key,
+                    updates: group.updates,
+                    unsupported: group.unsupported,
+                    last_seen: group.last_seen,
+                    last_seen_poll_generation: group.last_seen_poll_generation,
+                    saturated_page_blocked: group.saturated_page_blocked,
+                }
+            })
+            .collect()
+    }
+
+    fn media_group_poll_timeout_secs(
+        pending: &std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+    ) -> u64 {
+        if pending.is_empty() {
+            TELEGRAM_IDLE_POLL_TIMEOUT_SECS
+        } else {
+            TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS
+        }
+    }
+
+    fn media_group_sender_scope(message: &serde_json::Value) -> Option<String> {
+        if let Some(id) = message
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            return Some(format!("user:{id}"));
+        }
+        if let Some(id) = message
+            .get("sender_chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            return Some(format!("chat:{id}"));
+        }
+        message
+            .get("from")
+            .and_then(|from| from.get("username"))
+            .and_then(serde_json::Value::as_str)
+            .map(Self::normalize_identity)
+            .filter(|username| !username.is_empty())
+            .map(|username| format!("username:{username}"))
+    }
+
+    fn media_group_scope(message: &serde_json::Value) -> MediaGroupScope {
+        MediaGroupScope {
+            chat_id: message
+                .get("chat")
+                .and_then(|chat| chat.get("id"))
+                .and_then(serde_json::Value::as_i64),
+            media_group_id: message
+                .get("media_group_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            thread_id: message
+                .get("message_thread_id")
+                .and_then(serde_json::Value::as_i64),
+            sender: Self::media_group_sender_scope(message),
+        }
+    }
+
+    fn media_group_scopes_match(anchor: &MediaGroupScope, candidate: &MediaGroupScope) -> bool {
+        anchor.chat_id.is_some()
+            && anchor.media_group_id.is_some()
+            && anchor.sender.is_some()
+            && anchor == candidate
+    }
+
+    fn media_group_members_share_scope(
+        anchor: &serde_json::Value,
+        candidate: &serde_json::Value,
+    ) -> bool {
+        Self::media_group_scopes_match(
+            &Self::media_group_scope(anchor),
+            &Self::media_group_scope(candidate),
+        )
     }
 
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
@@ -1480,16 +2003,20 @@ impl TelegramChannel {
 
         // Only queue substantive natural-language replies for voice.
         // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-        let is_substantive = content.len() > 40
-            && !content.starts_with("http")
-            && !content.starts_with('{')
-            && !content.starts_with('[')
-            && !content.starts_with("Error")
-            && !content.contains("```")
-            && !content.contains("tool_call")
-            && !content.contains("wttr.in");
-
-        if !is_substantive {
+        if let Some(reason) = crate::util::voice_reply_skip_reason(content) {
+            // Stable literal per the logging contract: the classification and
+            // per-event measurements ride solely in `attributes` above.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_attrs(::serde_json::json!({
+                        "recipient": recipient,
+                        "reason": reason,
+                        "content_len": content.len(),
+                        "immediate": immediate,
+                    })),
+                "voice reply skipped"
+            );
             return;
         }
 
@@ -2391,29 +2918,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         None
     }
 
-    /// Attempt to parse a Telegram update as a document/photo attachment.
-    ///
-    /// Downloads the file to `{workspace_dir}/telegram_files/` and returns a
-    /// `Parsed` disposition carrying a `ChannelMessage` with the local file
-    /// path, `SkipPermanent` when the update is not a parseable attachment, or
-    /// `RetryTransient` when a download or write fails and is worth retrying.
-    ///
-    /// `pub(crate)` so orchestrator regressions can drive a REAL parsed
-    /// Telegram update through `process_channel_message` (the live
-    /// smoke failed precisely in the seam between this parser and the
-    /// orchestrator's typed image gate).
-    pub(crate) async fn try_parse_attachment_message(
-        &self,
-        update: &serde_json::Value,
-    ) -> UpdateDisposition {
-        let Some(message) = update.get("message") else {
-            return UpdateDisposition::SkipPermanent;
-        };
-        let Some(attachment) = Self::parse_attachment_metadata(message) else {
-            return UpdateDisposition::SkipPermanent;
-        };
+    fn allowed_attachment_sender(&self, message: &serde_json::Value) -> Option<String> {
+        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+        self.is_any_user_allowed(identities.iter().copied())
+            .then_some(sender_identity)
+    }
 
-        // Check file size limit
+    /// Download and persist one attachment, returning only its prompt marker.
+    /// Authorization, mention gating, captions, replies, and forwarding are
+    /// intentionally handled by the caller so an album applies them once.
+    async fn materialize_attachment_content(
+        &self,
+        attachment: &IncomingAttachment,
+        chat_id: &str,
+        message_id: i64,
+        disambiguate_document_name: bool,
+    ) -> AttachmentMaterialization {
         if let Some(size) = attachment.file_size
             && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
         {
@@ -2425,51 +2949,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
                 )
             );
-            return UpdateDisposition::SkipPermanent;
+            return AttachmentMaterialization::SkipPermanent;
         }
-
-        let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
-
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
-
-        if !self.is_any_user_allowed(identities.iter().copied()) {
-            return UpdateDisposition::SkipPermanent;
-        }
-
-        // Apply mention_only gate before downloading. Photo / document
-        // updates carry no `text` field, so the text-only gate in
-        // `parse_update_message` can never see them and they used to slip
-        // through unconditionally.
-        let Some(gated_caption) =
-            self.check_media_mention_gate(message, attachment.caption.as_deref())
-        else {
-            return UpdateDisposition::SkipPermanent;
-        };
-
-        let Some(chat_id) = message
-            .get("chat")
-            .and_then(|chat| chat.get("id"))
-            .and_then(serde_json::Value::as_i64)
-            .map(|id| id.to_string())
-        else {
-            return UpdateDisposition::SkipPermanent;
-        };
-
-        let message_id = message
-            .get("message_id")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(0);
-
-        let thread_id = Self::topic_thread_id(message);
-
-        let reply_target = if let Some(ref tid) = thread_id {
-            format!("{}:{}", chat_id, tid)
-        } else {
-            chat_id.clone()
-        };
 
         // Ensure workspace directory is configured
         let Some(workspace) = self.workspace_dir.as_ref().or_else(|| {
@@ -2481,7 +2962,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             );
             None
         }) else {
-            return UpdateDisposition::SkipPermanent;
+            return AttachmentMaterialization::SkipPermanent;
         };
 
         let save_dir = workspace.join("telegram_files");
@@ -2493,7 +2974,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                 "Failed to create telegram_files directory"
             );
-            return UpdateDisposition::RetryTransient;
+            return AttachmentMaterialization::RetryTransient;
         }
 
         // Download file from Telegram
@@ -2513,8 +2994,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // A permanently rejected file id can never download; retrying
                 // it head-of-line blocks every later update forever.
                 return match e.kind {
-                    FileLookupFailure::Permanent => UpdateDisposition::SkipPermanent,
-                    FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
+                    FileLookupFailure::Permanent => AttachmentMaterialization::SkipPermanent,
+                    FileLookupFailure::Transient => AttachmentMaterialization::RetryTransient,
                 };
             }
         };
@@ -2529,17 +3010,28 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                     "Failed to download attachment"
                 );
-                return UpdateDisposition::RetryTransient;
+                return AttachmentMaterialization::RetryTransient;
             }
         };
 
         // Determine local filename
-        let local_filename = match &attachment.file_name {
-            Some(name) => name.clone(),
+        let (local_filename, display_filename) = match &attachment.file_name {
+            Some(name) => {
+                let display_filename = safe_attachment_filename(name);
+                let local_filename = if disambiguate_document_name
+                    && attachment.kind == IncomingAttachmentKind::Document
+                {
+                    media_group_document_storage_filename(&display_filename, chat_id, message_id)
+                } else {
+                    display_filename.clone()
+                };
+                (local_filename, display_filename)
+            }
             None => {
                 // For photos, derive extension from Telegram file path
                 let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
-                format!("photo_{chat_id}_{message_id}.{ext}")
+                let filename = format!("photo_{chat_id}_{message_id}.{ext}");
+                (filename.clone(), filename)
             }
         };
 
@@ -2552,47 +3044,56 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
                 &format!("Failed to save attachment to {}", local_path.display())
             );
-            return UpdateDisposition::RetryTransient;
+            return AttachmentMaterialization::RetryTransient;
         }
 
-        // Carry a typed envelope alongside the content marker (parity with
-        // Discord's documented attachment contract). Message text is a
-        // rendering, not a source of truth: any consumer that needs to know
-        // whether a turn carried an image must be able to ask
-        // `msg.attachments` and get a truthful answer, so leaving the envelope
-        // empty here would make a real photo turn indistinguishable from a
-        // text one. Applies to documents too, with the sender's declared MIME
-        // carried through: `looks_like_image()` classifies by MIME, extension,
-        // or magic bytes, so an image sent "as file" (even extensionless) is
-        // still reported as an image.
+        // Preserve the typed envelope as the source of truth for both the
+        // rendered marker and downstream attachment classification. Albums
+        // collect these envelopes alongside their ordered content markers.
         let mut media_attachment = zeroclaw_api::media::MediaAttachment {
-            file_name: local_filename.clone(),
+            file_name: display_filename,
             data: file_data,
             mime_type: attachment.mime_type.clone(),
             marker: None,
         };
-
-        // Record the disposition this channel commits to together with the
-        // saved path it references, resolved once against the loadability
-        // contract. The rendering below reads the same verdict, so an
-        // unsupported image document stays a document end to end: the pipeline
-        // reads `marker` and defers instead of re-classifying the bytes as an
-        // image and inlining a base64 copy the provider would reject.
         let marker_kind = attachment_marker_kind(&media_attachment);
         media_attachment.marker = Some(zeroclaw_api::media::RenderedMarker {
             target: local_path.display().to_string(),
             kind: marker_kind,
         });
+        let content = format_attachment_content(&media_attachment, &local_path);
 
-        // Build message content. The marker is decided by the envelope's
-        // loadable-image verdict, not Telegram's photo/document
-        // classification, so image documents get the same re-loadable
-        // [IMAGE:] marker as photos and the media pipeline can recognize
-        // them as already-marked instead of re-inlining base64.
-        let mut content = format_attachment_content(&media_attachment, &local_path);
-        // `gated_caption` is the trimmed caption when the `mention_only`
-        // gate admits it; otherwise the raw caption (or None).
-        if let Some(caption) = gated_caption.as_deref()
+        AttachmentMaterialization::Ready {
+            content,
+            attachment: media_attachment,
+        }
+    }
+
+    fn finalize_attachment_message(
+        &self,
+        message: &serde_json::Value,
+        sender_identity: String,
+        mut content: String,
+        gated_caption: Option<&str>,
+        attachments: Vec<zeroclaw_api::media::MediaAttachment>,
+    ) -> Option<ChannelMessage> {
+        let chat_id = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())?;
+        let message_id = message
+            .get("message_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let thread_id = Self::topic_thread_id(message);
+        let reply_target = if let Some(ref tid) = thread_id {
+            format!("{chat_id}:{tid}")
+        } else {
+            chat_id.clone()
+        };
+
+        if let Some(caption) = gated_caption
             && !caption.is_empty()
         {
             use std::fmt::Write;
@@ -2609,7 +3110,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content = Self::prepend_forward_attribution(&attr, content);
         }
 
-        UpdateDisposition::Parsed(Box::new(ChannelMessage {
+        Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
             reply_target,
@@ -2622,17 +3123,259 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
-            attachments: vec![media_attachment],
+            attachments,
             subject: None,
 
             ..Default::default()
-        }))
+        })
+    }
+
+    /// Attempt to parse a Telegram update as a document/photo attachment.
+    ///
+    /// Downloads the file to `{workspace_dir}/telegram_files/` and returns a
+    /// parsed message with matching rendered content and typed attachment
+    /// metadata. `pub(crate)` lets orchestrator regressions drive the real
+    /// parser through the typed media boundary.
+    pub(crate) async fn try_parse_attachment_message(
+        &self,
+        update: &serde_json::Value,
+    ) -> UpdateDisposition {
+        let Some(message) = update.get("message") else {
+            return UpdateDisposition::SkipPermanent;
+        };
+        let Some(attachment) = Self::parse_attachment_metadata(message) else {
+            return UpdateDisposition::SkipPermanent;
+        };
+        let Some(sender_identity) = self.allowed_attachment_sender(message) else {
+            return UpdateDisposition::SkipPermanent;
+        };
+
+        // Apply mention_only gate before downloading. Photo / document
+        // updates carry no `text` field, so the text-only gate in
+        // `parse_update_message` can never see them and they used to slip
+        // through unconditionally.
+        let Some(gated_caption) =
+            self.check_media_mention_gate(message, attachment.caption.as_deref())
+        else {
+            return UpdateDisposition::SkipPermanent;
+        };
+        let Some((chat_id, message_id)) = Self::extract_update_message_target(update) else {
+            return UpdateDisposition::SkipPermanent;
+        };
+        let (content, media_attachment) = match self
+            .materialize_attachment_content(&attachment, &chat_id, message_id, false)
+            .await
+        {
+            AttachmentMaterialization::Ready {
+                content,
+                attachment,
+            } => (content, attachment),
+            AttachmentMaterialization::SkipPermanent => {
+                return UpdateDisposition::SkipPermanent;
+            }
+            AttachmentMaterialization::RetryTransient => {
+                return UpdateDisposition::RetryTransient;
+            }
+        };
+        self.finalize_attachment_message(
+            message,
+            sender_identity,
+            content,
+            gated_caption.as_deref(),
+            vec![media_attachment],
+        )
+        .map(|message| UpdateDisposition::Parsed(Box::new(message)))
+        .unwrap_or(UpdateDisposition::SkipPermanent)
+    }
+
+    /// Materialize one settled Telegram media group as one inbound message.
+    /// Group scope, authorization, and mention gating are validated before
+    /// any file download. Individual attachment failures do not discard
+    /// successfully materialized siblings.
+    /// Album parsing with the text-only context of unsupported members.
+    ///
+    /// `unsupported` never reaches `parse_attachment_metadata()` or `getFile`;
+    /// it only widens caption aggregation and the mention gate so a caption or
+    /// mention carried by a member we cannot download is not silently dropped.
+    async fn try_parse_media_group_with_unsupported(
+        &self,
+        updates: &[serde_json::Value],
+        unsupported: &[UnsupportedMember],
+    ) -> UpdateDisposition {
+        let mut ordered: Vec<&serde_json::Value> = updates.iter().collect();
+        ordered.sort_by_key(|update| Self::update_message_id(update).unwrap_or(i64::MAX));
+
+        // An album with no materializable members must dispatch nothing and
+        // download nothing, exactly as before -- unsupported context alone can
+        // never produce a turn.
+        let Some(anchor_update) = ordered.first().copied() else {
+            return UpdateDisposition::SkipPermanent;
+        };
+        let Some(anchor_message) = anchor_update.get("message") else {
+            return UpdateDisposition::SkipPermanent;
+        };
+        let anchor_scope = Self::media_group_scope(anchor_message);
+        let supported_share_scope = ordered.iter().all(|update| {
+            update.get("message").is_some_and(|message| {
+                Self::media_group_members_share_scope(anchor_message, message)
+            })
+        });
+        let unsupported_share_scope = unsupported
+            .iter()
+            .all(|member| Self::media_group_scopes_match(&anchor_scope, &member.scope));
+        if !supported_share_scope || !unsupported_share_scope {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "Rejecting Telegram media group with mixed chat, sender, or thread scope"
+            );
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        let Some(sender_identity) = self.allowed_attachment_sender(anchor_message) else {
+            return UpdateDisposition::SkipPermanent;
+        };
+
+        // Caption aggregation spans the whole album -- materialized members and
+        // text-only ones -- merged in `message_id` order before dedup + join.
+        let mut captioned: Vec<(i64, &str)> = ordered
+            .iter()
+            .filter_map(|update| {
+                let message_id = Self::update_message_id(update)?;
+                let caption = update
+                    .get("message")
+                    .and_then(|message| message.get("caption"))
+                    .and_then(serde_json::Value::as_str)?;
+                Some((message_id, caption))
+            })
+            .collect();
+        captioned.extend(
+            unsupported
+                .iter()
+                .filter_map(|member| Some((member.message_id, member.caption.as_deref()?))),
+        );
+        captioned.sort_by_key(|(message_id, _)| *message_id);
+
+        let mut seen_captions = std::collections::HashSet::new();
+        let shared_caption = captioned
+            .into_iter()
+            .map(|(_, caption)| caption)
+            .filter(|caption| !caption.trim().is_empty())
+            .filter(|caption| seen_captions.insert((*caption).to_string()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let Some(gated_caption) = self.check_media_mention_gate(
+            anchor_message,
+            (!shared_caption.is_empty()).then_some(shared_caption.as_str()),
+        ) else {
+            return UpdateDisposition::SkipPermanent;
+        };
+
+        let mut contents = Vec::with_capacity(ordered.len());
+        let mut attachments = Vec::with_capacity(ordered.len());
+        for update in ordered {
+            let Some(message) = update.get("message") else {
+                continue;
+            };
+            let Some(attachment) = Self::parse_attachment_metadata(message) else {
+                continue;
+            };
+            let Some((chat_id, message_id)) = Self::extract_update_message_target(update) else {
+                continue;
+            };
+            match self
+                .materialize_attachment_content(&attachment, &chat_id, message_id, true)
+                .await
+            {
+                AttachmentMaterialization::Ready {
+                    content,
+                    attachment,
+                } => {
+                    contents.push(content);
+                    attachments.push(attachment);
+                }
+                AttachmentMaterialization::SkipPermanent => {}
+                AttachmentMaterialization::RetryTransient => {
+                    return UpdateDisposition::RetryTransient;
+                }
+            }
+        }
+
+        if contents.is_empty() {
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        self.finalize_attachment_message(
+            anchor_message,
+            sender_identity,
+            contents.join("\n\n"),
+            gated_caption.as_deref(),
+            attachments,
+        )
+        .map(|message| UpdateDisposition::Parsed(Box::new(message)))
+        .unwrap_or(UpdateDisposition::SkipPermanent)
+    }
+
+    /// Tell the sender why their voice message will not be answered.
+    ///
+    /// Best effort by design: if the notice itself cannot be delivered the
+    /// drop is still permanent, so the failure is logged and swallowed rather
+    /// than turned into a retry of the original update.
+    ///
+    /// The whole attempt is bounded by [`VOICE_DROP_NOTICE_TIMEOUT`]. This
+    /// runs before the permanent skip lets the offset advance, and the
+    /// sending client has no request timeout of its own — an unbounded await
+    /// on a stalled request or response body would head-of-line block every
+    /// later update on this listener. Rejections that never touched the
+    /// network before (an over-duration recording) must not start doing so
+    /// just because they now say goodbye.
+    async fn notify_voice_drop(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        reason: VoiceDropReason,
+    ) {
+        let notice = reason.notice();
+        let attempt = self.send_text_chunks(&notice, chat_id, thread_id);
+        match tokio::time::timeout(self.voice_drop_notice_timeout, attempt).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "Failed to notify sender about skipped voice message"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "timeout_secs": self.voice_drop_notice_timeout.as_secs_f64(),
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "Timed out notifying sender about skipped voice message; abandoning the notice"
+                );
+            }
+        }
     }
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
     /// disabled, or the message exceeds duration limits; `RetryTransient` if download or
     /// transcription I/O fails.
+    ///
+    /// Every permanent drop that reaches an allowed sender is announced to them
+    /// (see [`VoiceDropReason`]): silence is indistinguishable from a bot that
+    /// never received the recording. Transient failures stay silent — the same
+    /// update is retried, and a notice per attempt would be spam.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> UpdateDisposition {
         let Some(config) = self.transcription.as_ref() else {
             return UpdateDisposition::SkipPermanent;
@@ -2648,18 +3391,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         };
 
-        if duration > config.max_duration_secs {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Skipping voice message: duration {duration}s exceeds limit {}s",
-                    config.max_duration_secs
-                )
-            );
-            return UpdateDisposition::SkipPermanent;
-        }
-
+        // The duration check used to run here, before the sender was known.
+        // It now runs once the chat is resolved and the sender has passed the
+        // allowlist and mention gate, so the skip can be explained to them —
+        // and so a stranger's oversized recording still costs nothing: the
+        // check stays ahead of every download.
         let (username, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let mut identities = vec![username.as_str()];
@@ -2701,6 +3437,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
+        if duration > config.max_duration_secs {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping voice message: duration {duration}s exceeds limit {}s",
+                    config.max_duration_secs
+                )
+            );
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::TooLong {
+                    limit_secs: config.max_duration_secs,
+                },
+            )
+            .await;
+            return UpdateDisposition::SkipPermanent;
+        }
+
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
             Ok(p) => p,
@@ -2718,7 +3474,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // See the attachment path: a permanent vendor rejection must
                 // not hold the offset, or the batch never drains.
                 return match e.kind {
-                    FileLookupFailure::Permanent => UpdateDisposition::SkipPermanent,
+                    FileLookupFailure::Permanent => {
+                        self.notify_voice_drop(
+                            &chat_id,
+                            thread_id.as_deref(),
+                            VoiceDropReason::FileUnavailable,
+                        )
+                        .await;
+                        UpdateDisposition::SkipPermanent
+                    }
                     FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
                 };
             }
@@ -2764,6 +3528,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "Voice transcription returned empty text, skipping"
             );
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::EmptyTranscript,
+            )
+            .await;
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -4127,24 +4897,51 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Fixed, bounded delay between retries of a transiently failing update.
-    /// The attempt count is diagnostic only: only an explicitly permanent
-    /// disposition may advance the Telegram offset.
+    /// The attempt count is diagnostic only.
     const TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
+
+    async fn pause_for_transient_update(
+        uid: Option<i64>,
+        transient_retry: &mut Option<(i64, u32)>,
+    ) -> UpdateOutcome {
+        let attempts = if let Some(uid) = uid {
+            let attempts = match *transient_retry {
+                Some((tracked_uid, n)) if tracked_uid == uid => n.saturating_add(1),
+                _ => 1,
+            };
+            *transient_retry = Some((uid, attempts));
+            attempts
+        } else {
+            1
+        };
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "update_id": uid,
+                    "attempts": attempts,
+                    "retry_delay_secs": Self::TRANSIENT_RETRY_DELAY_SECS,
+                })),
+            "Transient failure parsing update; leaving offset unadvanced so the next poll retries it"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(
+            Self::TRANSIENT_RETRY_DELAY_SECS,
+        ))
+        .await;
+        UpdateOutcome::StopBatch
+    }
 
     /// Route a single update from a `getUpdates` batch through the shared
     /// delivered/permanent-skip/retry-transient disposition path.
     ///
-    /// This is called from both the startup/restart probe and the main
-    /// long-poll loop so a queued update sitting in the probe's first batch
-    /// is handled identically to one seen mid-run: `offset` only advances
-    /// past an update once it has been delivered (`tx.send` succeeded) or
-    /// permanently skipped, never while a transient failure or a dropped
-    /// `tx` receiver could still cause it to be lost.
+    /// The listener acknowledgement queue owns offset advancement. This
+    /// helper only classifies and dispatches one ordinary update so the same
+    /// path serves both the startup probe and the main loop.
     async fn process_update(
         &self,
         update: &serde_json::Value,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-        offset: &mut i64,
         transient_retry: &mut Option<(i64, u32)>,
     ) -> UpdateOutcome {
         let uid = update.get("update_id").and_then(serde_json::Value::as_i64);
@@ -4160,8 +4957,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // its failure is logged, but a failed spinner dismissal must not
             // hold up the offset, since retrying the update would re-run the
             // approval side effect that has already been applied.
-            if let Some(uid) = uid {
-                *offset = uid + 1;
+            if uid.is_some() {
+                *transient_retry = None;
             }
             return UpdateOutcome::Advanced;
         }
@@ -4186,70 +4983,23 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             UpdateDisposition::Parsed(m) => m,
             UpdateDisposition::SkipPermanent => {
                 Box::pin(self.handle_unauthorized_message(update)).await;
-                if let Some(uid) = uid {
-                    *offset = uid + 1;
+                if uid.is_some() {
                     *transient_retry = None;
                 }
                 return UpdateOutcome::Advanced;
             }
             UpdateDisposition::RetryTransient => {
-                let attempts = if let Some(uid) = uid {
-                    let attempts = match *transient_retry {
-                        Some((tracked_uid, n)) if tracked_uid == uid => n.saturating_add(1),
-                        _ => 1,
-                    };
-                    *transient_retry = Some((uid, attempts));
-                    attempts
-                } else {
-                    1
-                };
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "update_id": uid,
-                            "attempts": attempts,
-                            "retry_delay_secs": Self::TRANSIENT_RETRY_DELAY_SECS,
-                        })),
-                    "Transient failure parsing update; leaving offset unadvanced so the next poll retries it"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    Self::TRANSIENT_RETRY_DELAY_SECS,
-                ))
-                .await;
-                return UpdateOutcome::StopBatch;
+                return Self::pause_for_transient_update(uid, transient_retry).await;
             }
         };
 
-        if self.ack_reactions
-            && let Some((reaction_chat_id, reaction_message_id)) =
-                Self::extract_update_message_target(update)
-        {
-            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
-        }
-
-        // Send "typing" indicator immediately when we receive a message
-        let typing_body = serde_json::json!({
-            "chat_id": &msg.reply_target,
-            "action": "typing"
-        });
-        let _ = self
-            .http_client()
-            .post(self.api_url("sendChatAction"))
-            .json(&typing_body)
-            .send()
-            .await; // Ignore errors for typing indicator
-
-        match tx.send(*msg).await {
-            Ok(()) => {
-                if let Some(uid) = uid {
-                    *offset = uid + 1;
-                    *transient_retry = None;
-                }
-                UpdateOutcome::Advanced
+        if self.dispatch_incoming_message(tx, update, *msg).await {
+            if uid.is_some() {
+                *transient_retry = None;
             }
-            Err(_) => UpdateOutcome::ReceiverClosed,
+            UpdateOutcome::Advanced
+        } else {
+            UpdateOutcome::ReceiverClosed
         }
     }
 }
@@ -4262,6 +5012,337 @@ impl ::zeroclaw_api::attribution::Attributable for TelegramChannel {
     }
     fn alias(&self) -> &str {
         &self.alias
+    }
+}
+
+impl TelegramChannel {
+    async fn dispatch_incoming_message(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        update: &serde_json::Value,
+        msg: ChannelMessage,
+    ) -> bool {
+        if self.ack_reactions
+            && let Some((reaction_chat_id, reaction_message_id)) =
+                Self::extract_update_message_target(update)
+        {
+            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
+        }
+
+        // Send one typing indicator for the logical inbound message. A media
+        // group reaches this helper only after all members are materialized.
+        let typing_body = serde_json::json!({
+            "chat_id": &msg.reply_target,
+            "action": "typing"
+        });
+        let _ = self
+            .http_client()
+            .post(self.api_url("sendChatAction"))
+            .json(&typing_body)
+            .send()
+            .await;
+
+        tx.send(msg).await.is_ok()
+    }
+
+    fn enqueue_update_batch(
+        queue: &mut std::collections::VecDeque<QueuedTelegramUpdate>,
+        pending_media_groups: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        updates: &[serde_json::Value],
+        now: Instant,
+        poll_generation: u64,
+    ) {
+        for update in updates {
+            let update_id = Self::update_id(update);
+            if update_id.is_some_and(|candidate| {
+                queue
+                    .iter()
+                    .any(|queued| queued.update_id == Some(candidate))
+            }) {
+                continue;
+            }
+
+            Self::buffer_media_group_update(pending_media_groups, update, now, poll_generation);
+            let payload = Self::extract_media_group_key(update)
+                .filter(|_| Self::should_defer_media_group_update(pending_media_groups, update))
+                .map(QueuedTelegramUpdatePayload::MediaGroup)
+                .unwrap_or_else(|| QueuedTelegramUpdatePayload::Ordinary(update.clone()));
+            queue.push_back(QueuedTelegramUpdate {
+                update_id,
+                payload,
+                delivered: false,
+            });
+        }
+
+        // A full page is a truncated view of the backlog: updates past its last
+        // one exist but stay invisible until the acknowledgement offset moves
+        // beyond the page. So a pending album whose position in the update
+        // ordering is still behind an older unacknowledged update cannot be
+        // shown complete by another poll: the same page comes back, its
+        // duplicates never refresh the debounce, and settling now would dispatch
+        // a partial album and turn the members past the page into a second turn.
+        // Groups the offset is already free to move past are left eligible, so
+        // the oldest work still settles and pagination keeps advancing. That
+        // eligibility is what the rule can promise: an album settles only after
+        // a page that began at or before its earliest member, so every member
+        // within one page of that member has been seen. An album spread across
+        // more than a full page of updates is out of reach, because nothing
+        // older is left to release the offset and holding it would stall
+        // polling instead of completing the album.
+        let page_saturated = updates.len() >= TELEGRAM_POLL_LIMIT;
+        for group in pending_media_groups.values_mut() {
+            group.saturated_page_blocked = page_saturated
+                && Self::pending_media_group_first_update_id(group).is_some_and(
+                    |first_update_id| {
+                        Self::has_unacknowledged_update_before(queue, first_update_id)
+                    },
+                );
+        }
+    }
+
+    /// Telegram order of the earliest member held for this album, counting the
+    /// text-only members that carry their own acknowledgement identity.
+    fn pending_media_group_first_update_id(group: &PendingMediaGroup) -> Option<i64> {
+        group
+            .updates
+            .iter()
+            .filter_map(Self::update_id)
+            .chain(group.unsupported.iter().map(|member| member.update_id))
+            .min()
+    }
+
+    /// Whether an update older than `update_id` is still unacknowledged, which
+    /// pins the delivered prefix (and therefore the next poll's offset) below
+    /// it. Delivered entries behind an undelivered one stay queued, so only
+    /// undelivered entries hold the offset back.
+    fn has_unacknowledged_update_before(
+        queue: &std::collections::VecDeque<QueuedTelegramUpdate>,
+        update_id: i64,
+    ) -> bool {
+        queue.iter().any(|queued| {
+            !queued.delivered
+                && queued
+                    .update_id
+                    .is_some_and(|queued_id| queued_id < update_id)
+        })
+    }
+
+    fn restore_media_group_batch(
+        pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        batch: MediaGroupBatch,
+    ) {
+        pending.insert(
+            batch.key,
+            PendingMediaGroup {
+                updates: batch.updates,
+                unsupported: batch.unsupported,
+                last_seen: batch.last_seen,
+                last_seen_poll_generation: batch.last_seen_poll_generation,
+                saturated_page_blocked: batch.saturated_page_blocked,
+            },
+        );
+    }
+
+    fn media_group_batch_first_update_id(batch: &MediaGroupBatch) -> Option<i64> {
+        batch
+            .updates
+            .iter()
+            .filter_map(Self::update_id)
+            .chain(batch.unsupported.iter().map(|member| member.update_id))
+            .min()
+    }
+
+    async fn dispatch_media_group_batch(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        batch: MediaGroupBatch,
+    ) -> MediaGroupDispatchOutcome {
+        let disposition = self
+            .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+            .await;
+        match disposition {
+            UpdateDisposition::Parsed(message) => {
+                let Some(anchor_update) = batch.updates.first() else {
+                    return MediaGroupDispatchOutcome::Delivered(batch.key);
+                };
+                if self
+                    .dispatch_incoming_message(tx, anchor_update, *message)
+                    .await
+                {
+                    MediaGroupDispatchOutcome::Delivered(batch.key)
+                } else {
+                    MediaGroupDispatchOutcome::ReceiverClosed
+                }
+            }
+            UpdateDisposition::SkipPermanent => {
+                if let Some(anchor_update) = batch.updates.first() {
+                    Box::pin(self.handle_unauthorized_message(anchor_update)).await;
+                }
+                MediaGroupDispatchOutcome::Delivered(batch.key)
+            }
+            UpdateDisposition::RetryTransient => MediaGroupDispatchOutcome::Retry(batch),
+        }
+    }
+
+    fn mark_media_group_delivered(
+        queue: &mut std::collections::VecDeque<QueuedTelegramUpdate>,
+        key: &MediaGroupKey,
+    ) {
+        for queued in queue {
+            if matches!(
+                &queued.payload,
+                QueuedTelegramUpdatePayload::MediaGroup(candidate) if candidate == key
+            ) {
+                queued.delivered = true;
+            }
+        }
+    }
+
+    fn advance_delivered_prefix(
+        queue: &mut std::collections::VecDeque<QueuedTelegramUpdate>,
+        offset: &mut i64,
+    ) {
+        while queue.front().is_some_and(|queued| queued.delivered) {
+            let Some(queued) = queue.pop_front() else {
+                break;
+            };
+            if let Some(update_id) = queued.update_id {
+                *offset = update_id + 1;
+            }
+        }
+    }
+
+    async fn dispatch_media_group_batches(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        pending_media_groups: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        queue: &mut std::collections::VecDeque<QueuedTelegramUpdate>,
+        batches: Vec<MediaGroupBatch>,
+        transient_retry: &mut Option<(i64, u32)>,
+    ) -> UpdateOutcome {
+        let mut batches = batches.into_iter();
+        while let Some(batch) = batches.next() {
+            match self.dispatch_media_group_batch(tx, batch).await {
+                MediaGroupDispatchOutcome::Delivered(key) => {
+                    Self::mark_media_group_delivered(queue, &key);
+                    *transient_retry = None;
+                }
+                MediaGroupDispatchOutcome::Retry(batch) => {
+                    let uid = Self::media_group_batch_first_update_id(&batch);
+                    Self::restore_media_group_batch(pending_media_groups, batch);
+                    for remaining in batches {
+                        Self::restore_media_group_batch(pending_media_groups, remaining);
+                    }
+                    return Self::pause_for_transient_update(uid, transient_retry).await;
+                }
+                MediaGroupDispatchOutcome::ReceiverClosed => {
+                    for remaining in batches {
+                        Self::restore_media_group_batch(pending_media_groups, remaining);
+                    }
+                    return UpdateOutcome::ReceiverClosed;
+                }
+            }
+        }
+        UpdateOutcome::Advanced
+    }
+
+    async fn process_queued_updates(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        queue: &mut std::collections::VecDeque<QueuedTelegramUpdate>,
+        pending_media_groups: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
+        offset: &mut i64,
+        transient_retry: &mut Option<(i64, u32)>,
+        now: Instant,
+        completed_poll_generation: u64,
+    ) -> UpdateOutcome {
+        let mut index = 0;
+        while index < queue.len() {
+            if queue[index].delivered {
+                index += 1;
+                continue;
+            }
+
+            let payload = queue[index].payload.clone();
+            let outcome = match payload {
+                QueuedTelegramUpdatePayload::Ordinary(update) => {
+                    let prior_groups = Self::take_prior_media_groups_for_update(
+                        pending_media_groups,
+                        &update,
+                        now,
+                        completed_poll_generation,
+                    );
+                    let group_outcome = self
+                        .dispatch_media_group_batches(
+                            tx,
+                            pending_media_groups,
+                            queue,
+                            prior_groups,
+                            transient_retry,
+                        )
+                        .await;
+                    if !matches!(group_outcome, UpdateOutcome::Advanced) {
+                        group_outcome
+                    } else {
+                        let ordinary_outcome =
+                            self.process_update(&update, tx, transient_retry).await;
+                        if matches!(ordinary_outcome, UpdateOutcome::Advanced) {
+                            queue[index].delivered = true;
+                        }
+                        ordinary_outcome
+                    }
+                }
+                QueuedTelegramUpdatePayload::MediaGroup(key) => {
+                    let is_settled = pending_media_groups.get(&key).is_some_and(|group| {
+                        !group.saturated_page_blocked
+                            && now.saturating_duration_since(group.last_seen)
+                                >= TELEGRAM_MEDIA_GROUP_SETTLE_DELAY
+                            && group.last_seen_poll_generation < completed_poll_generation
+                    });
+                    if !is_settled {
+                        index += 1;
+                        continue;
+                    }
+                    let batches =
+                        Self::take_media_groups_matching(pending_media_groups, |candidate, _| {
+                            candidate == &key
+                        });
+                    self.dispatch_media_group_batches(
+                        tx,
+                        pending_media_groups,
+                        queue,
+                        batches,
+                        transient_retry,
+                    )
+                    .await
+                }
+            };
+
+            match outcome {
+                UpdateOutcome::Advanced => index += 1,
+                UpdateOutcome::StopBatch => {
+                    Self::advance_delivered_prefix(queue, offset);
+                    return UpdateOutcome::StopBatch;
+                }
+                UpdateOutcome::ReceiverClosed => {
+                    Self::advance_delivered_prefix(queue, offset);
+                    return UpdateOutcome::ReceiverClosed;
+                }
+            }
+        }
+
+        let settled =
+            Self::take_settled_media_groups(pending_media_groups, now, completed_poll_generation);
+        let settled_outcome = self
+            .dispatch_media_group_batches(tx, pending_media_groups, queue, settled, transient_retry)
+            .await;
+        if !matches!(settled_outcome, UpdateOutcome::Advanced) {
+            Self::advance_delivered_prefix(queue, offset);
+            return settled_outcome;
+        }
+
+        Self::advance_delivered_prefix(queue, offset);
+        UpdateOutcome::Advanced
     }
 }
 
@@ -4721,6 +5802,10 @@ impl Channel for TelegramChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
+        let mut poll_generation: u64 = 0;
+        let mut pending_media_groups: std::collections::HashMap<MediaGroupKey, PendingMediaGroup> =
+            std::collections::HashMap::new();
+        let mut queued_updates = std::collections::VecDeque::new();
         // Single-slot transient-retry tracker: (update_id, attempts so far).
         // One slot is sufficient because a transient failure via
         // `process_update` stops processing of the current update batch (be
@@ -4748,6 +5833,7 @@ impl Channel for TelegramChannel {
             let url = self.api_url("getUpdates");
             let probe = serde_json::json!({
                 "offset": offset,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
                 "allowed_updates": ["message", "callback_query"]
             });
@@ -4798,20 +5884,29 @@ impl Channel for TelegramChannel {
                                 if let Some(results) =
                                     data.get("result").and_then(serde_json::Value::as_array)
                                 {
-                                    for update in results {
-                                        match self
-                                            .process_update(
-                                                update,
-                                                &tx,
-                                                &mut offset,
-                                                &mut transient_retry,
-                                            )
-                                            .await
-                                        {
-                                            UpdateOutcome::Advanced => {}
-                                            UpdateOutcome::StopBatch => break,
-                                            UpdateOutcome::ReceiverClosed => return Ok(()),
-                                        }
+                                    poll_generation = poll_generation.saturating_add(1);
+                                    let probe_completed_at = Instant::now();
+                                    Self::enqueue_update_batch(
+                                        &mut queued_updates,
+                                        &mut pending_media_groups,
+                                        results,
+                                        probe_completed_at,
+                                        poll_generation,
+                                    );
+                                    if matches!(
+                                        self.process_queued_updates(
+                                            &tx,
+                                            &mut queued_updates,
+                                            &mut pending_media_groups,
+                                            &mut offset,
+                                            &mut transient_retry,
+                                            probe_completed_at,
+                                            poll_generation,
+                                        )
+                                        .await,
+                                        UpdateOutcome::ReceiverClosed
+                                    ) {
+                                        return Ok(());
                                     }
                                 }
                                 self.record_poll_health(true);
@@ -4863,9 +5958,11 @@ impl Channel for TelegramChannel {
             }
 
             let url = self.api_url("getUpdates");
+            let poll_timeout_secs = Self::media_group_poll_timeout_secs(&pending_media_groups);
             let body = serde_json::json!({
                 "offset": offset,
-                "timeout": 30,
+                "limit": TELEGRAM_POLL_LIMIT,
+                "timeout": poll_timeout_secs,
                 "allowed_updates": ["message", "callback_query"]
             });
 
@@ -4878,7 +5975,7 @@ impl Channel for TelegramChannel {
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(
                                 ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
-                            ),
+                        ),
                         "poll error"
                     );
                     self.record_poll_health(false);
@@ -4896,7 +5993,7 @@ impl Channel for TelegramChannel {
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(
                                 ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})
-                            ),
+                        ),
                         "parse error"
                     );
                     self.record_poll_health(false);
@@ -4948,17 +6045,36 @@ Ensure only one `zeroclaw` process is using this bot token."
                 continue;
             }
 
+            poll_generation = poll_generation.saturating_add(1);
+            // Debounce against the time this response was observed, not the
+            // time its updates finish processing. Slow downloads or channel
+            // backpressure must not make an album look quiet prematurely.
+            let poll_completed_at = Instant::now();
+
             if let Some(results) = data.get("result").and_then(serde_json::Value::as_array) {
-                for update in results {
-                    match self
-                        .process_update(update, &tx, &mut offset, &mut transient_retry)
-                        .await
-                    {
-                        UpdateOutcome::Advanced => {}
-                        UpdateOutcome::StopBatch => break,
-                        UpdateOutcome::ReceiverClosed => return Ok(()),
-                    }
-                }
+                Self::enqueue_update_batch(
+                    &mut queued_updates,
+                    &mut pending_media_groups,
+                    results,
+                    poll_completed_at,
+                    poll_generation,
+                );
+            }
+
+            match self
+                .process_queued_updates(
+                    &tx,
+                    &mut queued_updates,
+                    &mut pending_media_groups,
+                    &mut offset,
+                    &mut transient_retry,
+                    poll_completed_at,
+                    poll_generation,
+                )
+                .await
+            {
+                UpdateOutcome::Advanced | UpdateOutcome::StopBatch => {}
+                UpdateOutcome::ReceiverClosed => return Ok(()),
             }
         }
     }
@@ -5075,8 +6191,14 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
+        // Back-to-back cards from one message are otherwise indistinguishable
+        // before the operator taps, so say which call this is.
+        let position = Self::escape_html(&crate::util::approval_position_line(
+            request.position_counter(),
+        ));
         let text = format!(
             "\u{1f527} <b>{heading}</b>\n\n\
+             {position}\
              {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
              {tap_instruction}",
@@ -5134,9 +6256,13 @@ Ensure only one `zeroclaw` process is using this bot token."
                     "Telegram sendMessage (approval) with HTML failed; retrying without parse_mode"
                 );
 
-                // Fallback: plain text, no parse_mode, keep the buttons
+                // Fallback: plain text, no parse_mode, keep the buttons.
+                // Unescaped position line: this send has no parse_mode, so the
+                // HTML-escaped one above would show its entities literally.
+                let plain_position =
+                    crate::util::approval_position_line(request.position_counter());
                 let plain_text = format!(
-                    "🔧 {heading}\n\n{tool_label}: {}\n{}\n\n{tap_instruction}",
+                    "🔧 {heading}\n\n{plain_position}{tool_label}: {}\n{}\n\n{tap_instruction}",
                     request.tool_name, request.arguments_summary
                 );
                 let mut plain_body = serde_json::json!({
@@ -5489,6 +6615,337 @@ mod tests {
 
         let target = TelegramChannel::extract_update_message_target(&update);
         assert_eq!(target, Some(("-100123456".to_string(), 99)));
+    }
+
+    fn media_group_update(
+        update_id: i64,
+        message_id: i64,
+        chat_id: i64,
+        media_group_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "media_group_id": media_group_id,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": chat_id, "type": "private" },
+                "photo": [{ "file_id": format!("file-{message_id}") }]
+            }
+        })
+    }
+
+    fn expect_parsed_media_group(disposition: UpdateDisposition, context: &str) -> ChannelMessage {
+        match disposition {
+            UpdateDisposition::Parsed(message) => *message,
+            UpdateDisposition::SkipPermanent => panic!("{context}: permanently skipped"),
+            UpdateDisposition::RetryTransient => panic!("{context}: transient retry"),
+        }
+    }
+
+    #[test]
+    fn media_group_buffer_settles_at_exact_boundary() {
+        let mut pending = std::collections::HashMap::new();
+        let started = Instant::now();
+        let update = media_group_update(1, 10, 100, "album");
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &update,
+            started,
+            1
+        ));
+
+        assert!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_secs(5),
+                1
+            )
+            .is_empty(),
+            "a group cannot settle in the response that first observed it"
+        );
+
+        assert!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_millis(699),
+                2
+            )
+            .is_empty(),
+            "699 ms is still inside the debounce window"
+        );
+        assert_eq!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_millis(700),
+                2
+            )
+            .len(),
+            1,
+            "700 ms settles the group"
+        );
+    }
+
+    #[test]
+    fn media_group_buffer_cross_poll_resets_deadline_dedupes_and_orders() {
+        let mut pending = std::collections::HashMap::new();
+        let started = Instant::now();
+        let later = media_group_update(2, 12, 100, "album");
+        let earlier = media_group_update(1, 11, 100, "album");
+
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &later,
+            started,
+            1
+        ));
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &later,
+            started + Duration::from_millis(100),
+            2
+        ));
+        assert_eq!(pending.values().next().unwrap().updates.len(), 1);
+
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &earlier,
+            started + Duration::from_millis(500),
+            2
+        ));
+        assert!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_millis(1199),
+                3
+            )
+            .is_empty(),
+            "a distinct member resets last_seen across poll responses"
+        );
+
+        assert!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_millis(1200),
+                2
+            )
+            .is_empty(),
+            "the poll that observed a distinct member cannot settle it"
+        );
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            started + Duration::from_millis(1200),
+            3,
+        );
+        let ids: Vec<i64> = batches[0]
+            .updates
+            .iter()
+            .filter_map(TelegramChannel::update_message_id)
+            .collect();
+        assert_eq!(ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn unsupported_media_group_member_starts_or_refreshes_context_without_download_state() {
+        let mut pending = std::collections::HashMap::new();
+        let started = Instant::now();
+        let photo = media_group_update(1, 10, 100, "album");
+        let video = serde_json::json!({
+            "update_id": 2,
+            "message": {
+                "message_id": 11,
+                "media_group_id": "album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": { "file_id": "unsupported-video" }
+            }
+        });
+
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &photo,
+            started,
+            1
+        ));
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &video,
+            started + Duration::from_millis(600),
+            2
+        ));
+        assert_eq!(pending.values().next().unwrap().updates.len(), 1);
+        assert!(TelegramChannel::should_defer_media_group_update(
+            &pending, &video
+        ));
+        assert!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_millis(700),
+                3
+            )
+            .is_empty(),
+            "an unsupported sibling is still album activity"
+        );
+        assert_eq!(
+            TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                started + Duration::from_millis(1300),
+                3
+            )
+            .len(),
+            1
+        );
+
+        let mut unsupported_only = std::collections::HashMap::new();
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut unsupported_only,
+            &video,
+            started,
+            1
+        ));
+        let context_only = unsupported_only.values().next().unwrap();
+        assert!(context_only.updates.is_empty());
+        assert_eq!(context_only.unsupported.len(), 1);
+        assert_eq!(
+            TelegramChannel::media_group_poll_timeout_secs(&unsupported_only),
+            TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS
+        );
+
+        let grouped_audio = serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 12,
+                "media_group_id": "audio-album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "audio": { "file_id": "audio-file", "duration": 5 }
+            }
+        });
+        assert!(
+            !TelegramChannel::should_defer_media_group_update(&unsupported_only, &grouped_audio),
+            "an unsupported-only group must keep its existing parser behavior"
+        );
+    }
+
+    #[test]
+    fn media_group_buffer_scopes_same_group_id_by_chat_and_orders_due_groups() {
+        let mut pending = std::collections::HashMap::new();
+        let started = Instant::now();
+        let later = media_group_update(20, 20, 200, "same-id");
+        let earlier = media_group_update(10, 10, 100, "same-id");
+        TelegramChannel::buffer_media_group_update(&mut pending, &later, started, 1);
+        TelegramChannel::buffer_media_group_update(&mut pending, &earlier, started, 1);
+
+        assert_eq!(pending.len(), 2, "chat ID is part of the group key");
+        assert_eq!(
+            TelegramChannel::media_group_poll_timeout_secs(&pending),
+            TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS
+        );
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            started + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(TelegramChannel::update_id(&batches[0].updates[0]), Some(10));
+        assert_eq!(TelegramChannel::update_id(&batches[1].updates[0]), Some(20));
+        assert_eq!(
+            TelegramChannel::media_group_poll_timeout_secs(&pending),
+            TELEGRAM_IDLE_POLL_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn media_group_later_same_chat_update_takes_only_prior_groups() {
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        for update in [
+            media_group_update(10, 10, 100, "prior"),
+            media_group_update(11, 11, 100, "prior"),
+            media_group_update(30, 30, 100, "later"),
+            media_group_update(31, 31, 100, "later"),
+            media_group_update(5, 5, 200, "other-chat"),
+        ] {
+            TelegramChannel::buffer_media_group_update(&mut pending, &update, now, 1);
+        }
+        let ordinary = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 20,
+                "text": "follow up",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" }
+            }
+        });
+
+        assert!(
+            TelegramChannel::take_prior_media_groups_for_update(
+                &mut pending,
+                &ordinary,
+                now + Duration::from_millis(699),
+                2,
+            )
+            .is_empty(),
+            "an ordinary update must not flush an unsettled prior group"
+        );
+        let batches = TelegramChannel::take_prior_media_groups_for_update(
+            &mut pending,
+            &ordinary,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let ids: Vec<i64> = batches[0]
+            .updates
+            .iter()
+            .filter_map(TelegramChannel::update_message_id)
+            .collect();
+        assert_eq!(ids, vec![10, 11]);
+        assert!(pending.contains_key(&(100, "later".to_string())));
+        assert!(pending.contains_key(&(200, "other-chat".to_string())));
+    }
+
+    #[test]
+    fn prior_media_group_boundary_fails_closed_without_ordering_ids() {
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        let mut member = media_group_update(10, 10, 100, "album");
+        member.as_object_mut().unwrap().remove("update_id");
+        TelegramChannel::buffer_media_group_update(&mut pending, &member, now, 1);
+
+        let ordinary = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 20,
+                "text": "follow up",
+                "chat": { "id": 100, "type": "private" }
+            }
+        });
+        assert!(
+            TelegramChannel::take_prior_media_groups_for_update(
+                &mut pending,
+                &ordinary,
+                now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+                2,
+            )
+            .is_empty()
+        );
+        assert_eq!(pending.len(), 1);
+
+        let mut missing_update_id = ordinary;
+        missing_update_id
+            .as_object_mut()
+            .unwrap()
+            .remove("update_id");
+        assert!(
+            TelegramChannel::take_prior_media_groups_for_update(
+                &mut pending,
+                &missing_update_id,
+                now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+                2,
+            )
+            .is_empty()
+        );
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -8774,6 +10231,22 @@ mod tests {
 
     #[tokio::test]
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The skip is announced to the sender: silence would look like the bot
+        // never heard the recording at all.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let tc = zeroclaw_config::schema::TranscriptionConfig {
             enabled: true,
             api_key: Some("test_key".to_string()),
@@ -8788,7 +10261,8 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
             mention_only,
         )
-        .with_transcription(tc);
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
         let update = serde_json::json!({
             "message": {
                 "message_id": 2,
@@ -8800,6 +10274,157 @@ mod tests {
 
         let parsed = ch.try_parse_voice_message(&update).await;
         assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1, "the sender is told exactly once");
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["chat_id"], "456");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("5s limit"), "notice names the limit: {text}");
+    }
+
+    #[tokio::test]
+    async fn oversized_voice_notice_goes_to_the_forum_topic_it_came_from() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 8 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 3,
+                "message_thread_id": 42,
+                "is_topic_message": true,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -1004389982480_i64, "type": "supergroup" }
+            }
+        });
+
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            UpdateDisposition::SkipPermanent
+        ));
+
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["chat_id"], "-1004389982480");
+        assert_eq!(
+            body["message_thread_id"], "42",
+            "a notice in the wrong topic is as good as no notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_voice_from_stranger_is_dropped_without_a_word() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // No `expect`: any outgoing call at all is the failure this guards.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 9 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 5,
+            ..Default::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        )
+        .with_transcription(tc)
+        .with_api_base(mock_server.uri());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 4,
+                "voice": { "file_id": "voice_file", "duration": 30 },
+                "from": { "id": 999, "username": "bob" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        assert!(matches!(
+            ch.try_parse_voice_message(&update).await,
+            UpdateDisposition::SkipPermanent
+        ));
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "an unauthorized sender learns nothing — not even that a limit exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_drop_notices_name_the_reason_without_internals() {
+        let too_long = VoiceDropReason::TooLong { limit_secs: 900 }.notice();
+        assert!(too_long.contains("900s limit"));
+
+        // The parser accepts audio uploads as well as voice notes, and a
+        // permanent retrieval failure includes files that are too big — the
+        // advice must fit both, not steer a music-file sender to a microphone
+        // or tell them to resend a file Telegram just refused.
+        let unavailable = VoiceDropReason::FileUnavailable.notice();
+        assert!(
+            unavailable.contains("smaller or shorter"),
+            "retrieval-failure advice must cover the too-big case: {unavailable}"
+        );
+
+        for notice in [
+            too_long,
+            unavailable,
+            VoiceDropReason::EmptyTranscript.notice(),
+        ] {
+            assert!(
+                !notice.contains("microphone") && !notice.contains("voice"),
+                "wording must fit audio uploads, not just voice notes: {notice}"
+            );
+            assert!(
+                notice.starts_with("⚠️ Audio message skipped:"),
+                "every notice says what happened up front: {notice}"
+            );
+            assert!(
+                !notice.to_lowercase().contains("error")
+                    && !notice.contains("http")
+                    && !notice.contains("api"),
+                "diagnostics belong in the log, not in the chat: {notice}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10087,6 +11712,85 @@ mod tests {
         handle.abort();
     }
 
+    /// The drop notice is sent from inside the update-processing path, before
+    /// the permanent skip advances the offset, with a client that has no
+    /// request timeout. A `sendMessage` that stalls must not turn one
+    /// dropped recording into a listener-wide stall: the notice attempt is
+    /// bounded, the skip stays permanent, and the update behind it is still
+    /// processed. All three drop reasons share `notify_voice_drop`, so the
+    /// over-duration path exercised here covers the bound for every reason.
+    #[tokio::test]
+    async fn listen_stalled_drop_notice_does_not_block_later_updates() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_startup_probe(&mock_server).await;
+
+        let uid_voice = 8_400;
+        let uid_good = 8_401;
+        let mut voice = telegram_voice_update(uid_voice, 90, 555, "alice", "voice_stall");
+        voice["message"]["voice"]["duration"] = serde_json::json!(600);
+        let good =
+            telegram_text_update(uid_good, 91, 555, "alice", "i am behind the stalled notice");
+
+        mount_telegram_get_updates(&mock_server, 0, serde_json::json!([voice, good])).await;
+        mount_telegram_get_updates(&mock_server, uid_good + 1, serde_json::json!([])).await;
+
+        // The notice request stalls far past the (shrunk) notice bound.
+        // Unbounded, this await would hold the offset at 0 and the text
+        // update behind it would never be delivered.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 10}}))
+                    .set_delay(Duration::from_secs(120)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["alice".to_string()]),
+                false,
+            )
+            .with_transcription(tc)
+            .with_api_base(mock_server.uri())
+            .with_voice_drop_notice_timeout(Duration::from_millis(250)),
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The update behind the stalled notice must still arrive.
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
+            .await
+            .expect("timed out: a stalled drop notice head-of-line blocked the listener")
+            .expect("channel closed before delivering the update behind the stalled notice");
+        assert_eq!(msg.content, "i am behind the stalled notice");
+
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid_good + 1,
+            LISTEN_HANG_GUARD,
+            "past the voice update whose notice stalled",
+        )
+        .await;
+
+        handle.abort();
+    }
+
     /// The other half of the contract: a *transient* `getFile` failure must
     /// still pin the offset. Classification must not become a blanket
     /// "acknowledge on any error", which would reintroduce message loss.
@@ -10841,6 +12545,1494 @@ mod tests {
         assert_eq!(TELEGRAM_MAX_FILE_DOWNLOAD_BYTES, 20 * 1024 * 1024);
     }
 
+    #[tokio::test]
+    async fn media_group_listener_retains_video_context_before_photos_across_polls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let first = media_group_update(11, 101, 100, "album");
+        let unsupported_video = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 100,
+                "media_group_id": "album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": { "file_id": "unsupported-video" },
+                "caption": "compare these"
+            }
+        });
+        let second = media_group_update(12, 102, 100, "album");
+        let follow_up = serde_json::json!({
+            "update_id": 13,
+            "message": {
+                "message_id": 103,
+                "text": "after album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" }
+            }
+        });
+        let poll_index = Arc::new(AtomicUsize::new(0));
+        let responder_index = Arc::clone(&poll_index);
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/getUpdates"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body.get("timeout").and_then(serde_json::Value::as_u64) == Some(0) {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] }));
+                }
+
+                let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![unsupported_video.clone()],
+                    1 => vec![first.clone()],
+                    2 => vec![second.clone()],
+                    3 => vec![follow_up.clone()],
+                    _ => Vec::new(),
+                };
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": result }));
+                if responder_index.load(Ordering::SeqCst) >= 4 {
+                    response.set_delay(Duration::from_millis(750))
+                } else {
+                    response
+                }
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMyCommands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        for (file_id, file_path) in [
+            ("file-101", "photos/first.jpg"),
+            ("file-102", "photos/second.jpg"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(|| vec!["alice".into()]),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_ack_reactions(true),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album should dispatch")
+            .expect("listener should remain connected");
+        let follow_up = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("follow-up should dispatch")
+            .expect("listener should remain connected");
+        assert_eq!(album.id, "telegram_100_101");
+        assert_eq!(album.content.matches("[IMAGE:").count(), 2);
+        assert!(album.content.contains("compare these"));
+        assert_eq!(follow_up.content, "after album");
+        assert!(rx.try_recv().is_err(), "album must dispatch exactly once");
+        telegram_expect_main_loop_offset(
+            &server,
+            14,
+            Duration::from_secs(1),
+            "delivered album and follow-up",
+        )
+        .await;
+
+        for _ in 0..50 {
+            let requests = server.received_requests().await.unwrap();
+            let reaction_count = requests
+                .iter()
+                .filter(|request| request.url.path() == "/botfake-token/setMessageReaction")
+                .count();
+            if reaction_count == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        listener.abort();
+        let _ = listener.await;
+
+        let requests = server.received_requests().await.unwrap();
+        let typing_count = requests
+            .iter()
+            .filter(|request| request.url.path() == "/botfake-token/sendChatAction")
+            .count();
+        assert_eq!(typing_count, 2, "one typing action per logical message");
+        let reaction_message_ids: std::collections::HashSet<i64> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/botfake-token/setMessageReaction")
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter_map(|body| body.get("message_id").and_then(serde_json::Value::as_i64))
+            .collect();
+        assert_eq!(
+            reaction_message_ids,
+            std::collections::HashSet::from([101, 103])
+        );
+        let poll_timeouts: Vec<u64> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/botfake-token/getUpdates")
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter_map(|body| body.get("timeout").and_then(serde_json::Value::as_u64))
+            .filter(|timeout| *timeout > 0)
+            .collect();
+        assert!(poll_timeouts.starts_with(&[30, 1, 1, 1]));
+        let poll_offsets: Vec<i64> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/botfake-token/getUpdates")
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter(|body| {
+                body.get("timeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|timeout| timeout > 0)
+            })
+            .filter_map(|body| body.get("offset").and_then(serde_json::Value::as_i64))
+            .collect();
+        assert!(
+            poll_offsets.starts_with(&[0, 0, 0, 0, 14]),
+            "album members must remain unacknowledged until the combined turn and follow-up are delivered: {poll_offsets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_group_trailing_saturated_by_page_boundary_waits_for_next_page() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Build 101 updates:
+        // Update 1, 2: Album A (photos file-101, file-102)
+        // Updates 3..=98: text messages
+        // Updates 99..=101: Album B (photos file-199, file-200, file-201)
+        let mut all_updates = Vec::new();
+        all_updates.push(media_group_update(1, 101, 100, "album-a"));
+        all_updates.push(media_group_update(2, 102, 100, "album-a"));
+        for i in 3..=98 {
+            all_updates.push(serde_json::json!({
+                "update_id": i,
+                "message": {
+                    "message_id": 100 + i,
+                    "text": format!("msg {i}"),
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" }
+                }
+            }));
+        }
+        all_updates.push(media_group_update(99, 199, 100, "album-b"));
+        all_updates.push(media_group_update(100, 200, 100, "album-b"));
+        all_updates.push(media_group_update(101, 201, 100, "album-b"));
+
+        let updates_pool = Arc::new(all_updates);
+        let updates_ref = Arc::clone(&updates_pool);
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/getUpdates"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body.get("timeout").and_then(serde_json::Value::as_u64) == Some(0) {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] }));
+                }
+
+                let offset = body
+                    .get("offset")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100) as usize;
+
+                let page: Vec<serde_json::Value> = updates_ref
+                    .iter()
+                    .filter(|u| {
+                        u.get("update_id")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0)
+                            >= offset
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect();
+
+                let mut response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": page }));
+                response = response.set_delay(Duration::from_millis(50));
+                response
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMyCommands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        for (file_id, file_path) in [
+            ("file-101", "photos/101.jpg"),
+            ("file-102", "photos/102.jpg"),
+            ("file-199", "photos/199.jpg"),
+            ("file-200", "photos/200.jpg"),
+            ("file-201", "photos/201.jpg"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(|| vec!["alice".into()]),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_ack_reactions(true),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        // 1. Intermediate messages (3..=98) dispatch immediately, while the
+        // albums wait for their settlement delays.
+        for i in 3..=98 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("intermediate message should dispatch")
+                .expect("listener should remain connected");
+            assert_eq!(msg.content, format!("msg {i}"));
+        }
+
+        // 2. Album A arrives once settled
+        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album a should dispatch")
+            .expect("listener should remain connected");
+        assert_eq!(album_a.id, "telegram_100_101");
+        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+
+        // 3. Album B arrives as one single turn containing all 3 photos,
+        // because its settlement was held until the saturated page boundary
+        // was cleared by the next poll page returning update 101.
+        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album b should dispatch as a single combined turn")
+            .expect("listener should remain connected");
+        assert_eq!(album_b.id, "telegram_100_199");
+        assert_eq!(
+            album_b.content.matches("[IMAGE:").count(),
+            3,
+            "album b must include all 3 photos across the page boundary in a single turn"
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "album b must not be split into multiple dispatches"
+        );
+
+        telegram_expect_main_loop_offset(
+            &server,
+            102,
+            Duration::from_secs(3),
+            "delivered both albums and intermediate messages",
+        )
+        .await;
+
+        listener.abort();
+    }
+
+    /// The saturated-page guard follows update ordering, not the key of the
+    /// final update: an album still behind older unacknowledged updates is
+    /// held, while the oldest album stays eligible so the offset keeps moving.
+    #[test]
+    fn saturated_page_holds_only_groups_behind_older_unacknowledged_updates() {
+        let mut queue = std::collections::VecDeque::new();
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+
+        let mut page = vec![
+            media_group_update(1, 101, 100, "album-a"),
+            media_group_update(2, 102, 100, "album-a"),
+        ];
+        for i in 3..=98 {
+            page.push(serde_json::json!({
+                "update_id": i,
+                "message": {
+                    "message_id": 100 + i,
+                    "text": format!("msg {i}"),
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" }
+                }
+            }));
+        }
+        page.push(media_group_update(99, 199, 100, "album-b"));
+        // The page ends on an ordinary update, so the previous rule of reading
+        // the boundary from the last update's key sees no album at all.
+        page.push(serde_json::json!({
+            "update_id": 100,
+            "message": {
+                "message_id": 200,
+                "text": "boundary",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" }
+            }
+        }));
+        assert_eq!(page.len(), TELEGRAM_POLL_LIMIT);
+
+        TelegramChannel::enqueue_update_batch(&mut queue, &mut pending, &page, now, 1);
+
+        let album_a: MediaGroupKey = (100, "album-a".into());
+        let album_b: MediaGroupKey = (100, "album-b".into());
+        assert!(
+            !pending[&album_a].saturated_page_blocked,
+            "the oldest album must stay eligible or the replayed page stalls pagination"
+        );
+        assert!(
+            pending[&album_b].saturated_page_blocked,
+            "an album behind older unacknowledged updates cannot be shown complete by a full page"
+        );
+
+        // Once the older updates are acknowledged, the next poll starts past
+        // them, so album B is free to settle on the usual debounce.
+        pending.remove(&album_a);
+        for queued in queue.iter_mut() {
+            if queued.update_id.is_some_and(|id| id < 99) {
+                queued.delivered = true;
+            }
+        }
+        TelegramChannel::enqueue_update_batch(&mut queue, &mut pending, &page, now, 2);
+        assert!(
+            !pending[&album_b].saturated_page_blocked,
+            "album B must settle once nothing older holds the offset below the page"
+        );
+    }
+
+    /// The saturated page ends with an ordinary update rather than an album
+    /// member, so the page boundary cannot be recognized from the key of the
+    /// last update alone. Album B still has a member past the page, and the
+    /// offset stays pinned below the page while album A is unsettled, so B must
+    /// not settle from the replayed page: it waits for the page that exposes
+    /// its final photo and then arrives as one turn.
+    #[tokio::test]
+    async fn media_group_holds_across_saturated_page_ending_in_an_ordinary_update() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Build 101 updates:
+        // Updates 1, 2: Album A (photos file-101, file-102)
+        // Updates 3..=98: text messages
+        // Update 99: Album B's first photo (file-199)
+        // Update 100: an ordinary same-chat message at the page boundary
+        // Update 101: Album B's second photo (file-201), only reachable once
+        // the offset moves past the first page
+        let mut all_updates = Vec::new();
+        all_updates.push(media_group_update(1, 101, 100, "album-a"));
+        all_updates.push(media_group_update(2, 102, 100, "album-a"));
+        for i in 3..=98 {
+            all_updates.push(serde_json::json!({
+                "update_id": i,
+                "message": {
+                    "message_id": 100 + i,
+                    "text": format!("msg {i}"),
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" }
+                }
+            }));
+        }
+        all_updates.push(media_group_update(99, 199, 100, "album-b"));
+        all_updates.push(serde_json::json!({
+            "update_id": 100,
+            "message": {
+                "message_id": 200,
+                "text": "boundary",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" }
+            }
+        }));
+        all_updates.push(media_group_update(101, 201, 100, "album-b"));
+
+        let updates_pool = Arc::new(all_updates);
+        let updates_ref = Arc::clone(&updates_pool);
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/getUpdates"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body.get("timeout").and_then(serde_json::Value::as_u64) == Some(0) {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] }));
+                }
+
+                let offset = body
+                    .get("offset")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let limit = body
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(100) as usize;
+
+                let page: Vec<serde_json::Value> = updates_ref
+                    .iter()
+                    .filter(|u| {
+                        u.get("update_id")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0)
+                            >= offset
+                    })
+                    .take(limit)
+                    .cloned()
+                    .collect();
+
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": page }))
+                    .set_delay(Duration::from_millis(50))
+            })
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMyCommands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        for (file_id, file_path) in [
+            ("file-101", "photos/101.jpg"),
+            ("file-102", "photos/102.jpg"),
+            ("file-199", "photos/199.jpg"),
+            ("file-201", "photos/201.jpg"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(|| vec!["alice".into()]),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf())
+            .with_ack_reactions(true),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        // 1. The ordinary updates on the page dispatch immediately, including
+        // the one at the page boundary, while both albums wait to settle.
+        for i in 3..=98 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("intermediate message should dispatch")
+                .expect("listener should remain connected");
+            assert_eq!(msg.content, format!("msg {i}"));
+        }
+        let boundary = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("page-boundary message should dispatch")
+            .expect("listener should remain connected");
+        assert_eq!(boundary.content, "boundary");
+
+        // 2. Album A settles first and releases the offset.
+        let album_a = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album a should dispatch")
+            .expect("listener should remain connected");
+        assert_eq!(album_a.id, "telegram_100_101");
+        assert_eq!(album_a.content.matches("[IMAGE:").count(), 2);
+
+        // 3. Album B arrives once, with the photo from update 99 and the photo
+        // from update 101 in the same turn. Settling it from the replayed page
+        // would have delivered only the first photo here.
+        let album_b = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("album b should dispatch as a single combined turn")
+            .expect("listener should remain connected");
+        assert_eq!(album_b.id, "telegram_100_199");
+        assert_eq!(
+            album_b.content.matches("[IMAGE:").count(),
+            2,
+            "album b must include both photos spanning the page boundary in a single turn"
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "album b must not be split into multiple dispatches"
+        );
+
+        telegram_expect_main_loop_offset(
+            &server,
+            102,
+            Duration::from_secs(3),
+            "delivered both albums and every ordinary update",
+        )
+        .await;
+
+        listener.abort();
+    }
+
+    /// An ordinary same-chat message that arrives between a buffered photo and
+    /// a later retained (text-only) album member must not flush the album: the
+    /// unsupported member has its own ordering identity, so the group is not
+    /// wholly prior to the ordinary update. The ordinary message is delivered
+    /// first, the album stays pending, and both photos are delivered together
+    /// exactly once when the later sibling arrives.
+    #[tokio::test]
+    async fn media_group_stays_pending_when_a_later_unsupported_member_follows_an_ordinary_update()
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Poll 0: supported photo A for the album.
+        let photo_a = media_group_update(10, 100, 100, "album");
+        // Poll 1: ordinary same-chat message B. Poll 2 carries unsupported
+        // video C, whose own update_id/message_id are LATER than B's.
+        let ordinary = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 101,
+                "text": "interleaved",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" }
+            }
+        });
+        let unsupported_video = serde_json::json!({
+            "update_id": 12,
+            "message": {
+                "message_id": 102,
+                "media_group_id": "album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": { "file_id": "unsupported-video" },
+                "caption": "compare these"
+            }
+        });
+        // Poll 3: supported photo D completes the same album.
+        let photo_d = media_group_update(13, 103, 100, "album");
+
+        let poll_index = Arc::new(AtomicUsize::new(0));
+        let responder_index = Arc::clone(&poll_index);
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/getUpdates"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                if body.get("timeout").and_then(serde_json::Value::as_u64) == Some(0) {
+                    return ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "ok": true, "result": [] }));
+                }
+
+                let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
+                    0 => vec![photo_a.clone()],
+                    1 => vec![ordinary.clone()],
+                    2 => vec![unsupported_video.clone()],
+                    3 => vec![photo_d.clone()],
+                    _ => Vec::new(),
+                };
+                let response = ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": result }));
+                if responder_index.load(Ordering::SeqCst) >= 4 {
+                    response.set_delay(Duration::from_millis(750))
+                } else {
+                    response
+                }
+            })
+            .mount(&server)
+            .await;
+        for command_path in [
+            "/botfake-token/setMyCommands",
+            "/botfake-token/sendChatAction",
+            "/botfake-token/setMessageReaction",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(command_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .mount(&server)
+                .await;
+        }
+        for (file_id, file_path) in [
+            ("file-100", "photos/first.jpg"),
+            ("file-103", "photos/second.jpg"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        // The retained video must never be downloaded.
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "unsupported-video"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "default",
+                Arc::new(|| vec!["alice".into()]),
+                false,
+            )
+            .with_api_base(server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listener_channel = Arc::clone(&channel);
+        let listener = zeroclaw_spawn::spawn!(async move { listener_channel.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("the ordinary update should dispatch first")
+            .expect("listener should remain connected");
+        assert_eq!(
+            first.content, "interleaved",
+            "the ordinary same-chat update must be delivered before the album settles"
+        );
+
+        let album = tokio::time::timeout(Duration::from_secs(4), rx.recv())
+            .await
+            .expect("the album should dispatch once both photos are in")
+            .expect("listener should remain connected");
+        assert_eq!(album.id, "telegram_100_100");
+        assert_eq!(
+            album.content.matches("[IMAGE:").count(),
+            2,
+            "both supported photos must arrive in one turn: {}",
+            album.content
+        );
+        assert!(album.content.contains("compare these"));
+        assert!(
+            rx.try_recv().is_err(),
+            "the album must not produce a second agent turn"
+        );
+        telegram_expect_main_loop_offset(
+            &server,
+            14,
+            Duration::from_secs(2),
+            "whole album delivered",
+        )
+        .await;
+
+        let poll_offsets: Vec<i64> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/botfake-token/getUpdates")
+            .filter_map(|request| request.body_json::<serde_json::Value>().ok())
+            .filter(|body| {
+                body.get("timeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|timeout| timeout > 0)
+            })
+            .filter_map(|body| body.get("offset").and_then(serde_json::Value::as_i64))
+            .collect();
+        assert!(
+            poll_offsets
+                .iter()
+                .all(|offset| *offset == 0 || *offset >= 14),
+            "the listener must not acknowledge a partial album: {poll_offsets:?}"
+        );
+
+        listener.abort();
+        let _ = listener.await;
+    }
+
+    /// B1: a caption carried by an album member we never download (a video)
+    /// must still reach the model, and must not trigger a download for that
+    /// member's file.
+    #[tokio::test]
+    async fn media_group_unsupported_member_caption_participates_in_group() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (file_id, file_path, bytes) in [
+            ("photo-a", "photos/a.jpg", b"aaa".as_slice()),
+            ("photo-b", "photos/b.jpg", b"bbb".as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        *channel.bot_username.lock() = Some("mybot".to_string());
+
+        let photo = |update_id: i64, message_id: i64, file_id: &str| {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": message_id,
+                    "media_group_id": "album-mixed",
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": -100, "type": "group" },
+                    "photo": [{ "file_id": file_id, "file_size": 3 }]
+                }
+            })
+        };
+        // The video sits between the two photos and carries the only caption.
+        let video = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 11,
+                "media_group_id": "album-mixed",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "video": { "file_id": "video-file" },
+                "caption": "@mybot compare these"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        // Match one getUpdates response whose first album member is the
+        // unsupported video. Context must survive until the photos are seen.
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &video,
+            now,
+            1
+        ));
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &photo(10, 10, "photo-a"),
+            now,
+            1
+        ));
+        assert!(TelegramChannel::buffer_media_group_update(
+            &mut pending,
+            &photo(12, 12, "photo-b"),
+            now,
+            1
+        ));
+
+        let group = pending.values().next().unwrap();
+        assert_eq!(
+            group.updates.len(),
+            2,
+            "only the two photos are materializable"
+        );
+        assert_eq!(
+            group.unsupported,
+            vec![UnsupportedMember {
+                update_id: 11,
+                message_id: 11,
+                caption: Some("@mybot compare these".to_string()),
+                scope: MediaGroupScope {
+                    chat_id: Some(-100),
+                    media_group_id: Some("album-mixed".to_string()),
+                    thread_id: None,
+                    sender: Some("user:7".to_string()),
+                },
+            }],
+            "the video's caption must be retained as text-only context"
+        );
+
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        let msg = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+                .await,
+            "album with a captioned unsupported member must be admitted",
+        );
+
+        assert_eq!(
+            msg.content.matches("[IMAGE:").count(),
+            2,
+            "both supported image markers must be present"
+        );
+        let first_marker = msg
+            .content
+            .find("photo_-100_10")
+            .expect("first photo marker");
+        let second_marker = msg
+            .content
+            .find("photo_-100_12")
+            .expect("second photo marker");
+        assert!(
+            first_marker < second_marker,
+            "image markers must stay in message_id order"
+        );
+        assert_eq!(
+            msg.content.matches("@mybot compare these").count(),
+            1,
+            "the video's caption must appear exactly once in dispatched content"
+        );
+
+        // The unsupported member must never have been downloaded.
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.as_str().contains("video-file")),
+            "no getFile/download request may be issued for the unsupported member"
+        );
+    }
+
+    /// B1: under `mention_only`, a mention carried only by an unsupported
+    /// member must still admit the album. Before the fix the whole turn was
+    /// silently dropped.
+    #[tokio::test]
+    async fn media_group_mention_only_admits_on_unsupported_member_mention() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "only-photo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/only.jpg" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/botfake-token/photos/only.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"only".as_slice()))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        // mention_only = true -- this is the gate that used to reject the album.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["alice".into()]),
+            true,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        *channel.bot_username.lock() = Some("mybot".to_string());
+
+        // The photo has NO caption; the mention lives only on the video.
+        let photo = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 10,
+                "media_group_id": "album-mention",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "photo": [{ "file_id": "only-photo", "file_size": 4 }]
+            }
+        });
+        let video = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 11,
+                "media_group_id": "album-mention",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "video": { "file_id": "video-file" },
+                "caption": "@mybot look at this"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+        TelegramChannel::buffer_media_group_update(&mut pending, &photo, now, 1);
+
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        let msg = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+                .await,
+            "mention_only album whose only mention is on an unsupported member must still be admitted",
+        );
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "the supported sibling must still be dispatched"
+        );
+    }
+
+    /// B1 guard (item 4): an album with zero materializable members must still
+    /// produce no dispatch and download nothing, even though its captions are
+    /// now retained.
+    #[tokio::test]
+    async fn media_group_unsupported_only_group_still_produces_no_dispatch() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let video = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 10,
+                "media_group_id": "album-video-only",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": { "file_id": "video-file" },
+                "caption": "just a video"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+        assert_eq!(pending.len(), 1, "context waits for a supported sibling");
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].updates.is_empty());
+
+        // Even if such a batch is constructed directly, it must dispatch nothing.
+        let unsupported = vec![UnsupportedMember {
+            update_id: 10,
+            message_id: 10,
+            caption: Some("just a video".to_string()),
+            scope: MediaGroupScope {
+                chat_id: Some(100),
+                media_group_id: Some("album-video-only".to_string()),
+                thread_id: None,
+                sender: Some("user:7".to_string()),
+            },
+        }];
+        assert!(
+            matches!(
+                channel
+                    .try_parse_media_group_with_unsupported(&[], &unsupported)
+                    .await,
+                UpdateDisposition::SkipPermanent
+            ),
+            "unsupported-only album must produce no dispatch"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "unsupported-only album must not download anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_group_materializes_once_in_message_order_with_shared_context() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (file_id, file_path, bytes) in [
+            ("first-file", "photos/first.jpg", b"first".as_slice()),
+            ("second-file", "photos/second.jpg", b"second".as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["alice".into()]),
+            true,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        *channel.bot_username.lock() = Some("mybot".to_string());
+
+        let first = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 10,
+                "message_thread_id": 77,
+                "is_topic_message": true,
+                "media_group_id": "album-1",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "supergroup" },
+                "photo": [{ "file_id": "first-file", "file_size": 5 }],
+                "caption": "context"
+            }
+        });
+        let second = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 11,
+                "message_thread_id": 77,
+                "is_topic_message": true,
+                "media_group_id": "album-1",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "supergroup" },
+                "photo": [{ "file_id": "second-file", "file_size": 6 }],
+                "caption": "  @mybot compare these  "
+            }
+        });
+        let oversized = serde_json::json!({
+            "update_id": 9,
+            "message": {
+                "message_id": 9,
+                "message_thread_id": 77,
+                "is_topic_message": true,
+                "media_group_id": "album-1",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "supergroup" },
+                "photo": [{
+                    "file_id": "oversized-file",
+                    "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1
+                }],
+                "reply_to_message": {
+                    "message_id": 8,
+                    "from": { "id": 8, "username": "bob" },
+                    "text": "prior"
+                },
+                "forward_origin": {
+                    "type": "hidden_user",
+                    "sender_user_name": "Original Sender"
+                }
+            }
+        });
+
+        let msg = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(
+                    &[oversized.clone(), second.clone(), first.clone()],
+                    &[],
+                )
+                .await,
+            "valid siblings should survive one failed member",
+        );
+
+        assert_eq!(
+            msg.id, "telegram_-100_9",
+            "the earliest real member remains the anchor even when its file is skipped"
+        );
+        assert_eq!(msg.reply_target, "-100:77");
+        assert_eq!(msg.thread_ts.as_deref(), Some("77"));
+        assert_eq!(msg.content.matches("[IMAGE:").count(), 2);
+        assert_eq!(
+            msg.attachments.len(),
+            2,
+            "each rendered album member keeps its typed attachment envelope"
+        );
+        assert!(msg.attachments.iter().all(|attachment| {
+            attachment
+                .marker
+                .as_ref()
+                .is_some_and(|marker| marker.kind == zeroclaw_api::media::MarkerKind::Image)
+                && !attachment.data.is_empty()
+        }));
+        let first_pos = msg.content.find("photo_-100_10.jpg").unwrap();
+        let second_pos = msg.content.find("photo_-100_11.jpg").unwrap();
+        assert!(
+            first_pos < second_pos,
+            "attachments follow message_id order"
+        );
+        assert_eq!(msg.content.matches("@mybot compare these").count(), 1);
+        assert_eq!(msg.content.matches("context").count(), 1);
+        assert_eq!(msg.content.matches("> @bob:").count(), 1);
+        assert_eq!(
+            msg.content
+                .matches("[Forwarded from Original Sender]")
+                .count(),
+            1
+        );
+
+        let mut ordinary_reply_group = vec![oversized, second, first];
+        for update in &mut ordinary_reply_group {
+            update
+                .get_mut("message")
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .remove("is_topic_message");
+        }
+        let ordinary = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(&ordinary_reply_group, &[])
+                .await,
+            "ordinary reply-thread album should parse",
+        );
+        assert_eq!(ordinary.reply_target, "-100");
+        assert_eq!(ordinary.thread_ts, None);
+    }
+
+    #[tokio::test]
+    async fn media_group_same_named_documents_keep_distinct_files() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (file_id, file_path, bytes) in [
+            ("doc-one", "documents/one.bin", b"first".as_slice()),
+            ("doc-two", "documents/two.bin", b"second".as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/botfake-token/getFile"))
+                .and(query_param("file_id", file_id))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": file_path }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/file/botfake-token/{file_path}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let document_update = |update_id: i64, file_id: &str| {
+            serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "media_group_id": "documents",
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" },
+                    "document": {
+                        "file_id": file_id,
+                        "file_name": "../report.pdf"
+                    }
+                }
+            })
+        };
+
+        let msg = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(
+                    &[
+                        document_update(10, "doc-one"),
+                        document_update(11, "doc-two"),
+                    ],
+                    &[],
+                )
+                .await,
+            "both documents should materialize",
+        );
+
+        assert_eq!(msg.content.matches("[Document: report.pdf]").count(), 2);
+        assert_eq!(msg.attachments.len(), 2);
+        assert!(
+            msg.attachments
+                .iter()
+                .all(|attachment| attachment.file_name == "report.pdf"),
+            "storage disambiguation must not replace the canonical display name"
+        );
+        let save_dir = workspace.path().join("telegram_files");
+        let first_path = save_dir.join("document_100_10_report.pdf");
+        let second_path = save_dir.join("document_100_11_report.pdf");
+        assert_eq!(tokio::fs::read(&first_path).await.unwrap(), b"first");
+        assert_eq!(tokio::fs::read(&second_path).await.unwrap(), b"second");
+        assert!(msg.content.contains(&first_path.display().to_string()));
+        assert!(msg.content.contains(&second_path.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn media_group_rejects_mixed_sender_before_download() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let first = media_group_update(1, 1, 100, "album");
+        let mut second = media_group_update(2, 2, 100, "album");
+        second["message"]["from"]["id"] = serde_json::json!(8);
+
+        assert!(
+            matches!(
+                channel
+                    .try_parse_media_group_with_unsupported(&[first, second], &[])
+                    .await,
+                UpdateDisposition::SkipPermanent
+            ),
+            "mixed sender album must fail closed"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "scope validation must happen before any file request"
+        );
+    }
+
+    #[tokio::test]
+    async fn media_group_rejects_captionless_video_with_mixed_sender_or_thread_before_download() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        for mismatch in ["sender", "thread"] {
+            let mut video = serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 1,
+                    "media_group_id": "album",
+                    "from": { "id": 7, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" },
+                    "video": { "file_id": "unsupported-video" }
+                }
+            });
+            let mut photo = media_group_update(2, 2, 100, "album");
+            match mismatch {
+                "sender" => video["message"]["from"]["id"] = serde_json::json!(8),
+                "thread" => {
+                    video["message"]["message_thread_id"] = serde_json::json!(50);
+                    photo["message"]["message_thread_id"] = serde_json::json!(51);
+                }
+                _ => unreachable!(),
+            }
+
+            let mut pending = std::collections::HashMap::new();
+            let now = Instant::now();
+            TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
+            TelegramChannel::buffer_media_group_update(&mut pending, &photo, now, 1);
+            let batches = TelegramChannel::take_settled_media_groups(
+                &mut pending,
+                now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+                2,
+            );
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].unsupported.len(), 1);
+            assert_eq!(
+                batches[0].unsupported[0].caption, None,
+                "captionless context must still be retained for scope validation"
+            );
+            assert!(
+                matches!(
+                    channel
+                        .try_parse_media_group_with_unsupported(
+                            &batches[0].updates,
+                            &batches[0].unsupported,
+                        )
+                        .await,
+                    UpdateDisposition::SkipPermanent
+                ),
+                "mixed {mismatch} album must fail closed"
+            );
+        }
+
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "unsupported scope validation must happen before any file request"
+        );
+    }
+
     // ── Attachment content format tests ──────────────────────────────
 
     /// Build a typed envelope for content-format tests.
@@ -10855,6 +14047,18 @@ mod tests {
             mime_type: mime_type.map(str::to_string),
             marker: None,
         }
+    }
+
+    /// Photo attachments with image extension must use `[IMAGE:/path]` marker
+    /// so the multimodal pipeline validates vision capability on the model_provider.
+    #[test]
+    fn media_group_document_storage_names_are_safe_and_unique() {
+        let display = safe_attachment_filename("../reports/report.pdf");
+        assert_eq!(display, "report.pdf");
+        assert_ne!(
+            media_group_document_storage_filename(&display, "-100", 10),
+            media_group_document_storage_filename(&display, "-100", 11)
+        );
     }
 
     /// Photo attachments with image extension must use `[IMAGE:/path]` marker
@@ -12606,6 +15810,7 @@ mod tests {
             .and(path_regex(get_updates_path))
             .and(body_json(serde_json::json!({
                 "offset": 0,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 0,
                 "allowed_updates": allowed_updates.clone(),
             })))
@@ -12621,6 +15826,7 @@ mod tests {
             .and(path_regex(get_updates_path))
             .and(body_json(serde_json::json!({
                 "offset": 0,
+                "limit": TELEGRAM_POLL_LIMIT,
                 "timeout": 30,
                 "allowed_updates": allowed_updates,
             })))
@@ -13012,7 +16218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_update_routes_callback_to_single_edit_and_advances_offset() {
+    async fn process_update_routes_callback_to_single_edit_and_returns_advanced() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use zeroclaw_api::channel::ChannelApprovalResponse;
@@ -13058,7 +16264,6 @@ mod tests {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
-        let mut offset = 0i64;
         let mut transient_retry = None;
         let update = serde_json::json!({
             "update_id": 41,
@@ -13070,11 +16275,8 @@ mod tests {
             }
         });
 
-        let outcome = ch
-            .process_update(&update, &tx, &mut offset, &mut transient_retry)
-            .await;
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
         assert!(matches!(outcome, UpdateOutcome::Advanced));
-        assert_eq!(offset, 42);
         assert_eq!(resp_rx.await.unwrap(), ChannelApprovalResponse::Approve);
         assert!(
             rx.try_recv().is_err(),
@@ -13141,6 +16343,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let attributed = ch
             .request_approval_attributed("12345", &request)
@@ -13233,6 +16436,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let waiter = {
             let ch = Arc::clone(&ch);
@@ -13373,6 +16577,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
@@ -13414,6 +16619,153 @@ mod tests {
         }
         assert_eq!(ids.len(), 1, "all three buttons share one approval id");
         assert_eq!(actions, vec!["approve", "deny", "always"]);
+    }
+
+    #[tokio::test]
+    async fn approval_card_shows_the_batch_position_in_html_and_in_the_plain_fallback() {
+        use wiremock::matchers::{body_string_contains, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // When the HTML send is rejected, the card is rebuilt from scratch
+        // without `parse_mode` and resent with the same buttons. That rebuild
+        // is a second renderer, and it has to carry the position too — the
+        // operator sees the fallback card, not the one that failed.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .and(body_string_contains("parse_mode"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: can't parse entities"
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 2, total: 3 }),
+        };
+
+        // Nothing resolves the pending oneshot; the short timeout returns a
+        // Deny instead of hanging the test.
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "HTML send then plain-text retry");
+
+        let raw = crate::util::approval_position_line(Some((2, 3)));
+        let raw = raw.trim_end();
+        assert!(!raw.is_empty(), "helper should render a 2-of-3 line");
+        // The two sends escape differently, so the expectations differ. Several
+        // locales put an apostrophe in this line (fr: `Appel d'outil 2 sur 3`),
+        // which the HTML send escapes and the fallback must not; comparing both
+        // against the raw string passes only in locales with nothing to escape.
+        let escaped = TelegramChannel::escape_html(raw);
+
+        let html: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            html["parse_mode"], "HTML",
+            "the first send is the HTML card"
+        );
+        let html_text = html["text"].as_str().unwrap();
+        assert!(
+            html_text.contains(escaped.as_str()),
+            "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
+        );
+        if escaped != raw {
+            assert!(
+                !html_text.contains(raw),
+                "the HTML position line must be escaped, not raw; got {html_text}"
+            );
+        }
+
+        let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            plain.get("parse_mode").is_none(),
+            "the retry is the plain-text fallback"
+        );
+        let plain_text = plain["text"].as_str().unwrap();
+        assert!(
+            plain_text.contains(raw),
+            "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"
+        );
+        // With no parse_mode, an escaped line would show its entities literally.
+        // Only meaningful in a locale where the two forms actually differ.
+        if escaped != raw {
+            assert!(
+                !plain_text.contains(escaped.as_str()),
+                "the fallback position line must not be HTML-escaped; got {plain_text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_card_omits_the_position_for_a_single_call() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 1 }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_approval_timeout_secs(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: Some(zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 }),
+        };
+
+        let _ = ch.request_approval("12345", &request).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let heading = i18n::get_required_cli_string("channel-approval-heading");
+        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+        let tap_instruction = i18n::get_required_cli_string("channel-approval-tap-instruction");
+        assert_eq!(
+            body["text"],
+            format!(
+                "\u{1f527} <b>{heading}</b>\n\n{tool_label}: <code>shell</code>\nls -la\n\n{tap_instruction}",
+            ),
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     #[test]

@@ -1163,8 +1163,8 @@ impl McpRegistry {
     ///
     /// Returns the raw JSON-RPC result value. Callers that surface the result
     /// to the model should run
-    /// `embedded_resource::format_mcp_tool_result_for_model` so `resource`+`blob`
-    /// content is materialized instead of pretty-printed.
+    /// `embedded_resource::format_mcp_tool_result_for_model` so
+    /// `resource`+`blob` content is materialized instead of pretty-printed.
     pub async fn call_tool(
         &self,
         prefixed_name: &str,
