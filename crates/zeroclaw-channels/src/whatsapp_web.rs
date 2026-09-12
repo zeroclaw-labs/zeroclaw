@@ -912,6 +912,22 @@ impl WhatsAppWebChannel {
             info.source.is_from_me,
         );
 
+        // Business-mode `fromMe` events are delivery mirrors for messages sent
+        // by the linked account, not new user input. Reject them before either
+        // approval handling or `ChannelMessage` construction so their chat JID
+        // cannot grant the direct-message reply-intent bypass downstream.
+        if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Business
+            && info.source.is_from_me
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"chat": chat, "sender": sender})),
+                "ignoring fromMe delivery mirror in business mode"
+            );
+            return;
+        }
+
         // ── Approval-reply interception ──
         //
         // Must live here rather than in the gateway: the generic resolver at
@@ -2190,6 +2206,27 @@ fn fromme_outside_self_chat_is_operator_trigger(
     super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
 }
 
+/// WhatsApp JID domains that identify a one-to-one chat.
+///
+/// This is an allow-list rather than "anything that is not `@g.us`". Broadcast
+/// lists, newsletters and call JIDs are not group chats either, yet they are
+/// not direct messages, and treating an unrecognised future domain as a DM
+/// would silently widen every `is_direct_message()` bypass downstream.
+#[cfg(feature = "whatsapp-web")]
+const DIRECT_MESSAGE_JID_DOMAINS: [&str; 2] = ["s.whatsapp.net", "lid"];
+
+/// Whether an originating chat JID denotes a one-to-one conversation.
+///
+/// `reply_target` carries the originating chat JID unchanged, so the domain is
+/// the authoritative signal: `@g.us` is a group, `@s.whatsapp.net` and `@lid`
+/// are individual chats (the latter is WhatsApp's hidden-identity addressing).
+#[cfg(feature = "whatsapp-web")]
+fn is_direct_message_jid(chat_jid: &str) -> bool {
+    chat_jid.rsplit_once('@').is_some_and(|(user, domain)| {
+        !user.is_empty() && DIRECT_MESSAGE_JID_DOMAINS.contains(&domain)
+    })
+}
+
 #[cfg(feature = "whatsapp-web")]
 /// Whether a group chat may be processed.
 ///
@@ -2620,6 +2657,14 @@ impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
         "whatsapp"
+    }
+
+    /// Without this the trait default (`false`) applies, so every WhatsApp DM
+    /// is treated as a non-direct message. Callers that exist to spare direct
+    /// messages extra handling — notably the reply-intent precheck bypass in
+    /// the channel orchestrator — then never fire for WhatsApp at all.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        is_direct_message_jid(&msg.reply_target)
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -3778,6 +3823,41 @@ mod tests {
             &groups,
             &zeroclaw_config::schema::WhatsAppChatPolicy::All
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_accepts_individual_chats() {
+        // Both individual addressing forms: the plain phone JID and the hidden
+        // identity (LID) form WhatsApp uses for privacy-preserving chats.
+        assert!(super::is_direct_message_jid("15550001111@s.whatsapp.net"));
+        assert!(super::is_direct_message_jid("100000000000001@lid"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_groups() {
+        assert!(!super::is_direct_message_jid("120363000000000001@g.us"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_non_conversational_domains() {
+        // Not groups, but not direct messages either. An allow-list keeps these
+        // out; a "not @g.us" check would wrongly admit all three.
+        assert!(!super::is_direct_message_jid("status@broadcast"));
+        assert!(!super::is_direct_message_jid(
+            "120363000000000000@newsletter"
+        ));
+        assert!(!super::is_direct_message_jid("15550001111@call"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_malformed_input() {
+        assert!(!super::is_direct_message_jid(""));
+        assert!(!super::is_direct_message_jid("15550001111"));
+        assert!(!super::is_direct_message_jid("@s.whatsapp.net"));
     }
 
     #[test]
@@ -4995,6 +5075,105 @@ mod tests {
                 .is_err(),
             "business mode must not acquire the personal self-chat bypass"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_rejects_business_from_me_before_direct_message_bypass() {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const OPERATOR: &str = "15557654321";
+        const CUSTOMER: &str = "15551234567";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let event = |sender: &str, from_me: bool, content: &str| {
+            single_message_event(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some(content.to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: Jid::pn(CUSTOMER),
+                        sender: Jid::pn(sender),
+                        is_from_me: from_me,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("business-from-me-{from_me}"),
+                    r#type: "text".to_string(),
+                    push_name: "Business DM Probe".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new("business-dm-provenance".to_string()),
+            peer_resolver: Arc::new(Vec::new),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: Mode::Business,
+            dm_policy: Policy::All,
+            group_policy: Policy::All,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+
+        let outbound_echo = event(OPERATOR, true, "outbound delivery mirror");
+        WhatsAppWebChannel::handle_inbound_message_event(&outbound_echo, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "a business-mode fromMe mirror must not reach channel dispatch"
+        );
+
+        let customer_message = event(CUSTOMER, false, "genuine customer message");
+        WhatsAppWebChannel::handle_inbound_message_event(&customer_message, &client, &context)
+            .await;
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("a genuine business DM must reach channel dispatch")
+            .expect("channel dispatch sender must remain open");
+        assert_eq!(dispatched.content, "genuine customer message");
+
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "business-dm-provenance",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        assert!(zeroclaw_api::channel::Channel::is_direct_message(
+            &channel,
+            &dispatched
+        ));
     }
 
     // ── Reconnect retry state machine tests (exercise production helpers) ──
