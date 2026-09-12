@@ -2684,7 +2684,7 @@ impl RpcDispatcher {
         let turn = execute_turn(
             agent,
             prompt.clone(),
-            cancel,
+            cancel.clone(),
             TurnAttribution {
                 session_key: Some(tool_loop_session_key),
                 agent_alias,
@@ -2724,7 +2724,24 @@ impl RpcDispatcher {
                 }
             },
         );
-        let outcome = turn.await;
+        // The connection lifecycle owns prompt cancellation. `execute_turn`
+        // receives its own token so direct session cancellation and transport
+        // teardown share one cooperative-drain path; awaiting it without this
+        // bridge would leave a provider future alive after its RPC connection
+        // has closed.
+        tokio::pin!(turn);
+        let outcome = tokio::select! {
+            biased;
+            _ = self.connection_cancel.cancelled() => {
+                self.ctx.sessions.record_cancel_cause_if_absent(
+                    sid,
+                    crate::rpc::session::CancelCause::ConnectionClosed,
+                );
+                cancel.cancel();
+                turn.await
+            }
+            outcome = &mut turn => outcome,
+        };
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
