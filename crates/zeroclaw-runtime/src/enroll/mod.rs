@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_config::pairing::PairingGuard;
+use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
 
 use crate::security::cert_ledger::{CertLedger, CertStatus, IssuanceActor, LedgerEntry};
 
@@ -196,6 +196,9 @@ pub struct EnrollServer {
     pub ca_key_pem: zeroize::Zeroizing<String>,
     pub ledger: Arc<CertLedger>,
     pub pairing: Arc<PairingGuard>,
+    /// Resolve the pairing-code policy from the canonical live config at the
+    /// instant an operator asks the admin loop to mint another code.
+    pub pairing_code_policy: Arc<dyn Fn() -> PairingCodePolicy + Send + Sync>,
     /// Static WSS pin allowlists cannot admit freshly issued in-band certs unless
     /// the operator updates the canonical pin source out of band.
     pub static_client_pins_configured: bool,
@@ -803,6 +806,7 @@ mod tests {
             ca_key_pem: zeroize::Zeroizing::new(ca_key),
             ledger,
             pairing: Arc::new(pairing),
+            pairing_code_policy: Arc::new(PairingCodePolicy::default),
             static_client_pins_configured: false,
             allow_unpaired_until: deadline,
             relay_profile: RelayProfile::default(),
@@ -820,7 +824,7 @@ mod tests {
         // 300s. RelayBridge peers must use the class bucket (throttle), never
         // per-peer lockout.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let good = pairing.pairing_code().unwrap();
         let server = test_server(pairing, None);
 
@@ -863,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn process_issues_cert_with_valid_code_and_ignores_csr_identity() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server(pairing, None);
         // A CSR requesting an attacker CN; the daemon must mint its own device id.
@@ -900,7 +904,7 @@ mod tests {
         )
         .unwrap();
         let ledger = Arc::new(CertLedger::open_in_memory(Some(Arc::new(audit))).unwrap());
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server_with_ledger(pairing, None, ledger);
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
@@ -951,7 +955,7 @@ mod tests {
         .unwrap();
         let ledger = Arc::new(CertLedger::open_in_memory(Some(Arc::new(audit))).unwrap());
         ledger.detach_issued_certs_for_test().unwrap();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server_with_ledger(pairing, None, ledger);
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
@@ -1031,7 +1035,7 @@ mod tests {
             .unwrap(),
         );
         let ledger = Arc::new(CertLedger::open(dir.path(), Some(audit.clone())).unwrap());
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server_with_ledger(pairing, None, ledger);
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
@@ -1186,7 +1190,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let ledger = Arc::new(CertLedger::open_at(dir.path(), None, crl_for(dir.path())).unwrap());
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server_with_ledger(pairing, None, ledger);
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
@@ -1389,7 +1393,7 @@ mod tests {
     #[tokio::test]
     async fn process_rejects_in_band_enrollment_when_static_pins_are_configured() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let mut server = test_server(pairing, None);
         server.static_client_pins_configured = true;
@@ -1415,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn process_allows_retry_after_valid_code_with_bad_csr() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server(pairing, None);
         let bad = EnrollRequest {
@@ -1451,7 +1455,7 @@ mod tests {
     #[tokio::test]
     async fn process_rejects_wrong_code_and_consumes_one_time_code() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let server = test_server(pairing, None);
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
         let bad = EnrollRequest {
@@ -1469,7 +1473,7 @@ mod tests {
     #[tokio::test]
     async fn process_requires_code_when_window_closed() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let server = test_server(pairing, None);
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");
         let req = EnrollRequest {
@@ -1488,7 +1492,7 @@ mod tests {
         // Make-or-break: a real TLS client POSTs a CSR over the server-auth
         // enrollment endpoint and gets back a 200 with a signed certificate.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let code = pairing.pairing_code().unwrap();
         let server = test_server(pairing, None);
         let ca_pem = server.ca_cert_pem.clone();
@@ -1566,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn process_rejects_codeless_enroll_even_when_reserved_window_is_configured() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(true, &[], PairingCodePolicy::default());
         let future = chrono::Utc::now() + chrono::Duration::minutes(10);
         let server = test_server(pairing, Some(future));
         let (csr, _key) = zeroclaw_tls::testing::gen_client_csr("dev");

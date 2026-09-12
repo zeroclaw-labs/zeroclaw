@@ -240,7 +240,11 @@ async fn enrollment_post_round_trips_through_relay_route() {
         client_auth: None,
     })
     .unwrap();
-    let pairing = zeroclaw_config::pairing::PairingGuard::new(true, &[]);
+    let pairing = zeroclaw_config::pairing::PairingGuard::new(
+        true,
+        &[],
+        zeroclaw_config::pairing::PairingCodePolicy::default(),
+    );
     let pairing_code = pairing.pairing_code().unwrap();
     let enroll_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let enroll_addr = enroll_listener.local_addr().unwrap();
@@ -254,6 +258,7 @@ async fn enrollment_post_round_trips_through_relay_route() {
             zeroclaw_runtime::security::cert_ledger::CertLedger::open_in_memory(None).unwrap(),
         ),
         pairing: Arc::new(pairing),
+        pairing_code_policy: Arc::new(zeroclaw_config::pairing::PairingCodePolicy::default),
         static_client_pins_configured: false,
         allow_unpaired_until: None,
         relay_profile: zeroclaw_runtime::enroll::RelayProfile::default(),

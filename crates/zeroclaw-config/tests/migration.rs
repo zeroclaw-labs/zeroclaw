@@ -2145,6 +2145,114 @@ fn generate_current_emits_at_current_schema_version() {
     );
 }
 
+// ── Pairing-code policy ──────────────────────────────
+
+/// Review MAJOR-3: `zeroclaw config generate 3` must not hand the operator
+/// a config that names the retired `pairing_dashboard.code_length`, and must
+/// surface the `[gateway.pairing_code]` policy that actually decides pairing
+/// strength. The generator migrates the frozen V1 fixture, which still
+/// carries the retired key — so this pins the migration step, not the
+/// fixture.
+#[test]
+fn generate_current_retires_dashboard_code_length_and_surfaces_pairing_code() {
+    let raw = generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
+        .expect("generate current succeeds");
+    let parsed: toml::Value = toml::from_str(&raw).expect("generated output parses as TOML");
+    let gateway = parsed
+        .get("gateway")
+        .and_then(toml::Value::as_table)
+        .expect("generated config has a [gateway] section");
+
+    // The V1 fixture still carries the retired key; the migration drops it.
+    assert!(
+        V1_FIXTURE.contains("code_length"),
+        "precondition: the frozen V1 fixture still carries the retired key"
+    );
+    let dashboard = gateway
+        .get("pairing_dashboard")
+        .and_then(toml::Value::as_table)
+        .expect("[gateway.pairing_dashboard] survives with its other fields");
+    assert!(
+        !dashboard.contains_key("code_length"),
+        "retired key must not reach a current-schema config: {dashboard:?}"
+    );
+    assert!(
+        dashboard.contains_key("code_ttl_secs"),
+        "the rest of the dashboard section must be preserved"
+    );
+
+    // The shared policy is surfaced, at the shipped default.
+    let policy = gateway
+        .get("pairing_code")
+        .and_then(toml::Value::as_table)
+        .expect("[gateway.pairing_code] must be surfaced");
+    let default = zeroclaw_config::pairing::PairingCodePolicy::default();
+    assert_eq!(
+        policy.get("length").and_then(toml::Value::as_integer),
+        Some(default.length as i64),
+    );
+    assert_eq!(
+        policy.get("charset").and_then(toml::Value::as_str),
+        Some(default.charset.config_name()),
+    );
+
+    // And the whole thing still deserializes as the current schema.
+    let config: Config = toml::from_str(&raw).expect("generated config parses as Config");
+    assert_eq!(config.gateway.pairing_code, default);
+    config
+        .validate()
+        .expect("a generated config must be valid out of the box");
+}
+
+/// An operator who already hand-wrote `[gateway.pairing_code]` keeps it —
+/// the migration fills the section in, it does not overwrite a choice.
+#[test]
+fn migration_preserves_an_operator_authored_pairing_code_policy() {
+    let input = "schema_version = 2\n\
+                 [gateway]\n\
+                 port = 42617\n\
+                 [gateway.pairing_code]\n\
+                 length = 24\n\
+                 charset = \"unambiguous\"\n\
+                 [gateway.pairing_dashboard]\n\
+                 code_length = 8\n";
+    let migrated = migrate_v2(input);
+    let gateway = migrated
+        .get("gateway")
+        .and_then(toml::Value::as_table)
+        .expect("gateway section present");
+    let policy = gateway
+        .get("pairing_code")
+        .and_then(toml::Value::as_table)
+        .expect("operator-authored policy survives");
+    assert_eq!(
+        policy.get("length").and_then(toml::Value::as_integer),
+        Some(24),
+        "the operator's length must not be overwritten by the default"
+    );
+    assert_eq!(
+        policy.get("charset").and_then(toml::Value::as_str),
+        Some("unambiguous"),
+    );
+    // The retired key is still dropped.
+    let dashboard = gateway
+        .get("pairing_dashboard")
+        .and_then(toml::Value::as_table)
+        .expect("dashboard section present");
+    assert!(!dashboard.contains_key("code_length"));
+}
+
+/// A V2 config with no `[gateway]` at all must migrate cleanly — the
+/// normalizer must not synthesize a gateway section out of nothing.
+#[test]
+fn migration_leaves_a_gatewayless_config_alone() {
+    let migrated = migrate_v2("schema_version = 2\n");
+    assert!(
+        migrated.get("gateway").is_none(),
+        "no [gateway] in, no [gateway] out"
+    );
+}
+
 #[test]
 fn generate_v1_is_v1_shape() {
     let raw = generate(1, &GenerateOptions::default()).expect("generate v1 succeeds");

@@ -174,7 +174,10 @@ fn handle_request(server: &EnrollServer, request: PaircodeRequest) -> PaircodeRe
         };
     }
 
-    match server.pairing.generate_new_pairing_code() {
+    match server
+        .pairing
+        .generate_new_pairing_code((server.pairing_code_policy)())
+    {
         Some(code) => match sas_for_code(&server.ca_cert_pem, &code) {
             Ok(sas) => PaircodeResponse {
                 id: request.id,
@@ -243,7 +246,7 @@ fn now_unix() -> i64 {
 mod tests {
     use std::sync::Arc;
 
-    use zeroclaw_config::pairing::PairingGuard;
+    use zeroclaw_config::pairing::{PairingCodePolicy, PairingGuard};
 
     use super::*;
     use crate::enroll::RelayProfile;
@@ -272,6 +275,7 @@ mod tests {
             ca_key_pem: zeroize::Zeroizing::new(ca_key),
             ledger: Arc::new(CertLedger::open_in_memory(None).unwrap()),
             pairing: Arc::new(pairing),
+            pairing_code_policy: Arc::new(PairingCodePolicy::default),
             static_client_pins_configured: false,
             allow_unpaired_until: None,
             relay_profile: RelayProfile::default(),
@@ -285,7 +289,11 @@ mod tests {
     async fn running_loop_mints_additional_code_without_restart() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let data_dir = tempfile::tempdir().unwrap();
-        let pairing = PairingGuard::new(true, &[String::from("already-paired-token")]);
+        let pairing = PairingGuard::new(
+            true,
+            &[String::from("already-paired-token")],
+            PairingCodePolicy::default(),
+        );
         assert!(pairing.pairing_code().is_none());
 
         let server = test_server(pairing.clone());

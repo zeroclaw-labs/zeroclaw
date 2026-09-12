@@ -2344,7 +2344,11 @@ pub(crate) mod tests {
                 ),
             ),
             auto_save: false,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -3099,7 +3103,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn api_channel_relink_requires_bearer_auth_when_pairing_enabled() {
         let state = AppState {
-            pairing: Arc::new(PairingGuard::new(true, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             ..test_state(config_with_telegram("default"))
         };
 
@@ -3275,7 +3283,11 @@ pub(crate) mod tests {
         let config = config_with_webhook("paired", true, true, 42632, Some("/eyrie"));
         zeroclaw_runtime::health::mark_component_ok("channel:webhook.paired");
         let mut state = test_state(config.clone());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
         let readiness = channel_readiness(&config, &info, &health, &state);
@@ -3336,7 +3348,11 @@ pub(crate) mod tests {
     fn require_auth_rejects_empty_bearer_token() {
         let config = zeroclaw_config::schema::Config::default();
         let mut state = test_state(config);
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -5261,7 +5277,11 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
 
-        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let code = pairing.pairing_code().unwrap();
         let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
         let token_hash = PairingGuard::token_hash(&token);
@@ -5351,7 +5371,11 @@ pub(crate) mod tests {
         let data_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        );
         let code = pairing.pairing_code().unwrap();
         let token = pairing
             .try_pair(&code, "legacy-client")
@@ -5443,7 +5467,7 @@ pub(crate) mod tests {
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = submit_pairing_enhanced(
@@ -5527,7 +5551,7 @@ pub(crate) mod tests {
 
         let pending_code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = rotate_device_token(
@@ -5565,7 +5589,11 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
 
-        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let code = pairing.pairing_code().unwrap();
         let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
@@ -5573,7 +5601,7 @@ pub(crate) mod tests {
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing
-                .generate_new_pairing_code()
+                .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
             registry
@@ -5725,7 +5753,11 @@ pub(crate) mod tests {
             };
             config.agents.insert("maker".to_string(), agent);
             let mut state = test_state(config);
-            state.pairing = Arc::new(PairingGuard::new(true, &[TOKEN.to_string()]));
+            state.pairing = Arc::new(PairingGuard::new(
+                true,
+                &[TOKEN.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
             state
         }
 

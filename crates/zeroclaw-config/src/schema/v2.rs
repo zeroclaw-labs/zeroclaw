@@ -459,9 +459,55 @@ impl V2Config {
             "search_provider",
         );
 
+        normalize_gateway_pairing_code(&mut passthrough);
+
         passthrough.insert("schema_version".to_string(), toml::Value::Integer(3));
 
         Ok(toml::Value::Table(passthrough))
+    }
+}
+
+/// V3 moved pairing-code shape out of `[gateway.pairing_dashboard]` and into
+/// the shared `[gateway.pairing_code]` policy.
+///
+/// `[gateway]` rides through the V2→V3 step inside `passthrough`, so without
+/// this the migrated document keeps the retired `pairing_dashboard.code_length`
+/// — a key nothing reads — and never surfaces the policy that actually decides
+/// pairing-code strength. `zeroclaw config generate 3` emits that document
+/// verbatim, so a generated starting config would advertise the wrong setting.
+///
+/// An operator who already hand-wrote `[gateway.pairing_code]` keeps it: the
+/// section is only created when absent.
+fn normalize_gateway_pairing_code(passthrough: &mut toml::Table) {
+    let Some(toml::Value::Table(gateway)) = passthrough.get_mut("gateway") else {
+        return;
+    };
+
+    // Retire the dashboard-only length knob.
+    if let Some(toml::Value::Table(dashboard)) = gateway.get_mut("pairing_dashboard")
+        && dashboard.remove("code_length").is_some()
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "[gateway.pairing_dashboard] code_length retired → [gateway.pairing_code]"
+        );
+    }
+
+    // Surface the shared policy so the migrated document states the pairing
+    // strength it is actually running under.
+    if !gateway.contains_key("pairing_code") {
+        let default = crate::pairing::PairingCodePolicy::default();
+        let mut policy = toml::Table::new();
+        policy.insert(
+            "length".to_string(),
+            toml::Value::Integer(default.length as i64),
+        );
+        policy.insert(
+            "charset".to_string(),
+            toml::Value::String(default.charset.config_name().to_string()),
+        );
+        gateway.insert("pairing_code".to_string(), toml::Value::Table(policy));
     }
 }
 
