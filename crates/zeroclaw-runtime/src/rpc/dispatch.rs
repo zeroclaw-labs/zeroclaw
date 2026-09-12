@@ -3611,8 +3611,8 @@ impl RpcDispatcher {
                 ),
             ));
         }
-        if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
-            return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
+        if let Err(e) = config.set_prop_persistent_validated(&req.prop, &value_str) {
+            return Err(rpc_err(INVALID_PARAMS, format!("Config set failed: {e}")));
         }
         self.save_and_swap_config(*config, &config_write_guard)
             .await?;
@@ -11113,6 +11113,89 @@ mod tests {
     // isolation of its own, and a successful `config/set` falls through to
     // `flush_config()` -> `save_dirty()`. Always hand it a TempDir-rooted config
     // (`make_secret_test_config`), never a bare `Config::default()`.
+
+    #[tokio::test]
+    async fn config_set_rejects_invalid_value_without_mutating_live_or_disk_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let cfg = make_secret_test_config(&tmp);
+        cfg.save().await.expect("seed config");
+        let original_value = cfg.gateway.websocket_ping_interval_secs;
+        let original_disk = std::fs::read_to_string(&config_path).unwrap();
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let err = dispatcher
+            .handle_config_set(&json!({
+                "prop": "gateway.websocket_ping_interval_secs",
+                "value": zeroclaw_config::schema::GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1
+            }))
+            .await
+            .expect_err("invalid config/set must fail");
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("gateway.websocket_ping_interval_secs"));
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .gateway
+                .websocket_ping_interval_secs,
+            original_value
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path).unwrap(),
+            original_disk,
+            "rejected config/set must not rewrite the on-disk config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_allows_staged_agent_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.create_map_key("providers.models.openai", "primary")
+            .expect("create openai.primary");
+        cfg.create_map_key("risk_profiles", "standard")
+            .expect("create standard risk profile");
+        cfg.save().await.expect("seed config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        dispatcher
+            .handle_config_map_key_create(&json!({
+                "path": "agents",
+                "key": "worker"
+            }))
+            .await
+            .unwrap();
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.worker.model_provider",
+                "value": "openai.primary"
+            }))
+            .await
+            .unwrap();
+
+        let staged = dispatcher.ctx.config.read().clone();
+        assert_eq!(staged.agents["worker"].model_provider, "openai.primary");
+        assert!(staged.validate().is_err());
+
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "agents.worker.risk_profile",
+                "value": "standard"
+            }))
+            .await
+            .unwrap();
+        dispatcher.ctx.config.read().validate().unwrap();
+
+        let disk = std::fs::read_to_string(config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap();
+        assert_eq!(reloaded.agents["worker"].model_provider, "openai.primary");
+        assert_eq!(reloaded.agents["worker"].risk_profile, "standard");
+    }
 
     #[tokio::test]
     async fn config_set_does_not_materialize_resource_keyed_rate_alias() {
