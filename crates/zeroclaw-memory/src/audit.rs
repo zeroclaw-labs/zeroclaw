@@ -320,6 +320,91 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         self.inner.forget(key).await
     }
 
+    async fn store_for_principal(
+        &self,
+        principal_id: &str,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.log_audit(
+            AuditOp::Store,
+            Some(key),
+            None,
+            session_id,
+            Some(&format!("principal_id={principal_id}")),
+        );
+        self.inner
+            .store_for_principal(principal_id, key, content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        principal_id: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Recall,
+            None,
+            None,
+            session_id,
+            Some(&format!("principal_id={principal_id} query={query}")),
+        );
+        self.inner
+            .recall_for_principal(principal_id, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn list_for_principal(
+        &self,
+        principal_id: &str,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::List,
+            None,
+            None,
+            session_id,
+            Some(&format!("principal_id={principal_id}")),
+        );
+        self.inner
+            .list_for_principal(principal_id, category, session_id)
+            .await
+    }
+
+    async fn get_for_principal(
+        &self,
+        principal_id: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.log_audit(
+            AuditOp::Get,
+            Some(key),
+            None,
+            None,
+            Some(&format!("principal_id={principal_id}")),
+        );
+        self.inner.get_for_principal(principal_id, key).await
+    }
+
+    async fn forget_for_principal(&self, principal_id: &str, key: &str) -> anyhow::Result<bool> {
+        self.log_audit(
+            AuditOp::Forget,
+            Some(key),
+            None,
+            None,
+            Some(&format!("principal_id={principal_id}")),
+        );
+        self.inner.forget_for_principal(principal_id, key).await
+    }
+
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
         self.log_audit(
             AuditOp::Forget,

@@ -19,7 +19,12 @@ use super::tui_identity::TuiRegistry;
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
-    inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
+    /// `request_id -> (originating session_id, responder)`. The session id
+    /// binds each in-flight approval to the session it was raised for, so
+    /// `session/approve` authorizes against THAT session's owner instead
+    /// of trusting a client-supplied `session_id` or the bare
+    /// `request_id`.
+    inner: std::sync::Mutex<HashMap<String, (String, oneshot::Sender<ChannelApprovalResponse>)>>,
 }
 
 pub struct PendingApproval {
@@ -46,9 +51,10 @@ impl ApprovalPendingMap {
     pub fn register(
         self: &Arc<Self>,
         request_id: String,
+        session_id: String,
         tx: oneshot::Sender<ChannelApprovalResponse>,
     ) -> PendingApproval {
-        self.insert(request_id.clone(), tx);
+        self.insert(request_id.clone(), session_id, tx);
         PendingApproval {
             map: Arc::clone(self),
             request_id,
@@ -56,24 +62,40 @@ impl ApprovalPendingMap {
         }
     }
 
-    pub fn insert(&self, request_id: String, tx: oneshot::Sender<ChannelApprovalResponse>) {
+    pub fn insert(
+        &self,
+        request_id: String,
+        session_id: String,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+    ) {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, tx);
+            .insert(request_id, (session_id, tx));
     }
 
     pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) -> bool {
-        let tx = self
+        let entry = self
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(request_id);
-        if let Some(tx) = tx {
+        if let Some((_session_id, tx)) = entry {
             let _ = tx.send(response);
             return true;
         }
         false
+    }
+
+    /// The session id an in-flight approval was raised for, if still
+    /// pending. `session/approve` authorizes the caller against this
+    /// session's owner, never against client-supplied routing.
+    pub fn session_for(&self, request_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(request_id)
+            .map(|(session_id, _)| session_id.clone())
     }
 
     pub fn remove(&self, request_id: &str) -> bool {
@@ -184,6 +206,10 @@ pub struct RpcContext {
     /// Certificate paths fail closed on `None` rather than issuing
     /// credentials with no trail.
     pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
+    /// Inbound authentication layer: providers, shared resolver, and the
+    /// live pairing/roster authorities. Always present — a default config
+    /// yields the legacy local shared-operator behavior, never a bypass.
+    pub auth: Arc<crate::rpc::auth::RpcInboundAuth>,
 }
 
 impl RpcContext {
@@ -201,6 +227,7 @@ impl RpcContext {
             data_dir.clone(),
         )
         .ok();
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -218,11 +245,13 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit,
+            auth,
         })
     }
 
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -240,6 +269,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -254,6 +284,7 @@ impl RpcContext {
             config.data_dir.clone(),
         )
         .ok();
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -271,6 +302,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit,
+            auth,
         })
     }
 
@@ -280,6 +312,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -297,6 +330,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -306,6 +340,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -323,6 +358,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -332,6 +368,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -349,6 +386,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -358,6 +396,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         cost_tracker: Arc<CostTracker>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -375,6 +414,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -385,6 +425,7 @@ impl RpcContext {
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -402,6 +443,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -412,6 +454,7 @@ impl RpcContext {
         gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
         reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -429,6 +472,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 }
@@ -443,10 +487,25 @@ mod tests {
     fn pending_map_insert_and_resolve() {
         let map = ApprovalPendingMap::default();
         let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-1".to_string(), tx);
+        map.insert("req-1".to_string(), "test-session".to_string(), tx);
         assert!(map.resolve("req-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
         assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[test]
+    fn pending_map_binds_approvals_to_their_session() {
+        let map = ApprovalPendingMap::default();
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-9".to_string(), "sess-42".to_string(), tx);
+        assert_eq!(map.session_for("req-9").as_deref(), Some("sess-42"));
+        assert_eq!(map.session_for("other"), None);
+        assert!(map.resolve("req-9", ChannelApprovalResponse::Deny));
+        assert_eq!(
+            map.session_for("req-9"),
+            None,
+            "a resolved approval is no longer bound"
+        );
     }
 
     #[test]
@@ -459,7 +518,7 @@ mod tests {
     fn pending_map_insert_then_drop_is_safe() {
         let map = ApprovalPendingMap::default();
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-2".to_string(), tx);
+        map.insert("req-2".to_string(), "test-session".to_string(), tx);
         // _rx is dropped — resolve sends to a closed channel; must not panic
         assert!(map.resolve("req-2", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-2"));
@@ -469,7 +528,7 @@ mod tests {
     fn pending_map_remove_drops_stale_request() {
         let map = ApprovalPendingMap::default();
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-3".to_string(), tx);
+        map.insert("req-3".to_string(), "test-session".to_string(), tx);
         assert!(map.contains("req-3"));
         assert!(map.remove("req-3"));
         assert!(!map.contains("req-3"));
@@ -480,7 +539,7 @@ mod tests {
     fn pending_guard_drop_removes_registered_request() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let guard = map.register("req-4".to_string(), tx);
+        let guard = map.register("req-4".to_string(), "test-session".to_string(), tx);
         assert!(map.contains("req-4"));
         drop(guard);
         assert!(!map.contains("req-4"));
@@ -490,7 +549,7 @@ mod tests {
     fn pending_guard_can_be_disarmed_after_resolution() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let mut guard = map.register("req-5".to_string(), tx);
+        let mut guard = map.register("req-5".to_string(), "test-session".to_string(), tx);
         assert!(map.resolve("req-5", ChannelApprovalResponse::Approve));
         guard.disarm();
         drop(guard);

@@ -423,6 +423,7 @@ fn fact_overlaps_primary_update(
     }
 
     let candidate = MemoryEntry {
+        principal_id: None,
         id: "primary_update_candidate".into(),
         key: "primary_update_candidate".into(),
         content: primary.to_string(),
@@ -1027,6 +1028,7 @@ mod tests {
         let provider = ScriptedProvider::new(FACT_RESPONSE);
         let memory = RecordingMemory::default();
         memory.recall_entries.lock().push(MemoryEntry {
+            principal_id: None,
             id: "survivor".into(),
             key: "core_survivor".into(),
             content: "Use staged rollout".into(),
@@ -1190,6 +1192,7 @@ mod tests {
         let provider = ScriptedProvider::new(TYPED_RESPONSE);
         let memory = RecordingMemory::default();
         memory.recall_entries.lock().push(MemoryEntry {
+            principal_id: None,
             id: "existing".into(),
             key: "core_existing".into(),
             // Exact duplicate of TYPED_RESPONSE's memory_update.
