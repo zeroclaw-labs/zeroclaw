@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "message": {
+      "messageId": "msg-reply-1",
+      "role": "ROLE_AGENT",
+      "parts": [{ "text": "Direct reply" }]
+    }
+  }
+}
