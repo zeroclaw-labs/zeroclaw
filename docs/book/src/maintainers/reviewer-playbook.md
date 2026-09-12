@@ -57,7 +57,9 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
 - Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
 - Visual presentation changes include actual-interface evidence from an identifiable revision plus screenshots with enough surrounding layout to assess the result. String assertions, component-only snapshots, and helper-level renderer tests cannot replace this proof. Interaction and transition claims also name the user action and observed result.
-- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
+<!-- >>> generated:review-ci-evidence-playbook by `cargo generate review-docs` - do not edit <<< -->
+- Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI beyond the [base-drift-only review case](../contributing/pr-review-protocol.md#ci-freshness-and-base-drift), or unavailable CI.
+<!-- >>> end generated:review-ci-evidence-playbook <<< -->
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
 - Rollback path is concrete; "revert" is not concrete.

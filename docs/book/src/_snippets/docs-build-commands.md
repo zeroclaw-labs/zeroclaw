@@ -29,6 +29,7 @@ cargo mdbook serve                       # serve all locales at http://localhost
 cargo mdbook serve --locale ja           # live-reload against Japanese source
 cargo mdbook build                       # static build of every locale into docs/book/book/
 cargo mdbook refs                        # regenerate the auto-generated reference pages
+cargo generate review-docs               # regenerate tracked PR-review policy zones
 cargo mdbook sync                        # translation-cache pass: re-extract + merge .po files
 cargo mdbook sync --locale ja            # sync one locale only
 cargo mdbook sync --force                # force-retranslate everything (quality pass)
@@ -39,7 +40,7 @@ cargo mdbook check                       # validate .po format (run before a tra
 
 </div>
 
-> Always go through the `cargo mdbook …` wrapper. Running `mdbook build` directly from `docs/book/` skips the xtask step that renders `theme/lang-switcher.js` from `locales.toml`, which fails the build with `failed to open theme/lang-switcher.js for hashing`.
+> Always go through the `cargo mdbook …` wrapper for mdBook builds and translation work. Running `mdbook build` directly from `docs/book/` skips the xtask step that renders `theme/lang-switcher.js` from `locales.toml`, which fails the build with `failed to open theme/lang-switcher.js for hashing`. Tracked PR-review zones use the separate `cargo generate review-docs` command shown above.
 
 ## Required tools
 
@@ -64,6 +65,7 @@ Cargo resolves the compatible 0.5.x preprocessor used by mdBook 0.5.4.
 | `docs/book/src/**/*.md` (hand-written) | `docs/book/book/<locale>/` | `mdbook build` |
 | `docs/book/src/reference/cli.md` | (same path; **gitignored**) | `cargo mdbook refs` |
 | `docs/book/src/reference/config.md` | (same path; **gitignored**) | `cargo mdbook refs` |
+| Marked PR-review policy zones | Tracked skill and handbook regions | `cargo generate review-docs` |
 | `target/doc/` (rustdoc) | `docs/book/book/api/` | `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` |
 
 The two `reference/*.md` files are generated from the actual `clap` derives and JSON schema in the code, never edit them by hand. Edit the `///` doc comments on the relevant Rust types instead.
