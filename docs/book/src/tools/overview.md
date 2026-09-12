@@ -26,13 +26,31 @@ A minimal build ships with:
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, or Bocha |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, or AnySearch |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
 | `memory_store` | Store a fact, preference, or note in long-term memory |
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
 | `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
+
+### AnySearch provider
+
+AnySearch is an explicit, opt-in backend for `web_search_tool`:
+
+```toml
+[web_search]
+search_provider = "anysearch"
+# Optional; omit to use AnySearch's lower, rate-limited anonymous quota.
+anysearch_api_key = "..."
+```
+
+Search queries and the configured result limit are sent to
+`https://api.anysearch.com/v1/search`. When `anysearch_api_key` is configured,
+ZeroClaw sends it only as a Bearer authorization header; without a key, no
+`Authorization` header is sent. Selecting this provider therefore sends search
+queries to a third-party service even in anonymous mode. It does not change the
+default provider and is not used as an automatic fallback.
 
 Always registered alongside the built-ins:
 
