@@ -47,7 +47,12 @@ pub async fn handle_sops_list(State(state): State<AppState>, headers: HeaderMap)
     }
     let (dir, mode) = sops_dir_and_mode(&state);
     let sops = zeroclaw_runtime::sop::load_sops_from_directory(&dir, mode);
-    Json(serde_json::json!({ "sops": sops })).into_response()
+    // The global ceiling binds in addition to each SOP's own `max_concurrent`,
+    // so a client rendering only the per-SOP number shows a cap that may never
+    // be reachable. Resolved from live config per request, never snapshotted.
+    let max_concurrent_total = state.config.read().sop.max_concurrent_total;
+    Json(serde_json::json!({ "sops": sops, "max_concurrent_total": max_concurrent_total }))
+        .into_response()
 }
 
 pub async fn handle_sop_trigger_sources(
@@ -1618,5 +1623,36 @@ mod tests {
         assert_eq!(json["status"], "cancelled");
         assert_eq!(json["already_terminal"], false);
         assert_eq!(run_status(&state, &run_id), Some(SopRunStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn sops_list_carries_the_global_concurrency_ceiling() {
+        // The listing returned each SOP's declared `max_concurrent` but
+        // not the shared `sop.max_concurrent_total` pool that actually binds,
+        // so a client could render only a cap that may never be reachable.
+        let tmp = tempfile::tempdir().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        zeroclaw_runtime::sop::save_sop(&sops_dir, &authoring_policy_sop()).unwrap();
+
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        config.sop.max_concurrent_total = 7;
+        let state = crate::api::test_state(config);
+
+        let resp = handle_sops_list(State(state), HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["max_concurrent_total"], 7,
+            "the listing must carry the shared pool that actually binds"
+        );
+        // Additive guarantee: `sops` keeps its shape for existing clients.
+        assert!(json["sops"].is_array(), "sops must stay an array");
+        assert_eq!(json["sops"][0]["max_concurrent"], 1);
     }
 }
