@@ -1487,15 +1487,6 @@ impl RpcDispatcher {
                 .finish_existing_session_resume(session_id, &chat_mode, existing)
                 .await;
         }
-        if admitted_mode.is_some() {
-            if let Some(generation) = self.ctx.sessions.get_generation(&session_id).await {
-                self.ctx
-                    .sessions
-                    .remove_at_generation(&session_id, generation)
-                    .await;
-            }
-        }
-
         // Load resumed ACP metadata once, before constructing the live Agent.
         // The durable row owns the original workspace and interaction surface.
         let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
@@ -1731,6 +1722,19 @@ impl RpcDispatcher {
             } else {
                 (None, None)
             };
+
+        // Replacing a cross-mode session is the lifecycle commit point. Every
+        // fallible preparation above must complete first so a failed agent or
+        // ACP setup leaves the predecessor usable. Same-mode reconnects
+        // returned through `resume_existing` before this point.
+        if admitted_mode.is_some()
+            && let Some(generation) = self.ctx.sessions.get_generation(&session_id).await
+        {
+            self.ctx
+                .sessions
+                .remove_at_generation(&session_id, generation)
+                .await;
+        }
 
         let admission_error = self
             .ctx
@@ -10692,7 +10696,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_session_new_agent_construction_preserves_predecessor_incarnation() {
+    async fn session_new_rejects_different_agent_without_replacing_predecessor() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
@@ -10712,11 +10716,12 @@ mod tests {
         let error = dispatcher
             .handle_session_new_for_test(&json!({
                 "agent_alias": "missing-agent",
+                "chat_mode": "acp",
                 "session_id": sid,
             }))
             .await
-            .expect_err("unknown agent must fail construction");
-        assert_eq!(error.code, INTERNAL_ERROR);
+            .expect_err("a different agent must not take over an existing session");
+        assert_eq!(error.code, INVALID_PARAMS);
         assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
         assert_eq!(
             sessions.session_queue.generation(sid).await,
@@ -10744,7 +10749,7 @@ mod tests {
             RpcContext::for_persistence_tests(config, Arc::clone(&sessions), Some(backend), None);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
-        let sid = "session-limit-failure";
+        let sid = "session-limit-predecessor";
         dispatcher
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
@@ -10758,10 +10763,10 @@ mod tests {
         let error = dispatcher
             .handle_session_new_for_test(&json!({
                 "agent_alias": "test-agent",
-                "session_id": sid,
+                "session_id": "session-limit-successor",
             }))
             .await
-            .expect_err("replacement must be rejected at the session limit");
+            .expect_err("new session must be rejected at the session limit");
         assert_eq!(error.code, SESSION_LIMIT_REACHED);
         assert_eq!(sessions.get_generation(sid).await, predecessor_generation);
         assert_eq!(
