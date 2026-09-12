@@ -2107,6 +2107,7 @@ impl Agent {
             autonomy_level: self.autonomy_level,
             inject_memory: self.inject_memory,
             shell_profile: self.shell_profile.clone(),
+            is_messaging_channel_turn: false,
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
         append_timestamp_orientation(&mut prompt);

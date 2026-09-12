@@ -1829,6 +1829,7 @@ fn build_owned_step_system_prompt(
         config.channels.show_tool_calls,
         None,
         owned.shell_profile.as_ref(),
+        false,
     )
 }
 
