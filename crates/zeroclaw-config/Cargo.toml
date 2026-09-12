@@ -59,6 +59,7 @@ windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [dev-dependencies]
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+zeroclaw-spawn.workspace = true
 
 [features]
 # schema-export and clap are the only defaults. All channel schema types

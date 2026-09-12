@@ -4,6 +4,7 @@
 //! dispatch is the other SubAgent spawn site; both funnel through
 
 use crate::agent::loop_::AgentRunOverrides;
+use crate::live_config_authority::AgentExecutionCapability;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
@@ -26,6 +27,7 @@ pub struct SpawnSubagentTool {
     /// any spawn work happens. Set by the agent loop from
     /// `AgentRunOverrides.is_subagent` at registry construction time.
     is_subagent_caller: bool,
+    execution_capability: Option<AgentExecutionCapability>,
 }
 
 impl SpawnSubagentTool {
@@ -43,6 +45,7 @@ impl SpawnSubagentTool {
             parent_alias: parent_alias.into(),
             security,
             is_subagent_caller: false,
+            execution_capability: None,
         }
     }
 
@@ -52,6 +55,14 @@ impl SpawnSubagentTool {
     #[must_use]
     pub fn with_subagent_caller(mut self, is_subagent_caller: bool) -> Self {
         self.is_subagent_caller = is_subagent_caller;
+        self
+    }
+
+    pub fn with_execution_capability(
+        mut self,
+        capability: Option<AgentExecutionCapability>,
+    ) -> Self {
+        self.execution_capability = capability;
         self
     }
 }
@@ -101,7 +112,26 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
-        let risk_profile = self.config.risk_profile_for_agent(&self.parent_alias);
+        let execution_admission = match self
+            .execution_capability
+            .as_ref()
+            .map(|capability| capability.admit(&self.parent_alias))
+            .transpose()
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("subagent admission failed: {error}")),
+                });
+            }
+        };
+        let config = execution_admission
+            .as_ref()
+            .map(|admission| admission.config())
+            .unwrap_or_else(|| Arc::clone(&self.config));
+        let risk_profile = config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");
             let allowed_when_listed = rp.allowed_tools.is_empty()
@@ -150,7 +180,7 @@ impl Tool for SpawnSubagentTool {
         }
 
         let subagent_ctx = match SubAgentSpawn::for_agent_with_policy(
-            &self.config,
+            &config,
             &self.parent_alias,
             Arc::clone(&self.security),
         )
@@ -168,8 +198,7 @@ impl Tool for SpawnSubagentTool {
 
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        let temperature: Option<f64> = self
-            .config
+        let temperature: Option<f64> = config
             .model_provider_for_agent(&self.parent_alias)
             .and_then(|e| e.temperature);
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
@@ -189,6 +218,8 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            execution_admission: execution_admission.clone(),
+            ..AgentRunOverrides::default()
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
@@ -221,7 +252,7 @@ impl Tool for SpawnSubagentTool {
             session_key: run_id,
             =>
             crate::agent::run(
-                (*self.config).clone(),
+                (*config).clone(),
                 &self.parent_alias,
                 Some(prompt),
                 None,
@@ -294,6 +325,29 @@ mod tests {
             },
         );
         config
+    }
+
+    #[tokio::test]
+    async fn closed_authority_rejects_subagent_before_construction() {
+        let config = config_with_agent("alpha");
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_execution_capability(Some(authority.execution_capability()));
+        authority.close_agent_lifecycle();
+
+        let result = tool.execute(json!({"prompt": "hello"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("lifecycle generation is closing")
+        );
+        assert_eq!(authority.agent_lifecycle().active_turn_count("alpha"), 0);
     }
 
     #[tokio::test]

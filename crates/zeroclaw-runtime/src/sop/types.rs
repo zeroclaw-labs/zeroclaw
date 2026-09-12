@@ -5,6 +5,9 @@ use std::path::PathBuf;
 
 use super::scope::StepToolScope;
 use super::step_contract::{StepFailure, StepRouting};
+use crate::live_config_authority::{
+    AgentExecutionAdmission, AgentExecutionCapability, AgentExecutionError, AgentExecutionSelection,
+};
 
 // ── Priority ────────────────────────────────────────────────────
 
@@ -907,6 +910,36 @@ pub struct DeterministicSavings {
     pub total_runs: u64,
 }
 
+/// Non-serialized authority witness carried by an executable SOP action.
+///
+/// Capture generations when the engine produces the action. An unnamed live
+/// step inherits the executing agent, so its target is resolved by the consumer,
+/// using only these captured generations rather than a fresh admission token.
+#[derive(Clone)]
+pub struct SopExecutionWitness {
+    selection: AgentExecutionSelection,
+}
+
+impl fmt::Debug for SopExecutionWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SopExecutionWitness")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SopExecutionWitness {
+    pub fn capture(capability: &AgentExecutionCapability) -> Self {
+        Self {
+            selection: capability.capture_selection(),
+        }
+    }
+
+    pub fn admit(&self, alias: &str) -> Result<AgentExecutionAdmission, AgentExecutionError> {
+        self.selection.resolve_and_admit(alias)
+    }
+}
+
 /// What the engine instructs the caller to do next after a state transition.
 #[derive(Debug, Clone)]
 pub enum SopRunAction {
@@ -938,6 +971,9 @@ pub enum SopRunAction {
         run_id: String,
         step: SopStep,
         context: String,
+        /// The exact authority generations selected when this executable action
+        /// was produced. `None` is retained for unmanaged standalone callers.
+        execution_witness: Option<SopExecutionWitness>,
     },
     /// Pause and wait for operator approval before executing this step.
     WaitApproval {

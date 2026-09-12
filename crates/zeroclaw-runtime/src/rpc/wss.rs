@@ -3,7 +3,7 @@
 //! WebSocket connections, enabling remote TUI-to-daemon connectivity.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{RpcAccessPolicy, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -940,8 +940,9 @@ pub async fn run_wss_listener(
         "RPC WSS listener started"
     );
 
+    let connections_cancel = cancel.child_token();
     let mut connection_tasks = tokio::task::JoinSet::new();
-
+    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -952,7 +953,16 @@ pub async fn run_wss_listener(
                 );
                 break;
             }
-            Some(_) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {}
+            completed = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("RPC WSS connection task failed: {error}")
+                    );
+                }
+            }
             accept = listener.accept() => {
                 let (tcp_stream, remote_addr) = match accept {
                     Ok(v) => v,
@@ -971,7 +981,8 @@ pub async fn run_wss_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        return Err(e).context("WSS accept error");
+                        listener_result = Err(e).context("WSS accept error");
+                        break;
                     }
                 };
 
@@ -1003,7 +1014,7 @@ pub async fn run_wss_listener(
 
                 let ctx = ctx.clone();
                 let acceptor = tls_acceptor.clone();
-                let conn_cancel = cancel.child_token();
+                let conn_cancel = connections_cancel.child_token();
                 let handshake_timeout = limits.handshake_timeout;
                 // Consumed only after both handshakes succeed, so an unauthenticated
                 // stall can never occupy an established-session slot.
@@ -1193,11 +1204,13 @@ pub async fn run_wss_listener(
                     );
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                    let mut dispatcher = RpcDispatcher::new_with_cancel_and_channel_access(
                         ctx.clone(),
                         writer_tx,
                         peer,
                         conn_cancel.clone(),
+                        RpcAccessPolicy::RemoteSessionOwner,
+                        None,
                     )
                     .with_peer_cert_fingerprint(Some(peer_cert_fp))
                     .with_connection_activity(activity);
@@ -1236,6 +1249,7 @@ pub async fn run_wss_listener(
         }
     }
 
+    connections_cancel.cancel();
     // Drain accepted connection tasks. Each connection cancels its prompts
     // and drains them in `dispatcher.shutdown().await`. In-flight prompts have
     // up to CANCEL_GRACE (5 seconds) to unwind cooperatively. If a connection
@@ -1251,7 +1265,7 @@ pub async fn run_wss_listener(
         }
     }
 
-    Ok(())
+    listener_result
 }
 
 #[cfg(test)]
@@ -2002,6 +2016,7 @@ mod accept_error_tests {
         use crate::rpc::context::RpcContext;
         use crate::rpc::dispatch::connection_test_support::insert_session;
         use crate::rpc::session::SessionStore;
+        use crate::rpc::types::ChatMode;
         use async_trait::async_trait;
         use tokio::sync::Notify;
         use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
@@ -2009,6 +2024,7 @@ mod accept_error_tests {
         use zeroclaw_infra::session_queue::SessionActorQueue;
 
         const DURABLE_SID: &str = "durable-reload-session-wss";
+        const OWNER: &str = "reload-test-owner";
 
         struct HoldOnDrop {
             allow_finish: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -2141,12 +2157,16 @@ mod accept_error_tests {
         };
         let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
         let sessions1 = Arc::new(SessionStore::new(64, queue1));
-        let ctx1 = RpcContext::for_persistence_tests(
+        let mut ctx1 = RpcContext::for_persistence_tests(
             config1,
             sessions1,
             Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
             None,
         );
+
+        std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+        Arc::get_mut(&mut ctx1).unwrap().tui_registry =
+            Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
 
         insert_session(
             &ctx1,
@@ -2160,6 +2180,17 @@ mod accept_error_tests {
             }),
         )
         .await;
+
+        ctx1.sessions
+            .resume_existing(
+                DURABLE_SID,
+                "test-agent",
+                &ChatMode::Chat,
+                Some(OWNER.into()),
+            )
+            .await
+            .unwrap()
+            .expect("Gen 1 fixture session must exist");
 
         let cancel1 = CancellationToken::new();
         let count1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2207,8 +2238,8 @@ mod accept_error_tests {
         let (mut client_sink1, mut client_stream1) = ws1.split();
         let init = InitializeParams {
             protocol_version: 1,
-            tui_id: None,
-            tui_sig: None,
+            tui_id: Some(OWNER.into()),
+            tui_sig: Some(ctx1.tui_registry.sign(OWNER).expect("fixture signing key")),
             env: Default::default(),
             client_capabilities: None,
         };
@@ -2218,7 +2249,11 @@ mod accept_error_tests {
             ))
             .await
             .unwrap();
-        let _ = client_stream1.next().await.unwrap().unwrap();
+        let initialized = client_stream1.next().await.unwrap().unwrap();
+        let initialized: serde_json::Value =
+            serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+        assert!(initialized["error"].is_null(), "{initialized}");
+        assert_eq!(initialized["result"]["tui_id"], OWNER);
 
         // Send prompt to Generation 1
         client_sink1
@@ -2302,12 +2337,16 @@ mod accept_error_tests {
             };
             let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
             let sessions2 = Arc::new(SessionStore::new(64, queue2));
-            let ctx2 = RpcContext::for_persistence_tests(
+            let mut ctx2 = RpcContext::for_persistence_tests(
                 config2,
                 sessions2,
                 Some(chat_backend2 as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
                 None,
             );
+
+            Arc::get_mut(&mut ctx2).unwrap().tui_registry =
+                Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&tmp_path));
+            let owner_sig = ctx2.tui_registry.sign(OWNER).expect("fixture signing key");
 
             insert_session(
                 &ctx2,
@@ -2321,6 +2360,17 @@ mod accept_error_tests {
                 }),
             )
             .await;
+
+            ctx2.sessions
+                .resume_existing(
+                    DURABLE_SID,
+                    "test-agent",
+                    &ChatMode::Chat,
+                    Some(OWNER.into()),
+                )
+                .await
+                .unwrap()
+                .expect("Gen 2 fixture session must exist");
 
             let cancel2 = CancellationToken::new();
             let count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2365,8 +2415,8 @@ mod accept_error_tests {
             let (mut client_sink2, mut client_stream2) = ws2.split();
             let init = InitializeParams {
                 protocol_version: 1,
-                tui_id: None,
-                tui_sig: None,
+                tui_id: Some(OWNER.into()),
+                tui_sig: Some(owner_sig),
                 env: Default::default(),
                 client_capabilities: None,
             };
@@ -2376,7 +2426,11 @@ mod accept_error_tests {
                 ))
                 .await
                 .unwrap();
-            let _ = client_stream2.next().await.unwrap().unwrap();
+            let initialized = client_stream2.next().await.unwrap().unwrap();
+            let initialized: serde_json::Value =
+                serde_json::from_str(initialized.to_text().unwrap()).unwrap();
+            assert!(initialized["error"].is_null(), "{initialized}");
+            assert_eq!(initialized["result"]["tui_id"], OWNER);
 
             client_sink2
                 .send(Message::Text(
@@ -2647,5 +2701,100 @@ mod parser_bound_tests {
                 "a message beyond the 32 MiB ceiling must be refused"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::rpc::session::SessionStore;
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncReadExt;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    fn test_ctx(tmp: &std::path::Path) -> Arc<RpcContext> {
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.to_path_buf(),
+            config_path: tmp.join("config.toml"),
+            ..Default::default()
+        };
+        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(SessionStore::new(64, session_queue));
+        RpcContext::minimal(config, sessions)
+    }
+
+    fn test_tls_acceptor(tmp: &std::path::Path) -> TlsAcceptor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let materials = zeroclaw_tls::ensure_server_materials(tmp, &[]).unwrap();
+        build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap()
+    }
+
+    async fn wait_for_client_count(count: &Arc<AtomicUsize>, expected: usize) {
+        for _ in 0..250 {
+            if count.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "client count never reached {expected}; last observed {}",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_and_joins_inflight_wss_handshake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let acceptor = test_tls_acceptor(tmp.path());
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_wss_listener(
+                ctx,
+                server_cancel,
+                server_count,
+                acceptor,
+                bind_addr,
+                WssLimits::default(),
+            )
+            .await
+        });
+
+        let mut client = loop {
+            match TcpStream::connect(bind_addr).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        wait_for_client_count(&count, 1).await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("WSS listener should join an in-flight handshake after cancellation")
+            .expect("WSS listener task should not panic")
+            .expect("WSS listener should stop cleanly");
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        let mut byte = [0_u8; 1];
+        let bytes = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("cancelled WSS client should observe EOF")
+            .expect("client read should not fail");
+        assert_eq!(bytes, 0, "cancelled WSS connection should be closed");
     }
 }

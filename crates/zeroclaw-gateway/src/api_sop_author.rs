@@ -225,11 +225,17 @@ pub async fn handle_sop_run(
                 );
                 if needs_driver {
                     let config = state.config.read().clone();
-                    zeroclaw_runtime::sop::spawn_headless_run_driver(
+                    zeroclaw_runtime::sop::spawn_headless_run_driver_with_capability(
                         config,
                         std::sync::Arc::clone(engine),
                         Some(std::sync::Arc::clone(audit)),
                         action.as_ref().clone(),
+                        Some(
+                            zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                                std::sync::Arc::clone(&state.config),
+                                state.agent_lifecycle.clone(),
+                            ),
+                        ),
                     );
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
@@ -568,12 +574,18 @@ pub async fn handle_sop_decide(
     }
 
     if let Some(outcome) = resolved_outcome {
-        let config = state.config.read();
-        zeroclaw_runtime::sop::drive_resumed_broker_action(
+        let config = state.config.read().clone();
+        zeroclaw_runtime::sop::drive_resumed_broker_action_with_capability(
             &config,
             std::sync::Arc::clone(engine),
             state.sop_audit.clone(),
             &outcome,
+            Some(
+                zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                    std::sync::Arc::clone(&state.config),
+                    state.agent_lifecycle.clone(),
+                ),
+            ),
         );
     }
 

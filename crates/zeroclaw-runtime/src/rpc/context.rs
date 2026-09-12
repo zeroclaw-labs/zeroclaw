@@ -16,10 +16,17 @@ use zeroclaw_infra::session_backend::SessionBackend;
 
 use super::session::SessionStore;
 use super::tui_identity::TuiRegistry;
+use crate::LiveConfigAuthority;
+use crate::daemon::ChannelGenerationControl;
 
 #[derive(Default)]
 pub struct ApprovalPendingMap {
-    inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
+    inner: std::sync::Mutex<HashMap<String, PendingApprovalEntry>>,
+}
+
+struct PendingApprovalEntry {
+    session_id: String,
+    tx: oneshot::Sender<ChannelApprovalResponse>,
 }
 
 pub struct PendingApproval {
@@ -46,9 +53,10 @@ impl ApprovalPendingMap {
     pub fn register(
         self: &Arc<Self>,
         request_id: String,
+        session_id: String,
         tx: oneshot::Sender<ChannelApprovalResponse>,
     ) -> PendingApproval {
-        self.insert(request_id.clone(), tx);
+        self.insert(request_id.clone(), session_id, tx);
         PendingApproval {
             map: Arc::clone(self),
             request_id,
@@ -56,21 +64,33 @@ impl ApprovalPendingMap {
         }
     }
 
-    pub fn insert(&self, request_id: String, tx: oneshot::Sender<ChannelApprovalResponse>) {
+    pub fn insert(
+        &self,
+        request_id: String,
+        session_id: String,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+    ) {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(request_id, tx);
+            .insert(request_id, PendingApprovalEntry { session_id, tx });
     }
 
-    pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) -> bool {
-        let tx = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_id);
-        if let Some(tx) = tx {
-            let _ = tx.send(response);
+    pub fn resolve(
+        &self,
+        request_id: &str,
+        session_id: &str,
+        response: ChannelApprovalResponse,
+    ) -> bool {
+        let mut pending = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if pending
+            .get(request_id)
+            .is_none_or(|entry| entry.session_id != session_id)
+        {
+            return false;
+        }
+        if let Some(entry) = pending.remove(request_id) {
+            let _ = entry.tx.send(response);
             return true;
         }
         false
@@ -121,6 +141,14 @@ pub struct RpcContext {
     /// disk persistence for that write (memory keeps it, but the dirty
     /// flag is cleared by the concurrent flush).
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+
+    /// Alias-scoped admission and destructive lifecycle authority paired with
+    /// this context's live config identity.
+    pub agent_lifecycle: crate::live_config_authority::AgentLifecycleCoordinator,
+
+    /// Current daemon channel generation. Present only for daemon-owned RPC
+    /// contexts; standalone/test contexts cannot retire a live channel set.
+    pub(crate) channel_generation_control: Option<Arc<ChannelGenerationControl>>,
 
     /// In-memory session store for active RPC sessions.
     pub sessions: Arc<SessionStore>,
@@ -187,6 +215,12 @@ pub struct RpcContext {
 }
 
 impl RpcContext {
+    pub(crate) fn config_handles_for_authority(
+        authority: &LiveConfigAuthority,
+    ) -> (Arc<RwLock<Config>>, Arc<tokio::sync::Mutex<()>>) {
+        (authority.config(), authority.config_write_lock())
+    }
+
     pub fn for_live_test(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
         let tui_dir = config
             .config_path
@@ -201,9 +235,12 @@ impl RpcContext {
             data_dir.clone(),
         )
         .ok();
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -223,9 +260,12 @@ impl RpcContext {
 
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -257,6 +297,8 @@ impl RpcContext {
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -280,9 +322,12 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -306,9 +351,12 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -332,9 +380,12 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: Some(memory),
@@ -358,9 +409,12 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         cost_tracker: Arc<CostTracker>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -385,9 +439,12 @@ impl RpcContext {
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend,
             memory: None,
@@ -412,9 +469,12 @@ impl RpcContext {
         gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
         reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Arc<Self> {
+        let authority = LiveConfigAuthority::new(config);
         Arc::new(Self {
-            config: Arc::new(RwLock::new(config)),
-            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config: authority.config(),
+            config_write_lock: authority.config_write_lock(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
             sessions,
             session_backend: None,
             memory: None,
@@ -440,11 +500,20 @@ mod tests {
     use zeroclaw_api::channel::ChannelApprovalResponse;
 
     #[test]
+    fn config_handles_for_authority_preserve_identity() {
+        let authority = LiveConfigAuthority::new(Config::default());
+        let (config, write_lock) = RpcContext::config_handles_for_authority(&authority);
+
+        assert!(Arc::ptr_eq(&config, &authority.config()));
+        assert!(Arc::ptr_eq(&write_lock, &authority.config_write_lock()));
+    }
+
+    #[test]
     fn pending_map_insert_and_resolve() {
         let map = ApprovalPendingMap::default();
         let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-1".to_string(), tx);
-        assert!(map.resolve("req-1", ChannelApprovalResponse::Approve));
+        map.insert("req-1".to_string(), "sess-1".to_string(), tx);
+        assert!(map.resolve("req-1", "sess-1", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-1"));
         assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
     }
@@ -452,16 +521,16 @@ mod tests {
     #[test]
     fn pending_map_resolve_unknown_key_is_noop() {
         let map = ApprovalPendingMap::default();
-        assert!(!map.resolve("nonexistent", ChannelApprovalResponse::Deny));
+        assert!(!map.resolve("nonexistent", "sess-1", ChannelApprovalResponse::Deny));
     }
 
     #[test]
     fn pending_map_insert_then_drop_is_safe() {
         let map = ApprovalPendingMap::default();
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-2".to_string(), tx);
+        map.insert("req-2".to_string(), "sess-2".to_string(), tx);
         // _rx is dropped — resolve sends to a closed channel; must not panic
-        assert!(map.resolve("req-2", ChannelApprovalResponse::Approve));
+        assert!(map.resolve("req-2", "sess-2", ChannelApprovalResponse::Approve));
         assert!(!map.contains("req-2"));
     }
 
@@ -469,7 +538,7 @@ mod tests {
     fn pending_map_remove_drops_stale_request() {
         let map = ApprovalPendingMap::default();
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        map.insert("req-3".to_string(), tx);
+        map.insert("req-3".to_string(), "sess-3".to_string(), tx);
         assert!(map.contains("req-3"));
         assert!(map.remove("req-3"));
         assert!(!map.contains("req-3"));
@@ -480,7 +549,7 @@ mod tests {
     fn pending_guard_drop_removes_registered_request() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let guard = map.register("req-4".to_string(), tx);
+        let guard = map.register("req-4".to_string(), "sess-4".to_string(), tx);
         assert!(map.contains("req-4"));
         drop(guard);
         assert!(!map.contains("req-4"));
@@ -490,10 +559,23 @@ mod tests {
     fn pending_guard_can_be_disarmed_after_resolution() {
         let map = Arc::new(ApprovalPendingMap::default());
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
-        let mut guard = map.register("req-5".to_string(), tx);
-        assert!(map.resolve("req-5", ChannelApprovalResponse::Approve));
+        let mut guard = map.register("req-5".to_string(), "sess-5".to_string(), tx);
+        assert!(map.resolve("req-5", "sess-5", ChannelApprovalResponse::Approve));
         guard.disarm();
         drop(guard);
         assert!(!map.contains("req-5"));
+    }
+
+    #[test]
+    fn pending_map_rejects_foreign_session_without_consuming_request() {
+        let map = ApprovalPendingMap::default();
+        let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-6".to_string(), "sess-owner".to_string(), tx);
+
+        assert!(!map.resolve("req-6", "sess-foreign", ChannelApprovalResponse::Approve));
+        assert!(map.contains("req-6"));
+        assert!(rx.try_recv().is_err());
+        assert!(map.resolve("req-6", "sess-owner", ChannelApprovalResponse::Deny));
+        assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Deny);
     }
 }

@@ -1,4 +1,4 @@
-//! Regression coverage for `zeroclaw config patch --json` output.
+//! Regression coverage for config patch output and standalone execution ownership.
 //!
 //! The CLI/HTTP parity test needs the in-process gateway router, whose
 //! `AppState` and deps only exist under the `gateway` feature. Those items are
@@ -67,6 +67,7 @@ fn test_state(config: Config) -> AppState {
     AppState {
         config: Arc::new(RwLock::new(config)),
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        agent_lifecycle: Default::default(),
         model_provider: Arc::new(MockModelProvider),
         model: "test-model".into(),
         temperature: None,
@@ -871,4 +872,194 @@ fn config_init_channel_alias_survives_config_reload() {
         }),
         "the initialized channel alias must remain addressable after Config reload",
     );
+}
+
+#[cfg(feature = "agent-runtime")]
+#[test]
+fn agent_targeting_config_commands_fail_closed_while_daemon_owns_config() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+    let data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create resolved config data directory");
+    let _owner = zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&data_dir)
+        .expect("hold daemon config ownership");
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+
+    let commands: &[(&[&str], Option<&[u8]>)] = &[
+        (
+            &[
+                "config",
+                "set",
+                "--no-interactive",
+                "agents.recreated.enabled",
+                "true",
+            ],
+            None,
+        ),
+        (&["config", "init", "agents.recreated", "--json"], None),
+        (
+            &["config", "patch", "--json", "-"],
+            Some(br#"[{"op":"add","path":"/agents/recreated/enabled","value":true}]"#),
+        ),
+    ];
+
+    for (args, stdin) in commands {
+        let mut child = Command::new(bin)
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env("RUST_LOG", "off")
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn agent-targeting config command");
+        if let Some(stdin) = stdin {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("child stdin")
+                .write_all(stdin)
+                .expect("write patch body");
+        }
+        let output = child.wait_with_output().expect("wait for config command");
+        assert!(
+            !output.status.success(),
+            "agent-targeting command must fail closed while config is owned: {:?}",
+            args
+        );
+    }
+
+    let saved = std::fs::read_to_string(config_dir.path().join("config.toml"))
+        .expect("read config after refused commands");
+    let config: Config = toml::from_str(&saved).expect("config should remain valid");
+    assert!(!config.agents.contains_key("recreated"));
+}
+
+#[cfg(feature = "agent-runtime")]
+#[test]
+fn standalone_agent_ownership_uses_resolved_temp_data_dir_and_preserves_alias_validation() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let resolved_data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&resolved_data_dir).expect("create resolved data directory");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.8"}]"#,
+    );
+
+    let run_agent = || {
+        Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .env("RUST_LOG", "off")
+            .args(["agent", "--agent", "missing", "--message", "should-not-run"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run zeroclaw agent")
+    };
+
+    let owner =
+        zeroclaw_runtime::live_config_authority::ConfigOwnershipGuard::acquire(&resolved_data_dir)
+            .expect("hold the actual ZEROCLAW_CONFIG_DIR-resolved data directory");
+    let refused = run_agent();
+    assert!(!refused.status.success());
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused_stderr.contains("Cannot run `zeroclaw agent` while another ZeroClaw process owns"),
+        "ownership refusal must be actionable: {refused_stderr}"
+    );
+    assert!(
+        !refused_stderr.contains("is not configured"),
+        "ownership refusal must happen before alias validation or target construction: {refused_stderr}"
+    );
+    drop(owner);
+
+    let validated = run_agent();
+    assert!(!validated.status.success());
+    let validated_stderr = String::from_utf8_lossy(&validated.stderr);
+    assert!(
+        validated_stderr.contains("`zeroclaw agent --agent missing` is not configured"),
+        "after ownership release, the normal alias validation must run: {validated_stderr}"
+    );
+    assert!(
+        !validated_stderr.contains("while another ZeroClaw process owns"),
+        "released ownership must not leave a stale refusal: {validated_stderr}"
+    );
+}
+
+#[cfg(all(feature = "agent-runtime", feature = "channel-acp-server"))]
+#[test]
+fn standalone_acp_ownership_refuses_before_store_open_and_retains_stdio_authority() {
+    use zeroclaw::channels::acp_server::{AcpServer, AcpServerConfig};
+    use zeroclaw_runtime::LiveConfigAuthority;
+    use zeroclaw_runtime::live_config_authority::{ConfigOwnershipError, ConfigOwnershipGuard};
+
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let resolved_data_dir = config_dir.path().join("data");
+    std::fs::create_dir_all(&resolved_data_dir).expect("create resolved data directory");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.8"}]"#,
+    );
+    let store_path = resolved_data_dir.join("sessions/acp-sessions.db");
+    assert!(!store_path.exists());
+    let run_acp = || {
+        Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+            .env("ZEROCLAW_CONFIG_DIR", config_dir.path())
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .env("RUST_LOG", "off")
+            .arg("acp")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run zeroclaw acp with closed stdin")
+    };
+
+    let owner = ConfigOwnershipGuard::acquire(&resolved_data_dir).expect("hold resolved data dir");
+    let refused = run_acp();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("Cannot run `zeroclaw acp` while another ZeroClaw process owns"),
+        "ownership refusal must name the standalone command: {stderr}"
+    );
+    assert!(
+        !store_path.exists(),
+        "refusal must precede opening the ACP store"
+    );
+    drop(owner);
+
+    let started = run_acp();
+    assert!(
+        started.status.success(),
+        "after ownership release, stdio startup and EOF shutdown must succeed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    assert!(
+        store_path.exists(),
+        "successful startup must open the ACP store"
+    );
+
+    // The server must retain ownership even after its construction authority is dropped.
+    let config = Config {
+        data_dir: resolved_data_dir.clone(),
+        ..Config::default()
+    };
+    let authority = LiveConfigAuthority::new_owned(config).expect("own standalone state");
+    let server = AcpServer::new_stdio_with_authority(&authority, AcpServerConfig::default(), None);
+    drop(authority);
+    assert!(matches!(
+        ConfigOwnershipGuard::acquire(&resolved_data_dir),
+        Err(ConfigOwnershipError::AlreadyOwned { .. })
+    ));
+    drop(server);
+    let _released = ConfigOwnershipGuard::acquire(&resolved_data_dir)
+        .expect("dropping the final server owner must release ownership");
 }
