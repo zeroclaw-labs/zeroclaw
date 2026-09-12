@@ -62,6 +62,25 @@ agent.example.com {
 
 The gateway stays bound to `127.0.0.1`, the proxy does the listening.
 
+## Generic gateway webhook authentication
+
+The gateway's `POST /webhook` and SOP-only `POST /sop/*` routes can require an
+exact shared-secret header independently of pairing:
+
+```toml
+[gateway]
+webhook_secret = "replace-with-a-random-secret"
+```
+
+Send the value as `X-Webhook-Secret`. When `require_pairing = true` and
+`webhook_secret` is set, callers must send both the paired bearer token and
+the webhook secret. The generic gateway secret is deliberately separate from
+`[channels.webhook.<alias>].secret`; channel aliases run their own listeners
+and use body HMAC verification instead.
+
+Gateway config writes take effect through the live gateway config view. Direct
+file edits require the normal daemon reload (or a standalone gateway restart).
+
 ## Remote daemon reload
 
 `POST /admin/reload` re-reads `config.toml` and rebuilds every subsystem in place (same PID, sub-second downtime). It is the supported way to apply config changes without a full restart. By default it only accepts **loopback** callers, so a remote dashboard or `curl` from another machine gets `403 Forbidden`.

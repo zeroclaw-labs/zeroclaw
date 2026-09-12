@@ -21,10 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# Top-level keys that the SkillForge integrator emits inside `[skill]`
-# and that must be moved to `[forge]`. This list mirrors
-# `Integrator::generate_toml` exactly — keep it in sync if that
-# function's emit format changes.
+# Top-level keys the retired SkillForge integrator emitted inside `[skill]`
+# that must be moved to `[forge]`. The generator itself has been removed; this
+# list is a frozen compatibility contract for manifests it emitted while it
+# existed, and must not change.
 PROVENANCE_KEYS: Tuple[str, ...] = (
     "source",
     "owner",

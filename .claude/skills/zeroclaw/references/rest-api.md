@@ -139,7 +139,7 @@ Send a message to the agent and receive a response.
 
 **Response 200 (duplicate — idempotency key match):**
 ```json
-{"status": "duplicate", "idempotent": true, "message": "Request already processed for this idempotency key"}
+{"status": "duplicate", "idempotent": true, "message": "A prior request already reserved this idempotency key; no new dispatch was started"}
 ```
 
 **Response 401:**

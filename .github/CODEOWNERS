@@ -118,11 +118,9 @@
 # ---------------------------------------------------------------------------
 /crates/zeroclaw-plugins/**                @JordanTheJet @Audacity88
 /crates/zeroclaw-runtime/src/skills/**     @JordanTheJet @Audacity88
-/crates/zeroclaw-runtime/src/skillforge/** @JordanTheJet @Audacity88
 /plugins/**                                @JordanTheJet @Audacity88
 /src/plugins/**                            @JordanTheJet @Audacity88
 /src/skills/**                             @JordanTheJet @Audacity88
-/src/skillforge/**                         @JordanTheJet @Audacity88
 /.claude/skills/**                         @JordanTheJet @Audacity88
 
 # ---------------------------------------------------------------------------

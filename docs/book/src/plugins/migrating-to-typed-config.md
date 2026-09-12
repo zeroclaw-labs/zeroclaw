@@ -175,15 +175,19 @@ sharing credentials. Fresh installs seed and print this tool key automatically.
 A channel key includes the configured channel alias. `zeroclaw plugin install`
 and `zeroclaw plugin info` know the package but do not own that alias, so they
 cannot derive, print, or seed a channel key and must not invent a package-level
-substitute. The alias-aware production path is tracked in
-[zeroclaw#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its
-accepted successor; it must derive, display, and seed
-`zpi1(package, channel, alias)` from the actual configured alias.
+substitute. Alias-aware channel construction and runtime config resolution
+landed in
+[zeroclaw#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146): a daemon
+constructs an explicitly declared channel instance and resolves its typed config
+from `zpi1(package, channel, alias)`, keyed off the actual configured alias.
 
-Until that path lands, authors can prepare a channel manifest and guest for
-typed config, but must not mark a channel-only package migrated or publish it as
-compatible with this host contract. Operators do not yet have an automatic
-channel key path in this slice.
+Automatic `plugin info` key display and install-time seeding for channel
+instances remain manual until the grant ceremony in
+[zeroclaw#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584). Until that
+ceremony lands, operators seed the channel key by hand with `zeroclaw config
+set` rather than having install or info print and seed it for them, so a
+channel-only package that relies on the automatic install and info key path is
+not yet complete.
 
 ## Diagnosing a rejection
 

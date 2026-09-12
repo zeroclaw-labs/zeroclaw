@@ -659,6 +659,7 @@ mod tests {
             total_steps: 1,
             started_at: started_at.clone(),
             completed_at: completed_at.map(|s| s.to_string()),
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,

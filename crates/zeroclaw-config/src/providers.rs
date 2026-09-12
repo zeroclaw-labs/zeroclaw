@@ -28,7 +28,7 @@ use super::schema::{
     StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
     TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
     VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -218,6 +218,7 @@ macro_rules! for_each_model_provider_slot {
             (opencode, "opencode", OpencodeModelProviderConfig),
             (kilocli, "kilocli", KiloCliModelProviderConfig),
             (kilo, "kilo", KiloModelProviderConfig),
+            (zerorouter, "zerorouter", ZerorouterModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -272,6 +273,21 @@ impl ModelProviders {
         }
         for_each_model_provider_slot!(emit_iter_mut);
         out.into_iter()
+    }
+
+    /// First entry across every typed slot that declares a non-empty `model`,
+    /// in the existing `iter_entries` order. An entry without a `model`
+    /// cannot serve as an install-wide default — there is no model string to
+    /// pair with the provider — so entries without one are skipped instead of
+    /// seeding a provider/model mismatch at the consumer.
+    #[must_use]
+    pub fn first_entry_with_model(&self) -> Option<(&'static str, &str, &ModelProviderConfig)> {
+        self.iter_entries().find(|(_, _, base)| {
+            base.model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|model| !model.is_empty())
+        })
     }
 
     /// Resolve the family-default endpoint URI for `<family>.<alias>`. Returns
@@ -658,6 +674,51 @@ impl TranscriptionProviders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_entry_with_model_skips_model_less_entries() {
+        let mut providers = ModelProviders::default();
+        providers
+            .openai
+            .insert("alpha".to_string(), OpenAIModelProviderConfig::default());
+        providers.openai.insert(
+            "beta".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("beta-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        providers.ollama.insert(
+            "gamma".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gamma-model".to_string()),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        // Openai precedes ollama in slot order. Within openai, only "beta"
+        // has a model, so it is selected regardless of alias iteration order.
+        let first = providers
+            .first_entry_with_model()
+            .expect("an entry with a model must be found");
+        assert_eq!(
+            (first.0, first.1, first.2.model.as_deref()),
+            ("openai", "beta", Some("beta-model"))
+        );
+
+        // A whitespace-only model counts as unset, so the pick moves on to
+        // the next entry with a real model.
+        providers.openai.get_mut("beta").unwrap().base.model = Some("   ".to_string());
+        let first = providers
+            .first_entry_with_model()
+            .expect("a later entry with a model must be found");
+        assert_eq!((first.0, first.1), ("ollama", "gamma"));
+    }
 
     #[test]
     fn transcription_iter_entries_walks_every_typed_slot() {

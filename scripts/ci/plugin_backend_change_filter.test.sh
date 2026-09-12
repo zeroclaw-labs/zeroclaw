@@ -46,6 +46,15 @@ expect "mixed unrelated then config" "true" \
     "web/src/pages/AgentChat.tsx" \
     "crates/zeroclaw-config/src/schema.rs"
 
+# The root-package channel activation e2e must run the backend job. It is the
+# only piece of this job's coverage that lives outside a crate directory,
+# because it drives zeroclaw-runtime from the root `zeroclaw` package.
+expect "root channel activation e2e" "true" \
+    "tests/plugin_channel_runtime_e2e.rs"
+expect "mixed unrelated then activation e2e" "true" \
+    "web/src/pages/AgentChat.tsx" \
+    "tests/plugin_channel_runtime_e2e.rs"
+
 expect "wit contracts" "true" "wit/v0/tool-plugin.wit"
 expect "workspace manifest" "true" "Cargo.toml"
 expect "workspace lockfile" "true" "Cargo.lock"
@@ -66,6 +75,9 @@ expect "unrelated crate changes" "false" \
     "crates/zeroclaw-providers/src/openai.rs"
 expect "other workflow changes" "false" \
     ".github/workflows/release.yml"
+# The activation e2e is matched by exact path, not by a `tests/*` wildcard, so
+# the rest of the root test suite must stay outside this job.
+expect "other root tests" "false" "tests/test_live.rs"
 expect "empty input" "false"
 
 echo "plugin backend change filter tests: pass"

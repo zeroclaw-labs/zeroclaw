@@ -103,6 +103,7 @@ interface logging {
     ///
     /// This function is fire-and-forget: it has no return value and the host
     /// absorbs all errors silently. A failed log write must never crash or
-    /// interrupt plugin execution.
+    /// interrupt plugin execution. The host also discards the event if the
+    /// active service frame has exhausted its custom-import budget.
     log-record: func(level: log-level, event: plugin-event);
 }

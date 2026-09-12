@@ -77,44 +77,35 @@ impl PostgresMemory {
         let qualified_table = format!("{schema_ident}.{table_ident}");
         let qualified_agents = format!("{schema_ident}.agents");
 
-        let client = Self::initialize_client(
+        let pgvector = if pgvector_enabled.unwrap_or(false) {
+            Some(pgvector_dimensions.unwrap_or(1536))
+        } else {
+            None
+        };
+
+        let (client, pgvector_ok) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
             schema_ident.clone(),
             qualified_table.clone(),
+            pgvector,
         )?;
 
-        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
-        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
-
-        if pgvector_enabled {
-            let client_ref = Arc::new(Mutex::new(client));
-            let ext_ok = {
-                let mut c = client_ref.lock();
-                Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
-            };
-            if !ext_ok {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "pgvector extension not available; falling back to keyword-only recall"
-                );
-            }
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(client_ref),
-                qualified_table,
-                qualified_agents,
-            })
-        } else {
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(Arc::new(Mutex::new(client))),
-                qualified_table,
-                qualified_agents,
-            })
+        if !pgvector_ok {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "pgvector extension not available; falling back to keyword-only recall"
+            );
         }
+
+        Ok(Self {
+            alias: alias.to_string(),
+            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            qualified_table,
+            qualified_agents,
+        })
     }
 
     fn initialize_client(
@@ -122,10 +113,11 @@ impl PostgresMemory {
         connect_timeout_secs: Option<u64>,
         schema_ident: String,
         qualified_table: String,
-    ) -> Result<Client> {
+        pgvector: Option<usize>,
+    ) -> Result<(Client, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
+            .spawn(move || -> Result<(Client, bool)> {
                 let mut config: postgres::Config = db_url
                     .parse()
                     .context("invalid PostgreSQL connection URL")?;
@@ -145,7 +137,16 @@ impl PostgresMemory {
                     &schema_ident,
                     &qualified_table,
                 )?;
-                Ok(client)
+                // The synchronous postgres client uses block_on internally,
+                // so pgvector setup must also stay on this plain OS thread —
+                // calling it from a Tokio runtime thread panics.
+                let pgvector_ok = match pgvector {
+                    Some(dimensions) => {
+                        Self::try_enable_pgvector(&mut client, &qualified_table, dimensions).is_ok()
+                    }
+                    None => true,
+                };
+                Ok((client, pgvector_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
@@ -959,6 +960,96 @@ mod tests {
             outcome.unwrap().is_err(),
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_with_pgvector_enabled_does_not_panic_inside_tokio_runtime() {
+        let outcome = std::panic::catch_unwind(|| {
+            PostgresMemory::new(
+                "test",
+                "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
+                "public",
+                "memories",
+                Some(1),
+                Some(true),
+                Some(4),
+            )
+        });
+
+        assert!(
+            outcome.is_ok(),
+            "PostgresMemory::new should not panic with pgvector enabled"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
+
+    struct TestSchema {
+        admin: Client,
+        name: String,
+    }
+
+    impl TestSchema {
+        fn create(database_url: &str, purpose: &str) -> Self {
+            let name = format!("zc_mem_{purpose}_{}", std::process::id());
+            let mut admin = Client::connect(database_url, NoTls).unwrap();
+            admin
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {0} CASCADE; CREATE SCHEMA {0}",
+                    quote_identifier(&name)
+                ))
+                .unwrap();
+            Self { admin, name }
+        }
+    }
+
+    impl Drop for TestSchema {
+        fn drop(&mut self) {
+            let _ = self.admin.batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS {} CASCADE",
+                quote_identifier(&self.name)
+            ));
+        }
+    }
+
+    /// Live regression for the nested-runtime panic in the pgvector-enabled
+    /// construction path: `try_enable_pgvector` must run inside the
+    /// `postgres-memory-init` OS thread, because the synchronous postgres
+    /// client calls `block_on` internally and panics on a Tokio runtime
+    /// thread. The pgvector extension does not need to be installed in the
+    /// target database — an unavailable extension takes the graceful
+    /// keyword-only fallback, while the pre-fix code panics before that
+    /// fallback is reached.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_new_with_pgvector_enabled_from_tokio_runtime_does_not_panic() {
+        let database_url = std::env::var("ZEROCLAW_TEST_POSTGRES_URL")
+            .expect("set ZEROCLAW_TEST_POSTGRES_URL to run ignored PostgreSQL tests");
+        let schema = TestSchema::create(&database_url, "vec");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let memory = runtime.block_on(async {
+            PostgresMemory::new(
+                "test",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                Some(true),
+                Some(4),
+            )
+        });
+
+        let memory =
+            memory.expect("pgvector-enabled construction from a Tokio runtime should succeed");
+        drop(memory);
+        drop(runtime);
     }
 
     #[test]

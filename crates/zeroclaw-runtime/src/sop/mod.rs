@@ -31,7 +31,10 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
+pub use engine::{
+    CancelOutcome, MaintenanceSummary, SopEngine, err_is_cancellation_persistence_retained,
+    err_is_resume_at_capacity, err_is_terminal_persistence_retained,
+};
 pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -515,6 +518,194 @@ fn normalize_manifest_steps(mut steps: Vec<SopStep>) -> Vec<SopStep> {
 
 // ── Markdown step parser ────────────────────────────────────────
 
+/// A parser behavior or `SOP.md` bullet understood by [`parse_steps`].
+///
+/// The catalog is the source for the generated syntax reference. Bullet
+/// prefixes are also consumed by the parser below, so adding a supported
+/// bullet requires updating one source-side entry rather than a separate
+/// hand-maintained documentation list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopStepSyntaxKey {
+    StepsSection,
+    NumberedItem,
+    BoldTitle,
+    Tools,
+    AllowTools,
+    DenyTools,
+    RequiresConfirmation,
+    Kind,
+    Capability,
+    With,
+    Input,
+    Output,
+    When,
+    Next,
+    Terminal,
+    DependsOn,
+    Switch,
+    OnFailure,
+    Mode,
+    Agent,
+    Call,
+    Prompt,
+    Policy,
+    Edit,
+    ContinuationBody,
+}
+
+impl SopStepSyntaxKey {
+    fn bullet_prefixes(self) -> &'static [&'static str] {
+        match self {
+            Self::Tools => &["tools:"],
+            Self::AllowTools => &["allow-tools:", "allow_tools:"],
+            Self::DenyTools => &["deny-tools:", "deny_tools:"],
+            Self::RequiresConfirmation => &["requires_confirmation:"],
+            Self::Kind => &["kind:"],
+            Self::Capability => &["capability:"],
+            Self::With => &["with:"],
+            Self::Input => &["input:"],
+            Self::Output => &["output:"],
+            Self::When => &["when:"],
+            Self::Next => &["next:"],
+            Self::Terminal => &["terminal:"],
+            Self::DependsOn => &["depends_on:", "depends-on:"],
+            Self::Switch => &["switch:"],
+            Self::OnFailure => &["on_failure:", "on-failure:"],
+            Self::Mode => &["mode:"],
+            Self::Agent => &["agent:"],
+            Self::Call => &["call:"],
+            Self::Prompt => &["prompt:"],
+            Self::Policy => &["policy:"],
+            Self::Edit => &["edit:"],
+            Self::StepsSection | Self::NumberedItem | Self::BoldTitle | Self::ContinuationBody => {
+                &[]
+            }
+        }
+    }
+}
+
+/// One source-owned entry in the generated SOP syntax reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SopStepSyntaxSpec {
+    /// The parser behavior or bullet this entry documents.
+    pub key: SopStepSyntaxKey,
+    /// Human-readable explanation rendered into `docs/book/src/sop/syntax.md`.
+    pub description: &'static str,
+}
+
+/// Parser behavior and bullet catalog used by the SOP syntax reference.
+pub const SOP_STEP_SYNTAX_CATALOG: &[SopStepSyntaxSpec] = &[
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::StepsSection,
+        description: "The `## Steps` section is parsed until the next level-two heading.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::NumberedItem,
+        description: "Numbered items (`1.`, `2.`, ...) define step order.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::BoldTitle,
+        description: "Leading bold text (`**Title**`) becomes the step title; the remaining text becomes its body.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Tools,
+        description: "`- tools:` maps to `suggested_tools` and provides advisory tool names for the step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::AllowTools,
+        description: "`- allow-tools:` (or `- allow_tools:`) defines an explicit per-step tool allow-list.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::DenyTools,
+        description: "`- deny-tools:` (or `- deny_tools:`) defines an explicit per-step tool deny-list.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::RequiresConfirmation,
+        description: "`- requires_confirmation: true` enforces approval for that step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Kind,
+        description: "`- kind:` accepts `execute` (default), `checkpoint`/`approval`, or `capability`; a checkpoint pauses deterministic execution, while `requires_confirmation: true` requires approval in any execution mode.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Capability,
+        description: "`- capability:` names the deterministic capability used by a `kind: capability` step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::With,
+        description: "`- with:` supplies the structured input for a capability step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Input,
+        description: "`- input:` attaches a JSON Schema-like input contract to the step boundary.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Output,
+        description: "`- output:` attaches a JSON Schema-like output contract to the step boundary.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::When,
+        description: "`- when:` is evaluated against accumulated completed-step outputs after the current step finishes. A false guard bypasses `switch` and explicit `next`, taking the linear successor or completing when the step is terminal or has no successor. With a true or absent guard, a non-empty `switch` takes precedence over `next`; without a switch, an explicit `next` is used before terminal or linear routing.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Next,
+        description: "`- next:` routes to an explicit successor only when the top-level `when` allows routing and no `switch` ports are declared; ineligible routed steps are marked `skipped` and leave the run `pending` instead of dispatching.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Terminal,
+        description: "`- terminal: true` completes the run instead of advancing to another step; the final step also completes when it has no linear successor.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::DependsOn,
+        description: "`- depends_on:` (or `- depends-on:`) lists prerequisite steps for a non-linear run.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Switch,
+        description: "`- switch:` defines ordered `name>condition>step` ports for multi-branch routing. With a true or absent top-level `when`, the first matching port wins; an unmatched switch completes the run, and `next` plus the linear successor are ignored. A false top-level `when` bypasses switch evaluation.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::OnFailure,
+        description: "`- on_failure:` (or `- on-failure:`) accepts `fail`, `retry:<count>`, or `goto:<step>` and is enforced for reported step failures and output-schema failures.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Mode,
+        description: "`- mode:` overrides the SOP execution mode for that step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Agent,
+        description: "`- agent:` overrides the parent agent alias for that step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Call,
+        description: "`- call:` adds a JSON planned tool call to the step when the value parses as a planned call.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Prompt,
+        description: "`- prompt:` sets the approval-gate notice template.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Policy,
+        description: "`- policy:` names an approval-broker policy in `[sop.approval].policies`; the policy gates approval through required-group membership and quorum. An absent policy fails closed rather than clearing on a single approval, while omission leaves the gate unpoliced.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Edit,
+        description: "`- edit:` opts a checkpoint into editing the named field before resume.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::ContinuationBody,
+        description: "Unrecognized sub-bullets and other non-empty continuation lines are appended to the step body.",
+    },
+];
+
+fn parse_step_bullet(bullet: &str) -> Option<(SopStepSyntaxKey, &str)> {
+    SOP_STEP_SYNTAX_CATALOG.iter().find_map(|spec| {
+        spec.key
+            .bullet_prefixes()
+            .iter()
+            .find_map(|prefix| bullet.strip_prefix(prefix).map(|value| (spec.key, value)))
+    })
+}
+
 /// Parse procedure steps from SOP.md content.
 /// Expects a `## Steps` heading followed by numbered items (`1.`, `2.`, …).
 /// Each item's first bold text (`**...**`) is the step title; the rest is body.
@@ -570,85 +761,101 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
         // Sub-bullet parsing (only when inside a step)
         if current.number.is_some() && trimmed.starts_with("- ") {
             let bullet = trimmed.trim_start_matches("- ").trim();
-            if let Some(tools_str) = bullet.strip_prefix("tools:") {
-                current.tools = parse_csv_list(tools_str);
-            } else if let Some(tools_str) = bullet
-                .strip_prefix("allow-tools:")
-                .or_else(|| bullet.strip_prefix("allow_tools:"))
-            {
-                ensure_scope(&mut current.scope).allow = Some(parse_csv_list(tools_str));
-            } else if let Some(tools_str) = bullet
-                .strip_prefix("deny-tools:")
-                .or_else(|| bullet.strip_prefix("deny_tools:"))
-            {
-                ensure_scope(&mut current.scope).deny = parse_csv_list(tools_str);
-            } else if bullet.starts_with("requires_confirmation:") {
-                if let Some(val) = bullet.strip_prefix("requires_confirmation:") {
-                    current.requires_confirmation = val.trim().eq_ignore_ascii_case("true");
+            if let Some((key, val)) = parse_step_bullet(bullet) {
+                match key {
+                    SopStepSyntaxKey::Tools => {
+                        current.tools = parse_csv_list(val);
+                    }
+                    SopStepSyntaxKey::AllowTools => {
+                        ensure_scope(&mut current.scope).allow = Some(parse_csv_list(val));
+                    }
+                    SopStepSyntaxKey::DenyTools => {
+                        ensure_scope(&mut current.scope).deny = parse_csv_list(val);
+                    }
+                    SopStepSyntaxKey::RequiresConfirmation => {
+                        current.requires_confirmation = val.trim().eq_ignore_ascii_case("true");
+                    }
+                    SopStepSyntaxKey::Kind => {
+                        current.kind = parse_step_kind(val);
+                    }
+                    SopStepSyntaxKey::Capability => {
+                        current.capability = Some(val.trim().to_string());
+                    }
+                    SopStepSyntaxKey::With => {
+                        current.capability_input = Some(parse_value_fragment(val.trim()));
+                    }
+                    SopStepSyntaxKey::Input => {
+                        ensure_schema(&mut current.schema).input =
+                            Some(parse_value_fragment(val.trim()));
+                    }
+                    SopStepSyntaxKey::Output => {
+                        ensure_schema(&mut current.schema).output =
+                            Some(parse_value_fragment(val.trim()));
+                    }
+                    SopStepSyntaxKey::When => {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            current.routing.when = Some(val.to_string());
+                        }
+                    }
+                    SopStepSyntaxKey::Next => {
+                        current.routing.next = val.trim().parse::<u32>().ok();
+                    }
+                    SopStepSyntaxKey::Terminal => {
+                        current.routing.terminal = val.trim().eq_ignore_ascii_case("true");
+                    }
+                    SopStepSyntaxKey::DependsOn => {
+                        current.routing.depends_on = parse_u32_list(val);
+                    }
+                    SopStepSyntaxKey::Switch => {
+                        current.routing.switch = parse_switch_rules(val);
+                    }
+                    SopStepSyntaxKey::OnFailure => {
+                        current.on_failure = parse_step_failure(val);
+                    }
+                    SopStepSyntaxKey::Mode => {
+                        current.mode = Some(parse_execution_mode(val));
+                    }
+                    SopStepSyntaxKey::Agent => {
+                        let trimmed_val = val.trim();
+                        current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
+                    }
+                    SopStepSyntaxKey::Call => {
+                        if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
+                            current.calls.push(call);
+                        }
+                    }
+                    SopStepSyntaxKey::Prompt => {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            current.gate_prompt = Some(val.to_string());
+                        }
+                    }
+                    SopStepSyntaxKey::Policy => {
+                        let val = val.trim();
+                        current.policy = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                    }
+                    SopStepSyntaxKey::Edit => {
+                        // Editable-field opt-in for a checkpoint gate: the named field of
+                        // the piped value an approver may amend before the run resumes.
+                        let val = val.trim();
+                        current.edit = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                    }
+                    SopStepSyntaxKey::StepsSection
+                    | SopStepSyntaxKey::NumberedItem
+                    | SopStepSyntaxKey::BoldTitle
+                    | SopStepSyntaxKey::ContinuationBody => {
+                        unreachable!("non-bullet SOP syntax key returned by parse_step_bullet")
+                    }
                 }
-            } else if bullet.starts_with("kind:") {
-                if let Some(val) = bullet.strip_prefix("kind:") {
-                    current.kind = parse_step_kind(val);
-                }
-            } else if let Some(val) = bullet.strip_prefix("capability:") {
-                current.capability = Some(val.trim().to_string());
-            } else if let Some(val) = bullet.strip_prefix("with:") {
-                current.capability_input = Some(parse_value_fragment(val.trim()));
-            } else if let Some(val) = bullet.strip_prefix("input:") {
-                ensure_schema(&mut current.schema).input = Some(parse_value_fragment(val.trim()));
-            } else if let Some(val) = bullet.strip_prefix("output:") {
-                ensure_schema(&mut current.schema).output = Some(parse_value_fragment(val.trim()));
-            } else if let Some(val) = bullet.strip_prefix("when:") {
-                let val = val.trim();
-                if !val.is_empty() {
-                    current.routing.when = Some(val.to_string());
-                }
-            } else if let Some(val) = bullet.strip_prefix("next:") {
-                current.routing.next = val.trim().parse::<u32>().ok();
-            } else if let Some(val) = bullet.strip_prefix("terminal:") {
-                current.routing.terminal = val.trim().eq_ignore_ascii_case("true");
-            } else if let Some(val) = bullet
-                .strip_prefix("depends_on:")
-                .or_else(|| bullet.strip_prefix("depends-on:"))
-            {
-                current.routing.depends_on = parse_u32_list(val);
-            } else if let Some(val) = bullet.strip_prefix("switch:") {
-                current.routing.switch = parse_switch_rules(val);
-            } else if let Some(val) = bullet
-                .strip_prefix("on_failure:")
-                .or_else(|| bullet.strip_prefix("on-failure:"))
-            {
-                current.on_failure = parse_step_failure(val);
-            } else if let Some(val) = bullet.strip_prefix("mode:") {
-                current.mode = Some(parse_execution_mode(val));
-            } else if let Some(val) = bullet.strip_prefix("agent:") {
-                let trimmed_val = val.trim();
-                current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
-            } else if let Some(val) = bullet.strip_prefix("call:") {
-                if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
-                    current.calls.push(call);
-                }
-            } else if let Some(val) = bullet.strip_prefix("prompt:") {
-                let val = val.trim();
-                if !val.is_empty() {
-                    current.gate_prompt = Some(val.to_string());
-                }
-            } else if let Some(val) = bullet.strip_prefix("policy:") {
-                let val = val.trim();
-                current.policy = if val.is_empty() {
-                    None
-                } else {
-                    Some(val.to_string())
-                };
-            } else if let Some(val) = bullet.strip_prefix("edit:") {
-                // Editable-field opt-in for a checkpoint gate: the named field of
-                // the piped value an approver may amend before the run resumes.
-                let val = val.trim();
-                current.edit = if val.is_empty() {
-                    None
-                } else {
-                    Some(val.to_string())
-                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {

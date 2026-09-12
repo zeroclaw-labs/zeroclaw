@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
 use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
@@ -20,6 +21,32 @@ use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionS
 const CONFIG_RENAME_TIMEOUT: Duration = Duration::from_secs(120);
 const CRON_TRIGGER_TIMEOUT: Duration = Duration::from_secs(600);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTBOUND_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTBOUND_RETIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// ONE absolute budget for the entire client-side relay setup: the TCP connect,
+/// the outer TLS and WebSocket upgrade, the route request, the relay's `Opened`
+/// answer, and - on the RPC route - the inner WSS and mTLS handshake that runs
+/// over the finished tunnel.
+///
+/// Absolute rather than per phase: a fresh timeout per step lets an
+/// unresponsive relay spend one full budget on each of them, which is how a
+/// "bounded" setup still hangs for minutes. The daemon's own relay bridge bounds
+/// its outbound setup the same way and with the same figure, so a client and a
+/// daemon facing the same dead relay give up together instead of one waiting on
+/// the other.
+const RELAY_SETUP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A single outbound write to the relay may not stall longer than this. Mirrors
+/// the daemon bridge's write-stall bound, which is its dead-link interval: once
+/// the link is up the peer is expected to keep reading, and one that stops must
+/// not pin this pump - and the inner TLS stream behind it - forever.
+///
+/// Reads are deliberately NOT bounded this way. An idle session is legitimate:
+/// the operator may be reading rather than typing, and silence alone is not
+/// evidence of a dead link. Liveness of an established link is the keepalive
+/// layer's job, not the pump's.
+const RELAY_WRITE_STALL: Duration = Duration::from_secs(60);
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -89,6 +116,7 @@ pub mod method {
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
+    pub const SESSION_STATE: &str = "session/state";
     pub const SESSION_GIT_BRANCH: &str = "session/git_branch";
     pub const SESSION_APPROVE: &str = "session/approve";
     pub const SESSION_CLOSE: &str = "session/close";
@@ -211,14 +239,13 @@ pub struct RpcInboundRequest {
     pub params: Value,
 }
 
-/// Buffer capacity for the server-initiated inbound-request broadcast.
+/// Buffer size for the `session/update` notification broadcast.
 ///
-/// These frames are response-bearing (today: `elicitation/create`): a dropped
-/// one parks the daemon's tool call until the session timeout. The buffer is
-/// sized generously so a busy TUI draw loop does not lag the receiver and lose
-/// an elicitation. The Chat pane additionally surfaces a `Lagged` overflow so
-/// the rare drop is diagnosable rather than a silent hang.
-pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
+/// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
+/// background sessions live): chunk volume multiplies between draw-loop
+/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
+/// session's status dot in "running" forever.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
 
 // ── Typed session updates ────────────────────────────────────────
 
@@ -271,6 +298,8 @@ pub enum SessionUpdate {
         session_id: String,
         outcome: TurnEndOutcome,
         content: String,
+        client_turn_generation: Option<u64>,
+        message_count: Option<usize>,
     },
     /// The agent published or updated its execution plan (TodoWrite).
     /// Whole-list replacement; `entries` is the complete authoritative
@@ -279,6 +308,24 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+}
+
+impl SessionUpdate {
+    /// The session this update belongs to. Every variant carries the id;
+    /// multi-session panes route on it before applying the update.
+    pub fn session_id(&self) -> &str {
+        match self {
+            SessionUpdate::AgentMessageChunk { session_id, .. }
+            | SessionUpdate::AgentThoughtChunk { session_id, .. }
+            | SessionUpdate::ToolCall { session_id, .. }
+            | SessionUpdate::ToolResult { session_id, .. }
+            | SessionUpdate::ApprovalRequest { session_id, .. }
+            | SessionUpdate::ContextUsage { session_id, .. }
+            | SessionUpdate::HistoryTrimmed { session_id, .. }
+            | SessionUpdate::TurnComplete { session_id, .. }
+            | SessionUpdate::Plan { session_id, .. } => session_id,
+        }
+    }
 }
 
 /// Wire mirror of the daemon's `TurnCompletionOutcome`. Decoded straight from
@@ -349,6 +396,13 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            client_turn_generation: params
+                .get("client_turn_generation")
+                .and_then(|v| v.as_u64()),
+            message_count: params
+                .get("message_count")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
@@ -404,6 +458,30 @@ pub enum Transport {
 pub enum ConnectionState {
     Connected,
     Disconnected { reason: String },
+}
+
+fn replace_connection_state(state: &Mutex<ConnectionState>, next: ConnectionState) {
+    match state.lock() {
+        Ok(mut state) => *state = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+fn disconnect_rpc(rpc: &RpcOutbound, state: &Mutex<ConnectionState>, reason: String) {
+    replace_connection_state(
+        state,
+        ConnectionState::Disconnected {
+            reason: reason.clone(),
+        },
+    );
+    rpc.fail_pending(&format!("Connection closed: {reason}"));
+}
+
+fn clone_connection_state(state: &Mutex<ConnectionState>) -> ConnectionState {
+    match state.lock() {
+        Ok(state) => state.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 /// The TUI and daemon are built from the same package version and do not
@@ -573,9 +651,9 @@ async fn request_initialize(
 fn route_inbound_frame(
     rpc: &Arc<RpcOutbound>,
     notif_tx: &broadcast::Sender<RpcNotification>,
-    inbound_tx: &broadcast::Sender<RpcInboundRequest>,
+    inbound_tx: Option<&mpsc::UnboundedSender<RpcInboundRequest>>,
     frame: Value,
-) {
+) -> Option<RpcInboundRequest> {
     let id = frame.get(field::ID).cloned();
     let method = frame
         .get(field::METHOD)
@@ -586,7 +664,11 @@ fn route_inbound_frame(
         // Server-initiated request: both id and method present.
         (Some(id), Some(method)) if !id.is_null() => {
             let params = frame.get("params").cloned().unwrap_or(Value::Null);
-            let _ = inbound_tx.send(RpcInboundRequest { id, method, params });
+            let request = RpcInboundRequest { id, method, params };
+            if let Some(inbound_tx) = inbound_tx {
+                return inbound_tx.send(request).err().map(|error| error.0);
+            }
+            return Some(request);
         }
         // Response: id present (typically a string), result or error,
         // no method.
@@ -608,22 +690,118 @@ fn route_inbound_frame(
         }
         _ => {}
     }
+    None
+}
+
+#[derive(Debug)]
+enum ReaderControl {
+    Quiesce(oneshot::Sender<()>),
+}
+
+#[derive(Debug, Default)]
+struct WssFlushAck {
+    pending: Mutex<Option<(Vec<u8>, oneshot::Sender<()>)>>,
+}
+
+impl WssFlushAck {
+    fn register(&self, payload: Vec<u8>) -> Option<oneshot::Receiver<()>> {
+        let mut pending = self.pending.lock().ok()?;
+        let (ack_tx, ack_rx) = oneshot::channel();
+        *pending = Some((payload, ack_tx));
+        Some(ack_rx)
+    }
+
+    fn acknowledge(&self, payload: &[u8]) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if pending
+            .as_ref()
+            .is_some_and(|(expected, _)| expected == payload)
+            && let Some((_, ack)) = pending.take()
+        {
+            let _ = ack.send(());
+        }
+    }
+}
+
+fn handle_wss_reader_message(
+    message: Option<
+        std::result::Result<
+            tokio_tungstenite::tungstenite::Message,
+            tokio_tungstenite::tungstenite::Error,
+        >,
+    >,
+    rpc: &Arc<RpcOutbound>,
+    notif_tx: &broadcast::Sender<RpcNotification>,
+    inbound_tx: Option<&mpsc::UnboundedSender<RpcInboundRequest>>,
+    inbound_responses: &Arc<InboundResponseTracker>,
+    conn_state: &Arc<Mutex<ConnectionState>>,
+    flush_ack: &WssFlushAck,
+) -> bool {
+    use tokio_tungstenite::tungstenite::Message;
+
+    match message {
+        Some(Ok(Message::Text(text))) => {
+            let frame: Value = match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(_) => return true,
+            };
+            if let Some(request) = route_inbound_frame(rpc, notif_tx, inbound_tx, frame) {
+                respond_to_retired_inbound_request(rpc, inbound_responses, request);
+            }
+        }
+        Some(Ok(Message::Close(frame))) => {
+            let reason = frame
+                .map(|frame| frame.reason.to_string())
+                .unwrap_or_else(|| "server closed connection".to_string());
+            disconnect_rpc(rpc, conn_state, reason);
+            return false;
+        }
+        Some(Ok(Message::Pong(payload))) => {
+            flush_ack.acknowledge(payload.as_ref());
+        }
+        Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
+        Some(Ok(Message::Binary(_))) => {}
+        Some(Err(error)) => {
+            disconnect_rpc(rpc, conn_state, error.to_string());
+            return false;
+        }
+        None => {
+            disconnect_rpc(rpc, conn_state, "EOF (WSS connection closed)".to_string());
+            return false;
+        }
+    }
+    true
 }
 
 #[derive(Debug)]
 pub struct RpcClient {
     pub(crate) rpc: Arc<RpcOutbound>,
-    _read_task: tokio::task::JoinHandle<()>,
-    _router_task: tokio::task::JoinHandle<()>,
+    read_task: tokio::task::JoinHandle<()>,
+    /// Retirement closes the app-facing request queue while keeping the
+    /// transport reader alive to answer requests that cross the cutover.
+    reader_control: Option<mpsc::UnboundedSender<ReaderControl>>,
+    router_task: tokio::task::JoinHandle<()>,
+    /// Drains the outbound queue into the transport. `None` on the local socket
+    /// path, whose writer is owned by its own reader loop.
+    writer_task: Option<tokio::task::JoinHandle<()>>,
+    /// The relay tunnel pump, when this client runs over a relay. Held so
+    /// replacing the client also reclaims the relay route instead of leaving a
+    /// pump reading a link nobody consumes.
+    relay_pump: Option<tokio::task::JoinHandle<()>>,
     pub server_version: String,
     /// OS process ID reported by the daemon during initialize.
     pub server_pid: Option<u32>,
     notifications_bcast: broadcast::Sender<RpcNotification>,
-    /// Broadcast channel for server-initiated requests that expect a
-    /// response (today: `elicitation/create`). The Chat widget for the
-    /// targeted session subscribes and answers via
-    /// [`RpcClient::respond_to_inbound_request`].
-    inbound_requests_bcast: broadcast::Sender<RpcInboundRequest>,
+    /// Single-consumer queue for server-initiated requests that expect a
+    /// response (today: `elicitation/create`). Keeping the receiver here until
+    /// the app claims it preserves requests that arrive during pane startup.
+    inbound_requests_rx: Mutex<Option<mpsc::UnboundedReceiver<RpcInboundRequest>>>,
+    /// Responses accepted by the app but not yet enqueued to the bounded
+    /// writer. Registration is synchronous so an ordered retirement flush
+    /// cannot overtake a responder that Tokio has not polled yet.
+    inbound_responses: Arc<InboundResponseTracker>,
     connection_state: Arc<Mutex<ConnectionState>>,
     /// TUI session UID assigned by the daemon during initialize.
     pub tui_id: Option<String>,
@@ -634,6 +812,797 @@ pub struct RpcClient {
     /// Shared TUI command metadata received from the daemon's canonical
     /// command catalogue during initialization.
     commands: Vec<crate::wire::CommandDescriptor>,
+}
+
+#[derive(Debug, Default)]
+struct InboundResponseTracker {
+    pending: AtomicUsize,
+    idle: Notify,
+}
+
+impl InboundResponseTracker {
+    fn register(self: &Arc<Self>) -> InboundResponseGuard {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        InboundResponseGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+struct InboundResponseGuard {
+    tracker: Arc<InboundResponseTracker>,
+}
+
+impl Drop for InboundResponseGuard {
+    fn drop(&mut self) {
+        if self.tracker.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.idle.notify_waiters();
+        }
+    }
+}
+
+/// Build the one terminal response used when an app router is retired.
+pub(crate) fn terminal_inbound_response(
+    request: RpcInboundRequest,
+) -> (Value, std::result::Result<Value, JsonRpcError>) {
+    let response = if request.method == "elicitation/create" {
+        Ok(serde_json::json!({ "action": "cancel" }))
+    } else {
+        Err(JsonRpcError {
+            code: crate::jsonrpc::error_codes::METHOD_NOT_FOUND,
+            message: format!("Method not found: {}", request.method),
+            data: None,
+        })
+    };
+    (request.id, response)
+}
+
+fn enqueue_inbound_responses(
+    rpc: Arc<RpcOutbound>,
+    tracker: Arc<InboundResponseTracker>,
+    responses: Vec<(Value, std::result::Result<Value, JsonRpcError>)>,
+) {
+    if responses.is_empty() {
+        return;
+    }
+    let guard = tracker.register();
+    tokio::spawn(async move {
+        let _guard = guard;
+        for (id, result) in responses {
+            let _ = rpc.respond(id, result).await;
+        }
+    });
+}
+
+fn respond_to_retired_inbound_request(
+    rpc: &Arc<RpcOutbound>,
+    tracker: &Arc<InboundResponseTracker>,
+    request: RpcInboundRequest,
+) {
+    enqueue_inbound_responses(
+        Arc::clone(rpc),
+        Arc::clone(tracker),
+        vec![terminal_inbound_response(request)],
+    );
+}
+
+/// Dial the daemon through a nominated relay instead of connecting directly.
+#[derive(Debug, Clone)]
+pub struct RelayDial {
+    /// Relay address (`host:port`) to connect to.
+    pub relay_addr: String,
+    /// Server name presented for the relay's outer TLS certificate (its SAN).
+    /// Defaults to the host portion of `relay_addr` when unset.
+    pub relay_host: String,
+    /// Node-id of the target daemon to request from the relay.
+    pub node_id: String,
+    /// PEM CA to trust for the relay's outer certificate. When set, this wins
+    /// over remembered pins and TOFU; when unset (and not insecure) the built-in
+    /// public webpki roots are used.
+    pub relay_ca_path: Option<String>,
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    pub relay_insecure: bool,
+    /// Expected relay OUTER-leaf SHA-256 pin (`--relay-pin` or the enrollment-
+    /// delivered `relay_cert_pin`). Used only when no `relay_ca_path` is set.
+    pub relay_pin: Option<String>,
+    /// Opt-in trust-on-first-use for the relay's outer leaf: accept the first cert
+    /// and persist its pin to `pin_store` so later runs pin it. Ignored when a
+    /// relay CA or pin is configured.
+    pub relay_tofu: bool,
+    /// Where to persist a TOFU-observed pin (`<config_dir>/relay/relay_pin`).
+    pub pin_store: Option<std::path::PathBuf>,
+    /// Outer-mTLS variant: PEM cert/key presented to the relay on the OUTER layer
+    /// (when the relay sets `outer_client_auth`). Separate from the inner mTLS.
+    pub outer_client_cert: Option<String>,
+    pub outer_client_key: Option<String>,
+}
+
+/// TLS verification + mutual-TLS client identity for a WSS connection.
+#[derive(Debug, Clone, Default)]
+pub struct ClientTls {
+    /// Disable server certificate verification (self-signed dev only).
+    pub skip_verify: bool,
+    /// PEM CA certificate to verify the daemon against (mutual TLS). When unset
+    /// and not skipping, the system / webpki roots are used.
+    pub ca_cert_path: Option<String>,
+    /// PEM client certificate to present to the daemon (mutual TLS).
+    pub client_cert_path: Option<String>,
+    /// PEM private key for `client_cert_path`.
+    pub client_key_path: Option<String>,
+}
+
+impl ClientTls {
+    /// True when no custom TLS material is configured (plain default path). Any
+    /// lone field (including a stray `client_key_path`) forces the custom path so
+    /// the cert+key must-come-together validation in `wss_tls_config` runs.
+    pub fn is_default(&self) -> bool {
+        !self.skip_verify
+            && self.ca_cert_path.is_none()
+            && self.client_cert_path.is_none()
+            && self.client_key_path.is_none()
+    }
+}
+
+/// Verifier that accepts every server certificate without checking. Used only on
+/// the explicit `skip_verify` path (insecure; self-signed dev only).
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Persist a TOFU-observed relay outer-leaf pin (sha256 hex) to `path` at `0600`,
+/// creating parent dirs. Best-effort: a write failure just means we TOFU again
+/// next run (the connection already succeeded).
+pub(crate) fn persist_relay_pin(path: &std::path::Path, pin: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = f.write_all(pin.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, pin.as_bytes());
+    }
+}
+
+/// Outer TLS to the relay with a trust-on-first-use verifier purely to OBSERVE
+/// its leaf certificate fingerprint (it is not yet trusted/pinned), so the
+/// operator can confirm it interactively before it is remembered. Returns the
+/// SHA-256 pin the relay would be pinned to. The outer TLS is a metadata boundary;
+/// the inner mutual TLS to the daemon is unaffected (A2).
+///
+/// The probe runs under the same absolute setup budget as a real dial: it is
+/// the FIRST thing an interactive relay session does, and an unreachable or
+/// silent relay would otherwise hold the operator at a prompt that never
+/// resolves.
+pub async fn probe_relay_cert_pin(relay_addr: &str, relay_host: &str) -> Result<String> {
+    let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
+    within_relay_setup(deadline, "the relay trust probe", async {
+        probe_relay_cert_pin_unbounded(relay_addr, relay_host).await
+    })
+    .await
+}
+
+async fn probe_relay_cert_pin_unbounded(relay_addr: &str, relay_host: &str) -> Result<String> {
+    let tcp = tokio::net::TcpStream::connect(relay_addr)
+        .await
+        .with_context(|| format!("connecting to relay {relay_addr}"))?;
+    let verifier = Arc::new(crate::client_crypto::RelayPinVerifier::tofu());
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(verifier.clone())
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let server_name = rustls::pki_types::ServerName::try_from(relay_host.to_string())
+        .with_context(|| format!("relay host '{relay_host}' as a TLS server name"))?;
+    let _tls = connector
+        .connect(server_name, tcp)
+        .await
+        .with_context(|| format!("relay outer TLS handshake to {relay_addr}"))?;
+    verifier
+        .observed_pin()
+        .context("the relay presented no certificate to pin")
+}
+
+/// Load PEM certificates from a file into DER.
+fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let pem = std::fs::read(path).with_context(|| format!("reading certificate file {path}"))?;
+    rustls_pemfile::certs(&mut &pem[..])
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing PEM certificates from {path}"))
+}
+
+/// Load the daemon CA cached by enrollment. The enrollment SAS binds exactly one
+/// daemon trust anchor, so the connect path must not later broaden trust by
+/// accepting every PEM block in the cached file.
+fn load_single_daemon_ca_cert(path: &str) -> Result<rustls::pki_types::CertificateDer<'static>> {
+    let certs = load_pem_certs(path)?;
+    match certs.len() {
+        0 => anyhow::bail!("no daemon CA certificate found in {path}"),
+        1 => Ok(certs.into_iter().next().expect("checked exactly one cert")),
+        n => anyhow::bail!(
+            "cached daemon CA file {path} must contain exactly one daemon CA certificate, got {n}"
+        ),
+    }
+}
+
+/// Load a PEM private key from a file into DER.
+fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let pem = std::fs::read(path).with_context(|| format!("reading key file {path}"))?;
+    rustls_pemfile::private_key(&mut &pem[..])
+        .with_context(|| format!("parsing private key from {path}"))?
+        .ok_or_else(|| anyhow::Error::msg(format!("no private key found in {path}")))
+}
+
+/// Open a tunnel to the daemon through a nominated relay.
+///
+/// Establishes the OUTER TLS + WebSocket session to the relay, requests the
+/// target `node_id`, and on `Opened` returns an in-memory byte stream over which
+/// the caller runs the INNER WSS + mTLS. A pump task bridges that byte stream
+/// to/from the relay's binary `DATA` frames; the relay only ever forwards the
+/// (still-encrypted) inner bytes and never sees plaintext.
+#[derive(Debug, Clone, Copy)]
+enum RelayRoute {
+    Wss,
+    Enrollment,
+}
+
+impl RelayRoute {
+    fn open_control(self, node_id: String) -> crate::relay_proto::Control {
+        match self {
+            Self::Wss => crate::relay_proto::Control::Connect { node_id },
+            Self::Enrollment => crate::relay_proto::Control::Enroll { node_id },
+        }
+    }
+
+    fn send_context(self) -> &'static str {
+        match self {
+            Self::Wss => "sending relay Connect",
+            Self::Enrollment => "sending relay Enroll",
+        }
+    }
+}
+
+fn relay_outer_connector(
+    relay: &RelayDial,
+) -> Result<(
+    Option<tokio_tungstenite::Connector>,
+    Option<Arc<crate::client_crypto::RelayPinVerifier>>,
+)> {
+    // Outer TLS connector verifying the relay's OWN certificate (distinct from the
+    // inner mTLS to the daemon). Precedence: insecure (dev) > configured CA > a
+    // leaf pin (explicit, enrollment-delivered, or remembered) > opt-in TOFU >
+    // the public roots (`None`). The outer TLS is a metadata boundary, not the
+    // RPC boundary (A2).
+    let builder = || {
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default protocol versions")
+    };
+    // Apply the outer-mTLS client cert (when configured) to a server-verified
+    // builder and wrap it as a connector. The inner mTLS is separate.
+    let finish = |verified: rustls::ConfigBuilder<
+        rustls::ClientConfig,
+        rustls::client::WantsClientCert,
+    >|
+     -> Result<tokio_tungstenite::Connector> {
+        let cfg = match (&relay.outer_client_cert, &relay.outer_client_key) {
+            (Some(c), Some(k)) => {
+                let chain = load_pem_certs(c)?;
+                let key = load_pem_key(k)?;
+                verified
+                    .with_client_auth_cert(chain, key)
+                    .context("loading the relay outer client cert/key")?
+            }
+            _ => verified.with_no_client_auth(),
+        };
+        Ok(tokio_tungstenite::Connector::Rustls(Arc::new(cfg)))
+    };
+    let mut tofu_verifier: Option<Arc<crate::client_crypto::RelayPinVerifier>> = None;
+    let outer = if relay.relay_insecure {
+        Some(finish(
+            builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify)),
+        )?)
+    } else if let Some(ca) = &relay.relay_ca_path {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_pem_certs(ca)? {
+            roots.add(cert).context("adding relay CA to root store")?;
+        }
+        Some(finish(builder().with_root_certificates(roots))?)
+    } else if let Some(pin) = relay.relay_pin.as_deref().filter(|p| !p.is_empty()) {
+        let v = Arc::new(crate::client_crypto::RelayPinVerifier::pinned(
+            pin.to_string(),
+        ));
+        Some(finish(
+            builder().dangerous().with_custom_certificate_verifier(v),
+        )?)
+    } else if relay.relay_tofu {
+        let v = Arc::new(crate::client_crypto::RelayPinVerifier::tofu());
+        tofu_verifier = Some(v.clone());
+        Some(finish(
+            builder().dangerous().with_custom_certificate_verifier(v),
+        )?)
+    } else if relay.outer_client_cert.is_some() {
+        // Public-CA relay that also requires an outer client cert: build an
+        // explicit public-roots connector (the plain default below cannot carry a
+        // client cert).
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Some(finish(builder().with_root_certificates(roots))?)
+    } else {
+        None
+    };
+    Ok((outer, tofu_verifier))
+}
+
+/// A relay tunnel: the byte stream the inner TLS runs over, plus the pump task
+/// that moves DATA frames between that stream and the relay link.
+///
+/// The two travel together because dropping the stream is not what stops the
+/// pump - the pump owns the relay link and only notices a closed stream on its
+/// next read. An owner that replaces or abandons a tunnel aborts the pump.
+pub(crate) struct RelayTunnel {
+    io: tokio::io::DuplexStream,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+/// Owns a relay pump and aborts it when dropped.
+///
+/// Dropping a `JoinHandle` detaches the task; it does not stop it. A pump left
+/// that way keeps its relay route allocated and can stay parked in a DATA write,
+/// in its write-stall budget, or in the closing handshake, and nothing on the
+/// client can reach it again. This guard makes the cleanup structural: every way
+/// out of a scope holding one - success, `?`, a timeout dropping the whole
+/// future, a panic - runs the abort, so a caller cannot forget the path it did
+/// not think about.
+///
+/// Releasing the guard hands the task on to an owner that will keep it running,
+/// which is what the RPC path does when a session adopts its tunnel.
+pub struct RelayPumpGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl RelayPumpGuard {
+    /// Give up ownership without aborting, for a caller that takes over the
+    /// task's lifetime.
+    fn release(mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+
+    /// Watch the guarded task without owning it. Test-only: the guard's whole
+    /// purpose is that nothing else needs to reach the pump.
+    #[cfg(test)]
+    fn abort_handle(&self) -> Option<tokio::task::AbortHandle> {
+        self.0.as_ref().map(|h| h.abort_handle())
+    }
+}
+
+impl Drop for RelayPumpGuard {
+    fn drop(&mut self) {
+        if let Some(pump) = self.0.take() {
+            pump.abort();
+        }
+    }
+}
+
+/// An enrollment tunnel: the plaintext byte stream the enrollment TLS runs over,
+/// and the guard that retires its pump.
+///
+/// Enrollment is the path with no session to hand the pump to - the exchange
+/// finishes, fails, or times out, and the tunnel is done either way - so the
+/// pump's lifetime is bound to this value rather than to a caller's discipline.
+///
+/// It has no `Drop` of its own so that [`Self::split`] can hand the stream and
+/// the guard out separately; the guard keeps its own destructor.
+pub struct EnrollmentTunnel {
+    io: tokio::io::DuplexStream,
+    pump: RelayPumpGuard,
+}
+
+impl EnrollmentTunnel {
+    /// Split into the stream to run TLS over and the guard to keep alive for as
+    /// long as that stream is in use. Hold the guard in the same scope as the
+    /// exchange: dropping it retires the pump.
+    pub fn split(self) -> (tokio::io::DuplexStream, RelayPumpGuard) {
+        (self.io, self.pump)
+    }
+}
+
+/// Run one step of relay setup against the shared absolute deadline.
+///
+/// Every step of a setup passes through here with the SAME `deadline`, so the
+/// budget is spent once across the whole sequence rather than renewed per phase.
+async fn within_relay_setup<T>(
+    deadline: tokio::time::Instant,
+    what: &str,
+    step: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout_at(deadline, step).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "{what} did not complete within the {}s relay setup budget; the relay is \
+             unreachable, or it accepted the connection and then stopped responding",
+            RELAY_SETUP_DEADLINE.as_secs()
+        ),
+    }
+}
+
+/// Send one frame to the relay under [`RELAY_WRITE_STALL`].
+///
+/// `false` means the link is unusable - errored, closed, or making no progress -
+/// and the caller must tear the tunnel down rather than keep waiting on it.
+async fn relay_send<S>(sink: &mut S, msg: tokio_tungstenite::tungstenite::Message) -> bool
+where
+    S: futures_util::SinkExt<tokio_tungstenite::tungstenite::Message> + Unpin,
+{
+    matches!(
+        tokio::time::timeout(RELAY_WRITE_STALL, sink.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn dial_through_relay(
+    relay: &RelayDial,
+    route: RelayRoute,
+    deadline: tokio::time::Instant,
+) -> Result<RelayTunnel> {
+    within_relay_setup(
+        deadline,
+        "the relay tunnel setup",
+        dial_through_relay_unbounded(relay, route),
+    )
+    .await
+}
+
+/// The setup itself. Every caller reaches it through [`dial_through_relay`], so
+/// it always runs inside the shared deadline and needs no timeout of its own.
+async fn dial_through_relay_unbounded(relay: &RelayDial, route: RelayRoute) -> Result<RelayTunnel> {
+    use crate::relay_proto::{
+        ConnWindow, Control, INITIAL_WINDOW, MAX_DATA_PAYLOAD, SUBPROTOCOL, decode_data,
+        encode_data,
+    };
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let tcp = tokio::net::TcpStream::connect(&relay.relay_addr)
+        .await
+        .with_context(|| format!("connecting to relay {}", relay.relay_addr))?;
+
+    let (outer, tofu_verifier) = relay_outer_connector(relay)?;
+
+    let relay_uri: tokio_tungstenite::tungstenite::http::Uri =
+        format!("wss://{}/", relay.relay_host)
+            .parse()
+            .context("building relay ws uri")?;
+    let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(relay_uri)
+        .with_sub_protocol(SUBPROTOCOL);
+    let (relay_ws, _resp) = tokio_tungstenite::client_async_tls_with_config(
+        request,
+        tcp,
+        Some(relay_ws_config()),
+        outer,
+    )
+    .await
+    .with_context(|| format!("relay outer WSS to {}", relay.relay_addr))?;
+
+    // Persist a TOFU-observed relay pin so later runs pin this leaf instead of
+    // re-trusting (opt-in path only).
+    if let Some(v) = &tofu_verifier
+        && let (Some(observed), Some(store)) = (v.observed_pin(), &relay.pin_store)
+    {
+        persist_relay_pin(store, &observed);
+    }
+
+    let (mut sink, mut stream) = relay_ws.split();
+
+    if !relay_send(
+        &mut sink,
+        Message::text(route.open_control(relay.node_id.clone()).to_json()),
+    )
+    .await
+    {
+        anyhow::bail!("{}", route.send_context());
+    }
+
+    // Wait for the relay to pair us with the daemon (answer pings while waiting).
+    let conn_id = loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                Ok(Control::Opened { conn_id }) => break conn_id,
+                Ok(Control::Error { code, msg }) => {
+                    anyhow::bail!("relay refused the route: {code}: {msg}")
+                }
+                _ => {}
+            },
+            Some(Ok(Message::Ping(p))) => {
+                if !relay_send(&mut sink, Message::Pong(p)).await {
+                    anyhow::bail!("the relay stopped accepting writes while opening the route");
+                }
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(anyhow::Error::new(e).context("relay reply")),
+            None => anyhow::bail!("relay closed before opening the route"),
+        }
+    };
+
+    // Bridge the relay's DATA frames <-> an in-memory byte stream the inner mTLS
+    // runs over. What the inner TLS writes to `client_io` is read here and shipped
+    // as DATA; inbound DATA payloads are written back for the inner TLS to read.
+    let (client_io, mut relay_io) = tokio::io::duplex(128 * 1024);
+    let pump = tokio::spawn(async move {
+        // Counts this pump as live for as long as the task's future exists. Its
+        // destructor runs on a normal exit AND when the future is dropped by an
+        // abort, which is what lets a test observe that a tunnel was retired
+        // rather than merely asked to stop.
+        #[cfg(test)]
+        let _alive = live_pumps::Token::new();
+        // Per-conn credit flow control. `send_window` gates how much we ship to
+        // the relay before the daemon acks (so we never pin more than one window
+        // of unsent inner bytes); `recv_drained` counts daemon->client bytes we
+        // have handed to the inner stream so we can replenish the daemon's window.
+        let mut send_window = ConnWindow::new(INITIAL_WINDOW);
+        let mut recv_drained: u32 = 0;
+        // Grant the daemon our receive window up front.
+        if !relay_send(
+            &mut sink,
+            Message::text(
+                Control::Window {
+                    conn_id,
+                    credit: INITIAL_WINDOW,
+                }
+                .to_json(),
+            ),
+        )
+        .await
+        {
+            return;
+        }
+
+        let mut buf = vec![0u8; MAX_DATA_PAYLOAD];
+        loop {
+            tokio::select! {
+                // When the send window is exhausted, stop reading the inner stream
+                // (back-pressure to the inner TLS) until a DataAck replenishes it.
+                n = relay_io.read(&mut buf), if !send_window.is_blocked() => match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // `n <= MAX_DATA_PAYLOAD` (buffer size) so this is already a
+                        // single bounded chunk; the relay rejects anything larger.
+                        send_window.debit(n);
+                        if !relay_send(
+                            &mut sink,
+                            Message::binary(encode_data(conn_id, &buf[..n])),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                },
+                msg = stream.next() => match msg {
+                    Some(Ok(Message::Binary(b))) => match decode_data(&b) {
+                        // This link carries exactly ONE route, chosen above. A
+                        // frame naming a different conn is another connection's
+                        // ciphertext or a forgery, so the relay is mis-routing or
+                        // compromised: tear the tunnel down rather than feed the
+                        // inner TLS bytes from an unknown source. Discarding
+                        // would keep a broken relay in service silently.
+                        Some((frame_conn, _)) if frame_conn != conn_id => break,
+                        Some((_, payload)) => {
+                            if relay_io.write_all(payload).await.is_err() {
+                                break;
+                            }
+                            recv_drained = recv_drained.saturating_add(payload.len() as u32);
+                            // Replenish the daemon's window once we have drained
+                            // about half of it, amortizing the ack frames.
+                            if recv_drained >= INITIAL_WINDOW / 2 {
+                                if !relay_send(
+                                    &mut sink,
+                                    Message::text(
+                                        Control::DataAck {
+                                            conn_id,
+                                            consumed: recv_drained,
+                                        }
+                                        .to_json(),
+                                    ),
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                recv_drained = 0;
+                            }
+                        }
+                        // Too short to carry a conn id: not attributable to any
+                        // route, so it is dropped without ending the tunnel.
+                        None => {}
+                    },
+                    Some(Ok(Message::Text(t))) => match Control::from_json(t.as_str()) {
+                        // Credit and close control for another conn is the same
+                        // routing fault as a mis-addressed DATA frame: acting on
+                        // it would let one route's peer resize or close this one.
+                        Ok(Control::Close { conn_id: c, .. })
+                        | Ok(Control::Window { conn_id: c, .. })
+                        | Ok(Control::DataAck { conn_id: c, .. })
+                            if c != conn_id =>
+                        {
+                            break;
+                        }
+                        Ok(Control::Close { .. }) => break,
+                        Ok(Control::Window { credit, .. }) => send_window.set(credit),
+                        Ok(Control::DataAck { consumed, .. }) => send_window.ack(consumed),
+                        _ => {}
+                    },
+                    Some(Ok(Message::Ping(p))) => {
+                        if !relay_send(&mut sink, Message::Pong(p)).await {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+        let _ = relay_io.shutdown().await;
+        // The closing handshake is a write to the same peer that may already
+        // have stopped reading, so it gets the same budget as a DATA frame. An
+        // unbounded close is how a pump that has finished its work still fails
+        // to finish its task.
+        let _ =
+            tokio::time::timeout(RELAY_WRITE_STALL, futures_util::SinkExt::close(&mut sink)).await;
+        #[cfg(test)]
+        live_pumps::mark_completed();
+    });
+
+    Ok(RelayTunnel {
+        io: client_io,
+        pump,
+    })
+}
+
+/// Tracks how many relay pumps are alive, so a test can prove a tunnel was
+/// retired rather than merely abandoned.
+#[cfg(test)]
+pub(crate) mod live_pumps {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct Token;
+
+    impl Token {
+        pub(crate) fn new() -> Self {
+            LIVE.fetch_add(1, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Relay pumps whose task future still exists.
+    pub(crate) fn count() -> usize {
+        LIVE.load(Ordering::SeqCst)
+    }
+
+    static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Recorded at the end of the pump body, which an abort never reaches.
+    pub(crate) fn mark_completed() {
+        COMPLETED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Pumps that ran to the end of their body.
+    ///
+    /// This is what separates a pump that was RETIRED from one that merely
+    /// noticed its stream had gone: dropping the local stream unparks a pump
+    /// sitting in its read arm, so "the task ended" alone proves nothing about
+    /// the guard. A pump parked in a relay write or its closing handshake has no
+    /// such escape, and only an abort ends it - leaving this count unchanged.
+    pub(crate) fn completed() -> usize {
+        COMPLETED.load(Ordering::SeqCst)
+    }
+
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Held by every test that creates or counts a relay pump, so the shared
+    /// count is never perturbed by a tunnel another test opened in parallel.
+    ///
+    /// An async lock because the tests hold it across awaits, which is exactly
+    /// what a blocking guard must not be held across.
+    pub(crate) async fn exclusive() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+}
+
+/// Open the daemon's narrow enrollment endpoint through the nominated relay.
+///
+/// The returned tunnel's stream is still plaintext only to the caller; the
+/// caller must run the enrollment TLS client over it before sending pairing
+/// material.
+///
+/// The pump is returned under a guard rather than detached. An enrollment
+/// exchange has no session to hand the pump to, and it can end in more ways than
+/// it can succeed: the response times out, the endpoint refuses the pairing
+/// code, the TLS handshake fails, or the whole future is dropped when its budget
+/// expires. Only some of those run code the caller wrote, so the cleanup belongs
+/// to a value that every one of them drops.
+pub async fn dial_enrollment_through_relay(relay: &RelayDial) -> Result<EnrollmentTunnel> {
+    let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
+    let tunnel = dial_through_relay(relay, RelayRoute::Enrollment, deadline).await?;
+    Ok(EnrollmentTunnel {
+        io: tunnel.io,
+        pump: RelayPumpGuard(Some(tunnel.pump)),
+    })
 }
 
 impl RpcClient {
@@ -652,60 +1621,89 @@ impl RpcClient {
             .with_context(|| format!("connecting to {}", socket.display()))?;
         let (read_half, write_half) = tokio::io::split(stream);
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
-            let mut w = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if w.write_all(line.as_bytes()).await.is_err() {
-                    break;
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(64);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
+        let notif_tx_for_reader = notif_tx.clone();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
+        let mut inbound_tx_for_reader = Some(inbound_tx);
+        let inbound_responses = Arc::new(InboundResponseTracker::default());
+        let inbound_responses_for_reader = Arc::clone(&inbound_responses);
+
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let conn_state_for_reader = conn_state.clone();
+        let rpc_for_writer = Arc::downgrade(&rpc);
+        let conn_state_for_writer = conn_state.clone();
+        let writer_task = tokio::spawn(async move {
+            let mut writer = write_half;
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(mut line) => {
+                        if !line.ends_with('\n') {
+                            line.push('\n');
+                        }
+                        if let Err(error) = writer.write_all(line.as_bytes()).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
 
-        let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
-        let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) =
-            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
-        let inbound_tx_for_reader = inbound_tx.clone();
-
-        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
-        let conn_state_for_reader = conn_state.clone();
-
         let rpc_for_reader = rpc.clone();
+        let (reader_control_tx, mut reader_control_rx) = mpsc::unbounded_channel::<ReaderControl>();
         let read_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(read_half);
-            let mut buf = String::new();
+            let mut lines = BufReader::new(read_half).lines();
             loop {
-                buf.clear();
-                match reader.read_line(&mut buf).await {
-                    Ok(0) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: "EOF (daemon closed connection)".to_string(),
+                let line = tokio::select! {
+                    biased;
+                    control = reader_control_rx.recv() => {
+                        let Some(ReaderControl::Quiesce(ack)) = control else {
+                            break;
                         };
+                        inbound_tx_for_reader.take();
+                        let _ = ack.send(());
+                        continue;
+                    }
+                    line = lines.next_line() => line,
+                };
+                let line = match line {
+                    Ok(None) => {
+                        disconnect_rpc(
+                            &rpc_for_reader,
+                            &conn_state_for_reader,
+                            "EOF (daemon closed connection)".to_string(),
+                        );
                         break;
                     }
                     Err(e) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: e.to_string(),
-                        };
+                        disconnect_rpc(&rpc_for_reader, &conn_state_for_reader, e.to_string());
                         break;
                     }
-                    Ok(_) => {}
-                }
-                let frame: Value = match serde_json::from_str(buf.trim()) {
+                    Ok(Some(line)) => line,
+                };
+                let frame: Value = match serde_json::from_str(line.trim()) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                route_inbound_frame(
+                if let Some(request) = route_inbound_frame(
                     &rpc_for_reader,
                     &notif_tx_for_reader,
-                    &inbound_tx_for_reader,
+                    inbound_tx_for_reader.as_ref(),
                     frame,
-                );
+                ) {
+                    respond_to_retired_inbound_request(
+                        &rpc_for_reader,
+                        &inbound_responses_for_reader,
+                        request,
+                    );
+                }
             }
         });
 
@@ -738,6 +1736,7 @@ impl RpcClient {
             Ok(resp) => resp,
             Err(e) => {
                 read_task.abort();
+                writer_task.abort();
                 return Err(e);
             }
         };
@@ -746,6 +1745,7 @@ impl RpcClient {
             Ok(init) => init,
             Err(e) => {
                 read_task.abort();
+                writer_task.abort();
                 return Err(e);
             }
         };
@@ -755,12 +1755,16 @@ impl RpcClient {
 
         Ok(Self {
             rpc,
-            _read_task: read_task,
-            _router_task: router_task,
+            read_task,
+            reader_control: Some(reader_control_tx),
+            router_task,
+            writer_task: Some(writer_task),
+            relay_pump: None,
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
+            inbound_responses,
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -774,89 +1778,187 @@ impl RpcClient {
     /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
-    /// When `tls_skip_verify` is true, certificate verification is
-    /// disabled — required for self-signed certs on remote hosts.
-    pub async fn connect_wss(
+    /// `tls` controls TLS verification and mutual-TLS client identity. When the
+    /// daemon's remote WSS plane requires mutual TLS, set `ca_cert_path` (the
+    /// daemon CA to trust) and `client_cert_path` / `client_key_path` (the client
+    /// certificate to present). `skip_verify` disables server verification
+    /// (self-signed dev only).
+    pub async fn connect_wss_direct(
         url: &str,
         prev_tui_id: Option<&str>,
         prev_tui_sig: Option<&str>,
-        tls_skip_verify: bool,
+        tls: &ClientTls,
     ) -> Result<Self> {
+        // The built-in (webpki-roots) connector only for the plain default (no
+        // client cert, no custom CA, no skip-verify); any custom TLS material
+        // requires our own rustls ClientConfig.
+        let connector = if tls.is_default() {
+            None
+        } else {
+            Some(tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(
+                tls,
+            )?))
+        };
+        let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
+            url,
+            Some(rpc_ws_config()),
+            false,
+            connector,
+        )
+        .await
+        .with_context(|| format!("WSS connect to {url}"))?;
+        // No relay pump on the direct path: the socket IS the transport.
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, None).await
+    }
+
+    /// Connect to the daemon through a nominated relay.
+    ///
+    /// Establishes the OUTER TLS + WS to the relay, requests the target node-id,
+    /// then runs the SAME inner WSS + mTLS (against `inner_url`) over the tunnelled
+    /// byte stream. The relay only ever forwards ciphertext DATA frames and never
+    /// sees plaintext. `inner_url`'s server name is the daemon's loopback SAN.
+    pub async fn connect_wss_via_relay(
+        inner_url: &str,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+        tls: &ClientTls,
+        relay: &RelayDial,
+    ) -> Result<Self> {
+        // ONE deadline for the whole client-side setup. It is created here, before
+        // the first packet, and every step below shares what is left of it: the
+        // tunnel dial AND the inner handshake that runs over the finished tunnel.
+        let deadline = tokio::time::Instant::now() + RELAY_SETUP_DEADLINE;
+        let RelayTunnel { io, pump } = dial_through_relay(relay, RelayRoute::Wss, deadline).await?;
+        // A tunnel that outlives a failed handshake keeps a relay route open that
+        // nothing will ever read. The guard makes that structural: every exit
+        // from here retires the pump unless it is explicitly released to a
+        // session that will keep it running.
+        let pump = RelayPumpGuard(Some(pump));
+        let connector = tokio_tungstenite::Connector::Rustls(Self::wss_tls_config(tls)?);
+
+        let handshake = within_relay_setup(
+            deadline,
+            "the inner WSS handshake through the relay",
+            async {
+                tokio_tungstenite::client_async_tls_with_config(
+                    inner_url,
+                    io,
+                    Some(rpc_ws_config()),
+                    Some(connector),
+                )
+                .await
+                .with_context(|| format!("WSS-over-relay to {inner_url} via {}", relay.relay_addr))
+            },
+        )
+        .await;
+        // `?` here would drop the guard and retire the pump, which is exactly
+        // what a failed handshake wants.
+        let (ws_stream, _response) = handshake?;
+        Self::spawn_ws_session(ws_stream, prev_tui_id, prev_tui_sig, pump.release()).await
+    }
+
+    /// Drive a connected WSS stream: spawn the writer/reader tasks and complete
+    /// the `initialize` handshake. Generic over the underlying transport so it
+    /// serves both the direct (`TcpStream`) and relayed (`DuplexStream`) paths.
+    /// `relay_pump`, when present, is the tunnel pump this session runs over. The
+    /// session owns it from here: every error path below aborts it, and a
+    /// successful session hands it to the returned client so
+    /// [`RpcClient::shutdown`] can reclaim the relay route.
+    async fn spawn_ws_session<S>(
+        ws_stream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<S>>,
+        prev_tui_id: Option<&str>,
+        prev_tui_sig: Option<&str>,
+        relay_pump: Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<Self>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        let connector = if tls_skip_verify {
-            Some(tokio_tungstenite::Connector::Rustls(
-                Self::insecure_tls_config(),
-            ))
-        } else {
-            None
-        };
-
-        let (ws_stream, _response) =
-            tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
-                .await
-                .with_context(|| format!("WSS connect to {url}"))?;
-
         let (mut sink, mut stream) = ws_stream.split();
 
-        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
-        tokio::spawn(async move {
-            while let Some(line) = writer_rx.recv().await {
-                if sink.send(Message::Text(line.into())).await.is_err() {
-                    break;
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(64);
+        let rpc = Arc::new(jsonrpc::RpcOutbound::new_transport(writer_tx));
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
+        let notif_tx_for_reader = notif_tx.clone();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
+        let mut inbound_tx_for_reader = Some(inbound_tx.clone());
+        let inbound_responses = Arc::new(InboundResponseTracker::default());
+        let inbound_responses_for_reader = Arc::clone(&inbound_responses);
+
+        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
+        let conn_state_for_reader = conn_state.clone();
+        let rpc_for_writer = Arc::downgrade(&rpc);
+        let conn_state_for_writer = conn_state.clone();
+        let flush_ack = Arc::new(WssFlushAck::default());
+        let flush_ack_for_writer = Arc::clone(&flush_ack);
+        let writer_task = tokio::spawn(async move {
+            let mut next_flush_id = 0_u64;
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(line) => {
+                        if let Err(error) = sink.send(Message::Text(line.into())).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        // A successful write to a relayed WSS sink only proves
+                        // that bytes reached the inner duplex stream. The relay
+                        // pump can still be aborted before it forwards them to
+                        // the daemon. A matching ping/pong round trip crosses
+                        // that outer boundary and orders every earlier frame
+                        // ahead of the acknowledgement.
+                        let mut payload = b"zerocode-flush:".to_vec();
+                        payload.extend_from_slice(&next_flush_id.to_be_bytes());
+                        next_flush_id = next_flush_id.wrapping_add(1);
+                        let Some(pong_ack) = flush_ack_for_writer.register(payload.clone()) else {
+                            break;
+                        };
+                        if let Err(error) = sink.send(Message::Ping(payload.clone().into())).await {
+                            if let Some(rpc) = rpc_for_writer.upgrade() {
+                                disconnect_rpc(&rpc, &conn_state_for_writer, error.to_string());
+                            }
+                            break;
+                        }
+                        if pong_ack.await.is_err() {
+                            break;
+                        }
+                        let _ = ack.send(());
+                    }
                 }
             }
         });
 
-        let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
-        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
-        let notif_tx_for_reader = notif_tx.clone();
-        let (inbound_tx, _) =
-            broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
-        let inbound_tx_for_reader = inbound_tx.clone();
-
-        let conn_state = Arc::new(Mutex::new(ConnectionState::Connected));
-        let conn_state_for_reader = conn_state.clone();
-
         let rpc_for_reader = rpc.clone();
+        let (reader_control_tx, mut reader_control_rx) = mpsc::unbounded_channel::<ReaderControl>();
         let read_task = tokio::spawn(async move {
             loop {
-                match stream.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = match serde_json::from_str(&text) {
-                            Ok(v) => v,
-                            Err(_) => continue,
+                let message = tokio::select! {
+                    biased;
+                    control = reader_control_rx.recv() => {
+                        let Some(ReaderControl::Quiesce(ack)) = control else {
+                            break;
                         };
-                        route_inbound_frame(
-                            &rpc_for_reader,
-                            &notif_tx_for_reader,
-                            &inbound_tx_for_reader,
-                            frame,
-                        );
+                        inbound_tx_for_reader.take();
+                        let _ = ack.send(());
+                        continue;
                     }
-                    Some(Ok(Message::Close(frame))) => {
-                        let reason = frame
-                            .map(|f| f.reason.to_string())
-                            .unwrap_or_else(|| "server closed connection".to_string());
-                        *conn_state_for_reader.lock().unwrap() =
-                            ConnectionState::Disconnected { reason };
-                        break;
-                    }
-                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
-                    Some(Ok(Message::Binary(_))) => continue,
-                    Some(Err(e)) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: e.to_string(),
-                        };
-                        break;
-                    }
-                    None => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: "EOF (WSS connection closed)".to_string(),
-                        };
-                        break;
-                    }
+                    message = stream.next() => message,
+                };
+                if !handle_wss_reader_message(
+                    message,
+                    &rpc_for_reader,
+                    &notif_tx_for_reader,
+                    inbound_tx_for_reader.as_ref(),
+                    &inbound_responses_for_reader,
+                    &conn_state_for_reader,
+                    &flush_ack,
+                ) {
+                    break;
                 }
             }
         });
@@ -883,10 +1985,20 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
+        // A failed initialize must not leave the transport running: the reader,
+        // the writer, and (on the relayed path) the tunnel pump all belong to a
+        // session that will never exist.
+        let abandon = |pump: &Option<tokio::task::JoinHandle<()>>| {
+            read_task.abort();
+            writer_task.abort();
+            if let Some(pump) = pump {
+                pump.abort();
+            }
+        };
         let resp = match request_initialize(&rpc, init_params, INITIALIZE_TIMEOUT).await {
             Ok(resp) => resp,
             Err(e) => {
-                read_task.abort();
+                abandon(&relay_pump);
                 return Err(e);
             }
         };
@@ -894,7 +2006,7 @@ impl RpcClient {
         let init = match parse_initialize_response(&resp) {
             Ok(init) => init,
             Err(e) => {
-                read_task.abort();
+                abandon(&relay_pump);
                 return Err(e);
             }
         };
@@ -904,12 +2016,16 @@ impl RpcClient {
 
         Ok(Self {
             rpc,
-            _read_task: read_task,
-            _router_task: router_task,
+            read_task,
+            reader_control: Some(reader_control_tx),
+            router_task,
+            writer_task: Some(writer_task),
+            relay_pump,
             server_version: init.server_version,
             server_pid: init.server_pid,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
+            inbound_responses,
             connection_state: conn_state,
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
@@ -918,63 +2034,55 @@ impl RpcClient {
         })
     }
 
-    /// Build a rustls `ClientConfig` that accepts any server certificate.
-    fn insecure_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    /// Build a rustls `ClientConfig` from a [`ClientTls`]: server verification via
+    /// the configured CA (or `NoVerify` when `skip_verify`), presenting the client
+    /// certificate for mutual TLS when one is configured.
+    fn wss_tls_config(tls: &ClientTls) -> Result<std::sync::Arc<rustls::ClientConfig>> {
         use std::sync::Arc;
 
-        /// Verifier that accepts every certificate without checking.
-        #[derive(Debug)]
-        struct NoVerify;
-
-        impl rustls::client::danger::ServerCertVerifier for NoVerify {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &rustls::pki_types::CertificateDer<'_>,
-                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-                _server_name: &rustls::pki_types::ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::ring::default_provider()
-                    .signature_verification_algorithms
-                    .supported_schemes()
-            }
-        }
-
-        let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
-        .expect("ring provider supports the default protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
+        .expect("ring provider supports the default protocol versions");
 
-        Arc::new(config)
+        // Server verification.
+        let verified = if tls.skip_verify {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+        } else if let Some(ca_path) = &tls.ca_cert_path {
+            let daemon_ca = load_single_daemon_ca_cert(ca_path)?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(daemon_ca)
+                .context("adding daemon CA to the client root store")?;
+            builder.with_root_certificates(roots)
+        } else {
+            anyhow::bail!(
+                "WSS client certificate requires either tls.ca_cert_path (the daemon CA to trust) \
+                 or tls.skip_verify"
+            );
+        };
+
+        // Mutual-TLS client identity.
+        let config = match (&tls.client_cert_path, &tls.client_key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let chain = load_pem_certs(cert_path)?;
+                let key = load_pem_key(key_path)?;
+                verified
+                    .with_client_auth_cert(chain, key)
+                    .context("loading client certificate / key for mutual TLS")?
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "WSS mutual TLS requires both tls.client_cert_path and tls.client_key_path"
+                );
+            }
+            (None, None) => verified.with_no_client_auth(),
+        };
+
+        Ok(Arc::new(config))
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
@@ -1006,7 +2114,40 @@ impl RpcClient {
 
     /// Current connection state. Cheap mutex read, safe to call on every frame.
     pub fn connection_state(&self) -> ConnectionState {
-        self.connection_state.lock().unwrap().clone()
+        clone_connection_state(&self.connection_state)
+    }
+
+    pub async fn flush_outbound(&self) -> bool {
+        self.flush_outbound_with_timeout(OUTBOUND_FLUSH_TIMEOUT)
+            .await
+    }
+
+    /// Keep a replaced transport alive long enough to drain terminal replies
+    /// that missed the fast handoff deadline, then reclaim all of its tasks.
+    pub fn retire_after_outbound_flush(self: Arc<Self>) {
+        self.retire_after_outbound_flush_with_timeout(OUTBOUND_RETIRE_TIMEOUT);
+    }
+
+    fn retire_after_outbound_flush_with_timeout(self: Arc<Self>, timeout: Duration) {
+        tokio::spawn(async move {
+            let _ = self.flush_outbound_with_timeout(timeout).await;
+            self.shutdown();
+        });
+    }
+
+    async fn flush_outbound_with_timeout(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            self.inbound_responses.wait_until_idle().await;
+            self.rpc.flush_outbound().await
+        })
+        .await
+        .is_ok_and(|flushed| flushed)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn disconnect_for_test(&self, reason: &str) {
+        disconnect_rpc(&self.rpc, &self.connection_state, reason.to_string());
     }
 
     // ── Notifications ─────────────────────────────────────────────
@@ -1016,27 +2157,60 @@ impl RpcClient {
         self.notifications_bcast.subscribe()
     }
 
-    /// Get a receiver for server-initiated JSON-RPC requests that
-    /// expect a response (today: `elicitation/create`). The Chat
-    /// widget subscribes per Code tab, filters by `params.sessionId`,
-    /// surfaces a modal, and answers via [`Self::respond_to_inbound_request`].
-    pub fn subscribe_inbound_requests(&self) -> broadcast::Receiver<RpcInboundRequest> {
-        self.inbound_requests_bcast.subscribe()
+    /// Claim the sole receiver for server-initiated JSON-RPC requests that
+    /// expect a response (today: `elicitation/create`). The app resolves
+    /// `params.sessionId` to the owning pane and answers via
+    /// [`Self::respond_to_inbound_request`].
+    pub fn take_inbound_requests(&self) -> Result<mpsc::UnboundedReceiver<RpcInboundRequest>> {
+        self.inbound_requests_rx
+            .lock()
+            .map_err(|_| anyhow::Error::msg("inbound request receiver mutex poisoned"))?
+            .take()
+            .context("inbound request receiver already claimed")
     }
 
-    /// Send a JSON-RPC response back to the daemon for a previously
-    /// received server-initiated request. The `id` must be the same
-    /// `Value` carried by the originating `RpcInboundRequest`.
-    pub async fn respond_to_inbound_request(
+    /// Schedule a JSON-RPC response to a previously received server request.
+    /// The registration happens before the task is spawned, so reconnect
+    /// retirement cannot flush and stop this writer ahead of an unpolled task.
+    pub fn respond_to_inbound_request(
         &self,
         id: Value,
         result: std::result::Result<Value, JsonRpcError>,
-    ) -> Result<()> {
-        let sent = self.rpc.respond(id, result).await;
-        if !sent {
-            anyhow::bail!("writer task closed before response could be sent");
+    ) {
+        self.respond_to_inbound_requests(vec![(id, result)]);
+    }
+
+    /// Register one retirement-owned batch before spawning its serial enqueue
+    /// loop. A large drained inbound backlog therefore parks at most one task
+    /// on writer capacity while remaining visible to the flush barrier.
+    pub(crate) fn respond_to_inbound_requests(
+        &self,
+        responses: Vec<(Value, std::result::Result<Value, JsonRpcError>)>,
+    ) {
+        enqueue_inbound_responses(
+            Arc::clone(&self.rpc),
+            Arc::clone(&self.inbound_responses),
+            responses,
+        );
+    }
+
+    /// Stop accepting server-initiated requests without retiring the writer.
+    /// Router replacement uses this before its final receiver drain so every
+    /// request accepted by the old reader remains answerable on the old
+    /// transport. Full [`Self::shutdown`] follows after those responses have
+    /// been queued.
+    pub async fn quiesce_inbound_reader(&self) {
+        if let Some(control) = &self.reader_control {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            if control.send(ReaderControl::Quiesce(ack_tx)).is_ok() {
+                let _ = ack_rx.await;
+            }
+        } else {
+            self.read_task.abort();
+            while !self.read_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
         }
-        Ok(())
     }
 
     /// Ask the daemon to start streaming log events as notifications.
@@ -1317,9 +2491,14 @@ impl RpcClient {
         &self,
         submission: &crate::wire::BuilderSubmission,
     ) -> Result<QuickstartApplyResult> {
-        self.call(
+        // Apply persists config to disk, may enrich the provider entry over
+        // the network, and can queue behind an in-flight catalog fetch on
+        // the daemon's dispatcher, so it gets the same budget as
+        // `catalog_models` rather than the default call timeout.
+        self.call_with_timeout(
             method::QUICKSTART_APPLY,
             serde_json::json!({ "submission": submission }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }
@@ -1485,6 +2664,8 @@ impl RpcClient {
                 "tui_id": tui_id,
                 "exclude_memory": true,
                 "chat_mode": "acp",
+                "keep_siblings": true,
+                "interaction_surface": "zerocode_code",
             }),
         )
         .await
@@ -1493,6 +2674,10 @@ impl RpcClient {
     /// Create or rehydrate a session. When `session_id` is `Some`, the daemon
     /// creates the session with that ID, restoring persisted history if it
     /// exists — effectively "attaching" to a prior session.
+    ///
+    /// Always sends `keep_siblings: true`: zerocode tracks every session it
+    /// opens (agent sidebar) and closes them explicitly, so the daemon's
+    /// idle-sibling eviction sweep must not reap the tracked backgrounds.
     pub async fn session_new_with_id(
         &self,
         agent_alias: &str,
@@ -1502,7 +2687,13 @@ impl RpcClient {
         let tui_id = self.tui_id.as_deref();
         self.call(
             method::SESSION_NEW,
-            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd, "session_id": session_id, "tui_id": tui_id }),
+            serde_json::json!({
+                "agent_alias": agent_alias,
+                "cwd": cwd,
+                "session_id": session_id,
+                "tui_id": tui_id,
+                "keep_siblings": true,
+            }),
         )
         .await
     }
@@ -1510,6 +2701,14 @@ impl RpcClient {
     pub async fn session_cancel(&self, session_id: &str) -> Result<SessionCancelResult> {
         self.call(
             method::SESSION_CANCEL,
+            serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_state(&self, session_id: &str) -> Result<SessionStateResult> {
+        self.call(
+            method::SESSION_STATE,
             serde_json::json!({ "session_id": session_id }),
         )
         .await
@@ -1556,12 +2755,22 @@ impl RpcClient {
         self.call(method::SESSION_APPROVE, params).await
     }
 
-    pub async fn session_close(&self, session_id: &str) -> Result<Value> {
-        self.call(
+    pub async fn session_close(&self, session_id: &str) -> Result<()> {
+        let request = self.rpc.request(
             method::SESSION_CLOSE,
             serde_json::json!({ "session_id": session_id }),
-        )
-        .await
+        );
+        match tokio::time::timeout(Duration::from_secs(5), request).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) if error.code == jsonrpc::error_codes::SESSION_NOT_FOUND => Ok(()),
+            Ok(Err(error)) => anyhow::bail!(
+                "RPC {}: {} ({})",
+                method::SESSION_CLOSE,
+                error.message,
+                error.code
+            ),
+            Err(_) => anyhow::bail!("RPC {}: timed out after 5s", method::SESSION_CLOSE),
+        }
     }
 
     pub async fn session_kill(&self, session_id: &str) -> Result<()> {
@@ -1760,24 +2969,97 @@ impl RpcClient {
     // ── Test-only constructors ────────────────────────────────────
 
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
+    /// Broadcast buffers are large enough for scripted notification-routing
+    /// tests to enqueue a burst before the pane drains it.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
-        let (notif_tx, _) = tokio::sync::broadcast::channel(1);
-        let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
+        Self::with_rpc_parts(outbound, Transport::Local, None)
+    }
+
+    /// Test-only constructor that also attaches a relay pump handle, so a test
+    /// can observe that [`Self::shutdown`] reclaims the tunnel.
+    #[cfg(test)]
+    pub fn with_rpc_and_pump(
+        outbound: Arc<RpcOutbound>,
+        relay_pump: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        Self::with_rpc_parts(outbound, Transport::Local, relay_pump)
+    }
+
+    /// Test-only constructor that also controls the transport-specific payload
+    /// encoding used by callers such as attachment dispatch.
+    #[cfg(test)]
+    pub fn with_rpc_transport(outbound: Arc<RpcOutbound>, transport: Transport) -> Self {
+        Self::with_rpc_parts(outbound, transport, None)
+    }
+
+    /// The union constructor the named test constructors delegate to.
+    #[cfg(test)]
+    fn with_rpc_parts(
+        outbound: Arc<RpcOutbound>,
+        transport: Transport,
+        relay_pump: Option<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        let (notif_tx, _) = tokio::sync::broadcast::channel(64);
+        let (_inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             rpc: outbound,
-            _read_task: tokio::spawn(async {}),
-            _router_task: tokio::spawn(async {}),
+            read_task: tokio::spawn(async {}),
+            reader_control: None,
+            router_task: tokio::spawn(async {}),
+            writer_task: None,
+            relay_pump,
             server_version: "test".to_string(),
             server_pid: None,
             notifications_bcast: notif_tx,
-            inbound_requests_bcast: inbound_tx,
+            inbound_requests_rx: Mutex::new(Some(inbound_rx)),
+            inbound_responses: Arc::new(InboundResponseTracker::default()),
             connection_state: Arc::new(Mutex::new(ConnectionState::Connected)),
             tui_id: None,
             tui_sig: None,
-            transport: Transport::Local,
+            transport,
             commands: Vec::new(),
         }
+    }
+
+    /// Test-only: inject a notification as if the daemon had sent it.
+    /// Subscribers created before this call (e.g. a pane's drain receiver)
+    /// observe it on their next `try_recv`.
+    #[cfg(test)]
+    pub fn push_notification_for_test(&self, method: &str, params: Value) {
+        let _ = self.notifications_bcast.send(RpcNotification {
+            method: method.to_string(),
+            params,
+        });
+    }
+
+    /// Stop this client's transport and release everything it holds open.
+    ///
+    /// A replaced client is not idle: its reader still owns the socket, its
+    /// writer still drains a queue, and on the relayed path its pump still holds
+    /// a route open on the relay. Nothing drops those - the tasks are detached,
+    /// and `RpcClient` has no destructor that could reach them - so a migration
+    /// that simply overwrote the `Arc` left the old connection running and the
+    /// old relay route allocated until the daemon or relay timed it out.
+    ///
+    /// Call this on the client being REPLACED, after the new one has been
+    /// adopted, and on a new client whose adoption failed. It is idempotent:
+    /// aborting a finished task is a no-op.
+    pub fn shutdown(&self) {
+        self.read_task.abort();
+        self.router_task.abort();
+        if let Some(writer) = &self.writer_task {
+            writer.abort();
+        }
+        if let Some(pump) = &self.relay_pump {
+            pump.abort();
+        }
+    }
+
+    /// Whether this client still holds a relay tunnel pump.
+    #[cfg(test)]
+    pub fn relay_pump_finished(&self) -> Option<bool> {
+        self.relay_pump.as_ref().map(|p| p.is_finished())
     }
 
     /// Transport protocol of this connection.
@@ -2925,6 +4207,8 @@ pub struct LogsQueryParams {
 #[serde(rename_all = "snake_case")]
 pub struct LogsQueryResult {
     pub events: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub log_path: Option<String>,
     /// Legacy cursor: `(timestamp, id)` to feed back as `until_ts` +
     /// `until_id` for older. Tie-breaks same-timestamp events by
     /// lexicographic id, which can drop earlier-written events when id
@@ -2948,6 +4232,24 @@ pub struct LogsGetResult {
     pub event: serde_json::Value,
 }
 
+#[cfg(test)]
+mod logs_query_tests {
+    use super::LogsQueryResult;
+
+    #[test]
+    fn older_response_without_log_path_remains_compatible() {
+        let result: LogsQueryResult = serde_json::from_value(serde_json::json!({
+            "events": [],
+            "next_cursor": null,
+            "next_cursor_line_offset": null,
+            "at_end": true
+        }))
+        .expect("older logs/query response");
+
+        assert!(result.log_path.is_none());
+    }
+}
+
 // ── Session / Agents types ───────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -2955,12 +4257,26 @@ pub struct LogsGetResult {
 pub struct SessionNewResult {
     pub session_id: String,
     #[serde(default)]
+    pub message_count: usize,
+    #[serde(default)]
     pub workspace_dir: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionCancelResult {}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionStateResult {
+    pub state: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// `Some(empty)` is an authoritative cleared plan. `None` keeps
+    /// compatibility with older daemons that do not expose plan state.
+    #[serde(default)]
+    pub plan: Option<Vec<crate::wire::PlanEntry>>,
+}
 
 /// Session-scoped overrides mirror of
 /// `zeroclaw_runtime::rpc::session::SessionOverrides`. Sent on
@@ -3305,21 +4621,59 @@ pub struct MemoryGetResult {
 #[serde(rename_all = "snake_case")]
 pub struct SessionMessagesResult {
     pub messages: Vec<MessageEntry>,
-    /// Total persisted messages for the session. With `start`, lets
+    /// Total projected entries for the session. With `start`, lets
     /// the Sessions pane size scrollback affordances without keeping
     /// the full history in memory.
     #[serde(default)]
     pub total: usize,
-    /// Index of `messages[0]` in the full persisted history.
+    /// Index of `messages[0]` in the full projected history.
     #[serde(default)]
     pub start: usize,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub kind: MessageEntryKind,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
+    #[serde(default)]
+    pub tool_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageEntryKind {
+    #[default]
+    Message,
+    ToolCall,
+    ToolResult,
+    #[serde(other)]
+    Unknown,
+}
+
+#[cfg(test)]
+mod message_entry_kind_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_message_entry_kind_remains_readable() {
+        let entry: MessageEntry = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "future entry",
+            "kind": "future_kind"
+        }))
+        .expect("unknown additive kind should remain readable");
+
+        assert_eq!(entry.kind, MessageEntryKind::Unknown);
+    }
 }
 
 impl MessageEntry {
@@ -3782,6 +5136,43 @@ mod session_method_tests {
     }
 
     #[tokio::test]
+    async fn session_new_acp_declares_closed_zerocode_code_surface() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move {
+            client
+                .session_new_acp("my-agent", Some("/tmp/work"), Some("s-acp"))
+                .await
+        });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_new_acp must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/new");
+        assert_eq!(req["params"]["chat_mode"], "acp");
+        assert_eq!(req["params"]["interaction_surface"], "zerocode_code");
+        assert!(
+            req["params"].get("interaction_context").is_none(),
+            "ZeroCode must not send prompt prose or capability claims"
+        );
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s-acp","workspace_dir":"/tmp/work"})),
+            None,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_new_acp must resolve")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn session_cancel_sends_session_id() {
         let (rpc, mut write_rx) = make_rpc();
         let client = RpcClient::with_rpc(rpc.clone());
@@ -3803,6 +5194,35 @@ mod session_method_tests {
             .expect("client.session_cancel must resolve after the response is dispatched")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_state_sends_session_id_and_returns_lifecycle() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.session_state("s1").await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.session_state must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "session/state");
+        assert_eq!(req["params"]["session_id"], "s1");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({"session_id":"s1","state":"running"})),
+            None,
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.session_state must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.state, "running");
     }
 
     #[tokio::test]
@@ -3967,8 +5387,8 @@ mod notification_tests {
         Arc<RpcOutbound>,
         broadcast::Sender<RpcNotification>,
         broadcast::Receiver<RpcNotification>,
-        broadcast::Sender<RpcInboundRequest>,
-        broadcast::Receiver<RpcInboundRequest>,
+        mpsc::UnboundedSender<RpcInboundRequest>,
+        mpsc::UnboundedReceiver<RpcInboundRequest>,
         mpsc::Receiver<String>,
     );
 
@@ -3980,8 +5400,169 @@ mod notification_tests {
         let (writer_tx, writer_rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
         let (notif_tx, notif_rx) = broadcast::channel::<RpcNotification>(16);
-        let (inbound_tx, inbound_rx) = broadcast::channel::<RpcInboundRequest>(16);
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<RpcInboundRequest>();
         (rpc, notif_tx, notif_rx, inbound_tx, inbound_rx, writer_rx)
+    }
+
+    #[tokio::test]
+    async fn rtg_9739_delayed_wss_request_is_cancelled_after_quiesce_cut() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{
+            MaybeTlsStream, WebSocketStream,
+            tungstenite::{Message, protocol::Role},
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let release_request = Arc::new(Notify::new());
+        let server_release = Arc::clone(&release_request);
+        let server = tokio::spawn(async move {
+            let mut ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let initialize = ws.next().await.unwrap().unwrap();
+            let Message::Text(initialize) = initialize else {
+                panic!("client must initialize with a text frame");
+            };
+            let initialize: Value = serde_json::from_str(initialize.as_str()).unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": {
+                        "server_version": env!("CARGO_PKG_VERSION"),
+                        "commands": []
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            server_release.notified().await;
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "delayed-during-quiesce",
+                    "method": "elicitation/create",
+                    "params": { "sessionId": "retiring-session" }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+            let response = loop {
+                let message = tokio::time::timeout(Duration::from_secs(1), ws.next())
+                    .await
+                    .expect("retired reader must answer the delayed request")
+                    .expect("client transport remains open")
+                    .unwrap();
+                if let Message::Text(response) = message {
+                    break serde_json::from_str::<Value>(response.as_str()).unwrap();
+                }
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), ws.next())
+                    .await
+                    .is_err(),
+                "retired WSS request must be answered exactly once"
+            );
+            response
+        });
+
+        let client_ws =
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
+                .await;
+        let client = Arc::new(
+            RpcClient::spawn_ws_session(client_ws, None, None, None)
+                .await
+                .unwrap(),
+        );
+        let mut inbound_requests = client.take_inbound_requests().unwrap();
+        client.quiesce_inbound_reader().await;
+        assert!(inbound_requests.recv().await.is_none());
+
+        release_request.notify_one();
+        let response = server.await.unwrap();
+        assert_eq!(response["id"], "delayed-during-quiesce");
+        assert_eq!(response["result"]["action"], "cancel");
+        client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtg_9739_local_request_is_cancelled_after_quiesce_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("rpc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let release_request = Arc::new(Notify::new());
+        let server_release = Arc::clone(&release_request);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut lines = BufReader::new(read_half).lines();
+            let initialize = lines.next_line().await.unwrap().unwrap();
+            let initialize: Value = serde_json::from_str(&initialize).unwrap();
+            write_half
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": initialize["id"],
+                            "result": {
+                                "server_version": env!("CARGO_PKG_VERSION"),
+                                "commands": []
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            server_release.notified().await;
+            write_half
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": "local-during-quiesce",
+                            "method": "elicitation/create",
+                            "params": { "sessionId": "retiring-session" }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let response = tokio::time::timeout(Duration::from_secs(1), lines.next_line())
+                .await
+                .expect("retired local reader must answer the delayed request")
+                .unwrap()
+                .expect("client transport remains open");
+            let response = serde_json::from_str::<Value>(&response).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), lines.next_line())
+                    .await
+                    .is_err(),
+                "retired local request must be answered exactly once"
+            );
+            response
+        });
+
+        let client = Arc::new(RpcClient::connect(&socket, None, None).await.unwrap());
+        let mut inbound_requests = client.take_inbound_requests().unwrap();
+        client.quiesce_inbound_reader().await;
+        assert!(inbound_requests.recv().await.is_none());
+
+        release_request.notify_one();
+        let response = server.await.unwrap();
+        assert_eq!(response["id"], "local-during-quiesce");
+        assert_eq!(response["result"]["action"], "cancel");
+        client.shutdown();
     }
 
     /// Response frames — id + result/error, no method — should reach the
@@ -4005,12 +5586,444 @@ mod notification_tests {
             "id": "zc-out-0",
             "result": { "pong": true }
         });
-        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        assert!(route_inbound_frame(&rpc, &notif_tx, Some(&inbound_tx), frame).is_none());
 
         let answer = call_task.await.unwrap().unwrap();
         assert_eq!(answer["pong"], true);
         assert!(inbound_rx.try_recv().is_err(), "inbound rx must stay empty");
         assert!(notif_rx.try_recv().is_err(), "notif rx must stay empty");
+    }
+
+    #[tokio::test]
+    async fn inbound_response_batch_registration_precedes_flush_marker() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(3);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = Arc::new(RpcClient::with_rpc(rpc));
+        client.respond_to_inbound_requests(vec![
+            (
+                serde_json::json!("elicitation-1"),
+                Ok(serde_json::json!({ "action": "cancel" })),
+            ),
+            (
+                serde_json::json!("elicitation-2"),
+                Ok(serde_json::json!({ "action": "cancel" })),
+            ),
+        ]);
+
+        let writer = tokio::spawn(async move {
+            for expected_id in ["elicitation-1", "elicitation-2"] {
+                let response = writer_rx.recv().await.expect("response frame");
+                let jsonrpc::OutboundMessage::Frame(frame) = response else {
+                    panic!("flush overtook the registered response batch");
+                };
+                let response: Value = serde_json::from_str(&frame).expect("valid response");
+                assert_eq!(response["id"], expected_id);
+            }
+
+            let flush = writer_rx.recv().await.expect("flush marker");
+            let jsonrpc::OutboundMessage::Flush(ack) = flush else {
+                panic!("response batch must be followed by one flush marker");
+            };
+            let _ = ack.send(());
+        });
+
+        assert!(
+            client
+                .flush_outbound_with_timeout(Duration::from_secs(1))
+                .await
+        );
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_inbound_response_is_bounded_when_writer_queue_is_full() {
+        let (writer_tx, writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(1);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        assert!(rpc.send_raw("occupied".to_string()).await);
+        client.respond_to_inbound_request(
+            serde_json::json!("elicitation-2"),
+            Ok(serde_json::json!({ "action": "cancel" })),
+        );
+
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await,
+            "a response blocked on writer capacity must share the retirement budget"
+        );
+
+        drop(writer_rx);
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn flush_outbound_waits_for_delayed_writer_before_shutdown() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered_by_writer = Arc::clone(&delivered);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(_) => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        delivered_by_writer.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        assert!(client.flush_outbound().await);
+        assert!(
+            delivered.load(std::sync::atomic::Ordering::Acquire),
+            "flush must wait for the delayed frame before the writer is retired"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relayed_wss_flush_waits_for_outer_delivery_before_shutdown() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_tungstenite::{
+            MaybeTlsStream, WebSocketStream,
+            tungstenite::{Message, protocol::Role},
+        };
+
+        // Model the relayed transport as two byte streams joined by an outer
+        // pump. Once initialization finishes, hold client-to-server delivery so
+        // the inner WSS writer can finish while the daemon still has no bytes.
+        let (client_io, pump_client_io) = tokio::io::duplex(128 * 1024);
+        let (pump_server_io, server_io) = tokio::io::duplex(128 * 1024);
+        let hold_outbound = Arc::new(AtomicBool::new(false));
+        let release_outbound = Arc::new(tokio::sync::Notify::new());
+        let pump_hold = Arc::clone(&hold_outbound);
+        let pump_release = Arc::clone(&release_outbound);
+        let pump = tokio::spawn(async move {
+            let (mut client_read, mut client_write) = tokio::io::split(pump_client_io);
+            let (mut server_read, mut server_write) = tokio::io::split(pump_server_io);
+            let client_to_server = async move {
+                let mut buf = vec![0_u8; 16 * 1024];
+                loop {
+                    let n = client_read.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    if pump_hold.load(Ordering::Acquire) {
+                        pump_release.notified().await;
+                        pump_hold.store(false, Ordering::Release);
+                    }
+                    server_write.write_all(&buf[..n]).await?;
+                }
+                std::io::Result::Ok(())
+            };
+            let server_to_client = async move {
+                tokio::io::copy(&mut server_read, &mut client_write).await?;
+                std::io::Result::Ok(())
+            };
+            let _ = tokio::join!(client_to_server, server_to_client);
+        });
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let server_delivered = Arc::clone(&delivered);
+        let server = tokio::spawn(async move {
+            let mut ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(text) => {
+                        let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                        if frame["method"] == "initialize" {
+                            ws.send(Message::Text(
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": frame["id"],
+                                    "result": {
+                                        "server_version": env!("CARGO_PKG_VERSION"),
+                                        "commands": []
+                                    }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        } else if frame["id"] == "elicitation-relay" {
+                            server_delivered.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        ws.send(Message::Pong(b"unrelated-pong".to_vec().into()))
+                            .await
+                            .unwrap();
+                        ws.send(Message::Pong(payload)).await.unwrap();
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let client_ws =
+            WebSocketStream::from_raw_socket(MaybeTlsStream::Plain(client_io), Role::Client, None)
+                .await;
+        let client = Arc::new(
+            RpcClient::spawn_ws_session(client_ws, None, None, Some(pump))
+                .await
+                .unwrap(),
+        );
+        let mut inbound_requests = client.take_inbound_requests().unwrap();
+        hold_outbound.store(true, Ordering::Release);
+        client.respond_to_inbound_request(
+            serde_json::json!("elicitation-relay"),
+            Ok(serde_json::json!({ "action": "cancel" })),
+        );
+
+        client.quiesce_inbound_reader().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), inbound_requests.recv())
+                .await
+                .is_ok_and(|request| request.is_none()),
+            "quiesce must close the inbound queue so router draining terminates"
+        );
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_secs(1));
+        tokio::task::yield_now().await;
+        assert_eq!(delivered.load(Ordering::Acquire), 0);
+        assert!(
+            !client.writer_task.as_ref().unwrap().is_finished(),
+            "retirement must keep the WSS writer alive before outer delivery"
+        );
+        assert_eq!(
+            client.relay_pump_finished(),
+            Some(false),
+            "retirement must keep the relay pump alive before outer delivery"
+        );
+
+        release_outbound.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.load(Ordering::Acquire) != 1
+                || !client.writer_task.as_ref().unwrap().is_finished()
+                || client.relay_pump_finished() != Some(true)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement should deliver once and reclaim the relayed WSS transport");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn flush_outbound_times_out_when_writer_is_stalled() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(1);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let client = RpcClient::with_rpc(rpc);
+
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await,
+            "a stalled writer must not strand reconnect adoption"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_keeps_timed_out_writer_alive_until_terminal_frame_drains() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_writer = Arc::clone(&release);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let delivered_writer = Arc::clone(&delivered);
+        let writer = tokio::spawn(async move {
+            while let Some(message) = writer_rx.recv().await {
+                match message {
+                    jsonrpc::OutboundMessage::Frame(frame) => {
+                        release_writer.notified().await;
+                        let response: Value = serde_json::from_str(&frame).expect("valid response");
+                        assert_eq!(response["id"], "elicitation-retiring");
+                        delivered_writer.fetch_add(1, Ordering::AcqRel);
+                    }
+                    jsonrpc::OutboundMessage::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+        let client = Arc::new(client);
+
+        client.respond_to_inbound_request(
+            serde_json::json!("elicitation-retiring"),
+            Ok(serde_json::json!({ "action": "cancel" })),
+        );
+        assert!(
+            !client
+                .flush_outbound_with_timeout(Duration::from_millis(20))
+                .await
+        );
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_secs(1));
+        tokio::task::yield_now().await;
+        assert!(
+            !client.writer_task.as_ref().unwrap().is_finished(),
+            "a missed fast flush must not abort the writer immediately"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while delivered.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal frame should drain during bounded retirement");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.writer_task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement should reclaim the writer after its flush");
+        assert_eq!(
+            delivered.load(Ordering::Acquire),
+            1,
+            "retirement must deliver exactly one terminal response"
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_reclaims_a_permanently_stalled_writer_after_deadline() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<jsonrpc::OutboundMessage>(4);
+        let rpc = Arc::new(RpcOutbound::new_transport(writer_tx));
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let writer = tokio::spawn(async move {
+            if matches!(
+                writer_rx.recv().await,
+                Some(jsonrpc::OutboundMessage::Frame(_))
+            ) {
+                let _ = blocked_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        let mut client = RpcClient::with_rpc(Arc::clone(&rpc));
+        client.writer_task = Some(writer);
+        let client = Arc::new(client);
+
+        assert!(rpc.send_raw("terminal response".to_string()).await);
+        blocked_rx.await.expect("writer should stall on the frame");
+        Arc::clone(&client).retire_after_outbound_flush_with_timeout(Duration::from_millis(20));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !client.writer_task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement deadline should reclaim a permanently stalled writer");
+    }
+
+    async fn assert_disconnect_fails_pending_request(reason: &str) {
+        let (rpc, _notif_tx, _notif_rx, _inbound_tx, _inbound_rx, mut writer_rx) = route_fixture();
+        let call_task = {
+            let rpc = Arc::clone(&rpc);
+            tokio::spawn(async move { rpc.request("long-running", Value::Null).await })
+        };
+        writer_rx.recv().await.expect("request wrote a frame");
+        assert_eq!(rpc.pending_count(), 1);
+
+        let connection_state = Mutex::new(ConnectionState::Connected);
+        disconnect_rpc(&rpc, &connection_state, reason.to_string());
+
+        let error = call_task.await.unwrap().unwrap_err();
+        assert_eq!(error.code, jsonrpc::error_codes::INTERNAL_ERROR);
+        assert_eq!(error.message, format!("Connection closed: {reason}"));
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(matches!(
+            clone_connection_state(&connection_state),
+            ConnectionState::Disconnected { reason: actual } if actual == reason
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_reader_disconnect_fails_pending_request() {
+        assert_disconnect_fails_pending_request("EOF (daemon closed connection)").await;
+    }
+
+    #[tokio::test]
+    async fn wss_reader_disconnect_fails_pending_request() {
+        assert_disconnect_fails_pending_request("EOF (WSS connection closed)").await;
+    }
+
+    #[tokio::test]
+    async fn request_after_disconnect_is_rejected_without_write() {
+        let (rpc, _notif_tx, _notif_rx, _inbound_tx, _inbound_rx, mut writer_rx) = route_fixture();
+        let connection_state = Mutex::new(ConnectionState::Connected);
+        let reason = "EOF (daemon closed connection)";
+        disconnect_rpc(&rpc, &connection_state, reason.to_string());
+
+        let error = rpc.request("too-late", Value::Null).await.unwrap_err();
+
+        assert_eq!(error.code, jsonrpc::error_codes::INTERNAL_ERROR);
+        assert_eq!(error.message, format!("Connection closed: {reason}"));
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "a closed transport must reject the request before writing a frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_failure_settles_admitted_and_rejects_future_request() {
+        let (rpc, _notif_tx, _notif_rx, _inbound_tx, _inbound_rx, mut writer_rx) = route_fixture();
+        let admitted = {
+            let rpc = Arc::clone(&rpc);
+            tokio::spawn(async move { rpc.request("admitted", Value::Null).await })
+        };
+        writer_rx
+            .recv()
+            .await
+            .expect("admitted request wrote a frame");
+
+        let connection_state = Mutex::new(ConnectionState::Connected);
+        let reason = "broken pipe";
+        disconnect_rpc(&rpc, &connection_state, reason.to_string());
+
+        let admitted_error = admitted.await.unwrap().unwrap_err();
+        let future_error = rpc.request("future", Value::Null).await.unwrap_err();
+        assert_eq!(
+            admitted_error.message,
+            format!("Connection closed: {reason}")
+        );
+        assert_eq!(future_error.message, admitted_error.message);
+        assert_eq!(rpc.pending_count(), 0);
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "writer failure must close admission before a future frame is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn weak_writer_owner_allows_receiver_to_close() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let writer_owner = Arc::downgrade(&rpc);
+
+        drop(rpc);
+
+        assert!(writer_owner.upgrade().is_none());
+        assert!(
+            writer_rx.recv().await.is_none(),
+            "dropping external RPC owners must close the writer receiver"
+        );
     }
 
     /// Notification frames — method, no id — should reach the
@@ -4023,7 +6036,7 @@ mod notification_tests {
             "method": "session/update",
             "params": { "type": "agent_message_chunk", "session_id": "s1", "text": "hi" }
         });
-        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        assert!(route_inbound_frame(&rpc, &notif_tx, Some(&inbound_tx), frame).is_none());
         let notif = notif_rx.try_recv().expect("notification routed");
         assert_eq!(notif.method, "session/update");
         assert!(inbound_rx.try_recv().is_err());
@@ -4046,11 +6059,33 @@ mod notification_tests {
                 "requestedSchema": { "type": "object", "properties": {} }
             }
         });
-        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        assert!(route_inbound_frame(&rpc, &notif_tx, Some(&inbound_tx), frame).is_none());
         let req = inbound_rx.try_recv().expect("inbound request routed");
         assert_eq!(req.method, "elicitation/create");
         assert_eq!(req.id, serde_json::Value::String("elicit-42".to_string()));
         assert_eq!(req.params["sessionId"], "sess-1");
+        assert!(notif_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_inbound_frame_returns_server_request_after_reader_quiesce() {
+        let (rpc, notif_tx, mut notif_rx, _inbound_tx, mut inbound_rx, _writer_rx) =
+            route_fixture();
+        let request = route_inbound_frame(
+            &rpc,
+            &notif_tx,
+            None,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "too-late",
+                "method": "elicitation/create",
+                "params": { "sessionId": "retired-session" }
+            }),
+        )
+        .expect("retired reader must retain the request for a terminal response");
+
+        assert_eq!(request.id, "too-late");
+        assert!(inbound_rx.try_recv().is_err());
         assert!(notif_rx.try_recv().is_err());
     }
 
@@ -4067,9 +6102,50 @@ mod notification_tests {
             "method": "elicitation/create",
             "params": {}
         });
-        route_inbound_frame(&rpc, &notif_tx, &inbound_tx, frame);
+        assert!(route_inbound_frame(&rpc, &notif_tx, Some(&inbound_tx), frame).is_none());
         let req = inbound_rx.try_recv().expect("inbound request routed");
         assert_eq!(req.id, serde_json::json!(7));
+    }
+
+    #[tokio::test]
+    async fn response_bearing_requests_are_lossless_beyond_old_broadcast_capacity() {
+        let (rpc, notif_tx, _notif_rx, inbound_tx, mut inbound_rx, _writer_rx) = route_fixture();
+        for index in 0..2048 {
+            assert!(
+                route_inbound_frame(
+                    &rpc,
+                    &notif_tx,
+                    Some(&inbound_tx),
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": index,
+                        "method": "elicitation/create",
+                        "params": { "sessionId": "session-1" }
+                    }),
+                )
+                .is_none()
+            );
+        }
+
+        for index in 0..2048 {
+            let request = inbound_rx.try_recv().expect("request retained in order");
+            assert_eq!(request.id, serde_json::json!(index));
+        }
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn response_bearing_request_queue_has_exactly_one_owner() {
+        let (writer_tx, _writer_rx) = mpsc::channel::<String>(1);
+        let client = RpcClient::with_rpc(Arc::new(RpcOutbound::new(writer_tx)));
+
+        let _owner = client
+            .take_inbound_requests()
+            .expect("first app owner claims the receiver");
+        let error = client
+            .take_inbound_requests()
+            .expect_err("a second owner must be rejected");
+        assert!(error.to_string().contains("already claimed"));
     }
 
     fn make_notification(method: &str, params: serde_json::Value) -> RpcNotification {
@@ -4108,6 +6184,40 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         assert!(matches!(update, SessionUpdate::ApprovalRequest { .. }));
+    }
+
+    #[test]
+    fn parse_turn_complete_carries_optional_client_generation() {
+        let update = parse_session_update(&serde_json::json!({
+            "type": "turn_complete",
+            "session_id": "s1",
+            "outcome": "cancelled",
+            "content": "cancelled",
+            "client_turn_generation": 7,
+        }))
+        .expect("turn complete parses");
+        assert!(matches!(
+            update,
+            SessionUpdate::TurnComplete {
+                client_turn_generation: Some(7),
+                ..
+            }
+        ));
+
+        let legacy = parse_session_update(&serde_json::json!({
+            "type": "turn_complete",
+            "session_id": "s1",
+            "outcome": "completed",
+            "content": "done",
+        }))
+        .expect("legacy turn complete parses");
+        assert!(matches!(
+            legacy,
+            SessionUpdate::TurnComplete {
+                client_turn_generation: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -4156,9 +6266,100 @@ mod tls_tests {
     use super::*;
 
     #[test]
-    fn insecure_tls_config_builds_without_panic() {
-        let cfg = RpcClient::insecure_tls_config();
+    fn skip_verify_tls_config_builds_without_panic() {
+        let tls = ClientTls {
+            skip_verify: true,
+            ..Default::default()
+        };
+        let cfg = RpcClient::wss_tls_config(&tls).expect("skip-verify config builds");
         assert!(Arc::strong_count(&cfg) >= 1);
+    }
+
+    #[test]
+    fn client_cert_requires_ca_or_skip() {
+        // A client cert with neither a CA nor skip_verify is a clear error, not
+        // a silent fall-through to system roots.
+        let tls = ClientTls {
+            client_cert_path: Some("/x/cert.pem".into()),
+            client_key_path: Some("/x/key.pem".into()),
+            ..Default::default()
+        };
+        assert!(RpcClient::wss_tls_config(&tls).is_err());
+    }
+
+    #[test]
+    fn skip_verify_does_not_drop_the_client_cert() {
+        // Critic gap #8: `skip_verify` relaxes SERVER verification only. It must
+        // never silently drop the presented client certificate, or a relay/MITM
+        // could downgrade an mTLS client to an anonymous one. Build a config with
+        // skip_verify AND a real client cert+key and assert the resolver still
+        // carries certs. (`has_certs` is a trait-object method on the resolver, so
+        // no trait import is needed here.)
+        let (_, ca_crt, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let (csr_pem, key_pem) =
+            crate::client_crypto::generate_client_csr("dev_skipverify").unwrap();
+        let leaf =
+            crate::client_crypto::test_pki::sign_csr(&ca_crt, &ca_key, "dev_skipverify", &csr_pem);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, leaf.as_bytes()).unwrap();
+        std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+        let tls = ClientTls {
+            skip_verify: true,
+            client_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            client_key_path: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let cfg = RpcClient::wss_tls_config(&tls).expect("skip-verify + client cert builds");
+        assert!(
+            cfg.client_auth_cert_resolver.has_certs(),
+            "skip_verify must not drop the presented client certificate"
+        );
+    }
+
+    #[test]
+    fn cached_daemon_ca_requires_single_certificate() {
+        let (daemon_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let (extra_ca, _, _) = crate::client_crypto::test_pki::gen_ca();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, format!("{daemon_ca}\n{extra_ca}")).unwrap();
+
+        let tls = ClientTls {
+            ca_cert_path: Some(ca_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let err = RpcClient::wss_tls_config(&tls).unwrap_err().to_string();
+        assert!(
+            err.contains("exactly one daemon CA certificate"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_ca_path_takes_precedence_over_pins_and_tofu() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_ca = dir.path().join("relay-ca.pem");
+        let relay = RelayDial {
+            relay_addr: "127.0.0.1:443".into(),
+            relay_host: "localhost".into(),
+            node_id: "node".into(),
+            relay_ca_path: Some(missing_ca.to_string_lossy().into_owned()),
+            relay_insecure: false,
+            relay_pin: Some("00".into()),
+            relay_tofu: true,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        };
+
+        assert!(
+            relay_outer_connector(&relay).is_err(),
+            "configured relay CA must be loaded before stored pins or TOFU can be used"
+        );
     }
 }
 
@@ -4229,5 +6430,523 @@ mod plan_parse_tests {
     fn plan_update_missing_entries_is_none() {
         let params = serde_json::json!({ "type": "plan", "session_id": "s" });
         assert!(parse_session_update(&params).is_none());
+    }
+}
+
+/// Parser limits for the RELAY-PROTOCOL plane (client <-> relay outer session),
+/// derived from `zeroclaw-relay-proto` so transport and application bounds
+/// cannot drift apart.
+fn relay_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(crate::relay_proto::MAX_WS_MESSAGE);
+    cfg.max_frame_size = Some(crate::relay_proto::MAX_WS_MESSAGE);
+    cfg
+}
+
+/// Parser limits for the INNER RPC plane. This is NOT the relay budget: RPC
+/// carries attachments up to `zeroclaw_runtime::rpc::attachments::MAX_REQUEST_BYTES`
+/// (20 MiB), so a relay-sized cap would truncate legitimate traffic. 32 MiB
+/// leaves encoding headroom above that limit while still replacing
+/// tungstenite's unbounded-by-default 64 MiB with an explicit ceiling.
+fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    const RPC_WS_MAX: usize = 32 * 1024 * 1024;
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(RPC_WS_MAX);
+    cfg.max_frame_size = Some(RPC_WS_MAX);
+    cfg
+}
+
+#[cfg(test)]
+mod relay_transport_tests {
+    //! Client-side relay transport regressions: the setup budget, the pump's
+    //! write-stall bound, and route isolation on an established tunnel.
+    //!
+    //! The budget tests run on a paused clock and assert the ELAPSED virtual
+    //! time, not merely that an error came back. A test that only asserts the
+    //! error passes just as happily against a budget of a day, because a paused
+    //! clock auto-advances to whatever the next deadline happens to be.
+
+    use super::*;
+    use crate::relay_proto::{Control, SUBPROTOCOL, encode_data};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::AsyncReadExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// A listener that completes the TCP accept and then never speaks.
+    async fn accept_then_silent_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (addr, server)
+    }
+
+    fn relay_dial_to(addr: std::net::SocketAddr) -> RelayDial {
+        RelayDial {
+            relay_addr: addr.to_string(),
+            relay_host: "localhost".into(),
+            node_id: "node-1".into(),
+            relay_ca_path: None,
+            relay_insecure: true,
+            relay_pin: None,
+            relay_tofu: false,
+            pin_store: None,
+            outer_client_cert: None,
+            outer_client_key: None,
+        }
+    }
+
+    /// The longest a person will wait at a prompt before deciding the tool is
+    /// hung. Deliberately a LITERAL, not derived from the constant under test:
+    /// an assertion written in terms of that constant moves with it, so widening
+    /// the budget to a day would still satisfy it. This is the bound that says
+    /// what the budget is FOR.
+    const HUMAN_SCALE_CEILING: Duration = Duration::from_secs(60);
+
+    fn assert_spent_the_setup_budget(waited: tokio::time::Duration) {
+        assert!(
+            waited <= HUMAN_SCALE_CEILING,
+            "the setup budget must stay human-scale: {waited:?}"
+        );
+        assert!(
+            waited >= RELAY_SETUP_DEADLINE,
+            "the setup must run until its budget, not fail early: {waited:?}"
+        );
+        assert!(
+            waited <= RELAY_SETUP_DEADLINE + Duration::from_secs(1),
+            "the setup must end AT its budget: {waited:?} against {RELAY_SETUP_DEADLINE:?}"
+        );
+    }
+
+    /// The relay fallback is what a client reaches when the direct path is
+    /// already down, so an unbounded setup here strands the session with no
+    /// route left to try.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_cannot_stall_the_rpc_connect() {
+        let (addr, server) = accept_then_silent_listener().await;
+        let relay = relay_dial_to(addr);
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            RpcClient::connect_wss_via_relay(
+                "wss://127.0.0.1/",
+                None,
+                None,
+                &ClientTls {
+                    skip_verify: true,
+                    ..Default::default()
+                },
+                &relay,
+            )
+            .await
+            .expect_err("a silent relay must not hold the connect")
+        );
+
+        assert_spent_the_setup_budget(started.elapsed());
+        assert!(err.contains("relay setup budget"), "got: {err}");
+        server.abort();
+    }
+
+    /// The interactive trust probe runs before the operator is asked to confirm
+    /// the pin, so a silent relay here hangs the prompt itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_cannot_stall_the_trust_probe() {
+        let (addr, server) = accept_then_silent_listener().await;
+
+        let started = tokio::time::Instant::now();
+        let err = format!(
+            "{:#}",
+            probe_relay_cert_pin(&addr.to_string(), "localhost")
+                .await
+                .expect_err("a silent relay must not hold the trust probe")
+        );
+
+        assert_spent_the_setup_budget(started.elapsed());
+        assert!(err.contains("relay trust probe"), "got: {err}");
+        server.abort();
+    }
+
+    /// A sink that accepts nothing, ever: the peer that stopped reading.
+    struct StalledSink;
+
+    impl futures_util::Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// An established link that stops making progress must not pin the pump
+    /// forever: the inner TLS stream behind it would block with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_write_that_never_progresses_gives_up() {
+        let mut sink = StalledSink;
+
+        let started = tokio::time::Instant::now();
+        let sent = relay_send(&mut sink, Message::text("ping")).await;
+        let waited = started.elapsed();
+
+        assert!(
+            !sent,
+            "a write that never progresses must be reported failed"
+        );
+        // The literal ceiling again: a stall bound that can grow without limit
+        // is the unbounded write this test exists to forbid.
+        assert!(
+            waited <= Duration::from_secs(120),
+            "the write-stall bound must stay bounded in human terms: {waited:?}"
+        );
+        assert!(
+            waited >= RELAY_WRITE_STALL && waited <= RELAY_WRITE_STALL + Duration::from_secs(1),
+            "the write must give up AT the stall bound: {waited:?}"
+        );
+    }
+
+    /// Echo the relay subprotocol back so the client's handshake completes.
+    ///
+    /// The error type is tungstenite's `ErrorResponse`, which carries a whole
+    /// HTTP response and so trips the large-error lint; the signature is the
+    /// library's, not ours, and this handshake never takes the error path.
+    #[allow(clippy::result_large_err)]
+    fn echo_subprotocol(
+        req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> std::result::Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        if req
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .is_some_and(|v| v.to_str().is_ok_and(|v| v.contains(SUBPROTOCOL)))
+        {
+            resp.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                SUBPROTOCOL.parse().expect("static subprotocol"),
+            );
+        }
+        Ok(resp)
+    }
+
+    /// A relay stub that completes the outer TLS + WebSocket handshake, answers
+    /// the route request with `Opened { conn_id }`, and then sends `frames`.
+    async fn relay_stub(
+        conn_id: u64,
+        frames: Vec<Message>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let (ca_pem, ca, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let _ = ca_pem;
+        let (cert, key) =
+            crate::client_crypto::test_pki::gen_server_cert(&ca, &ca_key, &["localhost".into()]);
+        let acceptor = crate::client_crypto::test_pki::tls_acceptor(&cert, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let tls = acceptor.accept(tcp).await.expect("relay outer TLS");
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_subprotocol)
+                .await
+                .expect("relay ws accept");
+
+            // Wait for the route request before opening it.
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg
+                    && matches!(
+                        Control::from_json(t.as_str()),
+                        Ok(Control::Connect { .. } | Control::Enroll { .. })
+                    )
+                {
+                    break;
+                }
+            }
+            ws.send(Message::text(Control::Opened { conn_id }.to_json()))
+                .await
+                .expect("send Opened");
+            for frame in frames {
+                if ws.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            // Hold the link open so the client's teardown is its own decision.
+            while ws.next().await.is_some() {}
+        });
+        (addr, server)
+    }
+
+    /// A relay that forwards another route's DATA frame is mis-routing or
+    /// injecting. The tunnel must end rather than hand those bytes to the inner
+    /// TLS, and the client must never see the foreign payload.
+    #[tokio::test]
+    async fn a_frame_for_another_route_tears_the_tunnel_down() {
+        let (addr, server) = relay_stub(
+            7,
+            vec![
+                Message::binary(encode_data(9, b"FOREIGN")),
+                Message::binary(encode_data(7, b"MINE")),
+            ],
+        )
+        .await;
+
+        let _serial = live_pumps::exclusive().await;
+        // `_pump` must be a NAMED binding: `_` would drop the guard here and
+        // retire the tunnel immediately, which would end the stream for a reason
+        // that has nothing to do with what this test asserts.
+        let (mut io, _pump) = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens")
+            .split();
+        let mut seen = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut seen)).await;
+
+        assert!(
+            !seen.windows(7).any(|w| w == b"FOREIGN"),
+            "another route's payload must never reach the inner stream: {seen:?}"
+        );
+        assert!(
+            seen.is_empty(),
+            "the tunnel must end at the mis-addressed frame, before anything after it: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// The isolation check must not cost the tunnel its own traffic.
+    #[tokio::test]
+    async fn a_frame_for_this_route_is_delivered() {
+        let (addr, server) = relay_stub(7, vec![Message::binary(encode_data(7, b"MINE"))]).await;
+
+        let _serial = live_pumps::exclusive().await;
+        // `_pump` must be a NAMED binding: `_` would drop the guard here and
+        // retire the tunnel immediately, which would end the stream for a reason
+        // that has nothing to do with what this test asserts.
+        let (mut io, _pump) = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens")
+            .split();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), io.read_exact(&mut buf))
+            .await
+            .expect("the payload must arrive")
+            .expect("read");
+
+        assert_eq!(&buf, b"MINE");
+        server.abort();
+    }
+
+    /// Control frames are routed too: credit for another conn must not resize
+    /// this one's window, and another conn's close must not end this tunnel.
+    #[tokio::test]
+    async fn control_for_another_route_tears_the_tunnel_down() {
+        let (addr, server) = relay_stub(
+            7,
+            vec![
+                Message::text(
+                    Control::Close {
+                        conn_id: 9,
+                        reason: "not yours".into(),
+                    }
+                    .to_json(),
+                ),
+                Message::binary(encode_data(7, b"MINE")),
+            ],
+        )
+        .await;
+
+        let _serial = live_pumps::exclusive().await;
+        // `_pump` must be a NAMED binding: `_` would drop the guard here and
+        // retire the tunnel immediately, which would end the stream for a reason
+        // that has nothing to do with what this test asserts.
+        let (mut io, _pump) = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens")
+            .split();
+        let mut seen = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut seen)).await;
+
+        assert!(
+            seen.is_empty(),
+            "a control frame for another route must end the tunnel: {seen:?}"
+        );
+        server.abort();
+    }
+
+    /// A relay stub that opens the route and then stops reading entirely: it
+    /// never answers, never acks, and never drains what the client writes. This
+    /// is the shape that parks a pump in a DATA write or its closing handshake.
+    async fn relay_stub_that_stops_reading(
+        conn_id: u64,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let (ca_pem, ca, ca_key) = crate::client_crypto::test_pki::gen_ca();
+        let _ = ca_pem;
+        let (cert, key) =
+            crate::client_crypto::test_pki::gen_server_cert(&ca, &ca_key, &["localhost".into()]);
+        let acceptor = crate::client_crypto::test_pki::tls_acceptor(&cert, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let tls = acceptor.accept(tcp).await.expect("relay outer TLS");
+            let mut ws = tokio_tungstenite::accept_hdr_async(tls, echo_subprotocol)
+                .await
+                .expect("relay ws accept");
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(t) = msg
+                    && matches!(
+                        Control::from_json(t.as_str()),
+                        Ok(Control::Connect { .. } | Control::Enroll { .. })
+                    )
+                {
+                    break;
+                }
+            }
+            ws.send(Message::text(Control::Opened { conn_id }.to_json()))
+                .await
+                .expect("send Opened");
+            // From here the relay is inert: it holds the link open and reads
+            // nothing more.
+            std::future::pending::<()>().await;
+        });
+        (addr, server)
+    }
+
+    /// The enrollment tunnel has no session to hand its pump to, so dropping the
+    /// tunnel is the only thing that retires it. Proven against a relay that
+    /// opened the route and then stopped reading, which is the state that would
+    /// otherwise leave the task parked with the route still allocated.
+    #[tokio::test]
+    async fn dropping_an_enrollment_tunnel_retires_its_pump() {
+        let _serial = live_pumps::exclusive().await;
+        let (addr, server) = relay_stub_that_stops_reading(7).await;
+
+        let tunnel = dial_enrollment_through_relay(&relay_dial_to(addr))
+            .await
+            .expect("the tunnel opens");
+        let watch = tunnel
+            .pump
+            .abort_handle()
+            .expect("a fresh tunnel guards a live pump");
+        assert!(
+            !watch.is_finished(),
+            "the pump must be running while the tunnel is held"
+        );
+
+        let completed_before = live_pumps::completed();
+        drop(tunnel);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            watch.is_finished(),
+            "dropping the tunnel must retire its pump, not detach it"
+        );
+        // Ending is not enough. Dropping the stream also unparks a pump sitting
+        // in its read arm, so a detached pump would "finish" here too and this
+        // test would pass while proving nothing. The pump must have been
+        // ABORTED - stopped where it stood, without reaching the end of its
+        // body - because that is the only behaviour that also retires a pump
+        // parked in a relay write or its closing handshake.
+        assert_eq!(
+            live_pumps::completed(),
+            completed_before,
+            "the pump must be retired by the guard, not left to notice its stream closed"
+        );
+        server.abort();
+    }
+
+    /// The guard's contract on its own, independent of where the pump happens to
+    /// be parked: a task it owns does not outlive it.
+    #[tokio::test]
+    async fn a_pump_guard_retires_its_task_wherever_it_is_parked() {
+        let parked = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let watch = parked.abort_handle();
+        let guard = RelayPumpGuard(Some(parked));
+        assert!(!watch.is_finished());
+
+        drop(guard);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            watch.is_finished(),
+            "a task with no stream to notice must still be retired by its guard"
+        );
+    }
+
+    /// Releasing hands the task on intact: the RPC path adopts its tunnel into a
+    /// session that must keep running.
+    #[tokio::test]
+    async fn releasing_a_guard_keeps_the_task_running() {
+        let parked = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let watch = parked.abort_handle();
+        let guard = RelayPumpGuard(Some(parked));
+
+        let released = guard.release().expect("a live guard yields its task");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !watch.is_finished(),
+            "a released pump belongs to its new owner and must keep running"
+        );
+        released.abort();
+    }
+
+    /// Replacing a client must reclaim its relay route. Nothing else can: the
+    /// pump is a detached task and `RpcClient` has no destructor.
+    #[tokio::test]
+    async fn shutdown_reclaims_the_relay_pump() {
+        let (tx, _rx) = mpsc::channel::<String>(1);
+        let pump = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let client = RpcClient::with_rpc_and_pump(Arc::new(RpcOutbound::new(tx)), Some(pump));
+        assert_eq!(client.relay_pump_finished(), Some(false));
+
+        client.shutdown();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            client.relay_pump_finished(),
+            Some(true),
+            "the relay pump must not outlive the client that owned it"
+        );
     }
 }

@@ -132,15 +132,35 @@ fn release_targets(root: &Path) -> Result<Vec<String>> {
              source for the prebuilt-binary target matrix."
         ))
     })?;
-    let mut targets: Vec<String> = workflow
-        .lines()
-        .filter_map(|l| l.trim().strip_prefix("target:"))
-        .map(|t| t.trim().to_string())
-        .collect();
+    let mut targets = Vec::new();
+    let mut matrix_entry: Option<(String, bool)> = None;
+
+    for line in workflow.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("- os:")
+            && let Some((target, experimental)) = matrix_entry.take()
+            && !experimental
+        {
+            targets.push(target);
+        }
+        if let Some(target) = trimmed.strip_prefix("target:") {
+            matrix_entry = Some((target.trim().to_string(), false));
+        } else if trimmed == "experimental: true"
+            && let Some((_, experimental)) = matrix_entry.as_mut()
+        {
+            *experimental = true;
+        }
+    }
+    if let Some((target, experimental)) = matrix_entry
+        && !experimental
+    {
+        targets.push(target);
+    }
+
     targets.sort_unstable();
     targets.dedup();
     if targets.is_empty() {
-        anyhow::bail!("no `target:` entries parsed from {RELEASE_WORKFLOW}");
+        anyhow::bail!("no stable release targets parsed from {RELEASE_WORKFLOW}");
     }
     Ok(targets)
 }
@@ -224,5 +244,17 @@ mod tests {
                 "Pi target list leaked non-Pi target containing {excluded:?}: {snippet}"
             );
         }
+    }
+
+    #[test]
+    fn stable_release_targets_exclude_experimental_matrix_legs() {
+        let root = crate::util::repo_root();
+        let targets = release_targets(&root).expect("stable release targets must render");
+
+        assert!(targets.contains(&"aarch64-unknown-linux-gnu".to_string()));
+        assert!(
+            !targets.contains(&"aarch64-linux-android".to_string()),
+            "experimental Android must not be presented as a stable prebuilt target: {targets:?}"
+        );
     }
 }

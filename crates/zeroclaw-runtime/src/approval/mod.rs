@@ -261,10 +261,17 @@ impl ApprovalManager {
 /// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let summary = summarize_args(&request.arguments);
+    let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
-    eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
+    eprintln!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
+    );
     eprintln!("   {summary}");
-    eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
+    eprint!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
+    );
     let _ = io::stderr().flush();
 
     let Ok(line) = read_cli_approval_line() else {

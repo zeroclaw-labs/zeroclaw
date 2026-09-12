@@ -29,16 +29,14 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Largest byte index `<= max_bytes` that is still a valid UTF-8 boundary.
+/// Returns the largest UTF-8 character boundary at or before `max_bytes`.
+///
+/// This compatibility wrapper preserves the previously exported helper while
+/// directing new callers to the standard-library implementation.
+#[deprecated(since = "0.8.4", note = "use str::floor_char_boundary instead")]
 pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
+    // Keep downstream callers source-compatible without retaining duplicate boundary logic.
+    s.floor_char_boundary(max_bytes)
 }
 
 #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
@@ -325,6 +323,90 @@ pub(crate) fn parse_attachment_markers_of_kinds(
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Minimum reply size, in bytes, that earns a voice note. Byte-measured, so a
+/// non-ASCII reply clears the floor with fewer characters than an ASCII one.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+const MIN_VOICE_REPLY_BYTES: usize = 40;
+
+/// Bytes allowed between the brackets of a leading expressive audio tag. Real
+/// tags are short (`[whispers]`, `[strong French accent]`); the bound keeps a
+/// long bracketed block from passing as one.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+const MAX_AUDIO_TAG_INNER_BYTES: usize = 32;
+
+/// Classify a reply that opens with `[`. Returns the skip reason when the
+/// bracketed run is machine output, or `None` when it is an expressive audio
+/// tag (`[whispers]`, `[very excited]`) decorating real prose.
+///
+/// Audio tags are stage directions that TTS engines interpret rather than
+/// speak, so a reply opening with one is prose and belongs in a voice note.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+fn leading_bracket_skip_reason(content: &str) -> Option<&'static str> {
+    let after_open = content.strip_prefix('[')?;
+
+    // JSON-looking openers: `[{`, `["`, `[0`-`[9`, `[]`.
+    if after_open.starts_with(|c: char| matches!(c, '{' | '"' | ']') || c.is_ascii_digit()) {
+        return Some("json_array");
+    }
+
+    // No closing bracket at all, so nothing identifies this as a tag.
+    let Some(close) = after_open.find(']') else {
+        return Some("unclosed_bracket");
+    };
+    let inner = &after_open[..close];
+    let tail = &after_open[close + 1..];
+
+    // Attachment markers always carry `:` (`[IMAGE:/path]`), because both
+    // parsers key on `split_once(':')`. Audio tags never do, so the colon is
+    // what keeps a filesystem path from being read aloud.
+    if inner.contains(':') {
+        return Some("attachment_marker");
+    }
+    // Markdown link: `[text](url)`. Without this the URL would be spoken.
+    if tail.starts_with('(') {
+        return Some("markdown_link");
+    }
+    // Too long to be a stage direction, so treat it as an unknown bracketed
+    // block and keep the pre-existing rejection rather than guessing.
+    if inner.len() > MAX_AUDIO_TAG_INNER_BYTES {
+        return Some("bracketed_prefix");
+    }
+
+    None
+}
+
+/// Why a reply was not queued as a TTS voice note, or `None` when it is worth
+/// speaking. Voice chats mirror the agent's prose, not its plumbing: URLs,
+/// JSON, code blocks, raw tool output and one-line status make poor audio.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+pub(crate) fn voice_reply_skip_reason(content: &str) -> Option<&'static str> {
+    if content.len() <= MIN_VOICE_REPLY_BYTES {
+        return Some("too_short");
+    }
+    if content.starts_with("http") {
+        return Some("url_prefix");
+    }
+    if content.starts_with('{') {
+        return Some("json_object");
+    }
+    if let Some(reason) = leading_bracket_skip_reason(content) {
+        return Some(reason);
+    }
+    if content.starts_with("Error") {
+        return Some("error_prefix");
+    }
+    if content.contains("```") {
+        return Some("code_fence");
+    }
+    if content.contains("tool_call") {
+        return Some("tool_call_marker");
+    }
+    if content.contains("wttr.in") {
+        return Some("weather_tool_output");
+    }
+    None
+}
+
 /// A native location pin parsed from a `[LOCATION:...]` marker. Shared by
 /// both WhatsApp backends (web protobuf send and Cloud API JSON send).
 #[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
@@ -514,6 +596,96 @@ pub(crate) fn build_approve_deny_approval_prompt(
     )
 }
 
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+pub(crate) struct PendingApproval {
+    pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    pub(crate) destination: String,
+    pub(crate) tool_name: String,
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingApprovalResolution {
+    NotFound,
+    Rejected,
+    Resolved,
+    ReceiverClosed,
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+impl PendingApprovalResolution {
+    #[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
+    pub(crate) fn suppresses_message(self) -> bool {
+        !matches!(self, Self::NotFound)
+    }
+}
+
+#[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
+pub(crate) async fn resolve_pending_approval(
+    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    token: &str,
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    responder_allowed: bool,
+    destination: &str,
+) -> PendingApprovalResolution {
+    resolve_pending_approval_with_tool(
+        pending_approvals,
+        token,
+        response,
+        responder_allowed,
+        destination,
+    )
+    .await
+    .0
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+pub(crate) async fn resolve_pending_approval_with_tool(
+    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    token: &str,
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    responder_allowed: bool,
+    destination: &str,
+) -> (PendingApprovalResolution, Option<String>) {
+    let mut pending_approvals = pending_approvals.lock().await;
+    let Some(pending) = pending_approvals.get(token) else {
+        return (PendingApprovalResolution::NotFound, None);
+    };
+    if !responder_allowed || destination.is_empty() || pending.destination != destination {
+        return (PendingApprovalResolution::Rejected, None);
+    }
+
+    let Some(pending) = pending_approvals.remove(token) else {
+        return (PendingApprovalResolution::NotFound, None);
+    };
+    drop(pending_approvals);
+    if pending.sender.send(response).is_ok() {
+        (PendingApprovalResolution::Resolved, Some(pending.tool_name))
+    } else {
+        (PendingApprovalResolution::ReceiverClosed, None)
+    }
+}
+
 /// Generate a conversation history key from a channel message.
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match &msg.thread_ts {
@@ -525,9 +697,78 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     }
 }
 
+/// Fail with the vendor's status and body when an HTTP response is not a
+/// success, otherwise hand the response back so the caller can read it.
+///
+/// This is the one shape twenty-nine hand-written checks shared: a status
+/// test, the status captured, the body read best-effort, and
+/// `"<what> failed (<status>): <body>"`. Keeping the message byte-identical
+/// means callers migrate without changing what an operator sees in a log.
+/// Sites that need something else, such as a typed error, a sanitized body, a
+/// status-specific retry, or a body that must stay unread so it can be
+/// streamed — keep their own check on purpose.
+#[cfg(any(
+    feature = "channel-dingtalk",
+    feature = "channel-discord",
+    feature = "channel-line",
+    feature = "channel-mochat",
+    feature = "channel-qq",
+    feature = "channel-twitter",
+    feature = "channel-wechat",
+    feature = "channel-wecom"
+))]
+pub(crate) async fn ensure_success(
+    resp: reqwest::Response,
+    what: &str,
+) -> anyhow::Result<reqwest::Response> {
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    let status = resp.status();
+    let err = resp.text().await.unwrap_or_default();
+    anyhow::bail!("{what} failed ({status}): {err}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "channel-qq")]
+    #[tokio::test]
+    async fn ensure_success_passes_a_success_through_and_reports_status_and_body_otherwise() {
+        let (url, server) = spawn_raw_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+            false,
+        )
+        .await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let resp = ensure_success(resp, "QQ sendMessage").await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "ok");
+        server.await.unwrap();
+
+        let (url, server) = spawn_raw_http_response(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nboom!".to_vec(),
+            false,
+        )
+        .await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = ensure_success(resp, "QQ sendMessage").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "QQ sendMessage failed (500 Internal Server Error): boom!"
+        );
+        server.await.unwrap();
+    }
+
+    /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
+    #[allow(deprecated)]
+    #[test]
+    fn floor_char_boundary_compatibility_wrapper_delegates_to_std() {
+        let text = "abc😀def";
+
+        assert_eq!(floor_char_boundary(text, 5), 3);
+        assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
     async fn response_from_raw_http(
@@ -622,14 +863,6 @@ mod tests {
                 "channel-runtime-progress-finalizing-response",
             ]
         );
-    }
-
-    #[test]
-    fn floor_char_boundary_handles_mid_codepoint_offset() {
-        let text = "abc😀def";
-
-        assert_eq!(super::floor_char_boundary(text, 5), 3);
-        assert_eq!(super::floor_char_boundary(text, usize::MAX), text.len());
     }
 
     #[test]
@@ -736,6 +969,153 @@ mod tests {
             attachments,
             vec![("LOCATION".to_string(), "40.7,-74.0".to_string())]
         );
+    }
+
+    /// A reply opening with an ElevenLabs v3 expressive audio tag is prose
+    /// written for speech, so it must reach TTS rather than be filtered out
+    /// as machine output.
+    #[test]
+    fn voice_reply_accepts_leading_audio_tags() {
+        for content in [
+            "[dramatic] Signori, si alza il sipario sulla serata.",
+            "[exhales] Ascoltate, ascoltate... e l'aria della sera.",
+            "[very excited] Ho finito di preparare il tuo riepilogo!",
+            "[pause 2s] Adesso arriva la parte piu interessante del racconto.",
+            "[strong French accent] Bonjour, comment allez-vous aujourd'hui?",
+            "[whispers][slowly] Ascoltate bene quello che sto per dire.",
+        ] {
+            assert_eq!(voice_reply_skip_reason(content), None, "input: {content}");
+        }
+    }
+
+    /// The control case from the report: prose with no leading bracket was
+    /// always voiced and must stay that way.
+    #[test]
+    fn voice_reply_accepts_plain_prose() {
+        assert_eq!(
+            voice_reply_skip_reason("Si apra il sipario, si accordi l'orchestra!"),
+            None
+        );
+    }
+
+    /// The bracket clause still has to reject genuine machine output. An
+    /// attachment marker reaching TTS would read a filesystem path aloud.
+    #[test]
+    fn voice_reply_rejects_bracketed_machine_output() {
+        for (content, expected) in [
+            (
+                "[{\"a\":1},{\"b\":2}] ecco il meteo di oggi per Roma.",
+                "json_array",
+            ),
+            (
+                "[\"alpha\",\"beta\",\"gamma\",\"delta\",\"epsilon\"]",
+                "json_array",
+            ),
+            (
+                "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",
+                "json_array",
+            ),
+            (
+                "[] plus filler text to clear the length floor here",
+                "json_array",
+            ),
+            (
+                "[IMAGE:/home/pi/chart.png] Ecco il grafico richiesto.",
+                "attachment_marker",
+            ),
+            (
+                "[VOICE:/tmp/zeroclaw/out.ogg] Nota vocale registrata.",
+                "attachment_marker",
+            ),
+            (
+                "[DOCUMENT:https://example.com/report.pdf] Ecco il file.",
+                "attachment_marker",
+            ),
+            (
+                "[Guida](https://example.com/docs) ecco il link utile.",
+                "markdown_link",
+            ),
+            (
+                "[unclosed tag and a sentence that never closes it",
+                "unclosed_bracket",
+            ),
+            (
+                "[didascalia molto lunga che sfora il limite dei tag] ok",
+                "bracketed_prefix",
+            ),
+        ] {
+            assert_eq!(
+                voice_reply_skip_reason(content),
+                Some(expected),
+                "input: {content}"
+            );
+        }
+    }
+
+    /// The clauses that predate the audio-tag fix keep their behavior.
+    #[test]
+    fn voice_reply_rejects_non_bracket_machine_output() {
+        for (content, expected) in [
+            (
+                "{\"ok\":true,\"result\":{\"message_id\":123456}}",
+                "json_object",
+            ),
+            (
+                "https://example.com/a/very/long/path/that/clears",
+                "url_prefix",
+            ),
+            (
+                "Error: the provider refused the request again.",
+                "error_prefix",
+            ),
+            (
+                "Ecco:\n```bash\nls -la\n``` e poi fammi sapere tutto.",
+                "code_fence",
+            ),
+            (
+                "Ho ricevuto un tool_call malformato, riprovo.",
+                "tool_call_marker",
+            ),
+            (
+                "Meteo da wttr.in: Roma 21 gradi, cielo sereno.",
+                "weather_tool_output",
+            ),
+        ] {
+            assert_eq!(
+                voice_reply_skip_reason(content),
+                Some(expected),
+                "input: {content}"
+            );
+        }
+    }
+
+    /// The length floor is measured on the full reply, tag included, so a
+    /// leading tag can never shorten a reply into rejection.
+    #[test]
+    fn voice_reply_length_floor_is_measured_on_the_full_reply() {
+        assert_eq!(voice_reply_skip_reason(&"x".repeat(41)), None);
+        assert_eq!(voice_reply_skip_reason(&"x".repeat(40)), Some("too_short"));
+        assert_eq!(
+            voice_reply_skip_reason(&format!("[whispers]{}", "x".repeat(31))),
+            None
+        );
+        assert_eq!(voice_reply_skip_reason("[laughs]"), Some("too_short"));
+        assert_eq!(
+            voice_reply_skip_reason("[dramatic] Ciao!"),
+            Some("too_short")
+        );
+    }
+
+    /// Pins the classifier so a refactor that breaks tag recognition or the
+    /// marker guard fails loudly rather than silently.
+    #[test]
+    fn leading_bracket_classifier_distinguishes_tags_from_markers() {
+        assert_eq!(leading_bracket_skip_reason("[whispers] rest"), None);
+        assert_eq!(
+            leading_bracket_skip_reason("[IMAGE:/x] rest"),
+            Some("attachment_marker")
+        );
+        assert_eq!(leading_bracket_skip_reason("no bracket here"), None);
     }
 
     #[test]
@@ -1000,5 +1380,110 @@ mod tests {
                 "adapter source references Fluent key {key:?}, but it resolves to the missing-string sentinel (undefined or typo'd)"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_requires_authorized_responder_and_destination() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().await.insert(
+            "approval-id".to_string(),
+            PendingApproval {
+                sender: tx,
+                destination: "room-a".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        let rejected_responder = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Approve,
+            false,
+            "room-a",
+        )
+        .await;
+        assert_eq!(rejected_responder, PendingApprovalResolution::Rejected);
+        assert!(
+            rejected_responder.suppresses_message(),
+            "a rejected reply for a known approval must not reach normal dispatch"
+        );
+        assert!(pending.lock().await.contains_key("approval-id"));
+
+        let rejected_destination = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Deny,
+            true,
+            "room-b",
+        )
+        .await;
+        assert_eq!(rejected_destination, PendingApprovalResolution::Rejected);
+        assert!(
+            rejected_destination.suppresses_message(),
+            "a cross-destination reply for a known approval must not reach normal dispatch"
+        );
+        assert!(pending.lock().await.contains_key("approval-id"));
+
+        let resolved = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::AlwaysApprove,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(resolved, PendingApprovalResolution::Resolved);
+        assert!(resolved.suppresses_message());
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+        assert!(pending.lock().await.is_empty());
+
+        let not_found = resolve_pending_approval(
+            &pending,
+            "missing-approval-id",
+            ChannelApprovalResponse::Approve,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(not_found, PendingApprovalResolution::NotFound);
+        assert!(
+            !not_found.suppresses_message(),
+            "ordinary text must continue when no pending approval owns its token"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_resolution_reports_closed_receiver_as_failure() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        pending.lock().await.insert(
+            "approval-id".to_string(),
+            PendingApproval {
+                sender: tx,
+                destination: "room-a".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+
+        let resolution = resolve_pending_approval(
+            &pending,
+            "approval-id",
+            ChannelApprovalResponse::Approve,
+            true,
+            "room-a",
+        )
+        .await;
+        assert_eq!(resolution, PendingApprovalResolution::ReceiverClosed);
+        assert!(
+            resolution.suppresses_message(),
+            "a consumed approval must not fall through after its receiver closes"
+        );
+        assert!(pending.lock().await.is_empty());
     }
 }

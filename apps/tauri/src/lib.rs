@@ -178,6 +178,9 @@ fn set_dock_icon() {
     let data = NSData::with_bytes(icon_bytes);
     if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
         let app = NSApplication::sharedApplication(mtm);
+        // SAFETY: `mtm` proves this code is running on the AppKit main thread,
+        // and both `app` and `image` are live Objective-C objects for the
+        // duration of the message send.
         unsafe { app.setApplicationIconImage(Some(&image)) };
     }
 }

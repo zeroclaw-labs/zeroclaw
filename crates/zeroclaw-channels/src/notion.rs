@@ -306,7 +306,7 @@ impl NotionChannel {
                         ),
                     }
                 });
-                let short_id_end = crate::util::floor_char_boundary(page_id, 8);
+                let short_id_end = page_id.floor_char_boundary(8);
                 let short_id = &page_id[..short_id_end];
                 if let Err(e) = self
                     .api_call(reqwest::Method::PATCH, &page_url, Some(payload))
@@ -423,7 +423,7 @@ impl Channel for NotionChannel {
                         );
 
                         if input_text.trim().is_empty() {
-                            let short_end = crate::util::floor_char_boundary(&page_id, 8);
+                            let short_end = page_id.floor_char_boundary(8);
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -570,7 +570,7 @@ fn truncate_result(value: &str) -> String {
     }
     let cut = MAX_RESULT_LENGTH.saturating_sub(30);
     // Ensure we cut on a char boundary
-    let end = crate::util::floor_char_boundary(value, cut);
+    let end = value.floor_char_boundary(cut);
     format!("{}\n\n... [output truncated]", &value[..end])
 }
 

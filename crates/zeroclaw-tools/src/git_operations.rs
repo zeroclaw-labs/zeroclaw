@@ -959,12 +959,15 @@ impl Tool for GitOperationsTool {
             // Try to find .git in parent directories
             let mut current_dir = working_dir.as_path();
             let mut found_git = false;
-            while current_dir.parent().is_some() {
+            loop {
                 if current_dir.join(".git").exists() {
                     found_git = true;
                     break;
                 }
-                current_dir = current_dir.parent().unwrap();
+                let Some(parent) = current_dir.parent() else {
+                    break;
+                };
+                current_dir = parent;
             }
 
             if !found_git {

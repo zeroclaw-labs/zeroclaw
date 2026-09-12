@@ -43,14 +43,14 @@
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
         # Default feature set: canonical lean Dist.
         # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
         buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
           (pkgs.makeRustPlatform {
             cargo = rustToolchain;
             rustc = rustToolchain;
           }).buildRustPackage {
             inherit pname;
-            version = "0.8.4";
+            version = "0.8.5";
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;

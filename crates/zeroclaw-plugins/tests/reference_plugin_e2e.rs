@@ -21,10 +21,11 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use zeroclaw_config::schema::Config;
 use zeroclaw_plugins::component::PluginLimits;
-use zeroclaw_plugins::config::resolve_plugin_config;
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
+use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -51,6 +52,19 @@ type = "integer"
 [config_schema.properties.uppercase]
 type = "boolean"
 "#;
+
+fn toml_basic_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+#[test]
+fn toml_basic_string_preserves_windows_path_separators() {
+    let plugins_dir = r"C:\Users\agent\plugins";
+    let config = format!("plugins_dir = {}", toml_basic_string(plugins_dir));
+    let parsed: toml::Value = toml::from_str(&config).expect("parse escaped plugin path");
+
+    assert_eq!(parsed["plugins_dir"].as_str(), Some(plugins_dir));
+}
 
 /// Build the in-tree tool fixture once per test binary and return its component.
 fn fixture() -> PathBuf {
@@ -140,6 +154,7 @@ fn seed_config_dir(dir: &std::path::Path) {
     )
     .unwrap();
     let instance_key = scope.id().config_entry_key().unwrap();
+    let plugins_dir_toml = toml_basic_string(&plugins_root.to_string_lossy());
 
     fs::write(
         dir.join("config.toml"),
@@ -148,14 +163,13 @@ fn seed_config_dir(dir: &std::path::Path) {
              [plugins]\n\
              enabled = true\n\
              auto_discover = true\n\
-             plugins_dir = \"{}\"\n\n\
+             plugins_dir = {plugins_dir_toml}\n\n\
              [[plugins.entries]]\n\
              name = \"{}\"\n\n\
              [plugins.entries.config]\n\
              label = \"masked\"\n\
              uppercase = \"true\"\n\
              max_len = \"5\"\n",
-            plugins_root.display(),
             instance_key
         ),
     )
@@ -213,14 +227,21 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     assert_eq!(section.get("uppercase").map(String::as_str), Some("true"));
     assert_eq!(section.get("max_len").map(String::as_str), Some("5"));
 
+    let resolver_manifest = manifest.clone();
+    let resolver_section = section.clone();
+    let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
+    }));
     let mut plugin = runtime::create_plugin(
         wasm_path,
         &scope,
+        &services,
         PluginLimits {
             call_fuel: 1_000_000_000,
             max_memory_bytes: 256 * 1024 * 1024,
             max_table_elements: 100_000,
             max_instances: 64,
+            call_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await
@@ -230,9 +251,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
         .await
         .expect("read metadata");
 
-    let resolved = resolve_plugin_config(manifest, &scope, Some(&section))
-        .expect("materialize typed plugin config");
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#, &resolved).await;
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#).await;
 
     // SAFETY: serialized by ENV_LOCK.
     match prev {

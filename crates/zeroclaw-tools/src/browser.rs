@@ -3360,7 +3360,8 @@ mod tests {
         // Should be rejected as outside workspace
         assert!(
             err.to_string().contains("outside-workspace")
-                || err.to_string().contains("outside/page.png"),
+                || err.to_string().contains("outside/page.png")
+                || err.to_string().contains("not in the workspace allowlist"),
             "Expected outside-workspace rejection, got: {}",
             err
         );

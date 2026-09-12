@@ -3,6 +3,24 @@
   <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="ZeroClaw" type="win32" />
   <description>ZeroClaw Desktop</description>
 
+  <!--
+    TaskDialogIndirect is exported only by ComCtl32.dll version 6. Without this
+    activation-context dependency Windows selects the version 5 common controls
+    assembly and the packaged desktop process fails before startup.
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
