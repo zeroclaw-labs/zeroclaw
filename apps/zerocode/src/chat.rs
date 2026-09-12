@@ -15320,12 +15320,20 @@ mod tests {
         );
     }
 
+    // This test intentionally holds the process-global keymap test guard while
+    // async dispatch runs so override-mutating tests cannot race it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn rtg_9739_composer_enter_and_primary_enter_dispatch_without_approval() {
+    async fn rtg_9739_composer_enter_and_modifier_enter_dispatch_without_approval() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::keymap::overrides::reset();
+
         for kind in [PaneKind::Chat, PaneKind::Acp] {
-            for (key, prompt) in [
+            let mut cases = vec![
                 (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), "submit"),
                 (
                     KeyEvent::new(
@@ -15335,7 +15343,15 @@ mod tests {
                     ),
                     "inject",
                 ),
-            ] {
+            ];
+            if cfg!(target_os = "macos") {
+                cases.push((
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+                    "control inject",
+                ));
+            }
+
+            for (key, prompt) in cases {
                 let (tx, mut rx) = mpsc::channel::<String>(16);
                 let outbound = Arc::new(RpcOutbound::new(tx));
                 let client = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
