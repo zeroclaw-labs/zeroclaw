@@ -2897,6 +2897,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn patch_allow_from_deny_all_persists_and_reloads_tool_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.risk_profiles.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                deny_all_tools: true,
+                ..Default::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let state = test_state(config);
+        let (status, json) = response_json(
+            handle_patch(
+                State(state),
+                HeaderMap::new(),
+                axum::Json(serde_json::json!([
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/allowed_tools",
+                        "value": ["shell"]
+                    },
+                    {
+                        "op": "replace",
+                        "path": "/risk_profiles/default/deny_all_tools",
+                        "value": false
+                    }
+                ])),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["saved"], true);
+
+        let written = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&written).unwrap();
+        let profile = reloaded.risk_profiles.get("default").unwrap();
+        assert_eq!(profile.allowed_tools, vec!["shell"]);
+        assert!(!profile.deny_all_tools);
+
+        let policy =
+            zeroclaw_config::policy::SecurityPolicy::from_profiles(profile, None, tmp.path());
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(!policy.is_tool_allowed("memory_recall"));
+    }
+
+    #[tokio::test]
     async fn delete_map_key_handler_cascades_model_provider_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
         let mut config = temp_config(&tmp);
