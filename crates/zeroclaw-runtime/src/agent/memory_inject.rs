@@ -396,6 +396,7 @@ mod tests {
         score: Option<f64>,
     ) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: key.to_string(),
             key: key.to_string(),
             content: content.to_string(),
@@ -1091,6 +1092,7 @@ mod tests {
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             timestamp: timestamp.to_rfc3339(),
             importance,
             ..entry(key, content, category, score)

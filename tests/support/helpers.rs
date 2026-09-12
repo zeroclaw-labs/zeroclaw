@@ -155,6 +155,7 @@ impl zeroclaw::memory::Memory for StaticRecallMemory {
             .entries
             .iter()
             .map(|(k, v)| zeroclaw::memory::MemoryEntry {
+                principal_id: None,
                 id: k.clone(),
                 key: k.clone(),
                 content: v.clone(),

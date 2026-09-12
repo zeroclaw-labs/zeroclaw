@@ -145,6 +145,12 @@ cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
 cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
+cli-oidc-unknown-alias = No [oidc.{ $alias }] entry in the config. Configured entries: { $known }
+cli-oidc-device-visit = To sign in, visit { $uri } and enter code { $code }
+cli-oidc-device-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+cli-oidc-device-expired = The device code expired before approval; run the command again.
+cli-oidc-enrolled = Enrolled with [oidc.{ $alias }]. The access token is on stdout; present it as auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN.
+cli-oidc-token-expiry = The token expires in { $seconds } seconds.
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 

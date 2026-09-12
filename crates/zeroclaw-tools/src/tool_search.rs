@@ -867,6 +867,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_caller_allowlist_denies_every_mcp_tool() {
+        // The principal tool narrowing flows in as `caller_allowed`. An
+        // empty principal list must yield a tool-less session even in the
+        // presence of MCP `<server>__<tool>` names, which the risk-profile
+        // gate would otherwise auto-admit. No `__` escape at the caller layer.
+        let policy = ToolAccessPolicy::from_security(None, None, Some(&[]))
+            .expect("an empty caller allowlist still produces a policy");
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "empty caller allowlist must deny MCP tools despite the __ auto-admit"
+        );
+    }
+
+    #[test]
     fn caller_allowed_per_run_gate_still_honors_denylist() {
         let policy = ToolAccessPolicy::from_security(
             Some(&["shell".to_string()]),
