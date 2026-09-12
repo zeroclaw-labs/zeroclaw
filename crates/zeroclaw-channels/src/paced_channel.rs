@@ -215,6 +215,8 @@ impl PacedChannel {
                     "paced channel queue full: dropping newest outbound message"
                 );
                 (None, None, false)
+                // Reported to the caller as an error below — see the tail of
+                // this function for why a dropped send must not look sent.
             } else {
                 let (tx, rx) = oneshot::channel();
                 state.queue.push_back(PendingSend { op, reply: tx });
@@ -260,7 +262,16 @@ impl PacedChannel {
                 ))
             });
         }
-        Ok(())
+        // Only the queue-full branch yields `(None, None, _)`: the message was
+        // discarded and never reached the inner channel. Report that, rather
+        // than `Ok(())`. A silent success here is indistinguishable from
+        // delivery, so every caller — the orchestrator's reply path,
+        // `escalate_to_human`, `ask_user` — reports that it notified a human
+        // while the message was thrown away inside this process.
+        Err(anyhow::Error::msg(format!(
+            "paced channel queue full for this recipient (max {}): outbound message dropped without being sent",
+            self.queue_depth
+        )))
     }
 
     /// Spawn the worker that drains a recipient's queue at the floor rate.
@@ -812,7 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_overflow_drops_newest_and_warns() {
+    async fn queue_overflow_drops_newest_and_reports_the_drop() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
@@ -849,11 +860,16 @@ mod tests {
         // lock acquire and into the queue. 50ms is well inside the 1s
         // pacing floor so the worker hasn't drained anything yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // The third lands while the queue is full → drop + WARN, returns Ok.
-        paced
-            .send(&SendMessage::new("overflow", "alice"))
-            .await
-            .unwrap();
+        // The third lands while the queue is full → dropped, and the caller is
+        // told so. Reporting `Ok` here would be indistinguishable from delivery.
+        let overflow = paced.send(&SendMessage::new("overflow", "alice")).await;
+        let err =
+            overflow.expect_err("a dropped send must not be reported to the caller as success");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("queue full") && rendered.contains("dropped"),
+            "the error must say the message was dropped, got: {rendered}",
+        );
         // Allow the workers to drain at the 1s floor.
         let (a, b) = tokio::join!(h_a, h_b);
         a.unwrap().unwrap();
@@ -864,6 +880,46 @@ mod tests {
             counting.sends.load(Ordering::SeqCst),
             3,
             "queue overflow must drop the newest send before the inner channel sees it",
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_reports_the_drop_for_finalize_draft_too() {
+        // The orchestrator falls back to sending a new message when
+        // `finalize_draft` fails. That fallback only runs if the dropped
+        // finalize is reported as an error, so cover the non-`send` op.
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let inner: Arc<dyn Channel> = counting.clone();
+        let cfg = PacingFixture {
+            interval_secs: 1,
+            depth: 1,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+        paced
+            .send(&SendMessage::new("first", "carol"))
+            .await
+            .unwrap();
+        let paced_q = Arc::clone(&paced);
+        let queued = zeroclaw_spawn::spawn!(async move {
+            paced_q.send(&SendMessage::new("queued", "carol")).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let dropped = paced
+            .finalize_draft("carol", "draft-1", "final text", false)
+            .await;
+        assert!(
+            dropped.is_err(),
+            "a dropped finalize_draft must surface as an error so callers can fall back",
+        );
+        queued.await.unwrap().unwrap();
+        assert_eq!(
+            counting.finalize_drafts.load(Ordering::SeqCst),
+            0,
+            "the dropped finalize must never reach the inner channel",
         );
     }
 
