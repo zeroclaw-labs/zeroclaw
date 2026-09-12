@@ -42,6 +42,14 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{BufRead, ErrorKind, Read, Write};
 
+#[cfg(feature = "agent-runtime")]
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
 const STDIN_LINE_CAP: usize = 1024 * 1024;
 
 /// Result of [`read_capped_line`].
@@ -128,14 +136,14 @@ fn t(key: &str, fallback: &str) -> String {
 
 /// `t` with `{$name}` arguments.
 #[allow(unused_variables)]
-fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+fn ta(key: &str, args: &[(&str, &str)], fallback: impl Into<String>) -> String {
     #[cfg(feature = "agent-runtime")]
     {
         zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
-        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+        fallback.into() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
 }
 
@@ -173,6 +181,516 @@ fn qta(key: &str, args: &[(&str, &str)]) -> String {
 #[cfg(feature = "agent-runtime")]
 fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
     qta(key, &[("glyph", glyph), ("summary", summary)])
+}
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 20;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_ROW_OVERHEAD: usize = 3;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
+    if terminal_width < QUICKSTART_SELECTOR_MIN_WIDTH {
+        return None;
+    }
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
+}
+
+/// Resolve the terminal dimensions the Quickstart checklist will be fitted to.
+///
+/// A narrow terminal whose size is unavailable must not get rows fitted against
+/// a guessed geometry — that would reintroduce the exact overflow class this
+/// change exists to prevent. Unknown dimensions therefore take the same
+/// fail-closed path as a too-narrow terminal.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_terminal_size<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+) -> Option<(u16, u16)> {
+    term.size_checked()
+}
+
+/// Whether a sampled terminal size is usable for fitting the checklist.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
+    size.is_some()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_min_height(item_count: usize) -> usize {
+    item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_fits_height(terminal_height: usize, item_count: usize) -> bool {
+    terminal_height >= quickstart_selector_min_height(item_count)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
+    let normalized: String = row
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if normalized.len() <= budget && console::measure_text_width(&normalized) <= budget {
+        return normalized;
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let marker = if budget >= "…".len() { "…" } else { "." };
+    let byte_budget = budget - marker.len();
+    let width_budget = budget - console::measure_text_width(marker);
+    let mut fitted = String::with_capacity(budget);
+    for ch in normalized.chars() {
+        fitted.push(ch);
+        if fitted.len() > byte_budget || console::measure_text_width(&fitted) > width_budget {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted.push_str(marker);
+    fitted
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_resize_error(
+    initial_size: (u16, u16),
+    current_size: (u16, u16),
+) -> anyhow::Error {
+    let (initial_height, initial_width) = initial_size;
+    let (current_height, current_width) = current_size;
+    anyhow::Error::msg(qta(
+        "cli-quickstart-terminal-resized",
+        &[
+            ("initial_width", &initial_width.to_string()),
+            ("initial_height", &initial_height.to_string()),
+            ("current_width", &current_width.to_string()),
+            ("current_height", &current_height.to_string()),
+        ],
+    ))
+}
+
+/// Decide whether an interaction may continue at the size sampled now.
+///
+/// Returns `Err` both when the terminal changed size and when its size became
+/// unavailable: an unknown size is not evidence that the geometry still
+/// matches, and `Term::size()`'s fabricated `(24, 80)` fallback could even
+/// compare *equal* to the initial sample on an 80x24 terminal that has since
+/// lost its size query. Unknown therefore fails closed, like a resize.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_recheck_size(
+    initial_size: (u16, u16),
+    current_size: Option<(u16, u16)>,
+) -> Result<()> {
+    match current_size {
+        Some(current) if current == initial_size => Ok(()),
+        Some(current) => Err(quickstart_selector_resize_error(initial_size, current)),
+        None => Err(anyhow::Error::msg(qta(
+            "cli-quickstart-terminal-size-unknown",
+            &[],
+        ))),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_frame_lines(
+    labels: &[String],
+    prompt: &str,
+    selected: usize,
+) -> Vec<String> {
+    std::iter::once(format!("? {prompt}"))
+        .chain(labels.iter().enumerate().map(|(index, label)| {
+            let marker = if index == selected { ">" } else { " " };
+            format!("{marker} {label}")
+        }))
+        .collect()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn render_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    lines: &[String],
+) -> std::io::Result<()> {
+    for line in lines {
+        term.write_line(line)?;
+    }
+    term.flush()
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorKey {
+    Down,
+    Up,
+    Select,
+    Cancel,
+    Interrupt,
+    Other,
+}
+
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorTerminal {
+    /// Geometry of the terminal that receives `write_line` output, as
+    /// `(rows, columns)`, or `None` when it cannot be determined.
+    fn size_checked(&mut self) -> Option<(u16, u16)>;
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn clear_screen(&mut self) -> std::io::Result<()>;
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()>;
+    fn hide_cursor(&mut self) -> std::io::Result<()>;
+    fn show_cursor(&mut self) -> std::io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn write_line(&mut self, line: &str) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+/// The input half of the Crossterm selector: raw-mode ownership plus key
+/// decoding. It is separate from the output half so a regression can drive the
+/// production output adapter with injected keys.
+#[cfg(feature = "agent-runtime")]
+trait QuickstartSelectorInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey>;
+}
+
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartInput {
+    restore_cooked_mode: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartInput {
+    fn new() -> std::io::Result<Self> {
+        let raw_mode_was_enabled = terminal::is_raw_mode_enabled()?;
+        if !raw_mode_was_enabled {
+            terminal::enable_raw_mode()?;
+        }
+        Ok(Self {
+            restore_cooked_mode: !raw_mode_was_enabled,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl Drop for CrosstermQuickstartInput {
+    fn drop(&mut self) {
+        if self.restore_cooked_mode {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl QuickstartSelectorInput for CrosstermQuickstartInput {
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        loop {
+            match event::read()? {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+                {
+                    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let modified = key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+                    return Ok(match key.code {
+                        KeyCode::Char('c') if control => QuickstartSelectorKey::Interrupt,
+                        KeyCode::Down | KeyCode::Tab => QuickstartSelectorKey::Down,
+                        KeyCode::Char('j') if !modified => QuickstartSelectorKey::Down,
+                        KeyCode::Up | KeyCode::BackTab => QuickstartSelectorKey::Up,
+                        KeyCode::Char('k') if !modified => QuickstartSelectorKey::Up,
+                        KeyCode::Enter => QuickstartSelectorKey::Select,
+                        KeyCode::Char(' ') if !modified => QuickstartSelectorKey::Select,
+                        KeyCode::Esc => QuickstartSelectorKey::Cancel,
+                        KeyCode::Char('q') if !modified => QuickstartSelectorKey::Cancel,
+                        _ => QuickstartSelectorKey::Other,
+                    });
+                }
+                // A resize is returned to the loop so the checked geometry is
+                // sampled immediately rather than waiting for another key.
+                Event::Resize(_, _) => return Ok(QuickstartSelectorKey::Other),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A frame destination whose own terminal geometry can be measured.
+///
+/// Quickstart requires stdin and stderr to be terminals, not the same
+/// terminal. The frame is therefore fitted to the descriptor it is written to
+/// rather than to whichever terminal a process-global query describes.
+#[cfg(all(feature = "agent-runtime", unix))]
+trait QuickstartSelectorOutput: Write + std::os::fd::AsFd {}
+
+#[cfg(all(feature = "agent-runtime", unix))]
+impl<W: Write + std::os::fd::AsFd> QuickstartSelectorOutput for W {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+trait QuickstartSelectorOutput: Write {}
+
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+impl<W: Write> QuickstartSelectorOutput for W {}
+
+/// Measure the terminal behind `output` as `(rows, columns)`.
+///
+/// A zero dimension means the driver holds no geometry for that terminal. It
+/// is reported as unknown so the caller fails closed instead of fitting rows
+/// to a zero-width frame.
+#[cfg(all(feature = "agent-runtime", unix))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(output: &W) -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+    // SAFETY: `size` points to writable `winsize` storage and the borrowed
+    // descriptor stays open for the duration of the call.
+    let result = unsafe {
+        libc::ioctl(
+            output.as_fd().as_raw_fd(),
+            libc::TIOCGWINSZ,
+            size.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
+    let size = unsafe { size.assume_init() };
+    (size.ws_row > 0 && size.ws_col > 0).then_some((size.ws_row, size.ws_col))
+}
+
+/// Measure the active console screen buffer as `(rows, columns)`.
+///
+/// Crossterm offers no per-handle geometry query here. A native console
+/// shares one screen buffer between stdout and stderr, so the measured
+/// surface is the one that receives the frame. Native-console rendering is
+/// not exercised by hosted checks and remains a documented verification gap.
+#[cfg(all(feature = "agent-runtime", not(unix)))]
+fn quickstart_output_terminal_size<W: QuickstartSelectorOutput>(_output: &W) -> Option<(u16, u16)> {
+    terminal::size().ok().map(|(columns, rows)| (rows, columns))
+}
+
+/// Crossterm-backed selector terminal: frames go to `output`, keys come from
+/// `input`, and geometry is always read from `output`.
+#[cfg(feature = "agent-runtime")]
+struct CrosstermQuickstartTerminal<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> {
+    output: W,
+    input: K,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl CrosstermQuickstartTerminal<std::io::Stderr, CrosstermQuickstartInput> {
+    fn stderr() -> std::io::Result<Self> {
+        Ok(Self {
+            output: std::io::stderr(),
+            input: CrosstermQuickstartInput::new()?,
+        })
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<W: QuickstartSelectorOutput, K: QuickstartSelectorInput> QuickstartSelectorTerminal
+    for CrosstermQuickstartTerminal<W, K>
+{
+    fn size_checked(&mut self) -> Option<(u16, u16)> {
+        quickstart_output_terminal_size(&self.output)
+    }
+
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, EnterAlternateScreen)
+    }
+
+    fn clear_screen(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Clear(ClearType::All))
+    }
+
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+        execute!(self.output, MoveTo(0, 0))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Hide)
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        execute!(self.output, Show)
+    }
+
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+        // Crossterm uses the native screen-buffer API on legacy Windows
+        // consoles and the ANSI sequence on terminals that support it.
+        execute!(self.output, LeaveAlternateScreen)
+    }
+
+    fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+        // Raw mode disables the Unix terminal driver's LF-to-CRLF mapping.
+        // Emit both controls explicitly so every row begins in column zero.
+        write!(self.output, "{line}\r\n")
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+
+    fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+        self.input.read_key()
+    }
+}
+
+/// Own the alternate screen from before its first fallible operation.
+///
+/// Claiming ownership before `enter_alternate_screen` means a partial write or
+/// flush failure still triggers a best-effort restore. Cleanup attempts are
+/// independent: a cursor error must never strand the alternate screen.
+#[cfg(feature = "agent-runtime")]
+struct QuickstartSelectorScreen<'a, T: QuickstartSelectorTerminal> {
+    term: &'a mut T,
+    restore_needed: bool,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<'a, T: QuickstartSelectorTerminal> QuickstartSelectorScreen<'a, T> {
+    fn enter(term: &'a mut T) -> std::io::Result<Self> {
+        let screen = Self {
+            term,
+            restore_needed: true,
+        };
+        screen.term.enter_alternate_screen()?;
+        screen.term.clear_screen()?;
+        screen.term.move_cursor_to_origin()?;
+        screen.term.hide_cursor()?;
+        screen.term.flush()?;
+        Ok(screen)
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        if !self.restore_needed {
+            return Ok(());
+        }
+        self.restore_needed = false;
+
+        let mut first_error = None;
+        for result in [
+            self.term.show_cursor(),
+            self.term.leave_alternate_screen(),
+            self.term.flush(),
+        ] {
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl<T: QuickstartSelectorTerminal> Drop for QuickstartSelectorScreen<'_, T> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartSelectorOutcome {
+    Pick(Option<usize>),
+    Interrupt,
+}
+
+/// Render the fixed-size Quickstart checklist without dialoguer paging.
+///
+/// The terminal dimensions sampled for fitting are part of this interaction's
+/// contract. They describe the terminal that receives the frame, and every
+/// input event rechecks them before navigation or selection; a resize exits
+/// the selector-owned alternate screen instead of trying to erase a
+/// main-screen frame whose physical rows the terminal may have reflowed. A
+/// resize of the output terminal alone raises no input event, so it is caught
+/// at the next key. Leaving the alternate screen atomically restores
+/// unrelated output.
+#[cfg(feature = "agent-runtime")]
+fn interact_quickstart_selector<T: QuickstartSelectorTerminal>(
+    term: &mut T,
+    labels: &[String],
+    prompt: &str,
+    initial_size: (u16, u16),
+) -> Result<QuickstartSelectorOutcome> {
+    if labels.is_empty() {
+        bail!(qta("cli-quickstart-empty-checklist", &[]));
+    }
+    let current_size = quickstart_selector_terminal_size(term);
+    quickstart_selector_recheck_size(initial_size, current_size)?;
+
+    let mut screen = QuickstartSelectorScreen::enter(term)?;
+    let interaction = (|| -> Result<QuickstartSelectorOutcome> {
+        let mut selected = 0;
+        let mut frame = quickstart_selector_frame_lines(labels, prompt, selected);
+        render_quickstart_selector(screen.term, &frame)?;
+
+        loop {
+            let key = screen.term.read_key()?;
+            let current_size = quickstart_selector_terminal_size(screen.term);
+            quickstart_selector_recheck_size(initial_size, current_size)?;
+
+            match key {
+                QuickstartSelectorKey::Down => {
+                    selected = (selected + 1) % labels.len();
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Up => {
+                    selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
+                    frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
+                    render_quickstart_selector(screen.term, &frame)?;
+                }
+                QuickstartSelectorKey::Select => {
+                    return Ok(QuickstartSelectorOutcome::Pick(Some(selected)));
+                }
+                QuickstartSelectorKey::Cancel => {
+                    return Ok(QuickstartSelectorOutcome::Pick(None));
+                }
+                QuickstartSelectorKey::Interrupt => {
+                    return Ok(QuickstartSelectorOutcome::Interrupt);
+                }
+                QuickstartSelectorKey::Other => {}
+            }
+        }
+    })();
+    let cleanup = screen.restore();
+    match (interaction, cleanup) {
+        (Ok(QuickstartSelectorOutcome::Interrupt), _) => Ok(QuickstartSelectorOutcome::Interrupt),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(selection), Ok(())) => Ok(selection),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartChecklistAction {
+    Provider,
+    Risk,
+    Memory,
+    Channels,
+    PeerGroups,
+    Agent,
+    Create,
+    Quit,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_action_for_pick(
+    choices: &[(QuickstartChecklistAction, String)],
+    pick: Option<usize>,
+) -> QuickstartChecklistAction {
+    pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
+        .unwrap_or(QuickstartChecklistAction::Quit)
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -516,7 +1034,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -1056,8 +1574,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -1434,19 +1952,6 @@ async fn run_quickstart_cli(
         }
     }
 
-    // ── Main checklist loop ─────────────────────────────────────
-    #[derive(Clone, Copy)]
-    enum Action {
-        Provider,
-        Risk,
-        Memory,
-        Channels,
-        PeerGroups,
-        Agent,
-        Create,
-        Quit,
-    }
-
     println!();
     println!(
         "{}",
@@ -1536,74 +2041,127 @@ async fn run_quickstart_cli(
         };
 
         let risk_summary = preset_summary(&form.risk);
-        let mut labels: Vec<String> = vec![
-            quickstart_row(
-                "cli-quickstart-row-model-provider",
-                glyph(form.provider_done()),
-                &provider_summary,
+        let mut choices: Vec<(QuickstartChecklistAction, String)> = vec![
+            (
+                QuickstartChecklistAction::Provider,
+                quickstart_row(
+                    "cli-quickstart-row-model-provider",
+                    glyph(form.provider_done()),
+                    &provider_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-risk-profile",
-                glyph(form.risk_done()),
-                &risk_summary,
+            (
+                QuickstartChecklistAction::Risk,
+                quickstart_row(
+                    "cli-quickstart-row-risk-profile",
+                    glyph(form.risk_done()),
+                    &risk_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-memory",
-                glyph(form.memory_done()),
-                &memory_summary,
+            (
+                QuickstartChecklistAction::Memory,
+                quickstart_row(
+                    "cli-quickstart-row-memory",
+                    glyph(form.memory_done()),
+                    &memory_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-channels",
-                glyph(form.channels_done()),
-                &channels_summary,
+            (
+                QuickstartChecklistAction::Channels,
+                quickstart_row(
+                    "cli-quickstart-row-channels",
+                    glyph(form.channels_done()),
+                    &channels_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-peer-groups",
-                glyph(form.peer_groups_done()),
-                &peer_groups_summary,
+            (
+                QuickstartChecklistAction::PeerGroups,
+                quickstart_row(
+                    "cli-quickstart-row-peer-groups",
+                    glyph(form.peer_groups_done()),
+                    &peer_groups_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-agent-identity",
-                glyph(form.agent_done()),
-                &agent_summary,
+            (
+                QuickstartChecklistAction::Agent,
+                quickstart_row(
+                    "cli-quickstart-row-agent-identity",
+                    glyph(form.agent_done()),
+                    &agent_summary,
+                ),
             ),
         ];
         let create_enabled = form.all_done();
-        labels.push(if create_enabled {
-            t("cli-quickstart-create-agent", "── Create agent")
-        } else {
-            t(
-                "cli-quickstart-create-agent-locked",
-                "── Create agent (locked — fill every selector first)",
-            )
-        });
+        choices.push((
+            QuickstartChecklistAction::Create,
+            if create_enabled {
+                t("cli-quickstart-create-agent", "── Create agent")
+            } else {
+                t(
+                    "cli-quickstart-create-agent-locked",
+                    "── Create agent (locked — fill every selector first)",
+                )
+            },
+        ));
 
-        let actions = [
-            Action::Provider,
-            Action::Risk,
-            Action::Memory,
-            Action::Channels,
-            Action::PeerGroups,
-            Action::Agent,
-            Action::Create,
-        ];
+        let mut term = CrosstermQuickstartTerminal::stderr()?;
+        // Fail closed when the terminal API cannot report its dimensions;
+        // fitting against a guessed size would reintroduce row overflow.
+        let Some(terminal_size) = quickstart_selector_terminal_size(&mut term) else {
+            anyhow::bail!("{}", qta("cli-quickstart-terminal-size-unknown", &[]));
+        };
+        let (terminal_height, terminal_width) = terminal_size;
+        let terminal_height = usize::from(terminal_height);
+        let terminal_width = usize::from(terminal_width);
+        let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
+            let terminal_width = terminal_width.to_string();
+            let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-narrow",
+                    &[("width", &terminal_width), ("min_width", &min_width)],
+                )
+            );
+        };
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
+            .collect();
+        let min_height = quickstart_selector_min_height(labels.len());
+        if !quickstart_selector_fits_height(terminal_height, labels.len()) {
+            let terminal_height = terminal_height.to_string();
+            let min_height = min_height.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-short",
+                    &[("height", &terminal_height), ("min_height", &min_height)],
+                )
+            );
+        }
 
-        let pick = FuzzySelect::new()
-            .with_prompt(t(
+        let prompt = fit_quickstart_selector_row(
+            &t(
                 "cli-quickstart-open-selector-prompt",
                 "Open a selector (Enter), or pick Create. Esc to quit.",
-            ))
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_opt()?;
-        let action = match pick {
-            Some(i) => actions[i],
-            None => Action::Quit, // Esc on the main checklist quits.
+            ),
+            row_budget,
+        );
+        // Keep this checklist non-searchable and non-paged, and fail closed if
+        // its fitted terminal dimensions change while it is active.
+        let outcome = interact_quickstart_selector(&mut term, &labels, &prompt, terminal_size)?;
+        // `process::exit` does not run destructors. Restore cooked mode before
+        // preserving the selector's historical Ctrl+C exit semantics.
+        drop(term);
+        let pick = match outcome {
+            QuickstartSelectorOutcome::Pick(pick) => pick,
+            QuickstartSelectorOutcome::Interrupt => std::process::exit(130),
         };
+        let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
-            Action::Quit => {
+            QuickstartChecklistAction::Quit => {
                 println!(
                     "{}",
                     t(
@@ -1613,7 +2171,7 @@ async fn run_quickstart_cli(
                 );
                 return Ok(());
             }
-            Action::Create => {
+            QuickstartChecklistAction::Create => {
                 if !create_enabled {
                     println!(
                         "{}",
@@ -1626,7 +2184,7 @@ async fn run_quickstart_cli(
                 }
                 break;
             }
-            Action::Provider => {
+            QuickstartChecklistAction::Provider => {
                 // Step 1: pick Existing or Fresh, when there are
                 // existing providers to choose from.
                 let mut mode_labels: Vec<String> = Vec::new();
@@ -1792,7 +2350,7 @@ async fn run_quickstart_cli(
                     fields: field_buf,
                 });
             }
-            Action::Risk => {
+            QuickstartChecklistAction::Risk => {
                 let chosen = pick_preset(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
@@ -1808,7 +2366,7 @@ async fn run_quickstart_cli(
                     });
                 }
             }
-            Action::Memory => {
+            QuickstartChecklistAction::Memory => {
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1846,7 +2404,7 @@ async fn run_quickstart_cli(
                 };
                 form.memory = Some(kinds[i]);
             }
-            Action::Channels => {
+            QuickstartChecklistAction::Channels => {
                 // Channels sub-flow: list current drafts + Add / Done.
                 loop {
                     let mut items: Vec<String> = form
@@ -2002,7 +2560,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::PeerGroups => {
+            QuickstartChecklistAction::PeerGroups => {
                 // Available channel refs: staged channels (this run) +
                 // unassigned channels already in config. Refs already
                 // covered by a staged peer-group are filtered out.
@@ -2118,7 +2676,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::Agent => {
+            QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
                     .as_ref()
@@ -4030,6 +4588,20 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
+/// Explicit runtime construction instead of `#[tokio::main]` so worker
+/// threads get an 8 MiB stack. Debug builds of the deepest inline RPC
+/// handlers (quickstart apply walks the whole config tree with several
+/// `Config`-sized temporaries) overflow tokio's 2 MiB worker default and
+/// abort the daemon. The size matches the 8 MiB main-thread stacks the
+/// workspace already requests via linker args on other targets.
+fn async_main(command: clap::Command) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main_inner(command))
+}
+
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
 /// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
 /// Companion"), case-insensitively. Matching the visible application name — not
@@ -4524,9 +5096,8 @@ fn find_linux_desktop_app() -> Option<PathBuf> {
     None
 }
 
-#[tokio::main]
 #[allow(clippy::too_many_lines)]
-async fn async_main(command: clap::Command) -> Result<()> {
+async fn async_main_inner(command: clap::Command) -> Result<()> {
     // Install default crypto model_provider for Rustls TLS.
     // This prevents the error: "could not automatically determine the process-level CryptoProvider"
     // when both aws-lc-rs and ring features are available (or neither is explicitly selected).
@@ -4691,25 +5262,39 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
+    let running_executable =
+        running_executable_for_remediation().map(|path| path.display().to_string());
     for section in config
         .degraded_sections
         .iter()
         .chain(config.degraded_security.iter())
     {
-        eprintln!(
-            "{}",
+        let path = config.config_path.display().to_string();
+        let warning = if let Some(executable) = running_executable.as_deref() {
+            let fallback = format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. Use the \
+                 running executable at `{executable}` with `config migrate` to see the parse \
+                 error, then repair the file."
+            );
             ta(
-                "cli-config-section-degraded",
+                "cli-config-section-degraded-executable",
                 &[
                     ("section", section),
-                    ("path", &config.config_path.display().to_string()),
+                    ("path", &path),
+                    ("executable", executable),
                 ],
-                "warning: config section is malformed and was reset to defaults \
-                 for this run. Values in that section are NOT in effect. Run \
-                 `zeroclaw config migrate` to see the parse error, then repair \
-                 the file."
+                &fallback,
             )
-        );
+        } else {
+            format!(
+                "warning: config section `{section}` in {path} is malformed and was reset to \
+                 defaults for this run. Values in that section are NOT in effect. The running \
+                 executable path could not be resolved; repair the file through a daemon-owned \
+                 config surface instead of an unqualified PATH command."
+            )
+        };
+        eprintln!("{warning}");
     }
     for section in &config.retired_wati_config_sections {
         let fallback = format!(
@@ -5181,7 +5766,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 ta(
                                     "cli-pairing-fetch-failed",
                                     &[("endpoint", &endpoint)],
-                                    &format!(
+                                    format!(
                                         "❌ Failed to fetch pairing code from gateway at {endpoint}"
                                     ),
                                 )
@@ -6125,8 +6710,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let summary: Vec<String> = agent_aliases
                     .iter()
                     .map(|alias| match config.risk_profile_for_agent(alias) {
-                        Some(p) => format!("{alias}={:?}", p.level),
-                        None => format!("{alias}=<no risk_profile>"),
+                        Some(p) => {
+                            let level = format!("{:?}", p.level);
+                            let fallback = format!("{alias}={level}");
+                            ta(
+                                "cli-status-agent-risk-profile",
+                                &[("alias", alias), ("level", &level)],
+                                &fallback,
+                            )
+                        }
+                        None => {
+                            let fallback = format!("{alias}=<no risk_profile>");
+                            ta(
+                                "cli-status-agent-no-risk-profile-summary",
+                                &[("alias", alias)],
+                                &fallback,
+                            )
+                        }
                     })
                     .collect();
                 println!(
@@ -6152,6 +6752,33 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     "{}",
                     t("cli-status-service-stopped", "🔴 Service:       stopped")
                 );
+            }
+            #[cfg(feature = "gateway")]
+            {
+                match zeroclaw_gateway::resolve_web_dashboard_availability(&config) {
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Embedded) => {
+                        let path = "embedded";
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", path)], &fallback)
+                        );
+                    }
+                    Some(zeroclaw_gateway::WebDashboardAvailability::Filesystem(web_dist_dir)) => {
+                        let path = web_dist_dir.display().to_string();
+                        let fallback = format!("🌐 Web UI:        FOUND ({path})");
+                        println!(
+                            "{}",
+                            ta("cli-status-web-ui-found", &[("path", &path)], &fallback)
+                        );
+                    }
+                    None => {
+                        println!(
+                            "{}",
+                            t("cli-status-web-ui-missing", "🌐 Web UI:        MISSING")
+                        );
+                    }
+                }
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
@@ -6317,6 +6944,64 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row.
+                            // The warning qualifies the monthly spend line,
+                            // so it reads the current-UTC-month model rollup
+                            // rather than `summary.by_model`, which stays
+                            // daily-scoped for other consumers; unpriced usage
+                            // from an earlier day this month must not vanish
+                            // at day rollover. Surface any explicitly unpriced
+                            // subset loudly rather than let an understated
+                            // dollar total reassure the operator. Configured
+                            // zero rates and legacy rows without provenance
+                            // remain compatible and do not trigger this
+                            // warning.
+                            let month_by_model = match tracker.get_current_month_model_stats() {
+                                Ok(by_model) => by_model,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        ta(
+                                            "cli-warn-cost-usage",
+                                            &[("err", &e.to_string())],
+                                            "Could not load cost usage"
+                                        )
+                                    );
+                                    std::collections::HashMap::new()
+                                }
+                            };
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &month_by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -6366,15 +7051,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 } else {
                     t("cli-status-word-not-configured", "not configured")
                 };
-                println!(
-                    "  {:9} {}",
-                    entry.name,
-                    if entry.configured {
-                        format!("✅ {}", channel_status)
-                    } else {
-                        format!("❌ {}", channel_status)
-                    }
-                );
+                let status = if entry.configured {
+                    ta(
+                        "cli-status-channel-configured",
+                        &[("status", &channel_status)],
+                        format!("✅ {channel_status}"),
+                    )
+                } else {
+                    ta(
+                        "cli-status-channel-not-configured",
+                        &[("status", &channel_status)],
+                        format!("❌ {channel_status}"),
+                    )
+                };
+                println!("  {:9} {}", entry.name, status);
             }
             let uncompiled =
                 zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
@@ -6387,14 +7077,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                 );
                 for entry in &uncompiled {
-                    println!(
-                        "  {:9} {}",
-                        entry.name,
-                        t(
-                            "cli-status-channel-not-compiled",
-                            "🚫 configured, not compiled"
-                        )
+                    let status = t(
+                        "cli-status-channel-not-compiled",
+                        "🚫 configured, not compiled",
                     );
+                    println!("  {:9} {}", entry.name, status);
                 }
                 println!(
                     "{}",
@@ -6978,10 +7665,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
                 }
-                Ok(())
             }
         },
 
@@ -9409,6 +10098,24 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     );
 }
 
+fn running_executable_for_remediation() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "agent-runtime")]
+    {
+        if let Some(executable) = zeroclaw_runtime::restart::recorded_launch_executable() {
+            return Some(executable.to_path_buf());
+        }
+        if zeroclaw_runtime::restart::launch_command_recorded() {
+            return None;
+        }
+        std::env::current_exe().ok()
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -9418,13 +10125,27 @@ fn gate_security_posture(
     }
     let sections = config.degraded_security.join(", ");
     if !allow_degraded {
+        let remediation_executable = running_executable_for_remediation();
+        let remediation = remediation_executable.map_or_else(
+            || {
+                "The running executable path could not be resolved; use a daemon-owned repair \
+                 surface such as the gateway config editor instead of an unqualified PATH command."
+                    .to_string()
+            },
+            |exe| {
+                format!(
+                    "Running executable: {}. Use that executable with `config migrate` to see \
+                     the precise error.",
+                    exe.display()
+                )
+            },
+        );
         anyhow::bail!(
             "Config contains malformed security-critical sections ({sections}); \
              they were reset to defaults, so the running posture may be weaker \
              than intended. Refusing to serve with a degraded security posture. \
-             Repair these sections in {} and restart — run `zeroclaw config \
-             migrate` to see the precise error. To boot anyway (e.g. to reach \
-             the gateway config editor and repair from there), re-run with \
+             Repair these sections in {} and restart — {remediation} To boot anyway \
+             (e.g. to reach the gateway config editor and repair from there), re-run with \
              `--allow-degraded-security`.",
             config.config_path.display()
         );
@@ -9978,6 +10699,855 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(feature = "agent-runtime")]
+    struct SelectorTestTerminal {
+        size: Option<(u16, u16)>,
+        keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
+        actions: Vec<&'static str>,
+        fail_action: Option<&'static str>,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl SelectorTestTerminal {
+        fn new(
+            size: Option<(u16, u16)>,
+            keys: impl IntoIterator<Item = std::io::Result<QuickstartSelectorKey>>,
+        ) -> Self {
+            Self {
+                size,
+                keys: keys.into_iter().collect(),
+                actions: Vec::new(),
+                fail_action: None,
+            }
+        }
+
+        fn perform(&mut self, action: &'static str) -> std::io::Result<()> {
+            self.actions.push(action);
+            if self.fail_action == Some(action) {
+                return Err(std::io::Error::other(format!("injected {action} failure")));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    impl QuickstartSelectorTerminal for SelectorTestTerminal {
+        fn size_checked(&mut self) -> Option<(u16, u16)> {
+            self.size
+        }
+
+        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("enter_alternate_screen")
+        }
+
+        fn clear_screen(&mut self) -> std::io::Result<()> {
+            self.perform("clear_screen")
+        }
+
+        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+            self.perform("move_cursor_to_origin")
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("hide_cursor")
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.perform("show_cursor")
+        }
+
+        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.perform("leave_alternate_screen")
+        }
+
+        fn write_line(&mut self, _line: &str) -> std::io::Result<()> {
+            self.perform("write_line")
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.perform("flush")
+        }
+
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            self.actions.push("read_key");
+            self.keys.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no injected selector key",
+                ))
+            })
+        }
+    }
+
+    /// One step of a deterministic PTY interaction: a key press, or a resize
+    /// of the output terminal applied between key presses the way a terminal
+    /// emulator changes a window while the selector waits for input.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    enum PtyStep {
+        Key(QuickstartSelectorKey),
+        ResizeOutput { rows: u16, columns: u16 },
+    }
+
+    /// Injected input for the production Crossterm adapter.
+    ///
+    /// Keys are queued rather than read from the process-global event source
+    /// so the regression runs under a test harness without racing a
+    /// controlling terminal. Resizes are applied to the PTY master exactly as
+    /// a terminal emulator would, so the adapter's own geometry query must
+    /// observe them.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    struct PtyQuickstartInput {
+        master: std::fs::File,
+        steps: std::collections::VecDeque<PtyStep>,
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    impl QuickstartSelectorInput for PtyQuickstartInput {
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            loop {
+                match self.steps.pop_front() {
+                    Some(PtyStep::Key(key)) => return Ok(key),
+                    Some(PtyStep::ResizeOutput { rows, columns }) => {
+                        set_pty_size(&self.master, rows, columns);
+                    }
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "no injected selector key",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a PTY pair sized `rows` by `columns`, returned as `(master, slave)`.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn open_pty(rows: u16, columns: u16) -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: both descriptor pointers refer to live `c_int` storage. The
+        // optional name and termios inputs are null, and `dimensions` remains
+        // live for the duration of the call.
+        let openpty_result = unsafe {
+            libc::openpty(
+                &raw mut master_fd,
+                &raw mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut dimensions,
+            )
+        };
+        assert_eq!(openpty_result, 0, "openpty failed");
+
+        // SAFETY: `openpty` returned two distinct, live descriptors. Each is
+        // transferred to exactly one `File`, which closes it exactly once.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(master_fd),
+                std::fs::File::from_raw_fd(slave_fd),
+            )
+        }
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn set_pty_size(pty: &std::fs::File, rows: u16, columns: u16) {
+        use std::os::fd::AsRawFd;
+
+        let dimensions = libc::winsize {
+            ws_row: rows,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `pty` owns a live PTY descriptor and `dimensions` is a fully
+        // initialized `winsize` that outlives the call.
+        let result =
+            unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &raw const dimensions) };
+        assert_eq!(result, 0, "TIOCSWINSZ failed");
+    }
+
+    /// Build the production Crossterm adapter over a PTY slave with injected
+    /// input, so the exact production escape sequences and geometry query run.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn pty_quickstart_terminal(
+        master: &std::fs::File,
+        slave: std::fs::File,
+        steps: impl IntoIterator<Item = PtyStep>,
+    ) -> CrosstermQuickstartTerminal<std::fs::File, PtyQuickstartInput> {
+        CrosstermQuickstartTerminal {
+            output: slave,
+            input: PtyQuickstartInput {
+                master: master.try_clone().expect("PTY master should be clonable"),
+                steps: steps.into_iter().collect(),
+            },
+        }
+    }
+
+    /// Read everything written to the PTY, returning once the output is idle.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    fn drain_pty_output(master: &mut std::fs::File) -> String {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the PTY master descriptor is live; preserving its current
+        // flags and adding O_NONBLOCK prevents a spurious poll wakeup from
+        // hanging the test.
+        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(master_flags >= 0, "reading PTY master flags failed");
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    master.as_raw_fd(),
+                    libc::F_SETFL,
+                    master_flags | libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "setting PTY master nonblocking mode failed"
+        );
+
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let mut poll_fd = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` points to one initialized poll descriptor.
+            let ready = unsafe { libc::poll(&raw mut poll_fd, 1, 100) };
+            assert!(ready >= 0, "polling PTY output failed");
+            if ready == 0 || poll_fd.revents & libc::POLLIN == 0 {
+                break;
+            }
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to read PTY output: {error}"),
+            }
+        }
+        String::from_utf8(output).expect("selector output should be UTF-8")
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_CLEAR_AND_HOME: &str = "\u{1b}[2J\u{1b}[1;1H";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    const PTY_SHOW_CURSOR_AND_LEAVE_SCREEN: &str = "\u{1b}[?25h\u{1b}[?1049l";
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
+        let (mut master, slave) = open_pty(20, 80);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Up),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("repeated PTY navigation should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            4,
+            "the initial frame and all three navigation redraws must begin at the PTY origin; \
+             output: {output:?}"
+        );
+    }
+
+    /// Quickstart accepts distinct input and output terminals. The frame must
+    /// be fitted to the terminal that receives it: a process-global query can
+    /// describe the controlling terminal while stderr is a narrower one.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_measures_the_terminal_that_receives_the_frame() {
+        let (controlling_master, controlling_slave) = open_pty(20, 80);
+        let (mut output_master, output_slave) = open_pty(20, 40);
+
+        let mut controlling = pty_quickstart_terminal(&controlling_master, controlling_slave, []);
+        assert_eq!(
+            controlling.size_checked(),
+            Some((20, 80)),
+            "the adapter over the controlling PTY reports that PTY's geometry"
+        );
+
+        let mut term = pty_quickstart_terminal(
+            &output_master,
+            output_slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let output_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(
+            output_size,
+            (20, 40),
+            "the adapter over the output PTY must report the output PTY, not the controlling one"
+        );
+
+        // Fit exactly as the Quickstart caller does, from the sampled output
+        // geometry, with content that only fits the wider terminal unfitted.
+        let row_budget = quickstart_selector_row_budget(usize::from(output_size.1))
+            .expect("40 columns is a supported width");
+        let prompt = "Open a selector (Enter), or pick Create. Esc to quit.";
+        let fitted_prompt = fit_quickstart_selector_row(prompt, row_budget);
+        assert_ne!(
+            fitted_prompt, prompt,
+            "the prompt needs fitting at 40 columns"
+        );
+        let label = "[ ] Model provider — not yet chosen (pick one to continue)";
+        let fitted_label = fit_quickstart_selector_row(label, row_budget);
+        assert_ne!(fitted_label, label, "the row needs fitting at 40 columns");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            std::slice::from_ref(&fitted_label),
+            &fitted_prompt,
+            output_size,
+        )
+        .expect("navigation on the output PTY should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        let output = drain_pty_output(&mut output_master);
+        drop(term);
+        drop(controlling);
+
+        assert!(
+            output.contains(&format!("? {fitted_prompt}")) && output.contains(&fitted_label),
+            "the fitted prompt and row must reach the output terminal; output: {output:?}"
+        );
+        assert!(
+            !output.contains(prompt) && !output.contains(label),
+            "unfitted text must never reach the 40-column output terminal; output: {output:?}"
+        );
+        for line in output.split("\r\n") {
+            assert!(
+                console::measure_text_width(line) <= 40,
+                "{line:?} exceeds the 40-column output terminal"
+            );
+        }
+    }
+
+    /// A resize of the output terminal alone raises no Crossterm resize event,
+    /// so the recheck on the next key must read the output terminal itself.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_fails_closed_when_only_the_output_terminal_resizes() {
+        let (mut master, slave) = open_pty(20, 40);
+        let mut term = pty_quickstart_terminal(
+            &master,
+            slave,
+            [
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::ResizeOutput {
+                    rows: 20,
+                    columns: 30,
+                },
+                PtyStep::Key(QuickstartSelectorKey::Down),
+                PtyStep::Key(QuickstartSelectorKey::Cancel),
+            ],
+        );
+        let initial_size = quickstart_selector_terminal_size(&mut term)
+            .expect("the output PTY reports its geometry");
+        assert_eq!(initial_size, (20, 40));
+
+        let error = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            initial_size,
+        )
+        .expect_err("an output-only resize must stop the selector");
+        assert_eq!(
+            error.to_string(),
+            quickstart_selector_resize_error((20, 40), (20, 30)).to_string(),
+            "the recheck must report the output terminal's new geometry"
+        );
+
+        let output = drain_pty_output(&mut master);
+        drop(term);
+
+        assert_eq!(
+            output.matches(PTY_CLEAR_AND_HOME).count(),
+            2,
+            "only the initial frame and the pre-resize redraw may be drawn; output: {output:?}"
+        );
+        assert!(
+            output.ends_with(PTY_SHOW_CURSOR_AND_LEAVE_SCREEN),
+            "the cursor and main screen must be restored after the resize; output: {output:?}"
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_output_terminal_size_is_unknown_without_reported_geometry() {
+        let not_a_terminal = tempfile::tempfile().expect("temporary file");
+        assert_eq!(quickstart_output_terminal_size(&not_a_terminal), None);
+
+        let (_unset_master, unset_slave) = open_pty(0, 0);
+        assert_eq!(quickstart_output_terminal_size(&unset_slave), None);
+
+        let (_master, slave) = open_pty(9, 20);
+        assert_eq!(quickstart_output_terminal_size(&slave), Some((9, 20)));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn fit_quickstart_selector_row_respects_byte_and_display_budgets() {
+        let short = "[ ] Memory — not yet chosen";
+        assert_eq!(fit_quickstart_selector_row(short, 80), short);
+
+        let rows = [
+            "[✓] Model provider — Anthropic (alias: main, model: claude-sonnet-4-5)",
+            "[✓] モデルプロバイダー — Anthropic（モデル：長い名前）",
+            "[✓] 模型提供方 — 提供商与模型摘要",
+            "emoji 👩‍💻 and combining e\u{301} text",
+            "line one\nline two\twith controls",
+        ];
+        for row in rows {
+            for budget in 0..=64 {
+                let fitted = fit_quickstart_selector_row(row, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+
+        let long = rows[0];
+        assert_eq!(fit_quickstart_selector_row(long, 0), "");
+        assert_eq!(fit_quickstart_selector_row(long, 1), ".");
+        assert_eq!(fit_quickstart_selector_row(long, 2), "[.");
+        assert!(fit_quickstart_selector_row(long, 40).ends_with('…'));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
+        assert!(
+            (0..QUICKSTART_SELECTOR_MIN_WIDTH)
+                .all(|width| quickstart_selector_row_budget(width).is_none())
+        );
+        assert_eq!(quickstart_selector_row_budget(20), Some(17));
+        assert_eq!(quickstart_selector_row_budget(21), Some(18));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
+        let rows = [
+            ("[ ] Model provider — not yet chosen", "[ ] Model"),
+            ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
+            ("[ ] Memory — not yet chosen", "[ ] Memory"),
+            ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
+            ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
+            ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
+            ("── Create agent", "── Create"),
+        ];
+
+        for (row, identifiable_prefix) in rows {
+            let fitted = fit_quickstart_selector_row(row, budget);
+            assert!(
+                fitted.starts_with(identifiable_prefix),
+                "{fitted:?} does not identify {row:?}"
+            );
+        }
+    }
+
+    /// The checklist rows exactly as a committed locale ships them.
+    ///
+    /// The identifiability guarantee is about the strings users actually see,
+    /// so these are read from the committed catalogues rather than retyped:
+    /// a hand-written approximation can stay distinguishable at a width where
+    /// the real, longer, column-padded row has already collapsed.
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
+        const ROW_KEYS: [&str; 6] = [
+            "cli-quickstart-row-model-provider",
+            "cli-quickstart-row-risk-profile",
+            "cli-quickstart-row-memory",
+            "cli-quickstart-row-channels",
+            "cli-quickstart-row-peer-groups",
+            "cli-quickstart-row-agent-identity",
+        ];
+
+        let value_for = |key: &str| -> String {
+            cli_ftl
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("{key} should be defined in the catalogue"))
+                .to_string()
+        };
+
+        let mut rows: Vec<String> = ROW_KEYS
+            .iter()
+            .map(|key| {
+                value_for(key)
+                    .replace("{$glyph}", "[ ]")
+                    .replace("{$summary}", "not yet chosen")
+            })
+            .collect();
+        rows.push(value_for("cli-quickstart-create-agent"));
+        rows
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_accepted_widths_keep_every_action_distinguishable() {
+        // The blocker this guards: a width floor chosen only for arithmetic
+        // safety left widths 3 and 4 "supported" while every fitted row
+        // collapsed to "" or ".", producing an interactive menu in which the
+        // user could not tell Provider from Risk from Create — and could
+        // commit real config chosen blind. Accepting a width must therefore
+        // mean the rows stay individually readable, in every locale we ship,
+        // not merely that the budget subtraction did not underflow.
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+
+        for (locale, cli_ftl) in locales {
+            let rows = quickstart_checklist_rows_for_locale(cli_ftl);
+            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
+
+            for width in 0..=120usize {
+                let Some(budget) = quickstart_selector_row_budget(width) else {
+                    continue;
+                };
+
+                let fitted: Vec<String> = rows
+                    .iter()
+                    .map(|row| fit_quickstart_selector_row(row, budget))
+                    .collect();
+
+                for (row, label) in rows.iter().zip(&fitted) {
+                    assert!(
+                        !label.is_empty(),
+                        "{locale}: width {width} accepted but {row:?} fits to an empty label"
+                    );
+                    assert!(
+                        label.chars().any(|ch| ch.is_alphanumeric()),
+                        "{locale}: width {width} accepted but {row:?} fits to {label:?}, \
+                         which carries no readable text"
+                    );
+                }
+
+                let distinct: std::collections::HashSet<&str> =
+                    fitted.iter().map(String::as_str).collect();
+                assert_eq!(
+                    distinct.len(),
+                    fitted.len(),
+                    "{locale}: width {width} accepted but the fitted rows are not all \
+                     distinguishable: {fitted:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_widths_that_erase_action_labels() {
+        // The specific widths the previous floor blessed. At width 3 the row
+        // budget was 0 and every label fitted to ""; at width 4 the budget was
+        // 1 and every label fitted to ".". Both must now be rejected before
+        // any interaction can start.
+        let rows = quickstart_checklist_rows_for_locale(include_str!(
+            "../crates/zeroclaw-runtime/locales/en/cli.ftl"
+        ));
+
+        for width in [0usize, 1, 2, 3, 4, 5, 10, 19] {
+            assert_eq!(
+                quickstart_selector_row_budget(width),
+                None,
+                "width {width} must be rejected, not fitted"
+            );
+        }
+
+        // Demonstrate what acceptance at those widths would have meant, so the
+        // rejection above is anchored to the user-visible failure rather than
+        // to an arbitrary constant.
+        for (collapsed_budget, expected) in [(0usize, ""), (1, ".")] {
+            let fitted: std::collections::HashSet<String> = rows
+                .iter()
+                .map(|row| fit_quickstart_selector_row(row, collapsed_budget))
+                .collect();
+            assert_eq!(
+                fitted,
+                std::collections::HashSet::from([expected.to_string()]),
+                "budget {collapsed_budget} collapses every action to {expected:?}"
+            );
+        }
+
+        assert!(
+            quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some(),
+            "the floor itself must remain usable"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_height_prevents_paging_suffixes() {
+        let item_count = 7;
+        let min_height = quickstart_selector_min_height(item_count);
+
+        assert_eq!(min_height, 9);
+        assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
+        assert!(quickstart_selector_fits_height(min_height, item_count));
+        assert!(quickstart_selector_fits_height(min_height + 1, item_count));
+        assert_eq!(
+            quickstart_selector_min_height(usize::MAX),
+            usize::MAX,
+            "the terminal guard must not wrap on an unexpected item count"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
+        let prompts = [
+            "Open a selector (Enter), or pick Create. Esc to quit.",
+            "選択肢を開くには Enter、終了するには Esc を押してください。",
+            "Open a selector\nwithout adding a physical terminal row.",
+        ];
+
+        for terminal_width in [20, 40, 80] {
+            let budget = quickstart_selector_row_budget(terminal_width).unwrap();
+            for prompt in prompts {
+                let fitted = fit_quickstart_selector_row(prompt, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_terminal_size_fails_closed() {
+        // A narrow terminal with an unavailable size must not get rows fitted
+        // against a guessed geometry.
+        assert!(
+            !quickstart_selector_size_is_usable(None),
+            "an unknown terminal size must not be accepted for fitting"
+        );
+        assert!(
+            quickstart_selector_size_is_usable(Some((24, 80))),
+            "a reported size must still be accepted"
+        );
+
+        let mut term = SelectorTestTerminal::new(None, []);
+        assert_eq!(
+            quickstart_selector_terminal_size(&mut term),
+            None,
+            "the selector must preserve a failed terminal size query"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_recheck_rejects_resize_and_unknown_size() {
+        let initial = (24u16, 80u16);
+
+        assert!(
+            quickstart_selector_recheck_size(initial, Some(initial)).is_ok(),
+            "an unchanged size must allow the interaction to continue"
+        );
+
+        let resized = quickstart_selector_recheck_size(initial, Some((24, 40)))
+            .expect_err("a changed size must abort the interaction");
+        assert!(
+            resized.to_string().contains("40"),
+            "the resize error should name the new width; got {resized}"
+        );
+
+        // The important half: unknown is not evidence the geometry still
+        // matches. Without the checked query this branch would compare the
+        // fabricated (24, 80) against the initial sample, find them equal, and
+        // keep redrawing rows fitted for a terminal it can no longer see.
+        let unknown = quickstart_selector_recheck_size(initial, None)
+            .expect_err("an unavailable size must abort the interaction");
+        assert_eq!(
+            unknown.to_string(),
+            qta("cli-quickstart-terminal-size-unknown", &[]),
+            "unknown size must surface the localized size-unknown error"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_ctrl_c_restores_screen_even_when_cursor_restore_fails() {
+        let mut term =
+            SelectorTestTerminal::new(Some((20, 80)), [Ok(QuickstartSelectorKey::Interrupt)]);
+        term.fail_action = Some("show_cursor");
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("cleanup failure must not replace Ctrl+C interrupt semantics");
+
+        assert_eq!(outcome, QuickstartSelectorOutcome::Interrupt);
+        let show = term
+            .actions
+            .iter()
+            .position(|action| *action == "show_cursor")
+            .expect("cursor restoration must be attempted");
+        let leave = term
+            .actions
+            .iter()
+            .position(|action| *action == "leave_alternate_screen")
+            .expect("alternate-screen restoration must be attempted");
+        assert!(
+            show < leave,
+            "cleanup attempts should retain their safe order"
+        );
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_partial_entry_failure_still_restores_screen() {
+        let mut term = SelectorTestTerminal::new(Some((20, 80)), []);
+        term.fail_action = Some("clear_screen");
+
+        let error = match QuickstartSelectorScreen::enter(&mut term) {
+            Ok(_) => panic!("injected clear failure should abort entry"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("clear_screen"));
+        assert_eq!(
+            term.actions,
+            [
+                "enter_alternate_screen",
+                "clear_screen",
+                "show_cursor",
+                "leave_alternate_screen",
+                "flush",
+            ]
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_read_error_still_restores_screen() {
+        let mut term = SelectorTestTerminal::new(
+            Some((20, 80)),
+            [Err(std::io::Error::other("injected read failure"))],
+        );
+
+        let error =
+            interact_quickstart_selector(&mut term, &["first".to_string()], "Choose", (20, 80))
+                .expect_err("injected read failure should surface");
+        assert!(error.to_string().contains("injected read failure"));
+        assert!(term.actions.contains(&"show_cursor"));
+        assert!(term.actions.contains(&"leave_alternate_screen"));
+        assert_eq!(term.actions.last(), Some(&"flush"));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
+        let actions = [
+            QuickstartChecklistAction::Provider,
+            QuickstartChecklistAction::Risk,
+            QuickstartChecklistAction::Memory,
+            QuickstartChecklistAction::Channels,
+            QuickstartChecklistAction::PeerGroups,
+            QuickstartChecklistAction::Agent,
+            QuickstartChecklistAction::Create,
+        ];
+        let choices: Vec<(QuickstartChecklistAction, String)> = actions
+            .iter()
+            .copied()
+            .map(|action| (action, "same row".to_string()))
+            .collect();
+        let fitted: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, 0))
+            .collect();
+        assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
+
+        for (index, expected) in actions.into_iter().enumerate() {
+            assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
+        }
+        assert_eq!(
+            quickstart_action_for_pick(&choices, None),
+            QuickstartChecklistAction::Quit
+        );
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(choices.len())),
+            QuickstartChecklistAction::Quit
+        );
+    }
 
     #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
     #[test]
