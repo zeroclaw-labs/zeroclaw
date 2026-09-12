@@ -918,31 +918,30 @@ pub fn create_memory_for_migration(config: &Config) -> anyhow::Result<Box<dyn Me
     // (`create_memory_with_storage_and_routes`) applies the configured
     // `[memory.policy]`, so flagged rows remain withheld from recall
     // wherever `threat_scan_load_time` is enabled.
-    let policy = MemoryPolicyConfig {
+    //
+    // Migration writes also bypass the audit trail: the imported rows are
+    // bulk history, not live memory operations.
+    //
+    // Routed uniformly through `create_memory_with_storage_and_routes` (the
+    // same factory the running daemon uses) rather than the sqlite-only
+    // `create_memory_with_builders` helper, so backends that need resolved
+    // storage config — Postgres, Qdrant — are supported here too instead of
+    // erroring out from `memory list`/`get`/`stats`/`clear`.
+    let mut operator_config = config.memory.clone();
+    operator_config.policy = MemoryPolicyConfig {
         threat_scan_on_hit: "block-on-read".into(),
         threat_scan_load_time: false,
         ..MemoryPolicyConfig::default()
     };
+    operator_config.audit_enabled = false;
 
-    // Migration writes bypass the audit trail: the imported rows are bulk
-    // history, not live memory operations.
-    if matches!(classify_memory_backend(&backend), MemoryBackendKind::Lucid) {
-        let local = SqliteMemory::new("sqlite", &config.data_dir)?;
-        return wrap_scanned_and_audit(
-            build_lucid_memory(&config.data_dir, local, config.resolve_active_storage()),
-            &policy,
-            &config.data_dir,
-            false,
-        );
-    }
-
-    create_memory_with_builders(
-        &backend,
+    create_memory_with_storage_and_routes(
+        &operator_config,
+        &config.embedding_routes,
+        config.resolve_active_storage(),
         &config.data_dir,
-        || SqliteMemory::new("sqlite", &config.data_dir),
-        " during migration",
-        &policy,
-        false,
+        None,
+        Some(&config.providers.models),
     )
 }
 
@@ -2095,28 +2094,81 @@ store_timeout_ms = 40000
         );
     }
 
-    /// Regression for the builder-only factory: `qdrant` must never silently
-    /// degrade to the Markdown fallback. On the pre-fix code this returned a
-    /// working handle named "markdown"; now it is an explicit error naming
-    /// supported targets without exposing an internal factory function.
+    /// Regression for the migration/CLI factory: `qdrant` without a resolved
+    /// `[storage.qdrant.<alias>]` entry must never silently degrade to the
+    /// Markdown fallback. Historically (builder-only path) this returned a
+    /// working handle named "markdown"; now the migration factory is routed
+    /// through the same storage-aware resolution as the runtime, so it gives
+    /// the same explicit "needs a storage alias" error instead.
     #[test]
-    fn builder_only_factory_rejects_qdrant_instead_of_markdown_fallback() {
+    fn migration_factory_rejects_qdrant_without_storage_alias_instead_of_markdown_fallback() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.memory.backend = "qdrant".into();
         config.data_dir = tmp.path().to_path_buf();
         let error = create_memory_for_migration(&config)
             .err()
-            .expect("backend=qdrant must be rejected by the builder-only factory");
+            .expect("backend=qdrant without a storage alias must be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("not supported")
-                && message.contains("sqlite")
-                && message.contains("lucid")
-                && message.contains("markdown"),
-            "error should direct operators to supported targets: {message}"
+            message.contains("storage.qdrant") && message.contains("alias"),
+            "error should direct operators to configure a storage alias: {message}"
         );
-        assert!(!message.contains("create_memory_"));
+        // `.err().expect(...)` above already proves this returned an error
+        // rather than an `Ok` handle of any kind (markdown fallback included).
+    }
+
+    /// The migration/CLI factory (used by `zeroclaw memory
+    /// list`/`get`/`stats`/`clear`) must support Postgres and Qdrant, not
+    /// just sqlite/lucid/markdown — those two backends need resolved
+    /// `[storage.*]` config that the old sqlite-only builder path had no way
+    /// to supply, so `create_memory_for_migration` used to hard-error for
+    /// them (see the now-removed `create_memory_with_builders` postgres/
+    /// qdrant bail arms). Qdrant construction is lazy (no server contact),
+    /// so this exercises success end-to-end without a live server; Postgres
+    /// connects eagerly and is covered instead by
+    /// `migration_factory_postgres_without_storage_alias_errors` below,
+    /// which proves it takes the storage-aware error path rather than the
+    /// old unconditional "requires storage config" bail.
+    #[test]
+    fn migration_factory_builds_qdrant_with_storage_config() {
+        let tmp = TempDir::new().unwrap();
+        let raw = r#"
+[memory]
+backend = "qdrant.default"
+
+[storage.qdrant.default]
+url = "http://localhost:6333"
+"#;
+        let mut config: Config = toml::from_str(raw).expect("parse qdrant storage alias");
+        config.data_dir = tmp.path().to_path_buf();
+
+        let mem = create_memory_for_migration(&config)
+            .expect("migration factory must build Qdrant when a storage alias resolves");
+        assert_eq!(mem.name(), "qdrant");
+    }
+
+    /// Companion to the Qdrant case above: without `memory-postgres`
+    /// compiled in, or without a `[storage.postgres.<alias>]` entry, the
+    /// migration factory now surfaces the same storage-aware error the
+    /// runtime gives — not the old unconditional "postgres backend requires
+    /// storage config; call create_memory_with_storage_and_routes instead"
+    /// bail that made `zeroclaw memory list` unusable for every Postgres
+    /// user regardless of config.
+    #[test]
+    fn migration_factory_postgres_without_storage_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.memory.backend = "postgres".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let error = create_memory_for_migration(&config)
+            .err()
+            .expect("backend=postgres without a storage alias must be rejected");
+        let message = error.to_string();
+        assert!(
+            !message.contains("call create_memory_with_storage_and_routes"),
+            "must not surface the internal builder-only factory error: {message}"
+        );
     }
 
     /// The storage-aware factory still accepts Qdrant when a
