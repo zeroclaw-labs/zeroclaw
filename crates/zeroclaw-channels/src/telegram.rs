@@ -1935,16 +1935,20 @@ impl TelegramChannel {
 
         // Only queue substantive natural-language replies for voice.
         // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-        let is_substantive = content.len() > 40
-            && !content.starts_with("http")
-            && !content.starts_with('{')
-            && !content.starts_with('[')
-            && !content.starts_with("Error")
-            && !content.contains("```")
-            && !content.contains("tool_call")
-            && !content.contains("wttr.in");
-
-        if !is_substantive {
+        if let Some(reason) = crate::util::voice_reply_skip_reason(content) {
+            // Stable literal per the logging contract: the classification and
+            // per-event measurements ride solely in `attributes` above.
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_attrs(::serde_json::json!({
+                        "recipient": recipient,
+                        "reason": reason,
+                        "content_len": content.len(),
+                        "immediate": immediate,
+                    })),
+                "voice reply skipped"
+            );
             return;
         }
 

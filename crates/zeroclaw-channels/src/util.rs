@@ -323,6 +323,90 @@ pub(crate) fn parse_attachment_markers_of_kinds(
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Minimum reply size, in bytes, that earns a voice note. Byte-measured, so a
+/// non-ASCII reply clears the floor with fewer characters than an ASCII one.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+const MIN_VOICE_REPLY_BYTES: usize = 40;
+
+/// Bytes allowed between the brackets of a leading expressive audio tag. Real
+/// tags are short (`[whispers]`, `[strong French accent]`); the bound keeps a
+/// long bracketed block from passing as one.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+const MAX_AUDIO_TAG_INNER_BYTES: usize = 32;
+
+/// Classify a reply that opens with `[`. Returns the skip reason when the
+/// bracketed run is machine output, or `None` when it is an expressive audio
+/// tag (`[whispers]`, `[very excited]`) decorating real prose.
+///
+/// Audio tags are stage directions that TTS engines interpret rather than
+/// speak, so a reply opening with one is prose and belongs in a voice note.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+fn leading_bracket_skip_reason(content: &str) -> Option<&'static str> {
+    let after_open = content.strip_prefix('[')?;
+
+    // JSON-looking openers: `[{`, `["`, `[0`-`[9`, `[]`.
+    if after_open.starts_with(|c: char| matches!(c, '{' | '"' | ']') || c.is_ascii_digit()) {
+        return Some("json_array");
+    }
+
+    // No closing bracket at all, so nothing identifies this as a tag.
+    let Some(close) = after_open.find(']') else {
+        return Some("unclosed_bracket");
+    };
+    let inner = &after_open[..close];
+    let tail = &after_open[close + 1..];
+
+    // Attachment markers always carry `:` (`[IMAGE:/path]`), because both
+    // parsers key on `split_once(':')`. Audio tags never do, so the colon is
+    // what keeps a filesystem path from being read aloud.
+    if inner.contains(':') {
+        return Some("attachment_marker");
+    }
+    // Markdown link: `[text](url)`. Without this the URL would be spoken.
+    if tail.starts_with('(') {
+        return Some("markdown_link");
+    }
+    // Too long to be a stage direction, so treat it as an unknown bracketed
+    // block and keep the pre-existing rejection rather than guessing.
+    if inner.len() > MAX_AUDIO_TAG_INNER_BYTES {
+        return Some("bracketed_prefix");
+    }
+
+    None
+}
+
+/// Why a reply was not queued as a TTS voice note, or `None` when it is worth
+/// speaking. Voice chats mirror the agent's prose, not its plumbing: URLs,
+/// JSON, code blocks, raw tool output and one-line status make poor audio.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+pub(crate) fn voice_reply_skip_reason(content: &str) -> Option<&'static str> {
+    if content.len() <= MIN_VOICE_REPLY_BYTES {
+        return Some("too_short");
+    }
+    if content.starts_with("http") {
+        return Some("url_prefix");
+    }
+    if content.starts_with('{') {
+        return Some("json_object");
+    }
+    if let Some(reason) = leading_bracket_skip_reason(content) {
+        return Some(reason);
+    }
+    if content.starts_with("Error") {
+        return Some("error_prefix");
+    }
+    if content.contains("```") {
+        return Some("code_fence");
+    }
+    if content.contains("tool_call") {
+        return Some("tool_call_marker");
+    }
+    if content.contains("wttr.in") {
+        return Some("weather_tool_output");
+    }
+    None
+}
+
 /// A native location pin parsed from a `[LOCATION:...]` marker. Shared by
 /// both WhatsApp backends (web protobuf send and Cloud API JSON send).
 #[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
@@ -885,6 +969,153 @@ mod tests {
             attachments,
             vec![("LOCATION".to_string(), "40.7,-74.0".to_string())]
         );
+    }
+
+    /// A reply opening with an ElevenLabs v3 expressive audio tag is prose
+    /// written for speech, so it must reach TTS rather than be filtered out
+    /// as machine output.
+    #[test]
+    fn voice_reply_accepts_leading_audio_tags() {
+        for content in [
+            "[dramatic] Signori, si alza il sipario sulla serata.",
+            "[exhales] Ascoltate, ascoltate... e l'aria della sera.",
+            "[very excited] Ho finito di preparare il tuo riepilogo!",
+            "[pause 2s] Adesso arriva la parte piu interessante del racconto.",
+            "[strong French accent] Bonjour, comment allez-vous aujourd'hui?",
+            "[whispers][slowly] Ascoltate bene quello che sto per dire.",
+        ] {
+            assert_eq!(voice_reply_skip_reason(content), None, "input: {content}");
+        }
+    }
+
+    /// The control case from the report: prose with no leading bracket was
+    /// always voiced and must stay that way.
+    #[test]
+    fn voice_reply_accepts_plain_prose() {
+        assert_eq!(
+            voice_reply_skip_reason("Si apra il sipario, si accordi l'orchestra!"),
+            None
+        );
+    }
+
+    /// The bracket clause still has to reject genuine machine output. An
+    /// attachment marker reaching TTS would read a filesystem path aloud.
+    #[test]
+    fn voice_reply_rejects_bracketed_machine_output() {
+        for (content, expected) in [
+            (
+                "[{\"a\":1},{\"b\":2}] ecco il meteo di oggi per Roma.",
+                "json_array",
+            ),
+            (
+                "[\"alpha\",\"beta\",\"gamma\",\"delta\",\"epsilon\"]",
+                "json_array",
+            ),
+            (
+                "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",
+                "json_array",
+            ),
+            (
+                "[] plus filler text to clear the length floor here",
+                "json_array",
+            ),
+            (
+                "[IMAGE:/home/pi/chart.png] Ecco il grafico richiesto.",
+                "attachment_marker",
+            ),
+            (
+                "[VOICE:/tmp/zeroclaw/out.ogg] Nota vocale registrata.",
+                "attachment_marker",
+            ),
+            (
+                "[DOCUMENT:https://example.com/report.pdf] Ecco il file.",
+                "attachment_marker",
+            ),
+            (
+                "[Guida](https://example.com/docs) ecco il link utile.",
+                "markdown_link",
+            ),
+            (
+                "[unclosed tag and a sentence that never closes it",
+                "unclosed_bracket",
+            ),
+            (
+                "[didascalia molto lunga che sfora il limite dei tag] ok",
+                "bracketed_prefix",
+            ),
+        ] {
+            assert_eq!(
+                voice_reply_skip_reason(content),
+                Some(expected),
+                "input: {content}"
+            );
+        }
+    }
+
+    /// The clauses that predate the audio-tag fix keep their behavior.
+    #[test]
+    fn voice_reply_rejects_non_bracket_machine_output() {
+        for (content, expected) in [
+            (
+                "{\"ok\":true,\"result\":{\"message_id\":123456}}",
+                "json_object",
+            ),
+            (
+                "https://example.com/a/very/long/path/that/clears",
+                "url_prefix",
+            ),
+            (
+                "Error: the provider refused the request again.",
+                "error_prefix",
+            ),
+            (
+                "Ecco:\n```bash\nls -la\n``` e poi fammi sapere tutto.",
+                "code_fence",
+            ),
+            (
+                "Ho ricevuto un tool_call malformato, riprovo.",
+                "tool_call_marker",
+            ),
+            (
+                "Meteo da wttr.in: Roma 21 gradi, cielo sereno.",
+                "weather_tool_output",
+            ),
+        ] {
+            assert_eq!(
+                voice_reply_skip_reason(content),
+                Some(expected),
+                "input: {content}"
+            );
+        }
+    }
+
+    /// The length floor is measured on the full reply, tag included, so a
+    /// leading tag can never shorten a reply into rejection.
+    #[test]
+    fn voice_reply_length_floor_is_measured_on_the_full_reply() {
+        assert_eq!(voice_reply_skip_reason(&"x".repeat(41)), None);
+        assert_eq!(voice_reply_skip_reason(&"x".repeat(40)), Some("too_short"));
+        assert_eq!(
+            voice_reply_skip_reason(&format!("[whispers]{}", "x".repeat(31))),
+            None
+        );
+        assert_eq!(voice_reply_skip_reason("[laughs]"), Some("too_short"));
+        assert_eq!(
+            voice_reply_skip_reason("[dramatic] Ciao!"),
+            Some("too_short")
+        );
+    }
+
+    /// Pins the classifier so a refactor that breaks tag recognition or the
+    /// marker guard fails loudly rather than silently.
+    #[test]
+    fn leading_bracket_classifier_distinguishes_tags_from_markers() {
+        assert_eq!(leading_bracket_skip_reason("[whispers] rest"), None);
+        assert_eq!(
+            leading_bracket_skip_reason("[IMAGE:/x] rest"),
+            Some("attachment_marker")
+        );
+        assert_eq!(leading_bracket_skip_reason("no bracket here"), None);
     }
 
     #[test]
