@@ -11827,6 +11827,11 @@ pub struct MemoryConfig {
     /// operations; recall is a single hybrid call today, so this has no effect.
     #[serde(default = "default_fts_early_return_score")]
     pub fts_early_return_score: f64,
+    /// Prefix injected memory entries with their storage date
+    /// (`[from YYYY-MM-DD]`), so the model can tell recalled text from the
+    /// live turn it is prepended to.
+    #[serde(default = "default_true")]
+    pub recall_date_stamp: bool,
 
     // ── Namespace Isolation ─────────────────────────────────────
     /// Default namespace for memory entries.
@@ -12329,6 +12334,7 @@ impl Default for MemoryConfig {
             importance_weight: default_importance_weight(),
             recency_weight: default_recency_weight(),
             fts_early_return_score: default_fts_early_return_score(),
+            recall_date_stamp: true,
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),
             conflict_supersede_enabled: default_conflict_supersede_enabled(),
