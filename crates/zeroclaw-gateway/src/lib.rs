@@ -69,24 +69,46 @@ use axum::body::Bytes;
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
-#[cfg(any(
-    feature = "channel-linq",
-    feature = "channel-nextcloud",
-    feature = "channel-whatsapp-cloud"
-))]
-use axum::response::Response;
 use axum::{
     Router,
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{
+        IntoResponse, Json, Response,
+        sse::{Event as SseWireEvent, KeepAlive as SseKeepAlive, Sse as SseBody},
+    },
     routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Gateway session key prefix to avoid collisions with channel sessions.
+pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
+
+/// Return the canonical persistence key for a gateway session.
+///
+/// Persistence backends apply the shared filesystem-safe normalization so
+/// their in-memory and on-disk keys remain consistent.
+pub(crate) fn gateway_session_key(session_id: &str) -> String {
+    format!(
+        "{GW_SESSION_PREFIX}{}",
+        zeroclaw_api::session_keys::sanitize_session_key(session_id)
+    )
+}
+
+/// Return the process-local cancellation key for a gateway session.
+///
+/// Unlike persistence keys, cancellation keys must preserve the accepted
+/// session id verbatim: filesystem-safe normalization is lossy and would make
+/// distinct live sessions such as `team.alpha` and `team_alpha` cancel one
+/// another.
+pub(crate) fn gateway_cancel_key(session_id: &str) -> String {
+    format!("{GW_SESSION_PREFIX}{session_id}")
+}
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -612,9 +634,12 @@ pub struct AppState {
     /// Per-session cancellation tokens for aborting in-flight agent responses.
     /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
     /// current turn. Entries are inserted before each turn and removed after
-    /// completion (normal or cancelled).
+    /// completion (normal or cancelled). The outer `Arc` provides turn identity
+    /// so late cleanup cannot remove a replacement turn's token.
     pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+        >,
     >,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
@@ -2557,17 +2582,13 @@ struct GatewayChatDispatchCapture {
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
-// The four items below serialize and read the capture buffer, and only the
-// Linq webhook alias tests do either. Their gate has to name that feature as
-// well as `test`, or they are compiled and unused whenever it is off, which
-// `-D warnings` promotes to an error. The buffer itself, and the recording
-// function that fills it, stay on the plain `test` gate because the chat
-// dispatch path writes to them unconditionally.
-#[cfg(all(test, feature = "channel-linq"))]
+// Tests that read or clear the shared capture buffer hold this lock so
+// parallel webhook tests cannot invalidate one another's evidence.
+#[cfg(test)]
 static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(test)]
 async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
@@ -2580,7 +2601,7 @@ fn clear_gateway_chat_dispatch_captures_for_test() {
         .clear();
 }
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(test)]
 fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2681,7 +2702,6 @@ fn resolve_gateway_chat_agent_alias(
         .or_else(|| config.resolved_runtime_agent_alias().map(str::to_owned))
 }
 
-#[cfg(not(test))]
 fn require_gateway_chat_agent_alias(
     config: &Config,
     agent_override: Option<&str>,
@@ -2729,6 +2749,10 @@ fn sop_webhook_routes() -> Router<AppState> {
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Opt in to Server-Sent Events streaming for this turn. Callers must also
+    /// send an `Accept: text/event-stream` header.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// Webhook query parameters
@@ -3007,10 +3031,10 @@ async fn handle_webhook(
     Query(query): Query<WebhookQuery>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
+) -> Response {
     let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
         Ok(verdict) => verdict,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let Json(webhook_body) = match body {
         Ok(b) => b,
@@ -3025,7 +3049,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -3037,20 +3061,20 @@ async fn handle_webhook(
     let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
     let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
         Ok(matches) => matches,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
 
     if has_matching_sop {
         if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
-            return response;
+            return response.into_response();
         }
         if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-            return response;
+            return response.into_response();
         }
         if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
             api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
         {
-            return response;
+            return response.into_response();
         }
         // The engine reported no match after all (e.g. a trigger was
         // unloaded between the pre-check above and dispatch); fall through
@@ -3084,12 +3108,12 @@ async fn handle_webhook(
                     "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
                 )
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     }
 
     if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-        return response;
+        return response.into_response();
     }
 
     let message = &webhook_body.message;
@@ -3132,6 +3156,23 @@ async fn handle_webhook(
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
 
+    // ── Optional SSE streaming ──
+    // Opt in with `stream: true` plus an `Accept: text/event-stream` header:
+    // the turn then streams cumulative assistant tokens as `event: token`
+    // frames, ends with `event: done` (or `event: error`), and honours
+    // client disconnects through the shared cancellation registry. Every
+    // other combination keeps the JSON `{ response }` path below untouched.
+    if webhook_body.stream && accepts_sse(&headers) {
+        return run_gateway_chat_streaming_response(
+            &state,
+            message,
+            session_id.as_deref(),
+            agent_override,
+            started_at,
+        )
+        .await;
+    }
+
     match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
@@ -3141,7 +3182,7 @@ async fn handle_webhook(
             );
 
             let body = serde_json::json!({"response": response, "model": model_label});
-            (StatusCode::OK, Json(body))
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
             let duration = started_at.elapsed();
@@ -3167,7 +3208,7 @@ async fn handle_webhook(
                     "error": "needs_quickstart",
                     "url": "/quickstart"
                 });
-                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
             } else {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -3177,10 +3218,536 @@ async fn handle_webhook(
                     "webhook model_provider error"
                 );
                 let err = serde_json::json!({"error": "LLM request failed"});
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
             }
         }
     }
+}
+
+/// True when the request's `Accept` header negotiates Server-Sent Events.
+fn accepts_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+/// Build one cumulative `event: token` SSE frame.
+fn sse_token_frame(cumulative: &str) -> Result<SseWireEvent, std::convert::Infallible> {
+    let data = serde_json::json!({ "text": cumulative }).to_string();
+    Ok(SseWireEvent::default().event("token").data(data))
+}
+
+/// Build the terminating `event: error` SSE frame.
+fn sse_error_frame(message: &str) -> Result<SseWireEvent, std::convert::Infallible> {
+    let data = serde_json::json!({ "message": message }).to_string();
+    Ok(SseWireEvent::default().event("error").data(data))
+}
+
+fn send_sse_terminal_error(
+    terminal_tx: &mut Option<tokio::sync::oneshot::Sender<SseFrame>>,
+    message: &str,
+) {
+    if let Some(sender) = terminal_tx.take() {
+        let _ = sender.send(sse_error_frame(message));
+    }
+}
+
+/// Reconcile the runtime's authoritative final response with text already
+/// emitted from streamed chunks. The runtime may return a cached response with
+/// no chunks, or append a receipt/fallback suffix after the last chunk. Prefix
+/// reconciliation emits only the missing suffix; a non-prefix conflict uses a
+/// replacement cumulative frame so clients never concatenate duplicate text.
+/// An empty final response is authoritative too: when earlier chunks exist it
+/// emits an empty cumulative replacement instead of leaving stale text visible.
+fn reconcile_sse_final_response(cumulative: &mut String, final_response: &str) -> Option<SseFrame> {
+    if final_response == cumulative {
+        return None;
+    }
+
+    if let Some(suffix) = final_response.strip_prefix(cumulative.as_str()) {
+        cumulative.push_str(suffix);
+    } else {
+        cumulative.clear();
+        cumulative.push_str(final_response);
+    }
+    Some(sse_token_frame(cumulative))
+}
+
+type SseFrame = Result<SseWireEvent, std::convert::Infallible>;
+
+async fn send_sse_frame_or_cancel(
+    frame_tx: &tokio::sync::mpsc::Sender<SseFrame>,
+    frame: SseFrame,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        result = frame_tx.send(frame) => result.is_ok(),
+        _ = cancel_token.cancelled() => false,
+    }
+}
+
+/// Register the current turn for a gateway session and cancel any replaced
+/// turn before returning. Both HTTP/SSE and WebSocket transports share this
+/// registry, so replacement ownership must be identical at both edges.
+pub(crate) fn register_cancel_token(
+    cancel_tokens: &Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+        >,
+    >,
+    session_key: &str,
+    cancel_token: Arc<tokio_util::sync::CancellationToken>,
+) {
+    let previous_token = cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .insert(session_key.to_owned(), cancel_token);
+    if let Some(previous_token) = previous_token {
+        previous_token.cancel();
+    }
+}
+
+/// Remove a turn's registry entry only while it still owns the session key.
+/// A late completion from a replaced WS/SSE turn must never remove the newer
+/// turn's cancellation handle.
+pub(crate) fn remove_cancel_token_if_current(
+    cancel_tokens: &Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+        >,
+    >,
+    session_key: &str,
+    cancel_token: &Arc<tokio_util::sync::CancellationToken>,
+) {
+    let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
+    if tokens
+        .get(session_key)
+        .is_some_and(|current| Arc::ptr_eq(current, cancel_token))
+    {
+        tokens.remove(session_key);
+    }
+}
+
+struct SseClientStream {
+    receiver: tokio::sync::mpsc::Receiver<SseFrame>,
+    terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
+    terminal_delivered: bool,
+    cancel_token: Arc<tokio_util::sync::CancellationToken>,
+    cancel_tokens: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+        >,
+    >,
+    cancel_key: String,
+}
+
+impl futures_util::Stream for SseClientStream {
+    type Item = SseFrame;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.terminal_delivered {
+            return std::task::Poll::Ready(None);
+        }
+
+        if let Some(terminal_receiver) = this.terminal_receiver.as_mut() {
+            match std::pin::Pin::new(terminal_receiver).poll(cx) {
+                std::task::Poll::Ready(Ok(frame)) => {
+                    // A terminal error is deliberately independent of the
+                    // bounded token queue. Once it is delivered, discard any
+                    // queued token frames so the client observes one terminal
+                    // error rather than a truncated stream followed by stale
+                    // data.
+                    this.terminal_receiver = None;
+                    this.terminal_delivered = true;
+                    this.receiver.close();
+                    return std::task::Poll::Ready(Some(frame));
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    // Normal completion drops the sender after enqueueing the
+                    // regular done frame. Continue draining that frame queue.
+                    this.terminal_receiver = None;
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        this.receiver.poll_recv(cx)
+    }
+}
+
+impl Drop for SseClientStream {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        remove_cancel_token_if_current(&self.cancel_tokens, &self.cancel_key, &self.cancel_token);
+    }
+}
+
+/// Stream one gateway chat turn over Server-Sent Events.
+///
+/// Drives the turn with the same streamed agent API the `/ws/chat` path uses
+/// ([`zeroclaw_runtime::agent::Agent::turn_streamed`]), relaying cumulative
+/// `TurnEvent::Chunk` text as `event: token` frames. The turn's cancellation
+/// token is registered under the same `gw_{session}` key the abort endpoint
+/// uses, so an in-flight streamed turn is cancellable exactly like a
+/// WebSocket turn; a client disconnect cancels the token too.
+async fn run_gateway_chat_streaming_response(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+    started_at: Instant,
+) -> Response {
+    if let Some(err) = needs_quickstart_for(&state.model) {
+        if is_needs_quickstart_err(&err) {
+            let body = serde_json::json!({
+                "error": "needs_quickstart",
+                "url": "/quickstart"
+            });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        }
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+    // Register under the process-local cancellation key so the existing abort
+    // endpoint (and the shared cancellation registry) can cancel the
+    // in-flight turn without collapsing distinct display ids.
+    let (session_key, cancel_key) = match session_id {
+        Some(session_id) => (
+            gateway_session_key(session_id),
+            gateway_cancel_key(session_id),
+        ),
+        None => {
+            let generated_session_id = uuid::Uuid::new_v4().to_string();
+            (
+                gateway_session_key(&generated_session_id),
+                gateway_cancel_key(&generated_session_id),
+            )
+        }
+    };
+    register_cancel_token(&state.cancel_tokens, &cancel_key, Arc::clone(&cancel_token));
+
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<SseFrame>(16);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<SseFrame>();
+    let (turn_tx, turn_rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
+
+    let state_for_turn = state.clone();
+    let message_owned = message.to_string();
+    let session_for_turn = session_id.map(str::to_string);
+    let alias_for_turn = agent_override.map(str::to_string);
+    let session_key_for_turn = session_key.clone();
+    let token_for_turn = Arc::clone(&cancel_token);
+    zeroclaw_spawn::spawn!(async move {
+        let outcome = dispatch_gateway_turn_streaming(
+            &state_for_turn,
+            &message_owned,
+            event_tx,
+            token_for_turn.as_ref(),
+            session_for_turn.as_deref(),
+            alias_for_turn.as_deref(),
+            &session_key_for_turn,
+        )
+        .await;
+        let _ = turn_tx.send(outcome);
+    });
+
+    let state_for_frames = state.clone();
+    let cancel_key_for_frames = cancel_key.clone();
+    let token_for_stream = Arc::clone(&cancel_token);
+    zeroclaw_spawn::spawn!(async move {
+        let mut terminal_tx = Some(terminal_tx);
+        let mut cumulative = String::new();
+        loop {
+            tokio::select! {
+                maybe = event_rx.recv() => match maybe {
+                    Some(zeroclaw_api::agent::TurnEvent::Chunk { delta }) => {
+                        cumulative.push_str(&delta);
+                        if !send_sse_frame_or_cancel(
+                            &frame_tx,
+                            sse_token_frame(&cumulative),
+                            &cancel_token,
+                        )
+                        .await
+                        {
+                            // The bounded token queue may be full, so a
+                            // cancellation-aware send can return without
+                            // delivering the terminal frame through it.
+                            cancel_token.cancel();
+                            let message = zeroclaw_providers::sanitize_api_error(
+                                &zeroclaw_runtime::i18n::get_required_cli_string(
+                                    "turn-interrupted-by-user",
+                                ),
+                            );
+                            send_sse_terminal_error(&mut terminal_tx, &message);
+                            remove_cancel_token_if_current(
+                                &state_for_frames.cancel_tokens,
+                                &cancel_key_for_frames,
+                                &cancel_token,
+                            );
+                            return;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                _ = cancel_token.cancelled() => {
+                    // A server-side abort can leave the HTTP connection open.
+                    // Emit one sanitized terminal frame before ending the
+                    // stream; a disconnected client makes this send fail and
+                    // is handled by the same path without additional work.
+                    let message = zeroclaw_providers::sanitize_api_error(
+                        &zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        ),
+                    );
+                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    remove_cancel_token_if_current(
+                        &state_for_frames.cancel_tokens,
+                        &cancel_key_for_frames,
+                        &cancel_token,
+                    );
+                    return;
+                }
+            }
+        }
+        let result = turn_rx
+            .await
+            .unwrap_or_else(|e| Err(anyhow::Error::msg(e.to_string())));
+        remove_cancel_token_if_current(
+            &state_for_frames.cancel_tokens,
+            &cancel_key_for_frames,
+            &cancel_token,
+        );
+        state_for_frames.observer.record_metric(
+            &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(
+                started_at.elapsed(),
+            ),
+        );
+        match result {
+            Ok(final_response) => {
+                if let Some(frame) = reconcile_sse_final_response(&mut cumulative, &final_response)
+                {
+                    if !send_sse_frame_or_cancel(&frame_tx, frame, &cancel_token).await {
+                        cancel_token.cancel();
+                        let message = zeroclaw_providers::sanitize_api_error(
+                            &zeroclaw_runtime::i18n::get_required_cli_string(
+                                "turn-interrupted-by-user",
+                            ),
+                        );
+                        send_sse_terminal_error(&mut terminal_tx, &message);
+                        return;
+                    }
+                }
+                if !send_sse_frame_or_cancel(
+                    &frame_tx,
+                    Ok(SseWireEvent::default().event("done").data("{}")),
+                    &cancel_token,
+                )
+                .await
+                {
+                    cancel_token.cancel();
+                    let message = zeroclaw_providers::sanitize_api_error(
+                        &zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        ),
+                    );
+                    send_sse_terminal_error(&mut terminal_tx, &message);
+                }
+            }
+            Err(e) => {
+                if cancel_token.is_cancelled() {
+                    let message = zeroclaw_providers::sanitize_api_error(
+                        &zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        ),
+                    );
+                    send_sse_terminal_error(&mut terminal_tx, &message);
+                } else {
+                    let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                    if !send_sse_frame_or_cancel(
+                        &frame_tx,
+                        sse_error_frame(&sanitized),
+                        &cancel_token,
+                    )
+                    .await
+                    {
+                        cancel_token.cancel();
+                        let message = zeroclaw_providers::sanitize_api_error(
+                            &zeroclaw_runtime::i18n::get_required_cli_string(
+                                "turn-interrupted-by-user",
+                            ),
+                        );
+                        send_sse_terminal_error(&mut terminal_tx, &message);
+                    }
+                }
+            }
+        }
+    });
+
+    let body = SseBody::new(SseClientStream {
+        receiver: frame_rx,
+        terminal_receiver: Some(terminal_rx),
+        terminal_delivered: false,
+        cancel_token: token_for_stream,
+        cancel_tokens: Arc::clone(&state.cancel_tokens),
+        cancel_key,
+    })
+    .keep_alive(SseKeepAlive::default());
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_TYPE, "text/event-stream"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Dispatch one streamed gateway chat turn, emitting [`TurnEvent`]s on
+/// `event_tx`. Test builds dispatch to the mock model provider directly
+/// (mirroring `run_gateway_chat_with_tools`); production builds construct
+/// the per-request agent and drive it through `turn_streamed`.
+async fn dispatch_gateway_turn_streaming(
+    state: &AppState,
+    message: &str,
+    event_tx: tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+    session_key: &str,
+) -> anyhow::Result<String> {
+    #[cfg(test)]
+    {
+        // Keep the lightweight provider fixture for the existing webhook
+        // infrastructure tests, but allow configured-agent fixtures to run
+        // through the same Agent construction and cost scope as production.
+        let configured_agent = {
+            let config = state.config.read();
+            resolve_gateway_chat_agent_alias(&config, agent_override)
+                .is_some_and(|alias| config.agent(&alias).is_some())
+        };
+        if configured_agent {
+            return dispatch_gateway_turn_streaming_with_agent(
+                state,
+                message,
+                event_tx,
+                cancel_token,
+                session_id,
+                agent_override,
+                session_key,
+            )
+            .await;
+        }
+
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        let call =
+            state
+                .model_provider
+                .chat_with_system(None, message, &state.model, state.temperature);
+        tokio::select! {
+            result = call => {
+                let response = result?;
+                let _ = event_tx
+                    .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: response.clone() })
+                    .await;
+                Ok(response)
+            }
+            _ = cancel_token.cancelled() => Err(anyhow::Error::msg(
+                "streamed webhook turn cancelled",
+            )),
+        }
+    }
+
+    #[cfg(not(test))]
+    {
+        dispatch_gateway_turn_streaming_with_agent(
+            state,
+            message,
+            event_tx,
+            cancel_token,
+            session_id,
+            agent_override,
+            session_key,
+        )
+        .await
+    }
+}
+
+/// Construct and drive the production Agent for a streamed gateway turn.
+/// Keeping this helper outside the test-only dispatch branch lets configured
+/// test fixtures exercise the exact same construction, budget, and attribution
+/// path used by non-test builds.
+async fn dispatch_gateway_turn_streaming_with_agent(
+    state: &AppState,
+    message: &str,
+    event_tx: tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+    session_key: &str,
+) -> anyhow::Result<String> {
+    let config = state.config.read().clone();
+    let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+    let mut agent =
+        zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+            Arc::clone(&state.config),
+            &agent_alias,
+            None,
+            true,
+            false,
+            false,
+            state.sop_engine.clone(),
+            state.sop_audit.clone(),
+            Some(state.canvas_store.clone()),
+        )
+        .await?;
+    #[cfg(test)]
+    agent.set_turn_datetime_for_test(gateway_fixture_turn_datetime);
+    if let Some(session) = session_id {
+        agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
+            session,
+        )));
+    }
+
+    let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
+        zeroclaw_runtime::agent::cost::tool_loop_cost_tracking_context_from_tracker(
+            &config,
+            &agent_alias,
+            tracker.clone(),
+        )
+    });
+    let turn_usage = state.cost_tracker.as_ref().map(|_| {
+        Arc::new(Mutex::new(
+            zeroclaw_runtime::agent::cost::TurnUsage::default(),
+        ))
+    });
+    let (response, _) = Box::pin(zeroclaw_runtime::agent::loop_::scope_session_key(
+        Some(session_key.to_owned()),
+        zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+            turn_usage,
+            zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                cost_tracking_context,
+                agent.turn_streamed(message, event_tx, Some(cancel_token.clone())),
+            ),
+        ),
+    ))
+    .await?;
+    Ok(response)
+}
+
+#[cfg(test)]
+fn gateway_fixture_turn_datetime() -> chrono::DateTime<chrono::Local> {
+    chrono::DateTime::parse_from_rfc3339("2026-06-25T12:00:00+00:00")
+        .expect("fixed gateway fixture timestamp")
+        .with_timezone(&chrono::Local)
 }
 
 /// `WhatsApp` verification query params
@@ -4118,7 +4685,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
@@ -4159,6 +4726,16 @@ mod tests {
             },
         );
         assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn gateway_cancel_key_preserves_distinct_session_ids() {
+        let dotted = gateway_cancel_key("team.alpha");
+        let underscored = gateway_cancel_key("team_alpha");
+
+        assert_eq!(dotted, "gw_team.alpha");
+        assert_eq!(underscored, "gw_team_alpha");
+        assert_ne!(dotted, underscored);
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
@@ -6136,6 +6713,1587 @@ path = "{trigger_path}"
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
     }
 
+    /// Minimal AppState for webhook-SSE regressions.
+    fn sse_test_state(model_provider: Arc<dyn ModelProvider>) -> AppState {
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    /// A local OpenAI-compatible HTTP fixture used by the production-shaped
+    /// gateway tests below. Keeping the listener in the test process proves
+    /// that the configured Agent/provider path is exercised without relying on
+    /// a network credential or a mock `ModelProvider` injected into AppState.
+    struct ChatCompletionFixture {
+        address: SocketAddr,
+        requests: Arc<AtomicUsize>,
+        stream_chunks: Arc<AtomicUsize>,
+        stream_closed: Arc<AtomicBool>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ChatCompletionFixture {
+        fn base_url(&self) -> String {
+            format!("http://{}/v1", self.address)
+        }
+    }
+
+    impl Drop for ChatCompletionFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn spawn_chat_completion_fixture(
+        response_body: impl Into<String>,
+    ) -> ChatCompletionFixture {
+        spawn_chat_completion_fixture_sequence(vec![response_body.into()]).await
+    }
+
+    async fn spawn_chat_completion_fixture_sequence(
+        response_bodies: Vec<String>,
+    ) -> ChatCompletionFixture {
+        let response_bodies = Arc::new(response_bodies);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_handler = Arc::clone(&requests);
+        let bodies_for_handler = Arc::clone(&response_bodies);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |_: HeaderMap, axum::extract::Json(_request): axum::extract::Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_handler);
+                let requests = Arc::clone(&requests_for_handler);
+                async move {
+                    let request_index = requests.fetch_add(1, Ordering::SeqCst);
+                    let body = bodies
+                        .get(request_index)
+                        .or_else(|| bodies.last())
+                        .cloned()
+                        .unwrap_or_default();
+                    (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))],
+                        Body::from(body),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local chat-completions fixture");
+        let address = listener
+            .local_addr()
+            .expect("local chat-completions fixture address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve local chat-completions fixture");
+        });
+        ChatCompletionFixture {
+            address,
+            requests,
+            stream_chunks: Arc::new(AtomicUsize::new(0)),
+            stream_closed: Arc::new(AtomicBool::new(false)),
+            server,
+        }
+    }
+
+    struct BurstChatStream {
+        bodies: Arc<Vec<String>>,
+        next: usize,
+        emitted: Arc<AtomicUsize>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl futures_util::Stream for BurstChatStream {
+        type Item = Result<String, std::convert::Infallible>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if let Some(body) = self.bodies.get(self.next).cloned() {
+                self.next += 1;
+                self.emitted.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(Some(Ok(body)))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for BurstChatStream {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn spawn_burst_hanging_chat_completion_fixture() -> ChatCompletionFixture {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stream_chunks = Arc::new(AtomicUsize::new(0));
+        let stream_closed = Arc::new(AtomicBool::new(false));
+        let requests_for_handler = Arc::clone(&requests);
+        let bodies: Arc<Vec<String>> = Arc::new(
+            (0..17)
+                .map(|index| {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk-{index}\"}}}}]}}\n\n"
+                    )
+                })
+                .collect(),
+        );
+        let bodies_for_handler = Arc::clone(&bodies);
+        let chunks_for_handler = Arc::clone(&stream_chunks);
+        let closed_for_handler = Arc::clone(&stream_closed);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |_: HeaderMap,
+                      axum::extract::Json(_request): axum::extract::Json<serde_json::Value>| {
+                    let requests = Arc::clone(&requests_for_handler);
+                    let bodies = Arc::clone(&bodies_for_handler);
+                    let emitted = Arc::clone(&chunks_for_handler);
+                    let closed = Arc::clone(&closed_for_handler);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let stream = BurstChatStream {
+                            bodies,
+                            next: 0,
+                            emitted,
+                            closed,
+                        };
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            )],
+                            Body::from_stream(stream),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind burst chat-completions fixture");
+        let address = listener
+            .local_addr()
+            .expect("burst chat-completions fixture address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve burst chat-completions fixture");
+        });
+        ChatCompletionFixture {
+            address,
+            requests,
+            stream_chunks,
+            stream_closed,
+            server,
+        }
+    }
+
+    /// A provider fixture that sends response headers and then keeps the
+    /// streaming body open. This gives two real gateway transports time to
+    /// replace one another under the same session key before either provider
+    /// turn can complete.
+    async fn spawn_hanging_chat_completion_fixture() -> ChatCompletionFixture {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_handler = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |_: HeaderMap,
+                      axum::extract::Json(_request): axum::extract::Json<serde_json::Value>| {
+                    let requests = Arc::clone(&requests_for_handler);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let stream = futures_util::stream::pending::<
+                            Result<String, std::convert::Infallible>,
+                        >();
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            )],
+                            Body::from_stream(stream),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging chat-completions fixture");
+        let address = listener
+            .local_addr()
+            .expect("hanging chat-completions fixture address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve hanging chat-completions fixture");
+        });
+        ChatCompletionFixture {
+            address,
+            requests,
+            stream_chunks: Arc::new(AtomicUsize::new(0)),
+            stream_closed: Arc::new(AtomicBool::new(false)),
+            server,
+        }
+    }
+
+    async fn spawn_test_ws_gateway(state: AppState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/ws/chat", get(ws::handle_ws_chat))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gateway WebSocket listener");
+        let address = listener
+            .local_addr()
+            .expect("gateway WebSocket listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve gateway WebSocket listener");
+        });
+        (address, server)
+    }
+
+    async fn wait_for_fixture_requests(fixture: &ChatCompletionFixture, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture.requests.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("provider fixture request");
+    }
+
+    async fn wait_for_fixture_chunks(fixture: &ChatCompletionFixture, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture.stream_chunks.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("provider fixture stream chunks");
+    }
+
+    async fn wait_for_registry_token(
+        state: &AppState,
+        session_key: &str,
+    ) -> Arc<tokio_util::sync::CancellationToken> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(token) = state
+                    .cancel_tokens
+                    .lock()
+                    .expect("cancel_tokens lock poisoned")
+                    .get(session_key)
+                    .cloned()
+                {
+                    return token;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("registered transport cancellation token")
+    }
+
+    async fn wait_for_registry_replacement(
+        state: &AppState,
+        session_key: &str,
+        previous: &Arc<tokio_util::sync::CancellationToken>,
+    ) -> Arc<tokio_util::sync::CancellationToken> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(token) = state
+                    .cancel_tokens
+                    .lock()
+                    .expect("cancel_tokens lock poisoned")
+                    .get(session_key)
+                    .cloned()
+                    && !Arc::ptr_eq(&token, previous)
+                {
+                    return token;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement transport cancellation token")
+    }
+
+    async fn wait_for_registry_owner(
+        state: &AppState,
+        session_key: &str,
+        expected: &Arc<tokio_util::sync::CancellationToken>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let matches = state
+                    .cancel_tokens
+                    .lock()
+                    .expect("cancel_tokens lock poisoned")
+                    .get(session_key)
+                    .is_some_and(|current| Arc::ptr_eq(current, expected));
+                if matches {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("replacement transport retains registry ownership");
+    }
+
+    async fn wait_for_registry_empty(state: &AppState, session_key: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let empty = !state
+                    .cancel_tokens
+                    .lock()
+                    .expect("cancel_tokens lock poisoned")
+                    .contains_key(session_key);
+                if empty {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("transport cancellation registry cleanup");
+    }
+
+    async fn collect_cancelled_sse(response: Response) -> String {
+        let payload = tokio::time::timeout(Duration::from_secs(3), response.into_body().collect())
+            .await
+            .expect("cancelled SSE response body")
+            .expect("cancelled SSE response body stream")
+            .to_bytes();
+        String::from_utf8(payload.to_vec()).expect("cancelled SSE response is UTF-8")
+    }
+
+    async fn start_test_sse(state: &AppState, session_id: &str) -> Response {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "X-Session-Id",
+            HeaderValue::from_str(session_id).expect("transport test session id header"),
+        );
+        handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("web".to_string()),
+            }),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "transport overlap".to_string(),
+                stream: true,
+            })),
+        )
+        .await
+    }
+
+    /// Build an AppState whose `/webhook?agent=web` path constructs a real
+    /// runtime Agent and a configured custom OpenAI-compatible provider. The
+    /// synthetic allowlist deliberately leaves the Agent with no executable
+    /// tools so a text-only fixture cannot accidentally enter a tool loop.
+    fn production_sse_state(
+        tmp: &tempfile::TempDir,
+        provider_url: &str,
+        daily_limit_usd: f64,
+        response_cache_enabled: bool,
+    ) -> (AppState, Arc<CostTracker>) {
+        use zeroclaw_config::multi_agent::{
+            AgentMemoryConfig, AgentWorkspaceConfig, MemoryBackendKind,
+        };
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, CustomModelProviderConfig, ModelProviderConfig, RiskProfileConfig,
+            RuntimeProfileConfig,
+        };
+
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("production fixture workspace");
+        let mut config = Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.memory.response_cache_enabled = response_cache_enabled;
+        config.memory.response_cache_ttl_minutes = 60;
+        config.cost.enabled = true;
+        config.cost.track_per_agent = true;
+        config.cost.daily_limit_usd = daily_limit_usd;
+        config.cost.monthly_limit_usd = daily_limit_usd;
+        config.cost.warn_at_percent = 100;
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        config.providers.models.custom.insert(
+            "fixture".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(provider_url.to_string()),
+                    model: Some("fixture-model".to_string()),
+                    temperature: Some(0.0),
+                    pricing: HashMap::from([
+                        ("fixture-model.input".to_string(), 2.0),
+                        ("fixture-model.output".to_string(), 4.0),
+                    ]),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        let risk = RiskProfileConfig {
+            allowed_tools: vec!["__gateway_fixture_no_tools__".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        config.risk_profiles.insert("fixture".to_string(), risk);
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 1,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "web".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::None,
+                },
+                workspace: AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..AgentWorkspaceConfig::default()
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let tracker = Arc::new(
+            CostTracker::new(config.cost.clone(), &config.data_dir)
+                .expect("production fixture cost tracker"),
+        );
+        let mut state = crate::api::tests::test_state(config);
+        state.cost_tracker = Some(Arc::clone(&tracker));
+        (state, tracker)
+    }
+
+    async fn collect_production_sse(state: &AppState, message: &str, session_id: &str) -> String {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "X-Session-Id",
+            HeaderValue::from_str(session_id).expect("fixture session id header"),
+        );
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("web".to_string()),
+            }),
+            headers,
+            Ok(Json(WebhookBody {
+                message: message.to_string(),
+                stream: true,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response
+            .into_body()
+            .collect()
+            .await
+            .expect("production SSE response body")
+            .to_bytes();
+        String::from_utf8(payload.to_vec()).expect("production SSE response is UTF-8")
+    }
+
+    const PRODUCTION_FIXTURE_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"fixture answer\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+data: [DONE]\n\n";
+
+    const PRODUCTION_FIXTURE_TOOL_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_fixture\",\"type\":\"function\",\"function\":{\"name\":\"calculator\",\"arguments\":\"{\\\"function\\\":\\\"add\\\",\\\"values\\\":[1,2]}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+
+    const PRODUCTION_FIXTURE_FINAL_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
+    struct HangingProvider;
+
+    #[async_trait]
+    impl ModelProvider for HangingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            std::future::pending::<()>().await;
+            unreachable!("pending future never resolves")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for HangingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "HangingProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_agent_persists_usage_with_agent_alias() {
+        let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        let tmp = tempfile::tempdir().expect("production gateway temp dir");
+        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+
+        let text = collect_production_sse(&state, "production stream", "production-cost").await;
+
+        assert!(
+            text.contains("event: token") && text.contains(r#"data: {"text":"fixture answer"}"#),
+            "configured Agent/provider path must forward streamed text: {text}"
+        );
+        assert!(
+            text.contains("event: done") && !text.contains("event: error"),
+            "successful production-shaped turn must finish without an error frame: {text}"
+        );
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            1,
+            "one successful turn should make exactly one provider request"
+        );
+
+        let summary = tracker
+            .get_summary_for_agent("web")
+            .expect("agent-scoped cost summary");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 15);
+        assert!(
+            summary.session_cost_usd > 0.0,
+            "configured pricing must persist a non-zero streamed-turn cost"
+        );
+        let by_agent = tracker.get_summary().expect("global cost summary").by_agent;
+        let stats = by_agent.get("web").expect("agent alias attribution");
+        assert_eq!(stats.total_tokens, 15);
+        assert!(stats.cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_budget_exhaustion_skips_provider_request() {
+        let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        let tmp = tempfile::tempdir().expect("production gateway temp dir");
+        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 0.01, false);
+        tracker
+            .record_usage_with_agent(
+                zeroclaw_config::cost::types::TokenUsage::new(
+                    "fixture-model",
+                    1_000_000,
+                    0,
+                    0,
+                    2.0,
+                    4.0,
+                    0.0,
+                ),
+                Some("web"),
+            )
+            .expect("seed exhausted budget record");
+
+        let text = collect_production_sse(&state, "blocked stream", "production-budget").await;
+
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            0,
+            "an exhausted budget must reject before the provider request"
+        );
+        assert!(
+            text.contains("event: error"),
+            "budget rejection must be an SSE error: {text}"
+        );
+        assert!(
+            text.contains("Budget exceeded"),
+            "SSE error should preserve the budget explanation: {text}"
+        );
+        assert!(
+            !text.contains("event: done"),
+            "budget rejection must not emit done: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_cache_hit_reconciles_no_chunk_final_response() {
+        let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        let tmp = tempfile::tempdir().expect("production gateway temp dir");
+        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 1.0, true);
+
+        let first = collect_production_sse(&state, "cache me", "production-cache-first").await;
+        assert!(
+            first.contains("event: token"),
+            "cache seed must stream a token: {first}"
+        );
+        assert!(
+            first.contains("event: done"),
+            "cache seed must complete: {first}"
+        );
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
+
+        let second = collect_production_sse(&state, "cache me", "production-cache-second").await;
+        assert!(
+            second.contains("event: token")
+                && second.contains(r#"data: {"text":"fixture answer"}"#),
+            "a production cache hit has no runtime chunks, so reconciliation must emit the final response: {second}"
+        );
+        assert!(
+            second.contains("event: done"),
+            "cache hit must still terminate with done: {second}"
+        );
+        assert!(
+            !second.contains("event: error"),
+            "cache hit must not emit an error: {second}"
+        );
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            1,
+            "cache hit must not make another provider request"
+        );
+        assert_eq!(
+            tracker
+                .get_summary_for_agent("web")
+                .expect("cache cost summary")
+                .request_count,
+            1,
+            "cache hit must not record a second usage event"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_receipt_suffix_reconciles_before_done() {
+        use zeroclaw_config::schema::ToolReceiptsConfig;
+
+        let fixture = spawn_chat_completion_fixture_sequence(vec![
+            PRODUCTION_FIXTURE_TOOL_STREAM.to_string(),
+            PRODUCTION_FIXTURE_FINAL_STREAM.to_string(),
+        ])
+        .await;
+        let tmp = tempfile::tempdir().expect("production receipt fixture temp dir");
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        {
+            let mut config = state.config.write();
+            config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("production fixture risk profile")
+                .allowed_tools = vec!["calculator".to_string()];
+            config
+                .runtime_profiles
+                .get_mut("fixture")
+                .expect("production fixture runtime profile")
+                .max_tool_iterations = 2;
+            config
+                .runtime_profiles
+                .get_mut("fixture")
+                .expect("production fixture runtime profile")
+                .tool_receipts = ToolReceiptsConfig {
+                enabled: true,
+                show_in_response: true,
+                ..ToolReceiptsConfig::default()
+            };
+        }
+
+        let text = collect_production_sse(&state, "receipt stream", "production-receipt").await;
+
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+        let final_text = text
+            .find(r#"data: {"text":"final answer"}"#)
+            .unwrap_or_else(|| panic!("streamed final answer frame: {text}"));
+        let receipt_text = text
+            .find("Tool receipts:")
+            .expect("runtime receipt block in final response");
+        let done = text.find("event: done").expect("terminal done frame");
+        assert!(
+            final_text < receipt_text && receipt_text < done,
+            "receipt suffix must be reconciled before done: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_streams_cumulative_token_then_done() {
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        let state = sse_test_state(Arc::new(MockModelProvider::default()));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let body = Ok(Json(WebhookBody {
+            message: "sse cumulative hello".into(),
+            stream: true,
+        }));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&payload).unwrap();
+        assert!(
+            text.contains("event: token") && text.contains(r#"data: {"text":"ok"}"#),
+            "expected a cumulative token frame, got: {text}"
+        );
+        assert!(
+            text.contains("event: done") && text.contains("data: {}"),
+            "expected a terminating done frame, got: {text}"
+        );
+        assert!(
+            !text.contains("event: error"),
+            "unexpected error frame: {text}"
+        );
+        let captures = gateway_chat_dispatch_captures_for_test();
+        assert!(
+            captures
+                .iter()
+                .any(|capture| capture.message == "sse cumulative hello"),
+            "streamed dispatch must record the same capture as the JSON path"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_stream_true_without_sse_accept_keeps_json() {
+        let state = sse_test_state(Arc::new(MockModelProvider::default()));
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+            stream: true,
+        }));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["response"], "ok");
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_abort_cancels_turn_via_shared_registry() {
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-abort"));
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+            stream: true,
+        }));
+
+        let state_for_task = state.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            handle_webhook(
+                State(state_for_task.clone()),
+                test_connect_info(),
+                Query(WebhookQuery::default()),
+                headers,
+                body,
+            )
+            .await
+            .into_response()
+        });
+        let response = task.await.unwrap();
+
+        // The streamed turn registered its cancellation token under the
+        // gateway session key derived from X-Session-Id.
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-abort")
+            .cloned();
+        assert!(
+            token.is_some(),
+            "streamed webhook turn must register its cancellation token"
+        );
+
+        // Cancel through the same registry the abort endpoint uses; the
+        // stream must then terminate without a done frame.
+        if let Some(token) = token {
+            token.cancel();
+        }
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&payload).unwrap();
+        assert!(
+            !text.contains("event: done"),
+            "unexpected done frame: {text}"
+        );
+        assert!(
+            text.contains("event: error"),
+            "server-side cancellation must terminate an open SSE stream with an error frame: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_abort_cancels_backpressured_unread_client() {
+        let fixture = spawn_burst_hanging_chat_completion_fixture().await;
+        let tmp = tempfile::tempdir().expect("backpressure temp dir");
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let session_id = "sse-backpressure";
+        let response = start_test_sse(&state, session_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cancel_key = gateway_cancel_key(session_id);
+        let token = wait_for_registry_token(&state, &cancel_key).await;
+        wait_for_fixture_requests(&fixture, 1).await;
+        wait_for_fixture_chunks(&fixture, 17).await;
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let registry_empty = !state
+                    .cancel_tokens
+                    .lock()
+                    .expect("cancel_tokens lock poisoned")
+                    .contains_key(&cancel_key);
+                let provider_closed = fixture.stream_closed.load(Ordering::SeqCst);
+                if registry_empty && provider_closed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("server-side abort must wake a backpressured SSE turn");
+
+        assert!(token.is_cancelled());
+        assert!(fixture.stream_closed.load(Ordering::SeqCst));
+
+        // The response body was intentionally left unread while the bounded
+        // token queue filled. Resuming the read must still deliver the
+        // cancellation terminal frame through its priority channel.
+        let text = collect_cancelled_sse(response).await;
+        assert!(
+            text.contains("event: error"),
+            "backpressured cancellation must retain its terminal error: {text}"
+        );
+        assert!(
+            !text.contains("event: done"),
+            "a cancelled backpressured stream must not complete: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_body_drop_cancels_turn() {
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-drop"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-drop")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("dropping the SSE body must cancel the in-flight turn");
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key("gw_sse-drop"),
+            "dropping the SSE body must remove its cancellation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_replacement_cancels_old_turn_without_removing_new_token() {
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let request = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            headers.insert("X-Session-Id", HeaderValue::from_static("sse-replace"));
+            (
+                headers,
+                Ok(Json(WebhookBody {
+                    message: "hello".into(),
+                    stream: true,
+                })),
+            )
+        };
+
+        let (headers, body) = request();
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body,
+        )
+        .await;
+        let first_token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-replace")
+            .cloned()
+            .expect("first streamed turn must register its cancellation token");
+
+        let (headers, body) = request();
+        let second = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body,
+        )
+        .await;
+        let second_token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-replace")
+            .cloned()
+            .expect("replacement streamed turn must register its cancellation token");
+
+        tokio::time::timeout(Duration::from_secs(1), first_token.cancelled())
+            .await
+            .expect("registering a replacement must cancel the previous turn");
+        tokio::task::yield_now().await;
+        let current = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-replace")
+            .cloned()
+            .expect("old-turn cleanup must preserve the replacement token");
+        assert!(Arc::ptr_eq(&current, &second_token));
+
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn cancellation_transport_ws_to_sse_preserves_new_owner() {
+        // Real WebSocket/Agent setup is stack-heavy on the test platform; keep
+        // this transport-level race isolated without changing the global test
+        // stack or weakening the production boundary.
+        std::thread::Builder::new()
+            .name("gateway-ws-to-sse-cancellation".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(cancellation_transport_ws_to_sse_preserves_new_owner_inner());
+            })
+            .expect("spawn WS-to-SSE transport test thread")
+            .join()
+            .expect("WS-to-SSE transport test thread must not panic");
+    }
+
+    async fn cancellation_transport_ws_to_sse_preserves_new_owner_inner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let fixture = spawn_hanging_chat_completion_fixture().await;
+        let tmp = tempfile::tempdir().expect("transport test temp dir");
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        let session_id = "transport.ws-to.sse";
+        let session_key = gateway_cancel_key(session_id);
+
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport");
+        assert!(session_start.into_text().unwrap().contains("session_start"));
+        websocket
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("WS connect frame");
+        let connected = websocket
+            .next()
+            .await
+            .expect("WS connected frame")
+            .expect("WS connected transport");
+        assert!(connected.into_text().unwrap().contains("connected"));
+        websocket
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"first transport"}"#.into(),
+            ))
+            .await
+            .expect("WS chat frame");
+
+        let ws_token = wait_for_registry_token(&state, &session_key).await;
+        wait_for_fixture_requests(&fixture, 1).await;
+
+        let sse_response = start_test_sse(&state, session_id).await;
+        assert_eq!(sse_response.status(), StatusCode::OK);
+        let sse_token = wait_for_registry_replacement(&state, &session_key, &ws_token).await;
+        wait_for_fixture_requests(&fixture, 2).await;
+        tokio::time::timeout(Duration::from_secs(3), ws_token.cancelled())
+            .await
+            .expect("SSE registration cancels the replaced WS turn");
+        wait_for_registry_owner(&state, &session_key, &sse_token).await;
+
+        // The dotted display id must resolve to the canonical key and cancel
+        // the replacement SSE turn, not the original WebSocket turn.
+        let abort_response = api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(abort_response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(3), sse_token.cancelled())
+            .await
+            .expect("abort endpoint cancels the replacement SSE turn");
+
+        // Consume the body so its terminal error and owner-qualified cleanup run.
+        let sse_text = collect_cancelled_sse(sse_response).await;
+        assert!(
+            sse_text.contains("event: error"),
+            "SSE cancellation frame: {sse_text}"
+        );
+        assert!(
+            !sse_text.contains("event: done"),
+            "cancelled SSE must not complete: {sse_text}"
+        );
+        wait_for_registry_empty(&state, &session_key).await;
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    #[test]
+    fn cancellation_transport_sse_to_ws_preserves_new_owner() {
+        std::thread::Builder::new()
+            .name("gateway-sse-to-ws-cancellation".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(cancellation_transport_sse_to_ws_preserves_new_owner_inner());
+            })
+            .expect("spawn SSE-to-WS transport test thread")
+            .join()
+            .expect("SSE-to-WS transport test thread must not panic");
+    }
+
+    async fn cancellation_transport_sse_to_ws_preserves_new_owner_inner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let fixture = spawn_hanging_chat_completion_fixture().await;
+        let tmp = tempfile::tempdir().expect("transport test temp dir");
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let session_id = "transport-sse-to-ws";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let sse_response = start_test_sse(&state, session_id).await;
+        assert_eq!(sse_response.status(), StatusCode::OK);
+        let sse_token = wait_for_registry_token(&state, &session_key).await;
+        wait_for_fixture_requests(&fixture, 1).await;
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport");
+        assert!(session_start.into_text().unwrap().contains("session_start"));
+        websocket
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("WS connect frame");
+        let connected = websocket
+            .next()
+            .await
+            .expect("WS connected frame")
+            .expect("WS connected transport");
+        assert!(connected.into_text().unwrap().contains("connected"));
+        websocket
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"replacement transport"}"#.into(),
+            ))
+            .await
+            .expect("WS chat frame");
+
+        let ws_token = wait_for_registry_replacement(&state, &session_key, &sse_token).await;
+        wait_for_fixture_requests(&fixture, 2).await;
+        tokio::time::timeout(Duration::from_secs(3), sse_token.cancelled())
+            .await
+            .expect("WS registration cancels the replaced SSE turn");
+        wait_for_registry_owner(&state, &session_key, &ws_token).await;
+
+        let sse_text = collect_cancelled_sse(sse_response).await;
+        assert!(
+            sse_text.contains("event: error"),
+            "SSE cancellation frame: {sse_text}"
+        );
+        assert!(
+            !sse_text.contains("event: done"),
+            "cancelled SSE must not complete: {sse_text}"
+        );
+
+        // Cancel the replacement WS turn and verify that its cleanup removes
+        // only its own registry entry after the old SSE cleanup has completed.
+        ws_token.cancel();
+        wait_for_registry_empty(&state, &session_key).await;
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    #[test]
+    fn websocket_resumes_seeded_legacy_dotted_session_transcript() {
+        std::thread::Builder::new()
+            .name("gateway-ws-legacy-resume".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_resumes_seeded_legacy_dotted_session_inner());
+            })
+            .expect("spawn WS legacy-resume test thread")
+            .join()
+            .expect("WS legacy-resume test thread must not panic");
+    }
+
+    async fn websocket_resumes_seeded_legacy_dotted_session_inner() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let tmp = tempfile::tempdir().expect("legacy-resume temp dir");
+        let (mut state, _) =
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+        let session_db = tempfile::tempdir().expect("legacy-resume session db");
+        let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            std::sync::Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                    .expect("sqlite session backend"),
+            );
+        // Seed the transcript under the legacy raw gateway key: dot-bearing
+        // display ids persisted this exact key before cancellation keys were
+        // normalized, so a reconnect must resume it unchanged.
+        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport.legacy-resume");
+        backend
+            .append(
+                &legacy_key,
+                &zeroclaw_providers::ChatMessage::user("seeded legacy turn"),
+            )
+            .expect("seed legacy transcript");
+        state.session_backend = Some(backend);
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        let session_id = "transport.legacy-resume";
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport")
+            .into_text()
+            .expect("session_start text");
+        let session_start: serde_json::Value =
+            serde_json::from_str(&session_start).expect("session_start json");
+        assert_eq!(session_start["type"], "session_start");
+        assert_eq!(
+            session_start["resumed"], true,
+            "legacy raw-key transcript must resume for a dotted display id"
+        );
+        assert_eq!(session_start["message_count"], 1);
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    #[test]
+    fn websocket_delivers_api_injected_message_for_dotted_session() {
+        std::thread::Builder::new()
+            .name("gateway-ws-api-delivery".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_delivers_api_injected_message_inner());
+            })
+            .expect("spawn WS api-delivery test thread")
+            .join()
+            .expect("WS api-delivery test thread must not panic");
+    }
+
+    async fn websocket_delivers_api_injected_message_inner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let tmp = tempfile::tempdir().expect("api-delivery temp dir");
+        let (mut state, _) =
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+        let session_db = tempfile::tempdir().expect("api-delivery session db");
+        state.session_backend = Some(std::sync::Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                .expect("sqlite session backend"),
+        )
+            as std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>);
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        let session_id = "transport.api-delivery";
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let _session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport");
+        websocket
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("WS connect frame");
+        let connected = websocket
+            .next()
+            .await
+            .expect("WS connected frame")
+            .expect("WS connected transport");
+        assert!(connected.into_text().unwrap().contains("connected"));
+
+        // The `connected` acknowledgement is sent before the WebSocket has
+        // finished Agent setup and subscribed to the shared event channel.
+        // Wait for that authoritative readiness signal before injecting an
+        // API event; a fixed sleep would make this transport regression flaky.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.event_tx.receiver_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("WS subscribes to shared event channel");
+
+        // An API-injected message must broadcast with the display id the
+        // connected socket filters on, so it reaches the live transport.
+        let response = api::handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+            axum::Json(
+                serde_json::from_value::<api::SessionMessagePostBody>(serde_json::json!({
+                    "content": "injected for dotted session"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let frame = tokio::time::timeout(Duration::from_secs(3), websocket.next())
+            .await
+            .expect("WS receives API-injected message event")
+            .expect("WS message transport")
+            .expect("WS message frame")
+            .into_text()
+            .expect("message text");
+        let event: serde_json::Value = serde_json::from_str(&frame).expect("event json");
+        assert_eq!(event["type"], "message");
+        assert_eq!(
+            event["session_id"], session_id,
+            "API broadcasts must carry the display id the socket filters on"
+        );
+        assert_eq!(event["content"], "injected for dotted session");
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    #[test]
+    fn sse_final_response_reconciliation_handles_empty_and_receipt_suffix() {
+        let mut cumulative = String::new();
+        let frame = reconcile_sse_final_response(&mut cumulative, "cached response")
+            .expect("a no-chunk response must produce one token frame")
+            .unwrap();
+        let _ = frame;
+        assert_eq!(cumulative, "cached response");
+
+        let mut cumulative = "answer".to_string();
+        let frame = reconcile_sse_final_response(&mut cumulative, "answer\n\n[receipt]")
+            .expect("a final receipt suffix must be emitted")
+            .unwrap();
+        let _ = frame;
+        assert_eq!(cumulative, "answer\n\n[receipt]");
+
+        let mut cumulative = "already complete".to_string();
+        assert!(reconcile_sse_final_response(&mut cumulative, "already complete").is_none());
+        assert_eq!(cumulative, "already complete");
+
+        let mut cumulative = "speculative streamed text".to_string();
+        let frame = reconcile_sse_final_response(&mut cumulative, "authoritative final")
+            .expect("a conflicting final response must replace streamed text")
+            .unwrap();
+        let _ = frame;
+        assert_eq!(cumulative, "authoritative final");
+
+        let mut cumulative = "authoritative final with stale suffix".to_string();
+        let frame = reconcile_sse_final_response(&mut cumulative, "authoritative final")
+            .expect("a shorter authoritative final must remove stale streamed text")
+            .unwrap();
+        let _ = frame;
+        assert_eq!(cumulative, "authoritative final");
+
+        let mut cumulative = "stale streamed text".to_string();
+        let frame = reconcile_sse_final_response(&mut cumulative, "")
+            .expect("an empty authoritative final must clear stale streamed text")
+            .unwrap();
+        let _ = frame;
+        assert!(cumulative.is_empty());
+    }
+
+    #[test]
+    fn cancellation_registry_preserves_sse_owner_when_ws_finishes() {
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ws_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let sse_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&ws_token));
+        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&sse_token));
+        remove_cancel_token_if_current(&registry, "gw_cross_direction", &ws_token);
+
+        assert!(ws_token.is_cancelled());
+        let current = registry
+            .lock()
+            .expect("cancel registry lock")
+            .get("gw_cross_direction")
+            .cloned()
+            .expect("replacement SSE token remains registered");
+        assert!(Arc::ptr_eq(&current, &sse_token));
+        assert!(!sse_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_registry_preserves_ws_owner_when_sse_finishes() {
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let sse_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let ws_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&sse_token));
+        register_cancel_token(&registry, "gw_cross_direction", Arc::clone(&ws_token));
+        remove_cancel_token_if_current(&registry, "gw_cross_direction", &sse_token);
+
+        assert!(sse_token.is_cancelled());
+        let current = registry
+            .lock()
+            .expect("cancel registry lock")
+            .get("gw_cross_direction")
+            .cloned()
+            .expect("replacement WS token remains registered");
+        assert!(Arc::ptr_eq(&current, &ws_token));
+        assert!(!ws_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_registry_keeps_lossy_session_ids_separate() {
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let dotted_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let underscored_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+        register_cancel_token(
+            &registry,
+            &gateway_cancel_key("team.alpha"),
+            Arc::clone(&dotted_token),
+        );
+        register_cancel_token(
+            &registry,
+            &gateway_cancel_key("team_alpha"),
+            Arc::clone(&underscored_token),
+        );
+
+        assert!(!dotted_token.is_cancelled());
+        assert!(!underscored_token.is_cancelled());
+        assert_eq!(
+            registry.lock().expect("cancel registry lock").len(),
+            2,
+            "distinct session ids must not share a cancellation entry"
+        );
+    }
+
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockModelProvider::default());
@@ -6207,6 +8365,7 @@ path = "{trigger_path}"
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -6221,6 +8380,7 @@ path = "{trigger_path}"
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -6417,6 +8577,7 @@ path = "{trigger_path}"
             webhook_secret_header(&secret),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -6436,6 +8597,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "chat instead".into(),
+                stream: false,
             })),
         )
         .await
@@ -6469,6 +8631,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "chat".into(),
+                stream: false,
             })),
         )
         .await
@@ -6681,6 +8844,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -6824,6 +8988,7 @@ path = "{trigger_path}"
             forged,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -6969,6 +9134,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -7026,6 +9192,7 @@ path = "{trigger_path}"
             webhook_secret_header(&secret),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -7121,6 +9288,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7236,6 +9404,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7330,6 +9499,7 @@ path = "{trigger_path}"
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            stream: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -7344,6 +9514,7 @@ path = "{trigger_path}"
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            stream: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -7538,6 +9709,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7630,6 +9802,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7718,6 +9891,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await

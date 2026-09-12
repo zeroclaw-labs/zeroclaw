@@ -4,7 +4,10 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::AppState;
+use super::{
+    AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -197,9 +200,6 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-const GW_SESSION_PREFIX: &str = "gw_";
-
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
@@ -349,6 +349,9 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Transcript identity keeps the raw display id (`gw_{session_id}`) so
+    // existing persisted histories and metadata rows stay resumable across
+    // reconnects.
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
@@ -1047,15 +1050,15 @@ async fn process_chat_message(
     // ── Cancellation token lifecycle ─────────────────────────────
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
-    }
+    // of outcome (normal, error, or cancelled). Registration uses the
+    // process-local cancellation key shared with the webhook SSE transport,
+    // while persistence stays on the raw transcript key.
+    let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+    register_cancel_token(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        Arc::clone(&cancel_token),
+    );
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -1084,7 +1087,7 @@ async fn process_chat_message(
                         .turn_streamed_with_steering_state(
                             &content_owned,
                             event_tx,
-                            Some(cancel_token.clone()),
+                            Some(cancel_token.as_ref().clone()),
                             Some(&mut steering_rx),
                         )
                         .instrument(span),
@@ -1304,13 +1307,11 @@ async fn process_chat_message(
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .remove(session_key);
-    }
+    remove_cancel_token_if_current(
+        &state.cancel_tokens,
+        &gateway_cancel_key(session_id),
+        &cancel_token,
+    );
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
