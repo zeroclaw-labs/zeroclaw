@@ -117,8 +117,13 @@ use zeroclaw_config::schema::Config;
 #[cfg(test)]
 use zeroclaw_memory::MEMORY_CONTEXT_OPEN;
 use zeroclaw_memory::{self, Memory};
-use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
-use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_providers::reliable::{
+    ProviderFallbackInfo, scope_provider_fallback, take_last_provider_fallback,
+};
+use zeroclaw_providers::{
+    self, ChatMessage, ModelProvider, ProviderDispatch, SafeguardFallbackKind,
+    SafeguardFallbackNotice, scope_safeguard_fallback, take_last_safeguard_fallback,
+};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
@@ -344,24 +349,71 @@ fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> Str
 
 fn append_provider_fallback_footer(
     mut response: String,
-    fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+    fallback: Option<&ProviderFallbackInfo>,
+    safeguard: Option<&SafeguardFallbackNotice>,
 ) -> String {
-    let Some(fallback) = fallback else {
-        return response;
-    };
-    let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
-    let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
-    let same_family = requested_family == actual_family
-        || requested_family.starts_with(actual_family)
-        || actual_family.starts_with(requested_family);
-    if !same_family {
+    // The ordinary recovery leg comes first so the footers read in route
+    // order: the provider fallback, then the safeguard switch the accepted
+    // attempt itself went through.
+    match (
+        zeroclaw_providers::visible_provider_fallback(fallback, safeguard),
+        safeguard,
+    ) {
+        // A server-side safeguard notice names the client-fallback model as
+        // its request, so this leg is the only place the originally requested
+        // model appears and must name it. The alias-only footer below cannot
+        // (same-alias pinned entries share one display name), so the leg uses
+        // the model-naming notice. An identical requested and served pair is
+        // a retry, not a leg worth naming.
+        (Some(fallback), Some(_))
+            if fallback.requested_provider != fallback.actual_provider
+                || fallback.requested_model != fallback.actual_model =>
+        {
+            response.push_str("\n\n---\n");
+            response.push_str(&channel_runtime_cli_string_with_args(
+                "turn-model-fallback-notice",
+                &[
+                    ("requested_model", fallback.requested_model.as_str()),
+                    ("requested_provider", fallback.requested_provider.as_str()),
+                    ("actual_model", fallback.actual_model.as_str()),
+                    ("actual_provider", fallback.actual_provider.as_str()),
+                ],
+            ));
+        }
+        (Some(fallback), None) => {
+            let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
+            let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
+            let same_family = requested_family == actual_family
+                || requested_family.starts_with(actual_family)
+                || actual_family.starts_with(requested_family);
+            if !same_family {
+                response.push_str("\n\n---\n");
+                response.push_str(&channel_runtime_cli_string_with_args(
+                    "channel-runtime-fallback-footer",
+                    &[
+                        ("requested", fallback.requested_provider.as_str()),
+                        ("actual", fallback.actual_provider.as_str()),
+                        ("model", fallback.actual_model.as_str()),
+                    ],
+                ));
+            }
+        }
+        _ => {}
+    }
+    if let Some(notice) = safeguard {
+        let key = match notice.kind {
+            SafeguardFallbackKind::ServerSide => "channel-runtime-safeguard-footer-server",
+            SafeguardFallbackKind::ClientSide => "channel-runtime-safeguard-footer-client",
+            SafeguardFallbackKind::ClientAndServer => {
+                "channel-runtime-safeguard-footer-client-server"
+            }
+        };
         response.push_str("\n\n---\n");
         response.push_str(&channel_runtime_cli_string_with_args(
-            "channel-runtime-fallback-footer",
+            key,
             &[
-                ("requested", fallback.requested_provider.as_str()),
-                ("actual", fallback.actual_provider.as_str()),
-                ("model", fallback.actual_model.as_str()),
+                ("requested", notice.requested_model.as_str()),
+                ("served", notice.served_model.as_str()),
             ],
         ));
     }
@@ -7119,7 +7171,7 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
-    let (llm_result, fallback_info) = scope_provider_fallback(async {
+    let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
                 .interruption_scope_id
@@ -7352,9 +7404,10 @@ async fn process_channel_message_body(
             break loop_result;
         };
         let fb = take_last_provider_fallback();
-        (llm_result, fb)
-    })
-    .await;
+        let safeguard = take_last_safeguard_fallback();
+        (llm_result, fb, safeguard)
+    }));
+    let (llm_result, fallback_info, safeguard_notice) = scope_safeguard_fallback(scoped_turn).await;
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
         && let Some(tx) = delta_tx.as_ref()
@@ -7544,8 +7597,12 @@ async fn process_channel_message_body(
 
             // The runtime commits this candidate only after semantic acceptance.
             // This renderer must therefore receive only the final accepted route.
-            delivered_response =
-                append_provider_fallback_footer(delivered_response, fallback_info.as_ref());
+            let history_response = delivered_response.clone();
+            delivered_response = append_provider_fallback_footer(
+                delivered_response,
+                fallback_info.as_ref(),
+                safeguard_notice.as_ref(),
+            );
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -7577,7 +7634,6 @@ async fn process_channel_message_body(
                 }
             }
 
-            let history_response = delivered_response.clone();
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
@@ -7594,7 +7650,7 @@ async fn process_channel_message_body(
                 let model = ctx.model.to_string();
                 let temperature = ctx.temperature;
                 let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
+                let assistant_resp = history_response.clone();
                 zeroclaw_spawn::spawn!(async move {
                     if let Err(e) = memory_strategy
                         .consolidate_turn(
@@ -13802,15 +13858,113 @@ pub(crate) mod tests {
             actual_model: "model-b".to_string(),
         };
         let delivered =
-            append_provider_fallback_footer("final response".to_string(), Some(&fallback));
+            append_provider_fallback_footer("final response".to_string(), Some(&fallback), None);
         assert!(delivered.starts_with("final response\n\n---\n"));
         assert!(delivered.contains("openai.primary"));
         assert!(delivered.contains("anthropic.backup"));
         assert_eq!(delivered.matches("---").count(), 1);
         assert_eq!(
-            append_provider_fallback_footer("primary final".to_string(), None),
+            append_provider_fallback_footer("primary final".to_string(), None, None),
             "primary final"
         );
+    }
+
+    #[test]
+    fn safeguard_footer_wins_and_does_not_expose_private_category() {
+        let fallback = ProviderFallbackInfo {
+            requested_provider: "anthropic.primary".to_string(),
+            requested_model: "claude-fable".to_string(),
+            actual_provider: "anthropic.backup".to_string(),
+            actual_model: "claude-opus".to_string(),
+        };
+        let safeguard = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ClientAndServer,
+            requested_model: "claude-fable".to_string(),
+            served_model: "claude-opus".to_string(),
+            category: Some("private-category".to_string()),
+        };
+
+        let delivered = append_provider_fallback_footer(
+            "accepted response".to_string(),
+            Some(&fallback),
+            Some(&safeguard),
+        );
+
+        assert_eq!(delivered.matches("---").count(), 1);
+        assert_eq!(delivered.matches("🛡️").count(), 1);
+        assert!(delivered.contains("claude-opus"));
+        assert!(!delivered.contains("private-category"));
+        assert!(!delivered.contains("anthropic.backup"));
+    }
+
+    #[test]
+    fn server_side_safeguard_keeps_same_family_ordinary_leg_visible() {
+        // Ordinary failure on model A, Reliable advances to the pinned client
+        // fallback B (same alias, so both entries carry the bare family name),
+        // and Anthropic serves B's request with its server fallback C. No
+        // refusal occurred, so the safeguard notice covers only B to C.
+        let fallback = ProviderFallbackInfo {
+            requested_provider: "anthropic".to_string(),
+            requested_model: "model-a".to_string(),
+            actual_provider: "anthropic".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let safeguard = SafeguardFallbackNotice {
+            kind: SafeguardFallbackKind::ServerSide,
+            requested_model: "model-b".to_string(),
+            served_model: "model-c".to_string(),
+            category: Some("private-category".to_string()),
+        };
+
+        let delivered = append_provider_fallback_footer(
+            "accepted response".to_string(),
+            Some(&fallback),
+            Some(&safeguard),
+        );
+
+        assert!(delivered.starts_with("accepted response\n\n---\n"));
+        assert_eq!(
+            delivered.matches("---").count(),
+            2,
+            "both route legs must be delivered: {delivered}"
+        );
+        assert!(
+            delivered.contains("model-a"),
+            "the originally requested model must stay visible: {delivered}"
+        );
+        assert!(delivered.contains("model-b"));
+        assert!(delivered.contains("model-c"));
+        assert_eq!(delivered.matches("🛡️").count(), 1);
+        assert!(
+            delivered.find("model-a") < delivered.find("🛡️"),
+            "the ordinary leg precedes the safety leg: {delivered}"
+        );
+        assert!(
+            !delivered.contains("fallback chain"),
+            "an ordinary failure is not a refusal chain: {delivered}"
+        );
+        assert!(!delivered.contains("private-category"));
+
+        // Without a safeguard leg the same-family switch stays silent as before.
+        assert_eq!(
+            append_provider_fallback_footer("accepted response".to_string(), Some(&fallback), None),
+            "accepted response"
+        );
+
+        // A same-candidate retry served by C is only the server-side leg.
+        let retry = ProviderFallbackInfo {
+            requested_provider: "anthropic".to_string(),
+            requested_model: "model-b".to_string(),
+            actual_provider: "anthropic".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let delivered = append_provider_fallback_footer(
+            "accepted response".to_string(),
+            Some(&retry),
+            Some(&safeguard),
+        );
+        assert_eq!(delivered.matches("---").count(), 1, "{delivered}");
+        assert_eq!(delivered.matches("🛡️").count(), 1);
     }
 
     #[test]

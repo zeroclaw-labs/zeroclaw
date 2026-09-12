@@ -58,6 +58,7 @@ struct Node {
     provider_ref: String,
     model: String,
     composite: bool,
+    suppressed: bool,
     finalized: bool,
     outcome: Option<AttemptUsageOutcome>,
 }
@@ -117,14 +118,14 @@ impl CallAccountingCollector {
             nodes
                 .iter()
                 .rev()
-                .find(|node| node.finalized && !node.composite)
+                .find(|node| node.finalized && !node.composite && !node.suppressed)
                 .map(|node| (node.provider_ref.clone(), node.model.clone()))
         } else {
             None
         };
         let attempts = nodes
             .into_iter()
-            .filter(|node| !node.composite)
+            .filter(|node| !node.composite && !node.suppressed)
             .map(|node| {
                 AccountedAttempt::new(
                     node.provider_ref,
@@ -219,6 +220,7 @@ impl AttemptLease {
                     provider_ref,
                     model,
                     composite: false,
+                    suppressed: false,
                     finalized: false,
                     outcome: None,
                 });
@@ -421,6 +423,35 @@ pub(crate) fn mark_current_composite() {
     });
 }
 
+/// Suppress the currently polled dispatch attempt so synthetic no-replay
+/// returns (such as unwrapped refusal replays) do not bill a second physical attempt.
+pub(crate) fn suppress_current_attempt() {
+    let _ = ACTIVE_COLLECTOR.try_with(|collector| {
+        let key = collector_key(collector);
+        let node = POLL_STACK
+            .try_with(|stack| {
+                stack
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find_map(|(stack_key, node)| (*stack_key == key).then_some(*node))
+            })
+            .ok()
+            .flatten();
+        let Some(node) = node else {
+            return;
+        };
+        let mut state = collector.lock();
+        if !state.closed
+            && let Some(current) = state.nodes.get_mut(node.0)
+        {
+            current.suppressed = true;
+            current.finalized = true;
+            current.outcome = None;
+        }
+    });
+}
+
 /// Attach a runtime-observed final stream usage snapshot to the latest open
 /// physical leaf. This does not manufacture a node; it only preserves the
 /// lower bound already observed by the stream consumer.
@@ -485,7 +516,7 @@ pub(crate) fn current_billable_usage() -> Option<TokenUsage> {
             let state = collector.lock();
             let mut total: Option<TokenUsage> = None;
             for node in &state.nodes {
-                if node.composite {
+                if node.composite || node.suppressed {
                     continue;
                 }
                 let usage = match node.outcome.as_ref() {

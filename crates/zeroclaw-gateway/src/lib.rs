@@ -5219,6 +5219,7 @@ path = "{trigger_path}"
                     api_key: Some("sk-test-openai-shaped-key".to_string()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -7155,6 +7156,7 @@ path = "{trigger_path}"
                     model: Some("agent-model".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         let expected_provider = "anthropic.default".to_string();

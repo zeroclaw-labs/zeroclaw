@@ -20,9 +20,22 @@ use serde::{Deserialize, Serialize};
 /// and the wording is not.
 pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
 
+/// Stable code for the empty `server_fallback_models` entry notice.
+pub const EMPTY_SERVER_FALLBACK_MODEL: &str = "empty_server_fallback_model";
+
+/// Stable code for `server_fallback_models` entry duplicating primary model notice.
+pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
+    "server_fallback_model_duplicates_primary";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
+/// - `empty_server_fallback_model`: `server_fallback_models` contains an empty
+///   string entry, which cannot match any model name and is dropped before the
+///   request is sent.
+/// - `server_fallback_model_duplicates_primary`: `server_fallback_models` contains
+///   the primary model name, which duplicates the requested model and is dropped
+///   before the request is sent.
 /// - `codex_cli_extra_args_security_boundary`: `codex_cli.extra_args` contains
 ///   a known Codex CLI argument that can change sandbox, approval, policy,
 ///   workspace, feature, trust, or executable-integration boundaries. The

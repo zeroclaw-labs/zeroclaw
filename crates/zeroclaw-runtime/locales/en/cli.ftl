@@ -1045,6 +1045,12 @@ channel-runtime-provider-turn-init-failed =
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models
+channel-runtime-safeguard-footer-server =
+    🛡️ Safety safeguards flagged this request — Anthropic served the response with **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client =
+    🛡️ Safety safeguards flagged this request — switched to **{ $served }** (requested `{ $requested }`).
+channel-runtime-safeguard-footer-client-server =
+    🛡️ Safety safeguards flagged this request — switched through a fallback chain to **{ $served }** (requested `{ $requested }`).
 
 delegate-provider-fallback-warning = Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.
 turn-tool-protocol-strict-mixed-error = Strict tool parsing cannot run a fallback chain that mixes native-tool and text-only candidates. Configure every reachable candidate to use the same tool protocol, or set strict_tool_parsing to false.
@@ -1165,6 +1171,7 @@ cli-agent-error-provider-connection-remote = Cannot reach the model provider at 
 cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
 cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
 cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
+cli-agent-error-provider-refusal = The model's safety system declined this request. Rephrase it, or configure fallback_models on the provider to auto-switch models.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
