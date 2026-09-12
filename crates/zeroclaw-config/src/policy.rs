@@ -376,6 +376,10 @@ pub struct SecurityPolicy {
     /// Extra arguments forwarded to firejail when `sandbox_backend`
     /// resolves to `"firejail"`.
     pub firejail_args: Vec<String>,
+    /// Container image for the docker sandbox backend. `None` inherits the
+    /// built-in default; carried here so status surfaces report the image the
+    /// sandbox will actually run rather than assuming the default.
+    pub sandbox_image: Option<String>,
     pub tracker: PerSenderTracker,
 }
 
@@ -774,6 +778,7 @@ impl Default for SecurityPolicy {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: vec![],
+            sandbox_image: None,
             tracker: PerSenderTracker::new(),
         }
     }
@@ -3627,6 +3632,7 @@ impl SecurityPolicy {
             always_ask: risk_profile.always_ask.clone(),
             sandbox_enabled: risk_profile.sandbox_enabled,
             sandbox_backend: risk_profile.sandbox_backend.clone(),
+            sandbox_image: risk_profile.sandbox_image.clone(),
             firejail_args: risk_profile.firejail_args.clone(),
             tracker: PerSenderTracker::new(),
         }
@@ -3992,6 +3998,7 @@ mod tests {
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            sandbox_image: None,
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));

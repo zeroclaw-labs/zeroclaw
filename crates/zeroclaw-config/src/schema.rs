@@ -12869,6 +12869,13 @@ impl RiskProfileConfig {
             enabled: self.sandbox_enabled,
             backend,
             firejail_args: self.firejail_args.clone(),
+            image: self
+                .sandbox_image
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(default_sandbox_image),
         }
     }
 }
@@ -12993,6 +13000,11 @@ pub struct RiskProfileConfig {
     pub sandbox_backend: Option<String>,
     /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
     pub firejail_args: Vec<String>,
+    /// Container image the docker sandbox runs commands in when
+    /// `sandbox_backend = "docker"`. `None` inherits the built-in default.
+    /// Set this to pin a digest or a specific tag so the sandbox stops
+    /// tracking whatever the default tag moves to.
+    pub sandbox_image: Option<String>,
 }
 
 impl Default for RiskProfileConfig {
@@ -13015,6 +13027,7 @@ impl Default for RiskProfileConfig {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
+            sandbox_image: None,
         }
     }
 }
@@ -18069,6 +18082,23 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Container image the Docker sandbox runs commands in (when backend =
+    /// docker). Pin a digest or a specific tag if you need the sandbox to stop
+    /// tracking upstream changes to the default tag.
+    #[serde(default = "default_sandbox_image")]
+    pub image: String,
+}
+
+/// Default container image for the Docker sandbox backend.
+///
+/// The single source for this value: the serde default below and
+/// `DockerSandbox`'s own default both read it, so a change here cannot leave
+/// one path on a stale image.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "alpine:latest";
+
+fn default_sandbox_image() -> String {
+    DEFAULT_SANDBOX_IMAGE.to_string()
 }
 
 impl Default for SandboxConfig {
@@ -18077,6 +18107,7 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            image: default_sandbox_image(),
         }
     }
 }
@@ -28897,6 +28928,58 @@ reasoning_effort = "HIGH"
     }
 
     #[test]
+    async fn sandbox_image_defaults_to_the_shared_constant() {
+        // The default has to come from one place; a second literal anywhere is
+        // how the docs and the sandbox drifted apart before.
+        assert_eq!(SandboxConfig::default().image, DEFAULT_SANDBOX_IMAGE);
+        assert_eq!(DEFAULT_SANDBOX_IMAGE, "alpine:latest");
+    }
+
+    #[test]
+    async fn sandbox_image_is_configurable() {
+        // The sandbox is configured per risk profile, not under a
+        // `[security.sandbox]` table: `SandboxConfig` is a runtime view that
+        // `sandbox_config()` assembles from these flat keys.
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_backend = "docker"
+sandbox_image = "alpine:3.20"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config with a sandbox image should parse");
+        let profile = cfg
+            .risk_profiles
+            .get("custom")
+            .expect("the custom profile should deserialize");
+        assert_eq!(profile.sandbox_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(profile.sandbox_config().image, "alpine:3.20");
+    }
+
+    #[test]
+    async fn sandbox_image_absent_falls_back_to_the_default() {
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_backend = "docker"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config without an image should parse");
+        let profile = cfg.risk_profiles.get("custom").expect("profile");
+        assert_eq!(profile.sandbox_image, None);
+        assert_eq!(profile.sandbox_config().image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[test]
+    async fn sandbox_image_blank_is_treated_as_unset() {
+        // An empty or whitespace value must not hand Docker an empty image
+        // name; it falls back the same way an absent key does.
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_image = "   "
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config should parse");
+        let profile = cfg.risk_profiles.get("custom").expect("profile");
+        assert_eq!(profile.sandbox_config().image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[tokio::test]
     async fn runtime_reasoning_effort_rejects_invalid_values() {
         let raw = r#"
 default_temperature = 0.7
