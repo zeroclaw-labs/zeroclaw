@@ -511,6 +511,17 @@ impl Channel for PacedChannel {
             .await
     }
 
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: Duration,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.inner
+            .request_approval_attributed_with_timeout(recipient, request, timeout)
+            .await
+    }
+
     async fn request_choice(
         &self,
         question: &str,

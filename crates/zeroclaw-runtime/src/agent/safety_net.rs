@@ -1789,6 +1789,69 @@ impl zeroclaw_api::channel::Channel for RecordingApprovalChannel {
     }
 }
 
+/// A channel that can carry turns but inherits the API's `Ok(None)` approval
+/// response because it has no inline approval surface.
+struct UnsupportedApprovalChannel;
+impl ::zeroclaw_api::attribution::Attributable for UnsupportedApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "unsupported"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for UnsupportedApprovalChannel {
+    fn name(&self) -> &str {
+        "unsupported"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct ErroringApprovalChannel;
+impl ::zeroclaw_api::attribution::Attributable for ErroringApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "erroring"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for ErroringApprovalChannel {
+    fn name(&self) -> &str {
+        "erroring"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        anyhow::bail!("approval transport failed")
+    }
+}
+
 /// Counts executions and captures the args it was actually invoked with —
 /// the observable for the `approved`-arg trust assertions.
 struct CapturingArgTool {
@@ -2027,6 +2090,105 @@ async fn safety_net_loop_shell_marks_args_approved_after_backchannel_approval() 
         args["approved"], true,
         "runtime injects approved=true only after a real back-channel approval"
     );
+}
+
+#[tokio::test]
+async fn safety_net_loop_unsupported_approval_backchannel_defers_ordinary_shell_to_tool_policy() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "ls -la", "approved": true}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(UnsupportedApprovalChannel)),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert_eq!(exec.load(Ordering::SeqCst), 1, "shell reaches tool policy");
+    let args = captured.lock().clone().expect("executed args captured");
+    assert_eq!(
+        args["approved"], false,
+        "unsupported approval must never manufacture operator approval"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_loop_unsupported_approval_backchannel_does_not_bypass_always_ask_shell() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["shell".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args(
+                "tc1",
+                "shell",
+                serde_json::json!({"command": "ls -la", "approved": true}),
+            ),
+        ])])),
+        vec![Box::new(CapturingArgTool {
+            name: "shell",
+            output: "shell-out",
+            calls: Arc::clone(&exec),
+            last_args: Arc::clone(&captured),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &risk,
+        ))),
+        Some(Arc::new(UnsupportedApprovalChannel)),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert_eq!(exec.load(Ordering::SeqCst), 0, "always_ask remains closed");
+    assert!(captured.lock().is_none());
+}
+
+#[tokio::test]
+async fn safety_net_loop_approval_backchannel_error_denies_ordinary_shell() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call_args("tc1", "shell", serde_json::json!({"command": "ls -la"})),
+        ])])),
+        vec![Box::new(CountingTool {
+            name: "shell",
+            calls: Arc::clone(&exec),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive_backchannel(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        ))),
+        Some(Arc::new(ErroringApprovalChannel)),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    agent
+        .turn_streamed_with_steering_state("go", tx, None, None)
+        .await
+        .expect("streamed turn should succeed");
+
+    assert_eq!(exec.load(Ordering::SeqCst), 0, "channel errors fail closed");
 }
 
 #[tokio::test]

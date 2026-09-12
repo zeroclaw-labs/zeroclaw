@@ -1057,6 +1057,31 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             .map(AttributedApprovalResponse::operator))
     }
 
+    /// Request an attributed approval using a caller-owned response budget.
+    ///
+    /// The default keeps the existing caller-side timeout semantics. Channels
+    /// with a claim-aware deadline handoff may override this so their pending
+    /// decision and any bounded resolution grace share one deadline owner.
+    async fn request_approval_attributed_with_timeout(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        match tokio::time::timeout(
+            timeout,
+            self.request_approval_attributed(recipient, request),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(Some(AttributedApprovalResponse::from_runtime(
+                ChannelApprovalResponse::Deny,
+                ApprovalSource::TimedOut,
+            ))),
+        }
+    }
+
     /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
     /// approval) on this channel, rendered natively — an embed with one button
     /// per choice on Discord, an inline keyboard on Telegram, and so on.

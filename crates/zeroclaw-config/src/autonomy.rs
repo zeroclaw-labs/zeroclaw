@@ -87,6 +87,9 @@ fn default_approval_timeout_secs() -> u64 {
 pub struct ApprovalRoute {
     /// A registered channel name (NOT the originator) — the distinct-approver hop.
     pub approver_channel: String,
+    /// The recipient on the approver channel. Blank or absent means unavailable.
+    #[serde(default)]
+    pub approver_recipient: Option<String>,
     /// Behavior when the approver is unreachable. Fail-closed by default.
     #[serde(default)]
     pub on_no_approver: OnNoApprover,
@@ -123,6 +126,7 @@ mod tests {
         // Absent optional fields: fail-closed policy + bounded 120s window.
         let r: ApprovalRoute = toml::from_str("approver_channel = \"ops\"").unwrap();
         assert_eq!(r.approver_channel, "ops");
+        assert_eq!(r.approver_recipient, None);
         assert_eq!(
             r.on_no_approver,
             OnNoApprover::Deny,
@@ -135,6 +139,7 @@ mod tests {
     fn approval_route_round_trips() {
         let r = ApprovalRoute {
             approver_channel: "ops".into(),
+            approver_recipient: Some("ops-recipient".into()),
             on_no_approver: OnNoApprover::InheritOriginator,
             timeout_secs: 30,
         };
@@ -143,6 +148,7 @@ mod tests {
         assert!(s.contains("on_no_approver = \"inherit-originator\""), "{s}");
         let back: ApprovalRoute = toml::from_str(&s).unwrap();
         assert_eq!(back.approver_channel, r.approver_channel);
+        assert_eq!(back.approver_recipient, r.approver_recipient);
         assert_eq!(back.on_no_approver, r.on_no_approver);
         assert_eq!(back.timeout_secs, r.timeout_secs);
     }

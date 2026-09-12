@@ -60,6 +60,9 @@ pub(crate) async fn gate_tool_approval(
                 };
                 match response {
                     Ok(Some(a)) => Some(a),
+                    Ok(None) if mgr.unsupported_backchannel_may_fall_back(tool_name) => {
+                        return ApprovalGateOutcome::Proceed { approved: false };
+                    }
                     Ok(None) => None,
                     Err(e) => {
                         ::zeroclaw_log::record!(

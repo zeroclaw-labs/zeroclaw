@@ -66,7 +66,7 @@ impl Channel for AskUserApprovalBridge {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
-        if let Some(route) = &self.route {
+        let inherited_route = if let Some(route) = &self.route {
             match resolve_routed_approval(&self.handles, route, recipient, request).await {
                 // Cross-crate construction: `AttributedApprovalResponse` is
                 // `#[non_exhaustive]`, so struct-literal syntax is forbidden
@@ -83,9 +83,12 @@ impl Channel for AskUserApprovalBridge {
                 }
                 RoutedApproval::Fallthrough => {
                     // explicit InheritOriginator → originating fan-out below
+                    true
                 }
             }
-        }
+        } else {
+            false
+        };
 
         let channels: Vec<(String, Arc<dyn Channel>)> = self
             .handles
@@ -93,6 +96,13 @@ impl Channel for AskUserApprovalBridge {
             .iter()
             .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
             .collect();
+        if channels.is_empty() {
+            return Ok(Some(AttributedApprovalResponse::from_runtime(
+                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                zeroclaw_api::channel::ApprovalSource::Unavailable,
+            )));
+        }
+        let mut saw_error = false;
         for (channel_name, channel) in &channels {
             // Ask for the ATTRIBUTED response, not the legacy one: a back-channel
             // that synthesizes `Some(Deny)` on timeout reports that provenance
@@ -110,6 +120,7 @@ impl Channel for AskUserApprovalBridge {
                 }
                 Ok(None) => continue,
                 Err(e) => {
+                    saw_error = true;
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -123,6 +134,16 @@ impl Channel for AskUserApprovalBridge {
                     );
                 }
             }
+        }
+        if inherited_route || saw_error {
+            return Ok(Some(AttributedApprovalResponse::from_runtime(
+                zeroclaw_api::channel::ChannelApprovalResponse::Deny,
+                if saw_error {
+                    zeroclaw_api::channel::ApprovalSource::Unreachable
+                } else {
+                    zeroclaw_api::channel::ApprovalSource::Unavailable
+                },
+            )));
         }
         Ok(None)
     }
@@ -371,5 +392,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn empty_backchannel_registry_fails_closed() {
+        let bridge = AskUserApprovalBridge::new(handles_with(vec![]), None);
+        let decided = bridge
+            .request_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("an empty registry must become a runtime denial");
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn inherited_route_fails_closed_when_all_originators_abstain() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![approver("ws", "nobody")]),
+            Some(zeroclaw_config::autonomy::ApprovalRoute {
+                approver_channel: "ops".into(),
+                approver_recipient: Some("operator".into()),
+                on_no_approver: zeroclaw_config::autonomy::OnNoApprover::InheritOriginator,
+                timeout_secs: 1,
+            }),
+        );
+        let decided = bridge
+            .request_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("an exhausted inherited route must become a runtime denial");
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
+        );
+        assert!(decided.decided_by.is_none());
     }
 }

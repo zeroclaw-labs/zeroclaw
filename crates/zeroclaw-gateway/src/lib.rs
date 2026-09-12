@@ -2557,22 +2557,31 @@ struct GatewayChatDispatchCapture {
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
 
-// The four items below serialize and read the capture buffer, and only the
-// Linq webhook alias tests do either. Their gate has to name that feature as
-// well as `test`, or they are compiled and unused whenever it is off, which
-// `-D warnings` promotes to an error. The buffer itself, and the recording
-// function that fills it, stay on the plain `test` gate because the chat
-// dispatch path writes to them unconditionally.
-#[cfg(all(test, feature = "channel-linq"))]
+// The four items below serialize and read the capture buffer. Their gate has
+// to name the webhook features whose tests use them as well as `test`, or they
+// are compiled and unused whenever both are off, which `-D warnings` promotes
+// to an error. The buffer itself, and the recording function that fills it,
+// stay on the plain `test` gate because the chat dispatch path writes to them
+// unconditionally.
+#[cfg(all(
+    test,
+    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+))]
 static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(all(
+    test,
+    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+))]
 async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
     GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
 }
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(all(
+    test,
+    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+))]
 fn clear_gateway_chat_dispatch_captures_for_test() {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -2580,7 +2589,10 @@ fn clear_gateway_chat_dispatch_captures_for_test() {
         .clear();
 }
 
-#[cfg(all(test, feature = "channel-linq"))]
+#[cfg(all(
+    test,
+    any(feature = "channel-linq", feature = "channel-whatsapp-cloud")
+))]
 fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
     GATEWAY_CHAT_DISPATCH_CAPTURES
         .lock()
@@ -3364,19 +3376,25 @@ async fn process_whatsapp_message(
 
     // Route approval replies to pending approval requests before dispatching
     // to the agent.
-    let mut approvals = wa.pending_approvals().lock().await;
-    verified.retain(|msg| {
+    let mut handled_approval_messages = std::collections::HashSet::new();
+    for msg in verified.messages() {
         let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
         else {
-            return true;
+            continue;
         };
-        let Some(sender) = approvals.remove(&token) else {
-            return true;
-        };
-        let _ = sender.send(response);
-        false
-    });
-    drop(approvals);
+        if wa
+            .resolve_pending_approval(
+                &token,
+                response,
+                msg.sender.as_str(),
+                msg.reply_target.as_str(),
+            )
+            .await
+        {
+            handled_approval_messages.insert(msg.id.clone());
+        }
+    }
+    verified.retain(|msg| !handled_approval_messages.contains(&msg.id));
 
     let channel: Arc<dyn Channel> = wa.clone();
     webhook_ingress::dispatch_verified_webhook(
@@ -9728,6 +9746,19 @@ path = "{trigger_path}"
             "access-token".into(),
             "phone-number-id".into(),
             verify_token.into(),
+            alias,
+            peer_resolver,
+        ))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_instance_allowing_all(alias: &str, verify_token: &str) -> Arc<WhatsAppChannel> {
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        Arc::new(WhatsAppChannel::new(
+            "access-token".into(),
+            "phone-number-id".into(),
+            verify_token.into(),
             alias.to_string(),
             peer_resolver,
         ))
@@ -9740,6 +9771,36 @@ path = "{trigger_path}"
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_webhook_body(sender: &str, text: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": sender,
+                            "timestamp": "1700000000",
+                            "type": "text",
+                            "text": { "body": text }
+                        }]
+                    }
+                }]
+            }]
+        }))
+        .expect("WhatsApp test payload must serialize")
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    fn whatsapp_signed_headers(secret: &str, body: &[u8]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Hub-Signature-256",
+            HeaderValue::from_str(&whatsapp_signature(secret, body)).unwrap(),
+        );
+        headers
     }
 
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -9873,6 +9934,109 @@ path = "{trigger_path}"
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn authenticated_webhook_binds_approval_to_alias_responder_and_destination() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        const SECRET: &str = "app-secret";
+        const TOKEN: &str = "gw1024";
+        const APPROVER: &str = "+15551234567";
+        const APPROVER_WEBHOOK: &str = "15551234567";
+
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([
+            (
+                "work".to_string(),
+                whatsapp_instance_allowing_all("work", "tok-work"),
+            ),
+            (
+                "personal".to_string(),
+                whatsapp_instance_allowing_all("personal", "tok-personal"),
+            ),
+        ]);
+        state.whatsapp_app_secret = HashMap::from([
+            ("work".to_string(), Arc::<str>::from(SECRET)),
+            ("personal".to_string(), Arc::<str>::from(SECRET)),
+        ]);
+
+        let mut decision = zeroclaw_channels::whatsapp::register_pending_approval_for_test(
+            TOKEN, "work", APPROVER,
+        )
+        .await;
+
+        let wrong_alias = whatsapp_webhook_body(APPROVER_WEBHOOK, &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("personal".to_string()),
+            whatsapp_signed_headers(SECRET, &wrong_alias),
+            Bytes::from(wrong_alias),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let wrong_responder = whatsapp_webhook_body("15557654321", &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &wrong_responder),
+            Bytes::from(wrong_responder),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(matches!(decision.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let correct = whatsapp_webhook_body(APPROVER_WEBHOOK, &format!("{TOKEN} approve"));
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state.clone()),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &correct),
+            Bytes::from(correct),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(decision.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .all(|capture| !capture.message.contains(TOKEN))
+        );
+
+        let ordinary_text = "continue with the ordinary request";
+        let ordinary = whatsapp_webhook_body(APPROVER_WEBHOOK, ordinary_text);
+        let response = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            whatsapp_signed_headers(SECRET, &ordinary),
+            Bytes::from(ordinary),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            gateway_chat_dispatch_captures_for_test()
+                .iter()
+                .filter(|capture| capture.message == ordinary_text)
+                .count(),
+            1,
+            "a non-approval message must still dispatch through the gateway"
+        );
     }
 
     /// Fail closed. A configured alias with no app secret cannot verify
