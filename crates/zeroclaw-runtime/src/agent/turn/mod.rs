@@ -1067,6 +1067,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let fallback =
                 crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
             accumulated_display_text.push_str(&fallback);
+            // The fallback is synthesized here, never streamed live, and is the
+            // turn's only visible output on this exit: an event consumer that
+            // already flushed streamed narration would otherwise hide the
+            // TurnComplete payload. Same rationale as the max-iteration emit.
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &fallback).await;
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
@@ -1165,20 +1170,33 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
+            let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
+            // If narration wasn't streamed live, send the unforwarded remainder
+            // now as a post-hoc Chunk. Gated on event_tx independently of
+            // on_delta (never nested — §8.4). The native-tool-calls condition
+            // is parity with the on_delta relay below: text-parsed tool calls
+            // have their markup stripped from display, so only native
+            // providers carry separable narration. Loosen both together if a
+            // parsed-tool provider is ever shown to leave visible narration.
+            if !remainder.is_empty()
+                && !response_streamed_live
+                && !protocol_suppressed
+                && !native_tool_calls.is_empty()
+            {
+                events::emit_posthoc_turn_chunk(event_tx.as_ref(), remainder).await;
+            }
             // `protocol_suppressed` withholds the whole turn; the empty-remainder
             // skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
+                && !remainder.is_empty()
                 && let Some(ref tx) = on_delta
             {
-                let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
-                if !remainder.is_empty() {
-                    let mut narration = remainder.to_string();
-                    if !narration.ends_with('\n') {
-                        narration.push('\n');
-                    }
-                    let _ = tx.send(StreamDelta::Text(narration)).await;
+                let mut narration = remainder.to_string();
+                if !narration.ends_with('\n') {
+                    narration.push('\n');
                 }
+                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 eprint!("{display_text}");

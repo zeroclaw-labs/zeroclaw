@@ -2115,3 +2115,519 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
         "model-supplied approved=true must be stripped even with no approval gate"
     );
 }
+
+// ── seam: pre-tool narration must reach event consumers in order ────────
+// ACP and other event-driven channels render message content exclusively
+// from `TurnEvent::Chunk`. Narration that accompanies a tool-call response
+// must be emitted as a Chunk before that round's ToolCall event, or the
+// client drops it and only the text after the last tool call renders.
+
+type StreamScriptItem =
+    zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>;
+
+/// Streams one scripted event list per provider call; the non-streaming
+/// `chat` path answers with a marker so a test that expected the streaming
+/// engine fails loudly instead of silently changing subject.
+struct ScriptedStreamProvider {
+    scripts: parking_lot::Mutex<VecDeque<Vec<StreamScriptItem>>>,
+}
+
+impl ScriptedStreamProvider {
+    fn new(scripts: Vec<Vec<StreamScriptItem>>) -> Self {
+        Self {
+            scripts: parking_lot::Mutex::new(scripts.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for ScriptedStreamProvider {
+    async fn chat_with_system(
+        &self,
+        _: Option<&str>,
+        _: &str,
+        _: &str,
+        _: Option<f64>,
+    ) -> Result<String> {
+        Ok("ok".into())
+    }
+    async fn chat(&self, _: ChatRequest<'_>, _: &str, _: Option<f64>) -> Result<ChatResponse> {
+        Ok(text_response("unexpected non-streamed fallback"))
+    }
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+    fn stream_chat(
+        &self,
+        _: ChatRequest<'_>,
+        _: &str,
+        _: Option<f64>,
+        _: zeroclaw_providers::traits::StreamOptions,
+    ) -> futures_util::stream::BoxStream<'static, StreamScriptItem> {
+        use futures_util::StreamExt as _;
+        let script = self
+            .scripts
+            .lock()
+            .pop_front()
+            .unwrap_or_else(|| vec![Ok(zeroclaw_api::model_provider::StreamEvent::Final)]);
+        futures_util::stream::iter(script).boxed()
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for ScriptedStreamProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ScriptedStreamProvider"
+    }
+}
+
+fn narrated_tool_response(narration: &str, id: &str, name: &str) -> ChatResponse {
+    let mut response = tool_response(vec![tool_call(id, name)]);
+    response.text = Some(narration.into());
+    response
+}
+
+#[tokio::test]
+async fn safety_net_pretool_narration_chunk_precedes_tool_call_events() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            narrated_tool_response("let me check that for you", "tc-1", "echo"),
+            text_response("all done"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("narrate then act", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_narration = events
+        .iter()
+        .position(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .expect("pre-tool narration must be emitted as a Chunk");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("ToolCall event must be emitted");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("ToolResult event must be emitted");
+    let pos_final = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("all done")))
+        .expect("final response text must be emitted as a Chunk");
+
+    assert!(
+        pos_narration < pos_tool_call,
+        "narration Chunk must precede that round's ToolCall event"
+    );
+    assert!(
+        pos_tool_call < pos_tool_result,
+        "ToolCall must precede its ToolResult"
+    );
+    assert!(
+        pos_tool_result < pos_final,
+        "final-round Chunk must follow the ToolResult"
+    );
+    let narration_chunks = events
+        .iter()
+        .filter(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .count();
+    assert_eq!(
+        narration_chunks, 1,
+        "narration must be emitted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_live_streamed_tool_turn_does_not_duplicate_narration_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedStreamProvider::new(vec![
+            vec![
+                text_delta("thinking aloud"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::ToolCall(
+                    tool_call("tc-1", "echo"),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+            vec![
+                text_delta("all done"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("stream narrate then act", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let narration_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("thinking aloud")))
+        .count();
+    assert_eq!(
+        narration_chunks, 1,
+        "live-streamed narration must appear exactly once (no post-hoc duplicate)"
+    );
+    let pos_narration = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("thinking aloud")))
+        .expect("live narration Chunk must be emitted");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("ToolCall event must be emitted");
+    assert!(
+        pos_narration < pos_tool_call,
+        "live narration Chunk must precede that round's ToolCall event"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_protocol_suppressed_tool_turn_emits_no_narration_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    // Round 1 streams visible narration followed by an internal tool-protocol
+    // envelope. The stream text guard withholds the envelope (and everything
+    // after it), so the turn is protocol-suppressed: the withheld bytes must
+    // never surface as a Chunk, and the already-forwarded narration must not
+    // gain a post-hoc duplicate.
+    let mut agent = build_agent(
+        Box::new(ScriptedStreamProvider::new(vec![
+            vec![
+                text_delta("thinking aloud"),
+                text_delta("<tool_call>{\"name\": \"echo\", \"arguments\": {}}</tool_call>"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::ToolCall(
+                    tool_call("tc-1", "echo"),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+            vec![
+                text_delta("all done"),
+                Ok(zeroclaw_api::model_provider::StreamEvent::Final),
+            ],
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("suppressed envelope", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            TurnEvent::Chunk { delta } if delta.contains("tool_call")
+        )),
+        "protocol-suppressed bytes must never surface as a Chunk"
+    );
+    let narration_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("thinking aloud")))
+        .count();
+    assert_eq!(
+        narration_chunks, 1,
+        "protocol-suppressed turn must not duplicate the already-forwarded narration"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_narration_reaches_both_draft_and_event_channels_once() {
+    let exec_count = Arc::new(AtomicUsize::new(0));
+    let provider = ScriptedProvider::new(vec![
+        narrated_tool_response("let me check that for you", "tc-1", "echo"),
+        text_response("all done"),
+    ]);
+    let tools_registry =
+        crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec_count),
+        })]);
+    let mut history = vec![ChatMessage::user("hi")];
+    let (dtx, mut drx) = mpsc::channel(256);
+    let (etx, mut erx) = mpsc::channel(256);
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        parent_agent_alias: None,
+        sop_reassembly: None,
+        exec: crate::agent::loop_::ResolvedAgentExecution {
+            model_access: crate::agent::loop_::ResolvedModelAccess {
+                model_provider: &provider,
+                provider_name: "mock",
+                model: "mock-model",
+                temperature: None,
+            },
+            tools_registry: &tools_registry,
+            observer: &observability::NoopObserver {},
+            silent: true,
+            approval: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            config: None,
+            max_tool_iterations: 5,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 30_000,
+            context_token_budget: 100_000,
+            receipt_generator: None,
+            knobs: &crate::agent::loop_::LoopKnobs::default(),
+        },
+        history: &mut history,
+        channel_name: "cli",
+        channel_reply_target: None,
+        cancellation_token: None,
+        on_delta: Some(dtx),
+        shared_budget: None,
+        channel: None,
+        collected_receipts: None,
+        event_tx: Some(etx),
+        steering: None,
+        new_messages_out: None,
+        image_cache: None,
+        memory: None,
+        ingress: IngressContext::sub_turn(),
+        agent_alias: None,
+        turn_id: &turn_id,
+    })
+    .await
+    .expect("loop should succeed");
+
+    let mut draft_narration = 0;
+    while let Ok(delta) = drx.try_recv() {
+        if let crate::agent::loop_::StreamDelta::Text(t) = &delta
+            && t.contains("let me check that for you")
+        {
+            draft_narration += 1;
+        }
+    }
+    assert_eq!(
+        draft_narration, 1,
+        "draft channel must receive the narration exactly once"
+    );
+
+    let mut event_narration = 0;
+    while let Some(ev) = erx.recv().await {
+        if let TurnEvent::Chunk { delta } = &ev
+            && delta.contains("let me check that for you")
+        {
+            event_narration += 1;
+        }
+    }
+    assert_eq!(
+        event_narration, 1,
+        "event channel must receive the narration exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_terminal_malformed_fallback_reaches_event_consumer_after_tool() {
+    // A narrated valid tool round, then the malformed-protocol retry budget
+    // exhausts. The terminal fallback is the turn's last word on the event
+    // channel: it must be emitted as a Chunk after the ToolResult, because a
+    // client that already flushed streamed narration hides the TurnComplete
+    // payload and would otherwise settle the turn with no explanation.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            narrated_tool_response("let me check that for you", "tc-1", "echo"),
+            text_response(r#"{"toolcalls":[{"call_id":"call_1","arguments":{"value":"X"}}]}"#),
+            text_response(r#"{"toolcalls":[{"call_id":"call_2","arguments":{"value":"Y"}}]}"#),
+            text_response(r#"{"toolcalls":[{"call_id":"call_3","arguments":{"value":"Z"}}]}"#),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("narrate then break", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("turn should end with the safe fallback");
+
+    let fallback_text =
+        crate::i18n::get_english_cli_string_with_args("channel-runtime-malformed-tool-output", &[]);
+    let pos_narration = events
+        .iter()
+        .position(|e| {
+            matches!(e, TurnEvent::Chunk { delta } if delta.contains("let me check that for you"))
+        })
+        .expect("pre-tool narration must be emitted as a Chunk");
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "tc-1"))
+        .expect("the valid tool call must emit its ToolCall event");
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { id, .. } if id == "tc-1"))
+        .expect("the valid tool call must emit its ToolResult event");
+    let pos_fallback = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains(&fallback_text)))
+        .expect("terminal malformed-output fallback must reach the event consumer as a Chunk");
+
+    assert!(
+        pos_narration < pos_tool_call,
+        "narration Chunk must precede that round's ToolCall event"
+    );
+    assert!(
+        pos_tool_result < pos_fallback,
+        "the terminal fallback must follow the tool result"
+    );
+    let fallback_chunks = events
+        .iter()
+        .filter(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains(&fallback_text)))
+        .count();
+    assert_eq!(
+        fallback_chunks, 1,
+        "the terminal fallback must be emitted exactly once"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the valid tool round must have executed exactly once"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_text_parsed_tool_call_emits_no_narration_chunk() {
+    // A provider that conveys the tool call inside the text (no native tool
+    // calls): the parser strips the markup, so the display residue is not
+    // separable narration. Parity with the on_delta relay: neither consumer
+    // emits a Chunk for it before the ToolCall event.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![
+            text_response(
+                "Working on it.<tool_call>{\"name\": \"echo\", \"arguments\": {}}</tool_call>",
+            ),
+            text_response("all done"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })],
+    );
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("markup tool call", tx, None, None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect("streamed turn should succeed");
+
+    let pos_tool_call = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"))
+        .expect("the text-parsed tool call must emit its ToolCall event");
+    assert!(
+        !events[..pos_tool_call]
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { .. })),
+        "no narration Chunk may precede the ToolCall event for a text-parsed call"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("Working on it."))),
+        "the markup-stripped residue must not surface as a narration Chunk"
+    );
+    let pos_tool_result = events
+        .iter()
+        .position(|e| matches!(e, TurnEvent::ToolResult { name, .. } if name == "echo"))
+        .expect("the text-parsed tool call must emit its ToolResult event");
+    let pos_final = events
+        .iter()
+        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("all done")))
+        .expect("final response text must be emitted as a Chunk");
+    assert!(
+        pos_tool_result < pos_final,
+        "final-round Chunk must follow the ToolResult"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the text-parsed tool call must have executed exactly once"
+    );
+}
