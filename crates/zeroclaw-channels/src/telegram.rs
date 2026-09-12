@@ -2245,7 +2245,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             &suggested_identity,
         );
 
-        let _ = self.send(&SendMessage::new(notice, &chat_id)).await;
+        let _ = self.send_unauthorized_notice(&notice, &chat_id).await;
 
         // Only offer the `/bind <code>` path while the channel is genuinely
         // unpaired. Once peers exist (resolved live), the one-time code is
@@ -2253,12 +2253,23 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // someone — the "already assigned but still asks" complaint.
         if startup_pairing_available {
             let _ = self
-                .send(&SendMessage::new(
+                .send_unauthorized_notice(
                     "ℹ️ If the operator provides a one-time pairing code, you can also run `/bind <code>`.",
                     &chat_id,
-                ))
+                )
                 .await;
         }
+    }
+
+    /// Deliver the unauthorized notice, or its `/bind` hint, as text only.
+    ///
+    /// The notice is catalogue or operator copy, not agent output, so it
+    /// skips the voice routing and attachment interpretation in `send`: a
+    /// configured support URL ending in `.pdf`, a literal attachment marker,
+    /// or a voice-peer chat still receives the notice as `sendMessage` text.
+    /// Formatting and chunking stay those of every other text reply.
+    async fn send_unauthorized_notice(&self, notice: &str, chat_id: &str) -> anyhow::Result<()> {
+        self.send_text_chunks(notice, chat_id, None).await
     }
 
     /// Get the file path for a Telegram file ID via the Bot API.
@@ -6399,6 +6410,114 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// Run one unauthorized text update through a peer-resolving channel
+    /// configured with `unauthorized_message`, and return the path of every
+    /// Bot API request it emitted alongside the `sendMessage` texts.
+    async fn unauthorized_notice_requests(
+        configured_message: &str,
+        voice_peers: Vec<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {}})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some(configured_message.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["zeroclaw_user".to_string()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_persistence(Arc::new(RwLock::new(config)))
+        .with_voice_peer_resolver(Arc::new(move || voice_peers.clone()));
+
+        ch.handle_unauthorized_message(&telegram_text_update(
+            7_000,
+            50,
+            3_030,
+            "zeroclaw_unauthorized",
+            "hello",
+        ))
+        .await;
+
+        let paths = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        (paths, telegram_sent_message_texts(&mock_server).await)
+    }
+
+    fn assert_notice_sent_as_text_only(paths: &[String], texts: &[String], expected: &str) {
+        assert!(
+            paths.iter().all(|path| path.ends_with("/sendMessage")),
+            "the notice must not reach a media or voice method, got: {paths:?}"
+        );
+        assert_eq!(texts.len(), 1, "expected one notice, got: {texts:?}");
+        assert!(
+            texts[0].contains(expected),
+            "the notice must carry the configured text, got: {texts:?}"
+        );
+    }
+
+    /// A standalone document URL is support copy here, not a `sendDocument`
+    /// instruction.
+    #[tokio::test]
+    async fn unauthorized_notice_keeps_standalone_pdf_url_as_text() {
+        let (paths, texts) =
+            unauthorized_notice_requests("https://support.example/access.pdf", Vec::new()).await;
+        assert_notice_sent_as_text_only(&paths, &texts, "https://support.example/access.pdf");
+    }
+
+    /// A literal attachment marker is delivered verbatim, not parsed into
+    /// an upload.
+    #[tokio::test]
+    async fn unauthorized_notice_keeps_attachment_marker_as_text() {
+        let (paths, texts) = unauthorized_notice_requests(
+            "Access guide: [DOCUMENT:https://support.example/access.pdf]",
+            Vec::new(),
+        )
+        .await;
+        assert_notice_sent_as_text_only(
+            &paths,
+            &texts,
+            "[DOCUMENT:https://support.example/access.pdf]",
+        );
+    }
+
+    /// A chat in a voice-output peer group still receives the notice as
+    /// text: voice routing is for agent replies, and would otherwise
+    /// suppress the text entirely.
+    #[tokio::test]
+    async fn unauthorized_notice_ignores_voice_peer_routing() {
+        let (paths, texts) = unauthorized_notice_requests(
+            "Ask support to authorize {identity}.",
+            vec!["3030".to_string()],
+        )
+        .await;
+        assert_notice_sent_as_text_only(&paths, &texts, "Ask support to authorize 100050.");
     }
 
     /// Pairing state is a live reading, not the guard's lifetime. `try_pair`

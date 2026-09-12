@@ -149,10 +149,13 @@ Ask our support team to release access for {identity}.
 
 `{identity}` expands to the sender's Telegram user ID, or the username when no
 ID is available; `{bind_command}` expands to the bind command for this alias.
-Unset or blank keeps the built-in notice. Like every other channel field, an
-edit reaches a running listener on the terms in [Restart and persistence
-behavior](#restart-and-persistence-behavior) below: a `config.toml` edit or a
-`zeroclaw config set` change applies after a daemon reload or process restart.
+Unset or blank keeps the built-in notice. The notice is always sent as a text
+message: a URL, a file path, or an attachment marker in it reaches the sender
+as written, never as a document or a voice note. Like every other channel
+field, an edit reaches a running listener on the terms in [Restart and
+persistence behavior](#restart-and-persistence-behavior) below: a
+`config.toml` edit or a `zeroclaw config set` change applies after a daemon
+reload or process restart.
 
 ## 4. Start the channel and inspect it
 
@@ -222,9 +225,11 @@ write error before restarting.
 
 ## 6. Bind another user from the operator CLI
 
-An unauthorized user can message the bot to receive a suggested operator
-command containing their numeric ID. Run that command on the ZeroClaw host.
-For the `home` alias it has this form:
+The operator runs `bind-telegram` on the ZeroClaw host with the identity to
+approve. While startup pairing is available, an unauthorized user who messages
+the bot receives this command with their numeric ID filled in. Once any peer
+resolves, the built-in notice names that ID instead, and the operator composes
+the command. For the `home` alias it has this form:
 
 ```sh
 zeroclaw channel bind-telegram 111111111 --alias home
