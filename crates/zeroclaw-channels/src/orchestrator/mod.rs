@@ -7603,6 +7603,9 @@ async fn process_channel_message_body(
                             model_provider.as_ref(),
                             &model,
                             temperature,
+                            // A channel peer's message: the user text is a
+                            // person's own words.
+                            zeroclaw_api::ingress::TurnOrigin::Channel,
                         )
                         .await
                     {
