@@ -149,6 +149,10 @@ impl SqliteSessionBackend {
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
             ),
+            (
+                "trim_breadcrumb",
+                "ALTER TABLE session_metadata ADD COLUMN trim_breadcrumb INTEGER",
+            ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
         }
@@ -217,6 +221,41 @@ impl SqliteSessionBackend {
                 last_activity = excluded.last_activity,
                 message_count = message_count + 1",
             params![session_key, now, now],
+        )?;
+        Ok(())
+    }
+
+    fn rewrite_messages_on(
+        conn: &Connection,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for message in messages {
+            Self::append_on(conn, session_key, message, &now)?;
+        }
+        conn.execute(
+            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
+            params![session_key, messages.len() as i64],
+        )?;
+        Ok(())
+    }
+
+    fn set_session_trim_breadcrumb_on(
+        conn: &Connection,
+        session_key: &str,
+        present: bool,
+    ) -> rusqlite::Result<()> {
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, trim_breadcrumb)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET trim_breadcrumb = excluded.trim_breadcrumb",
+            params![session_key, now, now, i64::from(present)],
         )?;
         Ok(())
     }
@@ -665,11 +704,26 @@ impl SqliteSessionBackend {
                 if inserted == 0 && has_non_whitespace_source {
                     bail!("JSONL session {name} contains no valid messages to import");
                 }
+                // Carry the JSONL sidecar's explicit breadcrumb provenance
+                // into the same transaction as the messages it describes,
+                // so a backend switch cannot drop a recorded `true`/`false`
+                // and let a later restore fall back to inferring ownership
+                // from message text.
+                let trim_breadcrumb =
+                    match std::fs::read(sessions_dir.join(format!("{key}.trim_breadcrumb"))) {
+                        Ok(bytes) => Some(bytes.first() == Some(&b'1')),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "Failed to read trim breadcrumb sidecar for JSONL session {name}"
+                            )));
+                        }
+                    };
                 tx.execute(
                     "INSERT INTO session_metadata \
-                     (session_key, created_at, last_activity, message_count) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![key, now, now, inserted],
+                     (session_key, created_at, last_activity, message_count, trim_breadcrumb) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key, now, now, inserted, trim_breadcrumb.map(i64::from)],
                 )
                 .with_context(|| format!("Failed to record metadata for JSONL session {name}"))?;
                 tx.execute(
@@ -820,6 +874,36 @@ impl SessionBackend for SqliteSessionBackend {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+    }
+
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Replace the transcript and the breadcrumb flag in one transaction, so
+    /// the pair can never commit as a partial write: a crash or error
+    /// between the two rolls the whole transaction back rather than leaving
+    /// a new transcript paired with a stale flag (or vice versa). The
+    /// default `SessionBackend::replace_conversation_state` performs these
+    /// as two separate committed operations; this override replaces it for
+    /// SQLite where a single transaction can make the pair atomic.
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
+            .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -992,13 +1076,15 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = conn.changes() as usize;
 
-        if count > 0 {
-            conn.execute(
-                "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
-                params![Utc::now().to_rfc3339(), session_key],
-            )
-            .map_err(std::io::Error::other)?;
-        }
+        // Reset trim_breadcrumb to NULL (unrecorded) regardless of whether
+        // any rows were deleted: a reset transcript has no synthetic marker,
+        // and a stale recorded `true` on an already-empty session must not
+        // survive to misclassify the next first message.
+        conn.execute(
+            "UPDATE session_metadata SET message_count = 0, last_activity = ?1, trim_breadcrumb = NULL WHERE session_key = ?2",
+            params![Utc::now().to_rfc3339(), session_key],
+        )
+        .map_err(std::io::Error::other)?;
 
         Ok(count)
     }
@@ -1391,6 +1477,26 @@ impl SessionBackend for SqliteSessionBackend {
         })
     }
 
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        Self::set_session_trim_breadcrumb_on(&conn, session_key, present)
+            .map_err(std::io::Error::other)
+    }
+
+    fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT trim_breadcrumb FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
+        .map(|v| v.map(|n| n != 0))
+    }
+
     fn set_session_context(
         &self,
         session_key: &str,
@@ -1646,6 +1752,42 @@ mod tests {
     }
 
     #[test]
+    fn clear_messages_resets_trim_breadcrumb() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(true)
+        );
+
+        backend.clear_messages("s1").unwrap();
+
+        // A reset session has no synthetic marker; the recorded flag must
+        // not survive as a stale `true` for the next first message.
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_resets_trim_breadcrumb_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        backend.clear_messages("s1").unwrap();
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+
+        // Clearing an already-empty session must not leave a stale flag
+        // behind either.
+        backend.set_session_trim_breadcrumb("s1", true).unwrap();
+        assert_eq!(backend.clear_messages("s1").unwrap(), 0);
+        assert_eq!(backend.get_session_trim_breadcrumb("s1").unwrap(), None);
+    }
+
+    #[test]
     fn delete_session_removes_all_data() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -1709,6 +1851,57 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn migrate_from_jsonl_preserves_explicit_trim_breadcrumb() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // A genuine user message that happens to equal the canonical
+        // breadcrumb text, but was explicitly recorded as `false` in JSONL —
+        // the case where an inferring migration would misclassify it.
+        std::fs::write(
+            sessions_dir.join("false_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"[earlier turns omitted to fit the context window]\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("false_case.trim_breadcrumb"), b"0").unwrap();
+
+        std::fs::write(
+            sessions_dir.join("true_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        std::fs::write(sessions_dir.join("true_case.trim_breadcrumb"), b"1").unwrap();
+
+        std::fs::write(
+            sessions_dir.join("unrecorded_case.jsonl"),
+            "{\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let migrated = backend.migrate_from_jsonl(tmp.path()).unwrap();
+        assert_eq!(migrated, 3);
+
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("false_case").unwrap(),
+            Some(false),
+            "an explicit false must survive the backend switch despite the text collision"
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("true_case").unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            backend
+                .get_session_trim_breadcrumb("unrecorded_case")
+                .unwrap(),
+            None,
+            "genuinely unrecorded legacy state must stay NULL, not become an inferred value"
+        );
     }
 
     #[test]
@@ -2806,5 +2999,51 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+
+    #[test]
+    fn replace_conversation_state_is_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend
+            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .unwrap();
+        backend.set_session_trim_breadcrumb("s1", false).unwrap();
+
+        // A trigger that fails the breadcrumb half of the write, so the call
+        // has to roll back the transcript half too if it is truly one
+        // transaction rather than two committed statements.
+        {
+            let conn = backend.conn.lock();
+            conn.execute_batch(
+                "CREATE TRIGGER poison_trim_breadcrumb
+                 BEFORE UPDATE OF trim_breadcrumb ON session_metadata
+                 WHEN NEW.session_key = 's1'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated breadcrumb write failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let result = backend.replace_conversation_state(
+            "s1",
+            &[ChatMessage::user(
+                "replacement turn that must not land alone",
+            )],
+            true,
+        );
+        assert!(result.is_err(), "the poisoned trigger must fail the call");
+
+        // The transcript half must have rolled back with the breadcrumb
+        // half, not landed as a new transcript paired with the old flag.
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.get_session_trim_breadcrumb("s1").unwrap(),
+            Some(false)
+        );
     }
 }

@@ -1082,6 +1082,15 @@ impl AcpServer {
                 !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
             })
             .collect();
+        // Breadcrumb provenance is the store's own canonical record alongside
+        // the transcript, never inferred from message text: a genuine first
+        // user turn that happens to equal the localized breadcrumb string
+        // must keep its turn-boundary role. Set it BEFORE seeding: seeding
+        // trims immediately if the restored transcript is over the
+        // structured cap, and that seed-time trim reads the agent's current
+        // breadcrumb flag to decide whether a leading synthetic marker
+        // counts as a real turn.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event =
             agent.seed_conversation_history_with_event(stored_messages.clone());
         let dropped_messages = match &restore_trim_event {
@@ -1289,6 +1298,15 @@ impl AcpServer {
             }
         };
 
+        // Breadcrumb provenance is the store's own canonical record alongside
+        // the transcript, never inferred from message text: a genuine first
+        // user turn that happens to equal the localized breadcrumb string
+        // must keep its turn-boundary role. Set it BEFORE seeding: seeding
+        // trims immediately if the restored transcript is over the
+        // structured cap, and that seed-time trim reads the agent's current
+        // breadcrumb flag to decide whether a leading synthetic marker
+        // counts as a real turn.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
 
         let acp_channel = Arc::new(AcpChannel::new(
@@ -1543,6 +1561,9 @@ impl AcpServer {
         // concurrent stop/reap from touching the agent mid-turn. The outer
         // map entry remains in place.
         let session_id_for_task = session_id.clone();
+        // Kept alive for the post-turn breadcrumb-provenance persistence
+        // below, after `session_arc` itself moves into the spawned task.
+        let session_arc_for_breadcrumb = session_arc.clone();
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
@@ -1687,6 +1708,42 @@ impl AcpServer {
         };
 
         if was_cancelled {
+            // Persist the authoritative trimmed history even for cooperative/
+            // hard cancellations that occurred after the loop trimmed. The
+            // cancelled delta is empty, so a delta-append would leave the
+            // durable store with the pre-trim transcript.
+            if let Some(store) = &self.store {
+                let store = store.clone();
+                let sid = session_id.clone();
+                let (full_history, crumb_present) = {
+                    let session = session_arc_for_breadcrumb.lock().await;
+                    (
+                        session.agent.history().to_vec(),
+                        session.agent.history_has_trim_breadcrumb(),
+                    )
+                };
+                let persisted = tokio::task::spawn_blocking(move || {
+                    // One transaction covers the transcript and its
+                    // breadcrumb flag together, so a crash between two
+                    // separate writes cannot desynchronize them.
+                    store.replace_messages_and_breadcrumb(&sid, &full_history, crumb_present)
+                })
+                .await;
+                if let Some(detail) = match persisted {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(join) => Some(join.to_string()),
+                } {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": detail })),
+                        "Failed to persist cancelled turn; session continues in memory"
+                    );
+                }
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -1702,29 +1759,82 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
+        // Persist authoritative state even for failures that happened after a
+        // trim. The error delta may be empty, but the live agent has already
+        // dropped turns.
+        if turn_result.is_err()
+            && let Some(store) = &self.store
+        {
+                let store = store.clone();
+                let sid = session_id.clone();
+                let (full_history, crumb_present) = {
+                    let session = session_arc_for_breadcrumb.lock().await;
+                    (
+                        session.agent.history().to_vec(),
+                        session.agent.history_has_trim_breadcrumb(),
+                    )
+                };
+                let persisted = tokio::task::spawn_blocking(move || {
+                    // One transaction covers the transcript and its
+                    // breadcrumb flag together, so a crash between two
+                    // separate writes cannot desynchronize them.
+                    store.replace_messages_and_breadcrumb(&sid, &full_history, crumb_present)
+                })
+                .await;
+                if let Some(detail) = match persisted {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(join) => Some(join.to_string()),
+                } {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": detail })),
+                        "Failed to persist failed turn; session continues in memory"
+                    );
+                }
+            }
+
         let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
             let (diagnostic, rpc_error) = acp_turn_failure(&e);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error": diagnostic,
-                })),
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": diagnostic,
+                    })),
                 "ACP session/prompt turn failed"
             );
             rpc_error
         })?;
 
-        // Persist new messages on successful, non-cancelled turns.
+        // Replace the durable transcript with the agent's own authoritative
+        // post-turn history and breadcrumb flag, as one state, on
+        // successful, non-cancelled turns. Appending only this turn's delta
+        // on top of a transcript the agent's loop may have already trimmed
+        // underneath it can resurrect turns the live agent dropped.
         if let Some(store) = &self.store
             && !new_turn_msgs.is_empty()
         {
             let store = store.clone();
             let sid = session_id.clone();
-            let msgs = new_turn_msgs;
-            let persisted =
-                tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
+            let (full_history, crumb_present) = {
+                let session = session_arc_for_breadcrumb.lock().await;
+                (
+                    session.agent.history().to_vec(),
+                    session.agent.history_has_trim_breadcrumb(),
+                )
+            };
+            let persisted = tokio::task::spawn_blocking(move || {
+                // One transaction covers the transcript and its breadcrumb
+                // flag together, so a crash between two separate writes
+                // cannot desynchronize them.
+                store.replace_messages_and_breadcrumb(&sid, &full_history, crumb_present)
+            })
+            .await;
             let error = match persisted {
                 Ok(Ok(())) => None,
                 Ok(Err(e)) => Some(e.to_string()),
@@ -2465,18 +2575,45 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
             dropped_messages,
             kept_turns,
             reason,
-        } => JsonRpcNotification {
-            jsonrpc: "2.0",
-            // ACP's SessionUpdate union is closed. Custom notifications use
-            // underscore-prefixed methods so clients can safely ignore them.
-            method: "_zeroclaw/history_trimmed",
-            params: serde_json::json!({
+            token_budget,
+            tokens_before,
+            tokens_after,
+            tokens_before_source,
+            tokens_after_source,
+            unsatisfiable_floor,
+        } => {
+            let mut params = serde_json::json!({
                 "sessionId": session_id,
                 "droppedMessages": dropped_messages,
                 "keptTurns": kept_turns,
                 "reason": reason,
-            }),
-        },
+            });
+            if let Some(token_budget) = token_budget {
+                params["tokenBudget"] = (*token_budget).into();
+            }
+            if let Some(tokens_before) = tokens_before {
+                params["tokensBefore"] = (*tokens_before).into();
+            }
+            if let Some(tokens_after) = tokens_after {
+                params["tokensAfter"] = (*tokens_after).into();
+            }
+            if let Some(tokens_before_source) = tokens_before_source {
+                params["tokensBeforeSource"] = tokens_before_source.as_str().into();
+            }
+            if let Some(tokens_after_source) = tokens_after_source {
+                params["tokensAfterSource"] = tokens_after_source.as_str().into();
+            }
+            if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+                params["unsatisfiableFloor"] = (*unsatisfiable_floor).into();
+            }
+            JsonRpcNotification {
+                jsonrpc: "2.0",
+                // ACP's SessionUpdate union is closed. Custom notifications use
+                // underscore-prefixed methods so clients can safely ignore them.
+                method: "_zeroclaw/history_trimmed",
+                params,
+            }
+        }
         TurnEvent::Plan { entries } => JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",
@@ -4481,6 +4618,12 @@ mod tests {
                 dropped_messages: 12,
                 kept_turns: 3,
                 reason: "message limit".to_string(),
+                token_budget: Some(500_000),
+                tokens_before: Some(612_000),
+                tokens_after: Some(117_000),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                unsatisfiable_floor: None,
             },
         )
         .expect("history trim must produce an ACP notification");
@@ -4494,6 +4637,11 @@ mod tests {
                 "droppedMessages": 12,
                 "keptTurns": 3,
                 "reason": "message limit",
+                "tokenBudget": 500_000,
+                "tokensBefore": 612_000,
+                "tokensAfter": 117_000,
+                "tokensBeforeSource": "provider",
+                "tokensAfterSource": "calibrated",
             })
         );
         assert!(value["params"].get("update").is_none());

@@ -61,6 +61,37 @@ impl SessionStore {
             .join(format!("{}.jsonl", sanitize_session_key(session_key)))
     }
 
+    /// Sidecar file recording whether `session_key`'s transcript currently
+    /// starts with the synthetic trim breadcrumb. Kept as a canonical fact
+    /// next to the transcript so restore never has to infer provenance from
+    /// message text.
+    fn trim_breadcrumb_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir.join(format!(
+            "{}.trim_breadcrumb",
+            sanitize_session_key(session_key)
+        ))
+    }
+
+    /// Persist whether the session's transcript starts with the synthetic
+    /// trim breadcrumb. Respects the migration fence: fails if the JSONL
+    /// store has been migrated to SQLite.
+    pub fn set_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        std::fs::write(
+            self.trim_breadcrumb_path(session_key),
+            if present { b"1" as &[u8] } else { b"0" },
+        )
+    }
+
+    /// Read the persisted breadcrumb flag. `None` if never recorded.
+    pub fn get_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        match std::fs::read(self.trim_breadcrumb_path(session_key)) {
+            Ok(bytes) => Ok(Some(bytes.first() == Some(&b'1'))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the path is not a regular JSONL session file or
     /// the file is unreadable.
@@ -199,8 +230,17 @@ impl SessionStore {
 
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
+    /// Also removes the breadcrumb sidecar: a reset session has no synthetic
+    /// marker, so a stale recorded `true` must not survive into the next
+    /// first message and be mistaken for a real trim. The sidecar is removed
+    /// even when the transcript is absent or not a regular JSONL file: it is
+    /// independently creatable by `set_trim_breadcrumb`, so a sidecar-only
+    /// state (e.g. after a transcript write failure or a prior cleanup that
+    /// removed the transcript but not its provenance file) must not survive
+    /// a `clear_messages` call and be misread by a later restore.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let _guard = self.mutation_guard()?;
+        let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
         if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
             return Ok(0);
         }
@@ -211,14 +251,22 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a regular session JSONL file. Returns `true` if the file existed.
+    /// Delete a session's JSONL file and its breadcrumb sidecar. Returns
+    /// `true` if either file existed. The sidecar is removed even when the
+    /// transcript file is already absent (or not a regular JSONL session
+    /// file) so stale provenance cannot affect a later session that reuses
+    /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
+        let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
-            return Ok(false);
+            let had_crumb = crumb_path.exists();
+            let _ = std::fs::remove_file(&crumb_path);
+            return Ok(had_crumb);
         }
         std::fs::remove_file(&path)?;
+        let _ = std::fs::remove_file(crumb_path);
         Ok(true)
     }
 
@@ -352,6 +400,55 @@ impl SessionBackend for SessionStore {
         self.remove_last(session_key)
     }
 
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        self.rewrite(session_key, messages)
+    }
+
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        self.set_trim_breadcrumb(session_key, present)
+    }
+
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        // Hold the migration fence across both writes so a concurrent
+        // migration cannot interleave, and the transcript+flag pair is not
+        // observed partially. Two separate files still can't be made
+        // crash-atomic, so on a breadcrumb-write failure this rolls the
+        // transcript back to its pre-replace content instead of leaving a
+        // new transcript paired with a stale flag — a process that dies
+        // between the writes can still leave the pair split, but an
+        // in-process failure converges back to the last known-good state.
+        let _guard = self.mutation_guard()?;
+        let previous_messages = self.load(session_key);
+        self.rewrite(session_key, messages)?;
+        let breadcrumb_write = std::fs::write(
+            self.trim_breadcrumb_path(session_key),
+            if breadcrumb_present {
+                b"1" as &[u8]
+            } else {
+                b"0"
+            },
+        );
+        if let Err(e) = breadcrumb_write {
+            // Best-effort: if this rewrite also fails, the transcript is left
+            // at the new value with the stale flag, and the caller must
+            // reconcile by reloading both files rather than trusting either
+            // write succeeded.
+            let _ = self.rewrite(session_key, &previous_messages);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        self.get_trim_breadcrumb(session_key)
+    }
+
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         self.update_last(session_key, message)
     }
@@ -468,6 +565,41 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi there");
+    }
+
+    #[test]
+    fn trim_breadcrumb_round_trips_and_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), None);
+
+        store.set_trim_breadcrumb("chan_user", true).unwrap();
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), Some(true));
+
+        // A fresh store instance simulates a process restart: the flag must
+        // be a durable fact, not held only in an in-process cache.
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.get_trim_breadcrumb("chan_user").unwrap(),
+            Some(true)
+        );
+
+        store.set_trim_breadcrumb("chan_user", false).unwrap();
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), Some(false));
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_breadcrumb_flag() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        store.append("chan_user", &ChatMessage::user("hi")).unwrap();
+        store.set_trim_breadcrumb("chan_user", true).unwrap();
+
+        store.delete_session("chan_user").unwrap();
+
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), None);
     }
 
     #[test]
@@ -889,6 +1021,70 @@ mod tests {
     }
 
     #[test]
+    fn clear_messages_removes_trim_breadcrumb_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "crumb_reset_test";
+
+        store.append(key, &ChatMessage::user("hello")).unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), Some(true));
+
+        store.clear_messages(key).unwrap();
+
+        // A reset session has no synthetic marker; the recorded flag must
+        // not survive as a stale `true` for the next first message.
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_removes_stale_sidecar_even_when_already_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "already_empty_crumb_test";
+
+        store.append(key, &ChatMessage::user("hello")).unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        store.clear_messages(key).unwrap();
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+
+        // Clearing an already-empty session must not leave a stale flag
+        // behind either.
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert_eq!(store.clear_messages(key).unwrap(), 0);
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_messages_removes_sidecar_only_breadcrumb_with_no_transcript_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "sidecar_only_crumb_test";
+
+        // No transcript file exists at all for this key (e.g. after a prior
+        // cleanup removed the transcript but not its sidecar), yet the
+        // sidecar is independently creatable.
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert!(!is_regular_jsonl_session_file(&store.session_path(key)));
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), Some(true));
+
+        assert_eq!(store.clear_messages(key).unwrap(), 0);
+        assert_eq!(
+            store.get_trim_breadcrumb(key).unwrap(),
+            None,
+            "a sidecar-only breadcrumb must not survive clear_messages just because \
+             there was no transcript file to early-return past"
+        );
+
+        // A session that later receives its first message must not inherit
+        // the stale flag and misclassify that message as post-trim.
+        store
+            .append(key, &ChatMessage::user("first message"))
+            .unwrap();
+        assert_eq!(store.get_trim_breadcrumb(key).unwrap(), None);
+    }
+
+    #[test]
     fn delete_session_removes_jsonl_file() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
@@ -973,5 +1169,42 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    #[test]
+    fn replace_conversation_state_rolls_back_transcript_when_breadcrumb_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .unwrap();
+        backend.set_session_trim_breadcrumb("s1", false).unwrap();
+
+        // Force the breadcrumb half of the write to fail by occupying its
+        // path with a directory: `fs::write` errors instead of replacing it.
+        let breadcrumb_path = store.trim_breadcrumb_path("s1");
+        std::fs::remove_file(&breadcrumb_path).unwrap();
+        std::fs::create_dir(&breadcrumb_path).unwrap();
+
+        let result = backend.replace_conversation_state(
+            "s1",
+            &[ChatMessage::user(
+                "replacement turn that must not land alone",
+            )],
+            true,
+        );
+        assert!(
+            result.is_err(),
+            "the poisoned breadcrumb path must fail the call"
+        );
+
+        // The transcript must have rolled back to its pre-replace content,
+        // not the replacement that could never be paired with a committed
+        // flag.
+        let messages = backend.load("s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "pre-replace turn");
     }
 }
