@@ -243,6 +243,24 @@ async fn enforce_reported_budget(
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
 ) {
+    // The provider's own count of what the last request cost. Nothing else
+    // records it, so an operator sizing `max_context_tokens` has to infer the
+    // real peak from prompt reconstruction — which silently answers a
+    // different question, because it cannot see the trimming this function
+    // already applied. Emitted on every response, over budget or not, so the
+    // distribution is observable and not just the overruns.
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "reported_input_tokens": reported_input_tokens,
+                "context_token_budget": context_token_budget,
+                "over_budget": context_token_budget > 0
+                    && reported_input_tokens > context_token_budget,
+            })),
+        "context_usage"
+    );
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
         return;
     }
@@ -253,6 +271,21 @@ async fn enforce_reported_budget(
         reported_input_tokens,
     );
     if result.trimmed {
+        // Trimming is lossy and had no log record of its own: the existing
+        // TurnEvent reaches the UI and the observer event reaches telemetry,
+        // but neither lands in the daemon log an operator greps after the fact.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
+                    "reported_input_tokens": reported_input_tokens,
+                    "context_token_budget": context_token_budget,
+                    "dropped_messages": result.dropped_messages,
+                    "kept_turns": result.kept_turns,
+                })),
+            "context_budget_trim: dropped history to fit the reported budget"
+        );
         let mut trimmed = result.history;
         crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
         *history = trimmed;
