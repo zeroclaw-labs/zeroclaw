@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["assemble","build_locales","extract_shared_chrome","inject_lang_switcher_locales","prepare_generated_book_inputs","print_locales","prune_rustdoc_source_view","run","strip_chrome_hash","strip_source_anchors"]};

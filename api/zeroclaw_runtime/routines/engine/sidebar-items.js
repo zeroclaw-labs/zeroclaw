@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RoutineAction","RoutineDispatchResult"],"fn":["load_routines","load_routines_from_file"],"struct":["Routine","RoutinesEngine","RoutinesManifest"]};

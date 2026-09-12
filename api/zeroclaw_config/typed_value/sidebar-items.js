@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["coerce_for_set_prop"]};

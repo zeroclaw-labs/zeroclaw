@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ACP_PROTOCOL_VERSION","JSONRPC_VERSION","OUTBOUND_ID_PREFIX"],"mod":["error_codes","field"],"struct":["JsonRpcError","JsonRpcNotification","JsonRpcRequest","JsonRpcResponse","RpcOutbound"]};

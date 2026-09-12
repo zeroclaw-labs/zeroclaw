@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INITIAL_WINDOW","MAX_CONTROL_FRAME","MAX_DATA_PAYLOAD","MAX_WS_MESSAGE","PEER_HINT_ENROLL","SUBPROTOCOL"],"enum":["Control"],"fn":["decode_data","encode_data"],"struct":["ConnWindow","TokenBucket"]};

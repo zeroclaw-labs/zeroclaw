@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ATTRIBUTION_FIELDS","COMPOSITE_PREFIXES"],"enum":["Action","EventCategory","EventOutcome","Severity"],"fn":["alias_field","is_attribution_field","severity_text_from_number","severity_text_from_tracing_level","type_field"],"struct":["Event","EventDescriptor","LogEvent","ServiceDescriptor","ZeroclawAttribution"]};

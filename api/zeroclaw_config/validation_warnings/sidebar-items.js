@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["VERIFIABLE_INTENT_TOOL_WITHHELD"],"struct":["ValidationWarning"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["launch_command_recorded","record_launch","recorded_launch_executable","request_respawn","request_shutdown","respawn_if_requested","respawn_requested","shutdown_notify"]};

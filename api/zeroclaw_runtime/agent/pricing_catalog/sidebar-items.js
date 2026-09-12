@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["global_pricing_catalog","global_pricing_rates","load_global_pricing_catalog","set_global_pricing_catalog"],"struct":["CatalogModelPrice","GlobalPricingCatalog"]};
