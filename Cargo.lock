@@ -13984,6 +13984,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",
+ "rustls-native-certs 0.8.3",
  "rustls-pki-types",
  "schemars 1.2.1",
  "serde",
