@@ -765,26 +765,49 @@ async fn stdio_child_exit_watcher(
     }
 }
 
+#[derive(Debug)]
 enum BoundedLine {
-    Line(Vec<u8>),
+    /// A single line with its trailing `\r` stripped, plus the exact number of
+    /// raw bytes consumed from the wire to produce it (content, any `\r`, and the
+    /// terminating `\n`). Callers enforcing a raw-byte response cap must count
+    /// `consumed`, not `bytes.len()`: for CRLF framing the stripped line is one
+    /// byte shorter than what the server actually sent, so rebuilding the count
+    /// as `bytes.len() + 1` undercounts every line by the dropped `\r`.
+    Line {
+        bytes: Vec<u8>,
+        consumed: u64,
+    },
     Oversized,
     Eof,
 }
 
-async fn read_bounded_line(
-    reader: &mut BufReader<tokio::process::ChildStdout>,
-) -> std::io::Result<BoundedLine> {
+/// Read one `\n`-terminated line, never allocating more than `limit` bytes.
+///
+/// Generic over any buffered async reader so both the stdio response loop and the
+/// persistent SSE stream reader can bound a single line before it is fully
+/// buffered: a compromised server cannot force an unbounded `String`/`Vec`
+/// allocation with one arbitrarily long unterminated line. When a line exceeds
+/// `limit` the excess is drained to the next newline and `Oversized` is returned,
+/// so the stream resynchronizes rather than tearing down.
+async fn read_bounded_line<R>(reader: &mut R, limit: usize) -> std::io::Result<BoundedLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut line = Vec::new();
     let mut oversized = false;
+    let mut consumed_total: u64 = 0;
     loop {
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
-            return if line.is_empty() {
+            return if line.is_empty() && !oversized {
                 Ok(BoundedLine::Eof)
             } else if oversized {
                 Ok(BoundedLine::Oversized)
             } else {
-                Ok(BoundedLine::Line(line))
+                Ok(BoundedLine::Line {
+                    bytes: line,
+                    consumed: consumed_total,
+                })
             };
         }
 
@@ -792,7 +815,7 @@ async fn read_bounded_line(
         let consumed = newline.map_or(buf.len(), |index| index + 1);
         let content_len = newline.unwrap_or(buf.len());
         if !oversized {
-            if line.len().saturating_add(content_len) > MAX_LINE_BYTES {
+            if line.len().saturating_add(content_len) > limit {
                 oversized = true;
                 line.clear();
             } else {
@@ -800,6 +823,7 @@ async fn read_bounded_line(
             }
         }
         reader.consume(consumed);
+        consumed_total = consumed_total.saturating_add(consumed as u64);
         if newline.is_some() {
             if oversized {
                 return Ok(BoundedLine::Oversized);
@@ -807,9 +831,74 @@ async fn read_bounded_line(
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(BoundedLine::Line(line));
+            return Ok(BoundedLine::Line {
+                bytes: line,
+                consumed: consumed_total,
+            });
         }
     }
+}
+
+/// Base64 encodes 3 decoded bytes as 4 characters, so the largest legal decoded
+/// embedded-blob aggregate expands to this many bytes on the wire, before the
+/// surrounding JSON-RPC envelope. For the documented 10 MiB decoded budget this
+/// is 13,981,016 bytes. Derived from the single source of truth in
+/// [`crate::embedded_resource`] so the two layers cannot drift.
+const MAX_ENCODED_BLOB_BYTES: u64 = crate::embedded_resource::MAX_AGGREGATE_BLOB_BYTES
+    .div_ceil(3)
+    .saturating_mul(4);
+
+/// Headroom above the base64-expanded blob for the JSON-RPC envelope: the
+/// `{"jsonrpc","id","result":{"content":[{"type","resource",...}]}}` scaffolding,
+/// string escaping, and the bounded resource metadata the formatter keeps around
+/// each blob. 2 MiB comfortably covers the fixed framing plus the item-count cap.
+const RESPONSE_ENVELOPE_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Default maximum bytes for a single HTTP/SSE JSON-RPC response body when a
+/// server config does not override `max_response_bytes`.
+///
+/// The materialization stage enforces the *decoded* aggregate blob budget, but
+/// the transport sees *encoded* base64 wrapped in a JSON-RPC envelope. Sizing the
+/// transport cap to the decoded budget (as an earlier revision did) rejected a
+/// valid near-limit blob before the decoded-byte preflight could apply the
+/// documented boundary. The default now admits the base64-expanded blob plus
+/// bounded envelope overhead, so a legal near-limit response reaches
+/// materialization while a genuinely oversized one is still rejected before parse.
+const DEFAULT_MAX_RESPONSE_BYTES: u64 =
+    MAX_ENCODED_BLOB_BYTES.saturating_add(RESPONSE_ENVELOPE_OVERHEAD_BYTES);
+
+fn resolve_max_response_bytes(config: &McpServerConfig) -> u64 {
+    config
+        .max_response_bytes
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
+}
+
+/// Read `resp`'s body as a UTF-8 string, rejecting a body larger than `limit`
+/// bytes at read time — a `Content-Length` fast-reject plus a streaming cap —
+/// instead of buffering the whole body with `resp.text()`. The streaming cap
+/// reads at most `limit + 1` bytes via tokio's own `Take` adapter, so a body
+/// over the cap is detected by length without ever buffering past it and without
+/// a hand-rolled `AsyncRead` that could violate the `read_to_end` contract.
+async fn read_body_bounded_to_string(resp: reqwest::Response, limit: u64) -> Result<String> {
+    if let Some(len) = resp.content_length()
+        && len > limit
+    {
+        anyhow::bail!("MCP response body Content-Length {len} exceeds the {limit}-byte limit");
+    }
+    let stream = resp
+        .bytes_stream()
+        .map(|item| item.map_err(std::io::Error::other));
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let mut bounded = tokio::io::AsyncReadExt::take(reader, limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut bytes)
+        .await
+        .context("failed to read HTTP response")?;
+    if bytes.len() as u64 > limit {
+        anyhow::bail!("MCP response body exceeds the {limit}-byte limit");
+    }
+    String::from_utf8(bytes).context("MCP response body was not valid UTF-8")
 }
 
 fn drain_pending_generation(pending: &PendingMap, generation: u64) {
@@ -876,8 +965,8 @@ async fn stdio_read_loop(
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
-        match read_bounded_line(&mut reader).await {
-            Ok(BoundedLine::Line(line)) => {
+        match read_bounded_line(&mut reader, MAX_LINE_BYTES).await {
+            Ok(BoundedLine::Line { bytes: line, .. }) => {
                 let Ok(response) = serde_json::from_slice::<JsonRpcResponse>(&line) else {
                     continue;
                 };
@@ -1051,6 +1140,9 @@ pub struct HttpTransport {
     /// read timeout. Tool calls use the configured budget when present; when
     /// absent, the client layer's outer tool-call timeout owns the budget.
     tool_timeout_secs: Option<u64>,
+    /// Per-server response-body byte cap, from `McpServerConfig.max_response_bytes`
+    /// (or the built-in default). Enforced at read time before parsing.
+    max_response_bytes: u64,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: ParkingMutex<Option<String>>,
@@ -1084,6 +1176,7 @@ impl HttpTransport {
         Ok(Self {
             url,
             tool_timeout_secs: config.tool_timeout_secs,
+            max_response_bytes: resolve_max_response_bytes(config),
             client,
             headers: config.headers.clone(),
             session_id: ParkingMutex::new(None),
@@ -1202,7 +1295,7 @@ impl SharedMcpTransportConn for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
         if is_sse {
-            let read_response = read_first_jsonrpc_from_sse_response(resp);
+            let read_response = read_first_jsonrpc_from_sse_response(resp, self.max_response_bytes);
             let maybe_resp = if let Some(sse_timeout) =
                 http_sse_read_timeout_secs(request, self.tool_timeout_secs)
             {
@@ -1224,7 +1317,7 @@ impl SharedMcpTransportConn for HttpTransport {
             return finish_response(request, lifecycle, response);
         }
 
-        let resp_text = resp.text().await.context("failed to read HTTP response")?;
+        let resp_text = read_body_bounded_to_string(resp, self.max_response_bytes).await?;
         let response = parse_jsonrpc_response_text(&resp_text)?;
         finish_response(request, lifecycle, response)
     }
@@ -1255,6 +1348,8 @@ pub struct SseTransport {
     sse_url: String,
     server_name: String,
     tool_timeout_secs: Option<u64>,
+    /// Per-server response-body byte cap, enforced at read time before parsing.
+    max_response_bytes: u64,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     require_https: bool,
@@ -1300,6 +1395,7 @@ impl SseTransport {
             sse_url,
             server_name: config.name.clone(),
             tool_timeout_secs: config.tool_timeout_secs,
+            max_response_bytes: resolve_max_response_bytes(config),
             client,
             headers: config.headers.clone(),
             require_https,
@@ -1381,38 +1477,90 @@ impl SseTransport {
         let notify = self.notify.clone();
         let sse_url = self.sse_url.clone();
         let server_name = self.server_name.clone();
+        let max_response_bytes = self.max_response_bytes;
 
         conn.reader_task = Some(zeroclaw_spawn::spawn!(async move {
             let stream = resp
                 .bytes_stream()
                 .map(|item| item.map_err(std::io::Error::other));
             let reader = tokio_util::io::StreamReader::new(stream);
-            let mut lines = BufReader::new(reader).lines();
+            let mut reader = BufReader::new(reader);
+            // Bound each SSE line to the per-server response cap so one
+            // arbitrarily long unterminated `data:` line cannot force an
+            // unbounded allocation before the per-event counter below runs.
+            let line_limit = usize::try_from(max_response_bytes).unwrap_or(usize::MAX);
 
             let mut cur_event: Option<String> = None;
             let mut cur_id: Option<String> = None;
             let mut cur_data: Vec<String> = Vec::new();
+            // Bytes accumulated for the current event's `data:` lines. Reset at
+            // each event boundary. Bounds a single event so a persistent stream
+            // cannot accumulate unbounded event data before dispatch.
+            let mut cur_bytes: u64 = 0;
+            // Once an event is rejected, consume the rest of its lines through
+            // the blank boundary so a valid suffix cannot be dispatched alone.
+            let mut discard_event = false;
 
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => {
                         break;
                     }
-                    line = lines.next_line() => {
-                        let Ok(line_opt) = line else { break; };
-                        let Some(mut line) = line_opt else { break; };
+                    read = read_bounded_line(&mut reader, line_limit) => {
+                        let (raw, consumed) = match read {
+                            Ok(BoundedLine::Line { bytes, consumed }) => (bytes, consumed),
+                            Ok(BoundedLine::Oversized) => {
+                                // A single line already exceeded the response cap.
+                                // Drop the in-flight event and resync at the next
+                                // line rather than buffering the oversized payload.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "mcp_server": &server_name,
+                                            "limit": max_response_bytes,
+                                        })),
+                                    "mcp_transport: dropping oversized SSE line before dispatch"
+                                );
+                                cur_data.clear();
+                                cur_event = None;
+                                cur_id = None;
+                                cur_bytes = 0;
+                                discard_event = true;
+                                continue;
+                            }
+                            Ok(BoundedLine::Eof) | Err(_) => break,
+                        };
+                        // SSE is UTF-8; a non-UTF-8 line is malformed framing.
+                        let Ok(mut line) = String::from_utf8(raw) else {
+                            continue;
+                        };
                         if line.ends_with('\r') {
                             line.pop();
                         }
                         if line.is_empty() {
+                            if discard_event {
+                                cur_data.clear();
+                                cur_event = None;
+                                cur_id = None;
+                                cur_bytes = 0;
+                                discard_event = false;
+                                continue;
+                            }
                             if cur_event.is_none() && cur_id.is_none() && cur_data.is_empty() {
                                 continue;
                             }
                             let event = cur_event.take();
                             let data = cur_data.join("\n");
                             cur_data.clear();
+                            cur_bytes = 0;
                             let id = cur_id.take();
                             handle_sse_event(&server_name, &sse_url, &shared, &pending, &notify, event.as_deref(), id.as_deref(), data).await;
+                            continue;
+                        }
+
+                        if discard_event {
                             continue;
                         }
 
@@ -1425,6 +1573,29 @@ impl SseTransport {
                         }
                         if let Some(rest) = line.strip_prefix("data:") {
                             let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                            // Count the raw bytes consumed from the wire for this
+                            // line (prefix, any CR, and the newline), not the
+                            // CR-stripped payload, so a CRLF-framed event cannot
+                            // exceed the cap while the stripped lengths stay under.
+                            cur_bytes = cur_bytes.saturating_add(consumed);
+                            if cur_bytes > max_response_bytes {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "mcp_server": &server_name,
+                                            "limit": max_response_bytes,
+                                        })),
+                                    "mcp_transport: dropping oversized SSE event data before dispatch"
+                                );
+                                cur_data.clear();
+                                cur_event = None;
+                                cur_id = None;
+                                cur_bytes = 0;
+                                discard_event = true;
+                                continue;
+                            }
                             cur_data.push(rest.to_string());
                         }
                         if let Some(rest) = line.strip_prefix("id:") {
@@ -1673,21 +1844,54 @@ fn looks_like_sse_text(text: &str) -> bool {
 
 async fn read_first_jsonrpc_from_sse_response(
     resp: reqwest::Response,
+    limit: u64,
 ) -> Result<Option<JsonRpcResponse>> {
+    if let Some(len) = resp.content_length()
+        && len > limit
+    {
+        anyhow::bail!("MCP SSE response Content-Length {len} exceeds the {limit}-byte limit");
+    }
     let stream = resp
         .bytes_stream()
         .map(|item| item.map_err(std::io::Error::other));
+    // Read the SSE reply incrementally and return as soon as the first complete
+    // `message` event parses, rather than buffering to EOF. A compliant server
+    // may hold the SSE connection open for subsequent traffic after the response
+    // event, so waiting for EOF would stall a successful `tools/call` until the
+    // request/idle timeout. The byte total is still bounded at read time (each
+    // line via `read_bounded_line`, and the running total below) so an over-cap
+    // reply is rejected before any JSON parse.
     let reader = tokio_util::io::StreamReader::new(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let line_limit = usize::try_from(limit).unwrap_or(usize::MAX);
 
     let mut cur_event: Option<String> = None;
     let mut cur_data: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
 
-    while let Ok(line_opt) = lines.next_line().await {
-        let Some(mut line) = line_opt else { break };
+    loop {
+        let (raw, consumed) = match read_bounded_line(&mut reader, line_limit).await {
+            Ok(BoundedLine::Line { bytes, consumed }) => (bytes, consumed),
+            Ok(BoundedLine::Oversized) => {
+                anyhow::bail!("MCP SSE response body exceeds the {limit}-byte limit");
+            }
+            Ok(BoundedLine::Eof) => break,
+            Err(e) => return Err(anyhow::Error::new(e).context("failed to read MCP SSE response")),
+        };
+        // Count the raw consumed wire bytes (including any stripped `\r` and the
+        // `\n`), not the CR-stripped line, so a CRLF-delimited body cannot exceed
+        // the cap while every stripped line length stays under it.
+        total_bytes = total_bytes.saturating_add(consumed);
+        if total_bytes > limit {
+            anyhow::bail!("MCP SSE response body exceeds the {limit}-byte limit");
+        }
+        // `read_bounded_line` already strips a trailing `\r` for newline-delimited
+        // lines; the guard covers the final unterminated line at EOF.
+        let mut line = String::from_utf8_lossy(&raw).into_owned();
         if line.ends_with('\r') {
             line.pop();
         }
+
         if line.is_empty() {
             if cur_event.is_none() && cur_data.is_empty() {
                 continue;
@@ -1844,9 +2048,15 @@ impl SharedMcpTransportConn for SseTransport {
                     .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
 
                 if is_sse {
-                    got_direct = read_first_jsonrpc_from_sse_response(resp).await?;
+                    got_direct =
+                        read_first_jsonrpc_from_sse_response(resp, self.max_response_bytes).await?;
                 } else {
-                    let text = resp.text().await.unwrap_or_default();
+                    // Propagate a size-limit / read failure instead of masking it
+                    // as an empty body: swallowing it here would drop the request
+                    // onto the persistent stream wait forever. A genuinely empty
+                    // successful body still yields "" and falls through to the
+                    // stream, preserving the intentional async-delivery fallback.
+                    let text = read_body_bounded_to_string(resp, self.max_response_bytes).await?;
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
                         let json_str =
@@ -2607,7 +2817,18 @@ mod tests {
         let error = HttpTransport::new(&config)
             .err()
             .expect("a directory must not be read as a CA bundle");
-        assert!(error.to_string().contains("must name a regular file"));
+        // The directory is refused by whichever layer sees it first. POSIX
+        // opens it and rejects the classified handle; Windows cannot open a
+        // directory as a file at all (`OpenOptions::open` needs
+        // `FILE_FLAG_BACKUP_SEMANTICS`, which the loader deliberately does not
+        // pass), so the refusal surfaces as the read failure instead. Either
+        // way the directory never reaches the PEM parser.
+        let message = error.to_string();
+        assert!(
+            message.contains("must name a regular file")
+                || message.contains("cannot read TLS CA certificate"),
+            "a directory CA path must be refused, got: {message}"
+        );
     }
 
     #[cfg(unix)]
@@ -3370,6 +3591,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_transport_rejects_oversized_body_via_content_length() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(8192)))
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("oversized body must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_rejects_oversized_body_while_streaming_without_content_length() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `Transfer-Encoding: chunked` omits Content-Length, so only the
+        // streaming cap can enforce the ceiling — the fast Content-Length reject
+        // cannot fire.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Transfer-Encoding", "chunked")
+                    .set_body_string("y".repeat(8192)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("oversized streamed body must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a streaming size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_rejects_oversized_sse_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A `text/event-stream` response whose accumulated event data exceeds the
+        // limit must be rejected by the SSE read path before any JSON parse.
+        let body = format!("event: message\ndata: {}\n\n", "z".repeat(8192));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .insert_header("Transfer-Encoding", "chunked")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("oversized SSE body must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected an SSE size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_sse_returns_first_event_without_waiting_for_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Serve one request: a valid SSE `message` event, then hold the socket
+        // open. A reader that buffers to EOF would block here until the timeout;
+        // an incremental reader returns as soon as the event completes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            // Drain the request head so the client's write side does not block.
+            let _ = sock.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: keep-alive\r\n\
+\r\n\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Hold the connection open well past the assertion timeout.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let config = McpServerConfig {
+            name: "sse-eof".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("http://{addr}")),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let resp = timeout(
+            Duration::from_secs(5),
+            transport.send_and_recv(&req, &lifecycle),
+        )
+        .await
+        .expect("must return on the first complete SSE event, not wait for EOF")
+        .expect("valid SSE event must parse");
+        assert_eq!(resp.id, Some(serde_json::json!(1)));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn http_transport_404_without_session_is_plain_error() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3595,5 +3971,366 @@ mod tests {
         drop(shared);
         assert!(transport.pending.lock().is_empty());
         assert!(rx.await.is_err(), "pending receiver must be released");
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_reports_oversized_before_buffering_whole_line() {
+        // A line far longer than the limit must be reported as `Oversized` without
+        // buffering the whole line, and the reader must resync at the next newline
+        // so following lines still parse. This is the exact bound the persistent
+        // SSE reader relies on to survive an unterminated `data:` flood.
+        let limit = 16usize;
+        let mut input = vec![b'x'; limit * 4];
+        input.push(b'\n');
+        input.extend_from_slice(b"short\n");
+        let mut reader = BufReader::new(&input[..]);
+
+        assert!(matches!(
+            read_bounded_line(&mut reader, limit).await.unwrap(),
+            BoundedLine::Oversized
+        ));
+        match read_bounded_line(&mut reader, limit).await.unwrap() {
+            BoundedLine::Line { bytes, .. } => assert_eq!(bytes, b"short"),
+            other => panic!("expected the next line to parse, got {other:?}"),
+        }
+        assert!(matches!(
+            read_bounded_line(&mut reader, limit).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_reports_consumed_wire_bytes_including_crlf() {
+        // The returned line has its trailing `\r` stripped, but `consumed` must
+        // report every raw byte taken off the wire: content, the `\r`, and the
+        // `\n`. The response-cap readers count `consumed`, so a CRLF line that is
+        // undercounted here would let an over-cap body through.
+        let input = b"ab\r\ncd\ne";
+        let mut reader = BufReader::new(&input[..]);
+
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line { bytes, consumed } => {
+                assert_eq!(bytes, b"ab", "CR must be stripped from the returned line");
+                assert_eq!(consumed, 4, "CRLF line consumes content + \\r + \\n");
+            }
+            other => panic!("expected a line, got {other:?}"),
+        }
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line { bytes, consumed } => {
+                assert_eq!(bytes, b"cd");
+                assert_eq!(consumed, 3, "LF-only line consumes content + \\n");
+            }
+            other => panic!("expected a line, got {other:?}"),
+        }
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line { bytes, consumed } => {
+                assert_eq!(bytes, b"e");
+                assert_eq!(
+                    consumed, 1,
+                    "unterminated final line consumes only its content"
+                );
+            }
+            other => panic!("expected a line, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_sse_reader_discards_suffix_after_oversized_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut sse_socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let bytes_read = sse_socket.read(&mut request).await.unwrap();
+            assert!(request[..bytes_read].starts_with(b"GET /sse "));
+
+            sse_socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: keep-alive\r\n\r\n\
+event: endpoint\n\
+data: /messages\n\n",
+                )
+                .await
+                .unwrap();
+            sse_socket.flush().await.unwrap();
+
+            let (mut post_socket, _) = listener.accept().await.unwrap();
+            let bytes_read = post_socket.read(&mut request).await.unwrap();
+            assert!(request[..bytes_read].starts_with(b"POST /messages "));
+            post_socket
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            post_socket.shutdown().await.unwrap();
+
+            let suffix = r#"{"jsonrpc":"2.0","id":7,"result":{"source":"oversized-suffix"}}"#;
+            let expected = r#"{"jsonrpc":"2.0","id":7,"result":{"source":"next-event"}}"#;
+            let body = format!(
+                "data: {}\ndata: {}\n\ndata: {}\n\n",
+                "x".repeat(256),
+                suffix,
+                expected
+            );
+            sse_socket.write_all(body.as_bytes()).await.unwrap();
+            sse_socket.flush().await.unwrap();
+        });
+
+        let config = McpServerConfig {
+            name: "sse-event-boundary".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("http://{addr}/sse")),
+            max_response_bytes: Some(128),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("build transport");
+        let request = JsonRpcRequest::new(7, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = timeout(
+            Duration::from_secs(5),
+            SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle),
+        )
+        .await
+        .expect("next event should be delivered without waiting for EOF")
+        .expect("next event should parse");
+
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("source"))
+                .and_then(serde_json::Value::as_str),
+            Some("next-event")
+        );
+        server.await.unwrap();
+        transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_transport_sse_counts_crlf_response_by_wire_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A CRLF-delimited SSE response whose CR-stripped line lengths stay within
+        // the cap, but whose real wire bytes (each line's `\r` included) exceed it.
+        // The transport must reject it before parse. Regression: `read_bounded_line`
+        // drops the trailing `\r`, so a reader rebuilding the count as
+        // `line.len() + 1` undercounted every CRLF line by the dropped byte and
+        // admitted a body larger than the documented raw-wire ceiling.
+        let sse_lines = [
+            "data: {\"jsonrpc\":\"2.0\",",
+            "data: \"id\":1,",
+            "data: \"result\":{}}",
+            "", // blank line dispatches the event
+        ];
+        // The buggy accounting counted each line as its stripped length + 1 (the
+        // `\n` only). Size the cap to exactly that total: the CR-stripped body just
+        // fits, while the real CRLF wire body is one byte per line over.
+        let stripped_budget: u64 = sse_lines.iter().map(|line| line.len() as u64 + 1).sum();
+        let body_tail: String = sse_lines.iter().map(|line| format!("{line}\r\n")).collect();
+        // No Content-Length header: the length preflight is skipped, so the
+        // per-line running total is the only thing enforcing the cap.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: keep-alive\r\n\
+\r\n{body_tail}"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Hold the socket open past the assertion timeout so the read decision
+            // is driven by the byte cap, not by EOF.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let config = McpServerConfig {
+            name: "sse-crlf".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("http://{addr}")),
+            max_response_bytes: Some(stripped_budget),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = timeout(
+            Duration::from_secs(5),
+            transport.send_and_recv(&req, &lifecycle),
+        )
+        .await
+        .expect("must decide on the byte cap, not wait for EOF")
+        .expect_err("a response whose raw wire bytes exceed the cap must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a wire-byte size-limit rejection, got: {err}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn default_response_cap_admits_base64_expanded_blob() {
+        // The transport ceiling must clear the base64 expansion of the decoded
+        // aggregate blob budget plus JSON overhead; otherwise a valid near-limit
+        // blob is rejected on the wire before the decoded-byte preflight runs.
+        let decoded = crate::embedded_resource::MAX_AGGREGATE_BLOB_BYTES;
+        let encoded = decoded.div_ceil(3) * 4;
+        assert_eq!(encoded, 13_981_016, "10 MiB decoded -> base64 length");
+        assert_eq!(MAX_ENCODED_BLOB_BYTES, encoded);
+        assert!(
+            DEFAULT_MAX_RESPONSE_BYTES > encoded,
+            "default cap {DEFAULT_MAX_RESPONSE_BYTES} must admit a full base64 blob \
+             {encoded} plus JSON-RPC envelope headroom"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_admits_near_limit_blob_but_rejects_over_default_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A valid JSON-RPC response whose encoded size sits just above the old
+        // 10 MiB decoded cap but within the base64-aware default envelope must be
+        // admitted so it can reach the decoded-byte materialization preflight.
+        let near_len = MAX_ENCODED_BLOB_BYTES as usize + 4096;
+        let prefix = r#"{"jsonrpc":"2.0","id":1,"result":{"padding":""#;
+        let suffix = r#""}}"#;
+        let pad = near_len.saturating_sub(prefix.len() + suffix.len());
+        let near_body = format!("{prefix}{}{suffix}", "a".repeat(pad));
+        assert!(
+            near_body.len() as u64 > 10 * 1024 * 1024,
+            "near-limit body must exceed the old decoded cap to be a regression"
+        );
+        assert!(near_body.len() as u64 <= DEFAULT_MAX_RESPONSE_BYTES);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/near"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(near_body),
+            )
+            .mount(&server)
+            .await;
+        // A response one byte past the default envelope must be rejected before
+        // any JSON parse.
+        let over_body = "b".repeat(DEFAULT_MAX_RESPONSE_BYTES as usize + 1);
+        Mock::given(method("POST"))
+            .and(path("/over"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(over_body),
+            )
+            .mount(&server)
+            .await;
+
+        let near_cfg = McpServerConfig {
+            name: "http-near".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("{}/near", server.uri())),
+            ..Default::default()
+        };
+        let near = HttpTransport::new(&near_cfg).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let resp = near
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect("near-limit response must reach materialization, not be rejected");
+        assert_eq!(resp.id, Some(serde_json::json!(1)));
+
+        let over_cfg = McpServerConfig {
+            name: "http-over".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("{}/over", server.uri())),
+            ..Default::default()
+        };
+        let over = HttpTransport::new(&over_cfg).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = over
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("a response past the default cap must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_direct_post_oversized_body_propagates_instead_of_waiting() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A non-SSE POST reply larger than the cap must surface as an error rather
+        // than being silently emptied and dropped onto the persistent-stream wait.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string("x".repeat(8192)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "sse-direct-oversized".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("{}/sse", server.uri())),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = Arc::new(SseTransport::new(&config).expect("build transport"));
+        // A persistent reader that never delivers: if the oversized body were
+        // swallowed to an empty fallback, the request would wait here forever.
+        let reader = zeroclaw_spawn::spawn!(std::future::pending::<()>());
+        {
+            let mut conn = transport.conn.lock().await;
+            conn.stream_state = SseStreamState::Connected;
+            conn.reader_task = Some(reader);
+        }
+        {
+            let mut shared = transport.shared.lock().await;
+            shared.message_url = Some(format!("{}/messages", server.uri()));
+            shared.message_url_from_endpoint = true;
+        }
+
+        let request = JsonRpcRequest::new(9, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let result = timeout(
+            Duration::from_secs(5),
+            SharedMcpTransportConn::send_and_recv(transport.as_ref(), &request, &lifecycle),
+        )
+        .await
+        .expect("must not hang on the stream after an oversized direct body");
+        let err = result.expect_err("oversized direct POST body must propagate");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a size-limit rejection, got: {err}"
+        );
+        assert!(
+            transport.pending.lock().is_empty(),
+            "the pending waiter must be released on the propagated error"
+        );
+        SharedMcpTransportConn::close(transport.as_ref())
+            .await
+            .expect("close transport");
     }
 }

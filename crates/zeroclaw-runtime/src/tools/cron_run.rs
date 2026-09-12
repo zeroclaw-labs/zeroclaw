@@ -10,6 +10,8 @@ use zeroclaw_config::schema::Config;
 pub struct CronRunTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    /// Owning agent — another agent's job cannot be triggered from here.
+    agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
 }
 
@@ -17,22 +19,28 @@ impl CronRunTool {
     pub fn new_with_runtime(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
         Self {
             config,
             security,
+            agent_alias: agent_alias.into(),
             runtime,
         }
     }
 
     #[cfg(test)]
-    pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+    ) -> Self {
         let runtime = Arc::from(
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, runtime)
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 }
 
@@ -101,7 +109,7 @@ impl Tool for CronRunTool {
             });
         }
 
-        let job = match cron::get_job(&self.config, job_id) {
+        let job = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
             Ok(job) => job,
             Err(e) => {
                 return Ok(ToolResult {
@@ -235,7 +243,7 @@ mod tests {
             .cron_jobs
             .push(job.id.clone());
         let cfg = Arc::new(config);
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(result.success, "{:?}", result.error);
@@ -291,7 +299,7 @@ mod tests {
             .cron_jobs
             .push(job.id.clone());
         let cfg = Arc::new(config);
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(result.success, "{:?}", result.error);
@@ -330,7 +338,7 @@ mod tests {
     async fn errors_for_missing_job() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool
             .execute(json!({ "job_id": "missing-job-id" }))
@@ -357,7 +365,7 @@ mod tests {
             .or_default()
             .level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!result.success);
@@ -400,7 +408,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         // Without approval, the tool-level policy check blocks medium-risk commands.
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
@@ -436,7 +444,7 @@ mod tests {
         seed_test_agent(&mut config);
         let cfg = Arc::new(config);
         let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
-        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
         assert!(!result.success);
@@ -447,5 +455,43 @@ mod tests {
                 .contains("Rate limit exceeded")
         );
         assert!(cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty());
+    }
+
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
+    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            "other-agent",
+            Some("secret_job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cannot_trigger_another_agents_job() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let theirs = other_agents_job(&cfg);
+
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(
+            cron::list_runs(&cfg, &theirs.id, 10).unwrap().is_empty(),
+            "another agent's job must not have been executed"
+        );
     }
 }

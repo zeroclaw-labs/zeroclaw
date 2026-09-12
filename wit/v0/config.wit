@@ -1,0 +1,25 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-mediated access to the schema-validated, non-secret portion of one
+/// admitted plugin instance's canonical configuration.
+@unstable(feature = plugins-wit-v0)
+interface config {
+    @unstable(feature = plugins-wit-v0)
+    use types.{json-string};
+
+    /// Closed failures returned across the guest boundary. Resolver and schema
+    /// details stay on the host.
+    @unstable(feature = plugins-wit-v0)
+    enum config-error {
+        /// The admitted instance does not hold the required config-read grant.
+        access-denied,
+        /// The service is outside an authorized call frame, canonical config
+        /// cannot be resolved, or the invocation host-call budget is exhausted.
+        unavailable,
+    }
+
+    /// Return the current typed public config object as JSON. Properties marked
+    /// `x-secret: true` are omitted. Public and secret reads in one call share
+    /// one resolved canonical revision.
+    get: func() -> result<json-string, config-error>;
+}

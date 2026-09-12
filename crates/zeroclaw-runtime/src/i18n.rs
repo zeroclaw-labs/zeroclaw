@@ -400,6 +400,81 @@ mod tests {
     }
 
     #[test]
+    fn executable_degraded_guidance_falls_back_past_stale_translated_catalog() {
+        let stale_disk =
+            "cli-config-section-degraded = advertencia: Ejecuta `zeroclaw config migrate`.\n";
+        let executable = "/opt/zeroclaw/bin/zeroclaw";
+
+        let rendered = get_disk_override_cli_string_for_test(
+            "es",
+            stale_disk,
+            "cli-config-section-degraded-executable",
+            &[
+                ("section", "risk_profiles"),
+                ("path", "/tmp/config.toml"),
+                ("executable", executable),
+            ],
+        );
+
+        assert!(rendered.contains(executable));
+        assert!(rendered.contains("config migrate"));
+        assert!(!rendered.contains("`zeroclaw config migrate`"));
+    }
+
+    #[test]
+    fn paircode_cli_strings_format_in_every_builtin_locale() {
+        let endpoint = "gateway.example:49001";
+        let cases = [
+            ("cli-pairing-fetch-failed", &[("endpoint", endpoint)][..]),
+            ("cli-pairing-no-code", &[][..]),
+            ("cli-pairing-requests-accepted", &[][..]),
+            ("cli-pairing-enable-config", &[][..]),
+            ("cli-pairing-show-only", &[][..]),
+            ("cli-pairing-pair-another", &[][..]),
+            ("cli-pairing-revoke-replace", &[][..]),
+            ("cli-pairing-new-code-unavailable", &[][..]),
+            ("cli-pairing-retry-or-rotate", &[][..]),
+            ("cli-pairing-rotate-no-code", &[][..]),
+            ("cli-pairing-check-enabled", &[][..]),
+            ("cli-pairing-inspect", &[][..]),
+        ];
+        let locales = [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ];
+
+        for (source, locale) in locales {
+            for (key, args) in cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+
+        assert_eq!(
+            format_ftl_message(
+                include_str!("../locales/en/cli.ftl"),
+                "en",
+                "cli-pairing-fetch-failed",
+                &[("endpoint", endpoint)],
+            )
+            .as_deref(),
+            Some("❌ Failed to fetch pairing code from gateway at gateway.example:49001")
+        );
+        let spanish_fetch = format_ftl_message(
+            include_str!("../locales/es/cli.ftl"),
+            "es",
+            "cli-pairing-fetch-failed",
+            &[("endpoint", endpoint)],
+        )
+        .expect("Spanish paircode fetch failure should format");
+        assert!(spanish_fetch.contains(endpoint));
+    }
+
+    #[test]
     fn lifecycle_progress_strings_exist_in_every_builtin_locale() {
         let keys = [
             "channel-runtime-progress-received",
@@ -420,6 +495,60 @@ mod tests {
                 let value = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{key} should format in {locale}"));
                 assert!(!value.trim().is_empty(), "{key} is empty in {locale}");
+            }
+        }
+    }
+
+    #[test]
+    fn status_cli_strings_format_dynamic_entries() {
+        let keys = [
+            (
+                "cli-status-agent-risk-profile",
+                &[("alias", "ops"), ("level", "High")][..],
+                ["ops=High"].as_slice(),
+            ),
+            (
+                "cli-status-agent-no-risk-profile-summary",
+                &[("alias", "ops")][..],
+                ["ops", "risk_profile"].as_slice(),
+            ),
+            (
+                "cli-status-web-ui-found",
+                &[("path", "/srv/zeroclaw/web/dist")][..],
+                ["Web UI", "/srv/zeroclaw/web/dist"].as_slice(),
+            ),
+            ("cli-status-web-ui-missing", &[][..], ["Web UI"].as_slice()),
+            (
+                "cli-status-channel-configured",
+                &[("status", "configured")][..],
+                ["✅ configured"].as_slice(),
+            ),
+            (
+                "cli-status-channel-not-configured",
+                &[("status", "not configured")][..],
+                ["❌ not configured"].as_slice(),
+            ),
+        ];
+
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
+            for (key, args, expected_parts) in keys {
+                let value = format_cli_string_with_args(&sources, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
+                for expected_part in expected_parts {
+                    assert!(
+                        value.contains(expected_part),
+                        "{} in {} should contain {expected_part:?}, got {value:?}",
+                        key,
+                        locale.code
+                    );
+                }
+                assert!(
+                    !value.contains('{'),
+                    "{} in {} should not leak a missing Fluent placeholder: {value:?}",
+                    key,
+                    locale.code
+                );
             }
         }
     }
@@ -484,6 +613,102 @@ mod tests {
         .expect("missing disk key should fall back to built-in zh-CN");
         assert!(built_in.contains("123456"));
         assert!(built_in.contains("需要绑定"));
+    }
+
+    #[test]
+    fn quickstart_terminal_size_errors_format_from_english_fluent() {
+        let width_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-narrow",
+            &[("min_width", "3"), ("width", "2")],
+        );
+        assert_eq!(
+            width_message,
+            "Quickstart needs a terminal at least 3 columns wide; the current terminal is 2 columns. Widen the terminal and try again."
+        );
+
+        let height_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-short",
+            &[("height", "8"), ("min_height", "9")],
+        );
+        assert_eq!(
+            height_message,
+            "Quickstart needs a terminal at least 9 rows tall; the current terminal is 8 rows. Make the terminal taller and try again."
+        );
+
+        let resized_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-resized",
+            &[
+                ("initial_width", "40"),
+                ("initial_height", "9"),
+                ("current_width", "4"),
+                ("current_height", "9"),
+            ],
+        );
+        assert_eq!(
+            resized_message,
+            "The terminal changed from 40x9 to 4x9 while the Quickstart checklist was open. Reopen the checklist to continue."
+        );
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-empty-checklist", &[]),
+            "Quickstart cannot open an empty checklist."
+        );
+    }
+
+    #[test]
+    fn quickstart_terminal_geometry_errors_are_defined_in_every_locale() {
+        // The checklist fails closed when `Term::size_checked()` returns None.
+        // That path is only reachable through this key, so a locale missing it
+        // would render the raw `{key}` placeholder to the user at exactly the
+        // moment we are refusing to draw an unverifiable menu.
+        let cases = [
+            ("cli-quickstart-terminal-size-unknown", vec![]),
+            (
+                "cli-quickstart-terminal-too-narrow",
+                vec![("min_width", "20"), ("width", "19")],
+            ),
+            (
+                "cli-quickstart-terminal-too-short",
+                vec![("min_height", "9"), ("height", "8")],
+            ),
+            (
+                "cli-quickstart-terminal-resized",
+                vec![
+                    ("initial_width", "80"),
+                    ("initial_height", "20"),
+                    ("current_width", "40"),
+                    ("current_height", "20"),
+                ],
+            ),
+            ("cli-quickstart-empty-checklist", vec![]),
+        ];
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(&locale.code)
+                    .unwrap_or_else(|| panic!("{} must have a built-in CLI catalogue", locale.code))
+            };
+            for (key, args) in &cases {
+                let message = format_ftl_message(source, &locale.code, key, args)
+                    .unwrap_or_else(|| panic!("{}: {key} should be defined", locale.code));
+                assert!(
+                    !message.trim().is_empty(),
+                    "{}: {key} should not be empty",
+                    locale.code
+                );
+                assert!(
+                    !message.contains('{'),
+                    "{}: {key} should interpolate every argument; got {message:?}",
+                    locale.code
+                );
+            }
+        }
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-terminal-size-unknown", &[]),
+            "Quickstart could not determine the terminal size, so it cannot verify the checklist fits. Run it from a terminal that reports its dimensions, or use `zeroclaw config set <path> <value>` for headless configuration."
+        );
     }
 
     #[test]
@@ -824,6 +1049,50 @@ mod tests {
     }
 
     #[test]
+    fn cli_approval_prompt_strings_format_in_all_locales() {
+        let tool = "shell";
+        let cases = [
+            ("cli-approval-request", &["shell"][..]),
+            ("cli-approval-prompt", &["shell", "[Y]", "[N]", "[A]"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, &[("tool", tool)])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if key == "cli-approval-prompt" {
+                    assert!(
+                        value.ends_with(' ') && !value.ends_with("  "),
+                        "{key} in {locale} should end with exactly one space; got: {value:?}"
+                    );
+                }
+            }
+        }
+
+        let english = include_str!("../locales/en/cli.ftl");
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-request", &[("tool", tool)]).as_deref(),
+            Some("🔧 Agent wants to execute: shell")
+        );
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-prompt", &[("tool", tool)]).as_deref(),
+            Some("   [Y]es / [N]o / [A]lways for shell: ")
+        );
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (
@@ -843,26 +1112,25 @@ mod tests {
             ),
         ];
 
-        for (source, locale) in [
-            (include_str!("../locales/en/cli.ftl"), "en"),
-            (include_str!("../locales/es/cli.ftl"), "es"),
-            (include_str!("../locales/fr/cli.ftl"), "fr"),
-            (include_str!("../locales/ja/cli.ftl"), "ja"),
-            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
-        ] {
+        for locale in available_locales() {
+            let sources = load_cli_ftl_sources(locale.code.as_str());
             for (key, args, expected_parts) in cases {
-                let value = format_ftl_message(source, locale, key, args)
-                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                let value = format_cli_string_with_args(&sources, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
                 for expected in expected_parts {
                     assert!(
                         value.contains(expected),
-                        "{key} in {locale} should preserve {expected:?}"
+                        "{} in {} should preserve {expected:?}",
+                        key,
+                        locale.code
                     );
                 }
                 if key == "cli-update-prebuilt-channel-note" {
                     assert!(
                         !value.contains("Discord"),
-                        "{key} in {locale} should not mention Discord because it is in default-channels"
+                        "{} in {} should not mention Discord because it is in default-channels",
+                        key,
+                        locale.code
                     );
                 }
             }
@@ -1452,6 +1720,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_terminal_failure_endpoint_messages_are_owned_by_each_locale() {
+        for locale in ["en", "es", "fr", "ja", "zh-CN"] {
+            let sources = load_cli_ftl_sources(locale);
+            for key in [
+                "cli-agent-error-provider-connection-local",
+                "cli-agent-error-provider-connection-remote",
+            ] {
+                let formatted = format_cli_string_with_args(
+                    &sources,
+                    key,
+                    &[("endpoint", "http://127.0.0.1:11434/v1")],
+                )
+                .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("http://127.0.0.1:11434/v1"),
+                    "{locale}: {key} must own endpoint grammar: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$endpoint}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_credential_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            let missing = format_ftl_message(
+                source,
+                locale,
+                "cli-agent-error-provider-credentials-missing",
+                &[],
+            )
+            .unwrap_or_else(|| panic!("{locale}: missing-credentials message should format"));
+            assert!(!missing.is_empty(), "{locale}: missing-credentials message");
+
+            for key in [
+                "cli-agent-error-provider-credentials-missing-named",
+                "cli-agent-error-provider-authentication-named",
+            ] {
+                let formatted =
+                    format_ftl_message(source, locale, key, &[("provider", "custom.test")])
+                        .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("custom.test"),
+                    "{locale}: {key} must include the configured provider: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$provider}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_completion_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            for key in [
+                "cli-agent-error-invalid-semantic-completion",
+                "cli-agent-error-incomplete-after-provider-tools",
+            ] {
+                let formatted = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!formatted.is_empty(), "{locale}: {key} should not be empty");
+            }
+
+            for key in [
+                "cli-delegate-error-invalid-semantic-completion",
+                "cli-delegate-error-incomplete-after-provider-tools",
+            ] {
+                let formatted =
+                    format_ftl_message(source, locale, key, &[("agent_name", "delegate")])
+                        .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("delegate"),
+                    "{locale}: {key} must include the agent name: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$agent_name}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
     /// Argless `channel-approval-*` keys must be defined and non-empty in
     /// every committed locale.
     const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[
@@ -1466,6 +1822,7 @@ mod tests {
         "channel-telegram-approval-ack-approved",
         "channel-telegram-approval-ack-always-approved",
         "channel-telegram-approval-ack-denied",
+        "channel-telegram-approval-ack-not-accepted",
         "channel-telegram-approval-ack-unknown",
         "channel-discord-approval-btn-allow-once",
         "channel-discord-approval-btn-allow-session",
@@ -1476,7 +1833,7 @@ mod tests {
         "channel-approval-opt-reject-with-edit",
     ];
 
-    fn channel_approval_locale_sources() -> [(&'static str, &'static str); 5] {
+    fn committed_locale_sources() -> [(&'static str, &'static str); 5] {
         [
             (include_str!("../locales/en/cli.ftl"), "en"),
             (include_str!("../locales/es/cli.ftl"), "es"),
@@ -1492,7 +1849,7 @@ mod tests {
         // `channel-approval-*` key must be defined in all 5 committed
         // locales, and the complete Rust-built reply commands — plus the
         // tool arg — must survive translation verbatim.
-        for (source, locale) in channel_approval_locale_sources() {
+        for (source, locale) in committed_locale_sources() {
             for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
                 let value = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));
@@ -1600,6 +1957,11 @@ mod tests {
                 "Always approved",
             ),
             ("channel-telegram-approval-ack-denied", &[], "Denied"),
+            (
+                "channel-telegram-approval-ack-not-accepted",
+                &[],
+                "Approval not accepted",
+            ),
             (
                 "channel-telegram-approval-ack-unknown",
                 &[],

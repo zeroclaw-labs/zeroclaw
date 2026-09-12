@@ -208,7 +208,7 @@ fn resolve(
         // EPIC G: route through the broker (membership + quorum). With no
         // `[sop.approval]` policy this is exactly `resolve_gate`.
         guard
-            .resolve_via_broker(run_id, decision, principal)
+            .resolve_via_broker_deferred(run_id, decision, principal)
             .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

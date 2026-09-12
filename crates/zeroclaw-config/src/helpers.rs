@@ -614,8 +614,14 @@ pub fn validate_alias_key(key: &str) -> Result<(), String> {
             key.len()
         ));
     }
-    let first = key.chars().next().unwrap();
-    let last = key.chars().next_back().unwrap();
+    let first = key
+        .chars()
+        .next()
+        .ok_or_else(|| "alias must not be empty".to_string())?;
+    let last = key
+        .chars()
+        .next_back()
+        .ok_or_else(|| "alias must not be empty".to_string())?;
     if !matches!(first, 'a'..='z' | '0'..='9') {
         return Err(format!(
             "alias '{key}' must start with a lowercase letter or digit"

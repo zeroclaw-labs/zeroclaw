@@ -50,6 +50,39 @@ A server is reached over one of three transports (the `transport` field):
 
 Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
 
+### Example: Parallel Search
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+provides public web search and page extraction without a Parallel account or API
+key. Free access is rate limited. Its Streamable HTTP endpoint uses ZeroClaw's
+`http` transport:
+
+```toml
+[[mcp.servers]]
+name = "parallel"
+transport = "http"
+url = "https://search.parallel.ai/mcp"
+
+[mcp_bundles.web]
+servers = ["parallel"]
+
+[agents.assistant]
+mcp_bundles = ["web"]
+```
+
+Merge these entries into your existing `config.toml`, using the alias of the
+agent you want to grant access. Add `"web"` to that agent's existing
+`mcp_bundles` list rather than replacing its other grants. If the `web` bundle
+already exists, add `"parallel"` to its `servers` list. Keep `mcp.enabled = true`
+and restart the affected session after changing grants.
+
+The agent can then use `parallel__web_search` and `parallel__web_fetch`, subject
+to its normal tool authorization and approval policy. Calls send queries,
+requested URLs, and any supplied objective or context to Parallel. Once granted
+access, the agent may choose these tools during its work. To revoke access,
+remove `"parallel"` from every bundle granted to that agent, or add it to a
+granted bundle's `exclude` list, then restart the session.
+
 ## Editing servers
 
 Three surfaces edit the same `[[mcp.servers]]` table:
@@ -177,6 +210,54 @@ empty, so servers without it are unaffected.
 
 Pinned content is read once per run (no live refresh) and is labeled
 `trust="untrusted-external"` so the model treats it as data, not instructions.
+
+### Embedded resource blobs in tool results
+
+When an MCP `tools/call` result includes a content item shaped as
+`type: "resource"` with a nested `blob` (base64), ZeroClaw does **not** dump that
+base64 into the model context. Instead it materializes the bytes under the
+session workspace `uploads/` directory (same shared helper and 10 MB limit as
+ACP inbound `resource.blob`) and replaces the model-facing tool output with
+non-blob provenance text plus a `[Document: …]` or `[IMAGE:…]` marker. This is
+gated by content shape, not by tool name. Materialization does not auto-deliver
+the file to ACP clients; the agent still calls `deliver_file` when outbound
+delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
+
+The two other binary MCP content shapes are mapped as follows. A `type: "image"`
+item (base64 `data` + `mimeType`) is materialized the same way and its content
+item is rewritten to a text item carrying the `[IMAGE:<path>]` marker, which the
+multimodal pipeline lifts into a native provider image part; the item's
+`annotations`/`_meta` and other non-binary fields are preserved. Only the raster
+formats the vision pipeline accepts are materialized: PNG, JPEG, WebP, and GIF.
+The on-disk extension is derived from the declared `mimeType` (canonicalized to
+its case-insensitive essence, parameters dropped) when it names one of those
+types, otherwise from sniffing the decoded bytes; the extension must match the
+bytes because the loader prefers a path's extension over its magic. An image
+whose type is neither a supported declared type nor a recognized supported
+signature degrades to `[attachment unavailable: …]` and is not written. A
+`type: "audio"` item is **not** materialized in this path, because no provider
+resolves an audio path into content parts today, so its `data` is stripped to a
+non-materializing `[audio attachment: <mime>]` placeholder. In every case the raw base64 never
+reaches the model, including for a malformed image/audio item whose `data` is
+empty or not a string.
+
+Because the result comes from an untrusted server, two per-call bounds are
+enforced before any payload is decoded, hashed, or written: at most **64**
+materializable binary items (resource blobs plus valid image items) per
+`tools/call` result, and an estimated aggregate decoded size of at most **10 MiB**
+across all of them. A result that exceeds either bound has every such item
+degraded to an `[attachment unavailable: …]` marker and writes nothing to disk,
+so an array of many empty or tiny items cannot force per-item work. Each
+individual payload is still bounded by the same 10 MB per-file limit.
+
+Separate from these *decoded* budgets, each HTTP/SSE MCP server also has a
+transport-level response-body cap, `max_response_bytes`, enforced on the raw
+*encoded* wire bytes before the body is parsed so a server cannot force an
+unbounded read. It is not the 10 MiB decoded limit above: it defaults to
+**16,078,168 bytes**, the base64 expansion of the 10 MiB decoded aggregate plus
+JSON-RPC envelope headroom, so a valid near-limit blob still reaches
+materialization. Set `max_response_bytes` on a server to override it; `0` or
+leaving it unset uses that default.
 
 ### Security
 

@@ -32,9 +32,41 @@ pub mod traits;
 pub mod vision_override;
 
 pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
-pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
+pub use reliable::{
+    ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+    ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion,
+};
 
 mod request_payload;
+
+#[cfg(test)]
+pub(crate) static RUNTIME_PROXY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct RuntimeProxyTestGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl RuntimeProxyTestGuard {
+    pub(crate) async fn acquire() -> Self {
+        let guard = RUNTIME_PROXY_TEST_LOCK.lock().await;
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimeProxyTestGuard {
+    fn drop(&mut self) {
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+    }
+}
 
 #[allow(unused_imports)]
 pub use traits::{
@@ -58,6 +90,36 @@ const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
+
+/// Test-only override for the Qwen OAuth token endpoint URL.
+/// When set via [`set_qwen_oauth_endpoint_for_test`], the refresh
+/// function uses this URL instead of the hardcoded production endpoint.
+/// Gated on `test-helpers` feature so downstream crates can use it in
+/// their own tests.
+#[cfg(any(test, feature = "test-helpers"))]
+static QWEN_OAUTH_ENDPOINT_OVERRIDE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Override the Qwen OAuth token endpoint for deterministic testing.
+/// Call with `None` to restore the production endpoint after a test.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn set_qwen_oauth_endpoint_for_test(url: Option<String>) {
+    *QWEN_OAUTH_ENDPOINT_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = url;
+}
+
+/// Return the active Qwen OAuth token endpoint: the test override
+/// when running under `#[cfg(test)]`, or the production constant.
+fn qwen_oauth_token_endpoint() -> String {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Ok(guard) = QWEN_OAUTH_ENDPOINT_OVERRIDE.read()
+        && let Some(ref url) = *guard
+    {
+        return url.clone();
+    }
+    QWEN_OAUTH_TOKEN_ENDPOINT.to_string()
+}
 const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
@@ -294,7 +356,7 @@ pub(crate) fn refresh_qwen_oauth_access_token(
         .unwrap_or_else(|_| reqwest::blocking::Client::new());
 
     let response = client
-        .post(QWEN_OAUTH_TOKEN_ENDPOINT)
+        .post(qwen_oauth_token_endpoint())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
         .form(&[
@@ -623,6 +685,18 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// How compatible chat-completions providers handle image markers in
+    /// native role=`tool` results.
+    pub tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy,
+    /// Root `[multimodal]` policy applied when a provider expands
+    /// `[IMAGE:...]` markers into inline data URIs.
+    ///
+    /// Provider adapters run their own `prepare_messages_for_provider` pass, so
+    /// without this they silently fall back to `MultimodalConfig::default()` and
+    /// an operator's `max_images` / `max_image_size_mb` / `max_image_turns`
+    /// never reach the request that actually carries the images. Root-scoped,
+    /// not per-entry: every alias resolves the same section.
+    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -648,6 +722,8 @@ impl Default for ModelProviderRuntimeOptions {
             vision: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
+            tool_result_image_policy: Default::default(),
+            multimodal: Default::default(),
         }
     }
 }
@@ -711,6 +787,10 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        tool_result_image_policy: entry
+            .map(|e| e.tool_result_image_policy)
+            .unwrap_or_default(),
+        multimodal: config.multimodal.clone(),
     }
 }
 
@@ -774,8 +854,38 @@ pub fn options_for_provider_ref(
             // the fallback provider's capability flag. Clearing it falls back to
             // the family default (or the choke point's own resolution).
             options.vision = None;
+            // Tool-result image handling is provider-specific: a bare
+            // fallback family must use its own default rather than inherit
+            // the previous provider alias's policy.
+            options.tool_result_image_policy = Default::default();
+            // `multimodal` is deliberately NOT reset: it is the root
+            // `[multimodal]` section, identical for every alias, so a bare
+            // family ref inherits the same operator policy rather than
+            // silently reverting to library defaults.
             options
         }
+    }
+}
+
+/// Runtime options for a **bare family** reference (`ollama`) or an inline
+/// `custom:<url>` reference, neither of which resolves a configured entry.
+///
+/// Everything provider-specific (kind, URI, credentials, `vision`, ...) stays at
+/// its default because there is no entry to read it from. The root
+/// `[multimodal]` policy is not provider-specific, so it must still reach the
+/// adapter: `ModelProviderRuntimeOptions::default()` embeds
+/// `MultimodalConfig::default()`, and an adapter built that way re-applies
+/// library image limits to messages the runtime already prepared under the
+/// operator's policy — silently dropping attachments the operator allowed.
+///
+/// This path is reached in production by `resolve_vision_provider` for a
+/// configured `multimodal.vision_model_provider`.
+fn bare_family_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+) -> ModelProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
+        multimodal: config.multimodal.clone(),
+        ..ModelProviderRuntimeOptions::default()
     }
 }
 
@@ -931,13 +1041,41 @@ fn mentions_tools_token(message: &str) -> bool {
     false
 }
 
+/// Split a provider error message into independent clauses at `;`, newlines,
+/// and sentence-ending periods (a `.` followed by whitespace or end of
+/// input, so identifiers like `gpt-4.1` stay intact).
+///
+/// Compound provider errors can chain unrelated failures in one message;
+/// capability predicates must be evaluated within a single clause so that
+/// independent clauses cannot collectively satisfy them.
+fn error_message_clauses(message: &str) -> Vec<&str> {
+    let bytes = message.as_bytes();
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in message.char_indices() {
+        let is_boundary = match c {
+            ';' | '\n' => true,
+            '.' => bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace),
+            _ => false,
+        };
+        if is_boundary {
+            clauses.push(&message[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    clauses.push(&message[start..]);
+    clauses
+}
+
 /// Whether an endpoint explicitly rejected combining function tools with
 /// `reasoning_effort`.
 ///
 /// This predicate is intentionally narrow: callers may retry once with
 /// `reasoning_effort: "none"` only when the endpoint itself reports this exact
 /// capability mismatch. Other reasoning or tool errors must propagate
-/// unchanged.
+/// unchanged. A single clause of the message must report the relationship —
+/// unrelated clauses of a compound error (e.g. `reasoning_effort value is
+/// unsupported; tools must be an array`) do not collectively qualify.
 pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
     if !matches!(
         status,
@@ -965,22 +1103,30 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
         }
         Err(_) => (body.to_ascii_lowercase(), String::new()),
     };
-    let mentions_reasoning_effort = parameter == "reasoning_effort"
-        || message.contains("reasoning_effort")
-        || message.contains("reasoning effort");
-    let mentions_tools = mentions_tools_token(&message);
-    let reports_incompatibility = [
-        "not supported",
-        "unsupported",
-        "cannot be used",
-        "can't be used",
-        "incompatible",
-        "not allowed",
-    ]
-    .iter()
-    .any(|hint| message.contains(hint));
+    let clauses = error_message_clauses(&message);
+    // The structured `param` field is message-global; letting it satisfy an
+    // arbitrary clause would recreate the cross-clause false positive, so it
+    // counts as the reasoning signal only when the message has a single
+    // substantive clause for it to describe.
+    let single_clause = clauses.iter().filter(|c| !c.trim().is_empty()).count() <= 1;
+    clauses.into_iter().any(|clause| {
+        let mentions_reasoning_effort = clause.contains("reasoning_effort")
+            || clause.contains("reasoning effort")
+            || (single_clause && parameter == "reasoning_effort");
+        let mentions_tools = mentions_tools_token(clause);
+        let reports_incompatibility = [
+            "not supported",
+            "unsupported",
+            "cannot be used",
+            "can't be used",
+            "incompatible",
+            "not allowed",
+        ]
+        .iter()
+        .any(|hint| clause.contains(hint));
 
-    mentions_reasoning_effort && mentions_tools && reports_incompatibility
+        mentions_reasoning_effort && mentions_tools && reports_incompatibility
+    })
 }
 
 /// Format an error including its full source chain and sanitize the result.
@@ -1056,6 +1202,7 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("xai-", "xai"),
     ("nvapi-", "nvidia"),
     ("KEY-", "telnyx"),
+    ("zcr_", "zerorouter"),
 ];
 
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
@@ -1687,7 +1834,7 @@ pub fn create_model_provider_from_ref_with_model(
         "default",
         None,
         None,
-        &ModelProviderRuntimeOptions::default(),
+        &bare_family_runtime_options(config),
     )?;
     Ok(ResolvedModelProviderRef {
         provider,
@@ -1995,6 +2142,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
+            ("zerorouter", "ZeroRouter", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2371,6 +2519,17 @@ mod tests {
     }
 
     #[test]
+    fn factory_zerorouter() {
+        let model_provider = create_model_provider("zerorouter", Some("zcr_test")).unwrap();
+        // ZeroRouter speaks the OpenAI chat-completions wire: Bearer auth +
+        // native tool calling, no .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "ZeroRouter should use OpenAI-compatible native tool calling"
+        );
+    }
+
+    #[test]
     fn factory_nearai() {
         let model_provider = create_model_provider("nearai", Some("nearai-key")).unwrap();
         // NEAR AI Cloud is OpenAI-protocol-compatible: default Bearer auth +
@@ -2628,6 +2787,54 @@ mod tests {
             Some(&entry),
         );
         assert_eq!(opts.vision, Some(false));
+    }
+
+    #[test]
+    fn tool_result_image_policy_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, ToolResultImagePolicy};
+        let entry = ModelProviderConfig {
+            tool_result_image_policy: ToolResultImagePolicy::Omit,
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.tool_result_image_policy, ToolResultImagePolicy::Omit);
+    }
+
+    #[test]
+    fn root_multimodal_section_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+        config.multimodal.max_image_size_mb = 2;
+        config.multimodal.max_image_turns = 3;
+
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &config,
+            Some(&ModelProviderConfig::default()),
+        );
+
+        // Operator limits must reach the adapter that expands `[IMAGE:...]`
+        // markers; library defaults here mean the section is inert.
+        assert_eq!(opts.multimodal.max_images, 1);
+        assert_eq!(opts.multimodal.max_image_size_mb, 2);
+        assert_eq!(opts.multimodal.max_image_turns, 3);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_inherits_root_multimodal_policy() {
+        use zeroclaw_config::schema::Config;
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+
+        let fallback = model_provider_runtime_options_from_model_provider_entry(&config, None);
+        let options = options_for_provider_ref(&config, "ollama", &fallback);
+
+        // `[multimodal]` is root-scoped, so unlike the provider-specific
+        // `tool_result_image_policy` it must survive a bare family ref.
+        assert_eq!(options.multimodal.max_images, 1);
     }
 
     #[test]
@@ -2987,10 +3194,11 @@ mod tests {
     }
 
     #[test]
-    fn route_provider_options_clear_primary_only_state_for_bare_routes() {
+    fn route_provider_options_clear_alias_only_state_for_bare_routes() {
         let inherited = ModelProviderRuntimeOptions {
             provider_kind: Some("openai-compatible".to_string()),
             provider_api_url: Some("http://primary.example/v1".to_string()),
+            tool_result_image_policy: zeroclaw_config::schema::ToolResultImagePolicy::Omit,
             ..Default::default()
         };
         let config = zeroclaw_config::schema::Config::default();
@@ -2999,6 +3207,10 @@ mod tests {
 
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+        assert_eq!(
+            route_options.tool_result_image_policy,
+            zeroclaw_config::schema::ToolResultImagePolicy::ImageUrl
+        );
     }
 
     #[test]
@@ -3324,6 +3536,106 @@ mod tests {
                 panic!("Expected error when custom model model_provider has no URI configured")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bare_family_ref_carries_multimodal_policy_into_prepared_images() {
+        // `resolve_vision_provider` builds the configured vision provider through
+        // this factory, and a bare/`custom:<url>` ref resolves no entry. Building
+        // it with default runtime options made the adapter re-apply library image
+        // limits to messages the runtime had already prepared under the
+        // operator's policy, dropping allowed attachments. Drive a real request
+        // and count the images that actually leave.
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_api::model_provider::ChatRequest;
+        use zeroclaw_config::schema::Config;
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            *capture.lock().expect("capture lock poisoned") = Some(body.to_string());
+            (
+                StatusCode::OK,
+                Json(json!({"choices": [{"message": {"content": "ok"}}]})),
+            )
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut markers = Vec::new();
+        for index in 0..2 {
+            let path = temp.path().join(format!("bare-{index}.png"));
+            std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+            markers.push(format!("[IMAGE:{}]", path.display()));
+        }
+        // One image per message: `trim_old_images` evicts whole messages, so
+        // co-locating both would measure that eviction granularity instead of
+        // whether the operator policy reached this adapter at all.
+        let prompts: Vec<String> = markers
+            .iter()
+            .map(|marker| format!("look {marker}"))
+            .collect();
+
+        // Same server, same ref, same messages; only the operator policy differs.
+        let outbound_images = |max_images: usize, prompts: Vec<String>| async move {
+            let capture: Capture = Arc::new(Mutex::new(None));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("test server addr");
+            let app = Router::new()
+                .route("/chat/completions", post(capture_chat_request))
+                .with_state(capture.clone());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.expect("serve test server");
+            });
+
+            let mut config = Config::default();
+            config.multimodal.max_images = max_images;
+
+            let resolved = create_model_provider_from_ref_with_model(
+                &config,
+                &format!("custom:http://{addr}"),
+            )
+            .expect("bare custom:<url> ref builds a provider");
+
+            let messages: Vec<ChatMessage> = prompts.into_iter().map(ChatMessage::user).collect();
+            let _ = resolved
+                .provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+
+            let body = capture
+                .lock()
+                .expect("capture lock poisoned")
+                .clone()
+                .expect("provider must have sent a request");
+            server.abort();
+            body.matches("data:image/png;base64,").count()
+        };
+
+        assert_eq!(
+            outbound_images(2, prompts.clone()).await,
+            2,
+            "a policy admitting both images must send both"
+        );
+        assert_eq!(
+            outbound_images(1, prompts).await,
+            1,
+            "an operator cap of one must reach the adapter built from a bare ref"
+        );
     }
 
     #[test]
@@ -3698,6 +4010,63 @@ mod tests {
         assert!(rejects_tools_with_reasoning_effort(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"reasoning_effort cannot be used with \"tools\".","param":"reasoning_effort"}}"#
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_requires_conflict_within_one_clause() {
+        // Independent clauses of a compound error must not collectively
+        // satisfy the predicate: neither clause below reports a relationship
+        // between tools and reasoning effort, so retrying with
+        // reasoning_effort "none" would silently downgrade the operator's
+        // configured effort before the unrelated tools error propagates.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported; tools must be an array"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "reasoning_effort value is unsupported; tools must be an array"
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid. Tools are not allowed for this endpoint."}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            "reasoning_effort is unsupported\ntools are not allowed"
+        ));
+
+        // The structured `param` field must not bridge clauses either: it is
+        // message-global, so in a compound error it cannot supply the
+        // reasoning signal for an unrelated tools clause — in either order.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are unsupported; reasoning_effort value is invalid","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid; tools are unsupported","param":"reasoning_effort"}}"#
+        ));
+
+        // A single-clause structured error may rely on `param` alone for the
+        // reasoning signal.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are not supported at the requested effort","param":"reasoning_effort"}}"#
+        ));
+
+        // A genuine relationship stated in one clause still matches, even
+        // when other clauses surround it.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"The request was rejected. reasoning_effort cannot be used with tools. Remove one and retry."}}"#
+        ));
+        // A sentence-internal period (e.g. a version number) is not a clause
+        // boundary.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported with tools for model gpt-4.1"}}"#
         ));
     }
 

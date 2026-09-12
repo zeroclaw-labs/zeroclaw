@@ -715,8 +715,10 @@ impl Channel for MattermostChannel {
             "message": message.content
         });
 
-        if let Some(root) = root_id {
-            body_map.as_object_mut().unwrap().insert(
+        if let Some(root) = root_id
+            && let Some(body) = body_map.as_object_mut()
+        {
+            body.insert(
                 "root_id".to_string(),
                 serde_json::Value::String(root.to_string()),
             );

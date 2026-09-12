@@ -100,7 +100,7 @@ impl Tool for SopApproveTool {
             // `[sop.approval]` policy it is exactly `resolve_gate`, so behavior is
             // unchanged; with a policy the agent must be an authorized member and a
             // quorum must be met before the chokepoint clears the gate.
-            engine.resolve_via_broker(
+            engine.resolve_via_broker_deferred(
                 run_id,
                 ApprovalDecision::Approve,
                 ApprovalPrincipal::agent(&self.agent_alias),

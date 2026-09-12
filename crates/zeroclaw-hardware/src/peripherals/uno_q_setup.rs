@@ -44,12 +44,9 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
     }
 
     let status = Command::new("scp")
-        .args([
-            "-r",
-            "--",
-            bridge_dir.to_str().unwrap(),
-            &format!("{}:~/ArduinoApps/", ssh_target),
-        ])
+        .args(["-r", "--"])
+        .arg(bridge_dir)
+        .arg(format!("{}:~/ArduinoApps/", ssh_target))
         .status()
         .context("scp failed")?;
     if !status.success() {
@@ -149,7 +146,8 @@ fn deploy_local(bridge_dir: Option<&std::path::Path>) -> Result<()> {
 
     println!("Starting Bridge app...");
     let status = Command::new("arduino-app-cli")
-        .args(["app", "start", dest_dir.to_str().unwrap()])
+        .args(["app", "start"])
+        .arg(&dest_dir)
         .status()
         .context("arduino-app-cli start failed")?;
     if !status.success() {
@@ -163,23 +161,23 @@ fn deploy_local(bridge_dir: Option<&std::path::Path>) -> Result<()> {
 fn write_embedded_bridge(dest: &std::path::Path) -> Result<()> {
     let app_yaml = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/app.yaml"
+        "/firmware/uno-q-bridge/app.yaml"
     ));
     let sketch_ino = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/sketch/sketch.ino"
+        "/firmware/uno-q-bridge/sketch/sketch.ino"
     ));
     let sketch_yaml = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/sketch/sketch.yaml"
+        "/firmware/uno-q-bridge/sketch/sketch.yaml"
     ));
     let main_py = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/python/main.py"
+        "/firmware/uno-q-bridge/python/main.py"
     ));
     let requirements = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/python/requirements.txt"
+        "/firmware/uno-q-bridge/python/requirements.txt"
     ));
 
     std::fs::write(dest.join("app.yaml"), app_yaml)?;

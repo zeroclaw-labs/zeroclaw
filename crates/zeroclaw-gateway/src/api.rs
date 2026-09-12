@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
@@ -22,6 +23,9 @@ fn integration_entry_json(
         "category": entry.category,
         "category_label": entry.category.label(),
         "status": entry.status,
+        // Canonical config map key (provider family key / ChannelsConfig map
+        // key) for deep links; null when the entry has no config section.
+        "key": &entry.key,
     })
 }
 
@@ -121,6 +125,10 @@ pub struct CronAddBody {
     pub job_type: Option<String>,
     pub prompt: Option<String>,
     pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+    /// Agent session context: `"isolated"` (default) or `"main"`. For agent jobs,
+    /// a present value that is not one of those two names is rejected; omitted
+    /// keeps the isolated default. Same contract as the `cron_add` tool. Shell
+    /// jobs ignore this field.
     pub session_target: Option<String>,
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
@@ -227,6 +235,47 @@ pub struct SessionMessagePostBody {
 
 // ── Handlers ────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusNodes {
+    pub connected: Vec<String>,
+    pub mdns_peers: Vec<crate::nodes::mdns::MdnsPeerSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusResponse {
+    pub version: String,
+    /// Dotted `<type>.<alias>` of the resolved model provider, or `null` when none is configured.
+    /// The unqualified provider name is reserved; this field is always qualified.
+    pub model_provider: Option<String>,
+    pub model: String,
+    /// Resolved model temperature, or `null` when no temperature is configured.
+    pub temperature: Option<f64>,
+    pub uptime_seconds: u64,
+    /// RFC 3339 UTC wall-clock time when the daemon started.
+    pub daemon_started_at: String,
+    pub gateway_port: u16,
+    pub locale: String,
+    pub memory_backend: String,
+    pub paired: bool,
+    pub channels: BTreeMap<String, bool>,
+    pub nodes: StatusNodes,
+    pub health: zeroclaw_runtime::health::HealthSnapshot,
+    /// Configured agent alias used for per-agent resolution, or `null` for the install-wide view.
+    pub agent_alias: Option<String>,
+    /// Self-process resource snapshot; unsupported hosts report zero memory and a null CPU value.
+    pub process: zeroclaw_runtime::process_stats::ProcessStats,
+    /// Whether the gateway polls for newer releases and shows an update indicator.
+    pub check_updates: bool,
+    /// Whether browser-triggered self-upgrade is enabled.
+    pub allow_self_upgrade: bool,
+    /// How the daemon is restarted after an upgrade: supervised, self-respawn, or manual.
+    pub restart_mode: crate::version::RestartMode,
+    /// Operator-facing command or instruction for completing an upgrade restart.
+    pub restart_hint: String,
+}
+
 /// Query parameters for `GET /api/status`. Pass `?agent=<alias>` to
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
@@ -252,10 +301,10 @@ pub async fn handle_api_status(
 
     // Per-alias map keyed by composite `<type>.<alias>`. Every
     // populated `[channels.<type>.<alias>]` is a separate dashboard row.
-    let mut channels = serde_json::Map::new();
+    let mut channels = BTreeMap::new();
     for info in config.channels_by_alias() {
         let composite = format!("{}.{}", info.channel_type, info.alias);
-        channels.insert(composite, serde_json::Value::Bool(true));
+        channels.insert(composite, true);
     }
 
     let locale = config
@@ -311,30 +360,30 @@ pub async fn handle_api_status(
     // the upgrade button, and which restart command to show afterwards.
     let restart = crate::version::detect_restart();
 
-    let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "model_provider": model_provider,
-        "model": model,
-        "temperature": temperature,
-        "uptime_seconds": health.uptime_seconds,
-        "daemon_started_at": zeroclaw_runtime::health::daemon_started_at(),
-        "gateway_port": config.gateway.port,
-        "locale": locale,
-        "memory_backend": memory_backend,
-        "paired": state.pairing.is_paired(),
-        "channels": channels,
-        "nodes": {
-            "connected": state.node_registry.node_ids(),
-            "mdns_peers": state.mdns_peer_registry.snapshots(),
+    let body = StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model_provider,
+        model,
+        temperature,
+        uptime_seconds: health.uptime_seconds,
+        daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
+        gateway_port: config.gateway.port,
+        locale,
+        memory_backend,
+        paired: state.pairing.is_paired(),
+        channels,
+        nodes: StatusNodes {
+            connected: state.node_registry.node_ids(),
+            mdns_peers: state.mdns_peer_registry.snapshots(),
         },
-        "health": health,
-        "agent_alias": agent_alias,
-        "process": process,
-        "check_updates": config.gateway.check_updates,
-        "allow_self_upgrade": config.gateway.allow_self_upgrade,
-        "restart_mode": restart.mode.as_str(),
-        "restart_hint": restart.hint,
-    });
+        health,
+        agent_alias: agent_alias.map(String::from),
+        process,
+        check_updates: config.gateway.check_updates,
+        allow_self_upgrade: config.gateway.allow_self_upgrade,
+        restart_mode: restart.mode,
+        restart_hint: restart.hint,
+    };
 
     Json(body).into_response()
 }
@@ -479,10 +528,13 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        let session_target = session_target
-            .as_deref()
-            .map(zeroclaw_runtime::cron::SessionTarget::parse)
-            .unwrap_or_default();
+        let session_target = match session_target {
+            Some(raw) => match zeroclaw_runtime::cron::SessionTarget::try_parse(&raw) {
+                Ok(target) => target,
+                Err(e) => return bad_request(e).into_response(),
+            },
+            None => zeroclaw_runtime::cron::SessionTarget::Isolated,
+        };
 
         let default_delete = matches!(schedule, zeroclaw_runtime::cron::Schedule::At { .. });
         let delete_after_run = delete_after_run.unwrap_or(default_delete);
@@ -2359,7 +2411,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn api_status_includes_connected_nodes_and_mdns_peers() {
+    async fn api_status_contract_includes_connected_nodes_and_mdns_peers() {
         let state = test_state(zeroclaw_config::schema::Config::default());
         let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(1);
         assert!(state.node_registry.register(nodes::NodeInfo {
@@ -2407,6 +2459,72 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn api_status_contract_preserves_nullable_and_nested_fields() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        let actual_fields: std::collections::BTreeSet<_> = json
+            .as_object()
+            .expect("status response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_fields = [
+            "agent_alias",
+            "allow_self_upgrade",
+            "channels",
+            "check_updates",
+            "daemon_started_at",
+            "gateway_port",
+            "health",
+            "locale",
+            "memory_backend",
+            "model",
+            "model_provider",
+            "nodes",
+            "paired",
+            "process",
+            "restart_hint",
+            "restart_mode",
+            "temperature",
+            "uptime_seconds",
+            "version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_fields, expected_fields);
+        assert!(json["version"].as_str().is_some());
+        assert!(json["temperature"].is_null());
+        assert!(json["agent_alias"].is_null());
+        assert!(json["uptime_seconds"].is_u64());
+        assert!(json["daemon_started_at"].as_str().is_some());
+        assert!(json["channels"].is_object());
+        assert!(json["nodes"]["connected"].is_array());
+        assert!(json["nodes"]["mdns_peers"].is_array());
+        assert!(json["health"]["pid"].is_u64());
+        assert!(json["health"]["components"].is_object());
+        assert!(json["process"]["rss_bytes"].is_u64());
+        assert!(
+            json["process"]["cpu_percent"].is_null() || json["process"]["cpu_percent"].is_number()
+        );
+        assert!(json["check_updates"].is_boolean());
+        assert!(json["allow_self_upgrade"].is_boolean());
+        assert_eq!(
+            json["restart_mode"],
+            crate::version::detect_restart().mode.as_str()
+        );
+        assert!(json["restart_hint"].as_str().is_some());
+    }
+
     #[test]
     fn integration_entry_json_derives_category_label_from_category() {
         let entry = zeroclaw_runtime::integrations::IntegrationEntry {
@@ -2414,6 +2532,7 @@ pub(crate) mod tests {
             description: "Run browser automation".into(),
             category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
             status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+            key: None,
         };
 
         let json = integration_entry_json(&entry);
@@ -2421,6 +2540,22 @@ pub(crate) mod tests {
         assert_eq!(json["category"], "ToolsAutomation");
         assert_eq!(json["category_label"], "Tools & Automation");
         assert_eq!(json["status"], "Active");
+        assert!(json["key"].is_null());
+    }
+
+    #[test]
+    fn integration_entry_json_exposes_config_key() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Z.AI".into(),
+            description: String::new(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::AiModel,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Available,
+            key: Some("zai".into()),
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["key"], "zai");
     }
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
@@ -3869,6 +4004,174 @@ pub(crate) mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Isolated
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_persists_session_target_main() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "main"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.read().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_accepts_session_target_case_and_whitespace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "  MAIN  "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let jobs = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap();
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_invalid_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "typo-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "shared"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("session_target"),
+            "error should name the field, got {error}"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "invalid session_target must not persist a job"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_empty_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "empty-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session_target")
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

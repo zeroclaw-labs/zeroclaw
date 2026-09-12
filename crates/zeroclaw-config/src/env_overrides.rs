@@ -8,6 +8,31 @@ use std::sync::LazyLock;
 const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
 
+/// `[todotracker]` was a daemon schema section in v0.8.3 only; TodoWrite
+/// display config now lives in ZeroCode's `zerocode-config.toml`. Removing the
+/// schema section would make these previously valid env vars unresolved, and
+/// an unresolved path is a hard error — so a working deployment would stop
+/// starting after an upgrade. Recognized legacy fields are therefore accepted
+/// and ignored (with a migration warning) instead of failing startup.
+///
+/// This is an exact allowlist: an unknown `ZEROCLAW_todotracker__*` field is
+/// still a hard error, so genuine typos keep surfacing.
+const LEGACY_TODOTRACKER_FIELDS: [&str; 5] = [
+    "enabled",
+    "enabled_at_start",
+    "location",
+    "width",
+    "max_height",
+];
+
+/// True when `tail` names a recognized legacy `[todotracker]` field that must
+/// no longer block daemon startup.
+fn is_recognized_legacy_todotracker(tail: &str) -> bool {
+    tail.strip_prefix("todotracker")
+        .and_then(|rest| rest.strip_prefix(SEP))
+        .is_some_and(|field| LEGACY_TODOTRACKER_FIELDS.contains(&field))
+}
+
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| HashSet::from(["schema_version"]));
 
@@ -37,6 +62,20 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
     for (env_name, value, tail) in entries {
+        // Recognized legacy `[todotracker]` vars are accepted and ignored so an
+        // upgrade cannot turn a previously working deployment into a daemon
+        // that refuses to start. The value has no effect: TodoWrite display is
+        // now owned by ZeroCode's `zerocode-config.toml`.
+        if is_recognized_legacy_todotracker(&tail) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"env_var": env_name})),
+                "ignoring removed [todotracker] env override; move this setting into zerocode-config.toml"
+            );
+            continue;
+        }
         let path = resolve_path(&tail, config)
             .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
         if NON_OVERRIDABLE_PATHS.contains(path.as_str()) {
@@ -460,5 +499,60 @@ mod tests {
             msg.contains("schema_version") && msg.contains("not overridable"),
             "error must name the path and the reason: {msg}",
         );
+    }
+    // ── Legacy `[todotracker]` compatibility ────────────────────────────────
+    //
+    // The section moved out of the daemon schema into ZeroCode's
+    // `zerocode-config.toml`. Recognized legacy env vars must not become
+    // unresolved paths, because an unresolved path is fatal and would stop a
+    // previously working daemon from starting after an upgrade.
+
+    #[tokio::test]
+    async fn recognized_legacy_todotracker_env_does_not_block_startup() {
+        let _guard = super::env_test_lock().await;
+        let _a = EnvVarGuard::set("ZEROCLAW_todotracker__enabled", "false");
+        let _b = EnvVarGuard::set("ZEROCLAW_todotracker__enabled_at_start", "true");
+        let _c = EnvVarGuard::set("ZEROCLAW_todotracker__location", "left");
+        let _d = EnvVarGuard::set("ZEROCLAW_todotracker__width", "40");
+        let _e = EnvVarGuard::set("ZEROCLAW_todotracker__max_height", "8");
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config)
+            .expect("recognized legacy todotracker vars must not fail daemon startup");
+
+        // Accepted-and-ignored: no schema path is touched by these vars.
+        assert!(
+            !applied.paths.iter().any(|p| p.starts_with("todotracker")),
+            "legacy vars must not resolve to a schema path: {:?}",
+            applied.paths,
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_legacy_todotracker_field_still_errors() {
+        let _guard = super::env_test_lock().await;
+        // Not on the exact allowlist: a typo must still surface loudly rather
+        // than being silently swallowed by the compatibility shim.
+        let _v = EnvVarGuard::set("ZEROCLAW_todotracker__wdith", "40");
+
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("unknown field must hard-error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ZEROCLAW_todotracker__wdith") && msg.contains("did not resolve"),
+            "error must name the env var and the failure: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_shim_does_not_shadow_other_sections() {
+        let _guard = super::env_test_lock().await;
+        // A section that merely *starts with* the legacy name must not be
+        // captured by the allowlist prefix check.
+        let _v = EnvVarGuard::set("ZEROCLAW_todotracker_extra__enabled", "false");
+
+        let mut config = Config::default();
+        let err = apply_env_overrides(&mut config).expect_err("must hard-error");
+        assert!(format!("{err:#}").contains("did not resolve"));
     }
 }

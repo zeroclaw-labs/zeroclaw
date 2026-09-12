@@ -53,10 +53,26 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  history-guard:
+    name: Common Ancestor
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Test common ancestor guard
+        run: bash scripts/ci/common_ancestor_guard.test.sh
+      - name: Reject unrelated PR history
+        env:
+          HISTORY_CHECK_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/ci/common_ancestor_guard.sh origin/master "$HISTORY_CHECK_SHA"
 
   repo-structure:
     name: Repository Structure
@@ -105,8 +121,74 @@ jobs:
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
 
+      - name: Test apt install timeout and retry behavior
+        run: bash scripts/ci/apt_install.test.sh
+
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
+
+      - name: Test CLI and hardware path-label ownership
+        run: bash scripts/ci/path_labeler_matrix.test.sh
+
+  relay-container-smoke-changes:
+    name: Detect Relay Container Smoke changes
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect relay container smoke changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(apps/zerorelay/(Dockerfile|compose\.yaml|relay\.example\.toml|src/main\.rs|src/lib\.rs|src/ws_accept\.rs|build\.rs)|scripts/ci/smoke_relay_fresh_volume\.sh|\.github/workflows/ci\.yml$)' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  relay-container-smoke:
+    name: Relay Container Fresh-Volume Smoke
+    needs: [relay-container-smoke-changes]
+    if: needs.relay-container-smoke-changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build the zerorelay image
+        shell: bash
+        # The Dockerfile uses BuildKit-only RUN --mount cache instructions.
+        # Modern Docker defaults to BuildKit, but a legacy builder fails the
+        # documented command outright - require it explicitly so the job is
+        # reproducible anywhere.
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: docker build -f apps/zerorelay/Dockerfile -t zerorelay:smoke .
+      - name: Fresh-volume non-root startup smoke (self-provisions TLS + healthcheck)
+        shell: bash
+        run: ZERORELAY_SMOKE_IMAGE=zerorelay:smoke bash scripts/ci/smoke_relay_fresh_volume.sh
 
   # ── Post-format required quality gate ─────────────────────────────────────
 
@@ -123,7 +205,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           components: clippy
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -206,7 +288,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           components: clippy
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -255,7 +337,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -317,6 +399,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Test Windows task-owner recovery
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+           cargo test --profile ci --locked -p zeroclaw-runtime --lib
+           --target x86_64-pc-windows-msvc
+           control_plane::authority::tests::windows_process_exit_is_detected -- --exact
 
   check:
     name: Check (${{ matrix.name }})
@@ -350,7 +439,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -396,7 +485,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         if: steps.changed.outputs.run == 'true'
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - name: Install plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
@@ -411,13 +500,32 @@ jobs:
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
-      - name: Run runtime live-config plugin regression
+      - name: Run runtime live-config plugin regressions
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib live_agent_plugin_tool_observes_config_reload_after_construction
+        # Module filter, not a single test name: agent::plugin_live_config holds
+        # every production-constructor live-config regression (direct Agent and
+        # independently delegated registries today), and a filter pinned to one
+        # test name silently skips the others.
+        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib agent::plugin_live_config
+      # Feature-gated admission proofs. These only compile under plugins-wasm, so
+      # the default-feature workspace Test job never runs them: the activation
+      # plan (plugin_runtime), the shared instance ceiling, the auto_discover
+      # default-false gate, the repeated-construction determinism, and the
+      # pre-construction collision refusal. Filters are passed after `--` because
+      # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
+      - name: Run runtime plugin admission regressions
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin'
+      # Cross-crate activation proof. This lives in the root `zeroclaw` package
+      # rather than the line above because it drives `zeroclaw-runtime`, which
+      # `zeroclaw-plugins` cannot depend on without inverting the crate graph.
+      - name: Run channel plugin activation e2e
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked --features plugins-wasm-cranelift --test plugin_channel_runtime_e2e
 
   msrv:
     name: MSRV (declared floor)
@@ -470,7 +578,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           targets: i686-unknown-linux-gnu
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -494,7 +602,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -549,7 +657,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         id: rust-cache
@@ -579,6 +687,302 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-lark` is outside `default-channels`, so the workspace run above
+      # does not execute Lark's feature-gated library regressions. This step
+      # exercises the URL-verification handler coverage added by PR #9110.
+      - name: Run Lark channel URL-verification tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-matrix` is outside `default-channels`, so the workspace run
+      # above does not execute Matrix's feature-gated library regressions. This
+      # step is what actually executes them.
+      - name: Run Matrix channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-matrix --lib matrix::"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  windows-test-scope:
+    name: Advisory Windows test selection
+    needs: [fmt]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+      packages: ${{ steps.select.outputs.packages }}
+      reason: ${{ steps.select.outputs.reason }}
+      needs_plugin_host: ${{ steps.select.outputs.needs_plugin_host }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96.1
+      - name: Test Windows selector contract
+        run: bash scripts/ci/windows_test_scope.test.sh
+      - name: Select Windows nextest scope
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          changed_files="$RUNNER_TEMP/windows-changed-files"
+          metadata_file="$RUNNER_TEMP/windows-cargo-metadata.json"
+          : > "$changed_files"
+
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            git diff --name-only "$BASE_SHA" HEAD > "$changed_files"
+            if ! cargo metadata --locked --format-version 1 > "$metadata_file"; then
+              rm -f "$metadata_file"
+            fi
+          fi
+
+          python3 scripts/ci/windows_test_scope.py \
+            --event "$EVENT_NAME" \
+            --changed-paths-file "$changed_files" \
+            --metadata-file "$metadata_file" \
+            --repo-root "$GITHUB_WORKSPACE" > "$GITHUB_OUTPUT"
+      - name: Report Windows selection
+        shell: bash
+        env:
+          MODE: ${{ steps.select.outputs.mode }}
+          PACKAGES: ${{ steps.select.outputs.packages }}
+          REASON: ${{ steps.select.outputs.reason }}
+          NEEDS_PLUGIN_HOST: ${{ steps.select.outputs.needs_plugin_host }}
+        run: |
+          {
+            echo "### Advisory Windows test selection"
+            echo ""
+            printf "| Field | Value |\n"
+            printf "| --- | --- |\n"
+            printf "| Mode | %s |\n" "$MODE"
+            printf "| Packages | %s |\n" "$PACKAGES"
+            printf "| Reason | %s |\n" "$REASON"
+            printf "| Plugin host required | %s |\n" "$NEEDS_PLUGIN_HOST"
+            printf "| Measured nextest duration | not run (selection only) |\n"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows-test:
+    name: Advisory Windows nextest (${{ needs.windows-test-scope.outputs.mode }}, plugin-host=${{ needs.windows-test-scope.outputs.needs_plugin_host }})
+    needs: [windows-test-scope]
+    if: github.event_name == 'pull_request' && needs.windows-test-scope.outputs.mode != 'skip'
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96.1
+      - name: Install plugin fixture target
+        if: needs.windows-test-scope.outputs.needs_plugin_host == 'true'
+        run: rustup target add wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: platform-test
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install cargo-nextest
+        shell: bash
+        env:
+          NEXTEST_VERSION: 0.9.143
+          NEXTEST_SHA256: c42a1dbde532da06dc9b4a43d44fd0ce668b836c2ab7388410f10ff9834476a2
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-pc-windows-msvc.tar.gz"
+          curl -LsSf --retry 3 --retry-delay 2 -o "$archive" "$url"
+          actual_sha256="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$archive")"
+          if [[ "$actual_sha256" != "$NEXTEST_SHA256" ]]; then
+            echo "::error::cargo-nextest checksum mismatch (expected $NEXTEST_SHA256, got $actual_sha256)"
+            exit 1
+          fi
+          if command -v cygpath >/dev/null 2>&1; then
+            archive="$(cygpath -u "$archive")"
+          fi
+          tar zxf "$archive" -C "$HOME/.cargo/bin"
+      - name: Run advisory Windows tests
+        shell: bash
+        env:
+          MODE: ${{ needs.windows-test-scope.outputs.mode }}
+          PACKAGES_JSON: ${{ needs.windows-test-scope.outputs.packages }}
+          REASON: ${{ needs.windows-test-scope.outputs.reason }}
+          NEEDS_PLUGIN_HOST: ${{ needs.windows-test-scope.outputs.needs_plugin_host }}
+        run: |
+          set -euo pipefail
+
+          started_at=$SECONDS
+          baseline_log="$RUNNER_TEMP/windows-baseline-nextest.log"
+          plugin_components_log="$RUNNER_TEMP/windows-plugin-components-nextest.log"
+          plugin_lib_log="$RUNNER_TEMP/windows-plugin-lib-nextest.log"
+          plugin_runtime_config_log="$RUNNER_TEMP/windows-plugin-runtime-config-nextest.log"
+          plugin_runtime_admission_log="$RUNNER_TEMP/windows-plugin-runtime-admission-nextest.log"
+          plugin_gateway_log="$RUNNER_TEMP/windows-plugin-gateway-nextest.log"
+          plugin_cli_log="$RUNNER_TEMP/windows-plugin-cli-nextest.log"
+          plugin_root_log="$RUNNER_TEMP/windows-plugin-root-nextest.log"
+          case "$MODE" in
+            scoped)
+              package_args_file="$RUNNER_TEMP/windows-package-args"
+              if ! python3 scripts/ci/windows_test_scope.py --package-args-json "$PACKAGES_JSON" > "$package_args_file"; then
+                echo "::error::Invalid scoped Windows package selection"
+                baseline_status=2
+              else
+                mapfile -t package_args < "$package_args_file"
+                if (( ${#package_args[@]} == 0 )); then
+                  echo "::error::Scoped Windows package selection is empty"
+                  baseline_status=2
+                else
+                  set +e
+                  cargo nextest run --locked --no-fail-fast "${package_args[@]}" 2>&1 | tee "$baseline_log"
+                  baseline_status=${PIPESTATUS[0]}
+                  set -e
+                fi
+              fi
+              ;;
+            full)
+              set +e
+              cargo nextest run --locked --no-fail-fast --workspace --exclude zeroclaw-desktop 2>&1 | tee "$baseline_log"
+              baseline_status=${PIPESTATUS[0]}
+              set -e
+              ;;
+            *)
+              echo "::error::Unknown Windows test selection mode: $MODE"
+              baseline_status=2
+              ;;
+          esac
+
+          baseline_duration=$((SECONDS - started_at))
+          plugin_host_status=0
+          plugin_host_duration=0
+          plugin_components_status=not-run
+          plugin_lib_status=not-run
+          plugin_runtime_config_status=not-run
+          plugin_runtime_admission_status=not-run
+          plugin_gateway_status=not-run
+          plugin_cli_status=not-run
+          plugin_root_status=not-run
+          if [[ "$NEEDS_PLUGIN_HOST" == "true" ]]; then
+            plugin_started_at=$SECONDS
+            set +e
+            cargo nextest run --locked --no-fail-fast \
+              -p zeroclaw-plugins \
+              --features plugins-wasm-cranelift \
+              --test channel_plugin_e2e \
+              --test tool_plugin_timeout_e2e \
+              --test reference_plugin \
+              --test reference_plugin_e2e \
+              --test tool_plugin_e2e 2>&1 | tee "$plugin_components_log"
+            plugin_components_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              -p zeroclaw-plugins \
+              --no-default-features \
+              --features plugins-wasm-cranelift \
+              --lib 2>&1 | tee "$plugin_lib_log"
+            plugin_lib_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              -p zeroclaw-runtime \
+              --features plugins-wasm-cranelift \
+              --lib \
+              live_agent_plugin_tool_observes_config_reload_after_construction 2>&1 | tee "$plugin_runtime_config_log"
+            plugin_runtime_config_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              -p zeroclaw-runtime \
+              --features plugins-wasm-cranelift \
+              --lib \
+              plugin_runtime:: \
+              tools::tests::shared_ceiling \
+              tools::tests::repeated_loader \
+              tools::tests::auto_discover \
+              tools::tests::colliding_plugin 2>&1 | tee "$plugin_runtime_admission_log"
+            plugin_runtime_admission_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              -p zeroclaw-gateway \
+              --features plugins-wasm \
+              --lib 2>&1 | tee "$plugin_gateway_log"
+            plugin_gateway_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              --features plugins-wasm-cranelift \
+              --bin zeroclaw \
+              plugin_registry:: 2>&1 | tee "$plugin_cli_log"
+            plugin_cli_status=${PIPESTATUS[0]}
+            cargo nextest run --locked --no-fail-fast \
+              --features plugins-wasm-cranelift \
+              --test plugin_channel_runtime_e2e 2>&1 | tee "$plugin_root_log"
+            plugin_root_status=${PIPESTATUS[0]}
+            set -e
+            plugin_host_duration=$((SECONDS - plugin_started_at))
+            if (( plugin_components_status != 0 || plugin_lib_status != 0 || plugin_runtime_config_status != 0 || plugin_runtime_admission_status != 0 || plugin_gateway_status != 0 || plugin_cli_status != 0 || plugin_root_status != 0 )); then
+              plugin_host_status=1
+            fi
+          fi
+
+          overall_status=$baseline_status
+          if (( plugin_host_status != 0 )); then
+            overall_status=1
+          fi
+          failure_inventory=""
+          if (( baseline_status != 0 )); then
+            failure_inventory="baseline"
+          fi
+          if [[ "$plugin_components_status" != "not-run" && "$plugin_components_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-components"
+          fi
+          if [[ "$plugin_lib_status" != "not-run" && "$plugin_lib_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-lib"
+          fi
+          if [[ "$plugin_runtime_config_status" != "not-run" && "$plugin_runtime_config_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-runtime-config"
+          fi
+          if [[ "$plugin_runtime_admission_status" != "not-run" && "$plugin_runtime_admission_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-runtime-admission"
+          fi
+          if [[ "$plugin_gateway_status" != "not-run" && "$plugin_gateway_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-gateway"
+          fi
+          if [[ "$plugin_cli_status" != "not-run" && "$plugin_cli_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-cli"
+          fi
+          if [[ "$plugin_root_status" != "not-run" && "$plugin_root_status" != "0" ]]; then
+            failure_inventory="${failure_inventory:+$failure_inventory,}plugin-root"
+          fi
+          if [[ -z "$failure_inventory" ]]; then
+            failure_inventory=none
+          fi
+          total_duration=$((SECONDS - started_at))
+          {
+            echo "### Advisory Windows nextest"
+            echo ""
+            printf "| Field | Value |\n"
+            printf "| --- | --- |\n"
+            printf "| Mode | %s |\n" "$MODE"
+            printf "| Packages | %s |\n" "$PACKAGES_JSON"
+            printf "| Reason | %s |\n" "$REASON"
+            printf "| Plugin host required | %s |\n" "$NEEDS_PLUGIN_HOST"
+            printf "| Baseline status | %s |\n" "$baseline_status"
+            printf "| Plugin-host component status | %s |\n" "$plugin_components_status"
+            printf "| Plugin-host library status | %s |\n" "$plugin_lib_status"
+            printf "| Plugin-host runtime config status | %s |\n" "$plugin_runtime_config_status"
+            printf "| Plugin-host runtime admission status | %s |\n" "$plugin_runtime_admission_status"
+            printf "| Plugin-host gateway status | %s |\n" "$plugin_gateway_status"
+            printf "| Plugin-host CLI status | %s |\n" "$plugin_cli_status"
+            printf "| Plugin-host root status | %s |\n" "$plugin_root_status"
+            printf "| Failure inventory | %s |\n" "$failure_inventory"
+            printf "| Baseline duration | %ss |\n" "$baseline_duration"
+            printf "| Plugin-host duration | %ss |\n" "$plugin_host_duration"
+            printf "| Total duration | %ss |\n" "$total_duration"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit "$overall_status"
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
@@ -633,7 +1037,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -661,7 +1065,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
@@ -690,7 +1094,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
@@ -716,13 +1120,14 @@ jobs:
           for path in (
               ".github/workflows/ci.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/pr-size-labeler.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
               yaml.safe_load(open(path))
               print(f"{path}: valid")
           PY
-      - name: Validate project dashboard planner
-        run: python3 scripts/github/project_dashboard_plan_test.py
+      - name: Validate GitHub helper scripts
+        run: python3 -m unittest discover -s scripts/github -p '*_test.py'
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
@@ -788,7 +1193,10 @@ jobs:
           emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
           emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
-          emit web      "^web/|^\.nvmrc$|${wf}"
+          # The generated dashboard contract includes schemas owned by the
+          # config, runtime, and SOP graph crates and is rendered by the xtask generator.
+          # Keep this trigger aligned with every source that can change it.
+          emit web      "^web/|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
 
   nix-eval:
     name: Nix Module Eval
@@ -908,7 +1316,7 @@ jobs:
         run: bash scripts/ci/install_target_triple_test.sh
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: 1.96.1
+          toolchain: 1.98.0
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
@@ -917,6 +1325,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
+      - name: Check source-backed SOP syntax reference
+        run: cargo generate sop-syntax --check
       - name: Resolve canonical all-feature selection
         id: all_features
         run: |
@@ -933,9 +1343,17 @@ jobs:
     needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
@@ -944,6 +1362,8 @@ jobs:
       - name: Install web dependencies
         working-directory: web
         run: npm ci
+      - name: Typecheck generated dashboard contract
+        run: cargo web check
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
@@ -958,7 +1378,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

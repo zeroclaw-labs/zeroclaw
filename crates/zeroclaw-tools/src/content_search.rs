@@ -269,17 +269,13 @@ impl Tool for ContentSearchTool {
                     Err(result) => return Ok(result),
                 };
 
-                match backend {
-                    SearchBackend::Ripgrep => {
-                        format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
-                    }
-                    SearchBackend::Grep => {
-                        // grep receives a de-verbatimized search path (see build_grep_command), so its
-                        // output paths are de-verbatimized too — relativize against a matching prefix.
-                        let ws = strip_verbatim_prefix(&workspace_canon);
-                        format_grep_output(&raw_stdout, ws.as_ref(), output_mode, max_results)
-                    }
-                    SearchBackend::Internal => unreachable!(),
+                if backend == SearchBackend::Ripgrep {
+                    format_rg_output(&raw_stdout, &workspace_canon, output_mode, max_results)
+                } else {
+                    // grep receives a de-verbatimized search path (see build_grep_command), so its
+                    // output paths are de-verbatimized too — relativize against a matching prefix.
+                    let ws = strip_verbatim_prefix(&workspace_canon);
+                    format_grep_output(&raw_stdout, ws.as_ref(), output_mode, max_results)
                 }
             }
             SearchBackend::Internal => {
@@ -384,7 +380,15 @@ impl ContentSearchTool {
                 context_before,
                 context_after,
             ),
-            SearchBackend::Internal => unreachable!(),
+            SearchBackend::Internal => {
+                return Err(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "Internal search backend cannot be executed as a subprocess".to_string(),
+                    ),
+                });
+            }
         };
 
         // Security: clear environment, keep only safe variables

@@ -35,6 +35,8 @@ WhatsApp Web mode links a regular WhatsApp account through the optional Web back
 
 On first start, the Web backend pairs the account using QR or pair-code linking (`pair_phone` seeds pair-code linking; leave it unset for QR). Keep `session_path` on persistent storage; removing it forces a fresh device link. Bind the channel to an agent via that agent's `channels` list.
 
+`push_name` sets the display name recipients see; leave it unset and the account keeps the name the phone was registered with. It is applied on connect, only when it differs from the name the linked device already carries, and a failure to apply it is logged without stopping the channel. Cloud API mode ignores it; there the display name comes from the Meta Business profile.
+
 The shared `interrupt_on_new_message` option applies to both Cloud API mode and Web mode. When enabled, a newer WhatsApp message from the same sender/chat cancels the in-flight response.
 
 ## Personal and business behavior
@@ -72,7 +74,7 @@ notice a business-mode deployment gets.
 
 ## Restricting which groups (`allowed_groups`)
 
-`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list is **not** permission: what it means is decided by `group_policy`. Under `allowlist` (the default) or `ignore` an empty list admits no group, and under `all` it admits every group. A list that admits everything cannot be told apart from a list nobody configured, so open group access has to be asked for by name. A non-empty list drops every group message whose chat JID matches no entry, and keeps doing so under every policy including `all`, so `all` widens the empty-list default rather than overriding an explicit list. **Direct messages always bypass this filter.**
 
 Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part - the segment before `@` (`123456789012345`) - compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
 

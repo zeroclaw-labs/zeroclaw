@@ -1035,6 +1035,24 @@ fn emit_selector_pick(ctx: Option<&RunCtx>, selector: &str, mode: &str, value: &
 
 // ── Model provider ─────────────────────────────────────────────────
 
+/// Quickstart enrichment is best-effort and runs inline with the apply RPC,
+/// so it owns a short deadline instead of changing the shared provider helper's
+/// contract for interactive gateway and doctor callers.
+const CONTEXT_WINDOW_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn fetch_quickstart_context_window(
+    provider_type: &str,
+    provider_config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> Option<usize> {
+    tokio::time::timeout(
+        CONTEXT_WINDOW_FETCH_TIMEOUT,
+        zeroclaw_providers::fetch_context_window(provider_type, provider_config),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 fn apply_model_provider(
     config: &mut Config,
     choice: &SelectorChoice<ModelProviderChoice>,
@@ -1252,9 +1270,10 @@ fn apply_model_provider(
                 })
                 .unwrap_or(false)
                 && let Some(ctx) = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        zeroclaw_providers::fetch_context_window(provider_type, &provider_config),
-                    )
+                    tokio::runtime::Handle::current().block_on(fetch_quickstart_context_window(
+                        provider_type,
+                        &provider_config,
+                    ))
                 })
             {
                 let _ = config
@@ -3224,12 +3243,15 @@ mod tests {
             .await
             .expect_err("an existing same-port webhook must be rejected");
 
-        assert!(errors.iter().any(|error| {
-            error.field == "channels[0].fields.port"
-                && error.message
-                    == "webhook port 8090 is already used by enabled webhook `already-active` — \
-                        each enabled webhook needs its own port"
-        }));
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("already-active")
+            }),
+            "localized port conflict must preserve its field and parameters: {errors:?}"
+        );
         let after = std::fs::read_to_string(&config.config_path).unwrap();
         assert_eq!(
             after, before,
@@ -3318,12 +3340,12 @@ mod tests {
 
         assert!(
             errors.iter().any(|error| {
-                error.field == "channels[0].fields.port"
-                    && error.message
-                        == "webhook port 8090 is already used by enabled webhook `existing` — \
-                            each enabled webhook needs its own port"
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("existing")
             }),
-            "CLI surface must render the localized conflict string; got {errors:?}"
+            "localized port conflict must preserve its field and parameters; got {errors:?}"
         );
     }
 
@@ -3340,10 +3362,14 @@ mod tests {
         let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
             .expect_err("empty webhook secret must be rejected");
 
-        assert!(errors.iter().any(|error| {
-            error.field == "channels[0].fields.secret"
-                && error.message == "Webhook shared secret is required"
-        }));
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.secret"
+                    && !error.message.trim().is_empty()
+            }),
+            "localized webhook secret validation must preserve its field: {errors:?}"
+        );
     }
 
     #[test]
@@ -3647,5 +3673,36 @@ mod tests {
             "dotted `<family>.<alias>` selector must resolve that alias's \
              configured endpoint; got {models:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn quickstart_context_window_enrichment_uses_its_own_short_budget() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(4))
+                    .set_body_json(serde_json::json!({
+                        "data": [{
+                            "id": "slow-model",
+                            "context_length": 8192
+                        }]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some("slow-model".into()),
+            uri: Some(server.uri()),
+            ..Default::default()
+        };
+
+        let result = fetch_quickstart_context_window("groq", &provider_config).await;
+
+        assert_eq!(result, None, "slow enrichment should degrade to fallback");
     }
 }

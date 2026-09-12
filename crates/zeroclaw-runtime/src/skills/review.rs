@@ -66,16 +66,54 @@ pub async fn maybe_run_skill_review(
         return;
     }
 
-    let tools: Vec<Box<dyn Tool>> =
-        build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
+    let review_tools = build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
+    // Seal the fixed 3-tool review harness through the one assembly seam so the
+    // engine receives a `ScopedToolRegistry` like every other turn path. The
+    // policy is `SecurityPolicy::default()` (no allow/deny lists), which makes
+    // `assemble`'s built-in filter a provable identity over the harness tools -
+    // the review sub-turn still sees exactly those 3 tools (`skills_list`,
+    // `skill_view`, `skill_manage`), reproducing today's unfiltered behavior. A
+    // real agent policy (`for_agent`) is deliberately NOT used: it could drop a
+    // skill tool and would only be probably-neutral. Every assembly divergence
+    // is off (no peripherals, no MCP, no skills, no memory strip), so `config` /
+    // `agent_alias` are never read beyond satisfying the signature.
+    let review_default_config = zeroclaw_config::schema::Config::default();
+    let review_config_ref = full_config.unwrap_or(&review_default_config);
+    let review_alias = agent_alias.unwrap_or("default");
+    let review_security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+    let assembled_review =
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            config: review_config_ref,
+            agent_alias: review_alias,
+            security: &review_security,
+            built: crate::tools::AllToolsResult::from_prebuilt_tools(review_tools),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+    let tools = assembled_review.registry;
     let review_input = build_review_input(&failed_slugs);
 
     let mut review_history = history;
-    let fork_start_len = review_history.len();
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let turn_id = uuid::Uuid::new_v4().to_string();
+
+    // The tool loop can compact/trim `review_history` in place (hard-cap and
+    // reported-budget trimming both shrink the history vec during the loop).
+    // A slice taken from a pre-loop length would then be out of range, so we
+    // capture the fork's appended messages into a separate, append-only vec
+    // instead of slicing `review_history` after the fact.
+    let mut fork_messages: Vec<ChatMessage> = Vec::new();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
@@ -126,7 +164,7 @@ pub async fn maybe_run_skill_review(
                 collected_receipts: Some(&receipts),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+                new_messages_out: Some(&mut fork_messages),
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Per-transport
                 // stamping lands in a later phase.
@@ -142,8 +180,7 @@ pub async fn maybe_run_skill_review(
 
     match result {
         Ok(final_text) => {
-            let summary =
-                summarize_actions(&receipts, &review_history[fork_start_len..], &final_text);
+            let summary = summarize_actions(&receipts, &fork_messages, &final_text);
             if !summary.is_empty() {
                 println!(
                     "{}",

@@ -417,6 +417,41 @@ The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing work
 > previously configured the CLI provider under the `kilo` shorthand, switch to
 > `kilocli`.
 
+### ZeroRouter: slot `zerorouter`
+
+```toml
+[providers.models.zerorouter.gateway]
+model   = "anthropic/claude-sonnet-5"
+api_key = "..."   # a ZeroRouter key (prefix `zcr_`); or inject from the env
+# uri = "http://localhost:8080/v1"  # a self-hosted or local router; omit for the hosted default
+```
+
+OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is currently in
+beta. The slot defaults to the public hosted deployment at
+`https://zerorouter.ai/v1`, so model discovery works with no configuration at
+all. ZeroRouter is also self-hostable (AGPL); to reach your own router,
+locally at `http://localhost:8080/v1` or anywhere else, set `uri` explicitly.
+A key minted on one router does not authenticate on another, so `api_key`
+must come from the deployment `uri` points at.
+
+Beyond the chat-completions wire this slot speaks, ZeroRouter also serves the
+OpenAI Responses API inbound (`POST /v1/responses`), so Responses-wire
+clients, such as a Codex CLI `model_provider` with `wire_api = "responses"`,
+can point at the same deployment and key directly.
+
+The `/v1/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing
+and its prompt/completion pricing come live from the router itself without a
+credential; because it is queried live, it is the source that carries pricing
+into the cost-rates editor (this family has no models.dev or OpenRouter
+fallback). Inference does require a key: set `api_key` directly, or inject it
+from the environment the same way as any other provider key (see
+[Configuration](./configuration.md) for `api_key` resolution order).
+
+> **No built-in login.** This preset configures the provider through the
+> standard typed `api_key` path only; it does not add a device-flow login,
+> OAuth, or provider-specific credential storage. Set `api_key` (or its env
+> injection) to run inference.
+
 ---
 
 ## All slots
@@ -509,7 +544,7 @@ Variants: `cn`, `intl`, `code`.
 
 ### Qwen / DashScope: slot `qwen`
 
-OAuth-backed Qwen accounts use the same slot with `auth_mode = "oauth"`.
+OAuth-backed Qwen accounts use the same slot with `auth_mode = "o_auth"`.
 
 ### GLM: slot `glm`
 

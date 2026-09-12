@@ -165,6 +165,7 @@ impl Tool for SopAdvanceTool {
                     // Snapshot finished run for audit (Completed/Failed/Cancelled)
                     let finished = match &action {
                         SopRunAction::Completed { run_id, .. }
+                        | SopRunAction::Cancelled { run_id, .. }
                         | SopRunAction::Failed { run_id, .. } => engine.get_run(run_id).cloned(),
                         _ => None,
                     };
@@ -233,6 +234,9 @@ impl Tool for SopAdvanceTool {
                     }
                     SopRunAction::Completed { run_id, sop_name } => {
                         format!("SOP '{sop_name}' run {run_id} completed successfully.")
+                    }
+                    SopRunAction::Cancelled { run_id, sop_name } => {
+                        format!("SOP '{sop_name}' run {run_id} was cancelled.")
                     }
                     SopRunAction::Failed {
                         run_id,

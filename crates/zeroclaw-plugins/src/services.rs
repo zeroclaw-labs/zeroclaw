@@ -26,6 +26,13 @@ pub(crate) enum SecretLookupError {
     Unavailable,
 }
 
+/// Detail-free result for the guest-facing public-config service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigLookupError {
+    AccessDenied,
+    Unavailable,
+}
+
 impl PluginHostServices {
     /// Build the complete required host-service bundle.
     #[must_use]
@@ -70,6 +77,7 @@ pub(crate) fn test_host_services() -> PluginHostServices {
             })),
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         };
         resolve_plugin_config(&manifest, scope, None)
     }))

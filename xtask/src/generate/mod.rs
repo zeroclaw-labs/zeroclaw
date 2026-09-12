@@ -12,6 +12,7 @@ pub mod install_sh;
 pub mod packaging;
 pub mod runtime_locales;
 pub mod setup_bat;
+pub mod sop_syntax;
 pub mod spec;
 pub mod tools_ftl;
 pub mod zerocode_themes;

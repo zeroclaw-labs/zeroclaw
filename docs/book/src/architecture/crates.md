@@ -15,7 +15,7 @@ Notable submodules:
 - `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
 - `subagent/`: SubAgent spawning and lifecycle (see [Delegation & SubAgents](../agents/delegation.md))
 - `cron/`, `daemon/`, `heartbeat/`: scheduling and long-running process management
-- `skillforge/`, `skills/`: skill compilation and execution
+- `skills/`: skill compilation and execution
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
 
