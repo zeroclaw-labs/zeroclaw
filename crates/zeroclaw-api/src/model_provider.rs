@@ -11,10 +11,37 @@ pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 /// resolution time gives a clearer error site than the first API call.
 pub const MIN_BUDGET_TOKENS: u32 = 1_024;
 
-/// Parameters for native extended thinking support.
+/// How much reasoning a model should spend on a request, for model families
+/// that take a depth setting rather than a token budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingEffort {
+    Low,
+    High,
+    Max,
+}
+
+impl ThinkingEffort {
+    /// Wire value for the provider request body.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// Parameters for native extended thinking support. A model family reads
+/// whichever of the two it accepts; both are absent when the caller asked for
+/// the provider's own default depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NativeThinkingParams {
-    pub budget_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ThinkingEffort>,
     /// Requests Anthropic's `thinking.display` beta
     /// (`thinking-display-updates-2026-08-18`), which controls whether
     /// thinking blocks come back omitted, as progress updates, or
@@ -1208,7 +1235,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_includes_display_when_present() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: Some(ThinkingDisplay::Updates),
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");
@@ -1221,7 +1249,8 @@ mod thinking_display_tests {
     #[test]
     fn serialization_omits_display_when_absent() {
         let params = NativeThinkingParams {
-            budget_tokens: 1_024,
+            budget_tokens: Some(1_024),
+            effort: None,
             display: None,
         };
         let json = serde_json::to_string(&params).expect("serialization should succeed");

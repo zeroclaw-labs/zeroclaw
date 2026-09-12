@@ -9444,7 +9444,8 @@ mod tests {
         let answer_a = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 1_024,
+                    budget_tokens: Some(1_024),
+                    effort: None,
                     display: None,
                 }),
                 agent_a.turn("same request"),
@@ -9454,7 +9455,8 @@ mod tests {
         let answer_b = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
-                    budget_tokens: 2_048,
+                    budget_tokens: Some(2_048),
+                    effort: None,
                     display: None,
                 }),
                 agent_b.turn("same request"),

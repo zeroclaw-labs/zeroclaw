@@ -16,6 +16,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `temperature`: optional sampling temperature.
 - `timeout_secs`: HTTP request timeout in seconds.
 - `max_tokens`: optional response length cap.
+- `context_window`: the model's input limit in tokens. Drives history trimming and the doctor context checks. Set it for families whose model listing does not publish it.
 - `extra_headers`: extra HTTP headers for custom gateways or auth bridges.
 - `fallback_models`: alternate model IDs on the same provider alias.
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
@@ -24,7 +25,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
-Family-specific entries add their own typed fields on top of these shared fields.
+Family-specific entries add their own typed fields on top of these shared fields, for example `thinking_display` on the `anthropic` slot (see [Anthropic](#anthropic)).
 
 ## Field resolution order
 
@@ -138,7 +139,48 @@ The setting requires an Anthropic account enrolled in the
 request. Set `display = "off"` (or remove the field) to return to the
 previous wire behavior.
 
+### Per-entry override
+
+Each entry on the `anthropic` slot carries its own `thinking_display` field
+(`omitted`, `summarized` or `updates`). When it is set it wins over
+`agent.thinking.display` for requests through that entry. This includes
+`omitted`, which on the entry means the API default: no display field is
+sent, whatever the profile says. Leave the field unset to inherit the
+profile-level value. This is the same entry-overrides-profile pattern that
+`temperature` and `max_tokens` follow; see the [Anthropic](#anthropic)
+example below.
+
+Generation 5.1 and later accept only `summarized` and `omitted`, so a
+configured `updates` (from either knob) is sent to those models as
+`summarized`, and a warning names the model and the substitution. The beta
+header follows the value actually sent.
+
 ## Per-family knobs: worked examples
+
+### Anthropic
+
+Current Claude models think adaptively: the model decides how much to reason per request, and the API rejects the older fixed thinking budget, and a temperature other than 1 while thinking is active, which on these generations is the normal state. Earlier models keep the fixed budget. ZeroClaw reads the generation from the alias `model`, so one alias entry works for either.
+
+```toml
+[providers.models.anthropic.fable]
+api_key = "sk-ant-..."
+model = "claude-fable-5-1"
+max_tokens = 32000
+timeout_secs = 900
+context_window = 1000000
+thinking_display = "summarized"
+fallback_models = ["claude-opus-5"]
+```
+
+- `thinking_display` (this slot only): how much of the reasoning comes back. `summarized` returns a readable summary, and `updates` returns the short progress notes the model writes between tool calls. Leave it unset to inherit `agent.thinking.display`, or set `omitted` for the API default, which returns reasoning blocks with their text withheld. A value set here overrides the profile-level setting for this entry, and `updates` is sent as `summarized` to generation 5.1 and later (see [Native thinking display](#native-thinking-display-anthropic)). ZeroClaw adds the beta header the field needs. Older models ignore the field.
+- `max_tokens`: reasoning counts toward this cap on the current models, so the 4096 default is low. ZeroClaw warns when an adaptive model runs at or below it. Use 16000 or more, and 32000 for agentic work.
+- `timeout_secs`: a single request on a hard task can run for minutes. Raise this rather than relying on the default.
+- `context_window`: the large window is not auto-detected for this family. Set it so history trimming and `zeroclaw doctor` use the real limit.
+- `temperature`: current models reject a temperature other than 1 while thinking is active. A configured value is dropped with a warning naming it, so leave it unset on these aliases.
+
+Reasoning depth comes from the thinking level. The runtime profile setting `[runtime_profiles.<alias>.thinking] default_level`, or a `/think:<level>` prefix on one message, maps to the request depth: `off`, `minimal` and `low` ask for low; `medium`, the default, asks for nothing and lets the model choose; `high` and `max` ask for those. Setting `native_thinking = true` still selects the fixed budget on older models and does nothing on current ones.
+
+Signed reasoning is replayed only within the tool round that produced it, because these models reject reasoning whose conversation prefix has since changed.
 
 ### Ollama
 
