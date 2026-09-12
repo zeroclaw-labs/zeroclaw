@@ -21,6 +21,8 @@ pub(crate) const SAFE_SHELL_ENV_VARS: &[&str] = &[
     "WINDIR",
     "COMSPEC",
     "PSModulePath",
+    // Preserve the host-selected analysis cache to avoid costly module rediscovery.
+    "PSModuleAnalysisCachePath",
     "TEMP",
     "TMP",
     "TERM",
@@ -56,5 +58,6 @@ mod tests {
     #[test]
     fn safe_shell_env_vars_preserve_powershell_module_discovery() {
         assert!(SAFE_SHELL_ENV_VARS.contains(&"PSModulePath"));
+        assert!(SAFE_SHELL_ENV_VARS.contains(&"PSModuleAnalysisCachePath"));
     }
 }
