@@ -1,5 +1,5 @@
 name: Feature Request
-description: Propose an improvement or new capability
+description: Propose an improvement or new capability through the ordinary issue path
 title: "[Feature]: "
 labels:
   - enhancement
@@ -7,7 +7,11 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for sharing your idea.
+        **Use this form for new capabilities and improvements.** Most work does not need an RFC.
+        If you are unsure whether the proposal crosses an RFC trigger, use this form and describe
+        the architecture impact below. A maintainer can promote it if a durable project-level
+        decision is actually required.
+
         Please focus on user value, constraints, and rollout safety.
         Do not include personal/sensitive data; use neutral project-scoped placeholders.
 
@@ -90,10 +94,10 @@ body:
     id: routing
     attributes:
       label: Expected routing
-      description: Helps maintainers choose triage, design discussion, tracker routing, or contributor scoping.
+      description: Most feature requests use ordinary triage. Maintainers decide whether an RFC trigger is crossed.
       options:
         - Ordinary feature triage
-        - Needs design or RFC discussion first
+        - Needs maintainer design assessment
         - Should attach to an existing roadmap/tracker issue
         - Could become contributor-ready after maintainer scoping
         - Not sure

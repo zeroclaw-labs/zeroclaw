@@ -127,7 +127,7 @@ Process two groups:
    - Bug report (reproducible defect, something broken)
    - Feature request (new capability, enhancement)
    - Support question (how do I do X, why doesn't my config work)
-   - RFC (architectural proposal — do not triage; leave as-is)
+   - RFC (meets an RFC trigger below — do not triage; leave as-is)
    - Security issue (vulnerability — redirect immediately, see §2a)
    - Spam or noise — flag to user, do not close autonomously
 
@@ -379,15 +379,38 @@ Stale closures are especially sensitive — a reporter may have been waiting pat
 
 ## §7 Label Taxonomy
 
-Derived from RFC #5577 and current maintainer label policy. Apply these consistently:
+Derived from current maintainer label policy, with RFC scope set by [#9496](https://github.com/zeroclaw-labs/zeroclaw/issues/9496) (FND-003 Rev. 15). Apply these consistently:
 
 ### Type
 
 - `bug` — reproducible defect
 - `feature` — new capability or enhancement
-- `type:rfc` — architectural proposal issue
+- `type:rfc` — meets an RFC trigger; see below
 - `r:needs-repro` — bug report missing reproduction evidence
 - `r:support` — usage/configuration question, not a bug
+
+#### Applying `type:rfc`
+
+Never apply `type:rfc` because an issue merely sounds architectural, carries
+`domain:architecture`, or is labeled `risk:high`. Apply it only when the proposal requires a durable
+project-level decision before implementation, meaning it is at least one of:
+
+- a new security layer, or a material change to the project's security model;
+- a governance, contribution-process, or project-authority change;
+- a cross-cutting architectural refactor that changes ownership or contracts across established boundaries;
+- a new subsystem, or another project-wide capability boundary.
+
+An ordinary feature addition, a schema or data migration, a configuration field or default change, and
+a bounded implementation refactor are **not** RFCs, however large the diff or however sensitive the
+surrounding subsystem. A new channel, provider, or tool is ordinary work unless its substantive effect
+also crosses one of the triggers above.
+
+The test is substantive project effect, not the issue title, the author, or an AI-assisted origin.
+Explicit non-goals and acceptance criteria help scope the work, but they do not determine the trigger
+by themselves.
+
+When in doubt, do not apply `type:rfc`; leave the type label as-is and flag the issue to the user.
+Adding it wrongly parks the work behind a Core vote it does not need.
 
 ### Priority (apply when determinable)
 
