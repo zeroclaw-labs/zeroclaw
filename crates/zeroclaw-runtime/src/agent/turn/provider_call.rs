@@ -121,6 +121,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
         current_usd,
         limit_usd,
         period,
+        agent_alias,
     }) = check_tool_loop_budget()
     {
         ::zeroclaw_log::record!(
@@ -132,9 +133,17 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
                     "current_usd": current_usd,
                     "limit_usd": limit_usd,
                     "period": format!("{period:?}"),
+                    "agent_alias": agent_alias,
                 })),
             "tool-call loop budget exceeded"
         );
+        if let Some(agent_alias) = agent_alias {
+            anyhow::bail!(
+                "Budget exceeded for agent `{agent_alias}`: ${current_usd:.4} of \
+                 ${limit_usd:.2} {period:?} daily ceiling. Cannot make further API \
+                 calls until the budget resets.",
+            );
+        }
         anyhow::bail!(
             "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
             current_usd,

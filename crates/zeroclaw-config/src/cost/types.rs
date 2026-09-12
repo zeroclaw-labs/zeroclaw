@@ -297,6 +297,10 @@ pub enum BudgetCheck {
         limit_usd: f64,
         /// Aggregation period whose limit would be exceeded.
         period: UsagePeriod,
+        /// Agent alias whose own daily spend tripped a per-agent ceiling.
+        /// `None` for the shared (process-wide) limits; consumers use it to
+        /// name the tripped ceiling in user-facing refusals.
+        agent_alias: Option<String>,
     },
 }
 
