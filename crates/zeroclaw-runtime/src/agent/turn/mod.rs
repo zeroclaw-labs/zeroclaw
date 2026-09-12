@@ -27,7 +27,9 @@ pub(crate) mod vision_route;
 
 pub(crate) use call_prep::{PreparedToolCalls, prepare_tool_calls};
 pub(crate) use context::{TurnCtx, TurnMeta};
-pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
+pub(crate) use context_recovery::{
+    ContextRecovery, record_llm_failure, try_recover_context_overflow,
+};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{
@@ -975,7 +977,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     context_token_budget,
                 )
                 .await;
-                if recovered {
+                if recovered.recovered() {
                     continue;
                 }
                 // A stream that died after caller-visible output: persist the
@@ -1004,7 +1006,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     ));
                     turn_state.push_dual(msg);
                 }
-                return Err(e);
+                return Err(if recovered == ContextRecovery::Unrecoverable {
+                    zeroclaw_api::turn_stop::tag(
+                        e,
+                        zeroclaw_api::turn_stop::TurnStop::fatal(
+                            zeroclaw_api::turn_stop::TurnStopCode::ContextOverflow,
+                            "context window exceeded and history cannot be trimmed further",
+                        ),
+                    )
+                } else {
+                    e
+                });
             }
         };
 
