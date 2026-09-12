@@ -82,6 +82,56 @@ fn websocket_session_prompt_budget<T, E>(
     }
 }
 
+/// Registration owned by one admitted WebSocket turn.
+///
+/// The gateway token registry is the canonical cancellation authority. Create
+/// this immediately after the queue admission's generation check, before any
+/// fallible setup or provider work. A REST DELETE can then cancel the exact
+/// admitted turn instead of waiting behind it and missing the token.
+struct GatewayCancelTokenRegistration<'a> {
+    state: &'a AppState,
+    session_key: &'a str,
+    session_generation: u64,
+    token: tokio_util::sync::CancellationToken,
+}
+
+impl<'a> GatewayCancelTokenRegistration<'a> {
+    fn register(state: &'a AppState, session_key: &'a str, session_generation: u64) -> Self {
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(session_key.to_string(), (session_generation, token.clone()));
+        Self {
+            state,
+            session_key,
+            session_generation,
+            token,
+        }
+    }
+
+    fn token(&self) -> tokio_util::sync::CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for GatewayCancelTokenRegistration<'_> {
+    fn drop(&mut self) {
+        let mut cancel_tokens = self
+            .state
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cancel_tokens
+            .get(self.session_key)
+            .is_some_and(|(generation, _)| *generation == self.session_generation)
+        {
+            cancel_tokens.remove(self.session_key);
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
     #[serde(rename = "type")]
@@ -668,6 +718,11 @@ async fn handle_socket(
                         let _ = sender.send(Message::Text(err.to_string().into())).await;
                         return;
                     }
+                    let cancellation = GatewayCancelTokenRegistration::register(
+                        &state,
+                        &session_key,
+                        session_generation,
+                    );
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -680,7 +735,7 @@ async fn handle_socket(
                         &content,
                         &session_key,
                         &session_id,
-                        session_generation,
+                        cancellation.token(),
                         auth_subject.as_deref(),
                     )
                     .await;
@@ -850,6 +905,11 @@ async fn handle_socket(
                     let _ = sender.send(Message::Text(err.to_string().into())).await;
                     continue;
                 }
+                let cancellation = GatewayCancelTokenRegistration::register(
+                    &state,
+                    &session_key,
+                    session_generation,
+                );
 
                 process_chat_message(
                     &state,
@@ -863,7 +923,7 @@ async fn handle_socket(
                     &content,
                     &session_key,
                     &session_id,
-                    session_generation,
+                    cancellation.token(),
                     auth_subject.as_deref(),
                 )
                 .await;
@@ -1074,7 +1134,7 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
     session_id: &str,
-    session_generation: u64,
+    cancel_token: tokio_util::sync::CancellationToken,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
@@ -1175,22 +1235,6 @@ async fn process_chat_message(
     let turn_id = uuid::Uuid::new_v4().to_string();
     if let Some(ref backend) = state.session_backend {
         let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
-    }
-
-    // ── Cancellation token lifecycle ─────────────────────────────
-    // Create a token before the turn starts so the abort endpoint
-    // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(
-                session_key.to_string(),
-                (session_generation, cancel_token.clone()),
-            );
     }
 
     // Channel for streaming turn events from the agent.
@@ -1442,20 +1486,6 @@ async fn process_chat_message(
     };
 
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
-
-    // ── Remove cancel token (turn finished) ──────────────────────
-    {
-        let mut cancel_tokens = state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned");
-        if cancel_tokens
-            .get(session_key)
-            .is_some_and(|(generation, _)| *generation == session_generation)
-        {
-            cancel_tokens.remove(session_key);
-        }
-    }
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
@@ -2163,6 +2193,90 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
         assert_eq!(messages[0].content, "successor");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_delete_cancels_websocket_turn_registered_at_admission() {
+        use axum::extract::Path;
+        use zeroclaw_infra::session_backend::SessionBackend;
+        use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+        let tmp = tempfile::TempDir::new().expect("temporary gateway workspace");
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("gateway data directory");
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).expect("SQLite session backend"));
+        backend
+            .append(
+                "gw_delete-admission",
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .expect("durable session");
+        backend
+            .set_session_prompt("gw_delete-admission", "task", "keep this task")
+            .expect("durable prompt attachment");
+
+        let state = crate::api::tests::test_state_with_session_backend(config, backend.clone());
+        let session_key = "gw_delete-admission";
+        let session_guard = state
+            .session_queue
+            .acquire(session_key)
+            .await
+            .expect("WebSocket turn admission");
+        let generation = state.session_queue.generation(session_key).await;
+        let cancellation =
+            GatewayCancelTokenRegistration::register(&state, session_key, generation);
+        let token = cancellation.token();
+
+        let delete = crate::api::handle_api_session_delete(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            Path("delete-admission".to_string()),
+        );
+        tokio::pin!(delete);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut delete)
+                .await
+                .is_err(),
+            "DELETE must wait for the admitted WebSocket turn to finalize"
+        );
+        assert!(
+            token.is_cancelled(),
+            "DELETE must find the token registered immediately after WebSocket admission"
+        );
+
+        // Match the WebSocket handler's exit order: remove its registration
+        // before it releases the queue, then let DELETE own the lifecycle
+        // boundary and delete the durable session and attached prompts.
+        drop(cancellation);
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), delete)
+            .await
+            .expect("DELETE completes after cancelled turn finalization")
+            .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(!backend.session_exists(session_key));
+        assert!(
+            backend
+                .list_session_prompts(session_key)
+                .expect("deleted session prompt query")
+                .is_empty(),
+            "deletion must remove attachments after cancelling the admitted turn"
+        );
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel token lock")
+                .contains_key(session_key),
+            "a completed deletion must not leave an admission token behind"
+        );
     }
 
     #[tokio::test]
