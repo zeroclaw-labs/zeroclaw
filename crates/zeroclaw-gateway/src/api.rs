@@ -23,6 +23,9 @@ fn integration_entry_json(
         "category": entry.category,
         "category_label": entry.category.label(),
         "status": entry.status,
+        // Canonical config map key (provider family key / ChannelsConfig map
+        // key) for deep links; null when the entry has no config section.
+        "key": &entry.key,
     })
 }
 
@@ -1963,7 +1966,9 @@ pub async fn handle_api_session_delete(
     // registration and will clean it up. Cancellation is bound to the queue
     // incarnation captured above, so a stale DELETE cannot affect a same-ID
     // successor that has registered its own token.
-    if cancel_gateway_turn_at_generation(&state, &session_key, expected_generation) {
+    let deletion_cancellation =
+        signal_gateway_deletion_at_generation(&state, &session_key, expected_generation);
+    if deletion_cancellation.cancelled_active_turn {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2023,28 +2028,82 @@ pub async fn handle_api_session_delete(
     }
 }
 
-/// Cancel the active gateway turn only when it belongs to `expected_generation`.
+/// Lifecycle signal owned by one DELETE request.
+///
+/// An unconsumed pre-registration signal is removed when DELETE fails, so a
+/// later turn cannot inherit a cancellation from a request that made no
+/// durable lifecycle change.
+pub(crate) struct GatewayDeletionCancellation<'a> {
+    state: &'a AppState,
+    session_key: &'a str,
+    session_generation: u64,
+    pending: bool,
+    pub(crate) cancelled_active_turn: bool,
+}
+
+impl Drop for GatewayDeletionCancellation<'_> {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        let mut cancellations = self
+            .state
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if cancellations.pending_deletions.get(self.session_key) == Some(&self.session_generation) {
+            cancellations.pending_deletions.remove(self.session_key);
+        }
+    }
+}
+
+/// Cancel an active gateway turn or atomically latch DELETE for an admitted
+/// turn that has not registered its token yet.
 ///
 /// Gateway session IDs are reusable after deletion. The cancellation registry
-/// must therefore carry the same incarnation boundary as the session queue;
-/// otherwise a delayed DELETE can abort a replacement session's turn.
-fn cancel_gateway_turn_at_generation(
-    state: &AppState,
-    session_key: &str,
+/// carries the same incarnation boundary as the session queue. The pending
+/// latch and token registration share one mutex, so either DELETE observes and
+/// cancels the exact active token or the later registration consumes the latch.
+pub(crate) fn signal_gateway_deletion_at_generation<'a>(
+    state: &'a AppState,
+    session_key: &'a str,
     expected_generation: u64,
-) -> bool {
-    let token = state
+) -> GatewayDeletionCancellation<'a> {
+    let mut cancellations = state
         .cancel_tokens
         .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(session_key)
-        .filter(|(generation, _)| *generation == expected_generation)
-        .map(|(_, token)| token.clone());
-    let Some(token) = token else {
-        return false;
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some((generation, token)) = cancellations.get(session_key)
+        && *generation == expected_generation
+    {
+        token.cancel();
+        return GatewayDeletionCancellation {
+            state,
+            session_key,
+            session_generation: expected_generation,
+            pending: false,
+            cancelled_active_turn: true,
+        };
     };
-    token.cancel();
-    true
+    // A different active generation is a successor. Never publish a pending
+    // signal for it from this stale DELETE.
+    let pending = match cancellations
+        .pending_deletions
+        .entry(session_key.to_string())
+    {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(expected_generation);
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(_) => false,
+    };
+    GatewayDeletionCancellation {
+        state,
+        session_key,
+        session_generation: expected_generation,
+        pending,
+        cancelled_active_turn: false,
+    }
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -2465,7 +2524,9 @@ pub(crate) mod tests {
             path_prefix: String::new(),
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(
+                crate::GatewayCancellationRegistry::default(),
+            )),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -2618,6 +2679,7 @@ pub(crate) mod tests {
             description: "Run browser automation".into(),
             category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
             status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+            key: None,
         };
 
         let json = integration_entry_json(&entry);
@@ -2625,6 +2687,22 @@ pub(crate) mod tests {
         assert_eq!(json["category"], "ToolsAutomation");
         assert_eq!(json["category_label"], "Tools & Automation");
         assert_eq!(json["status"], "Active");
+        assert!(json["key"].is_null());
+    }
+
+    #[test]
+    fn integration_entry_json_exposes_config_key() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Z.AI".into(),
+            description: String::new(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::AiModel,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Available,
+            key: Some("zai".into()),
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["key"], "zai");
     }
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
@@ -3811,20 +3889,21 @@ pub(crate) mod tests {
                 (successor_generation, successor_token.clone()),
             );
 
+        let stale =
+            signal_gateway_deletion_at_generation(&state, session_key, predecessor_generation);
         assert!(
-            !cancel_gateway_turn_at_generation(&state, session_key, predecessor_generation),
+            !stale.cancelled_active_turn,
             "a stale DELETE must not find the successor token"
         );
+        drop(stale);
         assert!(
             !successor_token.is_cancelled(),
             "a stale DELETE must not cancel the same-ID successor"
         );
 
-        assert!(cancel_gateway_turn_at_generation(
-            &state,
-            session_key,
-            successor_generation
-        ));
+        let active =
+            signal_gateway_deletion_at_generation(&state, session_key, successor_generation);
+        assert!(active.cancelled_active_turn);
         assert!(successor_token.is_cancelled());
     }
 

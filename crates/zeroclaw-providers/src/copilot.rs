@@ -732,7 +732,10 @@ fn admit_cache_dir(path: &Path) -> io::Result<Arc<Dir>> {
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(unix)]
             let mut builder = cap_std::fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = cap_std::fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use cap_std::fs::DirBuilderExt;

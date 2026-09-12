@@ -1442,7 +1442,7 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
+                crate::GatewayCancellationRegistry::default(),
             )),
             pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,

@@ -98,11 +98,26 @@ struct GatewayCancelTokenRegistration<'a> {
 impl<'a> GatewayCancelTokenRegistration<'a> {
     fn register(state: &'a AppState, session_key: &'a str, session_generation: u64) -> Self {
         let token = tokio_util::sync::CancellationToken::new();
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), (session_generation, token.clone()));
+        let pending_delete = {
+            let mut cancel_tokens = state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned");
+            let pending_delete = cancel_tokens
+                .pending_deletions
+                .remove(session_key)
+                .is_some_and(|generation| generation == session_generation);
+            if let Some((generation, stale)) =
+                cancel_tokens.insert(session_key.to_string(), (session_generation, token.clone()))
+                && generation == session_generation
+            {
+                stale.cancel();
+            }
+            pending_delete
+        };
+        if pending_delete {
+            token.cancel();
+        }
         Self {
             state,
             session_key,
@@ -2277,6 +2292,47 @@ data: {\"type\":\"message_stop\"}\n\n",
                 .contains_key(session_key),
             "a completed deletion must not leave an admission token behind"
         );
+    }
+
+    /// DELETE can reach the lifecycle signal after queue admission but before
+    /// the WebSocket handler has installed its cancellation token. That exact
+    /// interleaving must not let the turn start uncancelled.
+    #[tokio::test]
+    async fn websocket_registration_consumes_pending_delete_at_admission() {
+        let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_pending-delete";
+        let session_guard = state
+            .session_queue
+            .acquire(session_key)
+            .await
+            .expect("WebSocket turn admission");
+        let generation = state.session_queue.generation(session_key).await;
+
+        let delete =
+            crate::api::signal_gateway_deletion_at_generation(&state, session_key, generation);
+        assert!(
+            !delete.cancelled_active_turn,
+            "the token does not exist yet, so DELETE must latch its generation"
+        );
+        let registration =
+            GatewayCancelTokenRegistration::register(&state, session_key, generation);
+        assert!(
+            registration.token().is_cancelled(),
+            "registration must atomically consume the pending DELETE signal"
+        );
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel token lock")
+                .pending_deletions
+                .contains_key(session_key),
+            "the consumed signal must not remain for a later session"
+        );
+
+        drop(registration);
+        drop(delete);
+        drop(session_guard);
     }
 
     #[tokio::test]
