@@ -428,6 +428,14 @@ pub enum StreamError {
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
 
+    /// The provider already exhausted its own retry/fallback budget producing
+    /// this error; consumers must not retry or fall back. Produced only when a
+    /// completed non-streaming call is synthesized into a stream (the wrapped
+    /// failure already survived the full ladder). A genuine streaming leg never
+    /// emits it, so fallback recovery for streamed failures is unaffected.
+    #[error("terminal provider error: {0}")]
+    Terminal(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

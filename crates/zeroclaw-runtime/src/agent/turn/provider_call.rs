@@ -249,47 +249,78 @@ pub(crate) async fn call_provider(
                                 scope.mark_stream_recovery_semantic_empty();
                             }
                             scope.record_stream_recovery_failure(&stream_err);
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                    .with_category(::zeroclaw_log::EventCategory::Provider)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({
-                                        "model": active_model,
-                                        "iteration": iteration + 1,
-                                        "error": scrub_credentials(&stream_err.to_string()),
-                                        "trace_id": ctx.turn_id,
-                                    })),
-                                "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
-                            );
-                            scope.clear_provisional_provider_route();
-                            let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-                            let recovery = with_exact_dispatch_route(
-                                ctx.provider_name.to_string(),
-                                active_model.to_string(),
-                                dispatcher.chat(
-                                ChatRequest {
-                                    messages: prepared_messages,
-                                    tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
-                                },
-                                active_model,
-                                ctx.temperature,
-                                ),
-                            );
-                            let result = if let Some(token) = ctx.cancellation_token {
-                                tokio::select! {
-                                    biased;
-                                    () = token.cancelled() => Err(ToolLoopCancelled.into()),
-                                    result = recovery => result,
-                                }
+                            // A terminal stream error means the provider already
+                            // exhausted its own retry/fallback budget producing
+                            // it (the synthesized non-streaming call completed
+                            // with this failure). Re-running the non-streaming
+                            // call would repeat that whole budget, so the error
+                            // becomes the turn's provider error directly: the
+                            // same shape a failed non-streaming chat produces.
+                            if stream_err.downcast_ref::<StreamErrorWithUsage>()
+                                .is_some_and(|error| {
+                                    matches!(
+                                        &error.cause,
+                                        zeroclaw_providers::traits::StreamError::Terminal(_)
+                                    )
+                                })
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "model": active_model,
+                                            "iteration": iteration + 1,
+                                            "error": scrub_credentials(&stream_err.to_string()),
+                                            "trace_id": ctx.turn_id,
+                                        })),
+                                    "llm_stream_terminal: provider stream error is terminal, not falling back to non-streaming chat"
+                                );
+                                (Err(stream_err), false, false, String::new())
                             } else {
-                                recovery.await
-                            };
-                            (result, false, false, String::new())
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "model": active_model,
+                                            "iteration": iteration + 1,
+                                            "error": scrub_credentials(&stream_err.to_string()),
+                                            "trace_id": ctx.turn_id,
+                                        })),
+                                    "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
+                                );
+                                scope.clear_provisional_provider_route();
+                                let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                                let recovery = with_exact_dispatch_route(
+                                    ctx.provider_name.to_string(),
+                                    active_model.to_string(),
+                                    dispatcher.chat(
+                                    ChatRequest {
+                                        messages: prepared_messages,
+                                        tools: request_tools,
+                                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                            .try_with(Clone::clone)
+                                            .ok()
+                                            .flatten(),
+                                    },
+                                    active_model,
+                                    ctx.temperature,
+                                    ),
+                                );
+                                let result = if let Some(token) = ctx.cancellation_token {
+                                    tokio::select! {
+                                        biased;
+                                        () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                        result = recovery => result,
+                                    }
+                                } else {
+                                    recovery.await
+                                };
+                                (result, false, false, String::new())
+                            }
                         }
                     }
                 }))))
@@ -1522,5 +1553,520 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+
+    /// Non-streaming leaf whose every request fails with a fixed error text.
+    /// Counts physical requests across both surfaces so a test can catch an
+    /// unexpected streaming leg too.
+    struct SynthesizedLadderCountingLeaf {
+        physical_requests: Arc<AtomicUsize>,
+        error_text: &'static str,
+    }
+
+    impl Attributable for SynthesizedLadderCountingLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "SynthesizedLadderCountingLeaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SynthesizedLadderCountingLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("{}", self.error_text)
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_providers::traits::StreamError::ModelProvider(self.error_text.to_string()),
+            )]))
+        }
+    }
+
+    /// Router over Reliable over the counting leaf: the production composition
+    /// for a resolved reliability domain whose served route is non-streaming.
+    fn router_over_reliable(
+        leaf: Box<dyn ModelProvider>,
+        max_retries: u32,
+    ) -> zeroclaw_providers::router::RouterModelProvider {
+        let reliable = ReliableModelProvider::new(
+            "reliable",
+            vec![("leaf".to_string(), leaf)],
+            max_retries,
+            1,
+        );
+        zeroclaw_providers::router::RouterModelProvider::new(
+            "router-test",
+            vec![("reliable".to_string(), Box::new(reliable))],
+            vec![],
+            "test-model".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_auth_failure_walks_ladder_once() {
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_reliable(
+            Box::new(SynthesizedLadderCountingLeaf {
+                physical_requests: Arc::clone(&physical_requests),
+                error_text: "401 Unauthorized: invalid api key",
+            }),
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let auth_error = outcome
+            .chat_result
+            .expect_err("the persistent 401 must fail the turn");
+        assert!(
+            auth_error
+                .to_string()
+                .contains("All model providers/models failed after 1 failure event(s)"),
+            "the reliability domain's terminal cause must survive synthesis, got: {auth_error}"
+        );
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            1,
+            "the reliability domain already walked its ladder inside the synthesized \
+             call; the runtime must not re-walk it"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_server_failure_walks_ladder_once() {
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_reliable(
+            Box::new(SynthesizedLadderCountingLeaf {
+                physical_requests: Arc::clone(&physical_requests),
+                error_text: "503 Service Unavailable",
+            }),
+            2,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let server_error = outcome
+            .chat_result
+            .expect_err("the persistent 503 must fail the turn");
+        assert!(
+            server_error
+                .to_string()
+                .contains("All model providers/models failed after 3 failure event(s)"),
+            "the reliability domain's terminal cause must survive synthesis, got: {server_error}"
+        );
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            3,
+            "retries=2 means the ladder makes 3 physical requests; the runtime must \
+             not double them"
+        );
+    }
+
+    /// Non-streaming leaf that always succeeds: the R4 success control.
+    struct SynthesizedSuccessLeaf {
+        physical_requests: Arc<AtomicUsize>,
+    }
+
+    impl Attributable for SynthesizedSuccessLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "SynthesizedSuccessLeaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for SynthesizedSuccessLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("synthesized ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(2),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "non-streaming leaf must never be streamed".to_string(),
+                ),
+            )]))
+        }
+    }
+
+    /// Streaming leaf that emits a usage event and then fails mid-stream,
+    /// before any visible output. Its non-streaming surface recovers.
+    struct MidStreamFailingStreamingLeaf {
+        physical_requests: Arc<AtomicUsize>,
+    }
+
+    impl Attributable for MidStreamFailingStreamingLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "MidStreamFailingStreamingLeaf"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MidStreamFailingStreamingLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("recovered via non-streaming fallback".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.physical_requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::Usage(TokenUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cached_input_tokens: None,
+                })),
+                Err(zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "503 Service Unavailable".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    /// Router over a bare streaming-capable leaf: the composition for the
+    /// genuine-streaming-leg controls (no reliability domain involved).
+    fn router_over_leaf(
+        leaf: Box<dyn ModelProvider>,
+    ) -> zeroclaw_providers::router::RouterModelProvider {
+        zeroclaw_providers::router::RouterModelProvider::new(
+            "router-test",
+            vec![("leaf".to_string(), leaf)],
+            vec![],
+            "test-model".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_success_makes_exactly_one_request() {
+        // R4 success control: a resolved non-streaming route serves the turn
+        // from the single completed call. One physical request proves the
+        // fallback branch (whose log line and second request live together)
+        // never ran; the synthesized sequence's Final event is pinned at the
+        // router surface (router.rs stream_chat_serves_non_streaming_...).
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_reliable(
+            Box::new(SynthesizedSuccessLeaf {
+                physical_requests: Arc::clone(&physical_requests),
+            }),
+            0,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let response = outcome
+            .chat_result
+            .expect("the synthesized success must complete the turn");
+        assert_eq!(response.text.as_deref(), Some("synthesized ok"));
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            1,
+            "the success control must serve the turn with exactly one physical \
+             request: no stream leg, no non-streaming fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_streaming_leaf_mid_stream_failure_still_falls_back() {
+        // R4 scoping control: a GENUINE streaming leg keeps today's fallback.
+        // The leaf fails after a usage event, before visible output; the
+        // stream error is not terminal, so the runtime recovers with one
+        // non-streaming call: 2 physical requests total. (A bare leaf under
+        // the router isolates this from Reliable's stream-resume ledger,
+        // which deliberately skips the failed entry on recovery; that shape
+        // is pinned by stream_failure_without_fallback_keeps_typed_terminal_
+        // cause.)
+        let physical_requests = Arc::new(AtomicUsize::new(0));
+        let provider = router_over_leaf(Box::new(MidStreamFailingStreamingLeaf {
+            physical_requests: Arc::clone(&physical_requests),
+        }));
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = std::sync::Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "router-test",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(std::sync::Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    call_provider(
+                        &ctx,
+                        &provider,
+                        "test-model",
+                        &[ChatMessage::user("go")],
+                        None,
+                        true,
+                        0,
+                    ),
+                ),
+            )
+            .await
+            .expect("provider call returns its terminal outcome");
+
+        let response = outcome
+            .chat_result
+            .expect("the pre-output stream failure must fall back and recover");
+        assert_eq!(
+            response.text.as_deref(),
+            Some("recovered via non-streaming fallback"),
+            "the recovery must come from the leaf's non-streaming surface"
+        );
+        assert_eq!(
+            physical_requests.load(Ordering::Relaxed),
+            2,
+            "one genuine stream request + one non-streaming recovery: the \
+             fallback must still fire for non-terminal stream errors"
+        );
     }
 }

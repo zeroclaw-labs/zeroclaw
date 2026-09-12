@@ -23,3 +23,6 @@ mod container_release;
 
 #[path = "architecture/publish_contract.rs"]
 mod publish_contract;
+
+#[path = "architecture/stream_error_terminal.rs"]
+mod stream_error_terminal;
