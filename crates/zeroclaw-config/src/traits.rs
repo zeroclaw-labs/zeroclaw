@@ -926,11 +926,14 @@ pub struct IntegrationDescriptor {
 /// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
-    /// Canonical kebab-case identifier used in config TOML
-    /// (`[channels.<kind>]`). Matches the field name on
-    /// `ChannelsConfig` so Quickstart and other surfaces can
-    /// reuse the schema's own labeling without a parallel map.
+    /// Canonical runtime/API identifier for the channel type. This can differ
+    /// from the config map key when multiple runtime backends share one
+    /// `ChannelsConfig` field, such as `whatsapp-web` and `whatsapp`.
     pub kind: &'static str,
+    /// Canonical `ChannelsConfig` map key used by config APIs and TOML paths.
+    /// Keep this separate from `kind`: runtime channel identifiers can use
+    /// kebab-case or distinguish backends that share one config map.
+    pub config_key: &'static str,
     pub name: &'static str,
     pub desc: &'static str,
     pub configured: bool,

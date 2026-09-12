@@ -97,6 +97,11 @@ Tool result payloads are easy to over-preserve. Reviewers should check:
 - whether the result is only in the current turn/session history or is also
   intentionally written to memory.
 
+When `max_tool_result_chars` truncates a result, the runtime emits a
+`tool_result_truncated` log event with the original, retained, elided, and limit
+byte counts. The event carries no tool-result content; it makes the lossy prompt
+boundary visible through the normal live and persisted log surfaces.
+
 If a PR says a tool result is "remembered", require it to say whether that means
 provider-visible history, persisted session history, a memory backend row, a
 file artifact, a receipt, or a log event.

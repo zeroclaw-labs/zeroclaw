@@ -662,7 +662,7 @@ pub(crate) fn build_system_prompt_for_turn(
             native_tool_specs_present,
             skills_prompt_mode,
             compact_context,
-            max_system_prompt_chars,
+            0,
             inject_memory,
             show_tool_calls,
             shell_profile,
@@ -682,7 +682,10 @@ pub(crate) fn build_system_prompt_for_turn(
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
 
-    Ok(system_prompt)
+    Ok(crate::agent::system_prompt::finalize_system_prompt(
+        system_prompt,
+        max_system_prompt_chars,
+    ))
 }
 
 pub fn make_query_summary(raw: &str) -> Option<String> {
@@ -3218,7 +3221,7 @@ pub async fn process_message(
                 native_tool_specs_present,
                 eff_prompt_injection_mode,
                 eff_compact_context,
-                eff_max_system_prompt_chars,
+                0,
                 false,
                 config.channels.show_tool_calls,
                 runtime.shell_profile().as_ref(),
@@ -3271,6 +3274,10 @@ pub async fn process_message(
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
+        system_prompt = crate::agent::system_prompt::finalize_system_prompt(
+            system_prompt,
+            eff_max_system_prompt_chars,
+        );
 
         let effective_msg_ref = effective_message.as_str();
         let runtime_capability_names: Vec<&str> = effective_tool_names.iter().copied().collect();
@@ -13701,6 +13708,42 @@ Let me check the result."#;
     }
 
     #[test]
+    fn turn_prompt_budget_applies_after_deferred_and_thinking_sections() {
+        use zeroclaw_config::schema::{RiskProfileConfig, SkillsPromptInjectionMode};
+
+        let workspace = tempdir().expect("tempdir");
+        let provider = ScriptedModelProvider::from_text_responses(vec!["ok"]);
+        let prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &[],
+            &format!("## Deferred\n\n{}", "界".repeat(300)),
+            &[],
+            None,
+            None,
+            &RiskProfileConfig::default(),
+            &provider,
+            &[],
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            512,
+            true,
+            false,
+            Some("THINKING_PREFIX"),
+            None,
+        )
+        .expect("turn prompt");
+
+        assert_eq!(prompt.chars().count(), 512);
+        assert!(prompt.starts_with("THINKING_PREFIX"));
+        assert!(prompt.ends_with(crate::agent::prompt::TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("System prompt truncated"));
+    }
+
+    #[test]
     fn interactive_turn_system_prompt_uses_effective_dynamic_mcp_specs() {
         use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
         use zeroclaw_config::schema::{
@@ -15122,6 +15165,7 @@ Let me check the result."#;
                     input_tokens: Some(1_000),
                     output_tokens: Some(200),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15225,6 +15269,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15235,6 +15280,7 @@ Let me check the result."#;
                 input_tokens: Some(80),
                 output_tokens: Some(7),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -15586,6 +15632,7 @@ Let me check the result."#;
                     input_tokens: Some(500),
                     output_tokens: Some(100),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15813,6 +15860,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -15884,6 +15932,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
@@ -16005,6 +16054,7 @@ Let me check the result."#;
                         input_tokens: Some(1_000_000),
                         output_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -16074,6 +16124,7 @@ Let me check the result."#;
                     input_tokens: Some(800),
                     output_tokens: Some(120),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }]))),
