@@ -12,6 +12,72 @@ use zeroclaw_providers::ProviderDispatch;
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
 
+/// Why a model probe failed.
+///
+/// A local provider-construction failure is not a transient request failure:
+/// nothing was ever sent, and the saved configuration cannot produce a usable
+/// provider on reload. The linked issue requires that such a failure cannot pass
+/// model validation, so the two are kept distinct all the way to the operator-visible
+/// `ToolResult` instead of being flattened into one `anyhow::Error` and sorted
+/// by the chat-oriented `is_non_retryable` heuristic.
+///
+/// Both variants carry the effective model the probe had resolved when the
+/// failure happened, so operator-facing diagnostics can name the model that
+/// was actually validated rather than the one saved on disk.
+#[derive(Debug)]
+enum ProbeFailure {
+    /// The provider could not be built from the effective configuration.
+    /// `model` is `None` when the failure happened before the effective
+    /// model was resolved, i.e. the environment layer could not be rebuilt.
+    Construction {
+        model: Option<String>,
+        error: anyhow::Error,
+    },
+    /// The provider was built and the ping request for `model` failed.
+    Request { model: String, error: anyhow::Error },
+}
+
+#[derive(Debug)]
+enum ProbeConfigFailure {
+    Decryption,
+    EnvironmentOverride(anyhow::Error),
+    Task(anyhow::Error),
+}
+
+impl ProbeFailure {
+    fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::Construction { error, .. } | Self::Request { error, .. } => error,
+        }
+    }
+
+    /// The effective model the probe resolved before failing, if it got that far.
+    fn model(&self) -> Option<&str> {
+        match self {
+            Self::Construction { model, .. } => model.as_deref(),
+            Self::Request { model, .. } => Some(model),
+        }
+    }
+
+    /// True when the new configuration must not be kept.
+    ///
+    /// Construction failures are always fatal. Request failures defer to the
+    /// existing retry classifier, so transient network conditions still keep
+    /// the new config.
+    fn is_fatal(&self) -> bool {
+        match self {
+            Self::Construction { .. } => true,
+            Self::Request { error, .. } => zeroclaw_providers::reliable::is_non_retryable(error),
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error())
+    }
+}
+
 pub struct ModelRoutingConfigTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
@@ -602,42 +668,75 @@ impl ModelRoutingConfigTool {
 
         cfg.save().await?;
 
-        // Probe the new model with a minimal API call to catch invalid model IDs
-        // before the channel hot-reload picks up the change.
+        // Probe the effective model with a minimal API call to catch invalid
+        // model IDs before the channel hot-reload picks up the change. The
+        // saved model is read only to name something in diagnostics when the
+        // probe failed before it resolved the effective one.
         let current_model = cfg
             .providers
             .models
             .find(&type_k, &alias_k)
             .and_then(|e| e.model.clone());
         let provider_name = format!("{type_k}.{alias_k}");
-        if let Some(model_name) = current_model
-            && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
-        {
-            if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
+        if let Err(probe_err) = self.probe_model(&cfg, &provider_name).await {
+            // Name the model the probe actually validated. Only a failure
+            // that happened before the effective model was resolved falls
+            // back to the saved model, since nothing else exists to name.
+            let model_name = probe_err
+                .model()
+                .or(current_model.as_deref())
+                .unwrap_or("environment-effective model");
+            if probe_err.is_fatal() {
                 let reverted_model = previous_provider_entry
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                if let Some(prev_entry) = previous_provider_entry
-                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
-                {
-                    *slot = prev_entry;
-                }
+                // Restore the previous entry when there was one. When there
+                // was not, this `set_default` call is what created the alias,
+                // so leaving it behind would persist an alias that just failed
+                // validation — and report `Reverted to '(none)'` while doing
+                // it. Remove it instead, so the rollback claim holds for a
+                // newly added alias as well.
+                let reverted_to = match previous_provider_entry {
+                    Some(prev_entry) => {
+                        if let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k) {
+                            *slot = prev_entry;
+                        }
+                        format!("Reverted to '{reverted_model}'.")
+                    }
+                    None => {
+                        cfg.providers.models.remove_alias(&type_k, &alias_k);
+                        format!("Removed the newly created '{provider_name}' alias.")
+                    }
+                };
                 cfg.save().await?;
+
+                let safe_probe_err = zeroclaw_providers::sanitize_api_error(&probe_err.to_string());
 
                 return Ok(ToolResult {
                     success: false,
                     output: format!(
-                        "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
-                    ).into(),
-                    error: None,
+                        "Model '{model_name}' is not available: {safe_probe_err}. {reverted_to}"
+                    )
+                    .into(),
+                    error: Some(safe_probe_err),
                 });
             }
-            // Retryable errors (e.g. transient network issues) — keep the
-            // new config and let the resilient wrapper handle retries.
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model": model_name, "probe_err": probe_err.to_string()})), "Model probe returned retryable error (keeping new config)");
+            // Retryable request errors (e.g. transient network issues) — keep
+            // the new config and let the resilient wrapper handle retries.
+            // Construction failures never reach here; they are fatal above.
+            let safe_probe_err = zeroclaw_providers::sanitize_api_error(&probe_err.to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"model": model_name, "probe_err": safe_probe_err})
+                    ),
+                "Model probe returned retryable error (keeping new config)"
+            );
         }
 
         Ok(ToolResult {
@@ -651,30 +750,161 @@ impl ModelRoutingConfigTool {
         })
     }
 
+    /// Build the configuration the probe validates against, using the same
+    /// precedence a post-save reload applies.
+    ///
+    /// `cfg` was just loaded via `load_config_without_env`, which parses the
+    /// on-disk TOML as-is and never decrypts `#[secret]` fields — so any
+    /// persisted API key is still `enc2:`-ciphertext at this point, exactly
+    /// as `save()` last wrote it. `load_or_init` decrypts and *then* applies
+    /// the `ZEROCLAW_*` override layer, which is the final in-memory
+    /// authority (see `docs/book/src/reference/env-vars.md`, persistence
+    /// boundary). Reproducing only the decrypt half would validate the model
+    /// against whatever is on disk while the reloaded runtime uses the
+    /// environment values — the probe could then authenticate against the
+    /// wrong account, or send an environment-provided credential to the
+    /// stored URI rather than the effective one. Overrides also reach sibling
+    /// fields the probe depends on (`uri`, OAuth material, headers, timeouts,
+    /// and every runtime option resolved by
+    /// `provider_runtime_options_for_alias`), so the layer is applied whole
+    /// rather than field by field.
+    ///
+    /// This is a private working copy; the caller's `cfg` — and therefore
+    /// what reaches disk — is untouched.
+    async fn effective_config_for_probe(cfg: &Config) -> Result<Config, ProbeConfigFailure> {
+        let effective = cfg.clone();
+        tokio::task::spawn_blocking(move || Self::build_effective_config_for_probe(effective))
+            .await
+            .map_err(|error| ProbeConfigFailure::Task(anyhow::Error::new(error)))?
+    }
+
+    fn build_effective_config_for_probe(
+        mut effective: Config,
+    ) -> Result<Config, ProbeConfigFailure> {
+        let zeroclaw_dir = effective
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| effective.config_path.clone());
+        let store =
+            zeroclaw_config::security::SecretStore::new(&zeroclaw_dir, effective.secrets.encrypt);
+        effective
+            .decrypt_secrets(&store)
+            .map_err(|_| ProbeConfigFailure::Decryption)?;
+        let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut effective)
+            .map_err(ProbeConfigFailure::EnvironmentOverride)?;
+        effective.env_overridden_paths = applied.paths;
+        effective.pre_override_snapshots = applied.snapshots;
+        Ok(effective)
+    }
+
     /// Send a minimal 1-token chat request to verify the model is accessible.
-    /// Returns `Ok(())` if the probe succeeds **or** if no API key is available
-    /// (the probe would fail with an auth error unrelated to model validity).
-    /// ModelProvider construction failures are also treated as non-fatal.
-    async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
-        // Use the runtime config's API key (which includes env-sourced keys),
-        // not the on-disk config (which may have no key at all).
+    /// The model is taken from the effective alias entry alone, so it is
+    /// always the one a reload would serve.
+    ///
+    /// Returns `Ok(())` if the probe succeeds **or** if no API key or model
+    /// resolves for the effective alias (checking the runtime snapshot for the
+    /// key too — see below, unless the environment explicitly cleared that
+    /// path; an environment override that clears the model leaves no model),
+    /// or the saved config's secrets cannot be
+    /// decrypted. Those skips
+    /// let an operator configure an alias while offline without turning an
+    /// unrelated auth/decryption condition into a model-validity failure.
+    /// Environment-override reconstruction errors remain distinct and fatal:
+    /// they mean the probe could not rebuild the runtime-effective config.
+    /// A failure to construct the model_provider is likewise surfaced as an
+    /// `Err` rather than treated as a passing probe.
+    ///
+    /// Errors are classified via [`ProbeFailure`] so the caller can tell a
+    /// local construction failure from a request failure.
+    async fn probe_model(&self, cfg: &Config, provider_name: &str) -> Result<(), ProbeFailure> {
+        // Resolve alias identity, endpoint, credentials, and runtime options
+        // from the effective post-reload view of what was just saved — disk
+        // decrypted, then the `ZEROCLAW_*` layer applied on top — rather than
+        // from the pre-update runtime snapshot or from disk alone.
+        let mut effective = match Self::effective_config_for_probe(cfg).await {
+            Ok(effective) => effective,
+            Err(ProbeConfigFailure::Decryption) => return Ok(()),
+            Err(
+                ProbeConfigFailure::EnvironmentOverride(error) | ProbeConfigFailure::Task(error),
+            ) => {
+                return Err(ProbeFailure::Construction { model: None, error });
+            }
+        };
         let (family, alias) = provider_name
             .split_once('.')
             .unwrap_or((provider_name, "default"));
-        let entry = self.config.providers.models.find(family, alias);
-        let api_key = entry.and_then(|e| e.api_key.as_deref());
-        if api_key.is_none_or(|k| k.trim().is_empty()) {
+
+        // `effective` already carries any env-sourced credential for this
+        // alias, so it is the authority. The runtime snapshot remains a
+        // fallback for a key this process resolved at boot through a path the
+        // override layer cannot reproduce here — but only while the
+        // environment has not spoken for this field. The override layer
+        // records every path it applied, and an empty value clears an optional
+        // string, so an explicitly overridden path that resolves to no key
+        // means the reloaded runtime has no credential for this alias. Reviving
+        // the boot snapshot there would construct or dispatch with a credential
+        // the runtime will not use, and could roll a saved update back over
+        // that stale credential's rejection.
+        let effective_key = effective
+            .providers
+            .models
+            .find(family, alias)
+            .and_then(|e| e.api_key.clone())
+            .filter(|key| !key.trim().is_empty());
+        let api_key_path = format!("providers.models.{family}.{alias}.api_key");
+        let api_key = match effective_key {
+            Some(key) => Some(key),
+            None if effective.prop_is_env_overridden(&api_key_path) => None,
+            None => self
+                .config
+                .providers
+                .models
+                .find(family, alias)
+                .and_then(|e| e.api_key.clone())
+                .filter(|key| !key.trim().is_empty()),
+        };
+        let Some(api_key) = api_key else {
             return Ok(());
+        };
+
+        // Carry the resolved key on the config handed to the factory so
+        // alias-specific credentials resolve correctly regardless of which
+        // config they came from.
+        if let Some(entry) = effective.providers.models.ensure(family, alias) {
+            entry.api_key = Some(api_key);
         }
 
-        let model_provider = match zeroclaw_providers::create_model_provider_with_url(
-            provider_name,
-            api_key,
-            entry.and_then(|e| e.uri.as_deref()),
-        ) {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
+        // Probe the model the post-reload runtime will actually serve, and
+        // take it from the effective entry alone. A `ZEROCLAW_*` override on
+        // the alias's `model` field is authoritative in memory after load, so
+        // falling back to the saved value would validate a model the runtime
+        // never uses — and could roll the disk change back over a model that
+        // was never going to be served. The override layer also treats an
+        // empty value as an explicit clear of an optional field, and a saved
+        // fallback would silently undo that clear.
+        //
+        // No effective model means the reloaded runtime resolves none for this
+        // alias (such an entry is only usable through routes that carry their
+        // own model), so there is nothing to validate and the probe stops
+        // before dispatch instead of failing the update.
+        let Some(probe_model_name) = effective
+            .providers
+            .models
+            .find(family, alias)
+            .and_then(|e| e.model.clone())
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(());
         };
+
+        let model_provider =
+            zeroclaw_providers::create_model_provider_from_ref(&effective, provider_name).map_err(
+                |error| ProbeFailure::Construction {
+                    model: Some(probe_model_name.clone()),
+                    error,
+                },
+            )?;
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
@@ -682,10 +912,14 @@ impl ModelRoutingConfigTool {
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
-                model,
+                &probe_model_name,
                 Some(PING_TEMPERATURE),
             )
-            .await?;
+            .await
+            .map_err(|error| ProbeFailure::Request {
+                model: probe_model_name,
+                error,
+            })?;
 
         Ok(())
     }
@@ -1251,8 +1485,76 @@ mod tests {
         cfg.providers.models.find(family, alias).cloned()
     }
 
+    /// Mount the OpenAI-shaped `404 model_not_found` rejection the composed
+    /// unavailable-model regressions drive through `set_default`.
+    async fn mount_model_not_found(server: &wiremock::MockServer, model: &str) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "The model `{model}` does not exist or you do not have access to it."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found"
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn env_override_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        use std::sync::OnceLock;
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    /// Panic-safe owner for one process-wide environment mutation. Requiring
+    /// the shared lock guard at construction keeps writers and every
+    /// environment-reading model probe in the same serialized test domain.
+    struct TestEnvVar {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvVar {
+        fn set(
+            _env_lock: &tokio::sync::MutexGuard<'static, ()>,
+            key: &'static str,
+            value: &str,
+        ) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: all tests that read or mutate the model-routing
+            // environment hold `env_override_test_lock`; Drop restores the
+            // exact prior process value before that lock is released.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvVar {
+        fn drop(&mut self) {
+            // SAFETY: this guard is declared after the shared lock guard, so
+            // Rust drops it first while the model-routing environment remains
+            // exclusively owned by this test.
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1447,6 +1749,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_skips_probe_without_api_key() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1468,6 +1771,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
+        let _env_guard = env_override_test_lock().await;
         let tmp = TempDir::new().unwrap();
         let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1484,5 +1788,974 @@ mod tests {
         let entry = read_saved_provider_entry(&cfg_path, "custom", "default")
             .expect("temperature-only set_default must create the custom.default placeholder slot");
         assert_eq!(entry.temperature, Some(1.5));
+    }
+
+    #[tokio::test]
+    async fn probe_model_uses_saved_alias_config_not_stale_snapshot() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let stale_snapshot = test_config(&tmp).await;
+        let tool = ModelRoutingConfigTool::new(stale_snapshot.clone(), test_security());
+
+        // The tool's own construction-time snapshot has no credentials for
+        // this alias at all, so probing directly against it is a legitimate
+        // skip (no API key means nothing to validate).
+        let against_stale = tool
+            .probe_model(stale_snapshot.as_ref(), "openai.default")
+            .await;
+        assert!(against_stale.is_ok(), "{against_stale:?}");
+
+        // A config that has since been saved carries a credential the stale
+        // snapshot never had (mismatched on purpose, so construction fails
+        // locally rather than reaching the network). Both configs offer the
+        // same alias, so this exercises alias resolution, not the runtime
+        // credential fallback: the probe must resolve from the config it is
+        // given, not fall back to the runtime snapshot captured at tool
+        // construction.
+        let mut saved = (*stale_snapshot).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", "default").unwrap();
+            entry.api_key = Some("sk-ant-not-an-openai-key".to_string());
+            entry.model = Some("gpt-test".to_string());
+        }
+
+        let against_saved = tool.probe_model(&saved, "openai.default").await;
+        assert!(
+            against_saved.is_err(),
+            "probe must resolve credentials from the saved alias config, not the stale runtime snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_model_does_not_swallow_provider_construction_errors() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = (*test_config(&tmp).await).clone();
+        {
+            let entry = cfg.providers.models.ensure("openai", "default").unwrap();
+            entry.api_key = Some("sk-ant-not-an-openai-key".to_string());
+            entry.model = Some("gpt-test".to_string());
+        }
+        let tool = ModelRoutingConfigTool::new(Arc::new(cfg.clone()), test_security());
+
+        let result = tool.probe_model(&cfg, "openai.default").await;
+        let error = result.expect_err(
+            "a model_provider that fails to construct must not be reported as a passing probe",
+        );
+        assert!(error.to_string().contains("prefix mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn probe_model_falls_back_to_runtime_snapshot_credential_when_saved_config_has_none() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        // Mirrors what `load_or_init` hands the tool at boot: decrypted, and
+        // with `ZEROCLAW_*` env-var bridged credentials already resolved
+        // onto the alias - something `load_config_without_env` never sees.
+        // Mismatched on purpose so a fallback attempt fails locally instead
+        // of reaching the network.
+        let mut runtime_snapshot = (*base).clone();
+        runtime_snapshot
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .api_key = Some("sk-ant-env-sourced-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+
+        // The saved config - what `load_config_without_env` produced - has
+        // the model this update just wrote but no credential for the alias at
+        // all.
+        let mut saved = (*base).clone();
+        saved
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .model = Some("gpt-test".to_string());
+
+        let result = tool.probe_model(&saved, "openai.default").await;
+        assert!(
+            result.is_err(),
+            "probe must fall back to the runtime snapshot's credential for this alias instead of silently skipping"
+        );
+    }
+
+    /// The same fallback, but with the credential path explicitly cleared by
+    /// the environment: the effective alias then has no credential at all, so
+    /// the probe must take the no-credential skip rather than constructing
+    /// with the boot snapshot's key.
+    #[tokio::test]
+    async fn probe_model_keeps_an_explicitly_cleared_credential_clear() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        let mut runtime_snapshot = (*base).clone();
+        runtime_snapshot
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .api_key = Some("sk-ant-env-sourced-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+
+        let mut saved = (*base).clone();
+        saved
+            .providers
+            .models
+            .ensure("openai", "default")
+            .unwrap()
+            .model = Some("gpt-test".to_string());
+
+        let _api_key = TestEnvVar::set(
+            &_env_guard,
+            "ZEROCLAW_providers__models__openai__default__api_key",
+            "",
+        );
+
+        let result = tool.probe_model(&saved, "openai.default").await;
+        assert!(
+            result.is_ok(),
+            "an explicitly cleared credential must take the no-credential skip instead of \
+             reviving the boot snapshot key: {result:?}"
+        );
+    }
+
+    /// `set_default` can create the alias it then probes. On a fatal probe the
+    /// rollback must remove that alias: restoring "the previous entry" is a
+    /// no-op when there was none, which would persist an alias that just
+    /// failed validation while reporting `Reverted to '(none)'`.
+    #[tokio::test]
+    async fn set_default_fails_and_removes_a_newly_created_alias_on_construction_error() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+
+        // The credential reaches the probe through the runtime-snapshot
+        // fallback — the container/CI posture where the key is environmental
+        // and never written to disk. It is anthropic-shaped on purpose so
+        // provider construction fails locally, with no network request.
+        let base = test_config(&tmp).await;
+        let mut runtime_snapshot = (*base).clone();
+        runtime_snapshot
+            .providers
+            .models
+            .ensure("openai", "fresh_alias")
+            .unwrap()
+            .api_key = Some("sk-ant-not-an-openai-key".to_string());
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+
+        // Nothing for this alias exists on disk, so the call below is what
+        // creates it.
+        assert!(
+            read_saved_provider_entry(&cfg_path, "openai", "fresh_alias").is_none(),
+            "precondition: the alias must not exist before set_default creates it"
+        );
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai.fresh_alias",
+                "model": "gpt-test-model"
+            }))
+            .await
+            .unwrap();
+
+        // Nothing was ever sent and the saved config cannot build a usable
+        // provider on reload, so this cannot be reported as a successful
+        // update.
+        assert!(
+            !result.success,
+            "a provider-construction failure must not pass model validation: {result:?}"
+        );
+        let output = result.output.to_string();
+        assert!(
+            output.contains("API key prefix mismatch"),
+            "the operator-visible result must name the construction failure: {output}"
+        );
+        assert!(
+            !output.contains("sk-ant-not-an-openai-key"),
+            "the operator-visible result must not expose credential material: {output}"
+        );
+        assert!(
+            output.contains("[REDACTED]"),
+            "the operator-visible result must show that credential material was redacted: {output}"
+        );
+        assert!(
+            result.error.is_some(),
+            "an unsuccessful probe result must carry the error field"
+        );
+        let error = result
+            .error
+            .as_deref()
+            .expect("the failed result carries a sanitized error");
+        assert!(
+            !error.contains("sk-ant-not-an-openai-key"),
+            "ToolResult.error must not expose credential material: {error}"
+        );
+        assert!(
+            error.contains("[REDACTED]"),
+            "ToolResult.error must retain a useful redaction marker: {error}"
+        );
+        assert!(
+            output.contains("Removed the newly created"),
+            "the result must state that the new alias was removed, not that it reverted to \
+             '(none)': {output}"
+        );
+
+        // Outer boundary: the failed alias must be absent from what was
+        // persisted, not merely absent from the in-memory config.
+        let persisted = read_saved_provider_entry(&cfg_path, "openai", "fresh_alias");
+        assert!(
+            persisted.is_none(),
+            "a newly created alias must be absent from the persisted config after a failed \
+             probe, got {persisted:?}"
+        );
+    }
+
+    /// The sibling case: when the alias already existed, rollback still
+    /// restores the previous entry rather than removing it.
+    #[tokio::test]
+    async fn set_default_restores_the_previous_entry_on_construction_error() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        // Seed a real (but provider-mismatched) credential and model onto the
+        // alias through a separate write, so the tool's own runtime snapshot
+        // never observes it — mirroring the "saved config the process hasn't
+        // seen yet" scenario the probe must read from.
+        let seed = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "default",
+                "model_provider": "openai",
+                "model": "placeholder",
+                "api_key": "sk-ant-not-an-openai-key"
+            }))
+            .await
+            .unwrap();
+        assert!(seed.success, "{:?}", seed.error);
+        let before = read_saved_provider_entry(&cfg_path, "openai", "default")
+            .expect("precondition: the alias must exist before set_default updates it");
+
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": "openai",
+                "model": "gpt-test-model"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a provider-construction failure must not pass model validation: {result:?}"
+        );
+        let after = read_saved_provider_entry(&cfg_path, "openai", "default")
+            .expect("a pre-existing alias must survive rollback");
+        assert_eq!(
+            after.model, before.model,
+            "rollback must restore the previous model, not keep the failed one"
+        );
+        assert_ne!(after.model.as_deref(), Some("gpt-test-model"));
+    }
+
+    /// Environment overrides are the final in-memory authority after
+    /// decryption, so the probe must be built from the same effective
+    /// configuration a post-save reload produces — not from the disk values
+    /// alone. `set_default` never writes an API key, so when a disk key and a
+    /// `ZEROCLAW_*` key both exist, the runtime will use the environment key
+    /// while the disk key is merely what `load_config_without_env` parsed.
+    ///
+    /// Probing the disk key would validate against the wrong account, and
+    /// probing the disk `uri` would send an environment-provided credential to
+    /// the wrong endpoint.
+    #[tokio::test]
+    async fn probe_model_prefers_env_overridden_credential_and_endpoint_over_disk() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        // A test-owned alias, so the process-wide env vars below cannot
+        // collide with another test's alias.
+        const ALIAS: &str = "probe_env_case";
+
+        // Disk carries a well-formed openai key. Alone, it would construct
+        // successfully and reach the network. No `uri` here: a custom endpoint
+        // disables the provider factory's key-prefix pre-flight, which is the
+        // no-network signal phase 1 relies on.
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-disk-key".to_string());
+            entry.model = Some("gpt-test".to_string());
+        }
+
+        // Phase 1 — the credential the probe actually uses. Only the key is
+        // overridden here: the disk key is well-formed openai and would
+        // construct cleanly, while the env key is anthropic-shaped, so
+        // construction failing is observable proof of which layer was read,
+        // with no network request.
+        let key_var = "ZEROCLAW_providers__models__openai__probe_env_case__api_key";
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        let probe = {
+            let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
+            tool.probe_model(&saved, &format!("openai.{ALIAS}")).await
+        };
+
+        let failure = probe.expect_err(
+            "the env-overridden anthropic-shaped key must reach provider construction; the \
+             disk key would have constructed cleanly",
+        );
+        assert!(
+            matches!(failure, ProbeFailure::Construction { .. }),
+            "an unusable effective credential is a construction failure, not a request failure"
+        );
+        assert!(
+            failure.to_string().contains("API key prefix mismatch"),
+            "the probe must receive the runtime-effective credential: {failure}"
+        );
+
+        // Phase 2 — the sibling fields. Overriding the endpoint too, and
+        // inspecting the effective config the probe builds from, proves the
+        // whole override layer is applied rather than the credential alone.
+        // This phase is pure config resolution; nothing is dispatched.
+        let uri_var = "ZEROCLAW_providers__models__openai__probe_env_case__uri";
+        let effective = {
+            let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
+            let _uri = TestEnvVar::set(&_env_guard, uri_var, "https://env.invalid/v1");
+            ModelRoutingConfigTool::effective_config_for_probe(&saved).await
+        };
+
+        let effective = effective.expect("effective config must build");
+        let entry = effective
+            .providers
+            .models
+            .find("openai", ALIAS)
+            .expect("the alias must survive the override layer");
+        assert_eq!(
+            entry.api_key.as_deref(),
+            Some("sk-ant-env-key"),
+            "credential must come from the environment layer"
+        );
+        assert_eq!(
+            entry.uri.as_deref(),
+            Some("https://env.invalid/v1"),
+            "endpoint must come from the environment layer, or a credential could be sent to the \
+             wrong host"
+        );
+        assert_eq!(
+            zeroclaw_providers::provider_runtime_options_for_alias(&effective, "openai", ALIAS)
+                .provider_api_url
+                .as_deref(),
+            Some("https://env.invalid/v1"),
+            "the representative runtime option resolved for the probe must also be \
+             environment-effective"
+        );
+    }
+
+    /// The environment layer is the in-memory authority after load, so an
+    /// alias `model` override decides what the post-reload runtime serves.
+    /// Probing the saved disk value instead would validate — or roll back
+    /// over — a model that is never dispatched.
+    #[tokio::test]
+    async fn probe_model_dispatches_the_env_effective_alias_model_not_the_saved_one() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+
+        // A test-owned alias, so the process-wide env var below cannot
+        // collide with another test's alias.
+        const ALIAS: &str = "probe_env_model_case";
+
+        let server = MockServer::start().await;
+        // Match on the verb alone: the assertion below is about the dispatched
+        // `model`, and pinning the alias's endpoint shape here would make this
+        // regression fail for an unrelated provider-route change.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        // Disk says `gpt-disk`. A custom `uri` points the probe at the mock
+        // and disables the factory's key-prefix pre-flight, so the request is
+        // actually dispatched and its body is observable.
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-disk-key".to_string());
+            entry.model = Some("gpt-disk".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+
+        let model_var = "ZEROCLAW_providers__models__openai__probe_env_model_case__model";
+        let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env");
+
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&base), test_security());
+        let probe = tool.probe_model(&saved, &format!("openai.{ALIAS}")).await;
+
+        assert!(probe.is_ok(), "the mock accepts the probe: {probe:?}");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the probe dispatches exactly one request"
+        );
+        let body: serde_json::Value = requests[0]
+            .body_json()
+            .expect("the probe sends a JSON chat request");
+        assert_eq!(
+            body["model"].as_str(),
+            Some("gpt-env"),
+            "the probe must dispatch the environment-effective alias model; probing the saved \
+             `gpt-disk` would validate a model the post-reload runtime never serves"
+        );
+    }
+
+    /// The outer `set_default` boundary must not use the on-disk model as the
+    /// condition for probing. An environment-only model is the model a reload
+    /// serves, so a temperature-only disk update still has to validate it.
+    #[tokio::test]
+    async fn set_default_probes_an_environment_only_model_override() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_only_model_case";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.model = None;
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let model_var = "ZEROCLAW_providers__models__openai__probe_env_only_model_case__model";
+        let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-only");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "temperature": 0.4
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "the mock accepts the probe: {result:?}");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "the environment-only model must cause exactly one outer-boundary probe"
+        );
+        let body: serde_json::Value = requests[0]
+            .body_json()
+            .expect("the probe sends a JSON chat request");
+        assert_eq!(body["model"].as_str(), Some("gpt-env-only"));
+
+        let persisted = read_saved_provider_entry(&tmp.path().join("config.toml"), "openai", ALIAS)
+            .expect("set_default preserves the configured alias");
+        assert_eq!(
+            persisted.model, None,
+            "the environment-only model must not be persisted"
+        );
+        assert_eq!(persisted.temperature, Some(0.4));
+    }
+
+    /// The override layer treats an empty `ZEROCLAW_*` value as an explicit
+    /// clear of an optional field. A cleared alias model means the reloaded
+    /// runtime resolves no model at all, so the probe must not fall back to
+    /// the saved model: dispatching it would validate, and could accept, a
+    /// model the runtime never serves.
+    #[tokio::test]
+    async fn set_default_does_not_probe_the_saved_model_after_an_explicit_empty_override() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_cleared_model_case";
+
+        let server = MockServer::start().await;
+        // Any request that arrives is accepted, so a dispatched saved model is
+        // observable only through the request count asserted below.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let model_var = "ZEROCLAW_providers__models__openai__probe_env_cleared_model_case__model";
+        let _model = TestEnvVar::set(&_env_guard, model_var, "");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-disk"
+            }))
+            .await
+            .unwrap();
+
+        // The scenario is real, not vacuous: the effective entry resolves no
+        // model, exactly as the runtime resolves it, and the path is recorded
+        // as environment-owned.
+        let effective = ModelRoutingConfigTool::build_effective_config_for_probe(
+            tool.load_config_without_env().unwrap(),
+        )
+        .expect("the effective configuration rebuilds from the saved file");
+        let effective_entry = effective
+            .providers
+            .models
+            .find("openai", ALIAS)
+            .expect("the effective configuration keeps the alias");
+        assert_eq!(
+            effective_entry.model, None,
+            "an empty override clears the alias model in the effective configuration"
+        );
+        assert!(
+            effective.prop_is_env_overridden(&format!("providers.models.openai.{ALIAS}.model")),
+            "the cleared model path must be recorded as environment-owned"
+        );
+
+        assert!(
+            result.success,
+            "no effective model leaves nothing to validate, as when the saved entry has none: \
+             {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert!(
+            requests.is_empty(),
+            "the saved model must not be probed once the environment cleared the effective one; \
+             got {} request(s)",
+            requests.len()
+        );
+        let persisted = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("set_default preserves the configured alias");
+        assert_eq!(
+            persisted.model.as_deref(),
+            Some("gpt-disk"),
+            "the saved model stays on disk; only the effective view is cleared"
+        );
+    }
+
+    /// An empty `ZEROCLAW_*__api_key` override clears the alias credential the
+    /// same way an empty model override clears the model, so the reloaded
+    /// runtime holds no key for the alias. The probe must take the existing
+    /// no-credential skip instead of reviving the key this process happened to
+    /// resolve at boot: that stale credential is not what the runtime will
+    /// send, and constructing or dispatching with it can fail the update over a
+    /// key that was never going to be used.
+    #[tokio::test]
+    async fn set_default_does_not_probe_with_the_snapshot_key_after_an_explicit_empty_override() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_cleared_api_key_case";
+
+        let server = MockServer::start().await;
+        // Any request that arrives is accepted, so a probe that reached
+        // dispatch is observable only through the request count asserted below.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        // On disk: an alias with an endpoint and no credential of its own.
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        // In this process's boot snapshot: a stale credential for the same
+        // alias, which the environment has since cleared.
+        let mut runtime_snapshot = saved.clone();
+        {
+            let entry = runtime_snapshot
+                .providers
+                .models
+                .ensure("openai", ALIAS)
+                .unwrap();
+            entry.api_key = Some("sk-ant-stale-runtime-snapshot-key".to_string());
+        }
+
+        let api_key_var =
+            "ZEROCLAW_providers__models__openai__probe_env_cleared_api_key_case__api_key";
+        let _api_key = TestEnvVar::set(&_env_guard, api_key_var, "");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-test"
+            }))
+            .await
+            .unwrap();
+
+        // The scenario is real, not vacuous: the effective entry resolves no
+        // credential, exactly as the runtime resolves it, and the path is
+        // recorded as environment-owned.
+        let effective = ModelRoutingConfigTool::build_effective_config_for_probe(
+            tool.load_config_without_env().unwrap(),
+        )
+        .expect("the effective configuration rebuilds from the saved file");
+        let effective_entry = effective
+            .providers
+            .models
+            .find("openai", ALIAS)
+            .expect("the effective configuration keeps the alias");
+        assert_eq!(
+            effective_entry.api_key, None,
+            "an empty override clears the alias credential in the effective configuration"
+        );
+        assert!(
+            effective.prop_is_env_overridden(&format!("providers.models.openai.{ALIAS}.api_key")),
+            "the cleared credential path must be recorded as environment-owned"
+        );
+
+        assert!(
+            result.success,
+            "no effective credential leaves nothing to validate, as when the saved entry has \
+             none: {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert!(
+            requests.is_empty(),
+            "the boot snapshot credential must not be probed once the environment cleared the \
+             effective one; got {} request(s)",
+            requests.len()
+        );
+        let persisted = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("set_default preserves the configured alias");
+        assert_eq!(
+            persisted.model.as_deref(),
+            Some("gpt-test"),
+            "the saved update is retained under the existing no-credential skip"
+        );
+    }
+
+    /// The runtime snapshot stays available when the environment has not
+    /// spoken for the credential path: a key this process resolved at boot
+    /// through a path the override layer cannot reproduce here is still what
+    /// the reloaded runtime will use.
+    #[tokio::test]
+    async fn set_default_still_probes_with_the_snapshot_key_when_the_path_is_not_overridden() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_snapshot_key_kept_case";
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "OK" }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let mut runtime_snapshot = saved.clone();
+        {
+            let entry = runtime_snapshot
+                .providers
+                .models
+                .ensure("openai", ALIAS)
+                .unwrap();
+            entry.api_key = Some("sk-test-snapshot-key".to_string());
+        }
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(runtime_snapshot), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-test"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "the probe succeeds against the mock: {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "an unoverridden credential path still falls back to the boot snapshot key"
+        );
+    }
+
+    /// The composed unavailable-model boundary the linked issue calls for: a
+    /// realistic `model_not_found` rejection from the endpoint must reach the
+    /// operator as an unsuccessful result and restore the persisted alias.
+    #[tokio::test]
+    async fn set_default_restores_the_persisted_alias_when_the_effective_model_is_not_found() {
+        use wiremock::MockServer;
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_unavailable_model_case";
+
+        let server = MockServer::start().await;
+        mount_model_not_found(&server, "gpt-missing").await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.model = Some("gpt-known".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+        let before = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("precondition: the alias exists before set_default updates it");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-missing"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a model the endpoint rejects must not pass validation: {result:?}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records requests");
+        assert_eq!(requests.len(), 1, "exactly one probe reaches the endpoint");
+        let body: serde_json::Value = requests[0]
+            .body_json()
+            .expect("the probe sends a JSON chat request");
+        assert_eq!(body["model"].as_str(), Some("gpt-missing"));
+
+        let output = result.output.to_string();
+        assert!(
+            output.contains("Model 'gpt-missing' is not available"),
+            "the result must name the rejected model: {output}"
+        );
+        assert!(
+            output.contains("404"),
+            "the rejection status must reach the operator: {output}"
+        );
+        assert!(
+            output.contains("Reverted to 'gpt-known'"),
+            "the result must report the restored model: {output}"
+        );
+        assert!(
+            result.error.is_some(),
+            "an unsuccessful probe result must carry the error field"
+        );
+
+        let after = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("a pre-existing alias must survive rollback");
+        assert_eq!(
+            after.model, before.model,
+            "rollback must restore the previous model on disk, not keep the rejected one"
+        );
+        assert_eq!(after.model.as_deref(), Some("gpt-known"));
+    }
+
+    /// When the environment overrides the alias model, the probe validates the
+    /// environment-effective model, so a failure must name that model rather
+    /// than the one just written to disk.
+    #[tokio::test]
+    async fn set_default_failure_names_the_environment_effective_model() {
+        use wiremock::MockServer;
+
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let base = test_config(&tmp).await;
+        const ALIAS: &str = "probe_env_model_diagnostic_case";
+
+        let server = MockServer::start().await;
+        mount_model_not_found(&server, "gpt-env-missing").await;
+
+        let mut saved = (*base).clone();
+        {
+            let entry = saved.providers.models.ensure("openai", ALIAS).unwrap();
+            entry.api_key = Some("sk-test-key".to_string());
+            entry.model = Some("gpt-known".to_string());
+            entry.uri = Some(format!("{}/v1", server.uri()));
+        }
+        saved.save().await.unwrap();
+
+        let model_var =
+            "ZEROCLAW_providers__models__openai__probe_env_model_diagnostic_case__model";
+        let _model = TestEnvVar::set(&_env_guard, model_var, "gpt-env-missing");
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(saved), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "set_default",
+                "model_provider": format!("openai.{ALIAS}"),
+                "model": "gpt-disk"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success, "{result:?}");
+        let output = result.output.to_string();
+        assert!(
+            output.contains("Model 'gpt-env-missing' is not available"),
+            "the diagnostic must name the model the probe dispatched: {output}"
+        );
+        assert!(
+            !output.contains("Model 'gpt-disk'"),
+            "the diagnostic must not name a saved model the runtime never serves: {output}"
+        );
+        let after = read_saved_provider_entry(&cfg_path, "openai", ALIAS)
+            .expect("a pre-existing alias must survive rollback");
+        assert_eq!(after.model.as_deref(), Some("gpt-known"));
+    }
+
+    #[tokio::test]
+    async fn probe_model_surfaces_environment_override_reconstruction_errors() {
+        let _env_guard = env_override_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let saved = test_config(&tmp).await;
+        let invalid_var =
+            "ZEROCLAW_providers__models__openai__probe_env_error_case__not_a_schema_field";
+        let _invalid = TestEnvVar::set(&_env_guard, invalid_var, "invalid");
+
+        let tool = ModelRoutingConfigTool::new(Arc::clone(&saved), test_security());
+        let result = tool
+            .probe_model(saved.as_ref(), "openai.probe_env_error_case")
+            .await;
+
+        assert!(
+            matches!(result, Err(ProbeFailure::Construction { .. })),
+            "an invalid environment layer must be a fatal reconstruction failure: {result:?}"
+        );
+    }
+
+    /// A request failure that the retry classifier calls transient must still
+    /// keep the new config — the construction/request split must not turn
+    /// every probe failure into a rollback.
+    #[tokio::test]
+    async fn probe_failure_is_fatal_only_for_construction_and_non_retryable_requests() {
+        assert!(
+            ProbeFailure::Construction {
+                model: Some("gpt-test".to_string()),
+                error: anyhow::Error::msg("API key prefix mismatch"),
+            }
+            .is_fatal(),
+            "a local construction failure is never transient"
+        );
+        assert!(
+            !ProbeFailure::Request {
+                model: "gpt-test".to_string(),
+                error: anyhow::Error::msg("error sending request: connection reset"),
+            }
+            .is_fatal(),
+            "a transient request failure must keep the new config"
+        );
+        assert!(
+            ProbeFailure::Request {
+                model: "gpt-test".to_string(),
+                error: anyhow::Error::msg("404 model not found"),
+            }
+            .is_fatal(),
+            "a non-retryable request failure must still roll back"
+        );
     }
 }
