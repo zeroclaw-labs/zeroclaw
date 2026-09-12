@@ -735,7 +735,7 @@ fn plugin_egress_policy(
 /// miss the row `zeroclaw plugin install` seeds and deny every destination the
 /// operator granted.
 #[cfg(feature = "plugins-wasm")]
-fn plugin_egress_service(
+pub(crate) fn plugin_egress_service(
     config: Arc<Config>,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
 ) -> zeroclaw_plugins::egress::EgressHostService {

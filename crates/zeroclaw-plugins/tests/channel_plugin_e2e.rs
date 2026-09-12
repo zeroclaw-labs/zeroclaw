@@ -85,10 +85,12 @@ fn manifest() -> PluginManifest {
         capabilities: vec![PluginCapability::Channel],
         // Every fixture channel is ConfigRead-granted so the typed-config and
         // scoped-secret contract is exercised on every instantiation. The
-        // HttpClient grant is kept but inert: the host withholds `wasi:http`
-        // from channels (see `new_channel_store`), so a channel that grants
-        // HttpClient still receives no outbound-HTTP surface. The deadline
-        // tests therefore drive guest compute (a `spin` message), not network.
+        // HttpClient grant attaches the governed `wasi:http` surface (see
+        // `new_channel_store`), but these channels are constructed with no egress
+        // policy (`from_wasm(.., None)`), so reach is deny-all — no destination
+        // is reachable. The deadline tests drive guest compute (a `spin`
+        // message), not network, so a linked-but-ungoverned surface does not
+        // change what they measure.
         permissions: vec![PluginPermission::ConfigRead, PluginPermission::HttpClient],
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -151,7 +153,7 @@ async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChan
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
 
-    WasmChannel::from_wasm(endpoint, &fixture(), services, limits())
+    WasmChannel::from_wasm(endpoint, &fixture(), services, limits(), None)
         .await
         .expect("instantiate fixture channel")
 }
@@ -186,7 +188,7 @@ async fn channel_with(
     )
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
-    WasmChannel::from_wasm(endpoint, &fixture(), &services, limits)
+    WasmChannel::from_wasm(endpoint, &fixture(), &services, limits, None)
         .await
         .expect("instantiate fixture channel")
 }
@@ -367,8 +369,10 @@ async fn timed_out_channel_call_releases_lock_and_recreates_instance() {
     let channel = channel_with_timeout("recreate", Duration::from_millis(500)).await;
 
     // A spinning send outlives the 500ms wall-clock deadline; the host must
-    // interrupt it, discard the store, and release the slot lock. Channels have
-    // no outbound-HTTP surface, so the slow operation is guest compute.
+    // interrupt it, discard the store, and release the slot lock. The slow
+    // operation is guest compute (a `spin` message): the governed `wasi:http`
+    // surface is linked but has no egress grant, so it reaches nothing and no
+    // network call is involved.
     let error = channel
         .send(&outbound("spin until the deadline", "room"))
         .await

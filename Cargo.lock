@@ -13864,6 +13864,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-channel-egress-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "wasi 0.14.7+wasi-0.2.4",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-channel-plugin-fixture"
 version = "0.0.0"
 dependencies = [

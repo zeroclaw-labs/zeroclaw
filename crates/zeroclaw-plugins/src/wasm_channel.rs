@@ -55,6 +55,13 @@ struct ChannelInstanceFactory {
     /// metadata check still guards against the external account or capabilities
     /// drifting under a rebuilt instance.
     services: PluginHostServices,
+    /// Host-owned egress authority for this instance, threaded into every store
+    /// this factory builds so a rebuilt instance is governed by the same policy
+    /// as the original. `None` is deny-by-default: the `wasi:http` surface is
+    /// still attached for an `HttpClient`-granted scope, but every destination
+    /// is refused. The service resolves reach from canonical config at request
+    /// time, so it is never a snapshot.
+    egress: Option<crate::egress::EgressHostService>,
     limits: crate::component::PluginLimits,
 }
 
@@ -107,29 +114,38 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
 
 /// Build the sandboxed store backing a channel plugin.
 ///
-/// Channel outbound HTTP is intentionally UNAVAILABLE on this host build: the
-/// store is constructed WITHOUT [`PluginStoreSpec::with_granted_http`], so even
-/// a channel whose manifest grants `HttpClient` receives no `wasi:http` surface.
-/// [`PluginState::http_enabled`] is therefore false, [`build_linker`] never
-/// wires `wasi:http`, and the guest cannot reach the network at all — genuinely
-/// unavailable, not "deny-all".
+/// Channel outbound HTTP is GOVERNED, not withheld: the store composes the
+/// `wasi:http` *surface* with a host-owned *reach* policy, exactly as
+/// [`crate::wasm_tool`] wires the tool path.
 ///
-/// The reason this is fail-closed rather than governed: enabling `wasi:http`
-/// here would attach `wasmtime_wasi_http::p2::default_hooks()` — UNRESTRICTED
-/// egress with no destination allowlist, no metadata/loopback denial, no DNS
-/// pinning, and no connection budget. That is a fresh instance of the egress
-/// SSRF hole (issue 9395), which making channel construction a production
-/// caller must not introduce. Egress-governed channel HTTP is a follow-up that
-/// threads the `EgressHostService` through channel construction on top of the
-/// `PluginEgressHooks` work (issue 9582); until that lands, the channel surface
-/// stays off.
+/// - [`PluginStoreSpec::with_granted_http`] attaches the `wasi:http` surface
+///   only when this scope was granted `HttpClient`; a channel without the grant
+///   still receives no surface at all.
+/// - [`PluginStoreSpec::with_egress_policy`] attaches the reach. `egress` is
+///   `None` for deny-by-default — the surface links `wasi:http`, but
+///   [`crate::wasi_http::PluginEgressHooks`] refuses every destination before a
+///   packet leaves or a name is resolved. A `Some(service)` grants exactly the
+///   destinations the operator's `[[plugins.entries]].egress_hosts` row lists,
+///   resolved from canonical config at request time.
+///
+/// This is what closes the egress SSRF hole (issue 9395) for channels without
+/// withholding the surface: the ungoverned `wasmtime_wasi_http::p2::default_hooks()`
+/// is never installed — [`PluginState`] hands `wasi:http` the policy hooks
+/// instead — so the host owns reach even though the guest links the import
+/// (issue 9582 threads `EgressHostService` through channel construction).
 fn new_channel_store(
     scope: crate::instance::PluginInstanceScope,
     services: PluginHostServices,
     limits: crate::component::PluginLimits,
     inbound: InboundQueue,
+    egress: Option<crate::egress::EgressHostService>,
 ) -> Store<PluginState> {
-    crate::component::new_store(PluginStoreSpec::new(scope, services, limits).with_inbound(inbound))
+    crate::component::new_store(
+        PluginStoreSpec::new(scope, services, limits)
+            .with_granted_http()
+            .with_egress_policy(egress)
+            .with_inbound(inbound),
+    )
 }
 
 impl WasmChannel {
@@ -138,6 +154,7 @@ impl WasmChannel {
         wasm_path: &Path,
         services: &PluginHostServices,
         limits: crate::component::PluginLimits,
+        egress: Option<crate::egress::EgressHostService>,
     ) -> Result<Self> {
         // Resolve and validate the operator config before any guest code is
         // loaded, so an invalid section rejects registration rather than
@@ -151,6 +168,7 @@ impl WasmChannel {
         let factory = ChannelInstanceFactory {
             component: load_component(wasm_path)?,
             services: services.clone(),
+            egress,
             limits,
         };
         let instance = factory.instantiate(&endpoint, inbound.clone()).await?;
@@ -207,19 +225,21 @@ impl ChannelInstanceFactory {
         endpoint: &PluginChannelEndpoint,
         inbound: InboundQueue,
     ) -> Result<ChannelInstance> {
-        // Channel outbound HTTP is intentionally withheld: routing through
-        // `new_channel_store` builds the store WITHOUT `with_granted_http`, so
-        // even a channel whose manifest grants `HttpClient` receives no
-        // `wasi:http` surface. Granting it would attach the ungoverned
-        // `default_hooks()` egress (a fresh instance of the SSRF hole, issue
-        // 9395); `new_channel_store` carries the full rationale and the issue
-        // 9582 egress-governed follow-up. Config and secrets still reach the
+        // Channel outbound HTTP is GOVERNED, not withheld: `new_channel_store`
+        // composes the `wasi:http` surface (attached only for an
+        // `HttpClient`-granted scope) with this factory's host-owned egress
+        // reach. Threading `self.egress` here — the same authority for every
+        // store this factory builds — keeps a rebuilt instance governed by the
+        // same policy as the original; `None` denies every destination while
+        // still linking the surface. `new_channel_store` carries the full
+        // rationale (issues 9395/9582). Config and secrets continue to reach the
         // guest through the live host services threaded into the store here.
         let mut store = new_channel_store(
             endpoint.scope().clone(),
             self.services.clone(),
             self.limits,
             inbound,
+            self.egress.clone(),
         );
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
@@ -928,15 +948,26 @@ mod tests {
     }
 
     #[test]
-    fn channel_http_surface_is_unavailable_even_when_granted() {
-        // Regression for the channel-activation egress hole. Making
-        // `WasmChannel::from_wasm` a production caller must NOT grant channels a
-        // usable outbound-HTTP surface on this host build: enabling `wasi:http`
-        // would attach the ungoverned `default_hooks()` egress (a fresh instance
-        // of the egress SSRF hole, issue 9395). The store is the security
-        // boundary, so a channel whose manifest GRANTS `HttpClient` must still
-        // carry no `wasi:http` context — the surface is unavailable, not
-        // "deny-all".
+    fn channel_http_is_deny_all_without_an_egress_grant() {
+        // Repurposed from the channel-activation withhold regression. Channel
+        // outbound HTTP is now GOVERNED, not withheld: the store composes the
+        // `wasi:http` *surface* with a host-owned *reach* policy, closing the
+        // egress SSRF hole (issue 9395) without dropping the surface (issue
+        // 9582). This locks in two properties of that composition:
+        //
+        // 1. The surface is still PERMISSION-GATED. `with_granted_http` attaches
+        //    `wasi:http` only for an `HttpClient`-granted scope; a channel
+        //    without the grant receives no surface at all. This is what keeps
+        //    re-enabling the surface from silently widening ungranted channels.
+        // 2. Built with `egress = None`, the granted channel gets the surface
+        //    (`http_enabled()`), but reach is DENY-ALL — every destination is
+        //    refused before a packet leaves. The request-time refusal is proven
+        //    at the hooks layer by
+        //    `wasi_http::tests::a_store_without_an_egress_service_denies_without_spawning`
+        //    and end-to-end by `channel_egress_e2e`'s ungranted -> zero-hits
+        //    case; here we pin that a granted, ungoverned store still LINKS the
+        //    surface (the state on which deny-by-default reach then acts),
+        //    rather than reverting to the fail-closed "no surface" model.
         let granted_scope = crate::instance::test_scope(
             PluginCapability::Channel,
             "main",
@@ -949,17 +980,42 @@ mod tests {
             "precondition: the channel scope must actually grant HttpClient"
         );
 
-        let store = new_channel_store(
+        // Property 2: surface present under the governed model, reach ungoverned.
+        let granted_store = new_channel_store(
             granted_scope,
             crate::services::test_host_services(),
             crate::component::test_limits(0),
             InboundQueue::default(),
+            None,
+        );
+        assert!(
+            granted_store.data().http_enabled(),
+            "a channel that grants HttpClient must now receive the governed \
+             `wasi:http` surface; reach is deny-all until an egress policy is \
+             attached"
         );
 
+        // Property 1: the surface stays permission-gated. A channel WITHOUT the
+        // `HttpClient` grant receives no surface at all, even under the governed
+        // model — so re-enabling the surface never widens an ungranted channel.
+        let ungranted_scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
         assert!(
-            !store.data().http_enabled(),
-            "a channel that grants HttpClient must NOT receive an outbound-HTTP \
-             surface: ungoverned default_hooks() egress is the SSRF hole"
+            !ungranted_scope
+                .grants()
+                .allows(crate::PluginPermission::HttpClient),
+            "precondition: the control scope must not grant HttpClient"
+        );
+        let ungranted_store = new_channel_store(
+            ungranted_scope,
+            crate::services::test_host_services(),
+            crate::component::test_limits(0),
+            InboundQueue::default(),
+            None,
+        );
+        assert!(
+            !ungranted_store.data().http_enabled(),
+            "a channel WITHOUT HttpClient must receive no `wasi:http` surface, \
+             even under the governed egress model"
         );
     }
 
@@ -977,6 +1033,7 @@ mod tests {
             Path::new("/path/that/must/not/exist.wasm"),
             &services,
             crate::component::test_limits(0),
+            None,
         )
         .await;
         let error = match result {

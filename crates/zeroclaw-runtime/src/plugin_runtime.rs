@@ -301,6 +301,14 @@ pub async fn configured_plugin_channels(
                 return Vec::new();
             }
         };
+        // One host-owned egress authority for every channel in this plan. It is
+        // shared, not per-channel: each store carries its own instance scope, and
+        // the service resolves reach from canonical config against that scope's
+        // `config_entry_key()` at request time. Built from the same live view as
+        // the host services — before `live_config` is moved into them — so egress
+        // and config read one row, by construction.
+        let egress_service =
+            crate::tools::plugin_egress_service(Arc::clone(&config), live_config.clone());
         let host_services =
             crate::tools::plugin_host_services(Arc::clone(&host), Arc::clone(&config), live_config);
         let limits = plugin_limits(&config);
@@ -344,6 +352,7 @@ pub async fn configured_plugin_channels(
                 wasm_path,
                 &host_services,
                 limits,
+                Some(egress_service.clone()),
             )
             .await
             {
