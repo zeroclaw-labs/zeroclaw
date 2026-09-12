@@ -12,6 +12,7 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 | `github-issue-triage` | Running a backlog sweep, closing stale/duplicate issues, applying labels, enforcing the canonical [issue stale policy](./labels.md#issue-stale-policy) |
 | `github-issue` | Filing a structured issue (bug report or feature request) |
 | `github-pr` | Opening or updating a PR with a fully-populated template body |
+| `anti-slop` | Checking changed Rust code for dead-code suppression, undocumented unsafe boundaries, and undocumented panic invariants before PR submission |
 | `squash-merge` | Landing an approved PR into `master` with preserved commit history and the purple **Merged** badge |
 | `changelog-generation` | Preparing `CHANGELOG-next.md` for a release: summarises merges since the last tag |
 | `skill-creator` | Creating, editing, or benchmarking the skills themselves |
