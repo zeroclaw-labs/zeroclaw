@@ -553,7 +553,6 @@ impl SlackChannel {
         self
     }
 
-    /// Set a per-channel proxy URL that overrides the global proxy config.
     /// Enable the newer `markdown` block type for richer formatting.
     /// Only use this if your Slack workspace supports it.
     pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
@@ -561,6 +560,7 @@ impl SlackChannel {
         self
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self

@@ -98,10 +98,12 @@ impl OpenAiTtsProvider {
                 .clone()
                 .filter(|f| !f.trim().is_empty())
                 .unwrap_or_else(|| "opus".to_string()),
-            client: reqwest::Client::builder()
-                .timeout(TTS_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build HTTP client for OpenAI TTS")?,
+            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
+                "channel.tts.openai",
+            )
+            .build()
+            .context("Failed to build HTTP client for OpenAI TTS")?,
         })
     }
 }
@@ -206,10 +208,12 @@ impl ElevenLabsTtsProvider {
                 .unwrap_or_else(|| "eleven_monolingual_v1".to_string()),
             stability: config.stability.unwrap_or(0.5),
             similarity_boost: config.similarity_boost.unwrap_or(0.5),
-            client: reqwest::Client::builder()
-                .timeout(TTS_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build HTTP client for ElevenLabs TTS")?,
+            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
+                "channel.tts.elevenlabs",
+            )
+            .build()
+            .context("Failed to build HTTP client for ElevenLabs TTS")?,
         })
     }
 
@@ -333,10 +337,12 @@ impl GoogleTtsProvider {
                 .clone()
                 .filter(|c| !c.trim().is_empty())
                 .unwrap_or_else(|| "en-US".to_string()),
-            client: reqwest::Client::builder()
-                .timeout(TTS_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build HTTP client for Google TTS")?,
+            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
+                "channel.tts.google",
+            )
+            .build()
+            .context("Failed to build HTTP client for Google TTS")?,
         })
     }
 
@@ -869,10 +875,12 @@ impl PiperTtsProvider {
             .unwrap_or_else(|| "http://127.0.0.1:5000/v1/audio/speech".to_string());
         Self {
             alias: alias.to_string(),
-            client: reqwest::Client::builder()
-                .timeout(TTS_HTTP_TIMEOUT)
-                .build()
-                .expect("Failed to build HTTP client for Piper TTS"),
+            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder().timeout(TTS_HTTP_TIMEOUT),
+                "channel.tts.piper",
+            )
+            .build()
+            .expect("Failed to build HTTP client for Piper TTS"),
             api_url,
         }
     }

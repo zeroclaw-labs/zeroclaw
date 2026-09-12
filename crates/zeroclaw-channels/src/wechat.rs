@@ -774,7 +774,7 @@ impl WeChatChannel {
             peer_resolver,
             persist: None,
             pairing,
-            client: reqwest::Client::new(),
+            client: zeroclaw_config::schema::build_runtime_proxy_client("channel.wechat"),
             context_tokens: Mutex::new(HashMap::new()),
             typing_tickets: Mutex::new(HashMap::new()),
             cursor: Mutex::new(String::new()),

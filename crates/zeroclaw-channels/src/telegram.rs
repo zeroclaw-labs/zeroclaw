@@ -729,7 +729,6 @@ pub struct TelegramChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     persist: Option<Arc<RwLock<Config>>>,
     pairing: Option<PairingGuard>,
-    client: reqwest::Client,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
@@ -1078,7 +1077,6 @@ impl TelegramChannel {
             peer_resolver,
             persist: None,
             pairing,
-            client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -1961,6 +1959,7 @@ impl TelegramChannel {
             // Finalize path: text is already the final answer — no debounce.
             let text = content.to_string();
             let recipient = recipient.to_string();
+            let proxy_url = self.proxy_url.clone();
             zeroclaw_spawn::spawn!(async move {
                 let is_config_voice_peer = voice_peer_resolver().contains(&recipient);
                 if !is_config_voice_peer && let Ok(mut vc) = voice_chats.lock() {
@@ -1969,6 +1968,7 @@ impl TelegramChannel {
                 match Self::synthesize_and_send_voice(
                     &api_base,
                     &bot_token,
+                    proxy_url.as_deref(),
                     &chat_id,
                     thread_id.as_deref(),
                     &text,
@@ -2013,6 +2013,7 @@ impl TelegramChannel {
 
         let pending = self.pending_voice.clone();
         let recipient = recipient.to_string();
+        let proxy_url = self.proxy_url.clone();
         zeroclaw_spawn::spawn!(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
@@ -2036,6 +2037,7 @@ impl TelegramChannel {
                 match Self::synthesize_and_send_voice(
                     &api_base,
                     &bot_token,
+                    proxy_url.as_deref(),
                     &chat_id,
                     thread_id.as_deref(),
                     &text,
@@ -2074,6 +2076,7 @@ impl TelegramChannel {
     async fn synthesize_and_send_voice(
         api_base: &str,
         bot_token: &str,
+        proxy_url: Option<&str>,
         chat_id: &str,
         thread_id: Option<&str>,
         text: &str,
@@ -2096,7 +2099,10 @@ impl TelegramChannel {
         let (method, field, filename, mime) = telegram_audio_send_spec("opus")?;
 
         let url = format!("{api_base}/bot{bot_token}/{method}");
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("channel.telegram");
+        // The same per-channel proxy every other Telegram request uses; the
+        // global proxy alone dropped a configured `proxy_url` for voice uploads.
+        let client =
+            zeroclaw_config::schema::build_channel_proxy_client("channel.telegram", proxy_url);
 
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
@@ -5290,7 +5296,7 @@ impl Channel for TelegramChannel {
         }
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("sendMessage"))
             .json(&body)
             .send()
@@ -5372,7 +5378,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -5428,7 +5434,7 @@ impl Channel for TelegramChannel {
         if !suppress_voice && self.is_voice_peer(recipient) {
             if let Ok(id) = message_id.parse::<i64>() {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5466,7 +5472,7 @@ impl Channel for TelegramChannel {
             // Delete the draft message
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5495,7 +5501,7 @@ impl Channel for TelegramChannel {
         if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
             if let Some(id) = msg_id {
                 let _ = self
-                    .client
+                    .http_client()
                     .post(self.api_url("deleteMessage"))
                     .json(&serde_json::json!({
                         "chat_id": chat_id,
@@ -5526,7 +5532,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&body)
             .send()
@@ -5552,7 +5558,7 @@ impl Channel for TelegramChannel {
         });
 
         let resp = self
-            .client
+            .http_client()
             .post(self.api_url("editMessageText"))
             .json(&plain_body)
             .send()
@@ -5572,7 +5578,7 @@ impl Channel for TelegramChannel {
         }
 
         let delete_resp = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,
@@ -5629,7 +5635,7 @@ impl Channel for TelegramChannel {
         };
 
         let response = self
-            .client
+            .http_client()
             .post(self.api_url("deleteMessage"))
             .json(&serde_json::json!({
                 "chat_id": chat_id,

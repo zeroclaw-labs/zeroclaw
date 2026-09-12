@@ -1715,15 +1715,17 @@ mod client {
             .as_deref()
             .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
-        let response = reqwest::Client::builder()
-            .timeout(WHOAMI_TIMEOUT)
-            .build()
-            .context("matrix: build whoami HTTP client")?
-            .get(url)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .context("matrix: whoami request failed")?;
+        let response = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder().timeout(WHOAMI_TIMEOUT),
+            "channel.matrix",
+        )
+        .build()
+        .context("matrix: build whoami HTTP client")?
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("matrix: whoami request failed")?;
         let status = response.status();
 
         if !status.is_success() {
@@ -3388,12 +3390,15 @@ mod outbound {
                 }
                 attempt.follow()
             });
-            reqwest::Client::builder()
-                .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(redirect_policy)
-                .user_agent("zeroclaw-matrix/1.0")
-                .build()
-                .expect("default reqwest client config never fails to build")
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder()
+                    .timeout(MARKER_HTTP_TIMEOUT)
+                    .redirect(redirect_policy)
+                    .user_agent("zeroclaw-matrix/1.0"),
+                "channel.matrix",
+            )
+            .build()
+            .expect("default reqwest client config never fails to build")
         })
     }
 

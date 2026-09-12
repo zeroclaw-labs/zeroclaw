@@ -166,10 +166,12 @@ impl GmailPushChannel {
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
+        let http = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            Client::builder().timeout(Duration::from_secs(30)),
+            "channel.gmail_push",
+        )
+        .build()
+        .expect("failed to build HTTP client");
         Self {
             config,
             alias: alias.into(),
