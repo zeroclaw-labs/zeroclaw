@@ -2917,21 +2917,7 @@ pub(crate) fn build_transcription_manager(
     config: &zeroclaw_config::schema::Config,
     agent_provider: &str,
 ) -> anyhow::Result<crate::transcription::TranscriptionManager> {
-    let manager = crate::transcription::TranscriptionManager::from_config_with_provider(
-        config,
-        agent_provider.to_string(),
-    )?;
-    if !agent_provider.is_empty() {
-        return Ok(manager);
-    }
-    let sole_provider = match manager.available_providers().as_slice() {
-        [only] => Some((*only).to_string()),
-        _ => None,
-    };
-    Ok(match sole_provider {
-        Some(alias) => manager.with_agent_transcription_provider(alias),
-        None => manager,
-    })
+    crate::transcription::build_channel_transcription_manager(config, agent_provider)
 }
 
 /// Resolves transcription state from live config at message time. `None` means

@@ -1238,35 +1238,31 @@ impl LarkChannel {
         }
     }
 
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let names = m.available_providers();
-                let m = if names.len() == 1 {
-                    let only = names[0].to_string();
-                    m.with_agent_transcription_provider(only)
-                } else {
-                    m
-                };
-                self.transcription_manager = Some(Arc::new(m));
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, audio transcription disabled"
-                );
-            }
-        }
-        self.transcription = Some(config);
         self
     }
 
@@ -5800,6 +5796,10 @@ mod tests {
         assert!(ch.transcription_manager.is_none());
     }
 
+    /// The manager cannot be built (enabled, but no usable provider), so the
+    /// channel keeps running without transcription. It must not record the
+    /// config either: a config with no manager advertised transcription the
+    /// channel could not perform, which is the drift this shared path removed.
     #[test]
     fn lark_manager_none_and_warn_on_init_failure() {
         let tc = zeroclaw_config::schema::TranscriptionConfig {
@@ -5809,7 +5809,10 @@ mod tests {
         };
         let ch = make_channel().with_transcription(tc);
         assert!(ch.transcription_manager.is_none());
-        assert!(ch.transcription.is_some());
+        assert!(
+            ch.transcription.is_none(),
+            "config is recorded only alongside a manager"
+        );
     }
 
     #[test]

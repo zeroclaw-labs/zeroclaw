@@ -1182,86 +1182,30 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure voice transcription.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                let names = m.available_providers();
-                let m = if names.len() == 1 {
-                    let only = names[0].to_string();
-                    m.with_agent_transcription_provider(only)
-                } else {
-                    m
-                };
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
-        }
-        self
-    }
-
-    pub fn with_typed_transcription_providers(
-        mut self,
-        typed: &zeroclaw_config::providers::TranscriptionProviders,
-        agent_alias: &str,
-    ) -> Self {
-        if agent_alias.is_empty() || typed.is_empty() {
-            return self;
-        }
-        let base = match self.transcription_manager.take() {
-            Some(arc) => match std::sync::Arc::try_unwrap(arc) {
-                Ok(m) => m,
-                Err(arc) => {
-                    self.transcription_manager = Some(arc);
-                    return self;
-                }
-            },
-            None => super::transcription::TranscriptionManager::empty(),
-        };
-        let updated = base
-            .with_typed_providers(typed)
-            .with_agent_transcription_provider(agent_alias.to_string());
-        self.transcription_manager = Some(std::sync::Arc::new(updated));
-        self
-    }
-
-    /// Set the agent transcription provider alias on the internal TranscriptionManager.
-    /// Must be called after `with_transcription`. No-op if transcription was not configured.
-    /// The alias should be the provider type key ("groq", "openai", etc.) registered in
-    /// the TranscriptionManager, or the full "type.alias" form (the type prefix is extracted).
-    pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
-        let alias = alias.into();
-        if alias.is_empty() {
-            return self;
-        }
-        // Resolve "groq.default" → "groq" (TranscriptionManager keys by type, not full alias)
-        let key = alias.split('.').next().unwrap_or(&alias).to_string();
-        if let Some(manager) = self.transcription_manager.take() {
-            match std::sync::Arc::try_unwrap(manager) {
-                Ok(m) => {
-                    self.transcription_manager = Some(std::sync::Arc::new(
-                        m.with_agent_transcription_provider(key),
-                    ));
-                }
-                Err(arc) => {
-                    self.transcription_manager = Some(arc);
-                }
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
     }

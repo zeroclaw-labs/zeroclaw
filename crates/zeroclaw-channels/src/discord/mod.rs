@@ -270,33 +270,31 @@ impl DiscordChannel {
         self
     }
 
-    /// Configure voice transcription for audio attachments.
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(manager) => return self.with_transcription_manager(config, manager),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
-        }
-        self
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
     }
 
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: super::transcription::TranscriptionManager,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        self.transcription_manager = Some(std::sync::Arc::new(manager));
-        self.transcription = Some(config);
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
+        }
         self
     }
 

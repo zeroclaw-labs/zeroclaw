@@ -586,28 +586,30 @@ impl SlackChannel {
         format!("https://slack.com/api/{method}")
     }
 
-    /// Configure voice transcription for audio file attachments.
-    pub fn with_transcription(
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
+    }
+
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
         }
         self
     }
@@ -6141,6 +6143,30 @@ mod tests {
             Arc::new(Vec::new),
         );
         assert_eq!(ch.channel_ids, vec!["C12345".to_string()]);
+    }
+
+    /// REGRESSION: Slack's own `with_transcription` never bound a provider, so
+    /// every audio attachment failed with "no transcription_provider
+    /// configured" even in a single-provider deployment. The shared snapshot
+    /// path binds the lone provider; the daemon path binds the owning agent's.
+    #[test]
+    fn with_transcription_binds_the_sole_provider() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            ..Default::default()
+        };
+        let ch = SlackChannel::new(
+            unique_test_bot_token(),
+            None,
+            vec!["C12345".into()],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_transcription(tc);
+        let manager = ch.transcription_manager.as_ref().expect("manager is built");
+        assert_eq!(manager.bound_provider(), "groq");
+        assert!(ch.transcription.is_some());
     }
 
     #[test]

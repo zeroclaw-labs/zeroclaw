@@ -623,50 +623,33 @@ impl WhatsAppWebChannel {
         self.send(message).await
     }
 
-    /// Configure voice transcription (STT) for incoming voice notes.
+    /// Configure voice transcription from a `[transcription]` snapshot.
+    ///
+    /// Compatibility and test path. The daemon routes every channel through
+    /// `with_transcription_manager` with a manager built from live
+    /// config and the owning agent's resolved provider; this path can only see
+    /// the legacy section, so it binds a lone registered provider and
+    /// otherwise leaves the choice unbound (see
+    /// `transcription::manager_from_snapshot`).
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_transcription(
-        mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
-    ) -> Self {
-        if !config.enabled {
-            return self;
-        }
-        match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                    "transcription manager init failed, voice transcription disabled"
-                );
-            }
-        }
-        self
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = super::transcription::manager_from_snapshot(&config);
+        self.with_transcription_manager(config, manager)
     }
 
-    /// Attach a transcription manager the caller already resolved against the
-    /// owning agent's `transcription_provider`.
-    ///
-    /// [`Self::with_transcription`] registers legacy `[transcription]`
-    /// providers only and leaves the agent alias empty, so
-    /// `TranscriptionManager::transcribe` can never select a provider. Channel
-    /// wiring uses this instead, mirroring [`Self::with_tts`], which already
-    /// binds the channel-owning agent.
+    /// Store an already-built transcription manager, or nothing. The config is
+    /// recorded only alongside a manager, so a channel never advertises
+    /// transcription it cannot perform.
     #[cfg(feature = "whatsapp-web")]
-    #[must_use]
-    pub fn with_transcription_manager(
+    pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: super::transcription::TranscriptionManager,
+        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
-        self.transcription_manager = Some(std::sync::Arc::new(manager));
-        self.transcription = Some(config);
+        if let Some(manager) = manager {
+            self.transcription_manager = Some(manager);
+            self.transcription = Some(config);
+        }
         self
     }
 
@@ -3544,6 +3527,14 @@ impl WhatsAppWebChannel {
         self
     }
 
+    pub(crate) fn with_transcription_manager(
+        self,
+        _config: zeroclaw_config::schema::TranscriptionConfig,
+        _manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    ) -> Self {
+        self
+    }
+
     pub fn with_tts(self, _config: zeroclaw_config::schema::TtsConfig) -> Self {
         self
     }
@@ -5120,11 +5111,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let manager = super::super::transcription::TranscriptionManager::from_config_with_provider(
-            &config,
-            "groq.fast".to_string(),
-        )
-        .expect("typed provider must build a manager");
+        let manager =
+            super::super::transcription::build_channel_transcription_manager(&config, "groq.fast")
+                .expect("typed provider must build a manager");
 
         let cfg = zeroclaw_config::schema::WhatsAppConfig {
             enabled: true,
@@ -5137,13 +5126,41 @@ mod tests {
             Arc::new(|| vec!["+1234567890".into()]),
             Arc::new(Vec::new),
         )
-        .with_transcription_manager(config.transcription.clone(), manager);
+        .with_transcription_manager(config.transcription.clone(), Some(Arc::new(manager)));
 
         assert!(ch.transcription.is_some());
-        assert!(
-            ch.transcription_manager.is_some(),
-            "caller-resolved manager must be installed on the channel"
-        );
+        let manager = ch
+            .transcription_manager
+            .as_ref()
+            .expect("caller-resolved manager must be installed on the channel");
+        assert_eq!(manager.bound_provider(), "groq.fast");
+    }
+
+    /// REGRESSION: WhatsApp Web's own `with_transcription` never bound a
+    /// provider, so voice notes always failed with "no transcription_provider
+    /// configured". The shared snapshot path binds the lone provider.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_binds_the_sole_provider() {
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            ..Default::default()
+        };
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            ..Default::default()
+        };
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
+        )
+        .with_transcription(tc);
+        let manager = ch.transcription_manager.as_ref().expect("manager is built");
+        assert_eq!(manager.bound_provider(), "groq");
     }
 
     #[test]
