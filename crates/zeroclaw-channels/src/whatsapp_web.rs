@@ -912,6 +912,22 @@ impl WhatsAppWebChannel {
             info.source.is_from_me,
         );
 
+        // Business-mode `fromMe` events are delivery mirrors for messages sent
+        // by the linked account, not new user input. Reject them before either
+        // approval handling or `ChannelMessage` construction so their chat JID
+        // cannot grant the direct-message reply-intent bypass downstream.
+        if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Business
+            && info.source.is_from_me
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"chat": chat, "sender": sender})),
+                "ignoring fromMe delivery mirror in business mode"
+            );
+            return;
+        }
+
         // ── Approval-reply interception ──
         //
         // Must live here rather than in the gateway: the generic resolver at
@@ -5059,6 +5075,105 @@ mod tests {
                 .is_err(),
             "business mode must not acquire the personal self-chat bypass"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_rejects_business_from_me_before_direct_message_bypass() {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const OPERATOR: &str = "15557654321";
+        const CUSTOMER: &str = "15551234567";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend_arc(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        let event = |sender: &str, from_me: bool, content: &str| {
+            single_message_event(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some(content.to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: Jid::pn(CUSTOMER),
+                        sender: Jid::pn(sender),
+                        is_from_me: from_me,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: format!("business-from-me-{from_me}"),
+                    r#type: "text".to_string(),
+                    push_name: "Business DM Probe".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = WhatsAppInboundContext {
+            tx,
+            alias: Arc::new("business-dm-provenance".to_string()),
+            peer_resolver: Arc::new(Vec::new),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode: Mode::Business,
+            dm_policy: Policy::All,
+            group_policy: Policy::All,
+            self_chat_mode: false,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+
+        let outbound_echo = event(OPERATOR, true, "outbound delivery mirror");
+        WhatsAppWebChannel::handle_inbound_message_event(&outbound_echo, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "a business-mode fromMe mirror must not reach channel dispatch"
+        );
+
+        let customer_message = event(CUSTOMER, false, "genuine customer message");
+        WhatsAppWebChannel::handle_inbound_message_event(&customer_message, &client, &context)
+            .await;
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("a genuine business DM must reach channel dispatch")
+            .expect("channel dispatch sender must remain open");
+        assert_eq!(dispatched.content, "genuine customer message");
+
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "business-dm-provenance",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
+        assert!(zeroclaw_api::channel::Channel::is_direct_message(
+            &channel,
+            &dispatched
+        ));
     }
 
     // ── Reconnect retry state machine tests (exercise production helpers) ──
