@@ -680,6 +680,138 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn execute_turn_scopes_session_prompt_tools_inside_the_spawned_task() {
+        use crate::agent::agent::Agent;
+        use crate::agent::dispatcher::XmlToolDispatcher;
+        use crate::observability::{NoopObserver, Observer};
+        use crate::tools::SessionPromptSetTool;
+        use async_trait::async_trait;
+        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+        use zeroclaw_api::model_provider::ModelProvider;
+        use zeroclaw_memory::Memory;
+        use zeroclaw_providers::{ChatRequest, ChatResponse};
+
+        struct ScriptedProvider {
+            responses: std::sync::Mutex<Vec<ChatResponse>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for ScriptedProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok("unused".into())
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                Ok(self.responses.lock().unwrap().remove(0))
+            }
+        }
+
+        impl Attributable for ScriptedProvider {
+            fn role(&self) -> Role {
+                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+            }
+
+            fn alias(&self) -> &str {
+                "session-prompt-test"
+            }
+        }
+
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..Default::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                .expect("memory creation"),
+        );
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                ChatResponse {
+                    text: Some(
+                        r#"<tool_call>
+{"name":"session_prompt_set","arguments":{"id":"task","content":"persisted marker"}}
+</tool_call>"#
+                            .into(),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        };
+        let full_config = zeroclaw_config::schema::Config {
+            session_prompt_approval: zeroclaw_config::schema::SessionPromptApproval::Disabled,
+            ..Default::default()
+        };
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SessionPromptSetTool::new(Arc::new(
+                    zeroclaw_config::policy::SecurityPolicy::default(),
+                )))],
+            ))
+            .memory(memory)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(workspace.path().to_path_buf())
+            .model_name("test-model".into())
+            .model_provider_name("session-prompt-test".into())
+            .agent_alias("rpc-agent".into())
+            .provider_switch_config(crate::agent::agent::ProviderSwitchConfig {
+                config: Some(Arc::new(full_config)),
+            })
+            .build()
+            .expect("agent build");
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(workspace.path())
+                .expect("session backend"),
+        );
+
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "remember this".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("rpc-current-session".into()),
+                agent_alias: "rpc-agent".into(),
+                model_provider: "session-prompt-test".into(),
+                model: "test-model".into(),
+                channel: "rpc",
+            },
+            None,
+            Some(backend.clone()),
+            None,
+            noop,
+        )
+        .await
+        .expect("turn must complete");
+
+        assert!(matches!(outcome, TurnOutcome::Completed { .. }));
+        let prompts = backend.list_session_prompts("rpc-current-session").unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].id, "task");
+        assert_eq!(prompts[0].content, "persisted marker");
+    }
+
     /// A forced listener teardown drops the prompt future while it is joining
     /// the turn task. The turn task must stay owned across that drop, and the
     /// connection it belongs to must stay counted until the task's cleanup has
