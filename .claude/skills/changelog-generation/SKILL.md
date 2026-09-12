@@ -112,13 +112,38 @@ Sort case-insensitively and prefix each with `@`.
 
 Write these sections in order; omit any with no content:
 
-1. Preamble (2–3 sentences — release theme, scale, reader context)
-2. Highlights (4–6 user-visible bullet points)
-3. What's New (grouped by area, human-readable sentences, PR references)
-4. Bug Fixes (summary table: Area | Fix)
-5. Breaking Changes (omit section entirely if none)
-6. Contributors (`@login` handles, case-insensitive sort, one per line)
-7. Footer (full diff reference)
+1. Preamble (2–3 sentences — release theme, scale, reader context; state
+   the commit and contributor counts as "N commits" and "M contributors")
+2. In brief (the announcement text; see the rules below)
+3. Highlights (4–6 user-visible bullet points)
+4. What's New (grouped by area, human-readable sentences, PR references)
+5. Bug Fixes (summary table: Area | Fix)
+6. Breaking Changes (omit section entirely if none)
+7. Contributors (`@login` handles, case-insensitive sort, one per line)
+8. Footer (full diff reference)
+
+#### The "In brief" section
+
+The release announcement workflows (`tweet-release.yml`,
+`discord-release.yml`) publish this section verbatim, followed by the counts
+from the preamble and a link to the website's release post. Write it as the
+post a reader would want, not as a summary of the sections below:
+
+- Two short paragraphs. The first names the biggest capability and says what
+  it does. The second starts with "Plus" and lists the next three or four
+  things, as benefits rather than module names.
+- At most 255 characters in total, so the counts and link fit under X's
+  280-character fold. Count before committing.
+- No hashtags, no slogans, no PR numbers, at most one emoji, no Markdown.
+- Reference shape, from v0.8.5:
+
+  ```
+  ZeroRelay + ZeroRouter, together — a blind relay with native mTLS, and a hosted model router.
+
+  Plus multi-chat with image upload, live thinking, two new providers, and hardened plugin, skill, sandbox, and webhook boundaries.
+  ```
+
+  The workflow appends "454 commits. 73 contributors." and the link itself.
 
 Write to **two locations**:
 - `tmp/CHANGELOG-next.md` — for in-session review before committing

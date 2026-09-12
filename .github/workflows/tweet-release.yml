@@ -12,6 +12,11 @@ on:
         description: "GitHub Release URL"
         required: true
         type: string
+      dry_run:
+        description: "Compose and print the post without publishing it"
+        required: false
+        type: boolean
+        default: false
     secrets:
       TWITTER_CONSUMER_API_KEY:
         required: false
@@ -23,14 +28,23 @@ on:
         required: false
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: "Compose the post from this stable release's notes (e.g. v0.8.5). Leave empty when supplying tweet_text."
+        required: false
+        type: string
       tweet_text:
-        description: "Custom tweet text (include emojis, keep it punchy)"
-        required: true
+        description: "Custom post text; overrides release_tag when set"
+        required: false
         type: string
       image_url:
         description: "Optional image URL to attach (png/jpg)"
         required: false
         type: string
+      dry_run:
+        description: "Compose and print the post without publishing it"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   tweet:
@@ -47,10 +61,15 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
         run: |
-          # Manual dispatch always proceeds
+          # Manual text always proceeds
           if [ -n "$MANUAL_TEXT" ]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "::error::Provide release_tag or tweet_text"
+            exit 1
           fi
 
           # Stable releases (no -beta suffix) always tweet — they represent
@@ -92,19 +111,40 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag || '' }}
           RELEASE_URL: ${{ inputs.release_url || '' }}
           MANUAL_TEXT: ${{ inputs.tweet_text || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
+          # The last STABLE release (exclude betas): the range the counts and
+          # the legacy fallback cover the whole beta cycle with.
+          PREV_STABLE=$(git tag --sort=-creatordate \
+            | grep -v "^${RELEASE_TAG}$" \
+            | grep -vE '\-beta\.' \
+            | head -1 || echo "")
+
           if [ -n "$MANUAL_TEXT" ]; then
             TWEET="$MANUAL_TEXT"
+          elif NOTES_FILE="$(mktemp)" \
+            && gh release view "$RELEASE_TAG" --json body --jq .body > "$NOTES_FILE" 2>/dev/null \
+            && [ -s "$NOTES_FILE" ]; then
+            # Preferred: the release author's "## In brief" section from the
+            # published release notes (CHANGELOG-next.md), with the counts and
+            # a link to the website's release post when one exists for this tag.
+            if [ -z "$RELEASE_URL" ]; then
+              RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+            fi
+            if ! TWEET="$(scripts/ci/release_post_text.sh \
+                --notes "$NOTES_FILE" --tag "$RELEASE_TAG" --prev "$PREV_STABLE" \
+                --site-feed https://www.zeroclaw.com/blog/rss.xml --fallback-link "$RELEASE_URL")"; then
+              echo "::warning::Release notes for ${RELEASE_TAG} carry no In brief or Highlights section; using the commit list"
+              TWEET=""
+            fi
           else
-            # Diff against the last STABLE release (exclude betas) to capture
-            # ALL features accumulated across the full beta cycle
-            PREV_STABLE=$(git tag --sort=-creatordate \
-              | grep -v "^${RELEASE_TAG}$" \
-              | grep -vE '\-beta\.' \
-              | head -1 || echo "")
+            echo "::warning::Could not read the release notes for ${RELEASE_TAG}; using the commit list"
+            TWEET=""
+          fi
 
+          if [ -z "$TWEET" ]; then
             RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
 
             # Extract ALL features since the last stable release
@@ -114,8 +154,6 @@ jobs:
               | sed 's/^feat: //' \
               | sed 's/ (#[0-9]*)$//' \
               | sort -uf || true)
-
-            FEAT_COUNT=$(echo "$FEATURES" | grep -c . || echo "0")
 
             # Format top features with rocket emoji (limit to 6 for tweet space)
             FEAT_LIST=$(echo "$FEATURES" \
@@ -169,9 +207,23 @@ jobs:
             echo "TWEET_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Dry run
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run == true
+        env:
+          TWEET_TEXT: ${{ steps.tweet.outputs.text }}
+        run: |
+          {
+            echo "## Post preview (dry run, nothing published)"
+            echo
+            echo '```'
+            echo "$TWEET_TEXT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: nothing published."
+
       - name: Check for duplicate tweet
         id: dedup
-        if: steps.check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
         shell: bash
         env:
           TWEET_TEXT: ${{ steps.tweet.outputs.text }}
@@ -185,20 +237,20 @@ jobs:
           echo "$TWEET_HASH" > "$MARKER_FILE"
 
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        if: steps.check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true
         id: tweet-cache
         with:
           path: /tmp/tweet-dedup-${{ steps.dedup.outputs.hash }}
           key: tweet-${{ steps.dedup.outputs.hash }}
 
       - name: Skip duplicate tweet
-        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit == 'true'
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true && steps.tweet-cache.outputs.cache-hit == 'true'
         run: |
           echo "::warning::Duplicate tweet detected (hash=${{ steps.dedup.outputs.hash }}) — skipping"
           echo "This exact tweet was already posted in a previous run."
 
       - name: Post to X
-        if: steps.check.outputs.skip != 'true' && steps.tweet-cache.outputs.cache-hit != 'true'
+        if: steps.check.outputs.skip != 'true' && inputs.dry_run != true && steps.tweet-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           TWITTER_CONSUMER_KEY: ${{ secrets.TWITTER_CONSUMER_API_KEY }}

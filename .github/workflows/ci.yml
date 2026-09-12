@@ -130,6 +130,9 @@ jobs:
       - name: Test CLI and hardware path-label ownership
         run: bash scripts/ci/path_labeler_matrix.test.sh
 
+      - name: Test release announcement composer
+        run: bash scripts/ci/release_post_text.test.sh
+
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
     needs: [fmt]
