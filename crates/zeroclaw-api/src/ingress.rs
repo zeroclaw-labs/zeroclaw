@@ -52,6 +52,33 @@ pub enum TurnOrigin {
     SubTurn,
 }
 
+/// The runtime-owned principal that initiated an internally driven turn —
+/// who caused the turn to exist, distinct from the executing agent identity
+/// the turn runs under. Stamped once at dispatch from the runtime's own
+/// resolved state (job config, canonical agent alias, runtime task id),
+/// never from message content or tool arguments, and immutable for the
+/// turn's lifetime. Persisted records carry it verbatim as at-time-of-action
+/// fact. Internal principals never appear in `peer_groups` and are never
+/// consulted by peer-membership checks — identity and delivery permission
+/// are separate axes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalPrincipal {
+    /// A scheduled cron job. `job_id` is the stable store id; `job_name`
+    /// the operator-facing name, if the job has one.
+    Cron {
+        job_id: String,
+        job_name: Option<String>,
+    },
+    /// A peer-agent dispatch. `sender_alias` is the sending agent's
+    /// canonical alias — the initiator only; the recipient turn executes
+    /// under the recipient's own alias.
+    PeerAgent { sender_alias: String },
+    /// A daemon-driven task (heartbeat pipeline, SOP step driver). `task`
+    /// is a runtime-owned identifier, never model-authored text.
+    Daemon { task: String },
+}
+
 /// Trust class resolved for the turn's sender. Minimal for phase 1; peer-group
 /// resolution (the real source) is phase 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +117,13 @@ pub struct IngressContext {
     /// existed deserialize fail-closed (no origin-gated behavior).
     #[serde(default)]
     pub origin: TurnOrigin,
+    /// The internal principal that initiated the turn, when the dispatching
+    /// surface stamps one (see [`InternalPrincipal`]). `None` for external
+    /// turns, for internal paths that have no principal contract yet, and
+    /// for envelopes serialized before this field existed (serde-defaults
+    /// fail-closed to absent).
+    #[serde(default)]
+    pub internal_principal: Option<InternalPrincipal>,
 }
 
 impl IngressContext {
@@ -101,6 +135,7 @@ impl IngressContext {
             transport: Transport::Internal,
             trust: TrustClass::Trusted,
             origin,
+            internal_principal: None,
         }
     }
 
@@ -151,6 +186,54 @@ impl IngressContext {
     #[must_use]
     pub fn from_origin(origin: TurnOrigin) -> Self {
         Self::phase1(origin)
+    }
+
+    /// Envelope for a turn whose origin and (optional) internal principal
+    /// are both threaded in from the entry point. With `None` this is
+    /// exactly [`IngressContext::from_origin`].
+    #[must_use]
+    pub fn from_parts(origin: TurnOrigin, internal_principal: Option<InternalPrincipal>) -> Self {
+        Self {
+            internal_principal,
+            ..Self::phase1(origin)
+        }
+    }
+
+    /// Envelope for a scheduled cron job turn stamped with its initiating
+    /// job. The principal is resolved from the job's stored config at
+    /// dispatch and is immutable for the turn's lifetime.
+    #[must_use]
+    pub fn cron_job(job_id: impl Into<String>, job_name: Option<String>) -> Self {
+        Self::from_parts(
+            TurnOrigin::Cron,
+            Some(InternalPrincipal::Cron {
+                job_id: job_id.into(),
+                job_name,
+            }),
+        )
+    }
+
+    /// Envelope for a peer-agent dispatch stamped with the sending agent's
+    /// canonical alias — the initiator; the recipient turn still executes
+    /// under the recipient's own alias.
+    #[must_use]
+    pub fn peer_agent(sender_alias: impl Into<String>) -> Self {
+        Self::from_parts(
+            TurnOrigin::AgentDirect,
+            Some(InternalPrincipal::PeerAgent {
+                sender_alias: sender_alias.into(),
+            }),
+        )
+    }
+
+    /// Envelope for a daemon-driven turn stamped with a runtime-owned task
+    /// identifier (never model-authored text).
+    #[must_use]
+    pub fn daemon_task(task: impl Into<String>) -> Self {
+        Self::from_parts(
+            TurnOrigin::Daemon,
+            Some(InternalPrincipal::Daemon { task: task.into() }),
+        )
     }
 }
 
@@ -210,6 +293,63 @@ mod tests {
             assert_eq!(ctx.transport, Transport::Internal);
             assert!(ctx.sender.is_none());
             assert!(ctx.message_id.is_none());
+            assert!(ctx.internal_principal.is_none());
+        }
+    }
+
+    #[test]
+    fn principal_constructors_stamp_origin_and_principal() {
+        let cron = IngressContext::cron_job("job-1", Some("nightly".to_string()));
+        assert_eq!(cron.origin, TurnOrigin::Cron);
+        assert_eq!(
+            cron.internal_principal,
+            Some(InternalPrincipal::Cron {
+                job_id: "job-1".to_string(),
+                job_name: Some("nightly".to_string()),
+            })
+        );
+        // Everything but origin and principal matches the plain envelope.
+        assert_eq!(
+            IngressContext {
+                internal_principal: None,
+                ..cron
+            },
+            IngressContext::cron()
+        );
+
+        let peer = IngressContext::peer_agent("front");
+        assert_eq!(peer.origin, TurnOrigin::AgentDirect);
+        assert_eq!(
+            peer.internal_principal,
+            Some(InternalPrincipal::PeerAgent {
+                sender_alias: "front".to_string(),
+            })
+        );
+
+        let daemon = IngressContext::daemon_task("heartbeat:decision");
+        assert_eq!(daemon.origin, TurnOrigin::Daemon);
+        assert_eq!(
+            daemon.internal_principal,
+            Some(InternalPrincipal::Daemon {
+                task: "heartbeat:decision".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn from_parts_without_principal_matches_from_origin() {
+        for origin in [
+            TurnOrigin::Interactive,
+            TurnOrigin::Channel,
+            TurnOrigin::Cron,
+            TurnOrigin::Daemon,
+            TurnOrigin::AgentDirect,
+            TurnOrigin::SubTurn,
+        ] {
+            assert_eq!(
+                IngressContext::from_parts(origin, None),
+                IngressContext::from_origin(origin)
+            );
         }
     }
 
@@ -235,5 +375,46 @@ mod tests {
         assert_eq!(v["origin"], "agent_direct");
         let back: IngressContext = serde_json::from_value(v).unwrap();
         assert_eq!(back, ctx);
+    }
+
+    #[test]
+    fn legacy_envelope_without_principal_deserializes_absent() {
+        // An envelope serialized before the internal_principal field existed
+        // must come back with no principal, not error.
+        let legacy = serde_json::json!({
+            "message_id": null,
+            "source_class": "internal",
+            "sender": null,
+            "transport": "internal",
+            "trust": "trusted",
+            "origin": "cron",
+        });
+        let ctx: IngressContext = serde_json::from_value(legacy).unwrap();
+        assert_eq!(ctx.origin, TurnOrigin::Cron);
+        assert!(ctx.internal_principal.is_none());
+    }
+
+    #[test]
+    fn principal_serializes_snake_case_and_round_trips() {
+        let cases = [
+            (
+                IngressContext::cron_job("j1", None),
+                serde_json::json!({"cron": {"job_id": "j1", "job_name": null}}),
+            ),
+            (
+                IngressContext::peer_agent("front"),
+                serde_json::json!({"peer_agent": {"sender_alias": "front"}}),
+            ),
+            (
+                IngressContext::daemon_task("sop:r1:step:2"),
+                serde_json::json!({"daemon": {"task": "sop:r1:step:2"}}),
+            ),
+        ];
+        for (ctx, expected_principal) in cases {
+            let v = serde_json::to_value(&ctx).unwrap();
+            assert_eq!(v["internal_principal"], expected_principal);
+            let back: IngressContext = serde_json::from_value(v).unwrap();
+            assert_eq!(back, ctx);
+        }
     }
 }

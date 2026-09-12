@@ -47,6 +47,7 @@ mod tests {
             },
             trust: TrustClass::Untrusted,
             origin: zeroclaw_api::ingress::TurnOrigin::Channel,
+            internal_principal: None,
         };
         let policy = IngressPolicy::default();
         assert_eq!(

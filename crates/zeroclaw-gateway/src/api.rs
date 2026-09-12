@@ -601,13 +601,20 @@ pub async fn handle_api_cron_runs(
     let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
     let config = state.config.read().clone();
 
-    // Verify the job exists before listing runs.
+    // A missing job is not necessarily a missing history: a successful
+    // auto-delete one-shot removes its job row while its run record is
+    // retained durably. 404 only when neither the job nor any run exists.
     if let Err(e) = zeroclaw_runtime::cron::get_job(&config, &id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
-        )
-            .into_response();
+        let retained = zeroclaw_runtime::cron::list_runs(&config, &id, 1)
+            .map(|runs| !runs.is_empty())
+            .unwrap_or(false);
+        if !retained {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
     }
 
     match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
@@ -623,6 +630,11 @@ pub async fn handle_api_cron_runs(
                         "status": r.status,
                         "output": r.output,
                         "duration_ms": r.duration_ms,
+                        "execution": r.execution,
+                        "delivery": r.delivery,
+                        "persistence": r.persistence,
+                        "principal": r.principal,
+                        "executing_agent": r.executing_agent,
                     })
                 })
                 .collect();
@@ -5140,6 +5152,70 @@ pub(crate) mod tests {
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn cron_runs_endpoint_serves_retained_history_after_job_deletion() {
+        // A successful auto-delete one-shot removes its job row but keeps
+        // its run record; the runs endpoint must serve that durable record
+        // rather than 404 on the missing job — and still 404 when neither
+        // job nor history exists.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let config = state.config.read().clone();
+
+        let now = chrono::Utc::now();
+        zeroclaw_runtime::cron::record_run(
+            &config,
+            "retained-one-shot",
+            now,
+            now + chrono::Duration::milliseconds(5),
+            "ok",
+            zeroclaw_runtime::cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            zeroclaw_runtime::cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("retained-one-shot".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let runs = json["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "ok");
+        assert_eq!(runs[0]["executing_agent"], "test-agent");
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("never-existed".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

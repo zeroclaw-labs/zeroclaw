@@ -189,6 +189,13 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            // Not yet propagated: a sub-turn spawned by an internally
+            // initiated parent (e.g. a cron turn delegating) loses the
+            // parent's initiating principal here. Inheritance semantics
+            // for nested dispatch belong to the reply-provenance slice of
+            // the internal-turn contract, which defines how provenance
+            // crosses dispatch boundaries; until then absence is explicit.
+            internal_principal: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 
