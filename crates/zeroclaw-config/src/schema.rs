@@ -12131,6 +12131,46 @@ pub fn validate_memory_semantics(
 ///
 /// Called from `Config::collect_warnings`, so this reaches the CLI and the
 /// gateway dashboard on the same path as the other warnings.
+/// Warn when a Sendblue instance has both inbound paths armed.
+///
+/// Polling and the webhook are meant to be exclusive: each dispatches every
+/// inbound record on its own, and they share no de-duplication, so an operator
+/// who registers the webhook and leaves the default poll interval in place gets
+/// the same message answered twice.
+///
+/// This warns rather than forcing the modes apart because a configured secret
+/// is not proof a webhook is registered — only Sendblue knows that — and
+/// silently disabling the poller would strand an operator who set a secret
+/// ahead of time and still relies on polling.
+pub fn validate_sendblue_semantics(
+    alias: &str,
+    sb: &SendblueConfig,
+) -> Vec<crate::validation_warnings::ValidationWarning> {
+    let mut out = Vec::new();
+
+    let secret_set = sb
+        .signing_secret
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|secret| !secret.is_empty());
+
+    if sb.enabled && secret_set && sb.poll_interval_secs > 0 {
+        out.push(crate::validation_warnings::ValidationWarning::new(
+            "sendblue_both_inbound_paths_armed",
+            format!(
+                "channels.sendblue.{alias} has a signing_secret set and polling enabled. \
+                 Those are the two inbound paths and they do not share de-duplication, so \
+                 a registered webhook will deliver the same message the poller also picks \
+                 up, and the agent answers twice. Set poll_interval_secs = 0 for \
+                 webhook-only, or clear signing_secret for polling-only."
+            ),
+            format!("channels.sendblue.{alias}.poll_interval_secs"),
+        ));
+    }
+
+    out
+}
+
 pub fn validate_whatsapp_semantics(
     alias: &str,
     wa: &WhatsAppConfig,
@@ -14212,6 +14252,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub linq: HashMap<String, LinqConfig>,
+    /// Sendblue iMessage/SMS channel instances (`[channels.sendblue.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub sendblue: HashMap<String, SendblueConfig>,
     /// Nextcloud Talk bot channel instances (`[channels.nextcloud_talk.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -14440,6 +14484,12 @@ impl ChannelsConfig {
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
+                kind: "sendblue",
+                name: "Sendblue",
+                desc: "iMessage/SMS via Sendblue API",
+                configured: !self.sendblue.is_empty(),
+            },
+            ChannelInfo {
                 kind: "nextcloud",
                 config_key: "nextcloud_talk",
                 name: "NextCloud Talk",
@@ -14640,6 +14690,7 @@ impl ChannelsConfig {
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
             || self.linq.values().any(|c| c.enabled)
+            || self.sendblue.values().any(|c| c.enabled)
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
@@ -14675,7 +14726,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -14687,6 +14738,7 @@ impl ChannelsConfig {
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
             ("linq", !self.linq.is_empty(), true),
+            ("sendblue", !self.sendblue.is_empty(), true),
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
@@ -14773,6 +14825,7 @@ impl Default for ChannelsConfig {
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
+            sendblue: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -16540,6 +16593,105 @@ impl ChannelConfig for LinqConfig {
     }
     fn desc() -> &'static str {
         "iMessage/RCS/SMS via Linq API"
+    }
+}
+
+/// Sendblue iMessage/SMS configuration (polling or webhook receive, REST send).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.sendblue"]
+pub struct SendblueConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sendblue API key ID, sent as the `sb-api-key-id` header.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub api_key_id: String,
+    /// Sendblue API secret key, sent as the `sb-api-secret-key` header.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub api_secret_key: String,
+    /// Sendblue phone number to send from (E.164 format).
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub from_number: String,
+    /// Shared secret presented by inbound webhooks.
+    ///
+    /// Required to receive webhooks. Sendblue does not sign its deliveries, so
+    /// unlike the signature-verified channels there is nothing to recompute
+    /// from the body: the gateway can only compare a shared secret the
+    /// operator configures on both ends. With no secret configured the
+    /// gateway refuses inbound requests with `401` rather than accepting them
+    /// unauthenticated.
+    ///
+    /// Because the secret is not bound to the request body, a captured header
+    /// can be replayed with forged content. Terminate the endpoint over TLS.
+    #[serde(default)]
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub signing_secret: Option<String>,
+    /// Seconds between polls of Sendblue's message list. Values below 5 are
+    /// clamped to 5. Set to `0` to disable polling and receive only through the
+    /// gateway's `/sendblue` webhook route. Default: `15`.
+    ///
+    /// Polling is the default because it needs nothing but the API credentials
+    /// — no publicly reachable endpoint, and none of the replay exposure that
+    /// comes with Sendblue's unsigned webhooks.
+    #[tab(Advanced)]
+    #[serde(default = "default_sendblue_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Mark a conversation read once an inbound message is accepted, so the
+    /// sender sees it landed while the agent is still composing. Default:
+    /// `false`.
+    ///
+    /// Off by default because Sendblue gates the endpoint per account: their
+    /// engineering team has to enable read receipts before
+    /// `POST /api/mark-read` will serve your line. Receipts are also
+    /// best-effort and iMessage/RCS only, since SMS carries no read state.
+    ///
+    /// Sendblue can do the same thing server-side with its account-level
+    /// auto-mark-read setting, which needs no configuration here.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub read_receipts: bool,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+fn default_sendblue_poll_interval_secs() -> u64 {
+    15
+}
+
+impl Default for SendblueConfig {
+    /// Derived from the serde defaults rather than restated, so
+    /// `SendblueConfig::default()` and a deserialized empty table cannot drift
+    /// apart on `poll_interval_secs`.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every SendblueConfig field declares a serde default or is Option")
+    }
+}
+
+impl ChannelConfig for SendblueConfig {
+    fn name() -> &'static str {
+        "Sendblue"
+    }
+    fn desc() -> &'static str {
+        "iMessage/SMS via Sendblue API"
     }
 }
 
@@ -20831,6 +20983,9 @@ impl Config {
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
+        }
+        for (alias, sb) in &self.channels.sendblue {
+            warnings.extend(validate_sendblue_semantics(alias, sb));
         }
         // `wire_api` is only honored by bring-your-own-endpoint families; on a
         // branded family with a fixed wire protocol it is silently ignored.
@@ -28396,6 +28551,7 @@ auto_save = true
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
                 linq: HashMap::new(),
+                sendblue: HashMap::new(),
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
@@ -30301,6 +30457,7 @@ allowed_users = ["@u:matrix.org"]
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
             linq: HashMap::new(),
+            sendblue: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -30852,6 +31009,7 @@ allowed_numbers = ["+1", "+2"]
                 },
             )]),
             linq: HashMap::new(),
+            sendblue: HashMap::new(),
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
@@ -35098,6 +35256,46 @@ group_policy = "disabled"
         assert!(
             !warnings.iter().any(|w| w.path.contains("custom.vllm")),
             "custom honors wire_api and must not warn",
+        );
+    }
+
+    fn sendblue(secret: Option<&str>, poll_interval_secs: u64) -> SendblueConfig {
+        SendblueConfig {
+            enabled: true,
+            api_key_id: "key".into(),
+            api_secret_key: "secret".into(),
+            from_number: "+15550000000".into(),
+            signing_secret: secret.map(ToOwned::to_owned),
+            poll_interval_secs,
+            ..SendblueConfig::default()
+        }
+    }
+
+    #[test]
+    async fn sendblue_warns_only_when_both_inbound_paths_are_armed() {
+        // Webhook-only and polling-only are the two intended shapes.
+        assert!(validate_sendblue_semantics("main", &sendblue(Some("s"), 0)).is_empty());
+        assert!(validate_sendblue_semantics("main", &sendblue(None, 15)).is_empty());
+        // A blank secret is not a configured webhook.
+        assert!(validate_sendblue_semantics("main", &sendblue(Some("   "), 15)).is_empty());
+
+        let warnings = validate_sendblue_semantics("main", &sendblue(Some("s"), 15));
+        assert_eq!(warnings.len(), 1, "both paths armed must warn exactly once");
+        assert_eq!(warnings[0].code, "sendblue_both_inbound_paths_armed");
+        assert_eq!(
+            warnings[0].path,
+            "channels.sendblue.main.poll_interval_secs"
+        );
+    }
+
+    #[test]
+    async fn sendblue_does_not_warn_while_the_channel_is_disabled() {
+        let mut config = sendblue(Some("s"), 15);
+        config.enabled = false;
+
+        assert!(
+            validate_sendblue_semantics("main", &config).is_empty(),
+            "a disabled channel dispatches on neither path"
         );
     }
 

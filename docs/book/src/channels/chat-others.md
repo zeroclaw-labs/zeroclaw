@@ -20,6 +20,114 @@ iMessage is bridged through the Linq Partner API (`[channels.linq.<alias>]`):
 
 **macOS-only** and requires either Linq as a third-party relay, or direct AppleScript automation (experimental, requires Full Disk Access and Accessibility grants).
 
+## Sendblue (iMessage/SMS, any OS)
+
+Sendblue (`[channels.sendblue.<alias>]`) is a hosted iMessage/SMS relay, so
+unlike the AppleScript bridge it needs no Mac and runs on any host.
+
+```toml
+[channels.sendblue.main]
+enabled = true
+api_key_id = "…"        # sb-api-key-id
+api_secret_key = "…"    # sb-api-secret-key
+from_number = "+15550000000"
+```
+
+Outbound goes to `POST https://api.sendblue.com/api/send-message`.
+
+### Inbound: polling (default)
+
+The channel polls `GET /api/v2/messages` every `poll_interval_secs` (default
+`15`, floor `5`). This is the default because it needs nothing but the API
+credentials: no publicly reachable endpoint, no webhook configured in the
+Sendblue dashboard, and none of the replay exposure below.
+
+Only messages that arrive after the listener starts are dispatched, so a
+restart does not re-answer the account's backlog. `created_at_gte` is
+inclusive, so the boundary message is de-duplicated on its `message_handle`.
+
+### Inbound: webhook (opt-in)
+
+Set `poll_interval_secs = 0` and a `signing_secret`, then register the
+gateway's `POST /sendblue[/<alias>]` route with Sendblue. Registration is an
+API call, not a dashboard step, and uses the same credentials the channel
+already holds:
+
+```bash
+curl -X POST https://api.sendblue.com/api/account/webhooks \
+  -H "sb-api-key-id: $SB_API_KEY_ID" \
+  -H "sb-api-secret-key: $SB_API_SECRET_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "receive",
+    "webhooks": [
+      { "url": "https://your-gateway.example.com/sendblue/main",
+        "secret": "<same value as signing_secret>" }
+    ]
+  }'
+```
+
+Both of Sendblue's authentication mechanisms are accepted, and which one you
+get depends on the webhook type:
+
+- **Signature.** `X-Sendblue-Signature: t=<unix>,v1=<hex>`, where the signature
+  is `HMAC_SHA256(secret, "<t>.<raw body>")`. This binds the secret to the body
+  and carries a timestamp, so it resists replay. Signatures older than five
+  minutes are refused. When this header is present it is authoritative: a bad
+  signature is refused rather than falling through to the weaker check, so an
+  attacker cannot downgrade by sending a deliberately broken one.
+- **Secret echo.** `sb-signing-secret` carrying the configured secret verbatim,
+  which is what Sendblue's message-webhook documentation describes.
+  `x-webhook-secret` is accepted too, for proxies that rename the header.
+
+> **The echo is weaker than a signature.** Nothing binds it to the request
+> body, so a captured header can be replayed with forged content. Sendblue
+> enforces HTTPS on webhook URLs, which is what keeps the header off the wire,
+> so do not terminate the route on plain HTTP. With `signing_secret` unset the
+> route refuses inbound requests with `401` rather than accepting them
+> unauthenticated.
+
+Sendblue re-delivers any webhook it did not get a 2xx for, so deliveries are
+de-duplicated on `message_handle` before dispatch. That record is shared with
+the poller, so switching modes or running a retry cannot double-answer.
+
+Group messages (`group_id` set) and delivery-status callbacks (`status` other
+than `RECEIVED`) are acknowledged without dispatch. Replying to a group would
+have to target the group rather than whoever spoke, and group sends are not
+implemented.
+
+### Read receipts
+
+`read_receipts = true` marks the conversation read as soon as an inbound
+message is accepted, on either path, so the sender sees it landed while the
+agent is still composing. One receipt per conversation, not per message.
+
+Off by default, because Sendblue gates `POST /api/mark-read` per account:
+their engineering team has to enable read receipts on your line before it
+serves anything. Receipts are best-effort with no delivery confirmation, and
+iMessage/RCS only, since SMS carries no read state. Failures are logged at
+debug and never hold up the inbound message.
+
+Sendblue can also do this server-side with its account-level auto-mark-read
+setting, which fires on every inbound 1:1 iMessage and needs nothing here.
+Enable one or the other, not both.
+
+### Both modes
+
+**The two inbound paths are exclusive.** They share no de-duplication, so if
+you register the webhook and leave polling on, the same message arrives twice
+and the agent answers twice. Pick one: `poll_interval_secs = 0` for
+webhook-only, or leave `signing_secret` unset for polling-only. `config
+validate` warns when both are armed.
+
+Senders are gated by the channel's peer group, matched literally against the
+E.164 number. A handle arriving without its leading `+` is normalized before
+the check, so both forms match one allowlist entry.
+
+Sendblue reports the bot's own sends alongside inbound traffic on both paths.
+Those carry `is_outbound: true` and are dropped before dispatch, so the agent
+does not answer itself.
+
 ## WeChat personal iLink Bot (微信个人号 iLink)
 
 WeChat personal iLink Bot uses QR-code login against the iLink Bot API for personal WeChat conversations.

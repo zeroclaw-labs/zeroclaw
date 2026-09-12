@@ -37,6 +37,7 @@
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -44,12 +45,14 @@ use std::sync::Arc;
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::body::Bytes;
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -59,12 +62,14 @@ use axum::response::Json;
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -72,6 +77,7 @@ use zeroclaw_memory::MemoryCategory;
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -87,6 +93,7 @@ pub(crate) enum CredentialPolicy {
     /// against it. `display` names the config field in refusal responses.
     #[cfg(any(
         feature = "channel-linq",
+        feature = "channel-sendblue",
         feature = "channel-nextcloud",
         feature = "channel-whatsapp-cloud"
     ))]
@@ -106,6 +113,7 @@ pub(crate) struct WebhookAdapterSpec {
     /// Human-readable name used in operator-facing log text.
     #[cfg(any(
         feature = "channel-linq",
+        feature = "channel-sendblue",
         feature = "channel-nextcloud",
         feature = "channel-whatsapp-cloud"
     ))]
@@ -116,6 +124,7 @@ pub(crate) struct WebhookAdapterSpec {
     /// Only used to report "missing" vs "invalid" in refusal logs.
     #[cfg(any(
         feature = "channel-linq",
+        feature = "channel-sendblue",
         feature = "channel-nextcloud",
         feature = "channel-whatsapp-cloud"
     ))]
@@ -123,6 +132,7 @@ pub(crate) struct WebhookAdapterSpec {
     /// Session-key policy owned by this adapter contract.
     #[cfg(any(
         feature = "channel-linq",
+        feature = "channel-sendblue",
         feature = "channel-nextcloud",
         feature = "channel-whatsapp-cloud"
     ))]
@@ -135,6 +145,7 @@ pub(crate) struct WebhookAdapterSpec {
 /// How an authenticated adapter derives the conversation session key.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -145,7 +156,7 @@ enum SessionKeyPolicy {
     ChannelSender,
     /// Include the resolved alias and sanitize the result for persisted
     /// multi-tenant session isolation.
-    #[cfg(feature = "channel-linq")]
+    #[cfg(any(feature = "channel-linq", feature = "channel-sendblue"))]
     AliasSenderSanitized,
 }
 
@@ -175,6 +186,29 @@ pub(crate) static LINQ_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     dispatch_routes: &["/linq", "/linq/{alias}"],
 };
 
+/// Sendblue authenticates a webhook one of two ways, and which one arrives
+/// depends on the webhook type. A signed delivery carries
+/// `X-Sendblue-Signature: t=…,v1=HMAC_SHA256(secret, "<t>.<raw body>")`; a
+/// message webhook instead echoes the configured secret verbatim in
+/// `sb-signing-secret`, with nothing binding it to the body.
+///
+/// `signature_header` names the echo header because that is the one a message
+/// channel is documented to receive; it only selects the "missing" vs "invalid"
+/// wording in refusal logs. The verifier accepts either mechanism and treats a
+/// present signature as authoritative.
+#[cfg(feature = "channel-sendblue")]
+pub(crate) static SENDBLUE_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
+    channel: "sendblue",
+    display_name: "Sendblue",
+    credential: CredentialPolicy::Required {
+        display: "signing_secret",
+    },
+    signature_header: Some("sb-signing-secret"),
+    session_key: Some(SessionKeyPolicy::AliasSenderSanitized),
+    #[cfg(test)]
+    dispatch_routes: &["/sendblue", "/sendblue/{alias}"],
+};
+
 #[cfg(feature = "channel-nextcloud")]
 pub(crate) static NEXTCLOUD_TALK_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpec {
     channel: "nextcloud_talk",
@@ -196,6 +230,7 @@ pub(crate) static NEXTCLOUD_TALK_WEBHOOK: WebhookAdapterSpec = WebhookAdapterSpe
 #[cfg(any(
     test,
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -204,6 +239,8 @@ pub(crate) static MESSAGE_DISPATCHING_WEBHOOKS: &[&WebhookAdapterSpec] = &[
     &WHATSAPP_WEBHOOK,
     #[cfg(feature = "channel-linq")]
     &LINQ_WEBHOOK,
+    #[cfg(feature = "channel-sendblue")]
+    &SENDBLUE_WEBHOOK,
     #[cfg(feature = "channel-nextcloud")]
     &NEXTCLOUD_TALK_WEBHOOK,
 ];
@@ -215,6 +252,7 @@ pub(crate) enum IngressRefusal {
     /// blank, or unresolved) for the target alias.
     #[cfg(any(
         feature = "channel-linq",
+        feature = "channel-sendblue",
         feature = "channel-nextcloud",
         feature = "channel-whatsapp-cloud"
     ))]
@@ -222,6 +260,7 @@ pub(crate) enum IngressRefusal {
     /// A credential is configured but the request failed verification.
     #[cfg(any(
         feature = "channel-linq",
+        feature = "channel-sendblue",
         feature = "channel-nextcloud",
         feature = "channel-whatsapp-cloud"
     ))]
@@ -238,12 +277,14 @@ impl IngressRefusal {
         let error = match (self, &spec.credential) {
             #[cfg(any(
                 feature = "channel-linq",
+                feature = "channel-sendblue",
                 feature = "channel-nextcloud",
                 feature = "channel-whatsapp-cloud"
             ))]
             (IngressRefusal::InvalidSignature, _) => "Invalid signature".to_string(),
             #[cfg(any(
                 feature = "channel-linq",
+                feature = "channel-sendblue",
                 feature = "channel-nextcloud",
                 feature = "channel-whatsapp-cloud"
             ))]
@@ -273,12 +314,14 @@ fn log_refusal(
     let reason = match refusal {
         #[cfg(any(
             feature = "channel-linq",
+            feature = "channel-sendblue",
             feature = "channel-nextcloud",
             feature = "channel-whatsapp-cloud"
         ))]
         IngressRefusal::MissingCredential => "missing_credential",
         #[cfg(any(
             feature = "channel-linq",
+            feature = "channel-sendblue",
             feature = "channel-nextcloud",
             feature = "channel-whatsapp-cloud"
         ))]
@@ -310,6 +353,7 @@ fn log_refusal(
 /// cloned outside this module.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -321,6 +365,7 @@ pub(crate) struct VerifiedWebhookIngress {
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -347,6 +392,7 @@ impl VerifiedWebhookIngress {
 /// the dispatch helper consumes it.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -358,13 +404,22 @@ pub(crate) struct VerifiedWebhookMessages {
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
 impl VerifiedWebhookMessages {
-    #[cfg(feature = "channel-linq")]
+    #[cfg(any(feature = "channel-linq", feature = "channel-sendblue"))]
     pub(crate) fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+
+    /// Read-only view of the verified messages, for adapters that need to act
+    /// on the parsed set before dispatch. Borrowed rather than moved so the
+    /// proof still owns them when it is handed to the dispatcher.
+    #[cfg(feature = "channel-sendblue")]
+    pub(crate) fn messages(&self) -> &[ChannelMessage] {
+        &self.messages
     }
 
     /// Remove messages handled entirely by the transport adapter, such as
@@ -390,6 +445,7 @@ impl VerifiedWebhookMessages {
 /// timestamp rules). Returning `true` mints the proof for `body`.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -449,12 +505,17 @@ pub(crate) fn authenticate(
 /// Whether the shared gateway-webhook helper blocks the response on dispatch.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
 pub(crate) enum WebhookDispatchMode {
     /// Process every message before acknowledging the webhook.
-    #[cfg(any(feature = "channel-linq", feature = "channel-whatsapp-cloud"))]
+    #[cfg(any(
+        feature = "channel-linq",
+        feature = "channel-sendblue",
+        feature = "channel-whatsapp-cloud"
+    ))]
     Synchronous,
     /// Acknowledge immediately and process each message in a background
     /// task, for providers that cancel slow webhook deliveries.
@@ -465,6 +526,7 @@ pub(crate) enum WebhookDispatchMode {
 /// Handler-supplied wiring for the shared gateway-webhook dispatch helper.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -495,6 +557,7 @@ pub(crate) struct WebhookDispatchContext {
 /// it does not replace the shared channel turn lifecycle.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -510,7 +573,11 @@ pub(crate) async fn dispatch_verified_webhook(
     } = ingress;
 
     match ctx.mode {
-        #[cfg(any(feature = "channel-linq", feature = "channel-whatsapp-cloud"))]
+        #[cfg(any(
+            feature = "channel-linq",
+            feature = "channel-sendblue",
+            feature = "channel-whatsapp-cloud"
+        ))]
         WebhookDispatchMode::Synchronous => {
             for msg in &messages {
                 process_verified_message(
@@ -565,6 +632,7 @@ pub(crate) async fn dispatch_verified_webhook(
 /// One verified message through the shared gateway-webhook dispatch helper.
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -597,7 +665,7 @@ async fn process_verified_message(
     {
         #[cfg(any(feature = "channel-nextcloud", feature = "channel-whatsapp-cloud"))]
         SessionKeyPolicy::ChannelSender => sender_session_id(spec.channel, msg),
-        #[cfg(feature = "channel-linq")]
+        #[cfg(any(feature = "channel-linq", feature = "channel-sendblue"))]
         SessionKeyPolicy::AliasSenderSanitized => {
             let channel_ref = format!("{}.{}", spec.channel, alias);
             zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg))
@@ -902,6 +970,7 @@ mod tests {
         match feature {
             "channel-whatsapp-cloud" => cfg!(feature = "channel-whatsapp-cloud"),
             "channel-linq" => cfg!(feature = "channel-linq"),
+            "channel-sendblue" => cfg!(feature = "channel-sendblue"),
             "channel-nextcloud" => cfg!(feature = "channel-nextcloud"),
             "channel-email" => cfg!(feature = "channel-email"),
             other => panic!(

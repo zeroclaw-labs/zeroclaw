@@ -27,6 +27,7 @@ pub mod api_upload;
 pub mod api_webauthn;
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -47,6 +48,7 @@ pub mod version;
 pub mod voice_duplex;
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -59,18 +61,21 @@ use anyhow::{Context, Result};
 #[cfg(any(
     feature = "channel-email",
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::body::Bytes;
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -118,6 +123,7 @@ use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -130,6 +136,8 @@ use zeroclaw_channels::gmail_push::GmailPushChannel;
 use zeroclaw_channels::linq::LinqChannel;
 #[cfg(feature = "channel-nextcloud")]
 use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
+#[cfg(feature = "channel-sendblue")]
+use zeroclaw_channels::sendblue::SendblueChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
@@ -188,6 +196,11 @@ fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
 }
 
+#[cfg(feature = "channel-sendblue")]
+fn sendblue_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    format!("sendblue_{}_{}", msg.sender, msg.id)
+}
+
 #[cfg(feature = "channel-nextcloud")]
 fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
@@ -195,6 +208,7 @@ fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Str
 
 #[cfg(any(
     feature = "channel-linq",
+    feature = "channel-sendblue",
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
@@ -208,6 +222,11 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
 #[cfg(feature = "channel-linq")]
 fn linq_channel_ref(alias: &str) -> String {
     format!("linq.{alias}")
+}
+
+#[cfg(feature = "channel-sendblue")]
+fn sendblue_channel_ref(alias: &str) -> String {
+    format!("sendblue.{alias}")
 }
 
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
@@ -554,6 +573,14 @@ pub struct AppState {
     /// Linq webhook signing secrets per alias
     #[cfg(feature = "channel-linq")]
     pub linq_signing_secrets: HashMap<String, Arc<str>>,
+    /// Sendblue channel instances keyed by config alias.
+    #[cfg(feature = "channel-sendblue")]
+    pub sendblue: HashMap<String, Arc<SendblueChannel>>,
+    /// Sendblue webhook shared secrets per alias. Sendblue does not sign its
+    /// deliveries, so this is compared against a request header rather than
+    /// used to recompute a signature over the body.
+    #[cfg(feature = "channel-sendblue")]
+    pub sendblue_signing_secrets: HashMap<String, Arc<str>>,
     /// Nextcloud Talk channel instances keyed by config alias.
     #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk: HashMap<String, Arc<NextcloudTalkChannel>>,
@@ -1151,6 +1178,53 @@ pub async fn run_gateway(
         })
         .collect();
 
+    // Sendblue channel instances (multi-tenant: one per alias)
+    #[cfg(feature = "channel-sendblue")]
+    let sendblue_channels: HashMap<String, Arc<SendblueChannel>> = config
+        .channels
+        .sendblue
+        .iter()
+        .filter(|(_, sb)| sb.enabled)
+        .map(|(alias, sb)| {
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_state.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("sendblue", &alias))
+            };
+            (
+                alias.clone(),
+                // Webhook-only: the orchestrator owns the polling listener.
+                Arc::new(
+                    SendblueChannel::new(
+                        sb.api_key_id.clone(),
+                        sb.api_secret_key.clone(),
+                        sb.from_number.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    .with_read_receipts(sb.read_receipts),
+                ),
+            )
+        })
+        .collect();
+
+    // Sendblue shared webhook secrets per alias.
+    #[cfg(feature = "channel-sendblue")]
+    let sendblue_signing_secrets: HashMap<String, Arc<str>> = config
+        .channels
+        .sendblue
+        .iter()
+        .filter_map(|(alias, sb)| {
+            let secret = sb
+                .signing_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)?;
+            Some((alias.clone(), Arc::from(secret)))
+        })
+        .collect();
+
     // Nextcloud Talk channel instances keyed by alias.
     #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_channel: HashMap<String, Arc<NextcloudTalkChannel>> = config
@@ -1464,6 +1538,11 @@ pub async fn run_gateway(
     if !linq_channels.is_empty() {
         println!("  POST {pfx}/linq[/<alias>]      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    #[cfg(feature = "channel-sendblue")]
+    if !sendblue_channels.is_empty() {
+        // i18n-exempt: route inventory, printed as a literal like every other webhook path in this banner
+        println!("  POST {pfx}/sendblue[/<alias>]  - Sendblue message webhook (iMessage/SMS)");
+    }
     #[cfg(feature = "channel-nextcloud")]
     if !nextcloud_talk_channel.is_empty() {
         println!("  POST {pfx}/nextcloud-talk[/<alias>] — Nextcloud Talk bot webhook");
@@ -1604,6 +1683,10 @@ pub async fn run_gateway(
         linq: linq_channels,
         #[cfg(feature = "channel-linq")]
         linq_signing_secrets,
+        #[cfg(feature = "channel-sendblue")]
+        sendblue: sendblue_channels,
+        #[cfg(feature = "channel-sendblue")]
+        sendblue_signing_secrets,
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk: nextcloud_talk_channel,
         #[cfg(feature = "channel-nextcloud")]
@@ -2709,6 +2792,10 @@ fn optional_channel_routes() -> Router<AppState> {
     let router = router
         .route("/linq", post(handle_linq_webhook))
         .route("/linq/{alias}", post(handle_linq_webhook_alias));
+    #[cfg(feature = "channel-sendblue")]
+    let router = router
+        .route("/sendblue", post(handle_sendblue_webhook))
+        .route("/sendblue/{alias}", post(handle_sendblue_webhook_alias));
     #[cfg(feature = "channel-nextcloud")]
     let router = router
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -3523,6 +3610,148 @@ async fn process_linq_webhook(
         webhook_ingress::WebhookDispatchContext {
             channel,
             memory_key: linq_memory_key,
+            agent_override,
+            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
+}
+
+/// POST /sendblue — incoming message webhook (bare path, deprecated fallback).
+#[cfg(feature = "channel-sendblue")]
+async fn handle_sendblue_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_sendblue_webhook_impl(state, None, headers, body).await
+}
+
+/// POST /sendblue/{alias} — incoming message webhook for a specific instance.
+#[cfg(feature = "channel-sendblue")]
+async fn handle_sendblue_webhook_alias(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_sendblue_webhook_impl(state, Some(alias), headers, body).await
+}
+
+#[cfg(feature = "channel-sendblue")]
+async fn handle_sendblue_webhook_impl(
+    state: AppState,
+    alias: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resolved = api_webhook::resolve(&state.sendblue, alias.as_deref());
+    let Some((alias_key, sendblue)) = resolved.entry() else {
+        return api_webhook::not_found("sendblue");
+    };
+    let signing_secret = state.sendblue_signing_secrets.get(alias_key).cloned();
+    let resp = process_sendblue_webhook(
+        &state,
+        alias_key,
+        sendblue,
+        signing_secret.as_deref(),
+        headers,
+        body,
+    )
+    .await;
+    api_webhook::tag_deprecation(resp.into_response(), resolved, "sendblue")
+}
+
+/// Verify, parse, and dispatch a Sendblue webhook payload for one resolved
+/// instance. `signing_secret` is that instance's shared secret.
+///
+/// Sendblue does not sign its webhook deliveries, so unlike Linq there is no
+/// signature to recompute over the body — the verifier compares the shared
+/// secret presented in a request header.
+#[cfg(feature = "channel-sendblue")]
+async fn process_sendblue_webhook(
+    state: &AppState,
+    alias: &str,
+    sendblue: &Arc<SendblueChannel>,
+    signing_secret: Option<&str>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::SENDBLUE_WEBHOOK,
+        alias,
+        signing_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            zeroclaw_channels::sendblue::verify_sendblue_secret(secret, headers, body)
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::SENDBLUE_WEBHOOK),
+    };
+
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        // Sendblue re-delivers anything it did not get a 2xx for, so the
+        // same message can arrive more than once.
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+            sendblue.claim_unseen(sendblue.parse_webhook_payload(&payload)),
+        )
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+
+    if verified.is_empty() {
+        // Acknowledge status/delivery events before ownership resolution.
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Ahead of ownership resolution and dispatch: the point of the receipt is
+    // that the sender sees the message landed while the agent is still working
+    // on a reply. No-op unless the instance enables read receipts.
+    sendblue.mark_read_for(verified.messages()).await;
+
+    let channel_ref = sendblue_channel_ref(alias);
+    let (agent_override, has_channel_bindings) = {
+        let config = state.config.read();
+        (
+            config.agent_for_channel(&channel_ref).map(str::to_owned),
+            config
+                .agents
+                .values()
+                .any(|agent| !agent.channels.is_empty()),
+        )
+    };
+    if agent_override.is_none() && has_channel_bindings {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": "sendblue", "alias": alias})),
+            "Sendblue webhook ignored because no enabled agent owns the channel alias"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored", "reason": "no_agent_for_channel"})),
+        );
+    }
+
+    let channel: Arc<dyn Channel> = sendblue.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: sendblue_memory_key,
             agent_override,
             mode: webhook_ingress::WebhookDispatchMode::Synchronous,
             #[cfg(test)]
@@ -4489,6 +4718,10 @@ mod tests {
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -5409,6 +5642,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -5495,6 +5732,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -6168,6 +6409,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7074,6 +7319,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7193,6 +7442,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7292,6 +7545,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7497,6 +7754,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7583,6 +7844,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7674,6 +7939,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7770,6 +8039,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -7864,6 +8137,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
             nextcloud_talk_webhook_secret: HashMap::from([(alias.to_string(), Arc::from(secret))]),
             #[cfg(feature = "channel-email")]
@@ -7964,6 +8241,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
             nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-email")]
@@ -8104,6 +8385,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([("default".to_string(), channel)]),
             // A resolved secret, not an empty map. Inbound verification is now
             // mandatory and fail-closed, so an unsigned request is rejected with
@@ -8991,6 +9276,10 @@ path = "{trigger_path}"
             linq,
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets,
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -9076,6 +9365,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
@@ -9652,6 +9945,352 @@ path = "{trigger_path}"
         );
     }
 
+    // ── Sendblue webhook ───────────────────────────────────────────
+
+    /// Helper: build a minimal Sendblue webhook payload. Sendblue posts the
+    /// message object itself rather than a typed event envelope.
+    #[cfg(feature = "channel-sendblue")]
+    fn sendblue_webhook_body(sender: &str, text: &str) -> String {
+        serde_json::json!({
+            "message_handle": "msg-123",
+            "from_number": sender,
+            "to_number": "+15550000000",
+            "content": text,
+            "is_outbound": false,
+            "status": "RECEIVED",
+            "date_sent": "2026-09-10T18:00:00.000Z",
+        })
+        .to_string()
+    }
+
+    /// Helper: build an `AppState` with one Sendblue channel registered under
+    /// the given alias, with an allow-any peer resolver and an optional shared
+    /// secret.
+    #[cfg(feature = "channel-sendblue")]
+    fn sendblue_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
+        sendblue_test_state_with_config(alias, signing_secret, Config::default())
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    fn sendblue_test_state_with_config(
+        alias: &str,
+        signing_secret: Option<&str>,
+        config: Config,
+    ) -> AppState {
+        let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(|| vec!["*".to_string()]);
+        let channel = Arc::new(SendblueChannel::new(
+            "test-key-id".into(),
+            "test-secret-key".into(),
+            "+15550000000".into(),
+            alias,
+            peer_resolver,
+        ));
+        let mut sendblue = HashMap::new();
+        sendblue.insert(alias.to_string(), channel);
+
+        let mut sendblue_signing_secrets: HashMap<String, Arc<str>> = HashMap::new();
+        if let Some(secret) = signing_secret {
+            sendblue_signing_secrets.insert(alias.to_string(), Arc::from(secret));
+        }
+
+        AppState {
+            config: Arc::new(RwLock::new(config)),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory,
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::new(MockMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue,
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets,
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    fn sendblue_secret_headers(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("sb-signing-secret", secret.parse().unwrap());
+        headers
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_returns_not_found_for_unknown_alias() {
+        let state = sendblue_test_state("production", Some("shared"));
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("staging".to_string()),
+            sendblue_secret_headers("shared"),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_rejects_when_no_shared_secret_is_configured() {
+        // Sendblue does not sign deliveries, so an unset secret leaves nothing
+        // to authenticate with. Fail closed rather than accepting the request.
+        let state = sendblue_test_state("main", None);
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            sendblue_secret_headers("anything"),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_rejects_a_wrong_shared_secret() {
+        let state = sendblue_test_state("main", Some("correct-secret"));
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            sendblue_secret_headers("wrong-secret"),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_rejects_a_missing_secret_header() {
+        let state = sendblue_test_state("main", Some("correct-secret"));
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            HeaderMap::new(),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_accepts_a_valid_shared_secret() {
+        let state = sendblue_test_state("main", Some("correct-secret"));
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            sendblue_secret_headers("correct-secret"),
+            Bytes::from(sendblue_webhook_body("+15551234567", "hello")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_acknowledges_an_outbound_receipt_without_dispatch() {
+        // Sendblue posts delivery receipts for the bot's own sends on the same
+        // webhook; they must be acknowledged, not answered.
+        let state = sendblue_test_state("main", Some("correct-secret"));
+
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&sendblue_webhook_body("+15551234567", "hello")).unwrap();
+        payload["is_outbound"] = serde_json::json!(true);
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            sendblue_secret_headers("correct-secret"),
+            Bytes::from(payload.to_string()),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_accepts_an_hmac_signed_delivery() {
+        // Proves the ingress layer hands the verifier the raw, unparsed body:
+        // the signature is computed over those exact bytes, so any re-encoding
+        // between receipt and verification would break it.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let state = sendblue_test_state("main", Some("correct-secret"));
+        let body = sendblue_webhook_body("+15551234567", "hello");
+        let timestamp = chrono::Utc::now().timestamp();
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"correct-secret").unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body.as_bytes());
+        let signature = format!(
+            "t={timestamp},v1={}",
+            hex::encode(mac.finalize().into_bytes())
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sendblue-signature", signature.parse().unwrap());
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_rejects_a_signature_over_a_different_body() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let state = sendblue_test_state("main", Some("correct-secret"));
+        let timestamp = chrono::Utc::now().timestamp();
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"correct-secret").unwrap();
+        mac.update(timestamp.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(sendblue_webhook_body("+15551234567", "hello").as_bytes());
+        let signature = format!(
+            "t={timestamp},v1={}",
+            hex::encode(mac.finalize().into_bytes())
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sendblue-signature", signature.parse().unwrap());
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            headers,
+            Bytes::from(sendblue_webhook_body("+15551234567", "tampered")),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_does_not_dispatch_a_redelivery_twice() {
+        // Sendblue re-delivers anything it did not get a 2xx for.
+        let state = sendblue_test_state("main", Some("correct-secret"));
+        let body = sendblue_webhook_body("+15551234567", "hello");
+
+        for _ in 0..2 {
+            let response = Box::pin(handle_sendblue_webhook_alias(
+                State(state.clone()),
+                Path("main".to_string()),
+                sendblue_secret_headers("correct-secret"),
+                Bytes::from(body.clone()),
+            ))
+            .await
+            .into_response();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a retry must still be acknowledged so Sendblue stops retrying"
+            );
+        }
+    }
+
+    #[cfg(feature = "channel-sendblue")]
+    #[tokio::test]
+    async fn sendblue_webhook_rejects_an_invalid_json_body() {
+        let state = sendblue_test_state("main", Some("correct-secret"));
+
+        let response = Box::pin(handle_sendblue_webhook_alias(
+            State(state),
+            Path("main".to_string()),
+            sendblue_secret_headers("correct-secret"),
+            Bytes::from_static(b"not json"),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     // ── Per-alias webhook routing───────────────────────────────────
 
     /// Baseline `AppState` with no channels configured, for the per-alias
@@ -9686,6 +10325,10 @@ path = "{trigger_path}"
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue: HashMap::new(),
+            #[cfg(feature = "channel-sendblue")]
+            sendblue_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]

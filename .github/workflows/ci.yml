@@ -703,6 +703,16 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-sendblue` is outside `default-channels`, so the workspace run
+      # above executes neither the channel's parsing and webhook-auth tests nor
+      # the gateway route tests behind the same feature. This step does both.
+      - name: Run Sendblue channel and gateway tests
+        run: |
+          cargo nextest run --locked -p zeroclaw-channels --features channel-sendblue --lib sendblue::
+          cargo nextest run --locked -p zeroclaw-gateway --features channel-sendblue --lib sendblue
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   windows-test-scope:
     name: Advisory Windows test selection

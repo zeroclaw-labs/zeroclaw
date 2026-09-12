@@ -77,6 +77,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "signal",
     "whatsapp",
     "linq",
+    "sendblue",
     "nextcloud_talk",
     "email",
     "gmail_push",
@@ -1882,7 +1883,7 @@ fn fold_channel_peer_auth_into_peer_groups(
         "imessage" => Some("allowed_contacts"),
         "signal" => Some("allowed_from"),
         "whatsapp" => Some("allowed_numbers"),
-        "linq" | "email" | "gmail_push" => Some("allowed_senders"),
+        "linq" | "sendblue" | "email" | "gmail_push" => Some("allowed_senders"),
         "nostr" => Some("allowed_pubkeys"),
         _ => None,
     }) else {

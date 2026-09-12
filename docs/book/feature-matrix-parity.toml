@@ -74,6 +74,10 @@ hermes = "supported"
 openclaw = "none"
 hermes = "none"
 
+[channels.sendblue]
+openclaw = "supported"
+hermes = "none"
+
 [channels.nextcloud]
 openclaw = "supported"
 hermes = "none"
