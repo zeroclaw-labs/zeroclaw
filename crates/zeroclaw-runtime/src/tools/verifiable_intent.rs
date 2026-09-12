@@ -330,8 +330,8 @@ mod tests {
         let args = json!({
             "operation": "evaluate_constraints",
             "constraints": [{
-                "type": "mandate.checkout.allowed_merchant",
-                "allowed_merchants": [
+                "type": "mandate.checkout.allowed_merchants",
+                "allowed": [
                     { "name": "Store A", "website": "https://store-a.example.com" }
                 ]
             }],
@@ -355,7 +355,7 @@ mod tests {
         let entry = &output["results"][0];
         assert_eq!(
             entry["constraint_type"],
-            "mandate.checkout.allowed_merchant"
+            "mandate.checkout.allowed_merchants"
         );
         assert_eq!(entry["satisfied"], false);
         let violation = entry["violations"][0]
@@ -374,8 +374,8 @@ mod tests {
         let args = json!({
             "operation": "evaluate_constraints",
             "constraints": [{
-                "type": "payment.allowed_payee",
-                "allowed_payees": [
+                "type": "mandate.payment.allowed_payees",
+                "allowed": [
                     { "name": "Payee A", "website": "https://payee-a.example.com" }
                 ]
             }],
@@ -397,7 +397,7 @@ mod tests {
             serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
         assert_eq!(output["all_satisfied"], false);
         let entry = &output["results"][0];
-        assert_eq!(entry["constraint_type"], "payment.allowed_payee");
+        assert_eq!(entry["constraint_type"], "mandate.payment.allowed_payees");
         assert_eq!(entry["satisfied"], false);
         let violation = entry["violations"][0]
             .as_str()
@@ -417,8 +417,8 @@ mod tests {
         let args = json!({
             "operation": "evaluate_constraints",
             "constraints": [{
-                "type": "mandate.checkout.allowed_merchant",
-                "allowed_merchants": [
+                "type": "mandate.checkout.allowed_merchants",
+                "allowed": [
                     { "name": "Store A", "website": "https://store-a.example.com" }
                 ]
             }],
@@ -454,8 +454,8 @@ mod tests {
             "operation": "evaluate_constraints",
             "constraints": [
                 {
-                    "type": "mandate.checkout.allowed_merchant",
-                    "allowed_merchants": [
+                    "type": "mandate.checkout.allowed_merchants",
+                    "allowed": [
                         { "name": "Store A", "website": "https://store-a.example.com" }
                     ]
                 },
@@ -479,7 +479,7 @@ mod tests {
         let merchant = &output["results"][0];
         assert_eq!(
             merchant["constraint_type"],
-            "mandate.checkout.allowed_merchant"
+            "mandate.checkout.allowed_merchants"
         );
         assert_eq!(merchant["satisfied"], true);
         assert_eq!(merchant["skipped"], false);
