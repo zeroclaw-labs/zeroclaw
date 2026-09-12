@@ -648,10 +648,8 @@ impl RpcDispatcher {
     }
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
-        if let Some(event) = event
-            && let Some(notification) = notification_for_turn_event(session_id, &event, None)
-        {
-            let _ = self.rpc.send_raw(notification).await;
+        if let Some(event) = event {
+            forward_turn_event(&self.rpc, session_id, &event, None, None).await;
         }
     }
 
@@ -1498,9 +1496,9 @@ impl RpcDispatcher {
         self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone());
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             && let Some(plan) = self.ctx.sessions.get_plan(&session_id).await
-            && let Some(notification) = plan_replay_notification(&session_id, &plan)
         {
-            let _ = self.rpc.send_raw(notification).await;
+            let event = TurnEvent::Plan { entries: plan };
+            forward_turn_event(&self.rpc, &session_id, &event, None, None).await;
         }
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_start(&session_id, "rpc").await;
@@ -1903,9 +1901,9 @@ impl RpcDispatcher {
                             .unwrap_or_default();
                             if !plan.is_empty() {
                                 self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
+                                let event = TurnEvent::Plan { entries: plan };
+                                forward_turn_event(&self.rpc, &session_id, &event, None, None)
+                                    .await;
                             }
                         }
                     }
@@ -2469,6 +2467,10 @@ impl RpcDispatcher {
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
         // max_context_tokens`), not the provider model-window helper (which
         // falls back to 32_000 when `context_window` is unset).
+        // model_context_window is now resolved per Usage event from the live
+        // provider so it follows in-turn switches (session/configure or
+        // model_switch tool). max_context_tokens remains the agent-profile
+        // budget and is resolved once at turn start.
         let (agent_alias, model_provider, model, max_ctx) = {
             let alias = self
                 .ctx
@@ -2503,6 +2505,8 @@ impl RpcDispatcher {
         let attribution_agent_alias = agent_alias.clone();
         let attribution_model_provider = model_provider.clone();
         let attribution_model = model.clone();
+        // Config for per-event window resolution.
+        let config = self.ctx.config.clone();
         // Cost-tracking context for this turn. Built from the daemon-scoped
         // tracker + the live pricing map and stamped with the agent alias so
         // `execute_turn` can persist token usage and attribute spend. `None`
@@ -2534,27 +2538,45 @@ impl RpcDispatcher {
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
+                let config = config.clone();
                 async move {
                     if let (
                         Some(store),
                         TurnEvent::Usage {
-                            input_tokens: Some(it),
+                            input_tokens,
+                            accepted,
                             ..
                         },
                     ) = (acp_token_store.as_ref(), &event)
                     {
                         let store = store.clone();
                         let sid = sid.clone();
-                        let it = *it;
-                        let _ =
-                            tokio::task::spawn_blocking(move || store.set_token_count(&sid, it))
-                                .await;
+                        let (tokens, is_accepted) = (*input_tokens, *accepted);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            store.persist_usage_snapshot(&sid, tokens, is_accepted)
+                        })
+                        .await;
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
-                        let _ = rpc.send_raw(n).await;
-                    }
+                    // Resolve model_context_window per event from the embedded provider_ref.
+                    // No agent-mutex reacquisition — resolve the live provider's window
+                    // from the config RwLock (read-only, non-blocking). The served
+                    // model must match the entry's configured model; otherwise omit
+                    // so fallback/vision/override models fall back to trim budget.
+                    let model_ctx_window = if let TurnEvent::Usage {
+                        provider_ref,
+                        model,
+                        ..
+                    } = &event
+                    {
+                        let cfg = config.read();
+                        cfg.model_provider_context_window_opt(provider_ref, model)
+                            .map(|v| v as u64)
+                    } else {
+                        None
+                    };
+                    forward_turn_event(&rpc, &sid, &event, max_ctx, model_ctx_window).await;
                 }
             },
         );
@@ -5708,23 +5730,11 @@ async fn persist_plan_if_any(
     }
 }
 
-fn plan_replay_notification(
-    session_id: &str,
-    entries: &[zeroclaw_api::plan::PlanEntry],
-) -> Option<String> {
-    if entries.is_empty() {
-        return None;
-    }
-    let event = TurnEvent::Plan {
-        entries: entries.to_vec(),
-    };
-    notification_for_turn_event(session_id, &event, None)
-}
-
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
     max_context_tokens: Option<u64>,
+    model_context_window: Option<u64>,
 ) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
@@ -5776,20 +5786,49 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage {
+            input_tokens,
+            accepted: true,
+            ..
+        } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
+            model_context_window,
         },
         TurnEvent::Plan { entries } => SessionUpdateEvent::Plan {
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        _ => return None,
     };
 
     let params = serde_json::to_value(update).ok()?;
     let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
     serde_json::to_string(&n).ok()
+}
+
+/// Forward a turn event through the outbound RPC writer as a
+/// serialized `session/update` notification.
+///
+/// Returns `true` when the event type maps to a notification and the
+/// send succeeded. Returns `false` when the event type is not forwarded
+/// (e.g. silent variants) or the writer channel is closed.
+///
+/// The caller is responsible for any pre-send side effects (ACP token
+/// persistence, plan persistence). This helper is the single forward
+/// path used by both production dispatch and regression tests.
+pub(super) async fn forward_turn_event(
+    rpc: &RpcOutbound,
+    session_id: &str,
+    event: &TurnEvent,
+    max_context_tokens: Option<u64>,
+    model_context_window: Option<u64>,
+) -> bool {
+    match notification_for_turn_event(session_id, event, max_context_tokens, model_context_window) {
+        Some(n) => rpc.send_raw(n).await,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -8336,7 +8375,7 @@ mod tests {
         let event = TurnEvent::Chunk {
             delta: "hello".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["jsonrpc"], JSONRPC_VERSION);
         assert_eq!(v["method"], notification::SESSION_UPDATE);
@@ -8350,7 +8389,7 @@ mod tests {
         let event = TurnEvent::Thinking {
             delta: "hmm".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "agent_thought_chunk");
         assert_eq!(v["params"]["text"], "hmm");
@@ -8363,7 +8402,7 @@ mod tests {
             name: "bash".into(),
             args: json!({"cmd": "ls"}),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_call");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
@@ -8379,7 +8418,7 @@ mod tests {
             output: "file.txt".into(),
             artifact: None,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "tool_result");
         assert_eq!(v["params"]["tool_call_id"], "tc_1");
@@ -8398,7 +8437,7 @@ mod tests {
                 active_form: Some("Analyzing codebase".to_string()),
             }],
         };
-        let json = notification_for_turn_event("sess-1", &event, None)
+        let json = notification_for_turn_event("sess-1", &event, None, None)
             .expect("plan yields a notification");
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
@@ -8416,8 +8455,8 @@ mod tests {
     #[test]
     fn empty_plan_turn_event_maps_to_empty_entries() {
         let event = TurnEvent::Plan { entries: vec![] };
-        let json =
-            notification_for_turn_event("sess-2", &event, None).expect("empty plan still notifies");
+        let json = notification_for_turn_event("sess-2", &event, None, None)
+            .expect("empty plan still notifies");
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "plan");
         assert!(v["params"]["entries"].as_array().unwrap().is_empty());
@@ -8432,17 +8471,16 @@ mod tests {
             priority: PlanPriority::Medium,
             active_form: None,
         }];
-        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        let json = notification_for_turn_event("sess-9", &event, None, None)
+            .expect("nonempty plan should serialize as notification");
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "plan");
         assert_eq!(v["params"]["session_id"], "sess-9");
         assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
-    }
-
-    #[test]
-    fn resume_plan_notification_absent_for_empty_plan() {
-        assert!(plan_replay_notification("sess-9", &[]).is_none());
     }
 
     async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {
@@ -8534,7 +8572,7 @@ mod tests {
             arguments_summary: "rm -rf /".into(),
             timeout_secs: 30,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "approval_request");
         assert_eq!(v["params"]["request_id"], "ar_1");
@@ -8549,7 +8587,7 @@ mod tests {
             kept_turns: 1,
             reason: "context token budget exceeded".into(),
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "history_trimmed");
@@ -8559,32 +8597,83 @@ mod tests {
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
     }
 
+    /// Resolution: runtime_profile.max_context_tokens → 32_000 stub.
     #[test]
-    fn usage_event_emits_context_usage_notification() {
-        let event = TurnEvent::Usage {
-            input_tokens: Some(100),
-            cached_input_tokens: None,
-            output_tokens: Some(50),
-            cost_usd: Some(0.01),
-        };
-        let json = notification_for_turn_event("s1", &event, Some(32_000)).unwrap();
-        let v = parse(&json);
-        assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(v["params"]["session_id"], "s1");
-        // Context size is the prompt the model just consumed = input_tokens.
-        // Output tokens are the model's reply, not part of the prompt size.
-        // cached_input_tokens is a *subset* of input_tokens per the
-        // TokenUsage contract and must NOT be added (double-counts).
-        assert_eq!(v["params"]["input_tokens"], 100);
-        assert_eq!(v["params"]["max_context_tokens"], 32_000);
+    fn context_usage_max_tokens_resolution() {
+        use std::collections::HashMap;
+        use zeroclaw_config::providers::Providers;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // (runtime_profile.max_context_tokens, provider.context_window, expected)
+        let cases: &[(Option<usize>, Option<usize>, u64)] = &[
+            (Some(128_000), None, 128_000), // profile wins, no provider window
+            (Some(128_000), Some(200_000), 128_000),
+            (None, Some(200_000), 32_000), // meter reads profile budget (32k), not provider window
+            (None, None, 32_000),          // hard stub
+        ];
+
+        for (profile, window, expected) in cases {
+            let mut runtime_profiles = HashMap::new();
+            if let Some(t) = profile {
+                runtime_profiles.insert(
+                    "coding".to_string(),
+                    RuntimeProfileConfig {
+                        max_context_tokens: Some(*t),
+                        ..RuntimeProfileConfig::default()
+                    },
+                );
+            }
+
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: if profile.is_some() {
+                        "coding".into()
+                    } else {
+                        "".into()
+                    },
+                    model_provider: "anthropic.default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+
+            let mut providers = Providers::default();
+            if let Some(w) = window {
+                providers
+                    .models
+                    .ensure("anthropic", "default")
+                    .expect("ensure creates entry")
+                    .context_window = Some(*w);
+            }
+
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
+
+            assert_eq!(
+                context_usage_max_tokens(&cfg, "coder"),
+                *expected,
+                "resolution (profile={profile:?}, window={window:?})"
+            );
+            // Sanity: model-window helper stays at 32k when provider has no context_window.
+            if window.is_none() {
+                assert_eq!(
+                    cfg.effective_model_context_window("coder"),
+                    32_000,
+                    "model-window helper must stay at 32k stub without provider context_window"
+                );
+            }
+        }
     }
 
-    /// Regression: Zerocode's context meter must read the runtime-profile
-    /// `max_context_tokens` budget, not the provider model-window helper.
-    /// The model-window path falls back to 32_000 when `context_window` is
-    /// unset, which made the meter ignore a profile set to e.g. 128_000.
+    /// Regression: model_context_window survives the wire when provider has it.
     #[test]
-    fn context_usage_max_tokens_uses_runtime_profile_budget() {
+    fn context_usage_notification_wire_reports_model_context_window() {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
@@ -8592,7 +8681,7 @@ mod tests {
         runtime_profiles.insert(
             "coding".to_string(),
             RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
+                max_context_tokens: Some(800_000), // 80% of 1M
                 ..RuntimeProfileConfig::default()
             },
         );
@@ -8603,85 +8692,362 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 runtime_profile: "coding".into(),
-                // No provider context_window configured — the broken path
-                // would fall back to 32_000 here.
+                model_provider: "openrouter.default".into(), // provider with context_window
                 ..AliasedAgentConfig::default()
             },
         );
 
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            ..Config::default()
-        };
-
-        assert_eq!(
-            context_usage_max_tokens(&cfg, "coder"),
-            128_000,
-            "context meter must use runtime_profiles.<name>.max_context_tokens"
-        );
-        assert_eq!(
-            cfg.effective_model_context_window("coder"),
-            32_000,
-            "sanity: model-window helper still defaults to 32k without provider context_window"
-        );
-    }
-
-    /// Boundary regression: prove the corrected ceiling survives the *wire*
-    /// path, not just the config helper. This threads
-    /// `context_usage_max_tokens(&cfg, alias)` through the exact
-    /// `notification_for_turn_event` serialization the RPC dispatch emits, and
-    /// asserts the on-the-wire `context_usage.max_context_tokens` reads the
-    /// runtime-profile budget (128_000) rather than the model-window fallback
-    /// (32_000). This closes the "helper is right but does the emitted payload
-    /// carry it?" gap without needing a live daemon smoke.
-    #[test]
-    fn context_usage_notification_wire_reports_runtime_profile_budget() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                // No provider context_window: the broken path would emit 32_000.
-                ..AliasedAgentConfig::default()
-            },
-        );
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("ensure creates entry")
+            .context_window = Some(1_000_000);
 
         let cfg = Config {
             agents,
             runtime_profiles,
+            providers,
             ..Config::default()
         };
 
-        // Resolve the ceiling exactly as RPC dispatch does, then emit it
-        // through the real wire serializer.
+        // Resolve both values exactly as RPC dispatch does.
         let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let model_ctx = cfg.effective_model_context_window("coder") as u64;
+
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: Some(0.01),
+            provider_ref: String::new(),
+            model: String::new(),
+            accepted: true,
         };
-        let json = notification_for_turn_event("s1", &event, Some(max_ctx)).unwrap();
+        let json =
+            notification_for_turn_event("s1", &event, Some(max_ctx), Some(model_ctx)).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["max_context_tokens"], 800_000,
+            "emitted context_usage must carry the runtime-profile trim budget"
+        );
+        assert_eq!(
+            v["params"]["model_context_window"], 1_000_000,
+            "emitted context_usage must carry the provider model window"
+        );
+    }
+
+    /// Regression: RPC wire omits model_context_window when provider has
+    /// no explicit context_window — 32k stub leak.
+    #[test]
+    fn context_usage_notification_omits_model_window_when_provider_unset() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        // Profile budget = 128_000; provider window explicitly UNSET.
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(128_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openrouter.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("ensure creates entry");
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        let max_ctx = Some(context_usage_max_tokens(&cfg, "coder"));
+        let model_ctx_window = cfg
+            .model_provider_context_window_opt("openrouter.default", "test-model")
+            .map(|v| v as u64);
+        assert!(
+            model_ctx_window.is_none(),
+            "model_provider_context_window_opt must return None when no \
+             provider context_window is set"
+        );
+
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: None,
+            provider_ref: String::new(),
+            model: String::new(),
+            accepted: true,
+        };
+        let json = notification_for_turn_event("s1", &event, max_ctx, model_ctx_window).unwrap();
         let v = parse(&json);
 
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
             v["params"]["max_context_tokens"], 128_000,
-            "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
+            "profile budget must be emitted"
+        );
+        assert!(
+            v["params"].get("model_context_window").is_none(),
+            "model_context_window must be absent when provider has no context_window"
+        );
+    }
+
+    /// Regression: model_context_window follows the live session provider
+    /// after a session/configure switch. Configures provider A (128k) and B
+    /// (1M), static agent binding is A. session/configure switches live
+    /// session to B. The emitted ContextUsage must carry B's window (1M).
+    #[tokio::test]
+    async fn context_usage_model_window_follows_live_session_provider_switch() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        // Provider A: context_window = 128_000 (static binding)
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let provider_a = config
+            .providers
+            .models
+            .ensure("openai", "provider-a")
+            .expect("ensure provider A");
+        provider_a.api_key = Some("test-key-a".into());
+        provider_a.uri = Some("http://127.0.0.1:1".into());
+        provider_a.model = Some("model-a".into());
+        provider_a.context_window = Some(128_000);
+
+        // Provider B: context_window = 1_000_000 (switched to via session/configure)
+        let provider_b = config
+            .providers
+            .models
+            .ensure("openai", "provider-b")
+            .expect("ensure provider B");
+        provider_b.api_key = Some("test-key-b".into());
+        provider_b.uri = Some("http://127.0.0.1:2".into());
+        provider_b.model = Some("model-b".into());
+        provider_b.context_window = Some(1_000_000);
+
+        config.agents = HashMap::from([(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.provider-a".into(), // Static binding = A
+                runtime_profile: "test-profile".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        )]);
+        config
+            .runtime_profiles
+            .insert("test-profile".into(), RuntimeProfileConfig::default());
+        config
+            .risk_profiles
+            .insert("default".into(), Default::default());
+
+        let dispatcher = make_config_set_test_dispatcher(config);
+
+        // Create session bound to agent "test-agent" (static provider A)
+        let session_res = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace_dir,
+            }))
+            .await
+            .expect("session/new should create the agent");
+        let session_id = session_res
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .expect("session/new result includes session_id")
+            .to_string();
+
+        // Verify initial state: agent is bound to provider A
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session exists");
+        assert_eq!(overrides.model_provider, None);
+
+        // Switch live session to provider B via session/configure
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.provider-b"
+                }
+            }))
+            .await;
+        assert!(res.is_ok(), "session/configure must succeed: {res:?}");
+
+        // Verify the override was committed
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session still exists");
+        assert_eq!(overrides.model_provider, Some("openai.provider-b".into()));
+
+        // Now emit a Usage event through the turn closure to test
+        // that model_context_window is resolved from the live provider B
+        // (not the static alias A). We simulate what the turn closure does.
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .expect("agent exists");
+        let (_, live_provider, live_model) = agent.lock().await.attribution_fields();
+        assert_eq!(live_provider, "openai.provider-b");
+
+        // Resolve model_context_window from the live provider
+        let cfg = dispatcher.ctx.config.read();
+        let model_ctx_window = cfg
+            .model_provider_context_window_opt(&live_provider, &live_model)
+            .map(|v| v as u64);
+        assert_eq!(model_ctx_window, Some(1_000_000));
+
+        // Now simulate the notification emission
+        let event = TurnEvent::Usage {
+            input_tokens: Some(100),
+            cached_input_tokens: None,
+            output_tokens: Some(50),
+            cost_usd: None,
+            provider_ref: String::new(),
+            model: String::new(),
+            accepted: true,
+        };
+        let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
+        let json =
+            notification_for_turn_event("s1", &event, Some(max_ctx), model_ctx_window).unwrap();
+        let v = parse(&json);
+
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(
+            v["params"]["model_context_window"], 1_000_000,
+            "emitted context_usage must carry B's model_context_window (1M), not A's (128k)"
+        );
+    }
+
+    /// Blocking (note12): same-profile fallback to a different model must not
+    /// borrow the primary's capacity. Mirrors the gateway regression with the
+    /// same config: `openai.default` for model-a (200k) with
+    /// fallback_models=[model-b]. Serving model-b must omit
+    /// `model_context_window` on the RPC wire so clients use the trim budget.
+    #[test]
+    fn context_usage_omits_window_on_same_profile_model_fallback() {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
+
+        let mut runtime_profiles = HashMap::new();
+        runtime_profiles.insert(
+            "coding".to_string(),
+            RuntimeProfileConfig {
+                max_context_tokens: Some(800_000),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "coding".into(),
+                model_provider: "openai.default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        let entry = providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure entry");
+        entry.model = Some("model-a".to_string());
+        entry.fallback_models = vec!["model-b".to_string()];
+        entry.context_window = Some(200_000);
+
+        let cfg = Config {
+            agents,
+            runtime_profiles,
+            providers,
+            ..Config::default()
+        };
+
+        // Shared resolution: primary matches, fallback does not.
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-a"),
+            Some(200_000)
+        );
+        assert_eq!(
+            cfg.model_provider_context_window_opt("openai.default", "model-b"),
+            None,
+            "fallback model must not borrow the primary's capacity"
+        );
+
+        // RPC projection: resolve per event exactly as dispatch does.
+        let event = TurnEvent::Usage {
+            input_tokens: Some(1000),
+            cached_input_tokens: None,
+            output_tokens: Some(500),
+            cost_usd: Some(0.01),
+            provider_ref: "openai.default".to_string(),
+            model: "model-b".to_string(),
+            accepted: true,
+        };
+        let model_ctx_window = if let TurnEvent::Usage {
+            provider_ref,
+            model,
+            ..
+        } = &event
+        {
+            cfg.model_provider_context_window_opt(provider_ref, model)
+                .map(|v| v as u64)
+        } else {
+            None
+        };
+        assert!(
+            model_ctx_window.is_none(),
+            "RPC must omit window when served model differs from configured primary"
+        );
+
+        let max_ctx = context_usage_max_tokens(&cfg, "coder");
+        let json =
+            notification_for_turn_event("s1", &event, Some(max_ctx), model_ctx_window).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["params"]["type"], "context_usage");
+        assert_eq!(v["params"]["max_context_tokens"], 800_000);
+        assert!(
+            v["params"].get("model_context_window").is_none(),
+            "RPC wire must omit model_context_window on same-profile fallback"
         );
     }
 
@@ -8692,8 +9058,11 @@ mod tests {
             cached_input_tokens: None,
             output_tokens: Some(50),
             cost_usd: None,
+            provider_ref: String::new(),
+            model: String::new(),
+            accepted: true,
         };
-        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         // No input_tokens reported → field omitted (skip_serializing_if).
@@ -8710,8 +9079,11 @@ mod tests {
             cached_input_tokens: Some(15_000),
             output_tokens: Some(200),
             cost_usd: None,
+            provider_ref: String::new(),
+            model: String::new(),
+            accepted: true,
         };
-        let json = notification_for_turn_event("s1", &event, Some(200_000)).unwrap();
+        let json = notification_for_turn_event("s1", &event, Some(200_000), None).unwrap();
         let v = parse(&json);
         assert_eq!(v["params"]["type"], "context_usage");
         assert_eq!(
@@ -8729,8 +9101,11 @@ mod tests {
             cached_input_tokens: Some(80_000),
             output_tokens: Some(100),
             cost_usd: None,
+            provider_ref: String::new(),
+            model: String::new(),
+            accepted: true,
         };
-        let json = notification_for_turn_event("s1", &event, Some(100_000)).unwrap();
+        let json = notification_for_turn_event("s1", &event, Some(100_000), None).unwrap();
         let v = parse(&json);
         assert!(
             v["params"].get("input_tokens").is_none(),
