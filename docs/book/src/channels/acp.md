@@ -387,7 +387,7 @@ ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize respon
 
 ## Security
 
-ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
+ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, uncovered tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); tools listed in `always_ask` still prompt through `session/request_permission` (or fail closed if the client cannot answer). `forbidden_paths` still apply.
 
 The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. The agent's system prompt reflects that same effective session workspace: the prompt's "Working directory" is rendered from `SecurityPolicy.workspace_dir` (the session `cwd`, or the agent workspace when `cwd` is omitted), while the agent's identity and personality (`IDENTITY.md`, `SOUL.md`) are loaded from the separate agent workspace. The model therefore sees the directory its file and shell tools are actually rooted at.
 

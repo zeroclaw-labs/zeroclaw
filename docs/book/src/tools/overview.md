@@ -103,7 +103,7 @@ The schema has no per-channel `tools_allow` / `tools_deny` field. Tool gating li
 - **MCP exception**: when `allowed_tools` is non-empty, runtime-discovered MCP tools (any name containing `__`, the `<server>__<tool>` convention) are auto-admitted into the effective allow-list without having to be listed there individually. This keeps the post-#7464 eager-MCP default usable for agents that already pin an explicit allow-list. To block individual MCP tools, list them in `excluded_tools`.
 - The MCP exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) are still treated as strict explicit-list intersections. A job that narrows itself to `allowed_tools = ["cron_add"]` will not surface runtime-discovered MCP wrappers it did not name, even when the agent's risk profile would auto-admit them.
 
-If you need finer-grained gating, drop the profile's `level` to `read_only` or `supervised` and rely on the per-profile `auto_approve` / `always_ask` lists to gate sensitive tools behind operator approval.
+If you need finer-grained gating under Full autonomy, put sensitive tools in the per-profile `always_ask` list: they still prompt (or fail closed) even when `level = "full"`. Dropping the profile to `read_only` or `supervised` is only required when you want the whole risk-tier matrix, not when you need a handful of exceptions.
 
 See [Autonomy levels](../security/autonomy.md) for the full set of per-profile fields.
 
