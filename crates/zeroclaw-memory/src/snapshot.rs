@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use crate::sqlite::SqliteMemory;
 
 /// Filename for the snapshot (lives at workspace root for Git visibility).
-pub const SNAPSHOT_FILENAME: &str = "MEMORY_SNAPSHOT.md";
+///
+/// Defined in `zeroclaw-config` because the agent-bundle exporter has to
+/// recognize the same name to keep memory out of a bundle.
+pub const SNAPSHOT_FILENAME: &str = zeroclaw_config::paths::MEMORY_SNAPSHOT_FILE;
 
 /// Header written at the top of every snapshot file.
 const SNAPSHOT_HEADER: &str = "# 🧠 ZeroClaw Memory Snapshot\n\n\
