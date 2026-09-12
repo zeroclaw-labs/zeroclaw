@@ -483,6 +483,7 @@ impl CopilotModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         let choice = api_response.choices.into_iter().next().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -732,7 +733,10 @@ fn admit_cache_dir(path: &Path) -> io::Result<Arc<Dir>> {
         }
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            #[cfg(unix)]
             let mut builder = cap_std::fs::DirBuilder::new();
+            #[cfg(not(unix))]
+            let builder = cap_std::fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use cap_std::fs::DirBuilderExt;

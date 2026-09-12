@@ -2687,16 +2687,23 @@ impl Channel for WhatsAppWebChannel {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let skip_reason = crate::util::voice_reply_skip_reason(content);
+            if let Some(reason) = skip_reason {
+                // Stable literal per the logging contract: the classification
+                // and per-event measurements ride solely in `attributes` above.
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_attrs(::serde_json::json!({
+                            "recipient": message.recipient,
+                            "reason": reason,
+                            "content_len": content.len(),
+                        })),
+                    "voice reply skipped"
+                );
+            }
 
-            if is_substantive {
+            if skip_reason.is_none() {
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),

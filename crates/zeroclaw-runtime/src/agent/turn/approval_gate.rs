@@ -12,6 +12,7 @@ pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
+    Cancelled,
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -48,7 +49,16 @@ pub(crate) async fn gate_tool_approval(
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
-                match ch.request_approval_attributed(recipient, &ch_request).await {
+                let response = if let Some(cancel) = ctx.cancellation_token {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return ApprovalGateOutcome::Cancelled,
+                        response = ch.request_approval_attributed(recipient, &ch_request) => response,
+                    }
+                } else {
+                    ch.request_approval_attributed(recipient, &ch_request).await
+                };
+                match response {
                     Ok(Some(a)) => Some(a),
                     Ok(None) => None,
                     Err(e) => {
@@ -238,19 +248,24 @@ pub(crate) async fn gate_tool_approval(
 
 #[cfg(test)]
 mod tests {
-    use super::super::context::TurnCtx;
     use super::{ApprovalGateOutcome, gate_tool_approval};
+    use crate::agent::turn::context::TurnCtx;
     use crate::approval::ApprovalManager;
     use crate::observability::NoopObserver;
+    use crate::rpc::approval_channel::RpcApprovalChannel;
+    use crate::rpc::context::ApprovalPendingMap;
     use crate::security::AutonomyLevel;
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
     use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
     use zeroclaw_api::channel::{
         Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
     };
-    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
+    use zeroclaw_api::jsonrpc::RpcOutbound;
+    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig, StreamReasoningMode};
 
     fn full_always_ask_profile() -> RiskProfileConfig {
         RiskProfileConfig {
@@ -350,6 +365,7 @@ mod tests {
                 panic!("listed Full tool must not silently execute (approved={approved})")
             }
             ApprovalGateOutcome::Replace(_) => panic!("listed Full tool must not be replaced"),
+            ApprovalGateOutcome::Cancelled => panic!("unexpected cancellation"),
         }
 
         match gate_tool_approval(&ctx, "file_write", &serde_json::json!({"path": "x"}), 0).await {
@@ -357,7 +373,9 @@ mod tests {
             ApprovalGateOutcome::Proceed { approved: false } => {
                 panic!("uncovered Full tool must still auto-approve")
             }
-            ApprovalGateOutcome::Deny(_) | ApprovalGateOutcome::Replace(_) => {
+            ApprovalGateOutcome::Deny(_)
+            | ApprovalGateOutcome::Replace(_)
+            | ApprovalGateOutcome::Cancelled => {
                 panic!("uncovered Full tool must still auto-approve")
             }
         }
@@ -387,6 +405,7 @@ mod tests {
                 )
             }
             ApprovalGateOutcome::Replace(_) => panic!("unexpected replace"),
+            ApprovalGateOutcome::Cancelled => panic!("unexpected cancellation"),
         }
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -398,7 +417,8 @@ mod tests {
             ApprovalGateOutcome::Proceed { approved: true } => {}
             ApprovalGateOutcome::Proceed { approved: false }
             | ApprovalGateOutcome::Deny(_)
-            | ApprovalGateOutcome::Replace(_) => {
+            | ApprovalGateOutcome::Replace(_)
+            | ApprovalGateOutcome::Cancelled => {
                 panic!("uncovered Full tool must still auto-approve")
             }
         }
@@ -406,6 +426,70 @@ mod tests {
             requests.load(Ordering::SeqCst),
             1,
             "uncovered Full tool must not prompt the back-channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_turn_drops_pending_channel_approval() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(4);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let pending = Arc::new(ApprovalPendingMap::default());
+        let channel = RpcApprovalChannel::new(
+            "rpc",
+            "session-approval",
+            rpc,
+            Arc::clone(&pending),
+            Default::default(),
+        );
+        let approval =
+            ApprovalManager::for_non_interactive_backchannel(&RiskProfileConfig::default());
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let cancel = CancellationToken::new();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test",
+            model: "test-model",
+            temperature: None,
+            approval: Some(&approval),
+            channel_name: "rpc",
+            channel_reply_target: Some("operator"),
+            cancellation_token: Some(&cancel),
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: Some(&channel),
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "turn-approval",
+            agent_alias: Some("default"),
+            parent_agent_alias: None,
+        };
+
+        let arguments = serde_json::json!({"command": "sleep 60"});
+        let approval_wait = gate_tool_approval(&ctx, "shell", &arguments, 0);
+        tokio::pin!(approval_wait);
+        let line = tokio::select! {
+            outcome = &mut approval_wait => panic!("approval completed before cancellation: {}", matches!(outcome, ApprovalGateOutcome::Cancelled)),
+            line = writer_rx.recv() => line.expect("approval request notification"),
+        };
+        let frame: serde_json::Value = serde_json::from_str(&line).expect("valid notification");
+        let request_id = frame["params"]["request_id"]
+            .as_str()
+            .expect("approval request id")
+            .to_string();
+        assert!(pending.contains(&request_id));
+
+        cancel.cancel();
+        assert!(matches!(
+            approval_wait.await,
+            ApprovalGateOutcome::Cancelled
+        ));
+        assert!(
+            !pending.contains(&request_id),
+            "cancelling the turn must drop the stale approval responder"
         );
     }
 }

@@ -424,11 +424,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ token request failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "QQ token request").await?;
 
         let data: serde_json::Value = resp.json().await?;
         let token = data
@@ -540,11 +536,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ gateway request failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "QQ gateway request").await?;
 
         let data: serde_json::Value = resp.json().await?;
         let url = data
@@ -847,11 +839,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ upload media failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "QQ upload media").await?;
 
         let upload_resp: QQUploadResponse = resp.json().await?;
         Ok((upload_resp.file_info, upload_resp.ttl))
@@ -926,11 +914,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send media message failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "QQ send media message").await?;
 
         Ok(())
     }
@@ -1279,11 +1263,7 @@ impl QQChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send message failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "QQ send message").await?;
 
         Ok(())
     }
