@@ -5610,24 +5610,10 @@ fn render_entry_into(
             }
         }
         ChatEntry::AgentMessage(text) => {
-            lines.push(Line::from(vec![Span::styled(
-                format!("{} ", crate::i18n::t("zc-chat-label-agent")),
-                theme::agent_label_style().add_modifier(sel_mod),
-            )]));
-            let md_lines = markdown_to_lines(text.as_ref(), width);
-            for mut line in md_lines {
-                if is_selected {
-                    line = Line::from(
-                        line.spans
-                            .into_iter()
-                            .map(|s| {
-                                s.patch_style(Style::default().add_modifier(Modifier::REVERSED))
-                            })
-                            .collect::<Vec<_>>(),
-                    );
-                }
-                lines.push(line);
-            }
+            render_agent_message_into(text, is_selected, width, lines);
+        }
+        ChatEntry::AgentMessageContinuation(text) => {
+            render_agent_message_into(text, is_selected, width, lines);
         }
         ChatEntry::AgentThought(text) => {
             if show_thoughts {
@@ -5659,6 +5645,35 @@ fn render_entry_into(
                 is_selected,
             );
         }
+    }
+}
+
+fn render_agent_message_into(
+    text: &str,
+    is_selected: bool,
+    width: u16,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let sel_mod = if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!("{} ", crate::i18n::t("zc-chat-label-agent")),
+        theme::agent_label_style().add_modifier(sel_mod),
+    )]));
+    let md_lines = markdown_to_lines(text, width);
+    for mut line in md_lines {
+        if is_selected {
+            line = Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|s| s.patch_style(Style::default().add_modifier(Modifier::REVERSED)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        lines.push(line);
     }
 }
 
@@ -7101,6 +7116,10 @@ impl PendingElicitation {
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
+    /// A response committed after the prompt RPC returned but before its
+    /// terminal notification arrived. Late chunks extend this buffer in place;
+    /// the next ordering boundary freezes it back into `AgentMessage`.
+    AgentMessageContinuation(String),
     AgentThought(Arc<str>),
     /// Local system/info message (e.g. "Attached: photo.png").
     SystemMessage(Arc<str>),
@@ -7177,6 +7196,8 @@ enum LinesDirty {
     /// `rebuild_lines` can extend `cached_lines` instead of rebuilding from scratch,
     /// avoiding re-parsing markdown for unchanged `AgentMessage` entries.
     Appended,
+    /// The final cached entry changed without shifting the render window.
+    TailChanged(usize),
     /// Full rebuild required (entry mutation, selection/thoughts change, reset).
     Full,
 }
@@ -7386,6 +7407,11 @@ pub struct ChatState {
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
     turn_had_streaming_text: bool,
+    /// Agent-message entry committed by prompt-response fallback while its
+    /// terminal notification may still be in flight. Continuation chunks for
+    /// the same local generation extend this entry instead of creating a
+    /// second `Agent:` block.
+    prompt_settled_stream_entry: Option<(u64, usize)>,
     /// Set when any `ToolCall` event arrived during the current turn.
     /// Used by `commit_turn` to distinguish "empty completion with tool
     /// calls" (normal — tool output is the visible record) from "empty
@@ -7549,6 +7575,7 @@ impl ChatState {
             turn_generation: 0,
             optimistic_user_message: None,
             turn_had_streaming_text: false,
+            prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
@@ -7603,10 +7630,24 @@ impl ChatState {
     }
 
     fn mark_dirty_append(&mut self) {
-        if self.dirty == LinesDirty::Clean {
-            self.dirty = LinesDirty::Appended;
+        match self.dirty {
+            LinesDirty::Clean => self.dirty = LinesDirty::Appended,
+            LinesDirty::TailChanged(_) => self.dirty = LinesDirty::Full,
+            LinesDirty::Appended | LinesDirty::Full => {}
         }
         // Full is sticky — don't downgrade.
+    }
+
+    fn mark_dirty_tail(&mut self, entry_index: usize) {
+        match self.dirty {
+            LinesDirty::Clean => self.dirty = LinesDirty::TailChanged(entry_index),
+            LinesDirty::TailChanged(index) if index == entry_index => {}
+            LinesDirty::Appended => {
+                // The entry has not entered the cache yet, so the append pass
+                // will render its latest contents.
+            }
+            LinesDirty::TailChanged(_) | LinesDirty::Full => self.dirty = LinesDirty::Full,
+        }
     }
 
     /// Whether text input currently belongs to the composer rather than a
@@ -8104,6 +8145,40 @@ impl ChatState {
         }
         start = start.min(natural_start);
         let end = start.saturating_add(MAX_RENDERED_ENTRIES).min(total);
+
+        // A prompt-response fallback may commit the current stream just before
+        // its final chunks arrive. Re-render only that final entry: earlier
+        // markdown and row metadata remain valid.
+        if let LinesDirty::TailChanged(entry_index) = self.dirty
+            && start == self.cached_render_start
+            && entry_index + 1 == end
+            && let Some(range_pos) = self
+                .cached_line_ranges
+                .iter()
+                .position(|&(index, _, _)| index == entry_index)
+            && range_pos + 1 == self.cached_line_ranges.len()
+        {
+            let line_start = self.cached_line_ranges[range_pos].1;
+            self.cached_lines.truncate(line_start);
+            self.cached_line_ranges.truncate(range_pos);
+
+            let mut changed_lines = Vec::new();
+            render_entry_into(
+                &self.entries[entry_index],
+                self.is_entry_highlighted(entry_index),
+                self.show_thoughts,
+                width,
+                &mut changed_lines,
+            );
+            let line_end = line_start + changed_lines.len();
+            self.cached_lines.extend(changed_lines);
+            self.cached_line_ranges
+                .push((entry_index, line_start, line_end));
+            self.cached_row_breaks = row_breaks_for_lines(&self.cached_lines, width);
+            self.dirty = LinesDirty::Clean;
+            self.rebuild_screen_ranges(width);
+            return;
+        }
 
         // Incremental append path.
         if self.dirty == LinesDirty::Appended && start == self.cached_render_start {
@@ -8669,6 +8744,36 @@ impl ChatState {
         }
     }
 
+    fn append_to_prompt_settled_stream(&mut self, text: &str) -> bool {
+        let Some((generation, entry_index)) = self.prompt_settled_stream_entry else {
+            return false;
+        };
+        if generation != self.turn_generation {
+            self.prompt_settled_stream_entry = None;
+            return false;
+        }
+        let Some(ChatEntry::AgentMessageContinuation(existing)) = self.entries.get_mut(entry_index)
+        else {
+            self.prompt_settled_stream_entry = None;
+            return false;
+        };
+        existing.push_str(text);
+        self.mark_dirty_tail(entry_index);
+        true
+    }
+
+    fn freeze_prompt_settled_stream(&mut self) {
+        let Some((_, entry_index)) = self.prompt_settled_stream_entry.take() else {
+            return;
+        };
+        let Some(entry) = self.entries.get_mut(entry_index) else {
+            return;
+        };
+        if let ChatEntry::AgentMessageContinuation(text) = entry {
+            *entry = ChatEntry::AgentMessage(Arc::<str>::from(std::mem::take(text)));
+        }
+    }
+
     pub fn apply_update(&mut self, update: SessionUpdate) {
         // Ignore notifications that belong to a different session.
         let update_sid = match &update {
@@ -8688,6 +8793,9 @@ impl ChatState {
 
         match update {
             SessionUpdate::AgentMessageChunk { text, .. } => {
+                if !self.turn_in_flight && self.append_to_prompt_settled_stream(&text) {
+                    return;
+                }
                 // Flush any accumulated thought before the response text begins
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
@@ -8703,6 +8811,7 @@ impl ChatState {
                 }
             }
             SessionUpdate::AgentThoughtChunk { text, .. } => {
+                self.freeze_prompt_settled_stream();
                 self.streaming_thought.push_str(&text);
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::Thinking;
@@ -8714,6 +8823,7 @@ impl ChatState {
                 raw_input,
                 ..
             } => {
+                self.freeze_prompt_settled_stream();
                 // Flush any accumulated text and thought before the tool call
                 // so that pre-tool agent text and thinking both appear in
                 // conversation order before the Tool entry.
@@ -8795,6 +8905,7 @@ impl ChatState {
                 reason,
                 ..
             } => {
+                self.freeze_prompt_settled_stream();
                 let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
                 let notice = crate::i18n::t_args(
@@ -8853,6 +8964,7 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
+        self.freeze_prompt_settled_stream();
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
         }
@@ -8880,17 +8992,28 @@ impl ChatState {
         }
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
-        self.mark_dirty_append();
         self.settle_turn_lifecycle(clean);
     }
 
     fn settle_turn_from_prompt_response(&mut self) {
-        if self.flush_streaming_text() {
+        self.freeze_prompt_settled_stream();
+        let text = std::mem::take(&mut self.streaming_text);
+        if !text.is_empty() {
             self.turn_had_streaming_text = true;
+            let entry_index = self.entries.len();
+            self.entries.push(ChatEntry::AgentMessageContinuation(text));
+            self.prompt_settled_stream_entry = Some((self.turn_generation, entry_index));
+            self.mark_dirty_append();
         }
         self.flush_streaming_thought();
-        self.turn_had_streaming_text = false;
-        self.turn_had_tool_calls = false;
+        if self
+            .prompt_settled_stream_entry
+            .is_some_and(|(_, entry_index)| entry_index + 1 != self.entries.len())
+        {
+            self.freeze_prompt_settled_stream();
+        }
+        // Preserve per-turn provenance for a delayed terminal notification;
+        // the next turn resets both flags when its user message is committed.
         self.mark_dirty_append();
         self.settle_turn_lifecycle(false);
     }
@@ -8944,6 +9067,7 @@ impl ChatState {
     }
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
+        self.freeze_prompt_settled_stream();
         // A new prompt supersedes the previous failure: the red dot clears
         // until the daemon reports otherwise.
         self.last_error = None;
@@ -9478,6 +9602,7 @@ impl ChatState {
     }
 
     fn prepare_for_notification_resync(&mut self) {
+        self.freeze_prompt_settled_stream();
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.streaming_text.clear();
@@ -9640,6 +9765,7 @@ impl ChatState {
         self.turn_in_flight = false;
         self.message_count = 0;
         self.turn_generation = self.turn_generation.wrapping_add(1);
+        self.prompt_settled_stream_entry = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.browse_cursor = None;
@@ -9701,6 +9827,7 @@ fn clipboard_text(entry: &ChatEntry) -> String {
             }
         }
         ChatEntry::AgentMessage(t) => t.to_string(),
+        ChatEntry::AgentMessageContinuation(t) => t.clone(),
         ChatEntry::AgentThought(t) => format!("(thinking) {t}"),
         ChatEntry::SystemMessage(t) => t.to_string(),
         ChatEntry::Tool {
@@ -9721,7 +9848,7 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
         ChatEntry::UserMessage { .. } => {
             crate::i18n::t_args("zc-chat-clipboard-you", &[("text", &clipboard_text(entry))])
         }
-        ChatEntry::AgentMessage(_) => crate::i18n::t_args(
+        ChatEntry::AgentMessage(_) | ChatEntry::AgentMessageContinuation(_) => crate::i18n::t_args(
             "zc-chat-clipboard-agent",
             &[("text", &clipboard_text(entry))],
         ),
@@ -20066,6 +20193,147 @@ mod tests {
                 .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
             "the lifecycle fence must not invent the dropped final transcript content"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_before_turn_complete_does_not_duplicate_streamed_text() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "streamed reply"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let replies = active_state(&mut chat)
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(entry, ChatEntry::AgentMessage(text) if text.as_ref() == "streamed reply")
+            })
+            .count();
+        assert_eq!(
+            replies, 1,
+            "a delayed terminal frame must not duplicate text committed by response settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_keeps_late_stream_chunk_in_one_agent_entry() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_all_queues();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "```rust\nlet daemon = 1;"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+        let state = active_state(&mut chat);
+        state.rebuild_lines(80);
+        assert_eq!(state.dirty, LinesDirty::Clean);
+        assert!(state.prompt_settled_stream_entry.is_some());
+
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "agent_message_chunk",
+                    "session_id": "sess-1",
+                    "text": "\nlet late = 2;\n```"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        let state = active_state(&mut chat);
+        assert!(
+            matches!(state.dirty, LinesDirty::TailChanged(_)),
+            "late chunk should dirty only the transcript tail, got {:?}",
+            state.dirty
+        );
+        assert!(matches!(
+            state.entries().last(),
+            Some(ChatEntry::AgentMessageContinuation(text))
+                if text == "```rust\nlet daemon = 1;\nlet late = 2;\n```"
+        ));
+        state.rebuild_lines(80);
+        assert_eq!(state.dirty, LinesDirty::Clean);
+        assert_eq!(
+            state.cached_line_screen_ranges.len(),
+            state.cached_lines.len()
+        );
+        assert_eq!(state.cached_code_blocks.len(), 1);
+        assert!(state.cached_code_blocks[0].text.contains("let late = 2;"));
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "```rust\nlet daemon = 1;\nlet late = 2;\n```"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+        assert_eq!(active_state(&mut chat).dirty, LinesDirty::Clean);
+
+        let replies = active_state(&mut chat)
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::AgentMessage(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replies, ["```rust\nlet daemon = 1;\nlet late = 2;\n```"]);
     }
 
     #[tokio::test]
