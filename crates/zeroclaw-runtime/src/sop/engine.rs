@@ -100,6 +100,12 @@ pub struct SopEngine {
     /// until maintenance can persist the terminal `Failed` transition. This set
     /// creates the safe-boundary fact; it does not duplicate durable run state.
     step_budget_finalization_ready: std::collections::HashSet<String>,
+    /// Run IDs currently owned by a headless driver task. A resumed action can
+    /// be scheduled from several surfaces (HTTP approve, WS, channel, RPC), and
+    /// two drivers over one run execute the same step twice and hand the engine
+    /// two results for it. The lease is process-local like the driver itself;
+    /// the durable run state is unaffected by it.
+    headless_drivers: std::collections::HashSet<String>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
@@ -337,6 +343,7 @@ impl SopEngine {
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
             cancellation_finalization_ready: std::collections::HashSet::new(),
             step_budget_finalization_ready: std::collections::HashSet::new(),
+            headless_drivers: std::collections::HashSet::new(),
         }
     }
 
@@ -508,6 +515,13 @@ impl SopEngine {
                 let mut replay_parked_requests = Vec::new();
                 let mut finalize_cancel_requests = Vec::new();
                 for pr in runs {
+                    // A run this engine already holds is live state; the stored
+                    // snapshot is at best equal to it and usually older. Keep
+                    // the in-memory run so a repeated restore cannot rewind a
+                    // run to an earlier step or drop its recorded step results.
+                    if self.active_runs.contains_key(&pr.run.run_id) {
+                        continue;
+                    }
                     // A1: a run persisted while parked at a HITL approval / paused at
                     // a deterministic checkpoint normally holds NO exec claim - it
                     // released its slot on park. Restore it WITHOUT re-establishing a
@@ -1965,6 +1979,42 @@ impl SopEngine {
                      `resolve_gate` (WaitingApproval) or `approve_step` (PausedCheckpoint) \
                      before advancing with sop_advance",
                     run.status
+                );
+            }
+            // A result belongs to the step that produced it. The run may have
+            // moved on since that step was dispatched (a duplicate driver, a
+            // stale engine copy, a retry that already re-ran the step), and
+            // validating a late result against whatever step the run is on now
+            // rejects or promotes the wrong step and misattributes the record.
+            // Refuse it instead of routing it.
+            if result.step_number != run.current_step {
+                let expected = run.current_step;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "current_step": expected,
+                            "result_step": result.step_number,
+                        })),
+                    "SOP engine: advance_step rejected — result is for a step the run is not on"
+                );
+                self.record_transition_event(
+                    run_id,
+                    "step_result_stale",
+                    Some(format!(
+                        "result for step {} arrived while the run is on step {expected}",
+                        result.step_number
+                    )),
+                    ::serde_json::json!({
+                        "step": result.step_number,
+                        "current_step": expected,
+                    }),
+                );
+                bail!(
+                    "Run {run_id} is on step {expected}; a result for step {} cannot advance it",
+                    result.step_number
                 );
             }
             (run.sop_name.clone(), run.current_step)
@@ -5547,6 +5597,19 @@ impl SopEngine {
         }
     }
 
+    /// Take the headless-driver lease for `run_id`. Returns `false` when another
+    /// driver already owns the run, in which case the caller must not execute
+    /// its steps: the owning driver will reach the same next action itself.
+    pub(crate) fn try_lease_headless_driver(&mut self, run_id: &str) -> bool {
+        self.headless_drivers.insert(run_id.to_string())
+    }
+
+    /// Release the headless-driver lease taken by `try_lease_headless_driver`.
+    /// Idempotent; releasing a lease that is not held is a no-op.
+    pub(crate) fn release_headless_driver(&mut self, run_id: &str) {
+        self.headless_drivers.remove(run_id);
+    }
+
     /// Ordered event/ledger history for a run (from the durable store).
     pub fn run_events(&self, run_id: &str) -> Result<Vec<SopEventRecord>, StoreError> {
         self.store.list_events(run_id)
@@ -7743,6 +7806,159 @@ mod tests {
             .unwrap();
 
         assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+    }
+
+    fn completed_step_result(step_number: u32, output: &str) -> SopStepResult {
+        SopStepResult {
+            step_number,
+            status: SopStepStatus::Completed,
+            output: output.into(),
+            started_at: now_iso8601(),
+            completed_at: Some(now_iso8601()),
+            effective_agent: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// A late result for a step the run has already left (a duplicate driver,
+    /// a stale engine copy) must not be validated or routed as if it belonged
+    /// to the run's current step: that is how a promoted run got a schema
+    /// rejection recorded against an earlier step and re-ran it.
+    #[test]
+    fn advance_step_rejects_result_for_a_step_the_run_has_left() {
+        let mut sop = test_sop("stale-result", SopExecutionMode::Auto, SopPriority::Normal);
+        sop.steps[1].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].on_failure = StepFailure::Retry { max: 1 };
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("stale-result", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(&run_id, completed_step_result(1, "step one done"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+        let results_before = engine.active_runs()[&run_id].step_results.len();
+
+        // A second copy of step 1 finishes late, with prose that would fail
+        // step 2's object schema if it were mistaken for step 2's result.
+        let err = engine
+            .advance_step(&run_id, completed_step_result(1, "step one done again"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("on step 2") && err.to_string().contains("step 1"),
+            "rejection should name both steps, got: {err}"
+        );
+
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 2, "the run must stay on its current step");
+        assert_eq!(run.status, SopRunStatus::Running);
+        assert_eq!(
+            run.step_results.len(),
+            results_before,
+            "a refused result must not be recorded"
+        );
+
+        let events = engine.run_events(&run_id).unwrap();
+        assert!(
+            !events.iter().any(|e| e.kind == "step_schema_reject"),
+            "the late result must not be schema-checked against step 2"
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "step_retry"),
+            "the late result must not trigger a retry of any step"
+        );
+        let stale = events
+            .iter()
+            .find(|e| e.kind == "step_result_stale")
+            .expect("the refusal is recorded on the run's event trail");
+        assert_eq!(stale.payload["step"], 1);
+        assert_eq!(stale.payload["current_step"], 2);
+    }
+
+    #[test]
+    fn advance_step_still_routes_a_result_for_the_current_step() {
+        let sop = test_sop(
+            "current-result",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine.start_run("current-result", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2));
+        let action = engine
+            .advance_step(&run_id, completed_step_result(2, "two"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+        let finished = engine.finished_runs(None);
+        assert_eq!(
+            finished[0]
+                .step_results
+                .iter()
+                .map(|r| r.step_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// `restore_runs` rehydrates runs the engine does not hold. A run it
+    /// already holds is live state that the stored snapshot can only trail, so
+    /// a repeated restore must not rewind it or drop its recorded results.
+    #[test]
+    fn restore_runs_does_not_rewind_a_live_run() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sop = test_sop("live-run", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut engine = engine_with_sops(vec![sop]).with_store(store.clone());
+        let action = engine.start_run("live-run", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .advance_step(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert_eq!(engine.active_runs()[&run_id].current_step, 2);
+
+        // A stale snapshot lands in the store with a newer revision, the way a
+        // second engine over the same store would leave it.
+        let mut stale = engine.active_runs()[&run_id].clone();
+        stale.current_step = 1;
+        stale.step_results.clear();
+        let stored = store.load_run(&run_id).unwrap().expect("run persisted");
+        let mut persisted = PersistedRun::new(stale, now_iso8601(), SopTriggerSource::Manual);
+        persisted.revision = stored.revision + 1;
+        store.save_run(&persisted).unwrap();
+
+        engine.restore_runs();
+
+        let run = &engine.active_runs()[&run_id];
+        assert_eq!(run.current_step, 2, "restore must not rewind a live run");
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "restore must keep recorded results"
+        );
+    }
+
+    #[test]
+    fn headless_driver_lease_is_exclusive_until_released() {
+        let mut engine = engine_with_sops(vec![]);
+        assert!(engine.try_lease_headless_driver("run-a"));
+        assert!(
+            !engine.try_lease_headless_driver("run-a"),
+            "a second driver for the same run must be refused"
+        );
+        assert!(
+            engine.try_lease_headless_driver("run-b"),
+            "leases are per run"
+        );
+        engine.release_headless_driver("run-a");
+        assert!(engine.try_lease_headless_driver("run-a"));
+        engine.release_headless_driver("never-leased");
     }
 
     #[test]
