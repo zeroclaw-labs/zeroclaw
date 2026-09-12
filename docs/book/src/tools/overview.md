@@ -50,7 +50,7 @@ Conditionally registered:
 | `knowledge` | `[knowledge].enabled = true`. Stores structured relationship memory; see [Relationship memory](./relationship-memory.md) |
 | Hardware probes | `--features hardware`: GPIO reads/writes, device discovery, firmware flashing |
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
-| `discord_search` | Registered when a Discord alias has `archive` enabled |
+| `discord_search` | Registered per agent when that agent owns a Discord alias with `archive` enabled; results are scoped to the agent's own Discord channels |
 
 ## Extension protocols
 

@@ -91,6 +91,19 @@ records every message it sees, and registers a `discord_search` tool the agent
 can use to look up past conversation. Leave it off if you don't need history
 search; the bot still replies normally either way.
 
+The archive is shared across Discord aliases, but each archived row records
+which configured channel wrote it, and `discord_search` only returns rows
+belonging to the calling agent's own Discord channels. Rows archived by
+older versions carry no channel attribution: a single-agent install still
+sees them, while a multi-agent install hides them from every agent.
+Edits, deletes, bulk deletes, and reaction removals pass the same configured
+guild/channel admission gates as message creation and mutate a row only while
+its stored channel and alias provenance still match. Message and reaction ids
+are global, so two aliases can legitimately observe the same event and address
+the same archived row; the alias that archived it first keeps it, and the later
+write leaves that row untouched. An event observed by one Discord alias
+therefore cannot relabel or remove another alias's archive row.
+
 ## Streaming
 
 {{#streaming channel="Discord" mode="stream_mode" path="channels.discord.<alias>.stream_mode"}}

@@ -354,6 +354,15 @@ impl DiscordChannel {
         self
     }
 
+    /// Provenance namespace stamped on every archive row this channel
+    /// writes: its own ChannelRef (`discord.<alias>`). `discord_search`
+    /// enforces per-agent ownership against this value, so rows in the
+    /// shared discord.db are attributable to the configured channel that
+    /// observed them (never to model-supplied identifiers).
+    fn archive_namespace(&self) -> String {
+        format!("discord.{}", self.alias)
+    }
+
     async fn sync_archive_for_message_event(
         &self,
         event_type: &str,
@@ -363,12 +372,23 @@ impl DiscordChannel {
         let Some(archive_mem) = self.archive_memory.clone() else {
             return;
         };
+        let channel_id = d
+            .get("channel_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !self.archive_event_is_admitted(d, channel_id).await {
+            return;
+        }
         match event_type {
-            "MESSAGE_UPDATE" => self.apply_archive_edit(&archive_mem, d, bot_user_id).await,
+            "MESSAGE_UPDATE" => {
+                self.apply_archive_edit(&archive_mem, d, channel_id, bot_user_id)
+                    .await;
+            }
             "MESSAGE_DELETE" => {
                 let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 if !message_id.is_empty() {
-                    self.apply_archive_tombstone(&archive_mem, message_id).await;
+                    self.apply_archive_tombstone(&archive_mem, message_id, channel_id)
+                        .await;
                 }
             }
             "MESSAGE_DELETE_BULK" => {
@@ -380,11 +400,42 @@ impl DiscordChannel {
                     .map(|arr| arr.iter().filter_map(|i| i.as_str()).collect::<Vec<&str>>())
                     .unwrap_or_default();
                 for id in ids {
-                    self.apply_archive_tombstone(&archive_mem, id).await;
+                    self.apply_archive_tombstone(&archive_mem, id, channel_id)
+                        .await;
                 }
             }
             _ => {}
         }
+    }
+
+    async fn archive_event_is_admitted(&self, d: &serde_json::Value, channel_id: &str) -> bool {
+        if channel_id.is_empty() {
+            return false;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(guild_id) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == guild_id)
+        {
+            return false;
+        }
+        if self.channel_ids.is_empty() {
+            return true;
+        }
+        let parent_id = if self.channel_ids.iter().any(|allowed| allowed == channel_id) {
+            None
+        } else {
+            self.thread_parent(&self.http_client(), channel_id).await
+        };
+        channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref())
+    }
+
+    fn archived_entry_matches_event(
+        &self,
+        entry: &zeroclaw_memory::MemoryEntry,
+        channel_id: &str,
+    ) -> bool {
+        entry.namespace == self.archive_namespace()
+            && entry.session_id.as_deref() == Some(channel_id)
     }
 
     /// Fetch the archived entry for a message id, or `None` (logging
@@ -412,34 +463,153 @@ impl DiscordChannel {
         }
     }
 
-    /// Re-store an entry preserving its category and session attribution.
-    async fn restore_archived_entry(
+    /// Update content only while the row still carries this alias and event's
+    /// persisted provenance. The storage predicate closes the check/use race;
+    /// an event can never relabel a row as a side effect of editing it.
+    async fn update_archived_entry(
         &self,
         archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
         key: &str,
         content: &str,
         existing: &zeroclaw_memory::MemoryEntry,
     ) {
-        if let Err(e) = archive_mem
-            .store(
+        match archive_mem
+            .update_content_if_provenance(
                 key,
                 content,
-                existing.category.clone(),
+                &existing.namespace,
                 existing.session_id.as_deref(),
+                existing.agent_id.as_deref(),
             )
             .await
         {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error": format!("{e}"),
-                        "key": key,
-                    })),
-                "failed to sync discord archive for message event"
-            );
+            Ok(true) => {}
+            Ok(false) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_attrs(::serde_json::json!({"key": key})),
+                    "discord archive provenance changed before conditional update"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "failed to sync discord archive for message event"
+                );
+            }
         }
+    }
+
+    /// Record a newly observed event under this alias, or leave an existing
+    /// row alone when it already belongs to another alias or channel.
+    ///
+    /// Discord message and reaction ids are global, so two aliases that both
+    /// legitimately observe an event address the same archive key in the
+    /// shared sidecar. Writing later must not move the row's namespace,
+    /// session, and content, which is what decides whose scoped
+    /// `discord_search` still returns it. Redelivery to the owning alias
+    /// stays an ordinary refresh.
+    async fn archive_new_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        key: &str,
+        content: &str,
+        session_id: Option<&str>,
+    ) {
+        match archive_mem
+            .store_preserving_provenance(
+                key,
+                content,
+                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+                session_id,
+                &self.archive_namespace(),
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_attrs(::serde_json::json!({"key": key})),
+                    "discord archive row belongs to another alias or channel; not overwritten"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "archive store failed"
+                );
+            }
+        }
+    }
+
+    /// Format and archive one observed message. `author_id` is the gateway
+    /// author id, used only as the display fallback when the payload omits a
+    /// username.
+    async fn archive_message_create(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        d: &serde_json::Value,
+        author_id: &str,
+    ) {
+        let archive_channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        let is_dm_event = d.get("guild_id").is_none();
+        let username = d
+            .get("author")
+            .and_then(|a| a.get("username"))
+            .and_then(|u| u.as_str())
+            .unwrap_or(author_id);
+        let content_raw = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let archive_msg_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if content_raw.is_empty() {
+            return;
+        }
+        let ts = chrono::Utc::now().to_rfc3339();
+        let channel_display = if is_dm_event {
+            "dm"
+        } else {
+            archive_channel_id
+        };
+        let atts = d
+            .get("attachments")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let mut mem_content = format!("@{username} in #{channel_display} at {ts}: {content_raw}");
+        if !atts.is_empty() {
+            mem_content.push_str(&format!(" [attachments: {atts}]"));
+        }
+        let mem_key = if archive_msg_id.is_empty() {
+            format!("discord_{}", Uuid::new_v4())
+        } else {
+            format!("discord_{archive_msg_id}")
+        };
+        let session = if archive_channel_id.is_empty() {
+            None
+        } else {
+            Some(archive_channel_id)
+        };
+        self.archive_new_entry(archive_mem, &mem_key, &mem_content, session)
+            .await;
     }
 
     /// Append a deletion tombstone. Idempotent: gateway redelivery (and a
@@ -448,11 +618,15 @@ impl DiscordChannel {
         &self,
         archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
         message_id: &str,
+        channel_id: &str,
     ) {
         let key = format!("discord_{message_id}");
         let Some(existing) = self.archived_entry(archive_mem, &key).await else {
             return;
         };
+        if !self.archived_entry_matches_event(&existing, channel_id) {
+            return;
+        }
         if existing.content.contains("[deleted at ") {
             return;
         }
@@ -460,7 +634,7 @@ impl DiscordChannel {
         // available.
         let ts = chrono::Utc::now().to_rfc3339();
         let updated = format!("{} [deleted at {ts}]", existing.content);
-        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+        self.update_archived_entry(archive_mem, &key, &updated, &existing)
             .await;
     }
 
@@ -468,6 +642,7 @@ impl DiscordChannel {
         &self,
         archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
         d: &serde_json::Value,
+        channel_id: &str,
         bot_user_id: &str,
     ) {
         let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -508,6 +683,9 @@ impl DiscordChannel {
         let Some(existing) = self.archived_entry(archive_mem, &key).await else {
             return;
         };
+        if !self.archived_entry_matches_event(&existing, channel_id) {
+            return;
+        }
         let marker_key = format!(" [edited at {edited_ts}:");
         if existing.content.contains(&marker_key) {
             return;
@@ -524,7 +702,7 @@ impl DiscordChannel {
             base.push_str(" [edit history truncated]");
         }
         let updated = format!("{base}{marker}");
-        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+        self.update_archived_entry(archive_mem, &key, &updated, &existing)
             .await;
     }
 
@@ -539,7 +717,7 @@ impl DiscordChannel {
         let user_id = d.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
         let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
         let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
-        if user_id.is_empty() || message_id.is_empty() {
+        if user_id.is_empty() || message_id.is_empty() || channel_id.is_empty() {
             return;
         }
         // Our own ack/failure reactions arrive back as events — never record them.
@@ -603,19 +781,42 @@ impl DiscordChannel {
         };
 
         if event_type == "MESSAGE_REACTION_REMOVE" {
-            // A failed forget leaves the same stale entry a missed event
-            // would — log it like the store path does.
-            if let Err(e) = archive_mem.forget(&key).await {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": format!("{e}"),
-                            "key": key,
-                        })),
-                    "failed to forget archived discord reaction"
-                );
+            let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+                return;
+            };
+            if !self.archived_entry_matches_event(&existing, channel_id) {
+                return;
+            }
+            match archive_mem
+                .forget_if_provenance(
+                    &key,
+                    &existing.namespace,
+                    existing.session_id.as_deref(),
+                    existing.agent_id.as_deref(),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_attrs(::serde_json::json!({"key": key})),
+                        "discord reaction provenance changed before conditional delete"
+                    );
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "key": key,
+                            })),
+                        "failed to forget archived discord reaction"
+                    );
+                }
             }
             return;
         }
@@ -648,32 +849,14 @@ impl DiscordChannel {
         } else {
             Some(channel_id)
         };
-        if let Err(e) = archive_mem
-            .store(
-                &key,
-                &content,
-                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
-                session,
-            )
-            .await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "error": format!("{e}"),
-                        "key": key,
-                    })),
-                "failed to archive discord reaction"
-            );
-        }
+        self.archive_new_entry(archive_mem, &key, &content, session)
+            .await;
     }
 
     async fn sweep_message_reactions(&self, event_type: &str, d: &serde_json::Value) {
         let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
         let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
-        if message_id.is_empty() {
+        if message_id.is_empty() || channel_id.is_empty() {
             return;
         }
         if !self.guild_ids.is_empty()
@@ -751,17 +934,39 @@ impl DiscordChannel {
             if !reaction_sweep_matches(&entry.key, message_id, emoji_key) {
                 continue;
             }
-            if let Err(e) = archive_mem.forget(&entry.key).await {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": format!("{e}"),
-                            "key": entry.key,
-                        })),
-                    "failed to forget archived discord reaction during sweep"
-                );
+            if !self.archived_entry_matches_event(&entry, channel_id) {
+                continue;
+            }
+            match archive_mem
+                .forget_if_provenance(
+                    &entry.key,
+                    &entry.namespace,
+                    entry.session_id.as_deref(),
+                    entry.agent_id.as_deref(),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_attrs(::serde_json::json!({"key": entry.key})),
+                        "discord reaction provenance changed before conditional sweep"
+                    );
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "key": entry.key,
+                            })),
+                        "failed to forget archived discord reaction during sweep"
+                    );
+                }
             }
         }
     }
@@ -3174,62 +3379,7 @@ impl Channel for DiscordChannel {
 
                     // Archive every non-bot message to discord.db when enabled.
                     if let Some(ref archive_mem) = archive_memory {
-                        let archive_channel_id =
-                            d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
-                        let is_dm_event = d.get("guild_id").is_none();
-                        let username = d
-                            .get("author")
-                            .and_then(|a| a.get("username"))
-                            .and_then(|u| u.as_str())
-                            .unwrap_or(author_id);
-                        let content_raw =
-                            d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                        let archive_msg_id =
-                            d.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                        if !content_raw.is_empty() {
-                            let ts = chrono::Utc::now().to_rfc3339();
-                            let channel_display =
-                                if is_dm_event { "dm" } else { archive_channel_id };
-                            let atts = d
-                                .get("attachments")
-                                .and_then(|a| a.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|a| a.get("url").and_then(|u| u.as_str()))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default();
-                            let mut mem_content = format!(
-                                "@{username} in #{channel_display} at {ts}: {content_raw}"
-                            );
-                            if !atts.is_empty() {
-                                mem_content.push_str(&format!(" [attachments: {atts}]"));
-                            }
-                            let mem_key = if archive_msg_id.is_empty() {
-                                format!("discord_{}", Uuid::new_v4())
-                            } else {
-                                format!("discord_{archive_msg_id}")
-                            };
-                            let session = if archive_channel_id.is_empty() {
-                                None
-                            } else {
-                                Some(archive_channel_id)
-                            };
-                            if let Err(e) = archive_mem
-                                .store(
-                                    &mem_key,
-                                    &mem_content,
-                                    zeroclaw_memory::MemoryCategory::Custom(
-                                        "discord".to_string(),
-                                    ),
-                                    session,
-                                )
-                                .await
-                            {
-                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "archive store failed");
-                            }
-                        }
+                        self.archive_message_create(archive_mem, d, author_id).await;
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -5419,12 +5569,32 @@ mod tests {
         (ch, mem, dir)
     }
 
+    fn channel_for_shared_archive(
+        mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        alias: &str,
+        channel_ids: Vec<String>,
+    ) -> DiscordChannel {
+        DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            alias,
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(channel_ids)
+        .with_archive_memory(std::sync::Arc::clone(mem))
+        .with_reaction_notifications(DiscordReactionScope::All)
+    }
+
     async fn seed_archived_message(mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>) {
-        mem.store(
+        mem.store_with_metadata(
             "discord_111",
             "@alice in #200 at t0: original text",
             zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
             Some("200"),
+            Some("discord.discord_test_alias"),
+            None,
         )
         .await
         .unwrap();
@@ -5454,8 +5624,9 @@ mod tests {
                 .content
                 .contains("[edited at 2026-06-11T01:00:00Z: revised text]")
         );
-        // Session attribution survives the re-store.
+        // Persisted provenance survives the conditional content update.
         assert_eq!(entry.session_id.as_deref(), Some("200"));
+        assert_eq!(entry.namespace, "discord.discord_test_alias");
     }
 
     #[tokio::test]
@@ -5543,17 +5714,20 @@ mod tests {
         );
         assert_eq!(entry.content.matches("[deleted at ").count(), 1);
         assert_eq!(entry.session_id.as_deref(), Some("200"));
+        assert_eq!(entry.namespace, "discord.discord_test_alias");
     }
 
     #[tokio::test]
     async fn bulk_delete_tombstones_every_archived_id() {
         let (ch, mem, _dir) = archived_test_channel();
         seed_archived_message(&mem).await;
-        mem.store(
+        mem.store_with_metadata(
             "discord_112",
             "@bob in #200 at t1: second message",
             zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
             Some("200"),
+            Some("discord.discord_test_alias"),
+            None,
         )
         .await
         .unwrap();
@@ -5618,6 +5792,228 @@ mod tests {
             .await;
 
         assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn overlapping_alias_cannot_take_over_archive_rows_it_also_observes() {
+        // Discord message and reaction ids are global, so two enabled aliases
+        // watching the same channel address the same key in the shared
+        // discord.db. Both admissions are legitimate; only the first writer
+        // owns the row.
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = sqlite.clone();
+        let first = channel_for_shared_archive(&mem, "first", vec!["200".to_string()]);
+        let second = channel_for_shared_archive(&mem, "second", vec!["200".to_string()]);
+
+        let message = serde_json::json!({
+            "id": "111", "channel_id": "200", "guild_id": "g1",
+            "content": "shared observation",
+            "author": {"id": "u-alice", "username": "alice", "bot": false}
+        });
+        let reaction = serde_json::json!({
+            "user_id": "u1", "message_id": "111", "channel_id": "200",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "member": {"user": {"username": "bob"}}
+        });
+        let reaction_key = "discord_reaction_111_u1_👍";
+
+        first
+            .archive_message_create(&mem, &message, "u-alice")
+            .await;
+        first
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &reaction, "botid")
+            .await;
+        let owned_message = mem.get("discord_111").await.unwrap().unwrap().content;
+        let owned_reaction = mem.get(reaction_key).await.unwrap().unwrap().content;
+
+        second
+            .archive_message_create(&mem, &message, "u-alice")
+            .await;
+        second
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &reaction, "botid")
+            .await;
+
+        for (key, content) in [
+            ("discord_111", owned_message),
+            (reaction_key, owned_reaction),
+        ] {
+            let entry = mem.get(key).await.unwrap().unwrap();
+            assert_eq!(entry.content, content);
+            assert_eq!(entry.namespace, "discord.first");
+            assert_eq!(entry.session_id.as_deref(), Some("200"));
+        }
+
+        // Scoped `discord_search` visibility follows the preserved namespace.
+        let first_scope = sqlite
+            .recall_in_namespaces(&["discord.first".to_string()], "*", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first_scope.len(), 2);
+        assert!(
+            sqlite
+                .recall_in_namespaces(&["discord.second".to_string()], "*", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Redelivery to the owning alias is still an ordinary refresh.
+        let refreshed = serde_json::json!({
+            "id": "111", "channel_id": "200", "guild_id": "g1",
+            "content": "shared observation (redelivered)",
+            "author": {"id": "u-alice", "username": "alice", "bot": false}
+        });
+        first
+            .archive_message_create(&mem, &refreshed, "u-alice")
+            .await;
+        assert!(
+            mem.get("discord_111")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("shared observation (redelivered)")
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_alias_cannot_edit_delete_or_remove_shared_archive_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let observer = channel_for_shared_archive(&mem, "observer", vec![]);
+        for (key, content) in [
+            ("discord_111", "owner message one"),
+            ("discord_112", "owner message two"),
+            ("discord_reaction_111_u1_👍", "owner reaction"),
+        ] {
+            mem.store_with_metadata(
+                key,
+                content,
+                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+                Some("200"),
+                Some("discord.owner"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let edit = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "foreign edit",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        observer
+            .sync_archive_for_message_event("MESSAGE_UPDATE", &edit, "botid")
+            .await;
+        observer
+            .sync_archive_for_message_event(
+                "MESSAGE_DELETE",
+                &serde_json::json!({"id": "111", "channel_id": "excluded"}),
+                "botid",
+            )
+            .await;
+        observer
+            .sync_archive_for_message_event(
+                "MESSAGE_DELETE",
+                &serde_json::json!({"id": "111", "channel_id": "200"}),
+                "botid",
+            )
+            .await;
+        observer
+            .sync_archive_for_message_event(
+                "MESSAGE_DELETE_BULK",
+                &serde_json::json!({"ids": ["111", "112"], "channel_id": "200"}),
+                "botid",
+            )
+            .await;
+        let reaction_remove = serde_json::json!({
+            "user_id": "u1", "message_id": "111", "channel_id": "200",
+            "emoji": {"name": "👍"}
+        });
+        observer
+            .handle_reaction_event("MESSAGE_REACTION_REMOVE", &reaction_remove, "botid")
+            .await;
+        observer
+            .sweep_message_reactions(
+                "MESSAGE_REACTION_REMOVE_ALL",
+                &serde_json::json!({"message_id": "111", "channel_id": "200"}),
+            )
+            .await;
+
+        for (key, content) in [
+            ("discord_111", "owner message one"),
+            ("discord_112", "owner message two"),
+            ("discord_reaction_111_u1_👍", "owner reaction"),
+        ] {
+            let entry = mem.get(key).await.unwrap().unwrap();
+            assert_eq!(entry.content, content);
+            assert_eq!(entry.namespace, "discord.owner");
+            assert_eq!(entry.session_id.as_deref(), Some("200"));
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_channel_events_cannot_mutate_even_owned_archive_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let observer = channel_for_shared_archive(&mem, "observer", vec!["allowed".to_string()]);
+        for key in ["discord_111", "discord_reaction_111_u1_👍"] {
+            mem.store_with_metadata(
+                key,
+                "unchanged",
+                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+                Some("excluded"),
+                Some("discord.observer"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let edit = serde_json::json!({
+            "id": "111", "channel_id": "excluded", "content": "blocked edit",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        observer
+            .sync_archive_for_message_event("MESSAGE_UPDATE", &edit, "botid")
+            .await;
+        observer
+            .sync_archive_for_message_event(
+                "MESSAGE_DELETE_BULK",
+                &serde_json::json!({"ids": ["111"], "channel_id": "excluded"}),
+                "botid",
+            )
+            .await;
+        observer
+            .handle_reaction_event(
+                "MESSAGE_REACTION_REMOVE",
+                &serde_json::json!({
+                    "user_id": "u1", "message_id": "111", "channel_id": "excluded",
+                    "emoji": {"name": "👍"}
+                }),
+                "botid",
+            )
+            .await;
+
+        assert_eq!(
+            mem.get("discord_111").await.unwrap().unwrap().content,
+            "unchanged"
+        );
+        assert!(
+            mem.get("discord_reaction_111_u1_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5769,6 +6165,9 @@ mod tests {
                 .content
                 .contains("@bob reacted 👍 to message m1 in #c1")
         );
+        // Reaction rows carry the archiving channel's provenance namespace
+        // so discord_search can ownership-filter them.
+        assert_eq!(entry.namespace, "discord.discord_test_alias");
 
         let remove = serde_json::json!({
             "user_id": "u1", "message_id": "m1", "channel_id": "c1",
