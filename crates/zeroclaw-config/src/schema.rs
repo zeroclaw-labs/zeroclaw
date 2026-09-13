@@ -8732,7 +8732,8 @@ pub struct KnowledgeConfig {
     /// Enable the knowledge graph tool. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the knowledge graph SQLite database.
+    /// Path to the knowledge graph SQLite database. A leading `~` is expanded
+    /// at use time via [`KnowledgeConfig::resolved_db_path`].
     #[serde(default = "default_knowledge_db_path")]
     pub db_path: String,
     /// Maximum number of knowledge nodes. Default: 100000.
@@ -8763,6 +8764,20 @@ impl Default for KnowledgeConfig {
             auto_capture: false,
             suggest_on_query: true,
         }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Resolve `db_path` to a filesystem path, expanding only a leading `~`
+    /// or `~/` as the home directory.
+    ///
+    /// A `~` anywhere else in the path is left intact, so Windows 8.3 short
+    /// names such as `ADMINI~1` survive resolution. This is the single source
+    /// of truth for the knowledge database location. Pure — performs no
+    /// filesystem I/O.
+    #[must_use]
+    pub fn resolved_db_path(&self) -> PathBuf {
+        expand_tilde_path(&self.db_path)
     }
 }
 
@@ -25965,6 +25980,46 @@ mod tests {
         if std::env::var("HOME").is_ok() {
             assert!(!resolved.to_string_lossy().starts_with('~'));
             assert!(resolved.ends_with(".zeroclaw/plugins"));
+        }
+    }
+
+    // ── Knowledge db path resolution ──────────────────────────
+
+    #[test]
+    async fn resolved_db_path_passes_absolute_path_through() {
+        let cfg = KnowledgeConfig {
+            db_path: "/srv/zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/srv/zeroclaw/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_preserves_non_prefix_tilde() {
+        // Windows 8.3 short names contain a `~` that is not a home shortcut.
+        let cfg = KnowledgeConfig {
+            db_path: "/tmp/ADMINI~1/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/tmp/ADMINI~1/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_expands_leading_tilde() {
+        let cfg = KnowledgeConfig {
+            db_path: "~/.zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        let resolved = cfg.resolved_db_path();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with(".zeroclaw/knowledge.db"));
         }
     }
 
