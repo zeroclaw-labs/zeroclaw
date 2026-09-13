@@ -187,7 +187,7 @@ gh pr checks "$NUMBER" --repo zeroclaw-labs/zeroclaw \
 | `skipping` for any required check | Stop — report the skipped required check names and ask whether the skip is expected before proceeding |
 | No required checks are configured or returned | Warn and ask user whether to proceed |
 
-Do not merge on red CI unless the user explicitly overrides after seeing the failure list.
+Failed or cancelled required checks must be resolved before merging.
 
 ### Step 1c: Establish the Freshness Basis
 
@@ -253,8 +253,7 @@ If `origin/${HEAD_REF}` doesn't exist (contributor's branch is on their own fork
 **Single-commit PRs:** If `$COMMITS` is exactly one line, use the full commit body instead of the bullet list. Get it with:
 
 ```bash
-SHA=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json commits --jq '.commits[-1].oid')
-COMMITS=$(git log -1 --format="%b" "$SHA")
+COMMITS=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json commits --jq '.commits[0].messageBody')
 ```
 
 Leave `$COMMITS` empty if there is no commit body. A one-item bullet list adds no information.
@@ -276,6 +275,13 @@ printf '%s\n' "$COMMITS" | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):
 If this prints anything, stop and strip the remaining bot attribution or
 generated footer before continuing.
 
+Save the sanitized body before confirmation and show that file's contents with the merge command. Submit the same file unchanged:
+
+```bash
+BODY_FILE="tmp/merge-body-${NUMBER}.md"
+printf '%s' "$COMMITS" > "$BODY_FILE"
+```
+
 ```bash
 PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq '.title')
 SUBJECT="${PR_TITLE} (#${NUMBER})"
@@ -287,9 +293,7 @@ The title should follow conventional commit format, e.g. `feat(scope): descripti
 
 **This step is non-negotiable.** A squash merge into `upstream/master` cannot be undone without a revert commit.
 
-Present the following to the user with `$NUMBER`, `$HEAD_SHA`, `$SUBJECT`,
-`$COMMITS`, `$FRESHNESS_BASIS`, and `$RELEASE_LINE_DISPOSITION` substituted with
-their actual values — never show variable names or placeholder text:
+Present the following to the user with `$NUMBER`, `$HEAD_SHA`, `$SUBJECT`, `$BODY_FILE`, `$COMMITS`, `$FRESHNESS_BASIS`, and `$RELEASE_LINE_DISPOSITION` substituted with their actual values. Never show variable names or placeholder text:
 
 ---
 
@@ -298,7 +302,7 @@ their actual values — never show variable names or placeholder text:
 gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
   --match-head-commit "$HEAD_SHA" \
   --subject "$SUBJECT" \
-  --body "$COMMITS"
+  --body-file "$BODY_FILE"
 ```
 
 **Effect:**
@@ -358,7 +362,7 @@ Only then run the merge command:
 gh pr merge "$NUMBER" --repo zeroclaw-labs/zeroclaw --squash \
   --match-head-commit "$HEAD_SHA" \
   --subject "$SUBJECT" \
-  --body "$COMMITS"
+  --body-file "$BODY_FILE"
 ```
 
 If the command exits non-zero, stop and report the full error output verbatim. Do not retry or attempt to work around failures.
@@ -408,12 +412,12 @@ leaving a known public tracker stale.
 
 - **Require a PR number or explicit squash-merge context before triggering** — do not invoke on vague phrases without a clear target.
 - **Never push squash commits directly to `upstream/master`** — always use `gh pr merge`. Direct push produces "Closed" not "Merged", breaks issue auto-close, and loses PR association.
-- **Never use `gh pr merge --squash` without `--subject` and `--body`** — the auto-generated message omits the PR number and uses inconsistent formatting.
+- **Always supply `--subject` and `--body-file` with `gh pr merge --squash`.** The auto-generated message omits the PR number and uses inconsistent formatting.
 - **Never let GitHub auto-generate the squash message** — no web UI merge, no merge button clicks.
 - **Always strip bot/AI attribution from the squash body** before confirmation.
   Preserve intentional human co-author trailers only under the superseding and
   privacy rules.
-- **Always assign PR title and commit body to shell variables** — never interpolate untrusted content directly into quoted command arguments.
+- **Keep the subject in a shell variable and submit the unchanged checked body file.** Never interpolate untrusted content into shell command text.
 - **Always run pre-flight checks** (merge conflicts, review decision, labels, milestone, release-line placement, and CI status) before confirming — do not skip them even if the user says "just merge it."
 - **Always record a freshness basis before confirming** — refreshed official checks, exact queued/merge-result checks, exact merge-result smoke, or explicit stale-risk acceptance. Do not treat old green branch checks as merge readiness when current `master` could invalidate them.
 - **Always confirm before merging, no exceptions** — show the user the exact expanded command with real values and require an explicit yes. Never infer consent.

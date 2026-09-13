@@ -132,22 +132,16 @@ For checkbox fields, render each option as:
 
 Show the final constructed issue (title + labels + full body) for one last confirmation. If the selected template has no labels, show `Labels: none` and omit `--label` from the create command.
 
-Then submit using a HEREDOC for the body to preserve formatting:
+Save the final body to `tmp/issue-body.md`, preview that file, and submit it unchanged:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body "$(cat <<'ISSUE_EOF'
-<body content>
-ISSUE_EOF
-)"
+gh issue create --title "<title prefix><user title>" --label "<label1>,<label2>" --body-file tmp/issue-body.md
 ```
 
 When the selected template has no labels:
 
 ```bash
-gh issue create --title "<title prefix><user title>" --body "$(cat <<'ISSUE_EOF'
-<body content>
-ISSUE_EOF
-)"
+gh issue create --title "<title prefix><user title>" --body-file tmp/issue-body.md
 ```
 
 Return the resulting issue URL to the user.
