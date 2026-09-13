@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Attribution-propagating, lifecycle-logged wrapper around tokio::spawn for ZeroClaw."
 repository.workspace = true
+homepage.workspace = true
 publish = true
 
 [dependencies]

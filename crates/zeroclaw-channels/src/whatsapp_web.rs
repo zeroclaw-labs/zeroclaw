@@ -650,6 +650,26 @@ impl WhatsAppWebChannel {
         self
     }
 
+    /// Attach a transcription manager the caller already resolved against the
+    /// owning agent's `transcription_provider`.
+    ///
+    /// [`Self::with_transcription`] registers legacy `[transcription]`
+    /// providers only and leaves the agent alias empty, so
+    /// `TranscriptionManager::transcribe` can never select a provider. Channel
+    /// wiring uses this instead, mirroring [`Self::with_tts`], which already
+    /// binds the channel-owning agent.
+    #[cfg(feature = "whatsapp-web")]
+    #[must_use]
+    pub fn with_transcription_manager(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: super::transcription::TranscriptionManager,
+    ) -> Self {
+        self.transcription_manager = Some(std::sync::Arc::new(manager));
+        self.transcription = Some(config);
+        self
+    }
+
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
@@ -2667,16 +2687,23 @@ impl Channel for WhatsAppWebChannel {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let skip_reason = crate::util::voice_reply_skip_reason(content);
+            if let Some(reason) = skip_reason {
+                // Stable literal per the logging contract: the classification
+                // and per-event measurements ride solely in `attributes` above.
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_attrs(::serde_json::json!({
+                            "recipient": message.recipient,
+                            "reason": reason,
+                            "content_len": content.len(),
+                        })),
+                    "voice reply skipped"
+                );
+            }
 
-            if is_substantive {
+            if skip_reason.is_none() {
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),
@@ -3426,6 +3453,7 @@ impl Channel for WhatsAppWebChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         if binding.is_group {
             // Say so in the prompt. The token is now readable by everyone in
@@ -5082,6 +5110,50 @@ mod tests {
         assert!(ch.transcription_manager.is_some());
     }
 
+    /// Regression: channel wiring must be able to install a manager the caller
+    /// already bound to the owning agent's provider, instead of the
+    /// legacy-only manager `with_transcription` builds.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn with_transcription_manager_installs_caller_resolved_manager() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.transcription.enabled = true;
+        config.providers.transcription.groq.insert(
+            "fast".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let manager = super::super::transcription::TranscriptionManager::from_config_with_provider(
+            &config,
+            "groq.fast".to_string(),
+        )
+        .expect("typed provider must build a manager");
+
+        let cfg = zeroclaw_config::schema::WhatsAppConfig {
+            enabled: true,
+            session_path: Some("/tmp/test-whatsapp.db".into()),
+            ..Default::default()
+        };
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
+        )
+        .with_transcription_manager(config.transcription.clone(), manager);
+
+        assert!(ch.transcription.is_some());
+        assert!(
+            ch.transcription_manager.is_some(),
+            "caller-resolved manager must be installed on the channel"
+        );
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn with_transcription_ignores_when_disabled() {
@@ -5864,6 +5936,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         let err = channel
@@ -5926,6 +5999,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: "ls -la".to_string(),
                 raw_arguments: None,
+                position: None,
             };
             channel
                 .request_approval(recipient, &request)
@@ -5984,7 +6058,7 @@ mod tests {
         let dm_token = token_of(&dm);
         assert_eq!(
             dm,
-            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la"),
+            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la", None),
             "the direct-chat prompt must be exactly what the shared builder produces"
         );
 
@@ -6002,7 +6076,7 @@ mod tests {
             group,
             format!(
                 "{}\n\n{group_warning}",
-                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la")
+                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la", None)
             ),
             "the group prompt must be the shared builder's output plus exactly one warning"
         );
@@ -6317,6 +6391,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: format!("echo {word}"),
                 raw_arguments: None,
+                position: None,
             };
 
             let asking = channel.request_approval(&chat, &request);
@@ -6455,6 +6530,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let err = channel
             .request_approval("1@s.whatsapp.net", &request)
@@ -7319,6 +7395,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         let decision = channel
@@ -7396,6 +7473,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: "ls".to_string(),
                 raw_arguments: None,
+                position: None,
             };
 
             let started = tokio::time::Instant::now();

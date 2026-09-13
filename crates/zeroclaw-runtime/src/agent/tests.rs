@@ -941,6 +941,7 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         }),
         reasoning_content: None,
     }]));

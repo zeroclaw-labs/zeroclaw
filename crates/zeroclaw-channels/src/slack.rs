@@ -5002,6 +5002,48 @@ impl SlackChannel {
     }
 }
 
+/// `chat.postMessage` body for a Socket Mode approval card.
+///
+/// Split out from the send so the rendered card can be asserted directly.
+/// Socket Mode builds its own Block Kit card rather than going through
+/// [`crate::util::build_yesno_approval_prompt`], so the position line has to be
+/// threaded into both surfaces the operator can read: the `text` notification
+/// fallback and the `mrkdwn` section.
+fn build_socket_mode_approval_body(
+    recipient: &str,
+    token: &str,
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+) -> serde_json::Value {
+    let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = i18n::get_required_cli_string("channel-approval-args-label");
+    let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
+    let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
+    let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
+    // Two pending cards from one turn are otherwise identical until tapped.
+    let position_line = crate::util::approval_position_line(position);
+    serde_json::json!({
+        "channel": recipient,
+        "text": format!("{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"),
+        "blocks": [{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!("*{heading}* [`{token}`]\n{position_line}*{tool_label}:* `{tool_name}`\n*{args_label}:* {arguments_summary}"),
+            }
+        }, {
+            "type": "actions",
+            "elements": [
+                { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
+                { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
+                { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
+            ]
+        }]
+    })
+}
+
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
 
 /// Split `text` into chunks of at most `max_chars` bytes, breaking at newline or
@@ -6023,30 +6065,13 @@ impl Channel for SlackChannel {
         // Socket Mode: send interactive Block Kit buttons.
         // Polling mode: send plain text with token-echo instructions.
         let send_result = if self.app_token.is_some() {
-            let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
-            let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
-            let args_label = i18n::get_required_cli_string("channel-approval-args-label");
-            let btn_approve = i18n::get_required_cli_string("channel-approval-btn-approve");
-            let btn_deny = i18n::get_required_cli_string("channel-approval-btn-deny");
-            let btn_always = i18n::get_required_cli_string("channel-approval-btn-always");
-            let body = serde_json::json!({
-                "channel": recipient,
-                "text": format!("{heading} [{token}]\n{tool_label}: {}\n{args_label}: {}", request.tool_name, request.arguments_summary),
-                "blocks": [{
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": format!("*{heading}* [`{token}`]\n*{tool_label}:* `{}`\n*{args_label}:* {}", request.tool_name, request.arguments_summary),
-                    }
-                }, {
-                    "type": "actions",
-                    "elements": [
-                        { "type": "button", "text": { "type": "plain_text", "text": btn_approve }, "action_id": format!("approval_{token}_approve"), "style": "primary" },
-                        { "type": "button", "text": { "type": "plain_text", "text": btn_deny }, "action_id": format!("approval_{token}_deny"), "style": "danger" },
-                        { "type": "button", "text": { "type": "plain_text", "text": btn_always }, "action_id": format!("approval_{token}_always") },
-                    ]
-                }]
-            });
+            let body = build_socket_mode_approval_body(
+                recipient,
+                &token,
+                &request.tool_name,
+                &request.arguments_summary,
+                request.position_counter(),
+            );
             self.http_client()
                 .post("https://slack.com/api/chat.postMessage")
                 .bearer_auth(&self.bot_token)
@@ -6061,6 +6086,7 @@ impl Channel for SlackChannel {
                     &token,
                     &request.tool_name,
                     &request.arguments_summary,
+                    request.position_counter(),
                 ),
                 recipient,
             ))
@@ -9136,6 +9162,54 @@ mod tests {
             }
         });
         assert!(SlackChannel::try_parse_approval_block_action(&envelope).is_none());
+    }
+
+    #[test]
+    fn socket_mode_approval_card_shows_the_batch_position_on_both_surfaces() {
+        // Socket Mode is the documented supervised-mode path, and it renders
+        // twice: the `text` notification fallback and the Block Kit section.
+        // A line in only one of them still leaves a card the operator cannot
+        // tell apart from the next one.
+        let body = super::build_socket_mode_approval_body(
+            "C123",
+            "ab12cd",
+            "shell",
+            "ls -la",
+            Some((2, 3)),
+        );
+        let expected = crate::util::approval_position_line(Some((2, 3)));
+        assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
+
+        let notification = body["text"].as_str().expect("text is a string");
+        assert!(
+            notification.contains(expected.trim_end()),
+            "notification text should carry the position; got {notification}"
+        );
+
+        let section = body["blocks"][0]["text"]["text"]
+            .as_str()
+            .expect("section text is a string");
+        assert!(
+            section.contains(expected.trim_end()),
+            "Block Kit section should carry the position; got {section}"
+        );
+    }
+
+    #[test]
+    fn socket_mode_approval_card_omits_the_position_for_a_single_call() {
+        let single = super::build_socket_mode_approval_body(
+            "C123",
+            "ab12cd",
+            "shell",
+            "ls -la",
+            Some((1, 1)),
+        );
+        let none =
+            super::build_socket_mode_approval_body("C123", "ab12cd", "shell", "ls -la", None);
+        assert_eq!(
+            single, none,
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     #[test]

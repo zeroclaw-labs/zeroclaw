@@ -11,7 +11,9 @@ trap 'rm -rf "$fixture_dir"' EXIT
 repo_root="${fixture_dir}/repo"
 mkdir -p "$repo_root/crates/zeroclaw-channels" \
     "$repo_root/crates/zeroclaw-api" \
+    "$repo_root/crates/zeroclaw-config" \
     "$repo_root/crates/zeroclaw-plugins" \
+    "$repo_root/crates/zeroclaw-runtime" \
     "$repo_root/crates/zeroclaw-gateway" \
     "$repo_root/crates/zeroclaw-providers" \
     "$repo_root/crates/zeroclaw-plugins/tests/fixtures/channel-fixture" \
@@ -23,7 +25,9 @@ cat > "$metadata_file" <<EOF
     {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "name": "zeroclaw", "manifest_path": "Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "name": "zeroclaw-api", "manifest_path": "crates/zeroclaw-api/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "name": "zeroclaw-channels", "manifest_path": "crates/zeroclaw-channels/Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-config#zeroclaw-config 0.8.4", "name": "zeroclaw-config", "manifest_path": "crates/zeroclaw-config/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "name": "zeroclaw-plugins", "manifest_path": "crates/zeroclaw-plugins/Cargo.toml"},
+    {"id": "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4", "name": "zeroclaw-runtime", "manifest_path": "crates/zeroclaw-runtime/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "name": "zeroclaw-gateway", "manifest_path": "crates/zeroclaw-gateway/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "name": "zeroclaw-providers", "manifest_path": "crates/zeroclaw-providers/Cargo.toml"},
     {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "name": "zeroclaw-channel-plugin-fixture", "manifest_path": "crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml"},
@@ -33,7 +37,9 @@ cat > "$metadata_file" <<EOF
     "path+file://${repo_root}#zeroclaw 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-config#zeroclaw-config 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4",
+    "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4",
     "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0",
@@ -41,10 +47,12 @@ cat > "$metadata_file" <<EOF
   ],
   "resolve": {
     "nodes": [
-      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
+      {"id": "path+file://${repo_root}#zeroclaw 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-config#zeroclaw-config 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}, {"pkg": "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-channels#zeroclaw-channels 0.8.4", "deps": []},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-config#zeroclaw-config 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins#zeroclaw-plugins 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-api#zeroclaw-api 0.8.4"}]},
+      {"id": "path+file://${repo_root}/crates/zeroclaw-runtime#zeroclaw-runtime 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-gateway#zeroclaw-gateway 0.8.4", "deps": [{"pkg": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4"}]},
       {"id": "path+file://${repo_root}/crates/zeroclaw-providers#zeroclaw-providers 0.8.4", "deps": []},
       {"id": "path+file://${repo_root}/crates/zeroclaw-plugins/tests/fixtures/channel-fixture#zeroclaw-channel-plugin-fixture 0.1.0", "deps": []},
@@ -68,8 +76,11 @@ assert_selection() {
     local expected_reason="$4"
     local paths_file="$5"
     local expected_plugin_host="${6:-false}"
+    local expected_warning_path="${7:-}"
     local output
-    output="$(run_selector pull_request "$paths_file" "$metadata_file")"
+    local warning_file="${fixture_dir}/warning"
+    : > "$warning_file"
+    output="$(run_selector pull_request "$paths_file" "$metadata_file" 2> "$warning_file")"
     SELECTION_OUTPUT="$output" EXPECTED_MODE="$expected_mode" EXPECTED_PACKAGES="$expected_packages" EXPECTED_REASON="$expected_reason" EXPECTED_PLUGIN_HOST="$expected_plugin_host" python3 - <<'PY'
 import json
 import os
@@ -86,6 +97,13 @@ if os.environ["EXPECTED_REASON"]:
 assert values["needs_plugin_host"] == os.environ["EXPECTED_PLUGIN_HOST"], values
 assert set(values) == {"mode", "packages", "reason", "needs_plugin_host"}, values
 PY
+    if [[ -n "$expected_warning_path" ]]; then
+        grep -F "Unclassified changed path '${expected_warning_path}' selected the full Windows suite" "$warning_file" >/dev/null
+    elif [[ -s "$warning_file" ]]; then
+        echo "FAIL: unexpected selector warning for ${name}" >&2
+        cat "$warning_file" >&2
+        exit 1
+    fi
 }
 
 paths_file="$fixture_dir/paths"
@@ -119,6 +137,33 @@ assert_selection "deduplication" scoped '["zeroclaw","zeroclaw-channels"]' '' "$
 printf '%s\n' 'crates/zeroclaw-channels/tests/fixture.md' > "$paths_file"
 assert_selection "test fixture" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
 
+printf '%s\n' 'crates/zeroclaw-channels/locales/en/cli.ftl' > "$paths_file"
+assert_selection "package locale resource" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-channels/build.rs' > "$paths_file"
+assert_selection "package build script" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' 'build.rs' > "$paths_file"
+assert_selection "root build script" full '[]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-runtime/locales/en/cli.ftl' > "$paths_file"
+assert_selection "plugin-host package locale resource" scoped '["zeroclaw","zeroclaw-runtime"]' '' "$paths_file" true
+
+printf '%s\n' 'locales/en/cli.ftl' > "$paths_file"
+assert_selection "root package locale resource" full '[]' '' "$paths_file"
+
+printf '%s\n' 'crates/zeroclaw-channels/assets/locales/en/cli.ftl' > "$paths_file"
+assert_selection "nested locale-like resource" full '[]' '' "$paths_file" false 'crates/zeroclaw-channels/assets/locales/en/cli.ftl'
+
+printf '%s\n' 'crates/zeroclaw-channels/fuzz/fuzz_targets/parser.rs' > "$paths_file"
+assert_selection "unclassified member Rust path" full '[]' '' "$paths_file" false 'crates/zeroclaw-channels/fuzz/fuzz_targets/parser.rs'
+
+printf '%s\n' 'crates/zeroclaw-channels/assets/generated.bin' > "$paths_file"
+assert_selection "unclassified member asset" full '[]' '' "$paths_file" false 'crates/zeroclaw-channels/assets/generated.bin'
+
+printf '%s\n' 'crates/zeroclaw-channels/src/lib.rs' 'crates/zeroclaw-runtime/assets/generated.bin' > "$paths_file"
+assert_selection "unclassified plugin-host path with scoped path" full '[]' '' "$paths_file" true 'crates/zeroclaw-runtime/assets/generated.bin'
+
 printf '%s\n' 'crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs' > "$paths_file"
 assert_selection "dynamically consumed plugin fixture" full '[]' 'Dynamically consumed plugin test fixtures require the full suite.' "$paths_file" true
 
@@ -126,7 +171,6 @@ for plugin_path in \
     'crates/zeroclaw-plugins/src/lib.rs' \
     'crates/zeroclaw-runtime/src/lib.rs' \
     'crates/zeroclaw-config/src/lib.rs' \
-    'wit/zeroclaw-plugin.wit' \
     'tests/plugin_channel_runtime_e2e.rs' \
     'Cargo.toml' \
     'Cargo.lock' \
@@ -145,10 +189,10 @@ printf '%s\n' 'Cargo.toml' > "$paths_file"
 assert_selection "full workspace manifest" full '[]' '' "$paths_file" true
 
 printf '%s\n' 'crates/unknown/src/lib.rs' > "$paths_file"
-assert_selection "unknown path" full '[]' '' "$paths_file"
+assert_selection "unknown path" full '[]' '' "$paths_file" false 'crates/unknown/src/lib.rs'
 
 printf '%s\n' 'crates/zeroclaw-channels/config/ambiguous.yaml' > "$paths_file"
-assert_selection "ambiguous package path" full '[]' '' "$paths_file"
+assert_selection "ambiguous package path" full '[]' '' "$paths_file" false 'crates/zeroclaw-channels/config/ambiguous.yaml'
 
 printf '%s\n' 'Cargo.lock' > "$paths_file"
 assert_selection "lockfile only" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file" true
@@ -163,6 +207,7 @@ printf '%s\n' 'Cargo.lock' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
 assert_selection "lockfile with source change" full '[]' 'Cargo.lock changes require the full suite.' "$paths_file" true
 
 assert_selection "desktop exclusion" skip '[]' 'No covered Rust compilation or test paths changed.' <(printf '%s\n' 'apps/tauri/src/main.rs')
+assert_selection "desktop config exclusion" skip '[]' 'No covered Rust compilation or test paths changed.' <(printf '%s\n' 'apps/tauri/tauri.conf.json')
 
 printf '%s\n' '.cargo/config.toml' > "$paths_file"
 assert_selection "cargo configuration" full '[]' '' "$paths_file" true
@@ -170,11 +215,23 @@ assert_selection "cargo configuration" full '[]' '' "$paths_file" true
 printf '%s\n' '.github/actions/rust-cache/action.yml' > "$paths_file"
 assert_selection "workflow action" full '[]' '' "$paths_file" true
 
+printf '%s\n' 'wit/zeroclaw-plugin.wit' > "$paths_file"
+assert_selection "WIT interface" full '[]' '' "$paths_file" true
+
 printf '%s\n' 'rust-toolchain.toml' > "$paths_file"
 assert_selection "Rust toolchain" full '[]' '' "$paths_file" true
 
 printf '%s\n' '.github/workflows/ci.yml' > "$paths_file"
 assert_selection "workflow itself exercises plugin host path" full '[]' '' "$paths_file" true
+
+printf '%s\n' '.github/workflows/pr-size-labeler.yml' > "$paths_file"
+assert_selection "known independent workflow only" skip '[]' 'No covered Rust compilation or test paths changed.' "$paths_file"
+
+printf '%s\n' '.github/workflows/pr-size-labeler.yml' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
+assert_selection "known independent workflow with package source" scoped '["zeroclaw","zeroclaw-channels"]' '' "$paths_file"
+
+printf '%s\n' '.github/workflows/new-reusable-workflow.yml' 'crates/zeroclaw-channels/src/lib.rs' > "$paths_file"
+assert_selection "unknown workflow with package source remains full" full '[]' '' "$paths_file"
 
 printf '%s\n' 'scripts/ci/windows_test_scope.py' > "$paths_file"
 assert_selection "selector itself exercises plugin host path" full '[]' '' "$paths_file" true
@@ -249,6 +306,17 @@ printf '%s\n' "$output" | grep -Fx 'needs_plugin_host=true' >/dev/null
 
 package_args="$(python3 "$selector" --package-args-json '["zeroclaw","zeroclaw-channels"]')"
 test "$package_args" = $'-p\nzeroclaw\n-p\nzeroclaw-channels'
+
+package_args_file="$repo_root/package-args"
+python3 "$selector" --package-args-json '["zeroclaw","zeroclaw-channels"]' > "$package_args_file"
+PACKAGE_ARGS_FILE="$package_args_file" python3 - <<'PY'
+import os
+from pathlib import Path
+
+actual = Path(os.environ["PACKAGE_ARGS_FILE"]).read_bytes()
+expected = b"-p\nzeroclaw\n-p\nzeroclaw-channels\n"
+assert actual == expected, actual
+PY
 
 for invalid_packages in '[]' '{}' '["zeroclaw",""]' '["zeroclaw","zeroclaw"]' '["$(touch unsafe)"]'; do
     if python3 "$selector" --package-args-json "$invalid_packages" >/dev/null 2>&1; then

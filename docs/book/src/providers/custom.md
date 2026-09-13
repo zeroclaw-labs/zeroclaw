@@ -21,6 +21,12 @@ model = "my-model"
 tool_result_image_policy = "omit"
 ```
 
+### Connection warmup
+
+OpenAI-compatible providers warm the connection with `GET {base_url}/models`, using the same authentication and HTTP client settings as model listing.
+The probe consumes the response body and accepts non-success HTTP status codes, so a service without a models endpoint can still start.
+Chat-completion requests continue to use POST; warmup does not invoke inference or require a model catalog.
+
 ## First-class local-inference servers
 
 ZeroClaw ships canonical slots for popular local-inference stacks. They're all OpenAI-compatible under the hood but with default `uri` values pre-applied so you can usually omit `uri` entirely.

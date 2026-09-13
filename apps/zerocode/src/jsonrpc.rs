@@ -124,6 +124,18 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
+#[derive(Debug)]
+pub(crate) enum OutboundMessage {
+    Frame(String),
+    Flush(oneshot::Sender<()>),
+}
+
+#[derive(Debug)]
+enum OutboundSender {
+    Raw(mpsc::Sender<String>),
+    Transport(mpsc::Sender<OutboundMessage>),
+}
+
 #[derive(Debug, Default)]
 struct OutboundState {
     pending: HashMap<String, PendingResponder>,
@@ -135,7 +147,7 @@ struct OutboundState {
 /// notifications and outbound requests cannot interleave bytes.
 #[derive(Debug)]
 pub struct RpcOutbound {
-    writer_tx: mpsc::Sender<String>,
+    writer_tx: OutboundSender,
     state: std::sync::Mutex<OutboundState>,
     next_id: AtomicU64,
 }
@@ -158,14 +170,46 @@ impl Drop for PendingRequestGuard<'_> {
 impl RpcOutbound {
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
-            writer_tx,
+            writer_tx: OutboundSender::Raw(writer_tx),
             state: std::sync::Mutex::new(OutboundState::default()),
             next_id: AtomicU64::new(0),
         }
     }
 
+    pub(crate) fn new_transport(writer_tx: mpsc::Sender<OutboundMessage>) -> Self {
+        Self {
+            writer_tx: OutboundSender::Transport(writer_tx),
+            state: std::sync::Mutex::new(OutboundState::default()),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    async fn send_frame(&self, frame: String) -> bool {
+        match &self.writer_tx {
+            OutboundSender::Raw(writer_tx) => writer_tx.send(frame).await.is_ok(),
+            OutboundSender::Transport(writer_tx) => {
+                writer_tx.send(OutboundMessage::Frame(frame)).await.is_ok()
+            }
+        }
+    }
+
     pub async fn send_raw(&self, json: String) -> bool {
-        self.writer_tx.send(json).await.is_ok()
+        self.send_frame(json).await
+    }
+
+    pub async fn flush_outbound(&self) -> bool {
+        let OutboundSender::Transport(writer_tx) = &self.writer_tx else {
+            return true;
+        };
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if writer_tx
+            .send(OutboundMessage::Flush(ack_tx))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        ack_rx.await.is_ok()
     }
 
     /// Write a JSON-RPC response (success or error) keyed to a
@@ -184,7 +228,7 @@ impl RpcOutbound {
             id,
         };
         match serde_json::to_string(&resp) {
-            Ok(s) => self.writer_tx.send(s).await.is_ok(),
+            Ok(s) => self.send_frame(s).await,
             Err(_) => false,
         }
     }
@@ -192,7 +236,7 @@ impl RpcOutbound {
     pub async fn notify(&self, method: &'static str, params: Value) {
         let n = JsonRpcNotification::new(method, params);
         if let Ok(s) = serde_json::to_string(&n) {
-            let _ = self.writer_tx.send(s).await;
+            let _ = self.send_frame(s).await;
         }
     }
 
@@ -226,7 +270,7 @@ impl RpcOutbound {
                 });
             }
         };
-        if self.writer_tx.send(body).await.is_err() {
+        if !self.send_frame(body).await {
             return Err(JsonRpcError {
                 code: error_codes::INTERNAL_ERROR,
                 message: "Writer task closed".to_string(),

@@ -194,6 +194,16 @@ zeroclaw config set plugins.limits.call_timeout_ms 30000
 zeroclaw config set plugins.limits.max_memory_mb 256
 ```
 
+`plugins.limits.max_connections_per_instance` (default 16) caps how many
+outbound connections one logical plugin instance may hold open at once. The
+ceiling is per instance, not per call: a response holds its connection until
+the guest has drained the body or dropped the response, so a tool that keeps
+sixteen responses alive inside one invocation cannot open a seventeenth
+connection. Sequential requests that drain or drop each response as they go
+never approach the limit. When the ceiling binds, the guest sees
+`wasi:http`'s own `connection-limit-reached` error, not an egress denial: the
+destination was granted, and the host is reporting a resource it counted.
+
 `plugins.enabled = true` turns the plugin host on, but auto-discovered tool and
 skill capabilities load only when `plugins.auto_discover = true` as well. That
 flag is `false` by default (fail-closed), so `enabled = true` on its own gives

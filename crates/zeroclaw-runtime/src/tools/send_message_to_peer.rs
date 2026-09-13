@@ -757,6 +757,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: Some(1_000),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
             output_tokens: Some(200),
         };
 
