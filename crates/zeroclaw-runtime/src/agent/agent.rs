@@ -5237,9 +5237,7 @@ mod tests {
         assert_eq!(agent.tool_names(), vec!["echo"]);
         assert_eq!(agent.turn("first turn").await.unwrap(), "done");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(
-            format!("{:?}", agent.history).contains("Tool not available in this turn: forbidden")
-        );
+        assert!(format!("{:?}", agent.history).contains("Unknown tool: forbidden"));
         agent.narrow_to_principal_tools(Some(&[]));
         assert_eq!(agent.turn("after revocation").await.unwrap(), "done");
         assert_eq!(
@@ -5247,7 +5245,7 @@ mod tests {
             1,
             "revoked tool must not execute again"
         );
-        assert!(format!("{:?}", agent.history).contains("Tool not available in this turn: echo"));
+        assert!(format!("{:?}", agent.history).contains("Unknown tool: echo"));
     }
 
     #[tokio::test]

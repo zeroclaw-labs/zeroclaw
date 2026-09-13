@@ -6874,7 +6874,7 @@ mod tests {
             .dispatch_tool_for_test("file_read", json!({"path":"absent"}))
             .await;
         assert!(!denied.success);
-        assert!(denied.output.contains("Tool not available"));
+        assert_eq!(denied.output, "Unknown tool: file_read");
     }
 
     fn principal_test_config(
@@ -6995,7 +6995,7 @@ mod tests {
             .dispatch_tool_for_test("calculator", json!({"function":"add","values":[2,3]}))
             .await;
         assert!(!denied.success);
-        assert!(denied.output.contains("Tool not available"));
+        assert_eq!(denied.output, "Unknown tool: calculator");
     }
 
     #[tokio::test]
@@ -7149,7 +7149,7 @@ mod tests {
                     )
                     .await;
                 assert!(!denied.success);
-                assert!(denied.output.contains("Tool not available"));
+                assert_eq!(denied.output, "Unknown tool: delegate");
             }
         }
     }
@@ -7235,7 +7235,7 @@ mod tests {
             );
             let revoked = agent.dispatch_tool_for_test(TOOL, json!({})).await;
             assert!(!revoked.success);
-            assert!(revoked.output.contains("Tool not available"));
+            assert_eq!(revoked.output, format!("Unknown tool: {TOOL}"));
             if helper {
                 let selected = agent
                     .dispatch_tool_for_test(
