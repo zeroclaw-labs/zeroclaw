@@ -2,6 +2,7 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::execution::SettledAttemptSummary;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
 use anyhow::{Context, Result};
@@ -12,6 +13,31 @@ use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 use zeroclaw_tool_call_parser::{strip_think_tags, strip_trailing_terminal_markers};
+
+/// Project a finished summary call's settled attempts as `TurnEvent::Usage`
+/// so the gateway ledger includes the final-summary billed work. Mirrors
+/// `emit_rejected_attempt_usage`, but carries each summary's own `accepted`
+/// flag (the accepted leaf is `true`).
+async fn emit_summary_attempt_usage(
+    event_tx: Option<&Sender<TurnEvent>>,
+    summaries: &[SettledAttemptSummary],
+) {
+    if let Some(tx) = event_tx {
+        for summary in summaries {
+            let _ = tx
+                .send(TurnEvent::Usage {
+                    input_tokens: summary.input_tokens,
+                    cached_input_tokens: summary.cached_input_tokens,
+                    output_tokens: summary.output_tokens,
+                    cost_usd: summary.cost_usd,
+                    provider_ref: summary.provider_ref.clone(),
+                    model: summary.model.clone(),
+                    accepted: summary.accepted,
+                })
+                .await;
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_after_max_iterations(
@@ -88,6 +114,11 @@ pub(crate) async fn finish_after_max_iterations(
         TimedOut(u64),
         Done(Result<zeroclaw_providers::ChatResponse>),
     }
+    // Collect the summary call's settled attempts so they can be projected
+    // as Usage events below: without this the gateway ledger omits the
+    // final-summary billed work. Declared outside the call block so the
+    // match arms below can read it after the future completes.
+    let mut summary_attempts = Vec::new();
     let summary_call = {
         let summary_request = zeroclaw_providers::ChatRequest {
             messages: history,
@@ -108,7 +139,7 @@ pub(crate) async fn finish_after_max_iterations(
         // recorded no cost; through the seam it now fails closed when the turn's
         // budget is exhausted and its token usage is charged like any in-loop
         // call. Metering is a no-op when the turn is unscoped.
-        let summary_future = access.run_model_query(summary_request);
+        let summary_future = access.run_model_query(summary_request, &mut summary_attempts);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -164,12 +195,16 @@ pub(crate) async fn finish_after_max_iterations(
                     })),
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             history.pop();
             return Err(e).context(format!(
                 "Agent exceeded maximum tool iterations ({max_iterations})"
             ));
         }
-        SummaryCall::Done(Ok(resp)) => resp,
+        SummaryCall::Done(Ok(resp)) => {
+            emit_summary_attempt_usage(event_tx, &summary_attempts).await;
+            resp
+        }
     };
 
     let raw_text = resp.text.unwrap_or_default();
@@ -365,6 +400,43 @@ mod graceful_summary_metering_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 100);
         assert_eq!(recorded.output_tokens, 20);
+    }
+
+    // The final-summary call's billed work must reach the event ledger, not
+    // just the accumulator: the gateway derives done.cost_usd from emitted
+    // Usage events, so an unprojected summary silently under-reports the turn.
+    #[tokio::test]
+    async fn graceful_summary_projects_usage_event_for_gateway_ledger() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CountingUsageProvider {
+            calls: Arc::clone(&calls),
+        };
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let out = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_summary_with_events(&provider, String::new(), Some(&event_tx)),
+            )
+            .await
+            .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let mut usage_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                output_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage_events.push((input_tokens, output_tokens, accepted));
+            }
+        }
+        // Exactly the summary call's accepted attempt — no more, no less.
+        assert_eq!(usage_events, vec![(Some(100), Some(20), true)]);
     }
 
     // The graceful summary now fails closed on budget exhaustion: it was the one

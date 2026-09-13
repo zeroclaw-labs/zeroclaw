@@ -12,6 +12,13 @@ pub type ModelProviderPricing = HashMap<String, HashMap<String, f64>>;
 
 /// Per-scope token/cost accumulator derived from the usage events emitted
 /// during a single task-local runtime invocation.
+///
+/// `input_tokens`/`output_tokens`/`cost_usd` accumulate every billable
+/// attempt (accepted + rejected) for budgets, persistence, and peer scopes.
+/// `last_input_tokens` is the accepted-only context-window fill: only the
+/// accepted attempt may set it (see `settle_provider_attempts` and the
+/// accepted-response record paths). It is a separate fact from the totals —
+/// do not derive one from the other.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TurnUsage {
     pub input_tokens: u64,
@@ -339,6 +346,70 @@ pub fn record_tool_loop_cost_usage(
     usage: &zeroclaw_providers::traits::TokenUsage,
 ) -> Option<(u64, f64)> {
     record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
+}
+
+/// Compute cost_usd for a provider/model/usage triple using the task-local
+/// pricing context but WITHOUT updating any accumulators. For emitting
+/// Usage events for rejected attempts where the cost is already accounted
+/// via settle_provider_attempts.
+pub fn compute_cost_usd(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<f64> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
+    let config_rates = normalized_rates(
+        pricing
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default(),
+    );
+
+    let live = (!config_rates.is_complete())
+        .then(|| live_pricing_for(model_provider_name, model))
+        .flatten();
+    let mut rates = normalized_rates(merge_config_and_live_rates(config_rates, live));
+
+    // The catalog is the final per-dimension fallback, not an all-or-nothing
+    // replacement. Preserve every configured/live value (including an
+    // explicit free 0.0) and fill only the dimensions still absent.
+    if let Some((cat_in, cat_out, cat_cached)) =
+        crate::agent::pricing_catalog::global_pricing_rates(model)
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
+            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
+            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
+            cache_write_per_mtok: None,
+        });
+    }
+
+    rates = normalized_rates(rates);
+    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
+    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
+    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
+
+    let cost_usage = CostTokenUsage::new_with_cache(
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        input_rate,
+        cached_rate,
+        output_rate,
+    );
+    Some(cost_usage.cost_usd)
 }
 
 /// Settle the immutable physical-attempt report exactly once.  Only complete
@@ -865,6 +936,95 @@ mod tests {
         assert!((records[1].usage.cost_usd - 3.0).abs() < 1e-12);
     }
 
+    #[tokio::test]
+    async fn reliable_rejected_with_usage_then_accepted_without_usage() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([
+            (
+                "provider.first".to_string(),
+                HashMap::from([("model-a.input".to_string(), 1.0)]),
+            ),
+            (
+                "provider.second".to_string(),
+                HashMap::from([("model-b.input".to_string(), 3.0)]),
+            ),
+        ]));
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let turn_usage_arc = Arc::clone(&context.turn_usage);
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                scope
+                    .scope(async {
+                        let first = FailingWithUsageLeaf {
+                            alias: "wrapper.first",
+                        };
+                        let _ = with_exact_dispatch_route(
+                            "provider.first".to_string(),
+                            "model-a".to_string(),
+                            ProviderDispatch::from_ref(&first).chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "ignored",
+                                None,
+                            ),
+                        )
+                        .await;
+                        let second = NoUsageLeaf {
+                            alias: "wrapper.second",
+                        };
+                        assert!(
+                            with_exact_dispatch_route(
+                                "provider.second".to_string(),
+                                "model-b".to_string(),
+                                ProviderDispatch::from_ref(&second).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .is_ok()
+                        );
+                    })
+                    .await;
+                let report = scope.take();
+                settle_provider_attempts(report.attempts(), Some(1));
+            })
+            .await;
+
+        let turn_usage = *turn_usage_arc.lock();
+        let cost_from_a = 1_000_000_f64 / 1_000_000.0 * 1.0;
+        assert!(
+            (turn_usage.cost_usd - cost_from_a).abs() < 1e-12,
+            "turn cost includes rejected A"
+        );
+        assert_eq!(
+            turn_usage.input_tokens, 1_000_000,
+            "turn input_tokens includes rejected A"
+        );
+        assert_eq!(turn_usage.output_tokens, 0);
+    }
+
     struct PricedLeaf {
         alias: &'static str,
     }
@@ -906,6 +1066,93 @@ mod tests {
                     cached_input_tokens: None,
                     cache_creation_input_tokens: None,
                 }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    struct FailingWithUsageLeaf {
+        alias: &'static str,
+    }
+
+    impl Attributable for FailingWithUsageLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FailingWithUsageLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("fail".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    struct NoUsageLeaf {
+        alias: &'static str,
+    }
+
+    impl Attributable for NoUsageLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NoUsageLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
                 reasoning_content: None,
             })
         }
