@@ -19,6 +19,13 @@ pub struct LogConfig {
     pub log_persistence_retention_max_files: usize,
     /// Max age (days) of rotated archives in `rotating` mode. `0` disables.
     pub log_persistence_retention_max_age_days: u64,
+    /// Rotate the active file once it holds this many non-empty JSONL lines,
+    /// in `rotating` mode. In steady state each archive holds exactly this
+    /// many entries; an existing active file that already exceeds the cap at
+    /// startup is archived as-is on the next append (one over-cap transition
+    /// archive), after which steady state resumes.
+    /// `0` disables entry-count rotation. Ignored by every other policy.
+    pub log_persistence_max_entries_per_segment: usize,
     pub log_tool_io: String,
     pub log_tool_io_truncate_bytes: usize,
     pub log_tool_io_denylist: Vec<String>,
@@ -35,6 +42,7 @@ impl Default for LogConfig {
             log_persistence_rotate_daily: true,
             log_persistence_retention_max_files: 7,
             log_persistence_retention_max_age_days: 0,
+            log_persistence_max_entries_per_segment: 0,
             log_tool_io: "redacted".into(),
             log_tool_io_truncate_bytes: 40960,
             log_tool_io_denylist: Vec::new(),
@@ -71,6 +79,21 @@ impl StoragePolicy {
 
     pub fn is_enabled(self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    /// Whether a reader should merge timestamped archives with the active file.
+    ///
+    /// Only `Rotating` owns archives: it creates them and prunes them under
+    /// `retention_max_files` / `retention_max_age_days`. Every other policy
+    /// reads the active file alone. That matters most for `Rolling`, whose
+    /// contract is "the most recent `max_entries` events, older ones
+    /// discarded": if a path previously ran `Rotating`, its archives are still
+    /// on disk but explicitly unmanaged (see the storage-policy table in
+    /// `docs/book/src/architecture/logging.md`). Merging them would resurrect
+    /// events the rolling window is supposed to have dropped, and they would
+    /// never be pruned, since no rotation runs to trigger retention.
+    pub fn reads_archives(self) -> bool {
+        matches!(self, Self::Rotating)
     }
 }
 
@@ -142,6 +165,13 @@ pub struct ResolvedPolicy {
     pub retention_max_files: usize,
     /// Max age (days) of rotated archives in `Rotating` mode. `0` disables.
     pub retention_max_age_days: u64,
+    /// Rotate the active file once it holds this many non-empty JSONL lines,
+    /// in `Rotating` mode. In steady state each archive holds exactly this
+    /// many entries; an existing active file that already exceeds the cap at
+    /// first startup or reload is archived as-is (one over-cap transition
+    /// archive), and steady state resumes on the next append.
+    /// `0` disables entry-count rotation. Ignored by every other storage policy.
+    pub max_entries_per_segment: usize,
     pub tool_io: ToolIoPolicy,
     pub tool_io_truncate_bytes: usize,
     pub tool_io_denylist: Vec<String>,
@@ -158,6 +188,7 @@ impl ResolvedPolicy {
             rotate_daily: config.log_persistence_rotate_daily,
             retention_max_files: config.log_persistence_retention_max_files,
             retention_max_age_days: config.log_persistence_retention_max_age_days,
+            max_entries_per_segment: config.log_persistence_max_entries_per_segment,
             tool_io: ToolIoPolicy::from_raw(&config.log_tool_io),
             tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
             tool_io_denylist: config.log_tool_io_denylist.clone(),
@@ -275,5 +306,36 @@ mod tests {
         assert_eq!(p.storage, StoragePolicy::Full);
         assert_eq!(p.tool_io, ToolIoPolicy::Off);
         assert_eq!(p.tool_io_truncate_bytes, 123);
+    }
+
+    #[test]
+    fn resolved_policy_keeps_rolling_independent_of_rotating() {
+        // `rolling` keeps its own in-place trim path; this PR only adds an
+        // entry-count trigger to `rotating`, so `rolling` must not be
+        // rewritten into `Rotating` nor pick up `max_entries_per_segment`.
+        let mut c = make_config();
+        c.log_persistence = "rolling".to_string();
+        c.log_persistence_max_entries = 500;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(
+            p.storage,
+            StoragePolicy::Rolling,
+            "rolling must stay Rolling; entry-count rotation is a rotating-only feature"
+        );
+        assert_eq!(p.max_entries, 500);
+        assert_eq!(
+            p.max_entries_per_segment, 0,
+            "rolling must not inherit the rotating entry-count cap"
+        );
+    }
+
+    #[test]
+    fn resolved_policy_uses_own_field_for_rotating_entry_count_cap() {
+        let mut c = make_config();
+        c.log_persistence = "rotating".to_string();
+        c.log_persistence_max_entries_per_segment = 42;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(p.storage, StoragePolicy::Rotating);
+        assert_eq!(p.max_entries_per_segment, 42);
     }
 }
