@@ -363,6 +363,28 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             save(config).await
         }
         AgentsCommands::Rename { from, to } => {
+            for alias in [&from, &to] {
+                if alias_refs::is_reserved_agent_alias(alias) {
+                    bail!(
+                        "{}",
+                        mta(
+                            "cli-alias-rename-reserved",
+                            &[("alias", alias)],
+                            "alias `{$alias}` is reserved and cannot be renamed"
+                        )
+                    );
+                }
+                if let Err(message) = alias_refs::validate_agent_alias(alias) {
+                    bail!(
+                        "{}",
+                        mta(
+                            "cli-alias-agent-invalid",
+                            &[("message", &message)],
+                            "invalid agent alias: {$message}"
+                        )
+                    );
+                }
+            }
             // Capture the workspace path while the `from` entry still exists
             // (custom paths are read off the entry, which the rename moves).
             let old_ws = config.agent_workspace_dir(&from);
@@ -387,6 +409,16 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
                     )
                 );
             }
+            if let Err(message) = alias_refs::validate_agent_alias(&alias) {
+                bail!(
+                    "{}",
+                    mta(
+                        "cli-alias-agent-invalid",
+                        &[("message", &message)],
+                        "invalid agent alias: {$message}"
+                    )
+                );
+            }
             if dry_run {
                 print_impact(&AliasKind::Agent, &alias, config);
                 return Ok(());
@@ -405,6 +437,18 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             // Owned-state HARD gate (live ACP sessions) runs BEFORE the config
             // cascade so a refusal mutates nothing.
             agent_delete_precheck(config, &alias)?;
+            // A prior delete may have committed the config removal and then
+            // failed its owned-state cascade (the cascade refuses to purge when
+            // export/archive fails). Re-enter the cascade for the absent key
+            // instead of failing "not configured", otherwise retained rows stay
+            // stamped with the deleted alias and a recreated alias inherits
+            // them. Shared with the gateway and RPC surfaces.
+            if config.agent(&alias).is_none() {
+                let workspace = config.agent_workspace_dir(&alias);
+                if agent_delete_residue_exists(config, &alias).await {
+                    return agent_delete_owned_state(config, &alias, &workspace).await;
+                }
+            }
             // Resolve the workspace dir while the entry still exists (a custom
             // `workspace.path` is read off it), then apply + PERSIST the config
             // change before any irreversible owned-state side effects — so a
@@ -415,6 +459,29 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             agent_delete_owned_state(config, &alias, &workspace).await
         }
     }
+}
+
+/// Committed-delete recovery probe for the CLI surface, delegating to the
+/// shared runtime contract so gateway, CLI, and RPC converge identically.
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+async fn agent_delete_residue_exists(config: &Config, alias: &str) -> bool {
+    let Ok((mem, session_backend)) = build_owned_state_handles(config) else {
+        // Handles we cannot open are state we cannot inspect: fail toward
+        // residue so the retry surfaces the real failure.
+        return true;
+    };
+    zeroclaw_runtime::agent_owned_state::committed_delete_residue_exists(
+        config,
+        Some(&mem),
+        session_backend.as_ref(),
+        alias,
+    )
+    .await
+}
+
+#[cfg(not(all(feature = "gateway", feature = "agent-runtime")))]
+async fn agent_delete_residue_exists(_config: &Config, _alias: &str) -> bool {
+    false
 }
 
 /// Memory + optional session-backend handles opened from `data_dir` for the
@@ -454,7 +521,7 @@ fn build_owned_state_handles(config: &Config) -> Result<OwnedStateHandles> {
 fn agent_delete_precheck(config: &Config, alias: &str) -> Result<()> {
     // Fail closed: refuse if live ACP sessions exist, or if the store can't be
     // read to verify (mirrors the gateway delete gate).
-    let live = crate::gateway::agent_owned_state::live_acp_session_count(config, alias)
+    let live = zeroclaw_runtime::agent_owned_state::live_acp_session_count(config, alias)
         .context("could not verify live ACP sessions")?;
     if live > 0 {
         let count = live.to_string();
@@ -475,44 +542,62 @@ fn agent_delete_precheck(_config: &Config, _alias: &str) -> Result<()> {
     Ok(())
 }
 
+/// Archive the workspace and run the owned-state cascade, returning both halves
+/// so the caller can report every partial failure.
+///
+/// The gateway and RPC surfaces hand their archive and cascade warnings back to
+/// the requester; the CLI prints them. Keeping the side effects here and the
+/// printing in the caller is what lets a regression assert the archive half
+/// instead of only the cascade half.
+#[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+async fn run_agent_delete_cascade(
+    config: &Config,
+    alias: &str,
+    workspace: &std::path::Path,
+) -> Result<(
+    zeroclaw_runtime::agent_owned_state::AgentDeletionArchive,
+    zeroclaw_runtime::agent_owned_state::OwnedStateReport,
+)> {
+    let (mem, session_backend) = build_owned_state_handles(config)?;
+    // Archive the workspace dir alongside the owned-state exports through the
+    // shared runtime helper, so this surface gets the same exclusive archive
+    // leaf as the gateway and RPC (a duplicate delete cannot truncate the first
+    // attempt's export) and the same fail-toward-residue workspace probe (an
+    // unreadable workspace is reported, not silently skipped). `workspace` was
+    // resolved by the caller before the config entry was removed, so a custom
+    // `workspace.path` is preserved (post-removal it would default).
+    let archive =
+        zeroclaw_runtime::agent_owned_state::archive_agent_workspace(config, alias, workspace)
+            .await;
+    let report = zeroclaw_runtime::agent_owned_state::cascade_owned_state(
+        config,
+        Some(&mem),
+        session_backend.as_ref(),
+        alias,
+        &archive.path,
+    )
+    .await;
+    Ok((archive, report))
+}
+
 #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
 async fn agent_delete_owned_state(
     config: &Config,
     alias: &str,
     workspace: &std::path::Path,
 ) -> Result<()> {
-    let (mem, session_backend) = build_owned_state_handles(config)?;
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-    let archive_dir = config
-        .data_dir
-        .join("agents")
-        .join("_deleted")
-        .join(format!("{alias}-{ts}"));
-    tokio::fs::create_dir_all(&archive_dir).await.ok();
-    // Archive the workspace dir alongside the owned-state exports. `workspace`
-    // was resolved by the caller before the config entry was removed, so a
-    // custom `workspace.path` is preserved (post-removal it would default).
-    if workspace.exists()
-        && let Err(e) = tokio::fs::rename(&workspace, archive_dir.join("workspace")).await
-    {
-        let es = e.to_string();
+    let (archive, report) = run_agent_delete_cascade(config, alias, workspace).await?;
+    let archive_dir = archive.path;
+    for warning in &archive.warnings {
         eprintln!(
             "{}",
             mta(
                 "cli-alias-warn-workspace-archive",
-                &[("error", es.as_str())],
+                &[("error", warning.as_str())],
                 "warning: workspace archive failed: {$error}"
             )
         );
     }
-    let report = crate::gateway::agent_owned_state::cascade_owned_state(
-        config,
-        &mem,
-        session_backend.as_ref(),
-        alias,
-        &archive_dir,
-    )
-    .await;
     let memory = report.memory_purged.to_string();
     let cron = report.cron_removed.to_string();
     let acp = report.acp_removed.to_string();
@@ -565,26 +650,47 @@ async fn agent_rename_owned_state(
     // Move the workspace dir (default per-alias location only; a custom path is
     // alias-independent → old_ws == new_ws → skip).
     let new_ws = config.agent_workspace_dir(to);
-    if old_ws != new_ws && old_ws.exists() {
-        if let Some(parent) = new_ws.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        if let Err(e) = tokio::fs::rename(old_ws, &new_ws).await {
-            let es = e.to_string();
-            eprintln!(
-                "{}",
-                mta(
-                    "cli-alias-warn-workspace-move",
-                    &[("error", es.as_str())],
-                    "warning: workspace move failed: {$error}"
-                )
-            );
+    if old_ws != new_ws {
+        // An unreadable source is residue, not absence: reporting a metadata
+        // failure as "nothing to move" would leave the retired workspace on
+        // disk while the rename looks clean, and recreating the old alias would
+        // resolve to the previous incarnation's files. The shared runtime probe
+        // makes that distinction the same way on every supported platform.
+        match zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(old_ws).await {
+            zeroclaw_runtime::agent_owned_state::PathPresence::Present => {
+                if let Some(parent) = new_ws.parent() {
+                    tokio::fs::create_dir_all(parent).await.ok();
+                }
+                if let Err(e) = tokio::fs::rename(old_ws, &new_ws).await {
+                    let es = e.to_string();
+                    eprintln!(
+                        "{}",
+                        mta(
+                            "cli-alias-warn-workspace-move",
+                            &[("error", es.as_str())],
+                            "warning: workspace move failed: {$error}"
+                        )
+                    );
+                }
+            }
+            zeroclaw_runtime::agent_owned_state::PathPresence::Absent => {}
+            zeroclaw_runtime::agent_owned_state::PathPresence::Uninspectable(e) => {
+                let es = format!("workspace inspection failed for {}: {e}", old_ws.display());
+                eprintln!(
+                    "{}",
+                    mta(
+                        "cli-alias-warn-workspace-move",
+                        &[("error", es.as_str())],
+                        "warning: workspace move failed: {$error}"
+                    )
+                );
+            }
         }
     }
     let (mem, session_backend) = build_owned_state_handles(config)?;
-    let report = crate::gateway::agent_owned_state::cascade_rename_agent(
+    let report = zeroclaw_runtime::agent_owned_state::cascade_rename_agent(
         config,
-        &mem,
+        Some(&mem),
         session_backend.as_ref(),
         from,
         to,
@@ -827,6 +933,301 @@ mod tests {
                 channel_type: "discord".to_string(),
             }),
             "channels.discord"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_recovery_rejects_unsafe_aliases_before_filesystem_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.agents.insert(
+            "target".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let absolute_root = tmp.path().join("absolute_escape");
+        let traversal_root = tmp.path().join("traversal_escape");
+        let reserved_root = config.data_dir.join("agents/default");
+        let cases = [
+            (absolute_root.to_string_lossy().into_owned(), absolute_root),
+            ("../../traversal_escape".to_string(), traversal_root),
+            ("default".to_string(), reserved_root),
+        ];
+
+        for (alias, outside_root) in cases {
+            let marker = outside_root.join("workspace/marker.txt");
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "must remain untouched").unwrap();
+
+            let delete = handle_agents(
+                AgentsCommands::Delete {
+                    alias: alias.clone(),
+                    dry_run: false,
+                    yes: true,
+                },
+                &mut config,
+            )
+            .await;
+            assert!(delete.is_err(), "delete accepted unsafe alias `{alias}`");
+            assert!(marker.exists(), "delete touched unsafe path for `{alias}`");
+
+            let rename = handle_agents(
+                AgentsCommands::Rename {
+                    from: alias.clone(),
+                    to: "target".to_string(),
+                },
+                &mut config,
+            )
+            .await;
+            assert!(rename.is_err(), "rename accepted unsafe alias `{alias}`");
+            assert!(marker.exists(), "rename touched unsafe path for `{alias}`");
+        }
+
+        assert!(config.agents.contains_key("target"));
+    }
+
+    /// Committed-delete recovery, CLI surface. `zeroclaw agents delete` persists
+    /// the config removal before running the owned-state cascade, and that
+    /// cascade refuses to purge when its durable archive cannot be written. The
+    /// retry therefore runs against an absent config key: it must re-enter the
+    /// cascade off owned-state residue and converge, rather than bailing with
+    /// "agents.victim is not configured" and stranding rows under the deleted
+    /// alias (ADR-011 — a recreated alias would inherit them).
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn agent_delete_retry_after_cascade_failure_converges_on_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        // Block archive creation so the first cascade cannot cross the
+        // export-then-purge gate.
+        let agents_dir = config.data_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("_deleted"), b"").expect("seed _deleted blocker file");
+
+        let knowledge_path = config.knowledge.resolved_db_path();
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let stranded = knowledge
+            .add_node(
+                &zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new()),
+                zeroclaw_memory::knowledge_graph::NodeType::Pattern,
+                "Owned",
+                "cli committed-delete retry proof",
+                &[],
+                None,
+            )
+            .unwrap();
+        drop(knowledge);
+
+        // ── attempt 1: config is already committed as removed (the alias is
+        // absent), and the cascade is refused by the archive blocker. ────────
+        let workspace = config.agent_workspace_dir("victim");
+        agent_delete_owned_state(&config, "victim", &workspace)
+            .await
+            .expect("a refused cascade is still a completed call");
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            1,
+            "attempt 1 must leave the rows stamped with the deleted alias"
+        );
+        drop(knowledge);
+
+        // The retry's entry condition: the key is gone, but residue remains.
+        assert!(config.agent("victim").is_none());
+        assert!(
+            agent_delete_residue_exists(&config, "victim").await,
+            "retained knowledge rows are owned-state residue the retry must see"
+        );
+
+        // ── attempt 2: repair the blocker and re-enter the cascade ───────────
+        std::fs::remove_file(agents_dir.join("_deleted")).unwrap();
+        handle_agents(
+            AgentsCommands::Delete {
+                alias: "victim".to_string(),
+                dry_run: false,
+                yes: true,
+            },
+            &mut config,
+        )
+        .await
+        .expect("the retry must re-enter the cascade, not bail `not configured`");
+
+        let knowledge = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &knowledge_path,
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        assert_eq!(
+            knowledge.count_owner("victim").unwrap(),
+            0,
+            "the retry converges: no rows may stay stamped with the deleted alias"
+        );
+        // ADR-011: recreating the alias must not inherit the previous
+        // incarnation's rows.
+        let reused_scope =
+            zeroclaw_memory::knowledge_graph::KnowledgeScope::for_agent("victim", Vec::new());
+        assert!(
+            knowledge
+                .get_node(&reused_scope, &stranded)
+                .unwrap()
+                .is_none(),
+            "a recreated alias must not inherit rows from the deleted incarnation"
+        );
+    }
+
+    /// Committed-delete recovery, CLI surface. A workspace whose metadata
+    /// cannot be read is residue, not absence: skipping it silently would leave
+    /// the retired directory on disk while the delete reports a clean result,
+    /// and recreating the alias would then resolve to the previous
+    /// incarnation's files (ADR-011). Routing the CLI archive step through the
+    /// shared helper is what surfaces the inspection failure here, the same way
+    /// the gateway and RPC surfaces already do.
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn agent_delete_retries_unreadable_workspace_before_alias_reuse_on_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        // Committed-delete shape: `agents.victim` is already gone, only the
+        // workspace still lags behind.
+        let workspace = config.agent_workspace_dir("victim");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("retired-marker.txt"), b"prior incarnation").unwrap();
+        assert!(config.agent("victim").is_none());
+
+        // Unreadable rather than absent: the workspace's parent becomes a file,
+        // so metadata lookups on it fail with an error instead of `false`. The
+        // archive root lives under `data_dir`, so it stays writable.
+        let agent_root = workspace.parent().unwrap().to_path_buf();
+        let saved_agent_root = agent_root.with_extension("saved");
+        std::fs::rename(&agent_root, &saved_agent_root).unwrap();
+        std::fs::write(&agent_root, b"blocks child metadata").unwrap();
+        assert!(
+            zeroclaw_runtime::agent_owned_state::inspect_lifecycle_path(&workspace)
+                .await
+                .is_uninspectable(),
+            "the fixture must make the workspace uninspectable, not absent"
+        );
+
+        let (archive, _report) = run_agent_delete_cascade(&config, "victim", &workspace)
+            .await
+            .expect("a refused archive is still a completed call");
+        assert!(
+            archive
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("workspace inspection failed")),
+            "an unreadable workspace must be reported, not skipped: {:?}",
+            archive.warnings
+        );
+        assert!(
+            agent_delete_residue_exists(&config, "victim").await,
+            "an uninspectable workspace is residue the retry must see"
+        );
+
+        std::fs::remove_file(&agent_root).unwrap();
+        std::fs::rename(&saved_agent_root, &agent_root).unwrap();
+        assert!(workspace.join("retired-marker.txt").exists());
+
+        handle_agents(
+            AgentsCommands::Delete {
+                alias: "victim".to_string(),
+                dry_run: false,
+                yes: true,
+            },
+            &mut config,
+        )
+        .await
+        .expect("the retry must re-enter the cascade, not bail `not configured`");
+
+        let archived = std::fs::read_dir(config.data_dir.join("agents/_deleted"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.path().join("workspace/retired-marker.txt").exists())
+            .expect("the repaired retry must archive the retired workspace");
+        assert!(archived.path().join("workspace").is_dir());
+        assert!(
+            !workspace.exists(),
+            "the retired workspace must not stay in place after convergence"
+        );
+
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(
+            !workspace.join("retired-marker.txt").exists(),
+            "reusing the alias must not expose the previous incarnation's files"
+        );
+    }
+
+    /// The recovery path is a retry, not a bypass: deleting an alias that was
+    /// never configured and has no residue must still fail.
+    #[cfg(all(feature = "gateway", feature = "agent-runtime"))]
+    #[tokio::test]
+    async fn agent_delete_without_residue_still_fails_on_the_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.knowledge.db_path = tmp
+            .path()
+            .join("knowledge.db")
+            .to_string_lossy()
+            .to_string();
+
+        assert!(
+            !agent_delete_residue_exists(&config, "ghost").await,
+            "an alias with no owned state has no residue"
+        );
+        let err = handle_agents(
+            AgentsCommands::Delete {
+                alias: "ghost".to_string(),
+                dry_run: false,
+                yes: true,
+            },
+            &mut config,
+        )
+        .await
+        .expect_err("a bogus delete must not succeed through the recovery path");
+        assert!(
+            err.to_string().contains("ghost"),
+            "the localized failure must identify the requested alias, got: {err}"
         );
     }
 }
