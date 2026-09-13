@@ -68,6 +68,7 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub activated_tools: Option<&'a std::sync::Arc<std::sync::Mutex<ActivatedToolSet>>>,
     pub excluded_tools: &'a [String],
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
+    pub approval: Option<&'a ApprovalManager>,
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
@@ -146,6 +147,27 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
+    let mut call_arguments = call_arguments;
+    // Confirmation is consumed immediately before dispatch, after any queue
+    // or approval wait. The shell tool receives only this runtime-owned marker;
+    // the model-visible `approved` boolean is never an authority.
+    if call_name == "shell" {
+        let confirmed = dispatch
+            .approval
+            .map(|manager| {
+                manager.consume_shell_confirmation(&call_arguments)
+                    == zeroclaw_api::permission::ConsumeOutcome::Consumed
+            })
+            .unwrap_or(false);
+        if let Some(args) = call_arguments.as_object_mut() {
+            args.remove(crate::agent::RUNTIME_CONFIRMATION_ID_ARG);
+            args.insert(
+                "__zeroclaw_confirmation_consumed".to_string(),
+                serde_json::Value::Bool(confirmed),
+            );
+            args.insert("approved".to_string(), serde_json::Value::Bool(false));
+        }
+    }
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -731,6 +753,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -789,6 +812,7 @@ mod tests {
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -929,6 +953,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -979,6 +1004,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1073,6 +1099,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &NoopObserver,
@@ -1168,6 +1195,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1253,6 +1281,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1326,6 +1355,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1451,6 +1481,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &observer,
@@ -1633,6 +1664,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &observer,
@@ -1751,6 +1783,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &observer,
@@ -1866,6 +1899,7 @@ mod tests {
                     activated_tools: None,
                     excluded_tools: &[],
                     model_switch_callback: None,
+                    approval: None,
                 },
                 &meta,
                 &NoopObserver,
@@ -1934,6 +1968,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -1980,6 +2015,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,
@@ -2031,6 +2067,7 @@ mod tests {
                 activated_tools: None,
                 excluded_tools: &[],
                 model_switch_callback: None,
+                approval: None,
             },
             &meta,
             &NoopObserver,

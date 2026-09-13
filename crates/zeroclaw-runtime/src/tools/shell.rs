@@ -268,8 +268,11 @@ impl Tool for ShellTool {
         // approval gate's mint+consume writes `true`. See
         // `agent::set_runtime_approved_arg` and the gate in
         // `agent::turn::approval_gate`.
+        // Only the execution boundary may set this marker after consuming a
+        // fingerprint-bound confirmation. The legacy/model-visible `approved`
+        // boolean is intentionally ignored here.
         let confirmed = args
-            .get("approved")
+            .get("__zeroclaw_confirmation_consumed")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 

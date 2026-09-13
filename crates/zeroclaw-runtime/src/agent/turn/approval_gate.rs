@@ -11,11 +11,13 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
-use zeroclaw_api::permission::ConsumeOutcome;
 use zeroclaw_config::tool_policy::{Decision, Resolution, ResolutionReason};
 
 pub(crate) enum ApprovalGateOutcome {
-    Proceed { approved: bool },
+    Proceed {
+        approved: bool,
+        confirmation_id: Option<uuid::Uuid>,
+    },
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
     Cancelled,
@@ -49,7 +51,7 @@ pub(crate) async fn gate_tool_approval(
     // ── RFC 7155 shell resolution ──────────────────────────────────
     // Only when the manager carries a policy context; everything else
     // (non-shell tools, configless paths) keeps the legacy tool-name flow.
-    let mut shell_confirmation: Option<bool> = None;
+    let mut shell_confirmation: Option<uuid::Uuid> = None;
     if let Some(mgr) = ctx.approval
         && let Some(security) = mgr.policy()
         && crate::agent::is_runtime_approved_arg_tool(tool_name)
@@ -64,7 +66,10 @@ pub(crate) async fn gate_tool_approval(
             }
             Decision::Allow if !mgr.hard_asks(tool_name) => {
                 // Allow tier: explicitly allowed, no approval needed.
-                return ApprovalGateOutcome::Proceed { approved: false };
+                return ApprovalGateOutcome::Proceed {
+                    approved: false,
+                    confirmation_id: None,
+                };
             }
             Decision::Allow | Decision::Ask => {
                 if approval_requirement != ApprovalRequirement::Prompt {
@@ -74,7 +79,7 @@ pub(crate) async fn gate_tool_approval(
                     // the shell tool's confirmed validation then fails
                     // closed. Tool-level approval can never bypass a
                     // command-level Ask (RFC 7155 §1.3).
-                    shell_confirmation = Some(false);
+                    shell_confirmation = None;
                 }
                 // Prompt flow below; the Yes/Always branch mints the
                 // confirmation.
@@ -181,10 +186,9 @@ pub(crate) async fn gate_tool_approval(
         // RFC 7155 §5.1/§5.2: for the resolved shell command, the
         // operator's approval mints a single-use confirmation bound to the
         // command's action fingerprint, and `approved` means the
-        // confirmation was consumed. Nothing model-supplied can produce
-        // one: the loop strips the injected bits before this gate.
-        // `shell_confirmation` is the OUTER one from the resolution
-        // pre-check; the consumed result must reach the final Proceed.
+        // confirmation is carried to the execution boundary. Nothing
+        // model-supplied can produce one: the loop strips the injected bits
+        // before this gate, and execution revalidates/finally consumes it.
         let mut confirmation_audit: Option<crate::approval::ConfirmationAudit> = None;
         if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always)
             && let Some(command) = tool_args.get("command").and_then(serde_json::Value::as_str)
@@ -204,26 +208,11 @@ pub(crate) async fn gate_tool_approval(
                 zeroclaw_api::permission::RouteId::from(decision_channel.clone()),
                 security.tool_policy.confirmation_validity_secs,
             );
-            let outcome = mgr.consume_confirmation(&confirmation.confirmation_id, &facts);
-            if outcome != ConsumeOutcome::Consumed {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_category(::zeroclaw_log::EventCategory::Tool)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "tool": tool_name,
-                            "consume_outcome": format!("{outcome:?}"),
-                            "trace_id": ctx.turn_id,
-                        })),
-                    "confirmation consume failed right after mint"
-                );
-            }
-            shell_confirmation = Some(outcome == ConsumeOutcome::Consumed);
+            shell_confirmation = Some(confirmation.confirmation_id);
             confirmation_audit = Some(crate::approval::ConfirmationAudit {
                 action_fingerprint: confirmation.action_fingerprint.as_hex(),
                 trusted_route: confirmation.trusted_route.to_string(),
-                terminal_state: format!("{outcome:?}").to_lowercase(),
+                terminal_state: "pending".to_string(),
             });
         }
         mgr.record_decision(
@@ -358,8 +347,9 @@ pub(crate) async fn gate_tool_approval(
     }
 
     ApprovalGateOutcome::Proceed {
-        approved: shell_confirmation
-            .unwrap_or(approval_requirement == ApprovalRequirement::Approved),
+        approved: shell_confirmation.is_some()
+            || approval_requirement == ApprovalRequirement::Approved,
+        confirmation_id: shell_confirmation,
     }
 }
 

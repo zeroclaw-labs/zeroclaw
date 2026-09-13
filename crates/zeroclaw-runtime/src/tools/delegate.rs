@@ -3498,7 +3498,21 @@ impl DelegateTool {
             self.root_config
                 .as_ref()
                 .and_then(|config| config.risk_profile_for_agent(agent_name))
-                .map(ApprovalManager::for_non_interactive)
+                .map(|profile| {
+                    let manager = ApprovalManager::for_non_interactive(profile);
+                    // Independent turns execute under the target's policy. In
+                    // particular, Full autonomy must not lose the target
+                    // policy context and thereby bypass an explicit shell Ask.
+                    manager.set_policy_context(
+                        Arc::clone(&target_policy),
+                        self.runtime
+                            .as_ref()
+                            .map_or(zeroclaw_api::runtime_traits::ShellDialect::Posix, |runtime| {
+                                runtime.shell_dialect()
+                            }),
+                    );
+                    manager
+                })
         } else {
             None
         };

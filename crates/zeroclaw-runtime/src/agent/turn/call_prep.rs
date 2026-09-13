@@ -175,6 +175,7 @@ pub(crate) async fn prepare_tool_calls(
         );
 
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+        crate::agent::set_runtime_confirmation_id(&tool_name, &mut tool_args, None);
 
         let requires_prompt = ctx
             .approval
@@ -229,9 +230,12 @@ pub(crate) async fn prepare_tool_calls(
             index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
             total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
-        let approved =
+        let (approved, confirmation_id) =
             match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
-                ApprovalGateOutcome::Proceed { approved } => approved,
+                ApprovalGateOutcome::Proceed {
+                    approved,
+                    confirmation_id,
+                } => (approved, confirmation_id),
                 ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
                     // Streaming consumers see the denied/replaced call and its
                     // synthesized result (e.g. a DenyWithEdit replacement) as a
@@ -244,7 +248,12 @@ pub(crate) async fn prepare_tool_calls(
                     continue;
                 }
                 ApprovalGateOutcome::Cancelled => return Err(ToolLoopCancelled.into()),
-            };
+        };
+        crate::agent::set_runtime_confirmation_id(
+            &tool_name,
+            &mut tool_args,
+            confirmation_id,
+        );
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
         let signature = tool_call_signature(&tool_name, &tool_args);

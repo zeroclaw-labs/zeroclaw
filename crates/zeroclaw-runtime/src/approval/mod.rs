@@ -425,6 +425,44 @@ impl ApprovalManager {
         )
     }
 
+    /// Re-validate and consume a shell confirmation at the execution
+    /// boundary. The command facts are reconstructed from the actual tool
+    /// arguments; no model-supplied boolean is trusted. A denied or malformed
+    /// action never consumes a pending confirmation.
+    pub(crate) fn consume_shell_confirmation(
+        &self,
+        args: &serde_json::Value,
+    ) -> ConsumeOutcome {
+        let Some(id) = args
+            .get(crate::agent::RUNTIME_CONFIRMATION_ID_ARG)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+        else {
+            return ConsumeOutcome::Stale;
+        };
+        let Some(command) = args.get("command").and_then(serde_json::Value::as_str) else {
+            return ConsumeOutcome::Stale;
+        };
+        let Some(security) = self.policy() else {
+            return ConsumeOutcome::Stale;
+        };
+        let action = zeroclaw_config::tool_policy::extract_shell_action(
+            command,
+            self.shell_dialect(),
+            Some(&security.workspace_dir),
+        );
+        let zeroclaw_config::tool_policy::ToolAction::Shell(shell) = &action;
+        let resolution = security.resolve_shell_decision(
+            command,
+            self.shell_dialect(),
+            &self.session_rules(),
+        );
+        if resolution.decision == zeroclaw_config::tool_policy::Decision::Deny {
+            return ConsumeOutcome::Stale;
+        }
+        self.consume_confirmation(&id, &shell.fingerprint_facts())
+    }
+
     /// The narrow session rule an "Always" answer mints (RFC 7155 §3.3.4):
     /// for a shell-family tool, the exact executable plus the approved
     /// argument prefix (so `always allow git push` never widens into `git

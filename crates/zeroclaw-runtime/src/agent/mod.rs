@@ -47,6 +47,28 @@ pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     )
 }
 
+/// Runtime-only confirmation handle. This key is never advertised in a tool
+/// schema and is stripped/replaced by the tool loop before dispatch.
+pub(crate) const RUNTIME_CONFIRMATION_ID_ARG: &str = "__zeroclaw_confirmation_id";
+
+pub(crate) fn set_runtime_confirmation_id(
+    tool_name: &str,
+    args: &mut serde_json::Value,
+    confirmation_id: Option<uuid::Uuid>,
+) {
+    if is_runtime_approved_arg_tool(tool_name)
+        && let Some(args) = args.as_object_mut()
+    {
+        args.remove(RUNTIME_CONFIRMATION_ID_ARG);
+        if let Some(id) = confirmation_id {
+            args.insert(
+                RUNTIME_CONFIRMATION_ID_ARG.to_string(),
+                serde_json::Value::String(id.to_string()),
+            );
+        }
+    }
+}
+
 /// Overwrite the runtime-owned `approved` arg for an approval-gated tool.
 ///
 /// Callers must treat this as the sole authority for the bit: the tool loop
