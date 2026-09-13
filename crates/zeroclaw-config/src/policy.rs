@@ -1431,6 +1431,71 @@ pub(crate) fn strip_wrapping_quotes(token: &str) -> &str {
     token.trim_matches(|c| c == '"' || c == '\'')
 }
 
+/// Detect a POSIX token assembled from both unquoted and quoted fragments.
+///
+/// The shell concatenates adjacent fragments before invoking the executable,
+/// while the bounded policy parser intentionally does not perform that
+/// normalization.  Treating `pu"sh"` as a literal argument would therefore
+/// hide the `push` verb from risk and allowlist checks.  Fully bare and fully
+/// quoted tokens remain valid; mixed tokens are rejected conservatively.
+pub(crate) fn contains_mixed_quoted_token(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut has_bare = false;
+    let mut has_quoted = false;
+
+    let finish_token = |has_bare: &mut bool, has_quoted: &mut bool| {
+        let mixed = *has_bare && *has_quoted;
+        *has_bare = false;
+        *has_quoted = false;
+        mixed
+    };
+
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                has_quoted = true;
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                has_quoted = true;
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    has_bare = true;
+                } else if ch == '\\' {
+                    escaped = true;
+                    has_bare = true;
+                } else if ch == '\'' {
+                    quote = QuoteState::Single;
+                    has_quoted = true;
+                } else if ch == '"' {
+                    quote = QuoteState::Double;
+                    has_quoted = true;
+                } else if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>') {
+                    if finish_token(&mut has_bare, &mut has_quoted) {
+                        return true;
+                    }
+                } else {
+                    has_bare = true;
+                }
+            }
+        }
+    }
+
+    finish_token(&mut has_bare, &mut has_quoted)
+}
+
 fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
@@ -2668,6 +2733,7 @@ impl SecurityPolicy {
             || contains_unquoted_shell_variable_expansion(command)
             || command.contains("<(")
             || command.contains(">(")
+            || contains_mixed_quoted_token(command)
         {
             return false;
         }

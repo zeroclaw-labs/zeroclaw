@@ -200,6 +200,10 @@ pub enum DegradationReason {
     TeeFileWrite,
     /// An unquoted single `&` — background chaining hides extra commands.
     BackgroundChaining,
+    /// A token mixes bare and quoted fragments (for example `pu"sh`). The
+    /// shell concatenates these fragments before execution, but the bounded
+    /// extractor does not normalize them safely.
+    MixedQuotedToken,
     /// Injection-capable arguments of a known executable (`find -exec`,
     /// `git -c`, `python -c`, `node -e`, `pip install`, `npm exec`,
     /// `cargo install`) — the executed code is not visible in the segment.
@@ -388,6 +392,9 @@ fn extract_posix_like_segments(
         || command.contains(">(")
     {
         degradation = Some(DegradationReason::CommandSubstitution);
+    }
+    if degradation.is_none() && crate::policy::contains_mixed_quoted_token(command) {
+        degradation = Some(DegradationReason::MixedQuotedToken);
     }
     if degradation.is_none() && contains_unsafe_output_redirect_for_shell(command, dialect) {
         degradation = Some(DegradationReason::UnsafeOutputRedirect);
@@ -1827,6 +1834,38 @@ mod tests {
             shell.parse_status,
             ParseStatus::Degraded(DegradationReason::UnsafeExecutableArguments)
         );
+    }
+
+    #[test]
+    fn extraction_rejects_mixed_quoted_posix_tokens() {
+        let action = extract_shell_action("git pu\"sh\"", ShellDialect::Posix, None);
+        let ToolAction::Shell(shell) = &action;
+        assert_eq!(
+            shell.parse_status,
+            ParseStatus::Degraded(DegradationReason::MixedQuotedToken)
+        );
+
+        // The shell concatenates `pu"sh"` into `push`; with the default
+        // high-risk block enabled this must fail closed instead of allowing a
+        // broad `git` allowlist entry to hide the mutating verb.
+        let cfg = profile(AutonomyLevel::Supervised, &["git"]);
+        let resolution = resolve_with(&cfg, "git pu\"sh\"", ShellDialect::Posix);
+        assert_eq!(resolution.decision, Decision::Deny);
+        assert!(matches!(
+            resolution.reason,
+            ResolutionReason::DegradedSyntax {
+                reason: DegradationReason::MixedQuotedToken,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn fully_quoted_posix_tokens_remain_clean() {
+        let action = extract_shell_action("git \"push\"", ShellDialect::Posix, None);
+        let ToolAction::Shell(shell) = &action;
+        assert_eq!(shell.parse_status, ParseStatus::Clean);
+        assert_eq!(shell.segments[0].arguments, vec!["push"]);
     }
 
     #[test]
