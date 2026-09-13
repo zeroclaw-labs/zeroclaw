@@ -22,6 +22,7 @@ pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
 mod api_sop_webhook;
+pub mod api_upload;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -36,6 +37,8 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_webhook;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -168,6 +171,7 @@ pub fn gateway_long_running_request_timeout_secs(
 }
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
@@ -333,7 +337,27 @@ impl GatewayRateLimiter {
 pub struct IdempotencyStore {
     ttl: Duration,
     max_keys: usize,
-    keys: Mutex<HashMap<String, Instant>>,
+    entries: Mutex<IdempotencyEntries>,
+    #[cfg(feature = "plugins-wasm")]
+    next_generation: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct IdempotencyEntries {
+    committed: HashMap<String, Instant>,
+    /// Temporary plugin-delivery owners, bounded independently by `max_keys`.
+    /// Keeping this separate prevents one slow plugin request from making the
+    /// legacy boolean `record_if_new` path misclassify store pressure as a
+    /// committed duplicate.
+    #[cfg(feature = "plugins-wasm")]
+    pending: HashMap<String, PendingIdempotencyReservation>,
+}
+
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+struct PendingIdempotencyReservation {
+    generation: u64,
+    status: tokio::sync::watch::Sender<zeroclaw_api::webhook::WebhookReservationStatus>,
 }
 
 impl IdempotencyStore {
@@ -341,32 +365,138 @@ impl IdempotencyStore {
         Self {
             ttl,
             max_keys: max_keys.max(1),
-            keys: Mutex::new(HashMap::new()),
+            entries: Mutex::new(IdempotencyEntries::default()),
+            #[cfg(feature = "plugins-wasm")]
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
     /// Returns true if this key is new and is now recorded.
     fn record_if_new(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut keys = self.keys.lock();
+        let mut entries = self.entries.lock();
 
-        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
 
-        if keys.contains_key(key) {
+        let pending_contains = {
+            #[cfg(feature = "plugins-wasm")]
+            {
+                entries.pending.contains_key(key)
+            }
+            #[cfg(not(feature = "plugins-wasm"))]
+            {
+                false
+            }
+        };
+        if entries.committed.contains_key(key) || pending_contains {
             return false;
         }
 
-        if keys.len() >= self.max_keys {
-            let evict_key = keys
+        if entries.committed.len() >= self.max_keys {
+            let evict_key = entries
+                .committed
                 .iter()
                 .min_by_key(|(_, seen_at)| *seen_at)
                 .map(|(k, _)| k.clone());
             if let Some(evict_key) = evict_key {
-                keys.remove(&evict_key);
+                entries.committed.remove(&evict_key);
+            } else {
+                return false;
             }
         }
 
-        keys.insert(key.to_owned(), now);
+        entries.committed.insert(key.to_owned(), now);
+        true
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn begin_reservation(&self, key: &str) -> zeroclaw_api::webhook::WebhookReservation {
+        use zeroclaw_api::webhook::{
+            WebhookReservation, WebhookReservationStatus, WebhookReservationToken,
+            WebhookReservationWaiter,
+        };
+
+        let now = Instant::now();
+        let mut entries = self.entries.lock();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.contains_key(key) {
+            return WebhookReservation::Committed;
+        }
+        if let Some(pending) = entries.pending.get(key) {
+            return WebhookReservation::InFlight(WebhookReservationWaiter::new(
+                pending.status.subscribe(),
+            ));
+        }
+
+        if entries.pending.len() >= self.max_keys {
+            return WebhookReservation::Unavailable;
+        }
+
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (status, _) = tokio::sync::watch::channel(WebhookReservationStatus::InFlight);
+        entries.pending.insert(
+            key.to_string(),
+            PendingIdempotencyReservation { generation, status },
+        );
+        WebhookReservation::Owner(WebhookReservationToken::new(key.to_string(), generation))
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn commit_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
+        let mut entries = self.entries.lock();
+        if entries
+            .pending
+            .get(token.key())
+            .is_none_or(|pending| pending.generation != token.generation())
+        {
+            return false;
+        }
+        let Some(pending) = entries.pending.remove(token.key()) else {
+            return false;
+        };
+        pending
+            .status
+            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::Committed);
+        let now = Instant::now();
+        entries
+            .committed
+            .retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        if entries.committed.len() >= self.max_keys {
+            let evict_key = entries
+                .committed
+                .iter()
+                .min_by_key(|(_, seen_at)| *seen_at)
+                .map(|(key, _)| key.clone());
+            if let Some(evict_key) = evict_key {
+                entries.committed.remove(&evict_key);
+            }
+        }
+        entries.committed.insert(token.key().to_string(), now);
+        true
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    fn rollback_reservation(&self, token: &zeroclaw_api::webhook::WebhookReservationToken) -> bool {
+        let mut entries = self.entries.lock();
+        if entries
+            .pending
+            .get(token.key())
+            .is_none_or(|pending| pending.generation != token.generation())
+        {
+            return false;
+        }
+        let Some(pending) = entries.pending.remove(token.key()) else {
+            return false;
+        };
+        pending
+            .status
+            .send_replace(zeroclaw_api::webhook::WebhookReservationStatus::RolledBack);
         true
     }
 }
@@ -391,6 +521,65 @@ fn parse_client_ip(value: &str) -> Option<IpAddr> {
 
 fn dirs_data_local() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebDashboardAvailability {
+    Embedded,
+    Filesystem(std::path::PathBuf),
+}
+
+pub fn resolve_web_dashboard_availability(config: &Config) -> Option<WebDashboardAvailability> {
+    #[cfg(feature = "embedded-web")]
+    {
+        let _ = config;
+        Some(WebDashboardAvailability::Embedded)
+    }
+    #[cfg(not(feature = "embedded-web"))]
+    {
+        resolve_web_dist_dir(config).map(WebDashboardAvailability::Filesystem)
+    }
+}
+
+fn has_servable_dashboard_index(dir: &std::path::Path) -> bool {
+    let Ok(canonical_root) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let Ok(canonical_index) = std::fs::canonicalize(canonical_root.join("index.html")) else {
+        return false;
+    };
+
+    canonical_index.starts_with(&canonical_root) && canonical_index.is_file()
+}
+
+pub fn resolve_web_dist_dir(config: &Config) -> Option<std::path::PathBuf> {
+    match config
+        .gateway
+        .web_dist_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+    {
+        Some(explicit) if has_servable_dashboard_index(&explicit) => Some(explicit),
+        Some(_) | None => auto_detect_web_dist_dir(),
+    }
+}
+
+fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
+    let mut candidates = vec![
+        std::path::PathBuf::from("web/dist"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("web/dist")))
+            .unwrap_or_default(),
+        std::path::PathBuf::from("/zeroclaw-data/web/dist"),
+        std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
+    ];
+    if let Some(data_dir) = dirs_data_local() {
+        candidates.push(data_dir.join("zeroclaw/web/dist"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| !p.as_os_str().is_empty() && has_servable_dashboard_index(p))
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
@@ -567,8 +756,27 @@ pub struct AppState {
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
+/// Daemon-owned services whose lifecycle matches one supervised gateway run.
+pub struct GatewaySupervision {
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+}
+
+impl GatewaySupervision {
+    /// Pair startup readiness with the channel supervisor's route generation.
+    #[must_use]
+    pub fn new(
+        readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+        plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    ) -> Self {
+        Self {
+            readiness,
+            plugin_webhooks,
+        }
+    }
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
-#[allow(clippy::too_many_lines)]
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -587,6 +795,44 @@ pub async fn run_gateway(
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
+    Box::pin(run_gateway_with_plugin_webhooks(
+        host,
+        port,
+        config,
+        external_event_tx,
+        reload_controls,
+        tui_registry,
+        canvas_store,
+        sop_engine,
+        sop_audit,
+        GatewaySupervision::new(
+            readiness,
+            Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+        ),
+    ))
+    .await
+}
+
+/// Run the supervised gateway with the daemon generation's channel-plugin
+/// webhook registry. Standalone callers use [`run_gateway`], because no channel
+/// supervisor exists there to publish live routes.
+#[allow(clippy::too_many_lines)]
+pub async fn run_gateway_with_plugin_webhooks(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    supervision: GatewaySupervision,
+) -> Result<()> {
+    let GatewaySupervision {
+        readiness,
+        plugin_webhooks,
+    } = supervision;
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -638,11 +884,17 @@ pub async fn run_gateway(
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // Seed the install-wide default provider from the first entry that
+    // actually declares a `model`. Entries without one cannot serve as the
+    // default (there is no model string to pair with the provider), so
+    // skipping them keeps the boot family, credentials, runtime options, and
+    // model coherent — the previous "first entry, whatever it is" pick could
+    // build the provider from one entry while `resolve_default_model` sourced
+    // the model from another.
     let (boot_family, boot_alias, boot_entry) = config
         .providers
         .models
-        .iter_entries()
-        .next()
+        .first_entry_with_model()
         .map(|(f, a, e)| (f.to_string(), a.to_string(), Some(e)))
         .unwrap_or_else(|| ("openrouter".to_string(), "default".to_string(), None));
     let fallback = boot_entry;
@@ -685,34 +937,26 @@ pub async fn run_gateway(
     let model = if boot_provider_failed {
         String::new()
     } else {
-        match fallback
+        // `first_entry_with_model` guarantees a non-empty model for the boot
+        // entry, so reaching the empty fallback means no entry declares a
+        // model at all — the needs_quickstart onboarding path.
+        let model = fallback
             .and_then(|e| e.model.as_deref())
             .map(str::trim)
             .filter(|m| !m.is_empty())
-        {
-            Some(m) => m.to_string(),
-            None => match config.resolve_default_model() {
-                Some(m) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": m})), "first model_provider has no `model` set; using first configured \
-                     providers.models entry as default. Set \
-                     [providers.models.<type>.<alias>] model = \"...\" to silence \
-                     this warning.");
-                    m
-                }
-                None => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"display_addr": display_addr})),
-                        &format!(
-                            "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
-                        )
-                    );
-                    String::new()
-                }
-            },
+            .map(ToString::to_string);
+        if model.is_none() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"display_addr": display_addr})),
+                &format!(
+                    "Gateway booting without a configured model. Visit http://{display_addr}/quickstart to complete browser quickstart. Chat endpoints will return 503 needs_quickstart until at least one [providers.models.<type>.<alias>] model = \"...\" is set."
+                )
+            );
         }
+        model.unwrap_or_default()
     };
     // Preserve `Option<f64>` end-to-end. Substituting a hardcoded default
     // here would clobber the "let the provider decide" intent for models
@@ -1295,74 +1539,75 @@ pub async fn run_gateway(
         }
     }
 
-    let auto_detect_web_dist = || -> Option<std::path::PathBuf> {
-        let mut candidates = vec![
-            // Relative to CWD (development: running from repo root)
-            std::path::PathBuf::from("web/dist"),
-            // Relative to binary (installed alongside binary)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("web/dist")))
-                .unwrap_or_default(),
-            // Docker / packaged layout
-            std::path::PathBuf::from("/zeroclaw-data/web/dist"),
-            // AUR / system package
-            std::path::PathBuf::from("/usr/share/zeroclawlabs/web/dist"),
-        ];
-        // XDG data home (prebuilt binary installer)
-        if let Some(data_dir) = dirs_data_local() {
-            candidates.push(data_dir.join("zeroclaw/web/dist"));
-        }
-        candidates
-            .into_iter()
-            .find(|p| !p.as_os_str().is_empty() && p.join("index.html").is_file())
-    };
-
-    let web_dist_dir: Option<std::path::PathBuf> = match config
+    let web_dist_dir = resolve_web_dist_dir(&config);
+    if let Some(stale) = config
         .gateway
         .web_dist_dir
         .as_ref()
         .map(std::path::PathBuf::from)
+        && !has_servable_dashboard_index(&stale)
     {
-        Some(explicit) if explicit.join("index.html").is_file() => Some(explicit),
-        Some(stale) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
-                "gateway.web_dist_dir points at a path that doesn't contain index.html on \
-                 this machine; falling back to auto-detect. Update or remove the setting in \
-                 config.toml to silence this warning."
-            );
-            auto_detect_web_dist()
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"configured": stale.display().to_string()})),
+            "gateway.web_dist_dir points at a path without a usable index.html on \
+             this machine; falling back to auto-detect. Update or remove the setting in \
+             config.toml to silence this warning."
+        );
+    }
+
+    // Embedded assets take serving priority when compiled in. Otherwise, use
+    // the single resolved `web_dist_dir` snapshot stored in AppState.
+    let availability: Option<WebDashboardAvailability> = {
+        #[cfg(feature = "embedded-web")]
+        {
+            Some(WebDashboardAvailability::Embedded)
         }
-        None => auto_detect_web_dist(),
+        #[cfg(not(feature = "embedded-web"))]
+        {
+            web_dist_dir
+                .clone()
+                .map(WebDashboardAvailability::Filesystem)
+        }
     };
 
-    if let Some(ref dir) = web_dist_dir {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!("Web dashboard: serving from {}", dir.display().to_string())
-        );
-    } else if config.gateway.web_dist_dir.is_some() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
-             this machine and no fallback location was found. Reinstall with the supported \
-             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
-             build and place the dashboard where the gateway looks for it."
-        );
-    } else {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
-             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
-             build and place the dashboard where the gateway looks for it."
-        );
+    match availability {
+        Some(WebDashboardAvailability::Embedded) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Web dashboard: serving embedded assets"
+            );
+        }
+        Some(WebDashboardAvailability::Filesystem(ref dir)) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"path": dir.display().to_string()})),
+                "Web dashboard: serving filesystem assets"
+            );
+        }
+        None if config.gateway.web_dist_dir.is_some() => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
+                 this machine and no fallback location was found. Reinstall with the supported \
+                 installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+                 build and place the dashboard where the gateway looks for it."
+            );
+        }
+        None => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+                 installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+                 build and place the dashboard where the gateway looks for it."
+            );
+        }
     }
 
     let pfx = path_prefix.unwrap_or("");
@@ -1370,7 +1615,7 @@ pub async fn run_gateway(
     if let Some(ref url) = tunnel_url {
         println!("  🌐 Public URL: {url}");
     }
-    if web_dist_dir.is_some() {
+    if availability.is_some() {
         println!("  🌐 Web Dashboard: http://{display_addr}{pfx}/");
     } else {
         println!(
@@ -1885,6 +2130,11 @@ pub async fn run_gateway(
             get(canvas::handle_canvas_history),
         );
 
+    #[cfg(feature = "plugins-wasm")]
+    let inner = inner.merge(plugin_webhook::routes(plugin_webhooks));
+    #[cfg(not(feature = "plugins-wasm"))]
+    let _ = plugin_webhooks;
+
     #[cfg(feature = "a2a")]
     let inner = inner.merge(a2a::a2a_routes_with_endpoint(Some(
         a2a::AdvertisedGatewayEndpoint::new(host, actual_port),
@@ -1949,6 +2199,29 @@ pub async fn run_gateway(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
+
+    // The dashboard image upload lives on its own sub-router so it can opt out
+    // of the 64 KB gateway-wide RequestBodyLimitLayer, which is sized for JSON
+    // control-plane bodies and would otherwise reject any real image before the
+    // route's own ceiling runs. The route keeps the extractor-level
+    // DefaultBodyLimit at the same ceiling; the per-request size check against
+    // live `multimodal.max_image_size_mb` happens inside the handler.
+    let upload_router: Router = Router::new()
+        .route(
+            "/api/upload",
+            post(api_upload::handle_upload).layer(axum::extract::DefaultBodyLimit::max(
+                api_upload::UPLOAD_BODY_CEILING_BYTES,
+            )),
+        )
+        .with_state(state.clone())
+        .layer(RequestBodyLimitLayer::new(
+            api_upload::UPLOAD_BODY_CEILING_BYTES,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
+        ));
+    let inner = inner.merge(upload_router);
 
     // Manual cron-trigger and A2A task routes live on their own sub-router so
     // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
@@ -4288,10 +4561,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_web_dist_dir_accepts_configured_dist() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let dist_dir = temp.path().join("dist");
+        std::fs::create_dir_all(&dist_dir).expect("create dist dir");
+        std::fs::write(dist_dir.join("index.html"), "").expect("write index.html");
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(dist_dir.display().to_string());
+
+        assert_eq!(resolve_web_dist_dir(&config), Some(dist_dir));
+    }
+
+    #[test]
+    fn resolve_web_dist_dir_rejects_configured_path_without_index() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(temp.path().display().to_string());
+
+        assert_ne!(
+            resolve_web_dist_dir(&config),
+            Some(temp.path().to_path_buf())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_index_rejects_symlink_that_escapes_dashboard_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create dashboard root");
+        let outside = tempfile::tempdir().expect("create outside directory");
+        std::fs::write(outside.path().join("index.html"), "outside dashboard")
+            .expect("write outside index");
+        symlink(
+            outside.path().join("index.html"),
+            root.path().join("index.html"),
+        )
+        .expect("link escaping index");
+
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(root.path().display().to_string());
+
+        assert!(!has_servable_dashboard_index(root.path()));
+        assert_ne!(
+            resolve_web_dist_dir(&config),
+            Some(root.path().to_path_buf()),
+            "the resolver must not report an index the serving layer rejects"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "embedded-web"))]
+    fn web_dashboard_availability_uses_filesystem_dist() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let dist_dir = temp.path().join("dist");
+        std::fs::create_dir_all(&dist_dir).expect("create dist dir");
+        std::fs::write(dist_dir.join("index.html"), "").expect("write index.html");
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some(dist_dir.display().to_string());
+
+        assert_eq!(
+            resolve_web_dashboard_availability(&config),
+            Some(WebDashboardAvailability::Filesystem(dist_dir))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "embedded-web")]
+    fn web_dashboard_availability_reports_embedded_assets() {
+        let config = Config::default();
+
+        assert_eq!(
+            resolve_web_dashboard_availability(&config),
+            Some(WebDashboardAvailability::Embedded)
+        );
+    }
+
     /// Build an AppState wired with a real pairing guard, on-disk config path,
     /// and an optional device registry so the admin paircode handler's
     /// revoke + persist paths can be exercised end to end.
-    fn admin_paircode_state(
+    pub(super) fn admin_paircode_state(
         tmp: &tempfile::TempDir,
         require_pairing: bool,
         with_registry: bool,
@@ -4894,6 +5244,17 @@ path = "{trigger_path}"
         assert!(text.contains("dashboard shell"));
     }
 
+    #[cfg(not(feature = "embedded-web"))]
+    #[tokio::test]
+    async fn spa_fallback_reports_unavailable_without_dashboard_assets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+
+        let response = spa_fallback_response("/", state).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn spa_fallback_does_not_treat_api_like_spa_paths_as_api() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5447,11 +5808,11 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("k3"));
 
-        let keys = store.keys.lock();
-        assert_eq!(keys.len(), 2);
-        assert!(!keys.contains_key("k1"));
-        assert!(keys.contains_key("k2"));
-        assert!(keys.contains_key("k3"));
+        let entries = store.entries.lock();
+        assert_eq!(entries.committed.len(), 2);
+        assert!(!entries.committed.contains_key("k1"));
+        assert!(entries.committed.contains_key("k2"));
+        assert!(entries.committed.contains_key("k3"));
     }
 
     #[test]
@@ -8299,10 +8660,10 @@ path = "{trigger_path}"
         std::thread::sleep(Duration::from_millis(2));
         assert!(store.record_if_new("new-key"));
 
-        let keys = store.keys.lock();
-        assert_eq!(keys.len(), 1);
-        assert!(!keys.contains_key("old-key"));
-        assert!(keys.contains_key("new-key"));
+        let entries = store.entries.lock();
+        assert_eq!(entries.committed.len(), 1);
+        assert!(!entries.committed.contains_key("old-key"));
+        assert!(entries.committed.contains_key("new-key"));
     }
 
     #[test]
@@ -8430,8 +8791,8 @@ path = "{trigger_path}"
             handle.join().unwrap();
         }
 
-        let keys = store.keys.lock();
-        assert!(keys.len() <= 1000, "should respect max_keys");
+        let entries = store.entries.lock();
+        assert!(entries.committed.len() <= 1000, "should respect max_keys");
     }
 
     #[test]

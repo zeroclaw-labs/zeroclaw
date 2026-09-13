@@ -941,6 +941,7 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         }),
         reasoning_content: None,
     }]));
@@ -1547,6 +1548,32 @@ fn xml_dispatcher_generates_tool_instructions() {
     assert!(
         !instructions.contains("echo"),
         "dispatcher should not duplicate tool listing"
+    );
+}
+
+/// This builder used to carry an abridged copy of the tool-call
+/// guidance (no `CRITICAL:` line, no worked example) while `loop_`'s builder
+/// carried the full text, so tool-use behavior depended on which builder
+/// produced the prompt. It must now emit the shared block verbatim.
+#[test]
+fn xml_dispatcher_emits_shared_tool_call_guidance() {
+    use crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let instructions = XmlToolDispatcher.prompt_instructions(&tools);
+
+    assert!(
+        instructions.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
+        "dispatcher prompt drifted from the shared tool-call block:\n{instructions}"
+    );
+    assert!(
+        instructions.contains("CRITICAL: Output actual <tool_call> tags"),
+        "dispatcher prompt lost the emit-real-tags directive"
+    );
+    assert!(
+        instructions
+            .contains("You MUST respond with a real call naming one of your available tools"),
+        "dispatcher prompt lost the worked example"
     );
 }
 

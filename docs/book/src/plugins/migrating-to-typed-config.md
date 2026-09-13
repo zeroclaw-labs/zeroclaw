@@ -78,8 +78,11 @@ type = "array"
 ```
 
 The host enforces these limits on the schema itself: 64 KiB serialized, at most
-32 levels of nesting, no `$id`, and `$ref` targets must be local JSON Pointers.
-Remote references are rejected, so a schema never causes a network fetch.
+32 levels of nesting, no more than 256 root properties, no `$id`, and `$ref`
+targets must be local JSON Pointers. Remote references are rejected, so a
+schema never causes a network fetch. A schema that exceeds any of these limits
+is refused with fail-closed behavior during package install/admission, before
+validator compilation.
 
 Dynamic-key keywords are not part of this dialect: `patternProperties`,
 `propertyNames`, and `unevaluatedProperties` are rejected at the root, because

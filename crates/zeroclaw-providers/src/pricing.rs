@@ -16,6 +16,7 @@ pub struct ModelRates {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
     pub cached_input_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 impl ModelRates {
@@ -25,9 +26,12 @@ impl ModelRates {
         self.input_per_mtok.is_none()
             && self.output_per_mtok.is_none()
             && self.cached_input_per_mtok.is_none()
+            && self.cache_write_per_mtok.is_none()
     }
 
-    /// True when every dimension carries a rate (nothing left to fill).
+    /// True when the billing-critical dimensions carry a rate. Cache writes
+    /// are optional: without a write rate they stay priced at the plain
+    /// input rate, so they never block completeness.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.input_per_mtok.is_some()
@@ -36,8 +40,10 @@ impl ModelRates {
     }
 
     /// Per-dimension precedence merge: `self` wins, `fallback` fills only the
-    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self`
-    /// (a deliberately-free rate) is preserved, never overridden.
+    /// dimensions `self` left unset (`Option::or`). A `Some(0.0)` in `self` is
+    /// an explicitly configured rate and is preserved, never overridden: free
+    /// for input and output, and the "no cache discount" sentinel for cached
+    /// input, which the cost constructor bills at the standard input rate.
     #[must_use]
     pub fn or(self, fallback: ModelRates) -> ModelRates {
         ModelRates {
@@ -46,18 +52,13 @@ impl ModelRates {
             cached_input_per_mtok: self
                 .cached_input_per_mtok
                 .or(fallback.cached_input_per_mtok),
+            cache_write_per_mtok: self.cache_write_per_mtok.or(fallback.cache_write_per_mtok),
         }
     }
 }
 
-/// Upper bound on a sane per-1M-token rate. At `$1`/token this sits orders of
-/// magnitude above any real model price, so a genuine rate never trips it; it
-/// only catches a parsing artifact or a hostile/buggy gateway reporting an
-/// absurd value (which would otherwise bill a fortune).
-const MAX_SANE_PER_MTOK: f64 = 1_000_000.0;
-
 pub(crate) fn sane_mtok(rate: f64) -> Option<f64> {
-    (0.0..=MAX_SANE_PER_MTOK).contains(&rate).then_some(rate)
+    zeroclaw_config::cost::is_sane_usd_rate(rate).then_some(rate)
 }
 
 fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
@@ -67,12 +68,13 @@ fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
 
 /// Normalize a provider's `/models` [`ModelPricing`] (per-token strings) into
 /// per-1M-token [`ModelRates`]. `prompt`→input, `completion`→output,
-/// `input_cache_read`→cached.
+/// `input_cache_read`→cached, `input_cache_write`→cache write.
 pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
     ModelRates {
         input_per_mtok: per_token_str_to_mtok(&pricing.prompt),
         output_per_mtok: per_token_str_to_mtok(&pricing.completion),
         cached_input_per_mtok: per_token_str_to_mtok(&pricing.input_cache_read),
+        cache_write_per_mtok: per_token_str_to_mtok(&pricing.input_cache_write),
     }
 }
 
@@ -410,6 +412,7 @@ fn assemble_snapshot(
                     cached_input_per_mtok: slot
                         .cached_input_per_mtok
                         .or(rates.cached_input_per_mtok),
+                    cache_write_per_mtok: slot.cache_write_per_mtok.or(rates.cache_write_per_mtok),
                 };
             }
         }
@@ -525,6 +528,7 @@ mod tests {
                 input_per_mtok: Some(0.3),
                 output_per_mtok: Some(1.2),
                 cached_input_per_mtok: Some(0.06),
+                cache_write_per_mtok: None,
             },
         );
         // The cost path passes the bare family: direct hit.
@@ -610,14 +614,21 @@ mod tests {
             input_per_mtok: Some(input),
             output_per_mtok: None,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         }
     }
 
-    fn full_rate(input: Option<f64>, output: Option<f64>, cached: Option<f64>) -> ModelRates {
+    fn full_rate(
+        input: Option<f64>,
+        output: Option<f64>,
+        cached: Option<f64>,
+        write: Option<f64>,
+    ) -> ModelRates {
         ModelRates {
             input_per_mtok: input,
             output_per_mtok: output,
             cached_input_per_mtok: cached,
+            cache_write_per_mtok: write,
         }
     }
 
@@ -635,7 +646,10 @@ mod tests {
         gateway.insert("minimax/m2.7".to_string(), rate(0.3));
         gateway.insert("slug".to_string(), rate(0.7)); // matched via suffix
         // Gateway prices input+output for `partial` but leaves cache_read unset.
-        gateway.insert("partial".to_string(), full_rate(Some(2.0), Some(4.0), None));
+        gateway.insert(
+            "partial".to_string(),
+            full_rate(Some(2.0), Some(4.0), None, None),
+        );
         let gateway_results = vec![(wanted.as_slice(), gateway)];
 
         let mut md = HashMap::new();
@@ -646,7 +660,7 @@ mod tests {
         // models.dev has all three for `partial`; only cache_read should be used.
         md.insert(
             "partial".to_string(),
-            full_rate(Some(9.9), Some(9.9), Some(0.5)),
+            full_rate(Some(9.9), Some(9.9), Some(0.5), None),
         );
         let models_dev = HashMap::from([("kilo".to_string(), md)]);
 
@@ -680,12 +694,15 @@ mod tests {
     fn sane_mtok_rejects_nonfinite_negative_and_absurd() {
         assert_eq!(sane_mtok(3.0), Some(3.0));
         assert_eq!(sane_mtok(0.0), Some(0.0));
-        assert_eq!(sane_mtok(MAX_SANE_PER_MTOK), Some(MAX_SANE_PER_MTOK));
+        assert_eq!(
+            sane_mtok(zeroclaw_config::cost::MAX_SANE_USD_RATE),
+            Some(zeroclaw_config::cost::MAX_SANE_USD_RATE)
+        );
         assert!(sane_mtok(-1.0).is_none());
         assert!(sane_mtok(f64::INFINITY).is_none());
         assert!(sane_mtok(f64::NAN).is_none());
         // Above the ceiling ($1/token) -> rejected (parsing artifact / hostile gateway).
-        assert!(sane_mtok(MAX_SANE_PER_MTOK * 2.0).is_none());
+        assert!(sane_mtok(zeroclaw_config::cost::MAX_SANE_USD_RATE * 2.0).is_none());
     }
 
     // Alias-boundary regression test 1: when one alias opts in and another does

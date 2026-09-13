@@ -4,12 +4,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "WASM plugin system for ZeroClaw — host, manifests, signatures, execution bridge."
-publish = false
+repository.workspace = true
+homepage.workspace = true
+publish = true
 
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+plugins-wasmtime = [
+  "dep:wasmtime",
+  "dep:wasmtime-wasi",
+  "dep:wasmtime-wasi-http",
+  # The host-owned pinned send path: the shared egress boundary hands back a
+  # validated address, and this adapter dials it. These are the same crates
+  # (and the same locked versions) `wasmtime-wasi-http`'s own
+  # `default-send-request` pulls in, so enabling them adds no new compilation
+  # units to the workspace build.
+  "dep:hyper",
+  "dep:http-body-util",
+  "dep:rustls",
+  "dep:tokio-rustls",
+  "dep:webpki-roots",
+  # The operator's own trust decision. Provider HTTPS already reads the
+  # platform store; plugin egress reading a different set of roots on the same
+  # machine is the divergence this dependency removes.
+  "dep:rustls-native-certs",
+]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -41,8 +61,15 @@ wasmtime-wasi-http = { version = "47.0.4", default-features = false, features = 
   "p2",
   "default-send-request",
 ], optional = true }
+hyper = { version = "1", default-features = false, features = ["http1", "client"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"], optional = true }
+webpki-roots = { version = "1.0.6", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", default-features = false, features = ["io-util", "net"] }
 zeroclaw-config = { path = "../zeroclaw-config" }

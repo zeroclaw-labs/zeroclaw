@@ -21,6 +21,7 @@ Almost every family also takes the shared fields from `ModelProviderConfig`:
 - `fallback`: ordered list of other dotted provider aliases to try after this alias fails.
 - `wire_api`, `native_tools`, `provider_extra`, `think`, and `chat_template_kwargs`: advanced protocol and request-body overrides.
 - `vision`: override the provider's image-input (vision) capability. Leave unset to use the family's built-in default. Set `false` for a text-only model served by a vision-capable family (for example, a text model behind llama.cpp) so image messages route to a configured `[multimodal] vision_model_provider` instead of erroring; set `true` to force it on.
+- `tool_result_image_policy`: handling for image markers in native `role = "tool"` results sent to compatible chat-completions providers. Defaults to `"image_url"`; set to `"omit"` to remove image URI/base64 payloads and append a fixed notice. This does not change direct user images or OpenAI Responses providers.
 - `tls_ca_cert_path`: absolute path to a PEM-encoded CA certificate for TLS connections to this provider (a per-provider trust override, distinct from the gateway TLS `ca_cert_path`). Shell expansion such as `~` is not performed; leave unset to use the system trust store.
 
 Family-specific entries add their own typed fields on top of these shared fields.
@@ -106,6 +107,36 @@ When `[multimodal] vision_model_provider` names a dotted provider alias, its
 `model` is used automatically. An explicit `[multimodal] vision_model` takes
 precedence over the alias model; if neither is set, the primary turn model is
 used for backward compatibility.
+
+## Native thinking display (Anthropic)
+
+`agent.thinking.display` controls how Anthropic extended thinking is
+delivered when native thinking is enabled (`agent.thinking.native_thinking
+= true`). Accepted values:
+
+- `off` (default): no `display` field is sent; requests are byte-identical
+  to earlier ZeroClaw versions and thinking requests use the non-streaming
+  fallback.
+- `omitted`: Anthropic omits thinking text from the response; blocks arrive
+  signature-only (empty `thinking`, required signature), keeping replay
+  intact while minimizing visible reasoning.
+- `updates`: the request carries the
+  `thinking-display-updates-2026-08-18` beta and uses the streaming
+  response path. Readable thinking progress is surfaced live while the
+  model works; the signed reasoning payload is retained separately for
+  history replay and never shown.
+- `summarized`: same streaming behavior, requesting summarized thinking.
+
+```toml
+[agent.thinking]
+native_thinking = true
+display = "updates"
+```
+
+The setting requires an Anthropic account enrolled in the
+`thinking-display-updates` beta; without enrollment the API rejects the
+request. Set `display = "off"` (or remove the field) to return to the
+previous wire behavior.
 
 ## Per-family knobs: worked examples
 

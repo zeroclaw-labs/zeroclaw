@@ -271,18 +271,12 @@ impl DiscordChannel {
     }
 
     /// Configure voice transcription for audio attachments.
-    pub fn with_transcription(
-        mut self,
-        config: zeroclaw_config::schema::TranscriptionConfig,
-    ) -> Self {
+    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
         if !config.enabled {
             return self;
         }
         match super::transcription::TranscriptionManager::new(&config) {
-            Ok(m) => {
-                self.transcription_manager = Some(std::sync::Arc::new(m));
-                self.transcription = Some(config);
-            }
+            Ok(manager) => return self.with_transcription_manager(config, manager),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -294,6 +288,31 @@ impl DiscordChannel {
             }
         }
         self
+    }
+
+    pub(crate) fn with_transcription_manager(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+        manager: super::transcription::TranscriptionManager,
+    ) -> Self {
+        self.transcription_manager = Some(std::sync::Arc::new(manager));
+        self.transcription = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn process_attachments_for_test(
+        &self,
+        attachments: &[serde_json::Value],
+        client: &reqwest::Client,
+    ) -> (String, Vec<MediaAttachment>) {
+        process_attachments(
+            attachments,
+            client,
+            self.workspace_dir.as_deref(),
+            self.transcription_manager.as_deref(),
+        )
+        .await
     }
 
     /// Configure streaming mode for progressive draft updates or multi-message delivery.
@@ -813,6 +832,7 @@ impl DiscordChannel {
             token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         self.send(&SendMessage::new(text, channel_id)).await
     }
@@ -842,12 +862,10 @@ impl DiscordChannel {
             }
         }
 
-        let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
-        let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
-        let args_label = i18n::get_required_cli_string("channel-approval-args-label");
-        let text = format!(
-            "{heading}\n{tool_label}: {}\n{args_label}: {}",
-            request.tool_name, request.arguments_summary,
+        let text = build_buttoned_approval_text(
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
         );
         let outgoing = DiscordOutgoing::with_components(text, vec![row]);
         let client = self.http_client();
@@ -868,6 +886,27 @@ impl DiscordChannel {
         let mut reg = self.pending_components.lock();
         build_component_rows(nonce, rows, &mut reg)
     }
+}
+
+/// Card text for the buttoned approval message.
+///
+/// Split out from the send so the rendered string can be asserted directly:
+/// the buttoned path builds its own text rather than going through
+/// [`crate::util::build_yesno_approval_prompt`], because the operator taps a
+/// control instead of echoing a token.
+fn build_buttoned_approval_text(
+    tool_name: &str,
+    arguments_summary: &str,
+    position: Option<(u32, u32)>,
+) -> String {
+    let heading = i18n::get_required_cli_string("channel-approval-heading-shout");
+    let tool_label = i18n::get_required_cli_string("channel-approval-tool-label");
+    let args_label = i18n::get_required_cli_string("channel-approval-args-label");
+    // Two pending cards from one turn are otherwise identical until tapped.
+    let position_line = crate::util::approval_position_line(position);
+    format!(
+        "{heading}\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}"
+    )
 }
 
 fn build_component_rows(
@@ -7935,6 +7974,42 @@ mod tests {
                 "each button resolves to its server-bound decision"
             );
         }
+    }
+
+    #[test]
+    fn buttoned_approval_card_shows_the_batch_position() {
+        // The buttoned card is a real approval front door: without this line,
+        // two cards from one turn are indistinguishable before either is
+        // tapped, which is the whole failure being fixed.
+        let text = super::build_buttoned_approval_text("shell", "ls -la", Some((2, 3)));
+        assert!(
+            text.contains("2") && text.contains("3"),
+            "buttoned card should carry the batch position; got {text}"
+        );
+        assert_eq!(
+            text,
+            format!(
+                "{}\n{}{}",
+                i18n::get_required_cli_string("channel-approval-heading-shout"),
+                crate::util::approval_position_line(Some((2, 3))),
+                format_args!(
+                    "{}: shell\n{}: ls -la",
+                    i18n::get_required_cli_string("channel-approval-tool-label"),
+                    i18n::get_required_cli_string("channel-approval-args-label"),
+                ),
+            ),
+            "the position line comes from the shared helper, above the tool line"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_card_omits_the_position_for_a_single_call() {
+        let single = super::build_buttoned_approval_text("shell", "ls -la", Some((1, 1)));
+        let none = super::build_buttoned_approval_text("shell", "ls -la", None);
+        assert_eq!(
+            single, none,
+            "a one-call batch renders exactly as an unpositioned card"
+        );
     }
 
     // ── [COMPONENTS:{json}] agent marker → interactive components (EPIC B) ──

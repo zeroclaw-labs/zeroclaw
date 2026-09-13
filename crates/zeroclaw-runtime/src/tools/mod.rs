@@ -21,6 +21,7 @@ pub mod scoped;
 pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
+pub(crate) mod shell_env;
 pub mod skill_http;
 pub mod skill_manage;
 pub mod skill_tool;
@@ -160,7 +161,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
-use crate::security::{SecurityPolicy, create_sandbox};
+use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
@@ -348,7 +349,8 @@ pub fn default_tools_with_runtime(
     ]
 }
 
-pub fn register_skill_tools(
+#[cfg(test)]
+pub(crate) fn register_skill_tools(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
@@ -359,18 +361,20 @@ pub fn register_skill_tools(
 /// Register skill-defined tools with full context for builtin kinds.
 /// `unfiltered_registry` provides the pre-policy tool list for `kind = "builtin"`
 /// delegation.
-pub fn register_skill_tools_with_context(
+#[cfg(test)]
+pub(crate) fn register_skill_tools_with_context(
     tools_registry: &mut Vec<Box<dyn Tool>>,
     skills: &[crate::skills::Skill],
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
 ) {
-    register_skill_tools_with_context_and_runtime(
+    register_skill_tools_with_context_and_runtime_optional_nat64(
         tools_registry,
         skills,
         security,
         unfiltered_registry,
         Arc::new(NativeRuntime::new()),
+        Some(&[]),
     );
 }
 
@@ -380,6 +384,27 @@ pub fn register_skill_tools_with_context_and_runtime(
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
     runtime: Arc<dyn RuntimeAdapter>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) {
+    register_skill_tools_with_context_and_runtime_optional_nat64(
+        tools_registry,
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+        Some(nat64_prefixes),
+    );
+}
+
+/// Internal scoped assembly seam. `None` omits only HTTP tools after an invalid
+/// NAT64 configuration; other skill kinds continue through their normal path.
+pub(crate) fn register_skill_tools_with_context_and_runtime_optional_nat64(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+    unfiltered_registry: &[Arc<dyn Tool>],
+    runtime: Arc<dyn RuntimeAdapter>,
+    nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) {
     if skills.is_empty() {
         return;
@@ -387,11 +412,12 @@ pub fn register_skill_tools_with_context_and_runtime(
 
     let before = tools_registry.len();
     let policy = Arc::clone(&security);
-    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
+    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime_optional_nat64(
         skills,
         security,
         unfiltered_registry,
         runtime,
+        nat64_prefixes,
     );
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
@@ -617,6 +643,115 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+struct RuntimeShellAssembly {
+    shell_tool: ShellTool,
+    sandbox: Arc<dyn Sandbox>,
+}
+
+/// Pair the canonical runtime kind with one shared sandbox instance for every
+/// runtime-backed executor assembled by the production tool registry.
+fn runtime_shell_assembly(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> RuntimeShellAssembly {
+    let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+        read_write: security.allowed_roots.clone(),
+        read_only: security.allowed_roots_read_only.clone(),
+        write_only: security.allowed_roots_write_only.clone(),
+    };
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        root_config.runtime.kind,
+        Some(&security.workspace_dir),
+        &sandbox_extra_roots,
+    );
+    let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
+    RuntimeShellAssembly {
+        shell_tool,
+        sandbox,
+    }
+}
+
+/// Assemble a shell tool through the same runtime/sandbox ownership seam used
+/// by the production registry.
+#[must_use]
+pub fn shell_tool_for_runtime(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> ShellTool {
+    runtime_shell_assembly(security, runtime, risk_profile, root_config).shell_tool
+}
+
+/// One plugin instance's egress policy, read from canonical config at use time.
+///
+/// `instance_key` is the instance's
+/// [`PluginInstanceScope::config_entry_key`][key] — the very same
+/// `plugins.entries[].name` that [`plugin_config_values`] resolves against, so
+/// a single row carries both an instance's config and its granted reach.
+///
+/// The operator's `plugins.entries[].egress_hosts` is the only source of reach.
+/// The deployment's NAT64 prefixes and connection ceiling are read from the same
+/// config so a plugin and a built-in tool cannot classify one answer set
+/// differently.
+///
+/// [key]: zeroclaw_plugins::instance::PluginInstanceScope::config_entry_key
+#[cfg(feature = "plugins-wasm")]
+fn plugin_egress_policy(
+    config: &Config,
+    instance_key: &str,
+) -> Result<zeroclaw_plugins::egress::EgressPolicy, zeroclaw_plugins::egress::EgressError> {
+    let (hosts, allow_private) = config.plugins.entry_egress(instance_key);
+    zeroclaw_plugins::egress::EgressPolicy::new(
+        &hosts,
+        &allow_private,
+        &config.security.nat64_prefixes,
+        config.plugins.limits.max_connections_per_instance,
+    )
+}
+
+/// The one host-owned egress authority shared by every plugin instance in a
+/// registry.
+///
+/// It resolves a *view* of canonical config at the moment each request is made
+/// rather than snapshotting one here, so an operator edit takes effect without
+/// re-instantiating the guest. The live handle is preferred; one-shot callers
+/// that have none fall back to the documented `root_config` snapshot.
+///
+/// A fresh service is built per registry, and that is deliberately fine: the
+/// per-instance connection budget does *not* live in the service. It lives in
+/// `zeroclaw_plugins::egress`'s process-wide registry, keyed by canonical
+/// instance identity, so the agent loop, the gateway, the channels
+/// orchestrator, and the delegate tool spend one ceiling between them rather
+/// than one each.
+///
+/// Egress and config resolve the **same** `[[plugins.entries]]` row: both key on
+/// the instance's `config_entry_key()` (the opaque `zpi1_` instance key), never
+/// on the package name or the raw binding. Keying egress by the binding would
+/// miss the row `zeroclaw plugin install` seeds and deny every destination the
+/// operator granted.
+#[cfg(feature = "plugins-wasm")]
+fn plugin_egress_service(
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> zeroclaw_plugins::egress::EgressHostService {
+    zeroclaw_plugins::egress::EgressHostService::new(
+        zeroclaw_plugins::egress::EgressPolicyResolver::new(move |scope| {
+            let instance_key = scope.id().config_entry_key().map_err(|error| {
+                zeroclaw_plugins::egress::EgressError::PolicyUnavailable(error.to_string())
+            })?;
+            match live_config.as_ref() {
+                Some(handle) => plugin_egress_policy(&handle.read(), &instance_key),
+                None => plugin_egress_policy(&config, &instance_key),
+            }
+        }),
+    )
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_config_values(
     config: &Config,
@@ -705,19 +840,10 @@ pub fn all_tools_with_runtime(
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
-    let runtime_kind = root_config.runtime.kind.as_wire();
-    let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
-        read_write: security.allowed_roots.clone(),
-        read_only: security.allowed_roots_read_only.clone(),
-        write_only: security.allowed_roots_write_only.clone(),
-    };
-    let sandbox = create_sandbox(
-        &sandbox_cfg,
-        runtime_kind,
-        Some(&security.workspace_dir),
-        &sandbox_extra_roots,
-    );
+    let RuntimeShellAssembly {
+        shell_tool,
+        sandbox,
+    } = runtime_shell_assembly(security.clone(), runtime.clone(), risk_profile, root_config);
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -727,9 +853,13 @@ pub fn all_tools_with_runtime(
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
     // snapshot below.
+    // The `root_config`-derived tools below share ONE snapshot `Arc` instead
+    // of each taking a full `Config` clone: registry construction (per agent
+    // build and per channel-message turn) previously paid three deep copies.
+    let root_config_shared = Arc::new(root_config.clone());
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
+            shell_tool
                 .with_timeout_secs(if security.shell_timeout_secs > 0 {
                     security.shell_timeout_secs
                 } else {
@@ -804,16 +934,20 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
-            root_config.clone(),
+            Arc::clone(&root_config_shared),
             agent_alias,
             runtime.clone(),
         )),
         Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
-                .with_subagent_caller(is_subagent_caller),
+            SpawnSubagentTool::new(
+                Arc::clone(&root_config_shared),
+                agent_alias,
+                security.clone(),
+            )
+            .with_subagent_caller(is_subagent_caller),
         ),
         Arc::new(SendMessageToPeerTool::new(
-            Arc::new(root_config.clone()),
+            Arc::clone(&root_config_shared),
             agent_alias,
         )),
         Arc::new(ModelRoutingConfigTool::new(
@@ -897,10 +1031,11 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider
+    // LLM task tool — registered using the calling agent's provider.
+    // Preserves family + alias identity so alias-specific typed config
+    // (e.g. requires_openai_auth) survives into llm_task execution.
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {
-        let llm_task_provider = family.to_string();
         let llm_task_model = entry
             .model
             .clone()
@@ -909,7 +1044,9 @@ pub fn all_tools_with_runtime(
             zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            llm_task_provider,
+            config.clone(),
+            family.to_string(),
+            alias.to_string(),
             llm_task_model,
             entry.temperature,
             entry.api_key.clone(),
@@ -1719,11 +1856,14 @@ pub fn all_tools_with_runtime(
                             config.plugins.limits.call_timeout_ms,
                         ),
                     };
+                    let egress_service =
+                        plugin_egress_service(Arc::clone(&config), live_config.clone());
                     register_plugin_tools(
                         &config,
                         &host,
                         &host_services,
                         plugin_limits,
+                        Some(egress_service),
                         &mut registered_names,
                         &mut tool_arcs,
                     );
@@ -1808,6 +1948,7 @@ fn register_plugin_tools(
     host: &zeroclaw_plugins::host::PluginHost,
     services: &zeroclaw_plugins::services::PluginHostServices,
     plugin_limits: zeroclaw_plugins::component::PluginLimits,
+    egress: Option<zeroclaw_plugins::egress::EgressHostService>,
     registered_names: &mut std::collections::HashSet<String>,
     tool_arcs: &mut Vec<Arc<dyn Tool>>,
 ) {
@@ -1864,6 +2005,7 @@ fn register_plugin_tools(
             scope,
             services.clone(),
             plugin_limits,
+            egress.clone(),
         );
         match tool {
             Ok(tool) => {
@@ -2046,6 +2188,97 @@ const = true
         );
     }
 
+    /// End-to-end over the resolver the registry actually installs: an operator
+    /// grant authored on the instance-key row that `zeroclaw plugin install`
+    /// seeds must reach the policy, and nothing else may stand in for it.
+    ///
+    /// The existing egress tests build an `EgressPolicy` directly, so they
+    /// cannot see which `[[plugins.entries]]` row the runtime reads. This one
+    /// starts from canonical config and goes through `plugin_egress_service`.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_egress_resolves_the_instance_key_row_config_resolves() {
+        let plugins_dir = TempDir::new().unwrap();
+        let plugin_dir = plugins_dir.path().join("egress-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"name = "egress-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["http_client"]
+"#,
+        )
+        .unwrap();
+        let host =
+            zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins_dir.path()).unwrap();
+        let manifest = host.manifest("egress-plugin").unwrap();
+        // The production tool path: binding == package name, which is exactly
+        // what used to be handed to `entry_egress`.
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            manifest.permissions.iter().copied(),
+        )
+        .unwrap();
+        let instance_key = scope.id().config_entry_key().unwrap();
+        assert_ne!(
+            instance_key,
+            scope.id().binding(),
+            "the canonical entry key must not coincide with the binding, or this test proves nothing"
+        );
+
+        let entry = |name: &str| zeroclaw_config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+        };
+        let request = || {
+            zeroclaw_plugins::egress::EgressRequest::new(
+                scope.clone(),
+                zeroclaw_plugins::egress::EgressTransport::Http { encrypted: true },
+                "api.example.com",
+                443,
+            )
+            .unwrap()
+        };
+        let addresses = ["1.1.1.1:443".parse::<std::net::SocketAddr>().unwrap()];
+
+        // Granted on the instance-key row: the operator's grant reaches policy.
+        let mut granted = Config::default();
+        granted.plugins.entries = vec![entry(&instance_key)];
+        let service = plugin_egress_service(Arc::new(granted), None);
+        service
+            .authorize_addresses(request(), addresses)
+            .expect("a grant on the instance-key row must reach the resolved policy");
+
+        // No row at all: deny.
+        let service = plugin_egress_service(Arc::new(Config::default()), None);
+        assert!(
+            matches!(
+                service.authorize_addresses(request(), addresses),
+                Err(zeroclaw_plugins::egress::EgressError::DestinationNotGranted { .. })
+            ),
+            "an unconfigured instance must have no reach"
+        );
+
+        // A legacy package/binding-named row must not stand in for the
+        // canonical key, or egress and config would read two different rows.
+        let mut legacy = Config::default();
+        legacy.plugins.entries = vec![entry(scope.id().binding())];
+        let service = plugin_egress_service(Arc::new(legacy), None);
+        assert!(
+            matches!(
+                service.authorize_addresses(request(), addresses),
+                Err(zeroclaw_plugins::egress::EgressError::DestinationNotGranted { .. })
+            ),
+            "a raw package or binding entry must not bypass the canonical key"
+        );
+    }
+
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
@@ -2192,6 +2425,7 @@ const = true
             host,
             &services,
             test_plugin_limits(),
+            None,
             &mut registered_names,
             &mut tool_arcs,
         );
@@ -4158,6 +4392,119 @@ const = true
         assert!(
             names.contains(&"shell"),
             "positive control: the registry must still be populated"
+        );
+    }
+
+    // ── Regression: alias-specific provider config ───────────────────
+
+    /// Regression test: llm_task must preserve alias-specific
+    /// provider configuration so that families with typed alias fields
+    /// (e.g. OpenAI with `requires_openai_auth`) are constructed via the
+    /// alias-aware factory, not the legacy name-only factory.
+    ///
+    /// This test goes through the real `all_tools_with_runtime` registration
+    /// path — the same code that runs in production — then calls `execute()`
+    /// on the resulting `llm_task` tool and checks the error message.
+    ///
+    /// - On old master: `LlmTaskTool` stores only the family name ("openai"),
+    ///   `execute()` uses `create_model_provider_with_options("openai", …)`
+    ///   which passes `config=None, alias="default"` → falls back to
+    ///   `openai_missing_entry_fallback_config()` (requires_openai_auth=false)
+    ///   → creates standard `OpenAiModelProvider` → fails with a generic
+    ///   HTTP/auth error that does NOT mention "openai-codex".
+    ///
+    /// - On fixed branch: `LlmTaskTool` stores config + family + alias,
+    ///   `execute()` uses `create_model_provider_for_alias(&config, "openai",
+    ///   "codex", …)` → finds the typed alias with requires_openai_auth=true
+    ///   → creates `OpenAiCodexModelProvider` → fails at OAuth credential
+    ///   resolution with an error mentioning "openai-codex".
+    #[tokio::test]
+    async fn llm_task_uses_alias_aware_provider_for_alias_config() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, BrowserConfig, Config, HttpRequestConfig, MemoryConfig,
+            ModelProviderConfig, OpenAIModelProviderConfig, RiskProfileConfig, WebFetchConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+
+        // Config: agent "test-agent" with model_provider = "openai.codex",
+        // where codex has requires_openai_auth = true.
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.codex".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    requires_openai_auth: true,
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            &RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &HttpRequestConfig::default(),
+            &WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let llm_task = tools
+            .iter()
+            .find(|t| t.name() == "llm_task")
+            .expect("llm_task must be registered for agent with model_provider");
+
+        let result = llm_task
+            .execute(serde_json::json!({"prompt": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "execute must fail without credentials");
+        let error = result.error.expect("error must be present");
+
+        // The alias-aware factory routes openai.codex (requires_openai_auth=true)
+        // to OpenAiCodexModelProvider, whose credential resolution fails with
+        // an error mentioning "openai-codex".  The legacy factory would create
+        // a standard OpenAI provider whose error does NOT mention "openai-codex".
+        assert!(
+            error.contains("openai-codex"),
+            "llm_task should construct the Codex provider for \
+             openai.codex (requires_openai_auth=true), producing an \
+             openai-codex credential error; got: {error}"
         );
     }
 }

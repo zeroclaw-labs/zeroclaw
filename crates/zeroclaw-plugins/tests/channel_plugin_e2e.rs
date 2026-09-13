@@ -9,11 +9,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::webhook::{
+    MAX_WEBHOOK_RESPONSE_BODY_BYTES, RawWebhook, WebhookIdempotency, WebhookOutcome, WebhookReject,
+};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::endpoint::PluginChannelEndpoint;
@@ -104,6 +108,7 @@ fn manifest() -> PluginManifest {
         })),
         signature: None,
         publisher_key: None,
+        egress: Default::default(),
     }
 }
 
@@ -217,9 +222,35 @@ fn outbound(content: &str, recipient: &str) -> SendMessage {
     }
 }
 
+fn fixture_webhook(
+    body: impl Into<Vec<u8>>,
+    secret: &str,
+    cancellation: zeroclaw_api::webhook::WebhookCancellation,
+    idempotency: Option<WebhookIdempotency>,
+) -> (
+    RawWebhook,
+    tokio::sync::oneshot::Receiver<Result<WebhookOutcome, WebhookReject>>,
+) {
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    (
+        RawWebhook {
+            method: "POST".to_string(),
+            query: String::new(),
+            headers: vec![("x-fixture-secret".to_string(), secret.to_string())],
+            body: body.into(),
+            cancellation,
+            idempotency,
+            reply,
+        },
+        outcome,
+    )
+}
+
 #[tokio::test]
 async fn channel_component_runs_through_host_ingress() {
-    let channel = channel("main").await;
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(|_| true));
 
     assert_eq!(channel.name(), "plugin");
     assert_eq!(channel.alias(), "main");
@@ -264,6 +295,319 @@ async fn channel_component_runs_through_host_ingress() {
         .await
         .expect_err("aborting listen must cancel its polling loop");
     assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn poll_ingress_applies_the_host_sender_policy_before_delivery() {
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(|sender| sender == "allowed"));
+    let inbound = channel.inbound();
+    let message = |id: &str, sender: &str| HostInboundMessage {
+        id: id.to_string(),
+        sender: sender.to_string(),
+        reply_target: "room".to_string(),
+        content: id.to_string(),
+        channel: "guest-channel".to_string(),
+        timestamp: 7,
+        ..Default::default()
+    };
+    inbound.enqueue(message("blocked-1", "blocked"));
+    inbound.enqueue(message("allowed-1", "allowed"));
+
+    let (tx, mut receiver) = tokio::sync::mpsc::channel(2);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+    let delivered = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("authorized poll message arrives")
+        .expect("listener remains connected");
+    assert_eq!(delivered.id, "allowed-1");
+    assert!(receiver.try_recv().is_err());
+
+    listener.abort();
+}
+
+#[tokio::test]
+async fn channel_webhook_component_authenticates_parses_and_host_stamps() {
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(|_| true));
+    assert!(channel.has_webhook_ingress());
+    assert_eq!(
+        channel.webhook_path().await.expect("query webhook path"),
+        Some("fixture".to_string())
+    );
+    let (sink, receiver) = tokio::sync::mpsc::channel(4);
+    channel.set_webhook_receiver(receiver);
+    let (tx, mut inbound) = tokio::sync::mpsc::channel(2);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+    let (unauthorized, unauthorized_outcome) = fixture_webhook(
+        br#"{"id":"bad","sender":"tester","reply_target":"room","content":"ignored"}"#,
+        "wrong-token",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        None,
+    );
+    sink.send(unauthorized)
+        .await
+        .expect("webhook queue is open");
+    assert!(matches!(
+        unauthorized_outcome.await.expect("worker replies"),
+        Err(WebhookReject::Unauthorized(detail)) if detail.contains("private signature")
+    ));
+    assert!(inbound.try_recv().is_err());
+
+    let (malformed, malformed_outcome) = fixture_webhook(
+        b"not-json".to_vec(),
+        "token-main",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        None,
+    );
+    sink.send(malformed).await.expect("webhook queue is open");
+    assert!(matches!(
+        malformed_outcome.await.expect("worker replies"),
+        Err(WebhookReject::BadRequest(detail)) if detail.contains("private parser detail")
+    ));
+    assert!(inbound.try_recv().is_err());
+
+    let (valid, valid_outcome) = fixture_webhook(
+        br#"{"id":"event-1","sender":"tester","reply_target":"room","content":"hello"}"#,
+        "token-main",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        None,
+    );
+    sink.send(valid).await.expect("webhook queue is open");
+    assert!(valid_outcome.await.expect("worker replies").is_ok());
+    let message = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("decoded message arrives")
+        .expect("listener remains connected");
+    assert_eq!(message.id, "event-1");
+    assert_eq!(message.sender, "tester");
+    assert_eq!(message.channel, "plugin");
+    assert_eq!(message.channel_alias.as_deref(), Some("main"));
+
+    listener.abort();
+}
+
+#[tokio::test]
+async fn cancelled_webhook_drops_disposable_parser_and_later_request_recovers() {
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(|_| true));
+    let (sink, receiver) = tokio::sync::mpsc::channel(4);
+    channel.set_webhook_receiver(receiver);
+    let (tx, mut inbound) = tokio::sync::mpsc::channel(2);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+    let cancellation = zeroclaw_api::webhook::WebhookCancellation::new();
+    let (spinning, spinning_outcome) =
+        fixture_webhook(b"spin".to_vec(), "token-main", cancellation.clone(), None);
+    sink.send(spinning).await.expect("webhook queue is open");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), spinning_outcome)
+            .await
+            .expect("cancelled parser returns")
+            .expect("worker replies"),
+        Err(WebhookReject::Timeout)
+    ));
+
+    let (valid, valid_outcome) = fixture_webhook(
+        br#"{"id":"event-2","sender":"tester","reply_target":"room","content":"recovered"}"#,
+        "token-main",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        None,
+    );
+    sink.send(valid).await.expect("webhook queue is open");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), valid_outcome)
+            .await
+            .expect("replacement parser completes")
+            .expect("worker replies")
+            .is_ok()
+    );
+    let message = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("replacement delivery arrives")
+        .expect("listener remains connected");
+    assert_eq!(message.id, "event-2");
+    assert_eq!(message.content, "recovered");
+
+    listener.abort();
+}
+
+#[tokio::test]
+async fn host_config_failure_is_unavailable_and_a_later_webhook_recovers() {
+    let config = canonical_config("main", "v1", "token-main");
+    let services = host_services(Arc::clone(&config));
+    let channel = build_channel("main", &services)
+        .await
+        .with_sender_authorizer(Arc::new(|_| true));
+    let (sink, receiver) = tokio::sync::mpsc::channel(2);
+    channel.set_webhook_receiver(receiver);
+    let (tx, mut inbound) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+    config
+        .write()
+        .expect("lock canonical fixture config")
+        .remove("main");
+    let (unavailable, unavailable_outcome) = fixture_webhook(
+        br#"{"id":"unavailable-1","sender":"tester","reply_target":"room","content":"ignored"}"#,
+        "token-main",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        None,
+    );
+    sink.send(unavailable).await.expect("webhook queue is open");
+    assert!(matches!(
+        unavailable_outcome.await.expect("worker replies"),
+        Err(WebhookReject::Unavailable(_))
+    ));
+    assert!(inbound.try_recv().is_err());
+
+    config
+        .write()
+        .expect("lock canonical fixture config")
+        .insert("main".to_string(), instance_config("v1", "token-main"));
+    let (valid, valid_outcome) = fixture_webhook(
+        br#"{"id":"recovered-1","sender":"tester","reply_target":"room","content":"recovered"}"#,
+        "token-main",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        None,
+    );
+    sink.send(valid).await.expect("webhook queue is open");
+    assert!(valid_outcome.await.expect("worker replies").is_ok());
+    let delivered = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        .await
+        .expect("recovered webhook arrives")
+        .expect("listener remains connected");
+    assert_eq!(delivered.id, "recovered-1");
+
+    listener.abort();
+}
+
+#[tokio::test]
+async fn webhook_sender_policy_runs_before_idempotency_reservation() {
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(|sender| sender == "allowed"));
+    let (sink, receiver) = tokio::sync::mpsc::channel(2);
+    channel.set_webhook_receiver(receiver);
+    let (tx, mut inbound) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+    let begin_calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&begin_calls);
+    let idempotency = WebhookIdempotency::new(
+        move |_| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            zeroclaw_api::webhook::WebhookReservation::Unavailable
+        },
+        |_| false,
+        |_| false,
+    );
+    let (blocked, outcome) = fixture_webhook(
+        br#"{"id":"blocked-1","sender":"blocked","reply_target":"room","content":"ignored"}"#,
+        "token-main",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        Some(idempotency),
+    );
+    sink.send(blocked).await.expect("webhook queue is open");
+    assert!(outcome.await.expect("worker replies").is_ok());
+    assert_eq!(begin_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), inbound.recv())
+            .await
+            .is_err(),
+        "unauthorized sender must not reach the channel queue"
+    );
+
+    listener.abort();
+}
+
+#[tokio::test]
+async fn typed_webhook_replies_bypass_message_policy_and_bound_utf8_output() {
+    let policy_calls = Arc::new(AtomicUsize::new(0));
+    let observed_policy = Arc::clone(&policy_calls);
+    let channel = channel("main")
+        .await
+        .with_sender_authorizer(Arc::new(move |_| {
+            observed_policy.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+    let (sink, receiver) = tokio::sync::mpsc::channel(2);
+    channel.set_webhook_receiver(receiver);
+    let (tx, mut inbound) = tokio::sync::mpsc::channel(1);
+    let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+    let idempotency = WebhookIdempotency::new(
+        |_| panic!("challenge must not reserve a message ID"),
+        |_| panic!("challenge must not commit a message ID"),
+        |_| panic!("challenge must not roll back a message ID"),
+    );
+
+    for (method, text) in [
+        ("GET", "challenge=a%2Bb&part=one&part=two".to_string()),
+        ("POST", "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2)),
+        ("POST", "λ".repeat(MAX_WEBHOOK_RESPONSE_BODY_BYTES / 2 + 1)),
+    ] {
+        let body =
+            serde_json::to_vec(&serde_json::json!({"challenge": text})).expect("encode challenge");
+        let (mut request, outcome) = fixture_webhook(
+            body,
+            "token-main",
+            zeroclaw_api::webhook::WebhookCancellation::new(),
+            Some(idempotency.clone()),
+        );
+        request.method = method.to_string();
+        request.query = text.clone();
+        request.headers.extend([
+            ("x-webhook-method".to_string(), "DELETE".to_string()),
+            ("x-webhook-query".to_string(), "spoofed".to_string()),
+        ]);
+        sink.send(request).await.expect("webhook receiver active");
+        let result = outcome.await.expect("guest replies");
+        if text.len() <= MAX_WEBHOOK_RESPONSE_BODY_BYTES {
+            assert!(matches!(result, Ok(WebhookOutcome::Body(body)) if body == text));
+        } else {
+            assert!(matches!(result, Err(WebhookReject::InvalidResponse)));
+        }
+        assert!(inbound.try_recv().is_err());
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    let (mut request, outcome) = fixture_webhook(
+        b"",
+        "wrong-token",
+        zeroclaw_api::webhook::WebhookCancellation::new(),
+        Some(idempotency),
+    );
+    request.method = "GET".to_string();
+    request.query = "challenge=unauthenticated".to_string();
+    sink.send(request).await.expect("webhook receiver active");
+    assert!(matches!(
+        outcome.await.expect("guest rejects"),
+        Err(WebhookReject::Unauthorized(_))
+    ));
+    assert!(inbound.try_recv().is_err());
+
+    let (request, outcome) = fixture_webhook(
+        br#"{"id":"sentinel-1","sender":"tester","reply_target":"room","content":"ordinary message","channel":"__webhook_reply__"}"#,
+        "token-main", zeroclaw_api::webhook::WebhookCancellation::new(), None,
+    );
+    sink.send(request).await.expect("webhook receiver active");
+    assert!(matches!(
+        outcome.await.expect("message acknowledged"),
+        Ok(WebhookOutcome::Ack)
+    ));
+    let delivered = inbound
+        .recv()
+        .await
+        .expect("sentinel name cannot divert a message to HTTP");
+    assert_eq!(delivered.id, "sentinel-1");
+    assert_eq!(delivered.channel, "plugin");
+    assert_eq!(policy_calls.load(Ordering::SeqCst), 1);
+    listener.abort();
 }
 
 #[tokio::test]
@@ -493,7 +837,8 @@ async fn interrupted_poll_preserves_backlog_but_not_the_dequeued_message() {
         &HashMap::new(),
         limits_with(u64::MAX, Duration::from_millis(250)),
     )
-    .await;
+    .await
+    .with_sender_authorizer(Arc::new(|_| true));
 
     let inbound = channel.inbound();
     let queue_message = |id: &str, content: &str| HostInboundMessage {
