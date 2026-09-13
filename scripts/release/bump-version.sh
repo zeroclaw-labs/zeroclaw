@@ -6,15 +6,30 @@ set -euo pipefail
 # Usage:
 #   scripts/release/bump-version.sh           # reads version from Cargo.toml
 #   scripts/release/bump-version.sh 0.7.0     # explicit version
+#   scripts/release/bump-version.sh --release 0.7.0 # require every generator
 #
-# This script is called automatically by the version-sync workflow
-# whenever Cargo.toml changes on master. It can also be run locally.
+# Run locally when preparing a version-bump PR. Release mode checks prerequisites
+# before editing and stops on generation failures; it does not roll back edits.
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-if [[ $# -ge 1 ]]; then
-  VERSION="$1"
-else
+RELEASE_MODE=0
+VERSION=""
+for arg in "$@"; do
+  case "$arg" in
+    --release) RELEASE_MODE=1 ;;
+    -h|--help) sed -n '3,12p' "$0"; exit 0 ;;
+    -*) echo "error: unknown option: $arg" >&2; exit 2 ;;
+    *)
+      if [[ -n "$VERSION" ]]; then
+        echo "error: supply at most one version" >&2
+        exit 2
+      fi
+      VERSION="$arg"
+      ;;
+  esac
+done
+if [[ -z "$VERSION" ]]; then
   VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)"
 fi
 
@@ -37,6 +52,28 @@ if [[ ! "$MSRV" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
+generation_failure() {
+  if [[ "$RELEASE_MODE" -eq 1 ]]; then
+    echo "error: $*; release preparation is incomplete. Review local edits before retrying." >&2
+    exit 1
+  fi
+  echo "  warn: $*"
+}
+
+if [[ "$RELEASE_MODE" -eq 1 ]]; then
+  for tool in cargo jq nix-prefetch-git perl sha256sum; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "error: release preparation requires $tool; no files changed" >&2
+      exit 1
+    fi
+  done
+  if [[ ! -f "$REPO_ROOT/Cargo.lock" ]] || [[ ! -x "$REPO_ROOT/scripts/dev/refresh-nix-hashes.sh" ]]; then
+    echo "error: release preparation requires Cargo.lock and executable scripts/dev/refresh-nix-hashes.sh; no files changed" >&2
+    exit 1
+  fi
+fi
+
+cd "$REPO_ROOT"
 echo "Syncing all version references to $VERSION ..."
 
 changed=0
@@ -68,8 +105,11 @@ echo "Tauri config..."
 TAURI_CONF="$REPO_ROOT/apps/tauri/tauri.conf.json"
 if [[ -f "$TAURI_CONF" ]]; then
   if command -v jq >/dev/null 2>&1; then
-    jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$TAURI_CONF.tmp" \
-      && mv "$TAURI_CONF.tmp" "$TAURI_CONF"
+    if ! jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$TAURI_CONF.tmp"; then
+      generation_failure "Tauri version update failed"
+    else
+      mv "$TAURI_CONF.tmp" "$TAURI_CONF"
+    fi
   else
     sed -i '' -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF" 2>/dev/null \
       || sed -i -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF"
@@ -128,7 +168,7 @@ if [[ -f "$ROOT_LOCK" ]] && command -v cargo >/dev/null 2>&1; then
   before="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
   ( cd "$REPO_ROOT" && cargo update --workspace --offline >/dev/null 2>&1 ) \
     || ( cd "$REPO_ROOT" && cargo update --workspace >/dev/null 2>&1 ) \
-    || echo "  warn: cargo update --workspace failed; review Cargo.lock manually"
+    || generation_failure "cargo update --workspace failed; review Cargo.lock manually"
   after="$(sha256sum "$ROOT_LOCK" | awk '{print $1}')"
   if [[ "$before" != "$after" ]]; then
     echo "  updated: Cargo.lock"
@@ -220,15 +260,17 @@ fi
 
 # ── Nix git-dep hashes ──────────────────────────────────────────
 # Refresh NAR hashes for git-sourced dependencies so the flake can
-# resolve them.  Skips gracefully if the script or its prerequisites
-# (nix-prefetch-git, jq) are missing.
+# resolve them. Release mode requires this generator and its prerequisites;
+# ordinary local use retains best-effort behavior.
 echo "Nix git-dep hashes..."
 REFRESH_SCRIPT="$REPO_ROOT/scripts/dev/refresh-nix-hashes.sh"
 if [[ -x "$REFRESH_SCRIPT" ]]; then
   if command -v nix-prefetch-git >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-    ( cd "$REPO_ROOT" && bash "$REFRESH_SCRIPT" ) \
-      && echo "  refreshed nix/hashes.json" \
-      || echo "  warn: refresh-nix-hashes.sh failed; nix/hashes.json may be stale"
+    if ( cd "$REPO_ROOT" && bash "$REFRESH_SCRIPT" ); then
+      echo "  refreshed nix/hashes.json"
+    else
+      generation_failure "refresh-nix-hashes.sh failed; nix/hashes.json may be stale"
+    fi
   else
     echo "  skip: nix-prefetch-git or jq not on PATH"
   fi
@@ -245,9 +287,12 @@ fi
 # Drift gate fails if this is skipped.
 echo "Generated install surfaces (cargo generate installers)..."
 if command -v cargo >/dev/null 2>&1; then
-  ( cd "$REPO_ROOT" && cargo generate installers ) \
-    && { echo "  regenerated install surfaces"; changed=$((changed + 1)); } \
-    || echo "  warn: cargo generate installers failed; run it manually and commit the result"
+  if ( cd "$REPO_ROOT" && cargo generate installers ); then
+    echo "  regenerated install surfaces"
+    changed=$((changed + 1))
+  else
+    generation_failure "cargo generate installers failed; run it manually and commit the result"
+  fi
 else
   echo "  skip: cargo not on PATH; run 'cargo generate installers' before committing"
 fi
