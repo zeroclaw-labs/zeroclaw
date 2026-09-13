@@ -87,6 +87,7 @@ use axum::{
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -738,13 +739,12 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
-    /// Per-session cancellation tokens for aborting in-flight agent responses.
-    /// Key is session_key (e.g. `gw_<session_id>`), value is the token for the
-    /// current turn. Entries are inserted before each turn and removed after
-    /// completion (normal or cancelled).
-    pub cancel_tokens: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
-    >,
+    /// Per-session cancellation registry for in-flight agent responses.
+    ///
+    /// A DELETE may arrive in the short interval after queue admission but
+    /// before a WebSocket turn has registered its token. The registry latches
+    /// that generation-bound request so registration consumes it atomically.
+    pub cancel_tokens: Arc<std::sync::Mutex<GatewayCancellationRegistry>>,
     pub pending_reload: Arc<std::sync::atomic::AtomicBool>,
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
@@ -754,6 +754,32 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+}
+
+/// Gateway turn-cancellation state guarded by one synchronous mutex.
+///
+/// The map remains the canonical active-turn lookup used by abort and status
+/// handlers. Pending deletion signals exist only while a DELETE waits for the
+/// same queue incarnation to finalize; they close the admission-registration
+/// race without letting a stale delete affect a successor generation.
+#[derive(Default)]
+pub struct GatewayCancellationRegistry {
+    tokens: HashMap<String, (u64, tokio_util::sync::CancellationToken)>,
+    pub(crate) pending_deletions: HashMap<String, u64>,
+}
+
+impl Deref for GatewayCancellationRegistry {
+    type Target = HashMap<String, (u64, tokio_util::sync::CancellationToken)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tokens
+    }
+}
+
+impl DerefMut for GatewayCancellationRegistry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tokens
+    }
 }
 
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
@@ -1813,7 +1839,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
-        cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
         sop_engine,
@@ -1843,6 +1869,42 @@ pub async fn run_gateway_with_plugin_webhooks(
             None
         },
     };
+
+    // The gateway owns a separate queue from RPC. Reclaim idle actor slots
+    // and their tombstones here; connected WebSockets retain a lifecycle
+    // lease, so this cannot erase an incarnation still held by a socket.
+    {
+        let reaper_queue = Arc::clone(&state.session_queue);
+        let mut reaper_shutdown = state.shutdown_tx.subscribe();
+        zeroclaw_spawn::spawn!(async move {
+            const TICK: Duration = Duration::from_secs(60);
+            let mut interval = tokio::time::interval(TICK);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let queue_evicted = reaper_queue.evict_idle().await;
+                        if queue_evicted > 0 {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_attrs(::serde_json::json!({
+                                        "evicted_queue_slots": queue_evicted,
+                                    })),
+                                "Gateway session queue: released idle actor-queue slots"
+                            );
+                        }
+                    }
+                    changed = reaper_shutdown.changed() => {
+                        if changed.is_err() || *reaper_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Build router with middleware
     let inner = Router::new()
@@ -4705,7 +4767,7 @@ mod tests {
             device_registry: registry,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5625,7 +5687,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -5711,7 +5773,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -6384,7 +6446,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7290,7 +7352,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7409,7 +7471,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7508,7 +7570,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7713,7 +7775,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7799,7 +7861,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7890,7 +7952,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -7986,7 +8048,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8078,7 +8140,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8178,7 +8240,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -8329,7 +8391,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
@@ -9207,7 +9269,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -9292,7 +9354,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
@@ -9902,7 +9964,7 @@ path = "{trigger_path}"
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(GatewayCancellationRegistry::default())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

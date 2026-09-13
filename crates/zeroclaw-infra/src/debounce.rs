@@ -73,6 +73,15 @@ impl MessageDebouncer {
         self.debounce_inner(sender_key, message, window).await
     }
 
+    /// Discard a pending sender bucket. Lifecycle commands use this before
+    /// bypassing normal debouncing so `/new` cannot be folded into an ordinary
+    /// message or dispatch stale accumulated content after a reset.
+    pub async fn discard(&self, sender_key: &str) {
+        if let Some(entry) = self.entries.lock().await.remove(sender_key) {
+            entry.timer_handle.abort();
+        }
+    }
+
     async fn debounce_inner(
         &self,
         sender_key: &str,
@@ -222,5 +231,21 @@ mod tests {
         };
         let combined = rx.await.unwrap();
         assert_eq!(combined, "fast");
+    }
+
+    #[tokio::test]
+    async fn discard_drops_a_pending_bucket_without_dispatching_it() {
+        let debouncer = MessageDebouncer::new(Duration::from_secs(5));
+        let receiver = match debouncer.debounce("user1", "ordinary message").await {
+            DebounceResult::Pending(receiver) => receiver,
+            DebounceResult::Passthrough(_) => panic!("expected pending bucket"),
+        };
+
+        debouncer.discard("user1").await;
+
+        assert!(
+            receiver.await.is_err(),
+            "discard must drop the pending result"
+        );
     }
 }

@@ -16,6 +16,10 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) model: &'a str,
     pub(crate) temperature: Option<f64>,
     pub(crate) approval: Option<&'a ApprovalManager>,
+    /// The resolved operator policy for persistent-session-prompt mutations.
+    /// This is computed once at turn entry from global config and the effective
+    /// agent's risk profile; model output cannot alter it.
+    pub(crate) session_prompt_approval_required: bool,
     pub(crate) channel_name: &'a str,
     pub(crate) channel_reply_target: Option<&'a str>,
     pub(crate) cancellation_token: Option<&'a CancellationToken>,

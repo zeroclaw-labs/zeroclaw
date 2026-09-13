@@ -1,7 +1,8 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::prompt::{
-    InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
+    InteractionContext, PromptContext, SystemPromptBuilder,
+    append_required_session_prompt_attachments, append_timestamp_orientation,
 };
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
@@ -394,6 +395,11 @@ pub struct Agent {
     /// were skipped. Appended to the system prompt in `build_system_prompt`.
     mcp_pinned_section: String,
     mcp_deferred_section: String,
+    /// Durable session prompt attachments are resolved by the owning chat
+    /// transport at the start of each primary turn. They are intentionally not
+    /// part of agent configuration, so ACP and auxiliary callers never inherit
+    /// them accidentally.
+    session_prompt_attachments: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     /// Approval manager for direct Agent execution paths such as ACP.
@@ -903,6 +909,10 @@ impl AgentBuilder {
         let exclude_memory = self.exclude_memory;
         if exclude_memory {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
+            // ACP/Code sessions opt into this isolated construction path.
+            // Prompt attachments are chat-session state and must not even be
+            // advertised there until the stacked ACP follow-up lands.
+            tools.retain(|tool| !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()));
         }
 
         let memory: Arc<dyn Memory> = if exclude_memory {
@@ -1010,6 +1020,7 @@ impl AgentBuilder {
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
+            session_prompt_attachments: String::new(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1295,6 +1306,13 @@ impl Agent {
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
         self.tool_dispatcher = tool_dispatcher;
+        self.refresh_system_prompt();
+    }
+
+    /// Replace the per-turn session prompt attachment section and refresh the
+    /// stored system message so the next top-level turn observes it.
+    pub fn set_session_prompt_attachments(&mut self, attachments: String) {
+        self.session_prompt_attachments = attachments;
         self.refresh_system_prompt();
     }
 
@@ -1672,7 +1690,7 @@ impl Agent {
             _ => (None, None),
         };
 
-        let all_tools_result = tools::all_tools_with_runtime(
+        let mut all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             risk_profile,
@@ -1701,6 +1719,19 @@ impl Agent {
             // documented snapshot fallback.
             live_config.clone(),
         );
+        // Persistent prompt attachments are a daemon-owned primary-chat
+        // capability. A generic/one-shot Agent has no durable current-session
+        // identity, so advertising these tools there is misleading even though
+        // their task-local execution gate would reject the call. ACP agents
+        // are likewise excluded until their stacked implementation exists.
+        if live_config.is_none() || exclude_memory {
+            all_tools_result
+                .tools
+                .retain(|tool| !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()));
+            all_tools_result
+                .unfiltered_tool_arcs
+                .retain(|tool| !zeroclaw_api::SESSION_PROMPT_TOOL_NAMES.contains(&tool.name()));
+        }
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
@@ -2079,6 +2110,23 @@ impl Agent {
         &self,
         dispatcher: &dyn ToolDispatcher,
     ) -> Result<String> {
+        let mut prompt = self.build_system_prompt_without_session_prompt_attachments(dispatcher)?;
+        append_required_session_prompt_attachments(
+            &mut prompt,
+            &self.session_prompt_attachments,
+            self.config.resolved.max_system_prompt_chars,
+        )?;
+        Ok(prompt)
+    }
+
+    /// Build the complete host-authored prompt before the mutable session
+    /// attachment tail is appended. Primary-turn owners use its character count
+    /// for best-effort mutation admission; final assembly still validates the
+    /// actual prompt before dispatch.
+    fn build_system_prompt_without_session_prompt_attachments(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
@@ -2090,7 +2138,14 @@ impl Agent {
         } else {
             &no_tools
         };
-        let instructions = dispatcher.prompt_instructions(prompt_tools);
+        let has_advertised_tools = prompt_tools
+            .iter()
+            .any(|tool| crate::agent::prompt::tool_is_advertised_for_current_turn(tool.name()));
+        let instructions = if has_advertised_tools {
+            dispatcher.prompt_instructions(prompt_tools)
+        } else {
+            String::new()
+        };
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             agent_workspace_dir: &self.agent_workspace_dir,
@@ -2101,8 +2156,7 @@ impl Agent {
             identity_config: Some(&self.identity_config),
             interaction: self.interaction_context.as_ref(),
             dispatcher_instructions: &instructions,
-            sends_native_tool_specs: dispatcher.should_send_tool_specs()
-                && !prompt_tools.is_empty(),
+            sends_native_tool_specs: dispatcher.should_send_tool_specs() && has_advertised_tools,
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
             inject_memory: self.inject_memory,
@@ -2123,6 +2177,28 @@ impl Agent {
             prompt.push_str(&self.mcp_pinned_section);
         }
         Ok(prompt)
+    }
+
+    pub fn session_prompt_budget(
+        &self,
+    ) -> Result<zeroclaw_infra::session_backend::SessionPromptBudget> {
+        // A streamed primary turn always prepares both native and XML tool
+        // protocol prompts so a provider fallback can switch dispatcher without
+        // rebuilding the turn context. Admission must reserve the largest host
+        // variant; measuring only the currently selected dispatcher can accept
+        // an attachment that makes the alternate prompt fail before dispatch.
+        let native_host_prompt_chars = self
+            .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)?
+            .chars()
+            .count();
+        let xml_host_prompt_chars = self
+            .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)?
+            .chars()
+            .count();
+        Ok(zeroclaw_infra::session_backend::SessionPromptBudget::new(
+            native_host_prompt_chars.max(xml_host_prompt_chars),
+            self.config.resolved.max_system_prompt_chars,
+        ))
     }
 
     fn rebuild_system_prompt_for_dispatcher(
@@ -5176,6 +5252,7 @@ mod tests {
     mod surface2_tests {
         use super::*;
         use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+        use crate::agent::prompt::TIMESTAMP_ORIENTATION;
 
         /// Marker text produced by the section-based prompt builder when tools
         /// are advertised as XML/text instructions rather than native tool specs.
@@ -5483,6 +5560,193 @@ mod tests {
             assert!(
                 xml_prompt.contains(XML_TOOLS_MARKER),
                 "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn session_prompt_attachments_are_host_appended_and_refreshable() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, Vec::new());
+            let host_prompt_chars = agent.system_prompt_for_test().unwrap().chars().count();
+            let first_attachment =
+                "## Session Prompts\n- id: \"task\"; content: \"first\"\n".to_string();
+            agent.config.resolved.max_system_prompt_chars =
+                host_prompt_chars + 2 + first_attachment.chars().count();
+            agent.set_session_prompt_attachments(first_attachment.clone());
+            let fitted_prompt = agent
+                .system_prompt_for_test()
+                .expect("a finite budget must retain required host policy and persistent prompts");
+            assert!(
+                fitted_prompt.chars().count() <= agent.config.resolved.max_system_prompt_chars,
+                "prompt must respect max_system_prompt_chars"
+            );
+            assert!(fitted_prompt.contains("content: \"first\""));
+            assert!(fitted_prompt.contains(TIMESTAMP_ORIENTATION));
+
+            agent.config.resolved.max_system_prompt_chars =
+                host_prompt_chars + 1 + first_attachment.chars().count();
+            agent.set_session_prompt_attachments(first_attachment);
+            let error = agent
+                .system_prompt_for_test()
+                .expect_err("an attachment that would truncate host policy must block dispatch");
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing to dispatch without them")
+            );
+
+            agent.config.resolved.max_system_prompt_chars = 0;
+            agent.set_session_prompt_attachments(
+                "## Session Prompts\n- id: \"task\"; content: \"first\"\n".to_string(),
+            );
+            let first_prompt = agent.system_prompt_for_test().unwrap();
+            assert!(first_prompt.contains("content: \"first\""));
+            assert!(first_prompt.find("## Session Prompts").unwrap() > 0);
+
+            agent.set_session_prompt_attachments(
+                "## Session Prompts\n- id: \"task\"; content: \"second\"\n".to_string(),
+            );
+            let prompt = agent.system_prompt_for_test().unwrap();
+            assert!(prompt.contains("content: \"second\""));
+            assert!(!prompt.contains("content: \"first\""));
+        }
+
+        #[test]
+        fn session_prompt_budget_reserves_every_dispatch_tool_protocol_variant() {
+            let (provider, _) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, vec![Box::new(MockTool)]);
+            let attachments = "## Session Prompts\n- id: \"task\"; content: \"keep this task\"\n";
+            let native_host_chars = agent
+                .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)
+                .expect("native host prompt should render")
+                .chars()
+                .count();
+            let xml_host_chars = agent
+                .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)
+                .expect("XML host prompt should render")
+                .chars()
+                .count();
+            assert!(
+                xml_host_chars > native_host_chars,
+                "the test must exercise the XML tool catalog expansion"
+            );
+
+            agent.config.resolved.max_system_prompt_chars =
+                xml_host_chars + 2 + attachments.chars().count();
+            let budget = agent
+                .session_prompt_budget()
+                .expect("budget should account for every dispatch protocol");
+            assert!(
+                budget.permits(attachments),
+                "the preflight must admit an attachment that fits the largest host variant"
+            );
+
+            agent.set_session_prompt_attachments(attachments.to_string());
+            agent
+                .tool_protocol_prompts()
+                .expect("every dispatch protocol prompt must fit after a preflight-admitted write");
+        }
+
+        #[test]
+        fn session_prompt_budget_includes_tools_visible_to_a_chat_turn() {
+            let (provider, _) = capturing_provider(true);
+            let security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+            let mut agent = test_agent_with_provider(
+                provider,
+                vec![
+                    Box::new(crate::tools::SessionPromptListTool::new(security.clone())),
+                    Box::new(crate::tools::SessionPromptSetTool::new(security.clone())),
+                    Box::new(crate::tools::SessionPromptDeleteTool::new(security)),
+                ],
+            );
+
+            let attachments = "## Session Prompts\n- id: \"task\"; content: \"keep this task\"\n";
+            let outside_native = agent
+                .build_system_prompt_without_session_prompt_attachments(&NativeToolDispatcher)
+                .expect("unscoped host prompt should render")
+                .chars()
+                .count();
+            let outside_xml = agent
+                .build_system_prompt_without_session_prompt_attachments(&XmlToolDispatcher)
+                .expect("unscoped XML host prompt should render")
+                .chars()
+                .count();
+            let outside_chat_turn = outside_native.max(outside_xml);
+            let (inside_native, inside_xml) = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                .sync_scope(true, || {
+                    Ok::<_, anyhow::Error>((
+                        agent
+                            .build_system_prompt_without_session_prompt_attachments(
+                                &NativeToolDispatcher,
+                            )?
+                            .chars()
+                            .count(),
+                        agent
+                            .build_system_prompt_without_session_prompt_attachments(
+                                &XmlToolDispatcher,
+                            )?
+                            .chars()
+                            .count(),
+                    ))
+                })
+                .expect("scoped host prompt should render");
+            let inside_chat_turn = inside_native.max(inside_xml);
+
+            assert!(
+                inside_chat_turn > outside_chat_turn,
+                "chat-session admission must reserve the session-prompt tool catalog advertised to its turn"
+            );
+
+            agent.config.resolved.max_system_prompt_chars =
+                outside_chat_turn + 2 + attachments.chars().count();
+            assert!(
+                agent
+                    .session_prompt_budget()
+                    .expect("unscoped prompt budget should render")
+                    .permits(attachments),
+                "the deliberately under-scoped preflight would admit this attachment"
+            );
+            assert!(
+                !zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+                    .sync_scope(true, || agent.session_prompt_budget())
+                    .expect("scoped prompt budget should render")
+                    .permits(attachments),
+                "chat-session admission must reject an attachment that exceeds its scoped tool prompt"
+            );
+        }
+
+        #[test]
+        fn acp_style_agent_does_not_advertise_session_prompt_tools() {
+            let (provider, _) = capturing_provider(true);
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let workspace = tempfile::TempDir::new().unwrap();
+            let memory: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None).unwrap(),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(provider)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(crate::tools::SessionPromptListTool::new(
+                        Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+                    ))],
+                ))
+                .memory(memory)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .exclude_memory(true)
+                .build()
+                .unwrap();
+
+            assert!(
+                agent
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name() != "session_prompt_list")
             );
         }
 

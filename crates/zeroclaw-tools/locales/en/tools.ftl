@@ -194,3 +194,20 @@ tool-web-search-tool-note-truncated-results = (further results omitted)
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-session-prompt-list = List persistent prompt attachments for the chat session currently running this agent.
+tool-session-prompt-set = Create or replace one persistent prompt attachment for the current chat session.
+tool-session-prompt-delete = Delete one persistent prompt attachment from the current chat session.
+tool-session-prompt-param-id = Lowercase symbolic ID: [a-z][a-z0-9_.-]{"{"}0,63{"}"}.
+tool-session-prompt-param-content = Prompt text, up to 2048 UTF-8 bytes.
+tool-session-prompt-error-no-context = No active chat-session context. This tool is unavailable to auxiliary calls.
+tool-session-prompt-error-no-backend = No active chat-session backend. This tool is unavailable to auxiliary calls.
+tool-session-prompt-error-missing-id = Missing 'id' parameter.
+tool-session-prompt-error-missing-content = Missing 'content' parameter.
+tool-session-prompt-error-list = Failed to list session prompts: { $err }
+tool-session-prompt-error-set = Failed to set session prompt: { $err }
+tool-session-prompt-error-delete = Failed to delete session prompt: { $err }
+tool-session-prompt-set-created = Session prompt '{ $id }' created; it applies on the next top-level turn.
+tool-session-prompt-set-updated = Session prompt '{ $id }' updated; it applies on the next top-level turn.
+tool-session-prompt-delete-success = Session prompt '{ $id }' deleted; the change applies on the next top-level turn.
+tool-session-prompt-error-missing = Session prompt '{ $id }' does not exist.

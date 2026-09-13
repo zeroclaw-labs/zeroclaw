@@ -11,7 +11,9 @@ use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
-pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+// Keep this byte-identical in length to `NO_TOOLS_TASK_FRAMING`: the turn
+// loop may swap the framing after the final system-prompt budget is enforced.
+pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when this request needs it";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -639,6 +641,7 @@ fn inject_workspace_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::prompt::TIMESTAMP_ORIENTATION;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
 
     #[test]

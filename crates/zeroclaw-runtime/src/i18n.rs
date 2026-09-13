@@ -1054,6 +1054,7 @@ mod tests {
         let cases = [
             ("cli-approval-request", &["shell"][..]),
             ("cli-approval-prompt", &["shell", "[Y]", "[N]", "[A]"][..]),
+            ("cli-approval-prompt-yesno", &["[Y]", "[N]"][..]),
         ];
 
         for (source, locale) in [
@@ -1072,7 +1073,7 @@ mod tests {
                         "{key} in {locale} should preserve {expected:?}; got: {value:?}"
                     );
                 }
-                if key == "cli-approval-prompt" {
+                if matches!(key, "cli-approval-prompt" | "cli-approval-prompt-yesno") {
                     assert!(
                         value.ends_with(' ') && !value.ends_with("  "),
                         "{key} in {locale} should end with exactly one space; got: {value:?}"
@@ -1089,6 +1090,10 @@ mod tests {
         assert_eq!(
             format_ftl_message(english, "en", "cli-approval-prompt", &[("tool", tool)]).as_deref(),
             Some("   [Y]es / [N]o / [A]lways for shell: ")
+        );
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-prompt-yesno", &[]).as_deref(),
+            Some("   [Y]es / [N]o: ")
         );
     }
 

@@ -325,6 +325,9 @@ pub fn register_eager_mcp_tool_if_allowed(
     delegate_handle: Option<&tools::DelegateParentToolsHandle>,
     policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
 ) -> bool {
+    if crate::tools::SESSION_PROMPT_TOOL_NAMES.contains(&wrapper.name()) {
+        return false;
+    }
     if !eager_mcp_tool_allowed(wrapper.name(), policy) {
         return false;
     }
@@ -549,8 +552,13 @@ fn elide_image_data(content: &str) -> String {
 }
 
 pub(crate) fn scrub_for_export(content: &str) -> String {
+    if crate::agent::prompt::session_prompt_tool_call_envelope_mentioned(content) {
+        return "[Session-prompt tool exchange omitted from export]".to_string();
+    }
+    let without_attachments =
+        crate::agent::prompt::redact_session_prompt_attachments_for_export(content);
     scrub_credentials(&zeroclaw_providers::scrub_secret_patterns(
-        &elide_image_data(content),
+        &elide_image_data(&without_attachments),
     ))
 }
 
@@ -567,12 +575,15 @@ pub(crate) fn capture_llm_messages(
         LlmMessageSnapshot, MessageSnapshot, ToolCallSnapshot,
     };
 
-    let system_instructions = messages
+    let export_messages =
+        crate::agent::prompt::redact_session_prompt_tool_exchanges_for_export(messages);
+
+    let system_instructions = export_messages
         .iter()
         .find(|m| m.role == "system")
         .map(|m| scrub_for_export(&m.content));
 
-    let input = messages
+    let input = export_messages
         .iter()
         .filter(|m| m.role != "system")
         .map(|m| MessageSnapshot {
@@ -588,7 +599,13 @@ pub(crate) fn capture_llm_messages(
         .map(|tc| ToolCallSnapshot {
             id: tc.id.clone(),
             name: tc.name.clone(),
-            arguments_json: scrub_for_export(&tc.arguments),
+            arguments_json: if crate::agent::tool_execution::is_sensitive_session_prompt_tool(
+                &tc.name,
+            ) {
+                "[Session-prompt tool arguments omitted from export]".to_string()
+            } else {
+                scrub_for_export(&tc.arguments)
+            },
         })
         .collect();
 
@@ -13637,7 +13654,7 @@ Let me check the result."#;
             "Native prompt with effective native specs must not deny tool availability"
         );
         assert!(
-            system_prompt.contains("Use tools when the request requires action"),
+            system_prompt.contains("Use tools when this request needs it"),
             "Native prompt with effective native specs should authorize action tool use"
         );
     }
@@ -16392,6 +16409,89 @@ Let me check the result."#;
 
     #[cfg(feature = "observability-otel")]
     #[test]
+    fn capture_llm_messages_redacts_supported_session_prompt_envelopes_and_results() {
+        const MARKER: &str = "session-prompt-private-marker";
+        let messages = vec![
+            ChatMessage::assistant(format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"id\":\"task\",\"content\":\"{MARKER}\"}}}}]}}"#
+            )),
+            ChatMessage::tool(format!("native tool result: {MARKER}")),
+            ChatMessage::assistant(format!(
+                r#"{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}"#
+            )),
+            ChatMessage::user(format!("bare JSON result: {MARKER}")),
+            ChatMessage::assistant(format!(
+                r#"<toolcall>{{"name":"session_prompt_set","arguments":{{"id":"task","content":"{MARKER}"}}}}</toolcall>"#
+            )),
+            ChatMessage::user(format!("text tool result: {MARKER}")),
+            ChatMessage::assistant(
+                r#"<tool_calls>{"name":"session_prompt_list","arguments":{}}</tool_calls>"#,
+            ),
+            ChatMessage::user(format!("plural wrapper result: {MARKER}")),
+            ChatMessage::assistant(
+                r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
+            ),
+            ChatMessage::tool(format!("call-id-only list result: {MARKER}")),
+            ChatMessage::user("ordinary next-turn input"),
+        ];
+
+        let malformed_outputs = [
+            format!(
+                r#"{{"tool_calls":[{{"name":"session_prompt_set","arguments":{{"content":"{MARKER}"}}}}]"#
+            ),
+            format!(
+                r#"{{"type": "function_call", "name": "session_prompt_set", "arguments": "{{\"content\":\"{MARKER}\"}}""#
+            ),
+            format!(
+                r#"{{"tool_\u0063alls":[{{"na\u006de":"session_prompt_\u0073et","argu\u006dents":{{"content":"{MARKER}"}}}}]"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set}}]}}"#
+            ),
+            format!(
+                r#"{{"tool_calls":[{{"arguments":{{"content":"{MARKER}"}},"name":"session_prompt_set}}]}} Done"#
+            ),
+            format!(
+                r#"{{"name":"session_prompt_set","arguments":"{{\"content\":\"{MARKER}\"}}","type":"function_call"#
+            ),
+            format!(
+                r#"{{\"tool_calls\":[{{\"name\":\"session_prompt_set\",\"arguments\":{{\"content\":\"{MARKER}\"}}}}]"#
+            ),
+        ];
+        let snap =
+            super::capture_llm_messages(&messages, Some(&malformed_outputs[0]), &[]).expect("Some");
+
+        assert!(
+            snap.input
+                .iter()
+                .all(|message| !message.content.contains(MARKER)),
+            "snapshot input must not expose session-prompt content: {:#?}",
+            snap.input
+        );
+        assert_eq!(
+            snap.input.last().map(|message| message.content.as_str()),
+            Some("ordinary next-turn input"),
+            "the redaction boundary must not remove later ordinary input"
+        );
+        for malformed_output in malformed_outputs {
+            let snap =
+                super::capture_llm_messages(&messages, Some(&malformed_output), &[]).expect("Some");
+            assert!(
+                !snap
+                    .output_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(MARKER),
+                "malformed-tool parse-rejection output must not expose session-prompt content"
+            );
+        }
+    }
+
+    #[cfg(feature = "observability-otel")]
+    #[test]
     fn capture_llm_messages_empty_output_and_no_system() {
         let messages = vec![ChatMessage::user("hi")];
         let snap = super::capture_llm_messages(&messages, Some(""), &[]).expect("Some");
@@ -16587,6 +16687,12 @@ Let me check the result."#;
         // slack__post is explicitly excluded → denied
         assert!(!super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("slack__post"),
+            &mut tools,
+            Some(&delegate_handle),
+            access_policy.as_ref(),
+        ));
+        assert!(!super::register_eager_mcp_tool_if_allowed(
+            mock_tool_arc("session_prompt_set"),
             &mut tools,
             Some(&delegate_handle),
             access_policy.as_ref(),

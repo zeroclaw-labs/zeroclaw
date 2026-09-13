@@ -247,6 +247,15 @@ fn has_arguments_signal(value: &serde_json::Value) -> bool {
     value.get("arguments").is_some() || value.get("parameters").is_some()
 }
 
+fn has_responses_function_call_shape(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|ty| ty == "function_call")
+        && has_non_empty_string(value, "name")
+        && (has_arguments_signal(value) || has_non_empty_string(value, "call_id"))
+}
+
 fn looks_like_tool_call_object(value: &serde_json::Value) -> bool {
     if let Some(function) = value.get("function").and_then(serde_json::Value::as_object) {
         let function = serde_json::Value::Object(function.clone());
@@ -291,13 +300,7 @@ fn tool_call_array_has_malformed_protocol_signal(value: &serde_json::Value, key:
 fn classify_tool_protocol_json_value(
     value: &serde_json::Value,
 ) -> Option<ToolProtocolEnvelopeKind> {
-    if value
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|ty| ty == "function_call")
-        && has_non_empty_string(value, "name")
-        && (has_arguments_signal(value) || has_non_empty_string(value, "call_id"))
-    {
+    if has_responses_function_call_shape(value) {
         return Some(ToolProtocolEnvelopeKind::ResponsesFunctionCall);
     }
 
@@ -351,7 +354,9 @@ fn json_value_mentions_known_tool(
             .is_some_and(|name| known_tool_names.contains(&name.to_ascii_lowercase()))
     };
 
-    if name_matches(object.get("name")) {
+    if name_matches(object.get("name"))
+        && (has_arguments_signal(value) || has_responses_function_call_shape(value))
+    {
         return true;
     }
 
@@ -413,6 +418,27 @@ pub fn tool_protocol_envelope_mentions_known_tool(
 
     serde_json::from_str::<serde_json::Value>(trimmed)
         .is_ok_and(|value| json_value_mentions_known_tool(&value, known_tool_names))
+}
+
+/// Return whether the runtime would accept any call to one of `known_tool_names`.
+///
+/// This deliberately follows [`parse_tool_calls`] for legacy text formats
+/// rather than maintaining a second list of provider spellings. Complete JSON
+/// stays with [`tool_protocol_envelope_mentions_known_tool`], whose structural
+/// discriminator distinguishes an invocation from business JSON that happens
+/// to carry a `name` field. Callers at export-only boundaries use both helpers
+/// to preserve accepted-call identity without changing parsing or model-visible
+/// history.
+pub fn parsed_tool_protocol_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    !known_tool_names.is_empty()
+        && serde_json::from_str::<serde_json::Value>(text.trim()).is_err()
+        && parse_tool_calls(text)
+            .1
+            .iter()
+            .any(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
 }
 
 fn has_malformed_tool_protocol_json_signal(value: &serde_json::Value) -> bool {
@@ -665,20 +691,75 @@ pub fn looks_like_incomplete_tool_protocol_json(text: &str) -> bool {
     tool_protocol_json_identifying_keys().any(|key| trimmed.contains(key))
 }
 
-fn malformed_text_mentions_known_tool(text: &str, known_tool_names: &HashSet<String>) -> bool {
-    if known_tool_names.is_empty() {
+fn malformed_json_string_fields(text: &str) -> Vec<(String, String)> {
+    static JSON_STRING_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"("(?:\\.|[^"\\])*")\s*:\s*("(?:\\.|[^"\\])*")"#)
+            .expect("JSON_STRING_FIELD_RE regex must compile")
+    });
+
+    JSON_STRING_FIELD_RE
+        .captures_iter(text)
+        .filter_map(|cap| {
+            let key = serde_json::from_str::<String>(cap.get(1)?.as_str()).ok()?;
+            let value = serde_json::from_str::<String>(cap.get(2)?.as_str()).ok()?;
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn malformed_json_field_names(text: &str) -> HashSet<String> {
+    static JSON_FIELD_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"("(?:\\.|[^"\\])*")\s*:"#).expect("JSON_FIELD_KEY_RE regex must compile")
+    });
+
+    JSON_FIELD_KEY_RE
+        .captures_iter(text)
+        .filter_map(|cap| serde_json::from_str::<String>(cap.get(1)?.as_str()).ok())
+        .collect()
+}
+
+/// Recognize an incomplete JSON tool invocation without relying on a tool
+/// name. At export-only privacy boundaries this must fail closed: truncation
+/// can remove or corrupt either a structural discriminator or the name after
+/// opaque arguments have already arrived. This does not affect parsing or
+/// provider-visible history.
+pub fn looks_like_malformed_json_tool_invocation(
+    text: &str,
+    known_sensitive_tool_names: &HashSet<String>,
+) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
         return false;
     }
 
-    static JSON_NAME_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#""name"\s*:\s*"([^"]+)""#).expect("JSON_NAME_FIELD_RE regex must compile")
-    });
+    let lower = trimmed.to_ascii_lowercase();
+    let json_like =
+        trimmed.starts_with('{') || trimmed.starts_with('[') || lower.starts_with("```json");
+    if !json_like {
+        return false;
+    }
+    if let Some(body) = json_fence_body(trimmed) {
+        return looks_like_malformed_json_tool_invocation(body, known_sensitive_tool_names);
+    }
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return false;
+    }
 
-    JSON_NAME_FIELD_RE.captures_iter(text).any(|cap| {
-        cap.get(1)
-            .map(|name| name.as_str().trim().to_ascii_lowercase())
-            .is_some_and(|name| known_tool_names.contains(&name))
-    })
+    let field_names = malformed_json_field_names(trimmed);
+    let string_fields = malformed_json_string_fields(trimmed);
+    let has_protocol_container = ["tool_calls", "toolcalls", "function_call"]
+        .iter()
+        .any(|key| field_names.contains(*key))
+        || string_fields
+            .iter()
+            .any(|(key, value)| key == "type" && value == "function_call");
+    let has_arguments = ["arguments", "parameters"]
+        .iter()
+        .any(|key| field_names.contains(*key));
+    let has_known_sensitive_name = string_fields.iter().any(|(key, value)| {
+        key == "name" && known_sensitive_tool_names.contains(&value.trim().to_ascii_lowercase())
+    });
+    has_arguments && (has_protocol_container || has_known_sensitive_name)
 }
 
 fn has_malformed_tool_protocol_text_signal_for_known_tools(
@@ -704,7 +785,11 @@ fn has_malformed_tool_protocol_text_signal_for_known_tools(
 
     has_protocol_container
         && has_arguments
-        && malformed_text_mentions_known_tool(text, known_tool_names)
+        && malformed_json_string_fields(text)
+            .iter()
+            .any(|(key, value)| {
+                key == "name" && known_tool_names.contains(&value.trim().to_ascii_lowercase())
+            })
 }
 
 fn json_fence_body(trimmed: &str) -> Option<&str> {
@@ -3351,6 +3436,74 @@ mod tests {
             "The \"tool_call_id\" field identifies the call."
         ));
         assert!(!looks_like_incomplete_tool_protocol_json(""));
+    }
+
+    #[test]
+    fn malformed_json_tool_invocation_detection_is_name_independent() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"type": "function_call", "name": "session_prompt_set", "arguments": "{"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"tool_\u0063alls":[{"arguments":{"content":"secret"},"name":"session_prompt_set}]} Done"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]"#,
+            &known,
+        ));
+        assert!(looks_like_malformed_json_tool_invocation(
+            r#"{"name":"session_prompt_set","arguments":"{\"content\":\"secret\"}","type":"function_call"#,
+            &known,
+        ));
+        assert!(!looks_like_malformed_json_tool_invocation(
+            r#"{"retries": 3, "timeout_ms":"#,
+            &known,
+        ));
+    }
+
+    #[test]
+    fn known_tool_detection_requires_complete_invocation_shape() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        assert!(!tool_protocol_envelope_mentions_known_tool(
+            r#"{"name":"session_prompt_set","description":"Document this identifier"}"#,
+            &known,
+        ));
+        assert!(tool_protocol_envelope_mentions_known_tool(
+            r#"{"name":"session_prompt_set","arguments":{"content":"opaque"}}"#,
+            &known,
+        ));
+        assert!(tool_protocol_envelope_mentions_known_tool(
+            r#"{"type":"function_call","call_id":"call_1","name":"session_prompt_list"}"#,
+            &HashSet::from(["session_prompt_list".to_owned()]),
+        ));
+    }
+
+    #[test]
+    fn parsed_known_tool_detection_tracks_accepted_legacy_text_formats() {
+        let known = HashSet::from(["session_prompt_set".to_owned()]);
+
+        for response in [
+            r#"<minimax:tool_call>{"name":"session_prompt_set","arguments":{"content":"opaque"}}</minimax:tool_call>"#,
+            r#"<invoke name="session_prompt_set"><parameter name="content">opaque</parameter></invoke>"#,
+            r#"TOOL_CALL
+{tool => "session_prompt_set", args => { --content "opaque" }}}
+/TOOL_CALL"#,
+            "session_prompt_set/content>opaque",
+        ] {
+            assert!(
+                parsed_tool_protocol_mentions_known_tool(response, &known),
+                "accepted parser representation must retain known-tool identity: {response}"
+            );
+        }
+
+        assert!(!parsed_tool_protocol_mentions_known_tool(
+            r#"{"name":"session_prompt_set","description":"A documented identifier"}"#,
+            &known,
+        ));
     }
 
     #[test]

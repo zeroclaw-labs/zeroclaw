@@ -292,6 +292,14 @@ sections! {
                 Agents reference one via `agents.<alias>.runtime_profile`.",
     },
 
+    SessionPromptApproval => {
+        key:   "session_prompt_approval",
+        shape: DirectForm,
+        group: Agent,
+        help:  "Default approval policy for persistent session-prompt changes. \
+                Risk profiles may override it for their assigned agents.",
+    },
+
     // Tier 3 — Storage. memory.backend points at a storage.<type>.<alias>
     // instance, so storage must exist first.
     Storage => {
@@ -514,6 +522,7 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
         | Section::SkillBundles
         | Section::RiskProfiles
         | Section::RuntimeProfiles
+        | Section::SessionPromptApproval
         | Section::PeerGroups
         | Section::Storage
         | Section::Cron
