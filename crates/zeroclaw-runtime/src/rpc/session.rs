@@ -166,11 +166,10 @@ pub struct SessionStore {
     /// atomically replace the session and wait for completion.
     #[cfg(test)]
     test_gated_op_pause: std::sync::Mutex<Option<GatedOpPause>>,
-    /// Test-only pause after a prompt acquires admission and validates its
-    /// incarnation, but before its cancellation token is registered. This is
-    /// the lifecycle signal boundary a removal must not miss.
+    /// Test-only pause after a prompt owns the session queue permit but before
+    /// it publishes its generation-owned admission marker.
     #[cfg(test)]
-    test_prompt_pre_registration_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    test_prompt_pre_marker_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
 }
 
 /// Generation-owned handle for the canonical cancellation-token registration.
@@ -275,7 +274,7 @@ impl SessionStore {
             #[cfg(test)]
             test_gated_op_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
-            test_prompt_pre_registration_pause: std::sync::Mutex::new(None),
+            test_prompt_pre_marker_pause: std::sync::Mutex::new(None),
         }
     }
 
@@ -927,9 +926,9 @@ impl SessionStore {
     }
 
     #[cfg(test)]
-    pub(crate) async fn wait_test_prompt_pre_registration_pause(&self) {
+    pub(crate) async fn wait_test_prompt_pre_marker_pause(&self) {
         let (entered, release) = {
-            let guard = self.test_prompt_pre_registration_pause.lock().unwrap();
+            let guard = self.test_prompt_pre_marker_pause.lock().unwrap();
             match &*guard {
                 Some((entered, release)) => (Arc::clone(entered), Arc::clone(release)),
                 None => return,
@@ -941,13 +940,13 @@ impl SessionStore {
 
     #[cfg(not(test))]
     #[inline(always)]
-    pub(crate) async fn wait_test_prompt_pre_registration_pause(&self) {}
+    pub(crate) async fn wait_test_prompt_pre_marker_pause(&self) {}
 
     #[cfg(test)]
-    pub(crate) fn set_test_prompt_pre_registration_pause(&self) -> PromptRegistrationPause {
+    pub(crate) fn set_test_prompt_pre_marker_pause(&self) -> PromptRegistrationPause {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        *self.test_prompt_pre_registration_pause.lock().unwrap() =
+        *self.test_prompt_pre_marker_pause.lock().unwrap() =
             Some((Arc::clone(&entered), Arc::clone(&release)));
         (entered, release)
     }
@@ -1035,7 +1034,10 @@ impl SessionStore {
             .pending_cancellations
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if pending.contains_key(id) {
+        if pending
+            .get(id)
+            .is_some_and(|(pending_generation, _, _)| *pending_generation == session_generation)
+        {
             return None;
         }
         let generation = self
@@ -1099,7 +1101,8 @@ impl SessionStore {
             .map(|(generation, _, _)| *generation)
     }
 
-    pub async fn kill_session(&self, id: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) async fn kill_session(&self, id: &str) -> bool {
         if let Some((_, _, token)) = self
             .cancel_tokens
             .lock()
@@ -1737,6 +1740,63 @@ mod tests {
         drop(registration);
         drop(admission);
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn successor_admission_replaces_an_orphaned_predecessor_lifecycle_latch() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "reused".to_string(),
+                RpcSession::new(make_agent(), "a", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let predecessor_generation = store.get_generation("reused").await.unwrap();
+        let predecessor_admission =
+            store.begin_pre_registration_admission("reused", predecessor_generation);
+        let predecessor_lifecycle = store
+            .signal_session_removal_at_generation("reused", predecessor_generation)
+            .await
+            .expect("the first generation must latch its lifecycle request");
+
+        // Model a failed prompt setup: its pre-registration marker is dropped
+        // without a token registration, leaving the first lifecycle guard live.
+        drop(predecessor_admission);
+        store
+            .insert(
+                "reused".to_string(),
+                RpcSession::new(make_agent(), "b", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let successor_generation = store.get_generation("reused").await.unwrap();
+        assert_ne!(predecessor_generation, successor_generation);
+
+        let successor_admission =
+            store.begin_pre_registration_admission("reused", successor_generation);
+        let successor_lifecycle = store
+            .signal_session_removal_at_generation("reused", successor_generation)
+            .await
+            .expect("a successor lifecycle request must replace a stale generation latch");
+        let token = tokio_util::sync::CancellationToken::new();
+        let registration = store.register_cancel_token_guard_at_session_generation(
+            "reused",
+            successor_generation,
+            token.clone(),
+        );
+
+        assert!(
+            token.is_cancelled(),
+            "the successor registration must consume its own lifecycle latch, not the stale predecessor latch"
+        );
+
+        drop(registration);
+        drop(successor_admission);
+        drop(successor_lifecycle);
+        drop(predecessor_lifecycle);
     }
 
     #[tokio::test]

@@ -2509,20 +2509,22 @@ impl RpcDispatcher {
                 guard.map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?
             }
         };
+        // Publish the captured generation before any later await. A lifecycle
+        // request may run on another runtime worker while this turn verifies
+        // that the live incarnation still matches it; it must be able to
+        // latch cancellation for this admitted turn rather than miss both the
+        // token and the marker.
+        let pre_registration_admission = self
+            .ctx
+            .sessions
+            .begin_pre_registration_admission(sid, expected_session_generation);
+        self.ctx.sessions.wait_test_prompt_pre_marker_pause().await;
         let session_generation = self
             .ctx
             .sessions
             .get_generation(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-        // Mark the admission before the final generation validation. A
-        // lifecycle request can run concurrently on another runtime worker;
-        // without this marker it can miss both a cancel token and a pending
-        // admission, then wait for a turn that was already admitted.
-        let pre_registration_admission = self
-            .ctx
-            .sessions
-            .begin_pre_registration_admission(sid, session_generation);
         if self.connection_cancel.is_cancelled()
             || session_generation != expected_session_generation
             || self.ctx.sessions.session_queue.generation(sid).await != expected_queue_generation
@@ -2534,27 +2536,22 @@ impl RpcDispatcher {
         }
 
         // Lifecycle removal can observe this admitted incarnation before its
-        // cancellation token exists. Pause here only in tests; production
-        // registration atomically consumes any generation-bound removal latch
-        // before fallible setup or provider work can begin.
+        // cancellation token exists. Registration atomically consumes any
+        // generation-bound removal latch before fallible setup or provider
+        // work can begin.
         // Register cancellation only after this incarnation is admitted. The
         // pre-registration guard marks only this narrow interval for a
         // lifecycle latch; it drops as soon as the token exists, while the
         // token guard removes exactly its registration on every later exit.
         let cancel = tokio_util::sync::CancellationToken::new();
-        let cancel_registration = {
-            self.ctx
-                .sessions
-                .wait_test_prompt_pre_registration_pause()
-                .await;
-            self.ctx
-                .sessions
-                .register_cancel_token_guard_at_session_generation(
-                    sid,
-                    session_generation,
-                    cancel.clone(),
-                )
-        };
+        let cancel_registration = self
+            .ctx
+            .sessions
+            .register_cancel_token_guard_at_session_generation(
+                sid,
+                session_generation,
+                cancel.clone(),
+            );
         drop(pre_registration_admission);
 
         let chat_mode = self
@@ -15446,8 +15443,7 @@ mod tests {
             );
             let (tx, _rx) = tokio::sync::mpsc::channel(64);
             let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-pre-setup-removal".into());
-            let (prompt_admitted, release_prompt) =
-                sessions.set_test_prompt_pre_registration_pause();
+            let (prompt_admitted, release_prompt) = sessions.set_test_prompt_pre_marker_pause();
 
             let prompt_handle = dispatcher.spawn_handle();
             let sid_for_prompt = sid.clone();
@@ -15464,7 +15460,7 @@ mod tests {
                 prompt_admitted.notified(),
             )
             .await
-            .expect("prompt must own admission before registering its cancel token");
+            .expect("prompt must publish admission before its final generation validation");
             assert!(
                 !sessions.has_inflight_turn(&sid),
                 "the test must hold the exact pre-registration cancellation window"
