@@ -74,7 +74,9 @@ impl ToolAccessPolicy {
 
 /// Built-in tool that fetches full schemas for deferred MCP tools.
 pub struct ToolSearchTool {
-    deferred: DeferredMcpToolSet,
+    // This is the executable deferred registry, not a cached grants record.
+    // Session admission may only remove entries from it.
+    deferred: Mutex<DeferredMcpToolSet>,
     activated: Arc<Mutex<ActivatedToolSet>>,
     access_policy: Option<ToolAccessPolicy>,
     activation_hook: Option<ActivationHook>,
@@ -83,7 +85,7 @@ pub struct ToolSearchTool {
 impl ToolSearchTool {
     pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
         Self {
-            deferred,
+            deferred: Mutex::new(deferred),
             activated,
             access_policy: None,
             activation_hook: None,
@@ -98,6 +100,37 @@ impl ToolSearchTool {
     pub fn with_activation_hook(mut self, hook: ActivationHook) -> Self {
         self.activation_hook = Some(hook);
         self
+    }
+
+    /// Remove revoked schemas and activated tools together. Recovering a
+    /// poisoned guard is safe here because every surviving entry is checked
+    /// against the current ceiling before execution can resume.
+    pub fn narrow_to_caller(&self, allowed: &[String]) {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        deferred
+            .stubs
+            .retain(|stub| allowed.contains(&stub.prefixed_name));
+        self.activated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_allowed(allowed);
+    }
+
+    /// Advertise only still-loadable, not-yet-activated tools, from the same
+    /// registry used by both keyword search and exact selection.
+    pub fn deferred_prompt_section(&self) -> String {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let activated = self.activated.lock().unwrap_or_else(|e| e.into_inner());
+        let names = activated
+            .tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        crate::mcp_deferred::build_deferred_tools_section_excluding(
+            &deferred,
+            self.access_policy.as_ref(),
+            &names,
+        )
     }
 
     fn is_allowed(&self, tool_name: &str) -> bool {
@@ -180,7 +213,8 @@ impl Tool for ToolSearchTool {
         } else {
             max_results
         };
-        let results = self.deferred.search(query, search_limit);
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let results = deferred.search(query, search_limit);
         if results.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -226,9 +260,9 @@ impl Tool for ToolSearchTool {
                 );
                 continue;
             }
-            if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
+            if let Some(spec) = deferred.tool_spec(&stub.prefixed_name) {
                 if !guard.is_activated(&stub.prefixed_name)
-                    && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
+                    && let Some(tool) = deferred.activate(&stub.prefixed_name)
                 {
                     let tool: Arc<dyn Tool> = Arc::from(tool);
                     guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
@@ -269,6 +303,7 @@ impl Tool for ToolSearchTool {
 
 impl ToolSearchTool {
     fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let mut output = String::from("<functions>\n");
         let mut not_found = Vec::new();
         let mut activated_count = 0;
@@ -303,10 +338,10 @@ impl ToolSearchTool {
                 not_found.push(*name);
                 continue;
             }
-            match self.deferred.tool_spec(name) {
+            match deferred.tool_spec(name) {
                 Some(spec) => {
                     if !guard.is_activated(name)
-                        && let Some(tool) = self.deferred.activate(name)
+                        && let Some(tool) = deferred.activate(name)
                     {
                         let tool: Arc<dyn Tool> = Arc::from(tool);
                         guard.activate(String::from(*name), Arc::clone(&tool));
@@ -388,6 +423,60 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(guard.is_activated(tool_name));
+    }
+
+    #[tokio::test]
+    async fn principal_narrowing_keeps_positive_prompt_and_blocks_reactivation() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![
+                make_stub("mcp__keep", "retained tool"),
+                make_stub("mcp__revoke", "revoked tool"),
+            ])
+            .await,
+            Arc::clone(&activated),
+        );
+        assert!(tool.deferred_prompt_section().contains("mcp__revoke"));
+        tool.execute(serde_json::json!({"query":"select:mcp__revoke"}))
+            .await
+            .unwrap();
+        assert!(activated.lock().unwrap().is_activated("mcp__revoke"));
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        tool.narrow_to_caller(&["mcp__keep".into()]);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("mcp__keep") && prompt.contains("tool_search"));
+        assert!(!prompt.contains("mcp__revoke"));
+        for query in ["select:mcp__revoke", "revoked"] {
+            let result = tool
+                .execute(serde_json::json!({"query":query}))
+                .await
+                .unwrap();
+            assert!(!result.output.contains("<function>{"));
+            assert!(
+                !activated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_activated("mcp__revoke")
+            );
+        }
+        tool.execute(serde_json::json!({"query":"select:mcp__keep"}))
+            .await
+            .unwrap();
+        assert!(
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_activated("mcp__keep")
+        );
+        assert!(tool.deferred_prompt_section().is_empty());
     }
 
     #[tokio::test]

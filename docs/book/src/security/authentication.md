@@ -82,14 +82,35 @@ selector list grants no instances, and broad access requires the explicit
 Tool selectors compose by intersection at agent assembly: a session
 created by a constrained principal only receives the tools its
 `allowed_tools` names (an empty list yields a tool-less session), on top
-of whatever the agent's own risk profile allows. At every admitted prompt,
-the current principal selector narrows static and already-activated deferred
-tools again; a removed tool cannot survive in an existing, resumed, or
-rehydrated session. Agent selectors are checked at the same prompt boundary.
-Deferred MCP instructions are shown only for the final exposed surface. A
-principal needs `tool_search` itself as well as the named deferred MCP tool
-to activate that tool. Constrained sessions fail closed for nested delegation
-until both principal tool and agent ceilings can be carried into that path.
+of whatever the agent's own risk profile allows. After a queued prompt is
+admitted, authorization is rechecked against the shared resolver, including
+credential expiry and revocation. The current principal selector narrows
+static tools, the deferred search registry, and already-activated tools;
+removed tools cannot be reactivated. Reused sessions are narrowed before their
+next turn, and rehydrated sessions are rebuilt under current grants. Agent
+selectors are checked before a turn and before rehydration.
+
+Narrowing never adds tools back to an existing agent. After expanding grants,
+create a new session to receive the expanded surface. No new config snapshot
+or independent principal-policy cache is stored in the agent.
+
+Deferred MCP instructions are derived from the remaining loadable tools and
+shown only when `tool_search` is exposed. A principal needs both `tool_search`
+and the named deferred MCP tool for on-demand activation; the helper is never
+implicitly granted. Permitted `mode = "always"` MCP tools are preactivated and
+remain callable without the helper.
+
+If either the principal's tool selector or agent selector is constrained,
+`delegate` (bounded and independent), `spawn_subagent`, and `execute_pipeline`
+are unavailable, including skill aliases wrapping those tools. These nested
+paths do not yet carry both current principal ceilings; the ordinary parent
+turn remains usable. Admin principals and principals with both selectors set
+to `"*"` keep their agent's configured nested capabilities.
+
+The existing eight-argument Rust `Agent::from_live_config_with_tui_env`
+constructor remains available. RPC uses the additive
+`from_live_config_with_tui_env_and_principal_tools` constructor and reapplies
+the shared resolver's grants at prompt admission.
 
 ## Breaking change: remote WSS requires authentication
 

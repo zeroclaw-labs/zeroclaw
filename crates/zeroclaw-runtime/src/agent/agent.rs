@@ -388,6 +388,7 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
     /// Pre-rendered MCP pinned-resource system-prompt section, read once at
     /// construction from each server's `pinned_resources` and provenance-wrapped
     /// (`trust="untrusted-external"`). Empty when no pins are configured or all
@@ -1008,6 +1009,7 @@ impl AgentBuilder {
             inject_memory: !exclude_memory,
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
+            tool_search: None,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
@@ -1320,15 +1322,24 @@ impl Agent {
         };
         self.tools
             .retain(|tool| allowed.iter().any(|name| name == tool.name()));
-        if let Some(activated) = &self.activated_tools {
-            if let Ok(mut activated) = activated.lock() {
-                activated.retain_allowed(allowed);
-            }
+        if let Some(search) = &self.tool_search {
+            search.narrow_to_caller(allowed);
         }
-        // The deferred prompt text was assembled for an earlier surface. Do
-        // not advertise a tool-search route until a rehydrated/currently
-        // assembled session can derive it from the final exposed tools.
-        self.mcp_deferred_section.clear();
+        if let Some(activated) = &self.activated_tools {
+            // A poisoned lock must not preserve a revoked executable tool.
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain_allowed(allowed);
+        }
+        self.disable_principal_unaware_nested_tools();
+    }
+
+    /// Nested builders do not yet carry the RPC principal's two selectors.
+    /// Refuse only those entry points, not the correctly narrowed parent turn.
+    pub(crate) fn disable_principal_unaware_nested_tools(&mut self) {
+        self.tools
+            .retain(|tool| !tool.requires_unrestricted_principal());
         self.refresh_system_prompt();
     }
 
@@ -1340,6 +1351,37 @@ impl Agent {
     #[cfg(test)]
     pub fn system_prompt_for_test(&self) -> Result<String> {
         self.build_system_prompt()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn dispatch_tool_for_test(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> super::tool_execution::ToolExecutionOutcome {
+        super::tool_execution::execute_one_tool(
+            name,
+            args,
+            Some("principal-test-call"),
+            super::tool_execution::ToolDispatchContext {
+                tools_registry: &self.tools,
+                activated_tools: self.activated_tools.as_ref(),
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &super::turn::TurnMeta {
+                agent_alias: Some(&self.agent_alias),
+                parent_agent_alias: None,
+                turn_id: "principal-test-turn",
+                channel_name: "rpc",
+            },
+            self.observer.as_ref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("production dispatch returns a tool outcome")
     }
 
     #[cfg(test)]
@@ -1544,6 +1586,33 @@ impl Agent {
     /// the shared config after reloads.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+    ) -> Result<Self> {
+        Self::from_live_config_with_tui_env_and_principal_tools(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+        )
+        .await
+    }
+
+    /// Additive RPC constructor. The shared resolver owns grants; this argument
+    /// is only the current assembly ceiling, not a long-lived policy snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_principal_tools(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
         session_cwd: Option<&Path>,
@@ -1791,6 +1860,7 @@ impl Agent {
             escalate_handle,
             channel_room_handle,
             activated_handle,
+            tool_search_handle,
             // from_config performs no per-turn tool_filter_groups filtering
             // itself, so mcp_tool_names is dropped here along with `registry`'s
             // already-consumed sibling fields via `..`.
@@ -1801,7 +1871,7 @@ impl Agent {
         // but cannot enter either bounded or independent delegation and lose
         // that ceiling.
         if principal_allowed_tools.is_some() {
-            registry.retain(|tool| tool.name() != "delegate");
+            registry.retain(|tool| !tool.requires_unrestricted_principal());
         }
         // Thread the sealed registry straight to the builder - `.tools(...)` now
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
@@ -1939,6 +2009,8 @@ impl Agent {
                 config: Some(std::sync::Arc::new(config.clone())),
             })
             .build()?;
+
+        agent.tool_search = tool_search_handle;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
         // the ACP server) can register back-channels after construction.
@@ -2162,9 +2234,17 @@ impl Agent {
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
-        if !self.mcp_deferred_section.is_empty() {
+        let deferred_section = if self.tools.iter().any(|tool| tool.name() == "tool_search") {
+            self.tool_search.as_ref().map_or_else(
+                || self.mcp_deferred_section.clone(),
+                |search| search.deferred_prompt_section(),
+            )
+        } else {
+            String::new()
+        };
+        if !deferred_section.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&self.mcp_deferred_section);
+            prompt.push_str(&deferred_section);
         }
         if !self.mcp_pinned_section.is_empty() {
             prompt.push_str("\n\n");
@@ -5069,6 +5149,204 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn principal_turn_executes_permitted_tool_and_refuses_removed_tool() {
+        struct PrincipalNativeProvider(MockModelProvider);
+        #[async_trait]
+        impl ModelProvider for PrincipalNativeProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<String> {
+                self.0
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PrincipalNativeProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+            fn alias(&self) -> &str {
+                "principal-native-fixture"
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = |names: &[&str]| zeroclaw_providers::ChatResponse {
+            text: None,
+            tool_calls: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| zeroclaw_providers::ToolCall {
+                    id: format!("call-{i}"),
+                    name: (*name).into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            usage: None,
+            reasoning_content: None,
+        };
+        let done = || zeroclaw_providers::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(PrincipalNativeProvider(MockModelProvider {
+                responses: Mutex::new(vec![
+                    response(&["echo", "forbidden"]),
+                    done(),
+                    response(&["echo"]),
+                    done(),
+                ]),
+            })))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![
+                    Box::new(CountingTool {
+                        calls: Arc::clone(&calls),
+                    }),
+                    Box::new(NamedMockTool::new("forbidden")),
+                ],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.narrow_to_principal_tools(Some(&["echo".into()]));
+        assert_eq!(agent.tool_names(), vec!["echo"]);
+        assert_eq!(agent.turn("first turn").await.unwrap(), "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            format!("{:?}", agent.history).contains("Tool not available in this turn: forbidden")
+        );
+        agent.narrow_to_principal_tools(Some(&[]));
+        assert_eq!(agent.turn("after revocation").await.unwrap(), "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "revoked tool must not execute again"
+        );
+        assert!(format!("{:?}", agent.history).contains("Tool not available in this turn: echo"));
+    }
+
+    #[tokio::test]
+    async fn principal_nested_pipeline_skill_alias_cannot_bypass_ceiling() {
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let echo: Arc<dyn Tool> = Arc::new(CountingTool {
+            calls: Arc::clone(&calls),
+        });
+        let pipeline: Arc<dyn Tool> = Arc::new(crate::tools::PipelineTool::with_access_policy(
+            zeroclaw_config::schema::PipelineConfig::default(),
+            vec![echo],
+            None,
+        ));
+        let skill = make_skill("wrapped", &["pipeline"]);
+        let wrapper = crate::tools::skill_tool::SkillBuiltinTool::new(
+            "wrapped",
+            &skill.tools[0],
+            Arc::clone(&pipeline),
+            HashMap::new(),
+        );
+        let wrapper_name = wrapper.name().to_owned();
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(crate::tools::ArcToolRef(pipeline)),
+            Box::new(wrapper),
+        ]);
+        assert_eq!(
+            agent.tool_names().len(),
+            2,
+            "both raw and wrapped entry points exist before narrowing"
+        );
+        agent.narrow_to_principal_tools(Some(&[
+            crate::tools::PipelineTool::NAME.into(),
+            wrapper_name.clone(),
+        ]));
+        assert!(agent.tool_names().is_empty());
+        for name in [crate::tools::PipelineTool::NAME, wrapper_name.as_str()] {
+            assert!(
+                !agent
+                    .dispatch_tool_for_test(
+                        name,
+                        serde_json::json!({"steps":[{"tool":"echo","args":{}}]})
+                    )
+                    .await
+                    .success
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn principal_poisoned_activated_set_is_pruned_before_dispatch() {
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        }));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        for name in ["mcp__keep", "mcp__revoke"] {
+            activated
+                .lock()
+                .unwrap()
+                .activate(name.into(), Arc::new(NamedMockTool::new(name)));
+        }
+        agent.activated_tools = Some(Arc::clone(&activated));
+        assert!(
+            agent
+                .dispatch_tool_for_test("mcp__revoke", serde_json::json!({}))
+                .await
+                .success
+        );
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(activated.is_poisoned());
+        agent.narrow_to_principal_tools(Some(&["mcp__keep".into()]));
+        assert!(
+            agent
+                .dispatch_tool_for_test("mcp__keep", serde_json::json!({}))
+                .await
+                .success
+        );
+        assert!(
+            !agent
+                .dispatch_tool_for_test("mcp__revoke", serde_json::json!({}))
+                .await
+                .success
+        );
+        assert!(
+            !activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_activated("mcp__revoke")
+        );
     }
 
     #[tokio::test]

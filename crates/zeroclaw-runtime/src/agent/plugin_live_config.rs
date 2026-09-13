@@ -265,7 +265,6 @@ async fn live_agent_plugin_tool_observes_config_reload_after_construction() {
         None,
         None,
         None,
-        None,
     )
     .await
     .expect("build a live-config Agent with the fixture plugin installed");
@@ -347,7 +346,6 @@ async fn live_delegated_plugin_tool_observes_config_reload_after_construction() 
         None,
         false,
         false,
-        None,
         None,
         None,
         None,

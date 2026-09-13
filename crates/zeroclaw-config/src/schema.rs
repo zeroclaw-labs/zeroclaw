@@ -4016,8 +4016,9 @@ impl Config {
     }
 
     /// Return the first concrete `model` string available for use as a
-    /// default: the model declared by the first entry that has one, in the
-    /// iteration order of
+    /// default: the model declared by the first entry that has one. Entries
+    /// are visited in macro slot order, then sorted alias order within each
+    /// slot, as implemented by
     /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
     /// Returns `None` only when no model-provider entry has any model
     /// configured at all.
@@ -6753,6 +6754,7 @@ pub struct CostConfig {
     /// input_per_mtok = 15.0
     /// output_per_mtok = 75.0
     /// cached_input_per_mtok = 1.5
+    /// cache_write_per_mtok = 18.75
     ///
     /// [cost.rates.providers.tts.openai."tts-1-hd"]
     /// per_mchar = 30.0
@@ -6902,6 +6904,10 @@ impl CostRatesConfig {
                 format!("{prefix}.cached_input_per_mtok"),
                 rates.cached_input_per_mtok,
             )?;
+            validate_rate(
+                format!("{prefix}.cache_write_per_mtok"),
+                rates.cache_write_per_mtok,
+            )?;
         }
 
         let mut tts_rates: Vec<_> = self.providers.tts.iter_entries().collect();
@@ -6993,9 +6999,10 @@ pub struct ModelCostRates {
     /// providers that don't charge separately for prompt cache hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_per_mtok: Option<f64>,
-    /// Cache-write tokens (USD per 1M). Optional — premium providers may
-    /// charge separately to write prompt data into their cache. Leave unset
-    /// to price cache writes at the ordinary input rate.
+    /// Cache-write tokens (USD per 1M). Optional — the premium providers
+    /// charge to write prompt data into their cache (Anthropic bills 1.25x
+    /// the input rate for the 5-minute TTL and 2x for the 1-hour TTL).
+    /// Leave unset to keep pricing cache writes at the plain input rate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_per_mtok: Option<f64>,
 }
@@ -32622,6 +32629,28 @@ model = "primary-model"
         );
         // resolve_default_model returns the first non-empty model across all model_providers.
         assert!(config.resolve_default_model().is_some());
+
+        // Two aliases in one family: the pick is deterministic (slot order,
+        // then alias order), not HashMap iteration order.
+        config.providers.models.openrouter.insert(
+            "beta".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("beta-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openrouter.insert(
+            "aaa".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("aaa-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(config.resolve_default_model().as_deref(), Some("aaa-model"),);
     }
 
     #[test]
@@ -35004,6 +35033,7 @@ group_policy = "disabled"
             ("output_per_mtok", f64::NAN),
             ("cached_input_per_mtok", f64::INFINITY),
             ("input_per_mtok", f64::MAX),
+            ("cache_write_per_mtok", f64::MAX),
         ] {
             let mut rates = CostRatesConfig::default();
             rates.providers.models.openai.insert(
@@ -35012,6 +35042,7 @@ group_policy = "disabled"
                     input_per_mtok: (field == "input_per_mtok").then_some(value),
                     output_per_mtok: (field == "output_per_mtok").then_some(value),
                     cached_input_per_mtok: (field == "cached_input_per_mtok").then_some(value),
+                    cache_write_per_mtok: (field == "cache_write_per_mtok").then_some(value),
                 },
             );
             let error = validate_config_with_cost_rates(rates)
@@ -35073,6 +35104,7 @@ group_policy = "disabled"
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.0),
+                cache_write_per_mtok: Some(0.0),
             },
         );
         rates.providers.tts.openai.insert(
@@ -35107,6 +35139,7 @@ group_policy = "disabled"
                 input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.0),
+                cache_write_per_mtok: Some(0.0),
             },
         );
 

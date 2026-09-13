@@ -358,6 +358,10 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.target_tool.requires_unrestricted_principal()
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }

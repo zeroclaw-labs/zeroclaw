@@ -151,6 +151,8 @@ pub struct ScopedAssembled {
     /// Live handle to the activated deferred-MCP set (present only when a deferred
     /// `tool_search` tool was registered).
     pub activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    /// The same search instance exposed in the registry, for session narrowing.
+    pub tool_search_handle: Option<Arc<tools::ToolSearchTool>>,
     pub mcp_tool_names: HashSet<String>,
 }
 
@@ -303,6 +305,7 @@ impl ScopedToolRegistry {
         // `from_config` injects it into the Agent's distinct pinned-section slot.
         let mut pinned_section = String::new();
         let mut activated_handle: Option<Arc<std::sync::Mutex<ActivatedToolSet>>> = None;
+        let mut tool_search_handle = None;
         let mut mcp_elevation_arcs: Vec<Arc<dyn Tool>> = Vec::new();
         // MCP-origin ground truth for the tool_filter_groups gates; see
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
@@ -521,7 +524,9 @@ impl ScopedToolRegistry {
                                 }
                             }));
                         }
-                        tools_registry.push(Box::new(tool_search));
+                        let tool_search = Arc::new(tool_search);
+                        tool_search_handle = Some(Arc::clone(&tool_search));
+                        tools_registry.push(Box::new(tools::ArcToolRef(tool_search)));
                     }
                 } else {
                     let names = registry.tool_names();
@@ -616,6 +621,11 @@ impl ScopedToolRegistry {
             }
         }
 
+        if caller_allowed.is_some_and(|allowed| !allowed.iter().any(|name| name == "tool_search")) {
+            tools_registry.retain(|tool| tool.name() != "tool_search");
+            deferred_section.clear();
+        }
+
         ScopedAssembled {
             registry: ScopedToolRegistry(tools_registry),
             delegate_handle,
@@ -627,6 +637,7 @@ impl ScopedToolRegistry {
             deferred_section,
             pinned_section,
             activated_handle,
+            tool_search_handle,
             mcp_tool_names,
         }
     }
@@ -1548,6 +1559,7 @@ mod tests {
             deferred_section: deferred.to_string(),
             pinned_section: pinned.to_string(),
             activated_handle: None,
+            tool_search_handle: None,
             mcp_tool_names: HashSet::new(),
         }
     }
