@@ -508,7 +508,11 @@ impl ScopedToolRegistry {
                         );
                         let mut tool_search =
                             tools::ToolSearchTool::new(filtered_deferred, activated);
-                        if let Some(policy) = mcp_policy {
+                        if let Some(mut policy) = mcp_policy {
+                            // The caller ceiling already materialized the stub
+                            // registry above. Do not retain a second, stale
+                            // principal selector in the long-lived search tool.
+                            policy.caller_allowed = None;
                             tool_search = tool_search.with_access_policy(policy);
                         }
                         // Newly-activated deferred tools are also exposed to the
