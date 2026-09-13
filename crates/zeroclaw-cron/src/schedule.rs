@@ -1,4 +1,4 @@
-use crate::cron::Schedule;
+use crate::Schedule;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cron::Schedule as CronExprSchedule;

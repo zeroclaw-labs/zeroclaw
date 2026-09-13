@@ -1,7 +1,6 @@
 use super::cron_common::{
     AT_DESCRIPTION, CRON_TZ_DESCRIPTION, cron_add_output, deserialize_schedule_arg,
 };
-use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -10,6 +9,8 @@ use std::sync::Arc;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_cron as cron;
+use zeroclaw_cron::{DeliveryConfig, JobType, Schedule, SessionTarget};
 
 pub struct CronAddTool {
     config: Arc<Config>,

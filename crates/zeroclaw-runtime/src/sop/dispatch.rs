@@ -1329,7 +1329,7 @@ impl SopCronCache {
             for trigger in &sop.triggers {
                 if let super::types::SopTrigger::Cron { expression } = trigger {
                     // Normalize 5-field crontab to 6-field (prepend seconds)
-                    let normalized = match crate::cron::normalize_expression(expression) {
+                    let normalized = match zeroclaw_cron::normalize_expression(expression) {
                         Ok(n) => n,
                         Err(e) => {
                             ::zeroclaw_log::record!(
