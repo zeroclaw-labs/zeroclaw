@@ -5658,6 +5658,20 @@ async fn persist_acp_turn(
         {
             messages.clone()
         }
+        Err(error) => {
+            // A failed turn still has an accepted prompt and possibly
+            // completed tool exchanges; durable history must show what was
+            // attempted. Keep only replay-safe content, then mark the turn
+            // failed so the transcript reads as one bounded event.
+            let mut kept = filter_replay_safe_failed_turn_messages(error.turn_messages());
+            if kept.is_empty() {
+                return None;
+            }
+            kept.push(ConversationMessage::Chat(ChatMessage::system(
+                zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER,
+            )));
+            kept
+        }
         _ => return None,
     };
     let store = Arc::clone(store);
@@ -5667,6 +5681,90 @@ async fn persist_acp_turn(
         Ok(Err(error)) => Some(error.to_string()),
         Err(join) => Some(join.to_string()),
     }
+}
+
+/// Reduce a failed turn's messages to what a later provider request can
+/// safely replay once they are restored into a session: the user prompt,
+/// plain assistant text, and tool exchanges whose every call has a matching
+/// result in this same turn. An assistant `tool_use` whose result never
+/// arrived (the common failure shape) is dropped, as is any `tool_result`
+/// with no surviving call — an unmatched tool_use or tool_result on restore
+/// poisons the next provider request. Plain chat rows (user, assistant)
+/// always survive; if nothing survives at all the caller persists nothing.
+fn filter_replay_safe_failed_turn_messages(
+    messages: &[ConversationMessage],
+) -> Vec<ConversationMessage> {
+    // Result entries in batch order, each carrying the index of its
+    // ToolResults message. `consumed` pairs each result to exactly one call
+    // (first unmatched match wins), so duplicated ids pair in order.
+    let mut results: Vec<(usize, String)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if let ConversationMessage::ToolResults(entries) = message {
+            for entry in entries {
+                results.push((index, entry.tool_call_id.clone()));
+            }
+        }
+    }
+    let mut consumed = vec![false; results.len()];
+
+    let mut kept = Vec::with_capacity(messages.len());
+    let mut result_cursor = 0usize;
+    for (index, message) in messages.iter().enumerate() {
+        match message {
+            ConversationMessage::Chat(_) => kept.push(message.clone()),
+            ConversationMessage::AssistantToolCalls {
+                text: _,
+                tool_calls,
+                reasoning_content: _,
+            } => {
+                // The exchange survives only when EVERY call resolves to an
+                // unconsumed result appearing later in the batch. Partial
+                // pairing drops the whole exchange — and, with it, that
+                // exchange's results — never a half-paired message.
+                let mut matched: Vec<usize> = Vec::new();
+                let mut complete = true;
+                for call in tool_calls {
+                    let mut found = None;
+                    for (position, (result_index, result_id)) in results.iter().enumerate() {
+                        if *result_index > index && result_id == &call.id && !consumed[position] {
+                            found = Some(position);
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(position) => matched.push(position),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if !complete {
+                    continue;
+                }
+                for position in matched {
+                    consumed[position] = true;
+                }
+                kept.push(message.clone());
+            }
+            ConversationMessage::ToolResults(entries) => {
+                // This message's entries occupy the next `entries.len()`
+                // flattened positions; keep only those whose call survived.
+                let start = result_cursor;
+                result_cursor += entries.len();
+                let mut surviving = Vec::new();
+                for (offset, entry) in entries.iter().enumerate() {
+                    if consumed[start + offset] {
+                        surviving.push(entry.clone());
+                    }
+                }
+                if !surviving.is_empty() {
+                    kept.push(ConversationMessage::ToolResults(surviving));
+                }
+            }
+        }
+    }
+    kept
 }
 
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
@@ -10139,7 +10237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_persistence_skips_empty_and_failed_turns() {
+    async fn acp_persistence_skips_empty_and_messageless_failed_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
@@ -10152,8 +10250,224 @@ mod tests {
         });
         assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
 
-        let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
+        // Message-less failure (e.g. blank-prompt refusal): nothing reached
+        // history, so nothing is persisted — not even a bare marker.
+        let failed = Err(crate::rpc::turn::TurnError::AgentError {
+            message: "failed".into(),
+            messages: Vec::new(),
+        });
         assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert!(
+            store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_acp_turn_keeps_failed_turn_prompt_and_completed_tool_exchange() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "failed-turn-pairs";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        // The issue's shape: prompt accepted, one tool call completed, then
+        // the provider died mid-second-call. The trailing tool_use has no
+        // result, so it must not reach the store.
+        let failed = Err(crate::rpc::turn::TurnError::AgentError {
+            message: "provider exploded".into(),
+            messages: vec![
+                ConversationMessage::Chat(ChatMessage::user("write the file")),
+                ConversationMessage::AssistantToolCalls {
+                    text: Some("writing now".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "tc-1".into(),
+                        name: "file_write".into(),
+                        arguments: r#"{"path":"a.txt"}"#.into(),
+                        extra_content: None,
+                    }],
+                    reasoning_content: None,
+                },
+                ConversationMessage::ToolResults(vec![ToolResultMessage {
+                    tool_call_id: "tc-1".into(),
+                    content: "wrote 12 bytes".into(),
+                    tool_name: "file_write".into(),
+                }]),
+                ConversationMessage::AssistantToolCalls {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "tc-2".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"ls"}"#.into(),
+                        extra_content: None,
+                    }],
+                    reasoning_content: None,
+                },
+            ],
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            4,
+            "user prompt + completed exchange + failed marker, and NOT the \
+             trailing unmatched tool_use"
+        );
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(m) if m.role == "user" && m.content == "write the file"
+        ));
+        match &data.messages[1] {
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "tc-1", "completed call survives");
+            }
+            _ => panic!("expected the completed AssistantToolCalls exchange"),
+        }
+        match &data.messages[2] {
+            ConversationMessage::ToolResults(results) => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].tool_call_id, "tc-1");
+            }
+            _ => panic!("expected the completed ToolResults exchange"),
+        }
+        assert!(
+            matches!(
+                &data.messages[3],
+                ConversationMessage::Chat(m)
+                    if m.role == "system"
+                        && m.content == zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER
+            ),
+            "the failed turn ends with the system marker row"
+        );
+
+        // Provider-replay view: no dangling tool_use anywhere in the durable
+        // rows — the only tool call present is paired with its result.
+        let mut call_ids = std::collections::HashSet::new();
+        let mut result_ids = std::collections::HashSet::new();
+        for message in &data.messages {
+            match message {
+                ConversationMessage::AssistantToolCalls { tool_calls, .. } => {
+                    for call in tool_calls {
+                        call_ids.insert(call.id.clone());
+                    }
+                }
+                ConversationMessage::ToolResults(results) => {
+                    for result in results {
+                        result_ids.insert(result.tool_call_id.clone());
+                    }
+                }
+                ConversationMessage::Chat(_) => {}
+            }
+        }
+        assert_eq!(
+            call_ids, result_ids,
+            "every durable tool_use must have its tool_result after the filter"
+        );
+        assert_eq!(call_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn persist_acp_turn_keeps_prompt_only_failed_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "failed-turn-prompt-only";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let failed = Err(crate::rpc::turn::TurnError::AgentError {
+            message: "all providers failed".into(),
+            messages: vec![ConversationMessage::Chat(ChatMessage::user(
+                "the prompt the issue is about",
+            ))],
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "prompt + marker, even with no tools"
+        );
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(m) if m.role == "user" && m.content == "the prompt the issue is about"
+        ));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m)
+                if m.role == "system"
+                    && m.content == zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER
+        ));
+    }
+
+    #[tokio::test]
+    async fn persist_acp_turn_keeps_partial_assistant_text_from_failed_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "failed-turn-partial-text";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        // A stream that died after visible output: the agent loop already
+        // committed the partial as an assistant row with its interruption
+        // marker appended. Persistence treats that text as opaque and must
+        // store it byte-identically, with the failure marker after it.
+        let partial = "The first half of the answer was\n\n[stream interrupted]";
+        let failed = Err(crate::rpc::turn::TurnError::AgentError {
+            message: "provider stream failed".into(),
+            messages: vec![
+                ConversationMessage::Chat(ChatMessage::user("finish the thought")),
+                ConversationMessage::Chat(ChatMessage::assistant(partial)),
+            ],
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+
+        let data = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            3,
+            "prompt + partial assistant text + marker"
+        );
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(m) if m.role == "user" && m.content == "finish the thought"
+        ));
+        assert!(
+            matches!(
+                &data.messages[1],
+                ConversationMessage::Chat(m) if m.role == "assistant" && m.content == partial
+            ),
+            "partial assistant text survives unchanged"
+        );
+        assert!(
+            matches!(
+                &data.messages[2],
+                ConversationMessage::Chat(m)
+                    if m.role == "system"
+                        && m.content == zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER
+            ),
+            "the failure marker is the last row"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_acp_turn_panicked_persists_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "failed-turn-panicked";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+
+        let panicked = Err(crate::rpc::turn::TurnError::Panicked("join failed".into()));
+        assert_eq!(persist_acp_turn(&store, sid, &panicked).await, None);
         assert!(
             store
                 .load_session(sid)

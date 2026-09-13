@@ -6426,6 +6426,88 @@ mod tests {
     }
 
     #[test]
+    fn seed_conversation_history_skips_failed_turn_marker_from_provider_replay() {
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(provider)
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // The durable shape a failed turn leaves behind: prompt, complete
+        // tool exchange, fixed system marker. The marker must be dropped
+        // from live history (the system prompt is rebuilt fresh) while the
+        // complete pair survives intact for the next provider request.
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("write the file")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::system(
+                zeroclaw_infra::acp_session_store::FAILED_TURN_MARKER,
+            )),
+        ];
+
+        agent.seed_conversation_history(messages);
+
+        let non_system: Vec<_> = agent
+            .history()
+            .iter()
+            .filter(|m| !matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+            .collect();
+
+        assert_eq!(
+            non_system.len(),
+            3,
+            "prompt + tool call + tool result; the marker row must not \
+             become a provider-replay message"
+        );
+        assert!(matches!(
+            non_system[0],
+            ConversationMessage::Chat(c) if c.role == "user"
+        ));
+        assert!(
+            matches!(non_system[1], ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc-1")
+        );
+        assert!(
+            matches!(non_system[2], ConversationMessage::ToolResults(r) if r[0].tool_call_id == "tc-1")
+        );
+    }
+
+    #[test]
     fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();

@@ -22,10 +22,20 @@ pub enum TurnOutcome {
 #[derive(Debug)]
 pub enum TurnError {
     Panicked(String),
-    AgentError(String),
+    AgentError {
+        message: String,
+        /// Messages the turn produced before failing: the accepted user
+        /// prompt plus whatever assistant/tool exchanges completed. Carried
+        /// so persistence can keep the prompt and completed exchanges; an
+        /// empty vec means nothing reached history (e.g. blank-prompt
+        /// refusal).
+        messages: Vec<ConversationMessage>,
+    },
     TerminalCompletion {
         diagnostic: String,
         user_message: String,
+        /// Same contract as `AgentError.messages`.
+        messages: Vec<ConversationMessage>,
     },
 }
 
@@ -33,7 +43,9 @@ impl std::fmt::Display for TurnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Panicked(msg) => write!(f, "Turn task panicked: {msg}"),
-            Self::AgentError(msg) => write!(f, "Agent turn failed: {msg}"),
+            Self::AgentError { message, .. } => {
+                write!(f, "Agent turn failed: {message}")
+            }
             Self::TerminalCompletion { diagnostic, .. } => {
                 write!(f, "Agent turn failed: {diagnostic}")
             }
@@ -49,7 +61,19 @@ impl TurnError {
     pub fn user_message(&self) -> Option<&str> {
         match self {
             Self::TerminalCompletion { user_message, .. } => Some(user_message),
-            Self::Panicked(_) | Self::AgentError(_) => None,
+            Self::Panicked(_) | Self::AgentError { .. } => None,
+        }
+    }
+
+    /// Messages the turn produced before the failure (accepted prompt plus
+    /// completed assistant/tool exchanges). Empty for `Panicked`, which by
+    /// definition has none.
+    pub fn turn_messages(&self) -> &[ConversationMessage] {
+        match self {
+            Self::AgentError { messages, .. } | Self::TerminalCompletion { messages, .. } => {
+                messages
+            }
+            Self::Panicked(_) => &[],
         }
     }
 }
@@ -230,16 +254,24 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
-        Err(StreamedTurnError { error, .. }) => {
+        Err(StreamedTurnError {
+            error,
+            new_messages,
+            ..
+        }) => {
             if let Some(user_message) =
                 crate::agent::terminal_completion_error_message(&error, None)
             {
                 return Err(TurnError::TerminalCompletion {
                     diagnostic: error.to_string(),
                     user_message,
+                    messages: new_messages,
                 });
             }
-            Err(TurnError::AgentError(error.to_string()))
+            Err(TurnError::AgentError {
+                message: error.to_string(),
+                messages: new_messages,
+            })
         }
     }
 }
@@ -439,10 +471,99 @@ mod tests {
         };
         let outcome = outcome_from_task_result(Err(err), String::new());
         assert!(
-            matches!(outcome, Err(TurnError::AgentError(_))),
+            matches!(outcome, Err(TurnError::AgentError { .. })),
             "a genuine agent failure must surface as an error, not a silent \
              cancel"
         );
+    }
+
+    #[test]
+    fn agent_error_carries_the_failed_turn_messages() {
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+        let new_messages = vec![
+            ConversationMessage::Chat(zeroclaw_providers::ChatMessage::user("do the thing")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("running".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "file.txt".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-2".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"echo hi"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+        ];
+        let err = StreamedTurnError {
+            error: anyhow::Error::msg("provider exploded"),
+            committed_response: String::new(),
+            new_messages,
+        };
+        match outcome_from_task_result(Err(err), String::new()) {
+            Err(TurnError::AgentError { message, messages }) => {
+                assert!(
+                    message.contains("provider exploded"),
+                    "diagnostic text must survive the repack: {message}"
+                );
+                assert_eq!(
+                    messages.len(),
+                    4,
+                    "the accepted prompt and every exchange the turn produced \
+                     before the failure must be carried for persistence"
+                );
+                assert!(matches!(
+                    &messages[0],
+                    ConversationMessage::Chat(m) if m.role == "user"
+                ));
+                assert!(matches!(
+                    &messages[3],
+                    ConversationMessage::AssistantToolCalls { .. }
+                ));
+            }
+            _ => panic!("expected AgentError carrying the turn messages"),
+        }
+    }
+
+    #[test]
+    fn terminal_completion_carries_the_failed_turn_messages() {
+        let new_messages = vec![ConversationMessage::Chat(
+            zeroclaw_providers::ChatMessage::user("summarize this"),
+        )];
+        let err = StreamedTurnError {
+            error: anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ),
+            committed_response: String::new(),
+            new_messages,
+        };
+        match outcome_from_task_result(Err(err), String::new()) {
+            Err(TurnError::TerminalCompletion {
+                messages,
+                user_message,
+                ..
+            }) => {
+                assert_eq!(messages.len(), 1);
+                assert!(
+                    !user_message.is_empty(),
+                    "terminal completion keeps its localized delivery text"
+                );
+            }
+            _ => panic!("expected TerminalCompletion carrying the turn messages"),
+        }
     }
 
     #[test]

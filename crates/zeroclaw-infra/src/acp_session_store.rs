@@ -9,6 +9,15 @@ use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, T
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_log::{Action, EventOutcome};
 
+/// Fixed transcript marker appended after a turn that ended in an agent or
+/// provider error, stored as a `role == "system"` chat row. System rows are
+/// excluded from provider replay on restore (`Agent::seed_conversation_history_with_event`
+/// skips them), so this marker is the durable boundary of the failed turn,
+/// not something the next provider request sees. Distinct from the localized
+/// interrupted-turn markers (assistant text), so the two are tellable apart
+/// in the transcript.
+pub const FAILED_TURN_MARKER: &str = "turn failed";
+
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
 /// records the call args; the 'out' row records the result. Two append-only
 /// rows per call, correlated by the provider-issued `tool_call_id`.
@@ -1231,6 +1240,48 @@ mod tests {
             }
             other => panic!("expected ToolResults, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn append_turn_round_trips_failed_turn_system_marker_row() {
+        // The durable shape a failed turn leaves behind: accepted prompt,
+        // one complete tool exchange, then the fixed `system` marker row.
+        // load_messages must return them verbatim — the provider-replay
+        // exclusion of system rows happens at seed time (runtime side), not
+        // here; the transcript reads the marker.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-failed", "alpha", "/tmp/proj")
+            .unwrap();
+
+        let msgs = vec![
+            ConversationMessage::Chat(ChatMessage::user("write the file")),
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc-1".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "tc-1".into(),
+                content: "ok".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::system(FAILED_TURN_MARKER)),
+        ];
+        store.append_turn("sess-failed", &msgs).unwrap();
+
+        let data = store.load_session("sess-failed").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 4);
+        assert!(matches!(
+            &data.messages[3],
+            ConversationMessage::Chat(m)
+                if m.role == "system" && m.content == FAILED_TURN_MARKER
+        ));
     }
 
     #[test]
