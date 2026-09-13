@@ -625,6 +625,7 @@ impl OllamaModelProvider {
                 input_tokens: response.prompt_eval_count,
                 output_tokens: response.eval_count,
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             })
         } else {
             None

@@ -87,7 +87,7 @@ libc = "0.2"
 rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
-tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "test-util"] }
 # Real WebSocket client used to drive the `/acp` route end-to-end in
 # acp::tests (front-door proof for the gateway ACP surface). A plain
 # non-TLS loopback connection needs only the `connect` feature, no TLS.

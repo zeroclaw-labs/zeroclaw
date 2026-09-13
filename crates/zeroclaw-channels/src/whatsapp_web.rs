@@ -2687,16 +2687,23 @@ impl Channel for WhatsAppWebChannel {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let skip_reason = crate::util::voice_reply_skip_reason(content);
+            if let Some(reason) = skip_reason {
+                // Stable literal per the logging contract: the classification
+                // and per-event measurements ride solely in `attributes` above.
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_attrs(::serde_json::json!({
+                            "recipient": message.recipient,
+                            "reason": reason,
+                            "content_len": content.len(),
+                        })),
+                    "voice reply skipped"
+                );
+            }
 
-            if is_substantive {
+            if skip_reason.is_none() {
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),
@@ -3446,6 +3453,7 @@ impl Channel for WhatsAppWebChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         if binding.is_group {
             // Say so in the prompt. The token is now readable by everyone in
@@ -5928,6 +5936,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         let err = channel
@@ -5990,6 +5999,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: "ls -la".to_string(),
                 raw_arguments: None,
+                position: None,
             };
             channel
                 .request_approval(recipient, &request)
@@ -6048,7 +6058,7 @@ mod tests {
         let dm_token = token_of(&dm);
         assert_eq!(
             dm,
-            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la"),
+            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la", None),
             "the direct-chat prompt must be exactly what the shared builder produces"
         );
 
@@ -6066,7 +6076,7 @@ mod tests {
             group,
             format!(
                 "{}\n\n{group_warning}",
-                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la")
+                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la", None)
             ),
             "the group prompt must be the shared builder's output plus exactly one warning"
         );
@@ -6381,6 +6391,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: format!("echo {word}"),
                 raw_arguments: None,
+                position: None,
             };
 
             let asking = channel.request_approval(&chat, &request);
@@ -6519,6 +6530,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let err = channel
             .request_approval("1@s.whatsapp.net", &request)
@@ -7383,6 +7395,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         let decision = channel
@@ -7460,6 +7473,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: "ls".to_string(),
                 raw_arguments: None,
+                position: None,
             };
 
             let started = tokio::time::Instant::now();

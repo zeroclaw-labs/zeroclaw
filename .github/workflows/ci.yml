@@ -703,6 +703,14 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-qq` is outside `default-channels`, so the workspace run above
+      # does not execute QQ's feature-gated library regressions. This step is
+      # what actually executes the health probe's tests.
+      - name: Run QQ channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-qq --lib qq::tests::health_check"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   windows-test-scope:
     name: Advisory Windows test selection
