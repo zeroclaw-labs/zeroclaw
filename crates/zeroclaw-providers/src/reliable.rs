@@ -62,6 +62,12 @@ struct ReliableEntryId {
     entry_index: usize,
 }
 
+#[derive(Debug, Clone)]
+struct StreamRecoveryFailure {
+    diagnostic: ProviderErrorDiagnostic,
+    image_rejection: Option<super::traits::ProviderImageInputRejected>,
+}
+
 /// Call-scoped outcome retained independently of the provider result.
 ///
 /// In particular, callers must extract it before propagating an error: a
@@ -72,7 +78,7 @@ pub(crate) struct ReliableCallAccounting {
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
     stream_recovery_semantic_empty_permission: bool,
-    stream_recovery_failure: Option<ProviderErrorDiagnostic>,
+    stream_recovery_failure: Option<StreamRecoveryFailure>,
 }
 
 impl ReliableCallAccounting {
@@ -187,7 +193,14 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
 /// non-streaming recovery candidates.
 pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
     let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
-        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+        accounting.lock().stream_recovery_failure = Some(StreamRecoveryFailure {
+            diagnostic: provider_error_diagnostic(error),
+            image_rejection: error.chain().find_map(|source| {
+                source
+                    .downcast_ref::<super::traits::ProviderImageInputRejected>()
+                    .cloned()
+            }),
+        });
     });
 }
 
@@ -197,7 +210,7 @@ fn stream_recovery_was_semantic_empty() -> bool {
         .unwrap_or(false)
 }
 
-fn stream_recovery_failure_diagnostic() -> Option<ProviderErrorDiagnostic> {
+fn stream_recovery_failure() -> Option<StreamRecoveryFailure> {
     RELIABLE_CALL_ACCOUNTING
         .try_with(|accounting| accounting.lock().stream_recovery_failure.clone())
         .ok()
@@ -451,6 +464,13 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    if err
+        .chain()
+        .any(|source| source.is::<super::traits::ProviderImageInputRejected>())
+    {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -508,6 +528,27 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
 
     has_model_not_found_hint(&msg_lower)
+}
+
+fn is_provider_image_input_rejected(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.is::<super::traits::ProviderImageInputRejected>())
+}
+
+fn record_terminal_candidate_cause(
+    final_cause: &mut Option<anyhow::Error>,
+    all_terminal_causes_are_image_rejections: &mut bool,
+    cause: anyhow::Error,
+) {
+    let is_image_rejection = is_provider_image_input_rejected(&cause);
+    if is_image_rejection {
+        if *all_terminal_causes_are_image_rejections {
+            *final_cause = Some(cause);
+        }
+    } else {
+        *all_terminal_causes_are_image_rejections = false;
+        *final_cause = Some(cause);
+    }
 }
 
 /// Check if an error indicates an authentication/authorization failure.
@@ -1464,6 +1505,13 @@ fn reliable_terminal_error_with_cause(
     final_cause: Option<anyhow::Error>,
 ) -> anyhow::Error {
     let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
+    let stream_recovery_failure = stream_recovery_failure();
+    let final_cause = final_cause.filter(|cause| {
+        !is_provider_image_input_rejected(cause)
+            || stream_recovery_failure
+                .as_ref()
+                .is_none_or(|failure| failure.image_rejection.is_some())
+    });
     if !final_cause_is_semantic_empty && let Some(cause) = final_cause {
         let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
             provider,
@@ -1480,16 +1528,28 @@ fn reliable_terminal_error_with_cause(
         }
         return terminal_failure;
     }
-    if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
-    {
-        let terminal_failure = anyhow::Error::new(
-            ReliableProviderTerminalFailure::new(
-                ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
-                diagnostic.endpoint,
-                failure_aggregate(&failures),
-            )
-            .with_provider(provider.unwrap_or_default()),
-        );
+    if !final_cause_is_semantic_empty && let Some(recovery_failure) = stream_recovery_failure {
+        let aggregate = failure_aggregate(&failures);
+        let terminal_failure = match recovery_failure.image_rejection {
+            Some(image_rejection) => {
+                anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
+                    provider,
+                    recovery_failure.diagnostic,
+                    aggregate,
+                    anyhow::Error::new(image_rejection),
+                ))
+            }
+            None => anyhow::Error::new(
+                ReliableProviderTerminalFailure::new(
+                    ReliableProviderTerminalFailureKind::from_diagnostic_kind(
+                        recovery_failure.diagnostic.kind,
+                    ),
+                    recovery_failure.diagnostic.endpoint,
+                    aggregate,
+                )
+                .with_provider(provider.unwrap_or_default()),
+            ),
+        };
         if let Some(usage) = rejected_attempt_usage {
             return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
                 usage,
@@ -1987,6 +2047,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut all_terminal_causes_are_image_rejections = true;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -2040,6 +2101,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             if attempt > 0
@@ -2107,6 +2170,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             final_cause_is_semantic_empty = false;
@@ -2181,14 +2246,22 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
@@ -2218,8 +2291,14 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
-                            final_cause = Some(e);
-                            final_cause_provider = Some(entry.candidate_name().to_string());
+                            if attempt == self.max_retries {
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                            }
                         }
                     }
                 }
@@ -2266,6 +2345,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut all_terminal_causes_are_image_rejections = true;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -2316,6 +2396,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             if attempt > 0
@@ -2384,8 +2466,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
-                                final_cause = Some(e);
-                                final_cause_provider = Some(entry.candidate_name().to_string());
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             final_cause_is_semantic_empty = false;
@@ -2472,14 +2554,22 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
@@ -2509,8 +2599,14 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
-                            final_cause = Some(e);
-                            final_cause_provider = Some(entry.candidate_name().to_string());
+                            if attempt == self.max_retries {
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                            }
                         }
                     }
                 }
@@ -2652,6 +2748,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut all_terminal_causes_are_image_rejections = true;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
@@ -2710,6 +2807,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             if let Some(usage) = rejected_attempt_usage.take()
@@ -2783,6 +2882,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             final_cause_is_semantic_empty = false;
@@ -2869,14 +2970,22 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
@@ -2906,8 +3015,14 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
-                            final_cause = Some(e);
-                            final_cause_provider = Some(entry.candidate_name().to_string());
+                            if attempt == self.max_retries {
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                            }
                         }
                     }
                 }
@@ -2953,6 +3068,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
         let mut final_cause_provider = None;
+        let mut all_terminal_causes_are_image_rejections = true;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
@@ -3015,6 +3131,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             if let Some(usage) = rejected_attempt_usage.take()
@@ -3088,6 +3206,8 @@ impl ModelProvider for ReliableModelProvider {
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
+                                all_terminal_causes_are_image_rejections = false;
+                                final_cause = None;
                                 break;
                             }
                             final_cause_is_semantic_empty = false;
@@ -3174,14 +3294,22 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
-                                final_cause = Some(e);
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
@@ -3211,8 +3339,14 @@ impl ModelProvider for ReliableModelProvider {
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
-                            final_cause = Some(e);
-                            final_cause_provider = Some(entry.candidate_name().to_string());
+                            if attempt == self.max_retries {
+                                record_terminal_candidate_cause(
+                                    &mut final_cause,
+                                    &mut all_terminal_causes_are_image_rejections,
+                                    e,
+                                );
+                                final_cause_provider = Some(entry.candidate_name().to_string());
+                            }
                         }
                     }
                 }
@@ -3594,6 +3728,40 @@ mod tests {
         fail_until_attempt: usize,
         response: &'static str,
         error: &'static str,
+    }
+
+    struct ImageRejectingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRejectingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(
+                crate::traits::ProviderImageInputRejected::new(None, "image input rejected"),
+            ))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ImageRejectingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ImageRejectingProvider"
+        }
     }
 
     #[async_trait]
@@ -6258,6 +6426,12 @@ mod tests {
 
     #[test]
     fn non_retryable_detects_common_patterns() {
+        let image_rejection = anyhow::Error::new(crate::traits::ProviderImageInputRejected::new(
+            None,
+            "request image rejected",
+        ))
+        .context("candidate failed without an HTTP status in its display text");
+        assert!(is_non_retryable(&image_rejection));
         assert!(is_non_retryable(&anyhow::Error::msg("400 Bad Request")));
         assert!(is_non_retryable(&anyhow::Error::msg("401 Unauthorized")));
         assert!(is_non_retryable(&anyhow::Error::msg("403 Forbidden")));
@@ -6824,6 +6998,257 @@ mod tests {
         assert_eq!(result, "from fallback");
         // Primary should have been called only once (no retries)
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn image_rejection_skips_candidate_retries_but_allows_fallback() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(ImageRejectingProvider {
+                        calls: Arc::clone(&primary_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "fallback accepted the request",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let response = provider
+            .simple_chat("hello", "test-model", Some(0.0))
+            .await
+            .expect("ordinary provider fallback remains available");
+        assert_eq!(response, "fallback accepted the request");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn all_candidate_image_rejections_preserve_typed_terminal_cause() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "first".into(),
+                    Box::new(ImageRejectingProvider {
+                        calls: Arc::clone(&first_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "second".into(),
+                    Box::new(ImageRejectingProvider {
+                        calls: Arc::clone(&second_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let error = provider
+            .simple_chat("hello", "test-model", Some(0.0))
+            .await
+            .expect_err("all candidates reject image input");
+        assert!(
+            error
+                .chain()
+                .any(|source| { source.is::<crate::traits::ProviderImageInputRejected>() })
+        );
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_candidate_failures_do_not_preserve_image_rejection_cause() {
+        let generic_calls = Arc::new(AtomicUsize::new(0));
+        let image_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "generic".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&generic_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "image".into(),
+                    Box::new(ImageRejectingProvider {
+                        calls: Arc::clone(&image_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let error = provider
+            .simple_chat("hello", "test-model", Some(0.0))
+            .await
+            .expect_err("mixed candidate failures remain terminal");
+        assert!(
+            !error
+                .chain()
+                .any(|source| source.is::<crate::traits::ProviderImageInputRejected>())
+        );
+        assert_eq!(generic_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(image_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn later_concrete_recovery_error_supersedes_stream_image_rejection() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "stream-image-rejection".into(),
+                    Box::new(StreamingRecordMock::image_rejection(Arc::clone(
+                        &stream_calls,
+                    ))) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "ordinary-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (result, _) = scope_reliable_call_accounting(async {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let stream_error = anyhow::Error::new(
+                stream
+                    .next()
+                    .await
+                    .expect("stream error event")
+                    .expect_err("stream must reject the image"),
+            );
+            record_stream_recovery_failure(&stream_error);
+            provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        let error = result.expect_err("ordinary fallback remains terminal");
+        assert!(
+            !error
+                .chain()
+                .any(|source| source.is::<crate::traits::ProviderImageInputRejected>())
+        );
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn earlier_stream_error_supersedes_recovery_image_rejection() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "ordinary-stream-error".into(),
+                    Box::new(StreamingRecordMock::error(Arc::clone(&stream_calls)))
+                        as Box<dyn ModelProvider>,
+                ),
+                (
+                    "recovery-image-rejection".into(),
+                    Box::new(ImageRejectingProvider {
+                        calls: Arc::clone(&fallback_calls),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let (result, _) = scope_reliable_call_accounting(async {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                Some(0.0),
+                StreamOptions::new(true),
+            );
+            let stream_error = anyhow::Error::new(
+                stream
+                    .next()
+                    .await
+                    .expect("stream error event")
+                    .expect_err("stream must fail"),
+            );
+            record_stream_recovery_failure(&stream_error);
+            provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    Some(0.0),
+                )
+                .await
+        })
+        .await;
+
+        let error = result.expect_err("image-rejecting fallback remains terminal");
+        assert!(
+            !error
+                .chain()
+                .any(|source| source.is::<crate::traits::ProviderImageInputRejected>())
+        );
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -8851,6 +9276,7 @@ mod tests {
     enum StreamingRecordMode {
         Success,
         Error,
+        ImageRejection,
         UsageThenError,
     }
 
@@ -8959,6 +9385,15 @@ mod tests {
             }
         }
 
+        fn image_rejection(stream_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                stream_calls,
+                observed_models: None,
+                supports: true,
+                mode: StreamingRecordMode::ImageRejection,
+            }
+        }
+
         fn usage_then_error(stream_calls: Arc<AtomicUsize>) -> Self {
             Self {
                 stream_calls,
@@ -9060,6 +9495,10 @@ mod tests {
                 ])
                 .boxed(),
                 StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::ImageRejection => stream::iter(vec![Err(
+                    crate::traits::ProviderImageInputRejected::new(None, "image rejected").into(),
+                )])
+                .boxed(),
                 StreamingRecordMode::UsageThenError => stream::iter(vec![
                     Ok(StreamEvent::Usage(TokenUsage {
                         input_tokens: Some(10),
@@ -9089,7 +9528,9 @@ mod tests {
                     Ok(StreamChunk::final_chunk()),
                 ])
                 .boxed(),
-                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::Error | StreamingRecordMode::ImageRejection => {
+                    stream::iter(vec![Err(Self::stream_error())]).boxed()
+                }
                 StreamingRecordMode::UsageThenError => {
                     stream::iter(vec![Err(Self::stream_error())]).boxed()
                 }
@@ -9111,7 +9552,9 @@ mod tests {
                     Ok(StreamChunk::final_chunk()),
                 ])
                 .boxed(),
-                StreamingRecordMode::Error => stream::iter(vec![Err(Self::stream_error())]).boxed(),
+                StreamingRecordMode::Error | StreamingRecordMode::ImageRejection => {
+                    stream::iter(vec![Err(Self::stream_error())]).boxed()
+                }
                 StreamingRecordMode::UsageThenError => {
                     stream::iter(vec![Err(Self::stream_error())]).boxed()
                 }
