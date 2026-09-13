@@ -52,10 +52,26 @@ pub enum SectionGroup {
 }
 
 impl SectionGroup {
-    /// UI label. These exact strings are what `ConfigSectionEntry.group`
-    /// carries on the wire and what the dashboard's `GROUP_ORDER`
-    /// (web/src/pages/Config.tsx) and the zerocode Config pane group
-    /// by — change one, change all of them together.
+    /// Stable locale-independent key used for ordering and client-side
+    /// localization. Unlike [`Self::label`], this value is safe on the wire.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Foundation => "foundation",
+            Self::Agent => "agent",
+            Self::MultiAgent => "multi_agent",
+            Self::Tools => "tools",
+            Self::Integrations => "integrations",
+            Self::Network => "network",
+            Self::Storage => "storage",
+            Self::Operations => "operations",
+            Self::Other => "other",
+        }
+    }
+
+    /// English UI fallback carried in `ConfigSectionEntry.group`. The web
+    /// dashboard and older clients still group by these labels; newer clients
+    /// should use [`Self::key`] for locale-independent identity and ordering.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -739,6 +755,25 @@ mod tests {
             assert_eq!(g.label(), want);
             assert_eq!(g.to_string(), want);
         }
+    }
+
+    #[test]
+    fn section_group_keys_are_stable_and_unique() {
+        let expected = [
+            "foundation",
+            "agent",
+            "multi_agent",
+            "tools",
+            "integrations",
+            "network",
+            "storage",
+            "operations",
+            "other",
+        ];
+        let actual: Vec<_> = SECTION_GROUPS.iter().map(|group| group.key()).collect();
+        assert_eq!(actual, expected);
+        let unique: std::collections::HashSet<_> = actual.iter().copied().collect();
+        assert_eq!(unique.len(), actual.len());
     }
 
     #[test]
