@@ -633,6 +633,16 @@ fn normalize_provider_type(
         "stepfun" | "step" => Some("stepfun"),
         // KiloCli: was kilocli|kilo-cli
         "kilocli" | "kilo-cli" => Some("kilocli"),
+        // OpenAI chat-completions: V2's `Provider::kind` default/legacy
+        // literal for a plain OpenAI-compatible endpoint was `openai-chat`
+        // (see zeroclaw-providers' wire-kind constant), never folded into
+        // the V3 typed-family name. Left unmapped, `dispatch_family_factory`
+        // rejects it post-migration with "Unknown model_provider family:
+        // openai-chat" for any config that never rewrote `kind` to the V3
+        // spelling -- exactly the case for a config carrying only `uri` +
+        // `model` (no `kind` at all) once written back out with the old
+        // default literal, or hand-written configs copied from older docs.
+        "openai-chat" | "openai_chat" => Some("openai"),
         _ => None,
     };
 

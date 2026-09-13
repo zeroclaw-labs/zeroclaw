@@ -164,6 +164,57 @@ api_key = "sk-cc-v2-test"
 }
 
 #[test]
+fn openai_chat_folds_under_openai() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.openai-chat]
+api_key = "sk-oc-v2-test"
+uri = "http://127.0.0.1:8002/v1"
+model = "coder"
+"#,
+    );
+    let model_providers = lookup_dotted(&v3, "providers.models")
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    let entry = model_providers
+        .get("openai")
+        .and_then(toml::Value::as_table)
+        .and_then(|a| a.get("default"))
+        .and_then(toml::Value::as_table)
+        .expect("openai-chat folded under providers.models.openai.default");
+    assert_eq!(
+        entry.get("uri").and_then(toml::Value::as_str),
+        Some("http://127.0.0.1:8002/v1")
+    );
+    assert!(
+        !model_providers.contains_key("openai-chat"),
+        "standalone openai-chat provider must not appear in V3"
+    );
+}
+
+#[test]
+fn openai_underscore_chat_folds_under_openai() {
+    let v3 = migrate_v2(
+        r#"
+[providers.models.openai_chat]
+api_key = "sk-ocu-v2-test"
+uri = "http://127.0.0.1:8006/v1"
+"#,
+    );
+    let model_providers = lookup_dotted(&v3, "providers.models")
+        .and_then(toml::Value::as_table)
+        .expect("providers.models present after V2→V3");
+    assert!(
+        model_providers
+            .get("openai")
+            .and_then(toml::Value::as_table)
+            .and_then(|a| a.get("default"))
+            .is_some(),
+        "openai_chat folded under providers.models.openai.default"
+    );
+}
+
+#[test]
 fn v1_model_routes_preserved_at_providers_level() {
     let cfg = v3_config();
     assert!(
