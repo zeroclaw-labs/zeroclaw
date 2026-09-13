@@ -151,19 +151,6 @@ impl ProviderRegistry {
     /// than silently shadowed.
     pub fn register(&mut self, provider: Arc<dyn AuthProvider>) -> anyhow::Result<()> {
         let name = provider.name().to_owned();
-        // An OIDC provider derives its authorization mapping from the `<alias>`
-        // in its `oidc.<alias>` name, so the registry enforces that canonical
-        // shape here rather than trusting each provider to honor the convention.
-        // Without this, an OIDC-method provider registered under a noncanonical
-        // name would slip past the alias-provenance boundary in
-        // `bind_provenance` and borrow an arbitrary issuer's profile mapping.
-        if provider.method() == AuthMethod::Oidc
-            && name.strip_prefix("oidc.").is_none_or(str::is_empty)
-        {
-            anyhow::bail!(
-                "OIDC auth provider must be registered under a canonical `oidc.<alias>` name, got {name:?}"
-            );
-        }
         if self.by_name.contains_key(&name) {
             anyhow::bail!("auth provider name {name:?} is already registered");
         }

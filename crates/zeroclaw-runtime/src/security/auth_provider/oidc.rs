@@ -9,8 +9,8 @@
 //!   the resolver.
 //! - Only access tokens authenticate the bearer path. A token carrying the
 //!   ID-token `nonce` marker is rejected even when its signature, issuer,
-//!   and audience are valid; `require_at_jwt` additionally demands the
-//!   RFC 9068 `at+jwt` type.
+//!   and audience are valid; the bearer profile also requires an RFC 9068
+//!   typed access token.
 //! - Offline (JWKS) validation cannot see revocation, so the identity's
 //!   expiry is capped at the earlier of the token `exp` and
 //!   `max_auth_lifetime_secs`. Introspection identities carry a
@@ -37,14 +37,23 @@ use zeroclaw_config::schema::{OidcConfig, OidcValidation};
 
 use super::{AuthProvider, Credential};
 
-/// `amr` values accepted as evidence of a completed second factor.
-const MFA_AMR_VALUES: &[&str] = &["mfa", "otp", "hwk"];
-
 /// Allowed skew between our clock and the IdP's when checking `exp`/`nbf`.
 const CLOCK_LEEWAY_SECS: u64 = 30;
 
 /// Minimum interval between JWKS refreshes triggered by unknown key ids.
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// A known key is still refreshed periodically, so a same-`kid` rotation or
+/// removal cannot remain trusted indefinitely.
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Bound all untrusted OIDC metadata and introspection payloads, even when a
+/// peer omits Content-Length or uses chunked transfer encoding.
+const MAX_OIDC_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// A JWKS is an untrusted network document; cap its key cardinality before
+/// materializing the selection map.
+const MAX_JWKS_KEYS: usize = 64;
 
 #[derive(Debug, Clone, Deserialize)]
 struct Discovery {
@@ -63,6 +72,10 @@ struct Jwk {
     kty: String,
     #[serde(default)]
     alg: Option<String>,
+    #[serde(rename = "use", default)]
+    key_use: Option<String>,
+    #[serde(default)]
+    key_ops: Vec<String>,
     #[serde(default)]
     n: Option<String>,
     #[serde(default)]
@@ -104,6 +117,10 @@ struct Claims {
     aud: Option<serde_json::Value>,
     #[serde(default)]
     exp: Option<u64>,
+    #[serde(default)]
+    jti: Option<String>,
+    #[serde(default)]
+    iat: Option<u64>,
     #[serde(default)]
     nbf: Option<u64>,
     #[serde(default)]
@@ -150,6 +167,92 @@ fn audience_matches(aud: Option<&serde_json::Value>, expected: &str) -> bool {
         Some(serde_json::Value::Array(items)) => items.iter().any(|v| v.as_str() == Some(expected)),
         _ => false,
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+/// OIDC discovery endpoints are token-verification roots of trust. Apply the
+/// same HTTPS/exact-loopback transport rule as the configured issuer before
+/// a request can carry a bearer token or client credentials.
+fn validate_discovered_endpoint(endpoint: &str, field: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|e| anyhow::Error::msg(format!("invalid discovery {field}: {e}")))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("discovery {field} must not contain userinfo");
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(url.host_str().unwrap_or_default()) => Ok(()),
+        "http" => anyhow::bail!(
+            "discovery {field} must use https (http is allowed only for an exact loopback host)"
+        ),
+        other => anyhow::bail!("discovery {field} must be an http(s) URL, got scheme '{other}'"),
+    }
+}
+
+async fn read_response_limited(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_OIDC_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("OIDC response exceeds the configured size limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let new_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::Error::msg("OIDC response length overflow"))?;
+        if new_len > MAX_OIDC_RESPONSE_BYTES {
+            anyhow::bail!("OIDC response exceeds the configured size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn is_verification_key(jwk: &Jwk) -> bool {
+    jwk.key_use.as_deref().is_none_or(|use_| use_ == "sig")
+        && (jwk.key_ops.is_empty() || jwk.key_ops.iter().any(|op| op == "verify"))
+}
+
+fn select_verification_keys(set: JwkSet) -> anyhow::Result<HashMap<String, Jwk>> {
+    if set.keys.len() > MAX_JWKS_KEYS {
+        anyhow::bail!("issuer JWKS exceeds the configured key count limit");
+    }
+    let mut next = HashMap::new();
+    for key in set.keys {
+        let kid = key
+            .kid
+            .as_deref()
+            .filter(|kid| !kid.trim().is_empty())
+            .ok_or_else(|| anyhow::Error::msg("issuer JWKS contains a missing or empty kid"))?
+            .to_owned();
+        if next.contains_key(&kid) {
+            anyhow::bail!("issuer JWKS contains a duplicate kid");
+        }
+        if is_verification_key(&key) {
+            next.insert(kid, key);
+        }
+    }
+    if next.is_empty() {
+        anyhow::bail!("issuer JWKS contains no eligible verification keys");
+    }
+    Ok(next)
+}
+
+fn is_access_token_type(typ: Option<&str>) -> bool {
+    typ.is_some_and(|value| {
+        value.eq_ignore_ascii_case("at+jwt") || value.eq_ignore_ascii_case("application/at+jwt")
+    })
+}
+
+fn mfa_evidence_is_sufficient(amr: Option<&Vec<String>>, acr_accepted: bool) -> bool {
+    // Raw AMR method labels identify methods, not independent factors. Trust
+    // only an accepted configured ACR policy or the IdP aggregate MFA marker.
+    acr_accepted || amr.is_some_and(|values| values.iter().any(|value| value == "mfa"))
 }
 
 fn verify_signature(header: &JwtHeader, jwk: &Jwk, signed: &str, sig: &[u8]) -> anyhow::Result<()> {
@@ -204,6 +307,9 @@ pub struct OidcAuthProvider {
     jwks: RwLock<HashMap<String, Jwk>>,
     /// Earliest moment the next unknown-`kid` JWKS refresh may run.
     jwks_refresh_after: Mutex<Option<Instant>>,
+    /// A cached key set becomes stale after this deadline even when its
+    /// current token `kid` is known.
+    jwks_fresh_until: Mutex<Option<Instant>>,
 }
 
 impl OidcAuthProvider {
@@ -211,6 +317,7 @@ impl OidcAuthProvider {
         let alias = alias.into();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             name: format!("oidc.{alias}"),
@@ -220,6 +327,7 @@ impl OidcAuthProvider {
             discovery: RwLock::new(None),
             jwks: RwLock::new(HashMap::new()),
             jwks_refresh_after: Mutex::new(None),
+            jwks_fresh_until: Mutex::new(None),
         })
     }
 
@@ -241,14 +349,9 @@ impl OidcAuthProvider {
             "{}/.well-known/openid-configuration",
             self.config.issuer.trim_end_matches('/')
         );
-        let d: Discovery = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let response = self.http.get(&url).send().await?.error_for_status()?;
+        let body = read_response_limited(response).await?;
+        let d: Discovery = serde_json::from_slice(&body)?;
         // The document must assert the issuer we configured, or we fetched
         // somebody else's metadata (or a spoofed/misrouted endpoint).
         if d.issuer.as_deref() != Some(self.config.issuer.as_str()) {
@@ -256,6 +359,12 @@ impl OidcAuthProvider {
                 "discovery document issuer does not match the configured issuer for oidc.{}",
                 self.alias
             );
+        }
+        if let Some(uri) = d.jwks_uri.as_deref() {
+            validate_discovered_endpoint(uri, "jwks_uri")?;
+        }
+        if let Some(endpoint) = d.introspection_endpoint.as_deref() {
+            validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
         }
         *self.discovery.write() = Some(d.clone());
         Ok(d)
@@ -279,26 +388,23 @@ impl OidcAuthProvider {
         let uri = discovery
             .jwks_uri
             .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
-        let set: JwkSet = self
-            .http
-            .get(&uri)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut map = self.jwks.write();
-        map.clear();
-        for key in set.keys {
-            if let Some(kid) = key.kid.clone() {
-                map.insert(kid, key);
-            }
-        }
+        let response = self.http.get(&uri).send().await?.error_for_status()?;
+        let body = read_response_limited(response).await?;
+        let set: JwkSet = serde_json::from_slice(&body)?;
+        let next = select_verification_keys(set)?;
+        *self.jwks.write() = next;
+        *self.jwks_fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
         Ok(true)
     }
 
     fn cached_key(&self, kid: &str) -> Option<Jwk> {
         self.jwks.read().get(kid).cloned()
+    }
+
+    fn jwks_is_fresh(&self) -> bool {
+        self.jwks_fresh_until
+            .lock()
+            .is_some_and(|until| Instant::now() < until)
     }
 
     async fn verify_jwks(&self, token: &str) -> AuthOutcome {
@@ -313,20 +419,25 @@ impl OidcAuthProvider {
             Some(h) => h,
             None => return deny(DenyReason::BadCredential),
         };
-        // RFC 9068 typed access tokens, when the deployment demands them.
-        if self.config.require_at_jwt
-            && !header
-                .typ
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case("at+jwt"))
-        {
+        // The bearer profile accepts RFC 9068 typed access tokens only. A
+        // nonce-less ID token is not a safe discriminator.
+        if !is_access_token_type(header.typ.as_deref()) {
             return deny(DenyReason::BadCredential);
         }
-        let kid = header.kid.clone().unwrap_or_default();
-        let key = match self.cached_key(&kid) {
-            Some(k) => Some(k),
+        let Some(kid) = header.kid.as_deref().filter(|kid| !kid.trim().is_empty()) else {
+            return deny(DenyReason::BadCredential);
+        };
+        if !self.jwks_is_fresh() {
+            match self.refresh_jwks_bounded().await {
+                Ok(true) => {}
+                Ok(false) => return deny(DenyReason::Misconfigured),
+                Err(_) => return deny(DenyReason::Misconfigured),
+            };
+        }
+        let key = match self.cached_key(kid) {
+            Some(key) => Some(key),
             None => match self.refresh_jwks_bounded().await {
-                Ok(_) => self.cached_key(&kid),
+                Ok(_) => self.cached_key(kid),
                 Err(_) => return deny(DenyReason::Misconfigured),
             },
         };
@@ -372,7 +483,7 @@ impl OidcAuthProvider {
             .send()
             .await;
         let body = match response {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(resp) if resp.status().is_success() => match read_response_limited(resp).await {
                 Ok(b) => b,
                 Err(_) => return deny(DenyReason::Misconfigured),
             },
@@ -414,12 +525,12 @@ impl OidcAuthProvider {
             _ => return deny(DenyReason::BadCredential),
         }
         match (claims.exp, via) {
-            (Some(exp), _) if exp + CLOCK_LEEWAY_SECS > now => {}
+            (Some(exp), _) if exp.saturating_add(CLOCK_LEEWAY_SECS) > now => {}
             (None, VerifiedVia::Introspection) => {}
             _ => return deny(DenyReason::TokenExpired),
         }
         if let Some(nbf) = claims.nbf
-            && nbf > now + CLOCK_LEEWAY_SECS
+            && nbf > now.saturating_add(CLOCK_LEEWAY_SECS)
         {
             return deny(DenyReason::BadCredential);
         }
@@ -446,32 +557,45 @@ impl OidcAuthProvider {
         {
             return deny(DenyReason::MfaRequired);
         }
-        let mfa_verified = claims
-            .amr
-            .iter()
-            .flatten()
-            .any(|m| MFA_AMR_VALUES.contains(&m.as_str()));
+        let acr_accepted = !self.config.required_acr.is_empty()
+            && claims
+                .acr
+                .as_deref()
+                .is_some_and(|acr| self.config.required_acr.iter().any(|r| r == acr));
+        let mfa_verified = mfa_evidence_is_sufficient(claims.amr.as_ref(), acr_accepted);
         if self.config.require_mfa && !mfa_verified {
             return deny(DenyReason::MfaRequired);
         }
 
-        // Service principals are keyed by the stable verified client
-        // identity; humans by `sub`. A caller with neither fails closed.
-        let client_identity = claims.client_id.as_deref().or(claims.azp.as_deref());
-        let subject = match client_identity {
-            Some(cid) if self.config.service_clients.iter().any(|s| s == cid) => {
+        // RFC 9068 client_id is common to resource-owner and client-credentials
+        // tokens. A human sub remains human; only an allowlisted
+        // client-credentials shape (sub == client_id) is a service. A missing
+        // subject is ambiguous and is denied even for an allowlisted client.
+        let client_identity = claims.client_id.as_deref();
+        let human_subject = claims.sub.as_deref().filter(|sub| !sub.trim().is_empty());
+        let subject = match (client_identity, human_subject) {
+            (Some(client_id), Some(subject)) if subject != client_id => IdentitySubject::Oidc {
+                issuer: self.config.issuer.clone(),
+                subject: subject.to_owned(),
+            },
+            (Some(client_id), Some(subject))
+                if subject == client_id
+                    && self
+                        .config
+                        .service_clients
+                        .iter()
+                        .any(|allowed| allowed == client_id) =>
+            {
                 IdentitySubject::Service {
                     issuer: self.config.issuer.clone(),
-                    client_id: cid.to_owned(),
+                    client_id: client_id.to_owned(),
                 }
             }
-            _ => match claims.sub.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(sub) => IdentitySubject::Oidc {
-                    issuer: self.config.issuer.clone(),
-                    subject: sub.to_owned(),
-                },
-                None => return deny(DenyReason::BadCredential),
+            (None, Some(subject)) => IdentitySubject::Oidc {
+                issuer: self.config.issuer.clone(),
+                subject: subject.to_owned(),
             },
+            _ => return deny(DenyReason::BadCredential),
         };
 
         let mut identity = AuthenticatedIdentity::new(subject, AuthMethod::Oidc)
@@ -480,9 +604,30 @@ impl OidcAuthProvider {
             .with_mfa_verified(mfa_verified);
         match via {
             VerifiedVia::Jwks => {
-                // Offline validation cannot see revocation: cap the
-                // authentication lifetime.
-                let cap = now.saturating_add(self.config.max_auth_lifetime_secs);
+                // The RFC 9068 profile requires iat. Cap lifetime from token
+                // issuance (not from every verification) so an old valid
+                // token cannot be extended indefinitely.
+                let Some(iat) = claims.iat else {
+                    return deny(DenyReason::BadCredential);
+                };
+                if !claims
+                    .jti
+                    .as_deref()
+                    .is_some_and(|jti| !jti.trim().is_empty())
+                    || !claims
+                        .client_id
+                        .as_deref()
+                        .is_some_and(|client_id| !client_id.trim().is_empty())
+                {
+                    return deny(DenyReason::BadCredential);
+                }
+                if iat > now.saturating_add(CLOCK_LEEWAY_SECS) {
+                    return deny(DenyReason::BadCredential);
+                }
+                let cap = iat.saturating_add(self.config.max_auth_lifetime_secs);
+                if cap.saturating_add(CLOCK_LEEWAY_SECS) <= now {
+                    return deny(DenyReason::TokenExpired);
+                }
                 let exp = claims.exp.unwrap_or(cap);
                 identity = identity.with_expires_at(exp.min(cap));
             }
@@ -594,7 +739,10 @@ mod tests {
         }
 
         fn mint(&self, claims: serde_json::Value) -> String {
-            self.mint_with_header(r#"{"alg":"ES256","kid":"test-key"}"#, &claims)
+            self.mint_with_header(
+                r#"{"alg":"ES256","kid":"test-key","typ":"application/at+jwt"}"#,
+                &claims,
+            )
         }
 
         fn config(&self, validation: OidcValidation) -> OidcConfig {
@@ -619,6 +767,9 @@ mod tests {
                 "sub": "alice",
                 "aud": "zeroclaw",
                 "exp": now_unix() + 600,
+                "iat": now_unix(),
+                "jti": "test-token-id",
+                "client_id": "zerocode-cli",
                 "scope": "openid profile",
                 "realm_access": {"roles": ["ops"]},
             })
@@ -627,6 +778,419 @@ mod tests {
 
     fn bearer(token: impl Into<String>) -> Credential {
         Credential::Bearer(token.into())
+    }
+
+    fn public_jwk(key: &EcdsaKeyPair, kid: &str) -> serde_json::Value {
+        let public = key.public_key().as_ref();
+        serde_json::json!({
+            "kid": kid, "kty": "EC", "crv": "P-256", "alg": "ES256",
+            "use": "sig", "key_ops": ["verify"],
+            "x": URL_SAFE_NO_PAD.encode(&public[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&public[33..65]),
+        })
+    }
+
+    fn expire_jwks(provider: &OidcAuthProvider) {
+        // Advance just the cache deadlines, without wall-clock sleeps or
+        // changing the authenticated claims or the cached key material.
+        *provider.jwks_fresh_until.lock() = Some(Instant::now() - Duration::from_secs(1));
+        *provider.jwks_refresh_after.lock() = None;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ResponseFraming {
+        Advertised,
+        Chunked,
+        CloseDelimited,
+    }
+
+    // A raw HTTP peer is necessary here: a mock framework may insert
+    // Content-Length and accidentally stop exercising the streaming limit.
+    async fn serve_bounded_response(
+        listener: tokio::net::TcpListener,
+        body: String,
+        framing: ResponseFraming,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let count = socket.read(&mut buf).await.unwrap();
+            assert!(count > 0, "request must arrive before the response");
+            request.extend_from_slice(&buf[..count]);
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n".to_vec();
+        match framing {
+            ResponseFraming::Advertised => {
+                response.extend_from_slice(
+                    format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                response.extend_from_slice(body.as_bytes());
+            }
+            ResponseFraming::Chunked => {
+                response.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+                for chunk in body.as_bytes().chunks(8192) {
+                    response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                    response.extend_from_slice(chunk);
+                    response.extend_from_slice(b"\r\n");
+                }
+                response.extend_from_slice(b"0\r\n\r\n");
+            }
+            ResponseFraming::CloseDelimited => {
+                response.extend_from_slice(b"\r\n");
+                response.extend_from_slice(body.as_bytes());
+            }
+        }
+        // An oversized response can be rejected while the peer is writing;
+        // a reset/broken pipe then means the verifier stopped consuming it.
+        let _ = socket.write_all(&response).await;
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn assert_response_bound(surface: &str, framing: ResponseFraming) {
+        // Both fixtures are valid JSON with otherwise valid authentication
+        // evidence. Without the byte limit, the oversized case would verify.
+        for oversized in [false, true] {
+            let idp = start_idp().await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let mut config = idp.config(if surface == "introspection" {
+                OidcValidation::Introspection
+            } else {
+                OidcValidation::Jwks
+            });
+            let mut payload = match surface {
+                "discovery" => {
+                    config.issuer.clone_from(&endpoint);
+                    serde_json::json!({
+                        "issuer": endpoint,
+                        "jwks_uri": format!("{}/jwks", idp.issuer),
+                    })
+                }
+                "jwks" => serde_json::json!({"keys": [public_jwk(&idp.key, "test-key")]}),
+                "introspection" => {
+                    let mut claims = idp.good_claims();
+                    claims["active"] = serde_json::json!(true);
+                    claims
+                }
+                _ => panic!("unknown test surface"),
+            };
+            payload["padding"] = serde_json::json!(" ".repeat(if oversized {
+                MAX_OIDC_RESPONSE_BYTES
+            } else {
+                32
+            }));
+            let body = payload.to_string();
+            assert_eq!(body.len() > MAX_OIDC_RESPONSE_BYTES, oversized);
+            let peer = ::zeroclaw_spawn::spawn!(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    serve_bounded_response(listener, body, framing),
+                )
+                .await
+                .expect("the verifier must reach the response peer")
+            });
+            if surface != "discovery" {
+                let mut discovery = serde_json::json!({
+                    "issuer": idp.issuer,
+                    "jwks_uri": format!("{}/jwks", idp.issuer),
+                    "introspection_endpoint": format!("{}/introspect", idp.issuer),
+                });
+                discovery[if surface == "jwks" {
+                    "jwks_uri"
+                } else {
+                    "introspection_endpoint"
+                }] = serde_json::json!(endpoint);
+                Mock::given(method("GET"))
+                    .and(path("/.well-known/openid-configuration"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+                    .with_priority(1)
+                    .mount(&idp.server)
+                    .await;
+            }
+            let mut claims = idp.good_claims();
+            claims["iss"] = serde_json::json!(config.issuer);
+            let token = if surface == "introspection" {
+                "opaque-token".to_owned()
+            } else {
+                idp.mint(claims)
+            };
+            let provider = OidcAuthProvider::new("test", config).unwrap();
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(5), provider.verify(&bearer(token)))
+                    .await
+                    .expect("response collection must remain bounded");
+            assert_eq!(
+                outcome.is_allowed(),
+                !oversized,
+                "{surface} {framing:?}: {outcome:?}"
+            );
+            if oversized {
+                assert!(matches!(
+                    outcome,
+                    AuthOutcome::Denied {
+                        reason: DenyReason::Misconfigured
+                    }
+                ));
+            }
+            let request = peer.await.unwrap();
+            assert!(request.starts_with(if surface == "introspection" {
+                "POST "
+            } else {
+                "GET "
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn advertised_response_bound_reaches_all_oidc_endpoints() {
+        for surface in ["discovery", "jwks", "introspection"] {
+            assert_response_bound(surface, ResponseFraming::Advertised).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_response_bound_reaches_all_oidc_endpoints() {
+        for surface in ["discovery", "jwks", "introspection"] {
+            assert_response_bound(surface, ResponseFraming::Chunked).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn no_length_response_bound_reaches_all_oidc_endpoints() {
+        for surface in ["discovery", "jwks", "introspection"] {
+            assert_response_bound(surface, ResponseFraming::CloseDelimited).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_never_deliver_credentials_to_the_target() {
+        for surface in ["discovery", "jwks", "introspection"] {
+            for status in [302, 307, 308] {
+                let idp = start_idp().await;
+                let sink = MockServer::start().await;
+                Mock::given(path("/capture"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(0)
+                    .mount(&sink)
+                    .await;
+                let (verb, endpoint) = match surface {
+                    "discovery" => ("GET", "/.well-known/openid-configuration"),
+                    "jwks" => ("GET", "/jwks"),
+                    _ => ("POST", "/introspect"),
+                };
+                Mock::given(method(verb))
+                    .and(path(endpoint))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("Location", format!("{}/capture", sink.uri())),
+                    )
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&idp.server)
+                    .await;
+                let provider = idp.provider(if surface == "introspection" {
+                    OidcValidation::Introspection
+                } else {
+                    OidcValidation::Jwks
+                });
+                let token = if surface == "introspection" {
+                    "opaque-token".to_owned()
+                } else {
+                    idp.mint(idp.good_claims())
+                };
+                assert!(!provider.verify(&bearer(token)).await.is_allowed());
+                let requests = idp.server.received_requests().await.unwrap();
+                let request = requests
+                    .iter()
+                    .find(|request| request.url.path() == endpoint)
+                    .expect("the redirecting endpoint must actually be reached");
+                if surface == "introspection" {
+                    assert_eq!(
+                        request.headers["authorization"].to_str().unwrap(),
+                        format!(
+                            "Basic {}",
+                            base64::engine::general_purpose::STANDARD.encode("zeroclaw:s3cret")
+                        )
+                    );
+                    assert_eq!(request.body, b"token=opaque-token");
+                }
+                assert!(
+                    sink.received_requests().await.unwrap().is_empty(),
+                    "{surface} status {status} must not deliver any request to the redirect target"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn jwks_key_count_limit_is_independent_of_duplicate_ids() {
+        for count in [64, 65] {
+            let idp = start_idp().await;
+            let keys: Vec<_> = (0..count)
+                .map(|index| {
+                    if index == 0 {
+                        return public_jwk(&idp.key, "key-0");
+                    }
+                    let rng = SystemRandom::new();
+                    let pkcs8 =
+                        EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                            .unwrap();
+                    let key = EcdsaKeyPair::from_pkcs8(
+                        &ECDSA_P256_SHA256_FIXED_SIGNING,
+                        pkcs8.as_ref(),
+                        &rng,
+                    )
+                    .unwrap();
+                    public_jwk(&key, &format!("key-{index}"))
+                })
+                .collect();
+            let body = serde_json::json!({"keys": keys});
+            let set: JwkSet = serde_json::from_value(body.clone()).unwrap();
+            if count == 65 {
+                let error = select_verification_keys(set).unwrap_err();
+                assert!(error.to_string().contains("key count limit"), "{error}");
+            } else {
+                assert_eq!(select_verification_keys(set).unwrap().len(), 64);
+            }
+            Mock::given(method("GET"))
+                .and(path("/jwks"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .with_priority(1)
+                .expect(1)
+                .mount(&idp.server)
+                .await;
+            let provider = idp.provider(OidcValidation::Jwks);
+            let token = idp.mint_with_header(
+                r#"{"alg":"ES256","kid":"key-0","typ":"at+jwt"}"#,
+                &idp.good_claims(),
+            );
+            assert_eq!(
+                provider.verify(&bearer(token)).await.is_allowed(),
+                count == 64
+            );
+            idp.server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn same_kid_replacement_and_removal_replace_cached_trust() {
+        let idp = start_idp().await;
+        let replacement = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let old_token = idp.mint(idp.good_claims());
+        let new_token = replacement.mint(idp.good_claims());
+        assert!(
+            provider
+                .verify(&bearer(old_token.clone()))
+                .await
+                .is_allowed()
+        );
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [public_jwk(&replacement.key, "test-key")]
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&idp.server)
+            .await;
+        assert!(
+            !provider
+                .verify(&bearer(new_token.clone()))
+                .await
+                .is_allowed(),
+            "a fresh cache still trusts the old signing key"
+        );
+        expire_jwks(&provider);
+        assert!(
+            provider
+                .verify(&bearer(new_token.clone()))
+                .await
+                .is_allowed()
+        );
+        assert!(
+            !provider.verify(&bearer(old_token)).await.is_allowed(),
+            "the replaced key must stop authenticating after refresh"
+        );
+        idp.server.verify().await;
+        idp.server.reset().await;
+        // Discovery is already cached; only the next JWKS response changes.
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [public_jwk(&replacement.key, "remaining-key")]
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&idp.server)
+            .await;
+        expire_jwks(&provider);
+        let outcome = provider.verify(&bearer(new_token)).await;
+        assert!(matches!(
+            outcome,
+            AuthOutcome::Denied {
+                reason: DenyReason::BadCredential
+            }
+        ));
+        let remaining = replacement.mint_with_header(
+            r#"{"alg":"ES256","kid":"remaining-key","typ":"at+jwt"}"#,
+            &idp.good_claims(),
+        );
+        assert!(
+            provider.verify(&bearer(remaining)).await.is_allowed(),
+            "denial of the removed key must not be a broken JWKS fixture"
+        );
+        idp.server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn introspection_accepts_only_the_configured_acr_assurance() {
+        for acr in ["urn:example:assurance:mfa", "urn:example:assurance:single"] {
+            let idp = start_idp().await;
+            let response = Mock::given(method("POST"))
+                .and(path("/introspect"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "active": true, "iss": idp.issuer, "sub": "subject-1", "aud": "zeroclaw",
+                    "client_id": "zerocode-cli", "amr": ["otp"], "acr": acr,
+                })))
+                .expect(1)
+                .mount_as_scoped(&idp.server)
+                .await;
+            let mut config = idp.config(OidcValidation::Introspection);
+            config.require_mfa = true;
+            config.required_acr = vec!["urn:example:assurance:mfa".into()];
+            config.require_at_jwt = false;
+            config
+                .validate("test")
+                .expect("opaque introspection does not require JWT typing");
+            let provider = OidcAuthProvider::new("test", config).unwrap();
+            let outcome = provider.verify(&bearer("opaque-token")).await;
+            if acr == "urn:example:assurance:mfa" {
+                assert!(outcome.identity().expect("accepted ACR").mfa_verified);
+            } else {
+                assert!(matches!(
+                    outcome,
+                    AuthOutcome::Denied {
+                        reason: DenyReason::MfaRequired
+                    }
+                ));
+            }
+            drop(response);
+        }
     }
 
     #[tokio::test]
@@ -749,13 +1313,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn require_at_jwt_demands_the_rfc_9068_type() {
+    async fn bearer_profile_demands_an_rfc_9068_access_token_type() {
         let idp = start_idp().await;
-        let mut config = idp.config(OidcValidation::Jwks);
-        config.require_at_jwt = true;
+        let config = idp.config(OidcValidation::Jwks);
         let provider = OidcAuthProvider::new("test", config).unwrap();
 
-        let untyped = idp.mint(idp.good_claims());
+        let untyped =
+            idp.mint_with_header(r#"{"alg":"ES256","kid":"test-key"}"#, &idp.good_claims());
         assert!(!provider.verify(&bearer(untyped)).await.is_allowed());
 
         let typed = idp.mint_with_header(
@@ -763,6 +1327,12 @@ mod tests {
             &idp.good_claims(),
         );
         assert!(provider.verify(&bearer(typed)).await.is_allowed());
+
+        let media_typed = idp.mint_with_header(
+            r#"{"alg":"ES256","kid":"test-key","typ":"application/at+jwt"}"#,
+            &idp.good_claims(),
+        );
+        assert!(provider.verify(&bearer(media_typed)).await.is_allowed());
     }
 
     #[tokio::test]
@@ -783,6 +1353,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_lifetime_uses_iat_and_expiry_math_is_overflow_safe() {
+        let idp = start_idp().await;
+        let mut config = idp.config(OidcValidation::Jwks);
+        config.max_auth_lifetime_secs = 300;
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+
+        let mut too_old = idp.good_claims();
+        too_old["iat"] = serde_json::json!(now_unix() - 331);
+        too_old["exp"] = serde_json::json!(u64::MAX);
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(too_old)))
+                .await
+                .is_allowed(),
+            "an old token cannot restart its offline lifetime on each verification"
+        );
+
+        let mut extreme_expiry = idp.good_claims();
+        extreme_expiry["exp"] = serde_json::json!(u64::MAX);
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(extreme_expiry)))
+                .await
+                .is_allowed(),
+            "maximal exp must not overflow the leeway comparison"
+        );
+    }
+
+    #[tokio::test]
     async fn mfa_and_acr_requirements_fail_closed() {
         let idp = start_idp().await;
         let mut config = idp.config(OidcValidation::Jwks);
@@ -796,13 +1395,35 @@ mod tests {
             }
         ));
 
+        for factor in ["otp", "hwk"] {
+            let mut claims = idp.good_claims();
+            claims["amr"] = serde_json::json!([factor]);
+            assert!(
+                !provider
+                    .verify(&bearer(idp.mint(claims)))
+                    .await
+                    .is_allowed(),
+                "{factor}-only evidence is not sufficient MFA"
+            );
+        }
         let mut claims = idp.good_claims();
-        claims["amr"] = serde_json::json!(["otp"]);
+        claims["amr"] = serde_json::json!(["otp", "hwk"]);
         let out = provider.verify(&bearer(idp.mint(claims))).await;
-        assert!(out.is_allowed());
-        assert!(out.identity().unwrap().mfa_verified);
+        assert!(
+            !out.is_allowed(),
+            "method labels alone are not factor proof"
+        );
+        let mut claims = idp.good_claims();
+        claims["amr"] = serde_json::json!(["mfa"]);
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed()
+        );
 
         let mut config = idp.config(OidcValidation::Jwks);
+        config.require_mfa = true;
         config.required_acr = vec!["urn:mace:incommon:iap:silver".into()];
         let provider = OidcAuthProvider::new("test", config).unwrap();
         assert!(
@@ -813,6 +1434,7 @@ mod tests {
         );
         let mut claims = idp.good_claims();
         claims["acr"] = serde_json::json!("urn:mace:incommon:iap:silver");
+        claims["amr"] = serde_json::json!(["otp"]);
         assert!(
             provider
                 .verify(&bearer(idp.mint(claims)))
@@ -826,6 +1448,7 @@ mod tests {
         let idp = start_idp().await;
         let mut config = idp.config(OidcValidation::Jwks);
         config.allowed_authorized_parties = vec!["zerocode-cli".into()];
+        config.service_clients = vec!["zerocode-cli".into()];
         let provider = OidcAuthProvider::new("test", config).unwrap();
 
         assert!(
@@ -861,6 +1484,7 @@ mod tests {
 
         let mut claims = idp.good_claims();
         claims["client_id"] = serde_json::json!("reporting-batch");
+        claims["sub"] = serde_json::json!("reporting-batch");
         let out = provider.verify(&bearer(idp.mint(claims))).await;
         let identity = out.identity().expect("verified");
         assert_eq!(
@@ -871,16 +1495,27 @@ mod tests {
             }
         );
 
-        // A sub-less token whose client is NOT declared a service fails
-        // closed: there is no stable identity to bind.
+        // A client credential not declared as a service must never fall back
+        // to its human-looking sub or profile map.
         let mut claims = idp.good_claims();
-        claims.as_object_mut().unwrap().remove("sub");
         claims["client_id"] = serde_json::json!("undeclared-client");
+        claims["sub"] = serde_json::json!("undeclared-client");
         assert!(
             !provider
                 .verify(&bearer(idp.mint(claims)))
                 .await
                 .is_allowed()
+        );
+
+        let mut claims = idp.good_claims();
+        claims["client_id"] = serde_json::json!("reporting-batch");
+        claims.as_object_mut().unwrap().remove("sub");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed(),
+            "an allowlisted service JWT still needs a nonblank subject"
         );
     }
 
@@ -895,9 +1530,12 @@ mod tests {
                 .await
                 .is_allowed()
         );
-        // Two bad-kid tokens inside the cooldown: at most ONE extra fetch.
+        // Permit one refresh, then prove a second unknown key cannot fetch
+        // again inside the cooldown. Keep the access-token type valid so
+        // both requests reach the key lookup instead of the header gate.
+        *provider.jwks_refresh_after.lock() = None;
         let bad = idp.mint_with_header(
-            r#"{"alg":"ES256","kid":"rotated-away"}"#,
+            r#"{"alg":"ES256","kid":"rotated-away","typ":"at+jwt"}"#,
             &idp.good_claims(),
         );
         assert!(!provider.verify(&bearer(bad.clone())).await.is_allowed());
@@ -910,9 +1548,107 @@ mod tests {
             .iter()
             .filter(|r| r.url.path() == "/jwks")
             .count();
+        assert_eq!(jwks_fetches, 2, "one initial fetch and one bounded refresh");
+    }
+
+    #[tokio::test]
+    async fn stale_known_kid_refreshes_the_jwks_cache() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let token = idp.mint(idp.good_claims());
+        assert!(provider.verify(&bearer(token.clone())).await.is_allowed());
+        let before = idp
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/jwks")
+            .count();
+        *provider.jwks_fresh_until.lock() = Some(Instant::now() - Duration::from_secs(1));
+        *provider.jwks_refresh_after.lock() = None;
+        assert!(provider.verify(&bearer(token)).await.is_allowed());
+        let after = idp
+            .server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/jwks")
+            .count();
+        assert_eq!(after, before + 1, "a stale known kid must refresh");
+    }
+
+    #[test]
+    fn discovered_endpoints_require_https_or_exact_loopback() {
+        assert!(validate_discovered_endpoint("https://idp.example.com/jwks", "jwks_uri").is_ok());
+        assert!(validate_discovered_endpoint("http://127.0.0.1/jwks", "jwks_uri").is_ok());
+        assert!(validate_discovered_endpoint("http://idp.example.com/jwks", "jwks_uri").is_err());
         assert!(
-            jwks_fetches <= 2,
-            "bad tokens must not hammer the JWKS endpoint (saw {jwks_fetches} fetches)"
+            validate_discovered_endpoint("https://user:pass@idp.example.com/jwks", "jwks_uri")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn jwk_eligibility_requires_signature_verification_permission() {
+        let mut key = Jwk {
+            kid: Some("test".into()),
+            kty: "EC".into(),
+            alg: Some("ES256".into()),
+            key_use: Some("sig".into()),
+            key_ops: vec!["verify".into()],
+            n: None,
+            e: None,
+            x: None,
+            y: None,
+            crv: Some("P-256".into()),
+        };
+        assert!(is_verification_key(&key));
+        key.key_ops = vec!["sign".into()];
+        assert!(!is_verification_key(&key));
+        key.key_ops.clear();
+        key.key_use = Some("enc".into());
+        assert!(!is_verification_key(&key));
+    }
+
+    #[test]
+    fn jwks_rejects_missing_or_duplicate_key_ids() {
+        let key = |kid: Option<&str>| Jwk {
+            kid: kid.map(str::to_owned),
+            kty: "EC".into(),
+            alg: Some("ES256".into()),
+            key_use: Some("sig".into()),
+            key_ops: vec!["verify".into()],
+            n: None,
+            e: None,
+            x: None,
+            y: None,
+            crv: Some("P-256".into()),
+        };
+        assert!(
+            select_verification_keys(JwkSet {
+                keys: vec![key(None)]
+            })
+            .is_err()
+        );
+        assert!(
+            select_verification_keys(JwkSet {
+                keys: vec![key(Some("   "))]
+            })
+            .is_err()
+        );
+        assert!(
+            select_verification_keys(JwkSet {
+                keys: vec![key(Some("same")), key(Some("same"))],
+            })
+            .is_err()
+        );
+        assert!(
+            select_verification_keys(JwkSet {
+                keys: vec![key(Some(""))],
+            })
+            .is_err()
         );
     }
 
@@ -921,8 +1657,8 @@ mod tests {
         let idp = start_idp().await;
         let provider = idp.provider(OidcValidation::Jwks);
         for header in [
-            r#"{"alg":"HS256","kid":"test-key"}"#,
-            r#"{"alg":"none","kid":"test-key"}"#,
+            r#"{"alg":"HS256","kid":"test-key","typ":"at+jwt"}"#,
+            r#"{"alg":"none","kid":"test-key","typ":"at+jwt"}"#,
         ] {
             let token = idp.mint_with_header(header, &idp.good_claims());
             assert!(
@@ -952,9 +1688,9 @@ mod tests {
             ..OidcConfig::default()
         };
         let provider = OidcAuthProvider::new("test", config).unwrap();
-        // Any token needing a JWKS fetch hits the mismatched discovery.
-        let out = provider.verify(&bearer("aaaa.bbbb.cccc")).await;
-        assert!(!out.is_allowed());
+        // Call discovery directly: an invalid JWT header would otherwise be
+        // rejected before the claimed discovery branch is exercised.
+        assert!(provider.discovery().await.is_err());
     }
 
     #[tokio::test]
@@ -1004,9 +1740,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn introspection_mfa_requires_aggregate_or_acr_assurance() {
+        let idp = start_idp().await;
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "iss": idp.issuer, "sub": "bob", "aud": "zeroclaw",
+                "amr": ["otp"], "client_id": "zerocode-cli"
+            })))
+            .mount(&idp.server)
+            .await;
+        let mut config = idp.config(OidcValidation::Introspection);
+        config.require_mfa = true;
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        assert!(!provider.verify(&bearer("opaque-token")).await.is_allowed());
+
+        let idp = start_idp().await;
+        Mock::given(method("POST"))
+            .and(path("/introspect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "active": true, "iss": idp.issuer, "sub": "bob", "aud": "zeroclaw",
+                "amr": ["mfa"]
+            })))
+            .mount(&idp.server)
+            .await;
+        let mut config = idp.config(OidcValidation::Introspection);
+        config.require_mfa = true;
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        assert!(provider.verify(&bearer("opaque-token")).await.is_allowed());
+    }
+
+    #[tokio::test]
     async fn unreachable_idp_fails_closed() {
         let idp = start_idp().await;
         let provider = idp.provider(OidcValidation::Introspection);
+        assert!(provider.discovery().await.is_ok(), "warm discovery first");
         drop(idp.server);
         let out = provider.verify(&bearer("opaque-token")).await;
         assert!(matches!(
