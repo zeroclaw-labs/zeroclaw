@@ -23,6 +23,9 @@ fn integration_entry_json(
         "category": entry.category,
         "category_label": entry.category.label(),
         "status": entry.status,
+        // Canonical config map key (provider family key / ChannelsConfig map
+        // key) for deep links; null when the entry has no config section.
+        "key": &entry.key,
     })
 }
 
@@ -2533,6 +2536,7 @@ pub(crate) mod tests {
             description: "Run browser automation".into(),
             category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
             status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+            key: None,
         };
 
         let json = integration_entry_json(&entry);
@@ -2540,6 +2544,22 @@ pub(crate) mod tests {
         assert_eq!(json["category"], "ToolsAutomation");
         assert_eq!(json["category_label"], "Tools & Automation");
         assert_eq!(json["status"], "Active");
+        assert!(json["key"].is_null());
+    }
+
+    #[test]
+    fn integration_entry_json_exposes_config_key() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Z.AI".into(),
+            description: String::new(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::AiModel,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Available,
+            key: Some("zai".into()),
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["key"], "zai");
     }
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {

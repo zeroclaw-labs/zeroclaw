@@ -14,6 +14,13 @@ pub struct TokenUsage {
     /// `cached_input_per_mtok` applies to these.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub cached_input_tokens: u64,
+    /// Cache-write tokens (Anthropic `cache_creation_input_tokens`,
+    /// OpenAI-compatible `prompt_tokens_details.cache_creation_input_tokens`).
+    /// Subset of the uncached input that the provider wrote into its prompt
+    /// cache on this request; the rate sheet's `cache_write_per_mtok` applies
+    /// to these when set, otherwise they stay priced at the plain input rate.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_creation_input_tokens: u64,
     /// Total tokens (input + output, ignoring the cached subset).
     pub total_tokens: u64,
     /// Calculated cost in USD
@@ -85,33 +92,79 @@ impl TokenUsage {
         cached_input_price_per_million: f64,
         output_price_per_million: f64,
     ) -> Self {
+        Self::new_with_cache_write(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            0,
+            output_tokens,
+            input_price_per_million,
+            cached_input_price_per_million,
+            0.0,
+            output_price_per_million,
+        )
+    }
+
+    /// Create a new token usage record that also prices the cache-write
+    /// band: `cache_creation_input_tokens` at `cache_write_price_per_million`.
+    /// A non-positive write rate keeps the historical behavior — cache
+    /// writes stay inside the plain uncached-input band at the input rate —
+    /// so sheets without a write rate reproduce yesterday's totals exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cache_write(
+        model: impl Into<String>,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        output_tokens: u64,
+        input_price_per_million: f64,
+        cached_input_price_per_million: f64,
+        cache_write_price_per_million: f64,
+        output_price_per_million: f64,
+    ) -> Self {
         let model = model.into();
         let input_price_per_million = Self::sanitize_price(input_price_per_million);
         let output_price_per_million = Self::sanitize_price(output_price_per_million);
         let cached_input_price_per_million = Self::sanitize_price(cached_input_price_per_million);
+        let cache_write_price_per_million = Self::sanitize_price(cache_write_price_per_million);
         let cached_input_tokens = cached_input_tokens.min(input_tokens);
-        let billable_uncached_input = input_tokens.saturating_sub(cached_input_tokens);
+        let cache_creation_input_tokens =
+            cache_creation_input_tokens.min(input_tokens.saturating_sub(cached_input_tokens));
         let total_tokens = input_tokens.saturating_add(output_tokens);
 
         // Calculate cost: (tokens / 1M) * price_per_million for each band.
         // Cached subset uses its own rate when set, else falls back to the
         // standard input rate so providers without a cache-rate aren't
-        // charged $0 for the cached portion.
+        // charged $0 for the cached portion. Cache writes split out of the
+        // uncached band only when a write rate exists.
         let cached_rate = if cached_input_price_per_million > 0.0 {
             cached_input_price_per_million
         } else {
             input_price_per_million
         };
+        let write_cost = if cache_write_price_per_million > 0.0 {
+            (cache_creation_input_tokens as f64 / 1_000_000.0) * cache_write_price_per_million
+        } else {
+            0.0
+        };
+        let billable_uncached_input = input_tokens
+            .saturating_sub(cached_input_tokens)
+            .saturating_sub(if cache_write_price_per_million > 0.0 {
+                cache_creation_input_tokens
+            } else {
+                0
+            });
         let input_cost = (billable_uncached_input as f64 / 1_000_000.0) * input_price_per_million;
         let cached_cost = (cached_input_tokens as f64 / 1_000_000.0) * cached_rate;
         let output_cost = (output_tokens as f64 / 1_000_000.0) * output_price_per_million;
-        let cost_usd = input_cost + cached_cost + output_cost;
+        let cost_usd = input_cost + cached_cost + write_cost + output_cost;
 
         Self {
             model,
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
             total_tokens,
             cost_usd,
             unpriced_tokens: 0,
@@ -426,6 +479,73 @@ mod tests {
 
         assert_eq!(parsed.agent_alias.as_deref(), Some("agent-a"));
         assert_eq!(parsed.task_id.as_deref(), Some("goal-123"));
+    }
+
+    #[test]
+    fn cache_creation_tokens_bill_at_write_rate() {
+        // 700 uncached @ 10/M + 300 cache writes @ 12.5/M + 200 cached @ 1/M
+        // + 500 output @ 15/M
+        let usage = TokenUsage::new_with_cache_write(
+            "test/model",
+            1_200,
+            200,
+            300,
+            500,
+            10.0,
+            1.0,
+            12.5,
+            15.0,
+        );
+        let expected = (700.0 / 1e6) * 10.0
+            + (300.0 / 1e6) * 12.5
+            + (200.0 / 1e6) * 1.0
+            + (500.0 / 1e6) * 15.0;
+        assert!(
+            (usage.cost_usd - expected).abs() < 1e-9,
+            "{}",
+            usage.cost_usd
+        );
+        assert_eq!(usage.cache_creation_input_tokens, 300);
+    }
+
+    #[test]
+    fn unset_write_rate_reproduces_the_historical_totals() {
+        // Without a write rate the creation band must stay inside the plain
+        // uncached-input band, byte for byte as before the field existed.
+        let legacy = TokenUsage::new_with_cache("test/model", 1_200, 200, 500, 10.0, 1.0, 15.0);
+        let with_creation = TokenUsage::new_with_cache_write(
+            "test/model",
+            1_200,
+            200,
+            300,
+            500,
+            10.0,
+            1.0,
+            0.0,
+            15.0,
+        );
+        assert!((legacy.cost_usd - with_creation.cost_usd).abs() < 1e-12);
+        assert_eq!(with_creation.cache_creation_input_tokens, 300);
+    }
+
+    #[test]
+    fn cache_creation_roundtrip_through_the_ledger_json() {
+        let usage = TokenUsage::new_with_cache_write(
+            "test/model",
+            1_200,
+            200,
+            300,
+            500,
+            10.0,
+            1.0,
+            12.5,
+            15.0,
+        );
+        let record = CostRecord::new("session-123", usage);
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("cache_creation_input_tokens"));
+        let parsed: CostRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.usage.cache_creation_input_tokens, 300);
     }
 
     #[test]
