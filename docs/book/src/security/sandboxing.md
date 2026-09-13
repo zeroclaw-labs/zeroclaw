@@ -155,7 +155,7 @@ Firejail's default profile is fairly permissive; ZeroClaw applies a custom profi
 
 ### Docker
 
-Works anywhere Docker does. The Docker runtime kind (`[runtime] kind = "docker"`) runs each shell invocation in an ephemeral container; see the `[runtime.docker]` block above for image and resource controls.
+Works anywhere Docker does. The Docker runtime kind (`[runtime] kind = "docker"`) runs each shell invocation in an ephemeral container; see the `[runtime.docker]` block above for image and resource controls. `git_operations` does not execute inside that container: write-classified Git commands are rejected for the Docker runtime, while read-classified commands retain their existing host-side read isolation. Use the shell tool for Git commands that must run inside the container.
 
 <div class="os-tabs-src">
 

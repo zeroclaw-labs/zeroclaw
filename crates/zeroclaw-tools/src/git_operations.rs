@@ -934,7 +934,7 @@ impl GitOperationsTool {
                         .with_attrs(::serde_json::json!({"error": format!("{error}")})),
                     "git_operations: write command boundary rejected Git subprocess"
                 );
-                error.context("Git write command sandbox failed")
+                error
             })?;
         let boundary_env = Self::non_git_command_env_snapshot(command.as_std());
         Self::bind_git_worktree(command.as_std_mut(), &repository.root, &repository.git_dir);
@@ -2809,8 +2809,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            format!("{error:#}").contains("test boundary rejection"),
-            "the boundary rejection must remain actionable: {error:#}"
+            format!("{error}").contains("test boundary rejection"),
+            "the boundary rejection must remain actionable in normal user-facing rendering: {error}"
         );
         assert!(
             !worktree.exists(),

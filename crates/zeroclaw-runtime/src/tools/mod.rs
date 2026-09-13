@@ -658,9 +658,9 @@ struct RuntimeGitCommandBoundary {
 impl GitCommandBoundary for RuntimeGitCommandBoundary {
     fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
         if self.runtime_kind == zeroclaw_config::schema::RuntimeKind::Docker {
-            anyhow::bail!(
-                "Git write commands are unavailable with the Docker runtime because they cannot be confined to its container"
-            );
+            anyhow::bail!(crate::i18n::get_required_cli_string(
+                "tool-git-operations-error-docker-runtime-write-unsupported"
+            ));
         }
         self.sandbox
             .wrap_command(command)
@@ -2087,7 +2087,7 @@ mod tests {
     };
 
     #[test]
-    fn git_write_boundary_rejects_docker_runtime_before_spawning() {
+    fn git_write_boundary_rejects_docker_runtime_writes() {
         let boundary = RuntimeGitCommandBoundary {
             sandbox: Arc::new(crate::security::NoopSandbox),
             runtime_kind: zeroclaw_config::schema::RuntimeKind::Docker,
@@ -2097,10 +2097,8 @@ mod tests {
         let error = boundary.wrap_command(&mut command).unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("Git write commands are unavailable with the Docker runtime"),
-            "Docker runtime must reject Git writes before a host command can spawn: {error}"
+            error.to_string() != "{tool-git-operations-error-docker-runtime-write-unsupported}",
+            "Docker runtime must reject Git writes before a write-classified Git command can spawn: {error}"
         );
         assert_eq!(command.get_program(), "git");
     }
