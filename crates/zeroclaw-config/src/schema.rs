@@ -3510,6 +3510,11 @@ impl Default for DelegateToolConfig {
 
 // ── Aliased Agents ───────────────────────────────────────────────
 
+/// Default fraction of `max_history_messages` that a whole-turn history trim
+/// drops the history to. Strictly below 1.0 so a trim leaves headroom and
+/// the next turns do not immediately trigger another trim.
+pub const DEFAULT_HISTORY_TRIM_LOW_WATER: f32 = 0.7;
+
 /// Runtime tunables resolved from the agent's runtime profile. Populated
 /// by `Config::resolved_agent_config`; never deserialized from the agent
 /// table. The runtime profile is the sole config surface for these.
@@ -3518,6 +3523,9 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
+    /// Fraction of `max_history_messages` a whole-turn trim drops to
+    /// (hysteresis low-water mark; 1.0 disables hysteresis).
+    pub history_trim_low_water: f32,
     /// Token budget for preemptive context/history trimming (from runtime profile).
     /// NOT the provider `max_tokens` output limit.
     pub max_context_tokens: usize,
@@ -3560,6 +3568,7 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
+            history_trim_low_water: DEFAULT_HISTORY_TRIM_LOW_WATER,
             max_context_tokens: 32_000,
             model_context_window: 32_000,
             parallel_tools: false,
@@ -4175,6 +4184,17 @@ impl Config {
             .unwrap_or(50)
     }
 
+    /// Resolve the fraction of the history cap that a whole-turn trim drops
+    /// to (hysteresis low-water mark). Same resolution chain as
+    /// `effective_max_history_messages`: the agent's runtime profile value
+    /// when set, otherwise [`DEFAULT_HISTORY_TRIM_LOW_WATER`].
+    #[must_use]
+    pub fn effective_history_trim_low_water(&self, agent_alias: &str) -> f32 {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.history_trim_low_water)
+            .unwrap_or(DEFAULT_HISTORY_TRIM_LOW_WATER)
+    }
+
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
     /// An explicit runtime-profile cap remains authoritative. When omitted, the
@@ -4309,6 +4329,7 @@ impl Config {
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
+            history_trim_low_water: self.effective_history_trim_low_water(agent_alias),
             // Token budget for context/history trimming — from runtime profile
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
@@ -13074,6 +13095,11 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
+    /// Fraction of `max_history_messages` that a whole-turn history trim
+    /// drops the history to (the hysteresis low-water mark). Valid range is
+    /// `(0.0, 1.0]`; `1.0` disables hysteresis and trims straight back to
+    /// the cap. `None` inherits the default (0.7).
+    pub history_trim_low_water: Option<f32>,
     /// Maximum estimated tokens for context before compaction. `None` inherits.
     pub max_context_tokens: Option<usize>,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
@@ -13129,6 +13155,7 @@ impl Default for RuntimeProfileConfig {
             delegation_timeout_secs: None,
             agentic_timeout_secs: None,
             max_history_messages: None,
+            history_trim_low_water: None,
             max_context_tokens: None,
             compact_context: None,
             parallel_tools: None,
@@ -22769,6 +22796,25 @@ impl Config {
             );
         }
 
+        // Per-profile validation: the whole-turn history-trim hysteresis
+        // fraction must be in (0.0, 1.0]. Zero or negative would request an
+        // empty refill target; anything above 1.0 would trim deeper than the
+        // cap itself. Sorted iteration keeps error ordering stable.
+        let mut profile_aliases: Vec<&String> = self.runtime_profiles.keys().collect();
+        profile_aliases.sort();
+        for palias in profile_aliases {
+            let Some(low_water) = self.runtime_profiles[palias].history_trim_low_water else {
+                continue;
+            };
+            if !low_water.is_finite() || low_water <= 0.0 || low_water > 1.0 {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{palias}.history_trim_low_water"),
+                    "runtime_profiles.{palias}.history_trim_low_water must be a finite number in (0.0, 1.0] (got {low_water})",
+                );
+            }
+        }
+
         // Per-profile validation: the context-compression summarizer provider
         // ref must resolve to a configured `[providers.models.*]` alias.
         // Empty = inherit (valid). A shared profile fails loud at config time
@@ -28927,6 +28973,7 @@ reasoning_effort = "turbo"
         assert!(cfg.resolved.compact_context);
         assert_eq!(cfg.resolved.max_tool_iterations, 10);
         assert_eq!(cfg.resolved.max_history_messages, 50);
+        assert_eq!(cfg.resolved.history_trim_low_water, 0.7);
         assert!(!cfg.resolved.parallel_tools);
         assert_eq!(cfg.resolved.tool_dispatcher, "auto");
         assert!(!cfg.resolved.strict_tool_parsing);
@@ -29123,6 +29170,105 @@ runtime_profile = "long_turn"
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
             50
+        );
+    }
+
+    #[test]
+    async fn default_history_trim_low_water_is_seven_tenths() {
+        let raw = r#"
+[runtime_profiles.plain]
+
+[agents.default]
+runtime_profile = "plain"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.7);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.7);
+    }
+
+    #[test]
+    async fn runtime_profile_history_trim_low_water_is_honored() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.9
+
+[agents.default]
+runtime_profile = "mem_saver"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_history_trim_low_water("default"), 0.9);
+        let agent = parsed.resolved_agent_config("default").unwrap();
+        assert_eq!(agent.resolved.history_trim_low_water, 0.9);
+    }
+
+    #[test]
+    async fn validate_accepts_history_trim_low_water_of_one() {
+        let raw = r#"
+[runtime_profiles.no_hysteresis]
+history_trim_low_water = 1.0
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed
+                .runtime_profiles
+                .get("no_hysteresis")
+                .and_then(|p| p.history_trim_low_water),
+            Some(1.0)
+        );
+        parsed
+            .validate()
+            .expect("history_trim_low_water = 1.0 must be accepted");
+    }
+
+    #[test]
+    async fn validate_rejects_zero_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 0.0
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water = 0.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_history_trim_low_water_above_one() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = 1.5
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("history_trim_low_water above 1.0 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_non_finite_history_trim_low_water() {
+        let raw = r#"
+[runtime_profiles.mem_saver]
+history_trim_low_water = nan
+"#;
+        let parsed = parse_test_config(raw);
+        let error = parsed
+            .validate()
+            .expect_err("non-finite history_trim_low_water must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime_profiles.mem_saver.history_trim_low_water")
         );
     }
 

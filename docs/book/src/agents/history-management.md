@@ -68,6 +68,21 @@ Each tool iteration can add a tool call and a tool result; the extra two slots
 cover the user message and final assistant response. With the default
 `max_tool_iterations = 10`, the derived limit remains `50`.
 
+Trims refill to a low-water mark rather than to the cap. When the history
+exceeds the cap, the runtime drops the oldest whole turns until
+`floor(max_history_messages * history_trim_low_water)` non-system messages
+remain (at least 1), while still keeping the newest complete turn.
+`history_trim_low_water` is a runtime-profile fraction in `(0.0, 1.0]` and
+defaults to `0.7`. The effective cap and fraction resolve together from the
+agent's current runtime-profile binding at trim time, so profile reloads
+apply to existing sessions. Because the trigger stays on the cap, the usual
+pattern is one deeper trim at the cap followed by room for new turns,
+instead of a trim on every turn near the limit. A value of `1.0` disables
+hysteresis and refills straight to the cap, which matches the pre-hysteresis
+behavior. Validation reports out-of-range fractions, but loading is
+boot-resilient, so a config that starts anyway falls back to trimming
+straight to the cap until the fraction is repaired.
+
 ## Visible trimming
 
 Whenever token-budget trimming or the structured message-count limit drops

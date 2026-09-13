@@ -42,11 +42,47 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     )
 }
 
+/// The pair of policy values a whole-turn trim resolves at use time: the
+/// effective message cap and the low-water fraction applied to it. Resolved
+/// together from one config read so a concurrent profile edit cannot mix
+/// revisions of the two halves of the same trim decision.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryTrimLimits {
+    pub max_messages: usize,
+    pub low_water: f32,
+}
+
+/// Compute the hysteresis low-water target for a whole-turn trim: the
+/// largest number of non-system messages a trim should leave behind.
+/// `low_water` of 1.0 (or anything non-finite, zero, or negative) keeps the
+/// no-hysteresis behavior of trimming straight back to the cap; a fractional
+/// value floors to at least 1 so a trim never aims at an empty history.
+#[must_use]
+pub(crate) fn history_trim_target(max_messages: usize, low_water: f32) -> usize {
+    if !(low_water > 0.0 && low_water < 1.0) {
+        return max_messages;
+    }
+    // Evaluated in f32, the field's own type: the product rounds to the
+    // value a reader of the fraction expects (10 * 0.7 floors to 7, not to
+    // the 6 an exact f64 promotion of 0.7f32 would produce).
+    let scaled = (max_messages as f32 * low_water).floor();
+    if scaled < 1.0 {
+        1
+    } else {
+        // Float-to-int casts saturate, which is the right behavior for
+        // degenerate caps close to usize::MAX.
+        scaled as usize
+    }
+}
+
 /// Drop the oldest whole conversation turns until the non-system body fits
-/// `max_messages`, while always retaining the newest complete turn.
+/// `max_messages`, trimming down to `target` messages (the caller computes
+/// it from the hysteresis low-water fraction) while always retaining the
+/// newest complete turn.
 pub(crate) fn trim_conversation_to_recent_turns(
     history: Vec<ConversationMessage>,
     max_messages: usize,
+    target: usize,
     has_leading_breadcrumb: bool,
 ) -> MessageCountTrimResult {
     let first_non_system = history
@@ -100,7 +136,7 @@ pub(crate) fn trim_conversation_to_recent_turns(
     for (turn_index, &boundary) in boundaries.iter().enumerate().skip(1) {
         first_kept = boundary;
         dropped_turns = turn_index;
-        if body.len() - boundary <= max_messages || turn_index == boundaries.len() - 1 {
+        if body.len() - boundary <= target || turn_index == boundaries.len() - 1 {
             break;
         }
     }
@@ -348,6 +384,23 @@ mod tests {
         }
     }
 
+    /// Pins the no-hysteresis identity: a low-water fraction of 1.0 must
+    /// reproduce the pre-hysteresis drop points exactly. All pre-existing
+    /// fixtures in this module run through this wrapper so the 1.0 case
+    /// stays exercised by every one of them.
+    fn trim_conversation_to_recent_turns_at_legacy_cap(
+        history: Vec<ConversationMessage>,
+        max_messages: usize,
+        has_leading_breadcrumb: bool,
+    ) -> MessageCountTrimResult {
+        trim_conversation_to_recent_turns(
+            history,
+            max_messages,
+            history_trim_target(max_messages, 1.0),
+            has_leading_breadcrumb,
+        )
+    }
+
     #[test]
     fn trim_conversation_to_recent_turns_keeps_single_tool_heavy_turn_over_cap() {
         let mut history = vec![conversation_user("run the workflow")];
@@ -357,7 +410,7 @@ mod tests {
         history.push(conversation_assistant("workflow complete"));
         assert_eq!(history.len(), 64);
 
-        let result = trim_conversation_to_recent_turns(history, 50, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 50, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -389,7 +442,7 @@ mod tests {
         }
         history.push(conversation_assistant("new answer"));
 
-        let result = trim_conversation_to_recent_turns(history, 50, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 50, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_turns, 1);
@@ -417,7 +470,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 0, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 0, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -442,7 +495,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -476,7 +529,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 3, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 3, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -498,7 +551,7 @@ mod tests {
         ];
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -518,7 +571,7 @@ mod tests {
         history.push(conversation_assistant("done"));
         let original = serde_json::to_value(&history).expect("fixture should serialize");
 
-        let result = trim_conversation_to_recent_turns(history, 1, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 1, false);
 
         assert!(!result.trimmed);
         assert_eq!(result.dropped_messages, 0);
@@ -542,7 +595,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -573,7 +626,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 2, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 2, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -604,7 +657,7 @@ mod tests {
             conversation_assistant("new answer"),
         ];
 
-        let result = trim_conversation_to_recent_turns(history, 4, false);
+        let result = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, false);
 
         assert!(result.trimmed);
         assert_eq!(result.dropped_messages, 2);
@@ -634,7 +687,7 @@ mod tests {
             conversation_assistant("middle answer"),
         ];
 
-        let first = trim_conversation_to_recent_turns(history, 4, true);
+        let first = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, true);
         assert!(
             !first.trimmed,
             "a synthetic breadcrumb must not push an exactly-at-cap body over the limit"
@@ -643,7 +696,7 @@ mod tests {
         history = first.history;
         history.push(conversation_user("new request"));
         history.push(conversation_assistant("new answer"));
-        let mut second = trim_conversation_to_recent_turns(history, 4, true);
+        let mut second = trim_conversation_to_recent_turns_at_legacy_cap(history, 4, true);
 
         assert!(second.trimmed);
         assert_eq!(second.dropped_messages, 2);
@@ -674,6 +727,125 @@ mod tests {
             Some(ConversationMessage::Chat(message))
                 if message.role == "assistant" && message.content == "new answer"
         ));
+    }
+
+    #[test]
+    fn history_trim_target_semantics() {
+        // 1.0 keeps the no-hysteresis identity exactly.
+        assert_eq!(history_trim_target(10, 1.0), 10);
+        assert_eq!(history_trim_target(1, 1.0), 1);
+        assert_eq!(history_trim_target(0, 1.0), 0);
+        // Fractional values floor toward the cap.
+        assert_eq!(history_trim_target(10, 0.7), 7);
+        assert_eq!(history_trim_target(5, 0.7), 3);
+        assert_eq!(history_trim_target(4, 0.7), 2);
+        // The target never aims below a single message.
+        assert_eq!(history_trim_target(1, 0.7), 1);
+        assert_eq!(history_trim_target(0, 0.7), 1);
+        // Out-of-range fractions (rejected at config load) degrade to the
+        // legacy no-hysteresis target rather than something nonsensical.
+        assert_eq!(history_trim_target(10, 1.5), 10);
+        assert_eq!(history_trim_target(10, f32::NAN), 10);
+        assert_eq!(history_trim_target(10, 0.0), 10);
+    }
+
+    #[test]
+    fn trim_conversation_to_recent_turns_at_cap_does_not_trim_below_target() {
+        // The trigger stays on the cap: at or below max_messages the history
+        // is untouched even though the target is smaller.
+        let history = vec![
+            conversation_user("old request"),
+            conversation_assistant("old answer"),
+            conversation_user("new request"),
+            conversation_assistant("new answer"),
+        ];
+
+        let result =
+            trim_conversation_to_recent_turns(history, 4, history_trim_target(4, 0.7), false);
+
+        assert!(!result.trimmed);
+        assert_eq!(result.dropped_messages, 0);
+        assert_eq!(result.dropped_turns, 0);
+        assert_eq!(result.kept_turns, 2);
+        assert_eq!(result.history.len(), 4);
+    }
+
+    #[test]
+    fn trim_conversation_to_recent_turns_crossing_by_one_drops_to_target() {
+        let history = vec![
+            conversation_user("first request"),
+            conversation_user("second request"),
+            conversation_assistant("second answer"),
+            conversation_user("third request"),
+            conversation_assistant("third answer"),
+        ];
+        // 5 body messages over a cap of 4: the trim fires, but instead of
+        // refilling to the cap it drops to the low-water target (2), which
+        // here means two whole turns go instead of one.
+        let result = trim_conversation_to_recent_turns(history, 4, 2, false);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_turns, 2);
+        assert_eq!(result.dropped_messages, 3);
+        assert_eq!(result.kept_turns, 1);
+        assert_eq!(result.history.len(), 2);
+        assert!(matches!(
+            &result.history[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+            ] if user.role == "user" && user.content == "third request"
+                && assistant.role == "assistant" && assistant.content == "third answer"
+        ));
+
+        // The same fixture under a 1.0 low water mark keeps one more turn:
+        // hysteresis, not the cap change, is what drops the second turn.
+        let legacy = trim_conversation_to_recent_turns_at_legacy_cap(
+            vec![
+                conversation_user("first request"),
+                conversation_user("second request"),
+                conversation_assistant("second answer"),
+                conversation_user("third request"),
+                conversation_assistant("third answer"),
+            ],
+            4,
+            false,
+        );
+        assert_eq!(legacy.dropped_turns, 1);
+        assert_eq!(legacy.history.len(), 4);
+    }
+
+    #[test]
+    fn trim_conversation_to_recent_turns_newest_turn_alone_exceeds_target() {
+        let mut history = vec![
+            conversation_user("old request"),
+            conversation_assistant("old answer"),
+            conversation_user("new request"),
+        ];
+        for index in 0..25 {
+            push_tool_exchange(&mut history, index);
+        }
+        history.push(conversation_assistant("new answer"));
+
+        // Target 35 against a 52-message newest turn: the invariant wins,
+        // the newest complete turn is kept exactly.
+        let result = trim_conversation_to_recent_turns(history, 50, 35, false);
+
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_turns, 1);
+        assert_eq!(result.dropped_messages, 2);
+        assert_eq!(result.kept_turns, 1);
+        assert!(matches!(
+            result.history.first(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "user" && message.content == "new request"
+        ));
+        assert!(matches!(
+            result.history.last(),
+            Some(ConversationMessage::Chat(message))
+                if message.role == "assistant" && message.content == "new answer"
+        ));
+        assert_structural_tool_pairs(&result.history);
     }
 
     #[test]
