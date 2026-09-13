@@ -35701,14 +35701,47 @@ This is an example JSON object for profile settings."#;
             "no provider call may linger"
         );
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(
-            !sent_messages.iter().any(|m| m.contains("response-1")),
-            "older burst turn must be cancelled without a response, got {:?}",
+        // The provider labels each reply by the order of history calls that
+        // actually reached it (`response-N`), so the label of the newest turn
+        // is a property of who got there first, not of the turn's admission
+        // order. Supersession now happens at admission, which means the older
+        // burst turn is cancelled before it can reach the provider at all and
+        // the newest turn legitimately owns label 1. Derive the newest turn's
+        // label from the recorded call content instead of assuming index 1
+        // belongs to the older turn — that inference, not the dispatcher, was
+        // the brittle part of this assertion.
+        let newest_label = {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            let newest = calls
+                .iter()
+                .position(|call| {
+                    call.iter().any(|(role, content)| {
+                        role == "user" && content.contains("second question")
+                    })
+                })
+                .expect("the newest turn must reach the provider");
+            newest + 1
+        };
+        let provider_labels: Vec<String> = (1..=newest_label)
+            .map(|index| format!("response-{index}"))
+            .collect();
+        let delivered: Vec<&String> = sent_messages
+            .iter()
+            .filter(|message| {
+                provider_labels
+                    .iter()
+                    .any(|label| message.contains(label.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "exactly one provider reply may be delivered, got {:?}",
             *sent_messages
         );
         assert!(
-            sent_messages.iter().any(|m| m.contains("response-2")),
-            "newest turn's response must be delivered, got {:?}",
+            delivered[0].contains(&format!("response-{newest_label}")),
+            "newest turn's response must be the delivered one, got {:?}",
             *sent_messages
         );
     }
