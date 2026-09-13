@@ -2269,7 +2269,10 @@ fn generate_v3_channel_breadth_lower_bound() {
     // The V1 fixture covers a wide channel surface. Lower-bound count
     // catches accidental loss of a whole channel during migration.
     // Raise the bound only when adding more channels to the fixture.
-    const MIN_CHANNEL_ALIASES: usize = 25;
+    // The V4 cut removes the twitter/reddit/notion listen paths on
+    // purpose, so those channel maps are empty by the time the config
+    // reaches V5 and are not counted here.
+    const MIN_CHANNEL_ALIASES: usize = 24;
 
     let cfg = migrate_to_current(
         &generate(CURRENT_SCHEMA_VERSION, &GenerateOptions::default())
@@ -2296,9 +2299,7 @@ fn generate_v3_channel_breadth_lower_bound() {
         + cfg.channels.wecom.len()
         + cfg.channels.wechat.len()
         + cfg.channels.qq.len()
-        + cfg.channels.twitter.len()
         + cfg.channels.mochat.len()
-        + cfg.channels.reddit.len()
         + cfg.channels.bluesky.len()
         + cfg.channels.email.len()
         + cfg.channels.gmail_push.len()
@@ -2307,7 +2308,7 @@ fn generate_v3_channel_breadth_lower_bound() {
 
     assert!(
         alias_count >= MIN_CHANNEL_ALIASES,
-        "generate(V3) channel breadth dropped: expected ≥ {MIN_CHANNEL_ALIASES} \
+        "generate(current) channel breadth dropped: expected ≥ {MIN_CHANNEL_ALIASES} \
          channel aliases across all types, got {alias_count}. Most likely \
          cause: a V1 channel block got silently dropped during migration."
     );

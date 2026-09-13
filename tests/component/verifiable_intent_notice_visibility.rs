@@ -277,15 +277,18 @@ fn the_withheld_notice_is_recorded_once_per_config_application() {
 /// reporting nothing at all, which is the one moment the operator most needs to
 /// be told the tool stays absent.
 ///
-/// `schema_version` is written because `config patch` refuses to modify a config
-/// it would have to migrate first.
+/// `schema_version` is written at the current version because `config patch`
+/// refuses to modify a config it would have to migrate first.
 #[test]
 fn enabling_the_section_through_config_patch_records_the_notice_once() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
+    let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
     std::fs::write(
         dir.path().join("config.toml"),
-        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
-         [verifiable_intent]\nenabled = false\n",
+        format!(
+            "schema_version = {version}\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
+             [verifiable_intent]\nenabled = false\n"
+        ),
     )
     .expect("write config.toml");
     let patch = dir.path().join("patch.json");
@@ -345,10 +348,13 @@ fn enabling_the_section_through_config_patch_records_the_notice_once() {
 #[test]
 fn a_patch_that_does_not_enable_the_section_adds_no_second_record() {
     let dir = tempfile::TempDir::new().expect("temp config dir");
+    let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
     std::fs::write(
         dir.path().join("config.toml"),
-        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
-         [verifiable_intent]\nenabled = true\n",
+        format!(
+            "schema_version = {version}\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
+             [verifiable_intent]\nenabled = true\n"
+        ),
     )
     .expect("write config.toml");
     let patch = dir.path().join("patch.json");

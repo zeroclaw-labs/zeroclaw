@@ -1,4 +1,5 @@
 import { getMapKeys, getProp, getTemplates } from './api';
+import type { PropResponse } from './api';
 
 export type ConfiguredModelCategory = 'models' | 'tts' | 'transcription';
 
@@ -46,6 +47,36 @@ export async function walkConfiguredModelBindings(
         out.push({ type, alias, resource: v });
       }
     });
+    // Multi-model subtable entries live at
+    // `providers.models.<type>.<alias>.models.<sub>.id`. Only the `models`
+    // category has this subtable (tts/transcription do not), so guard on it.
+    if (category === 'models') {
+      const subResults = await Promise.all(
+        aliases.map(async (alias) => {
+          try {
+            const { keys } = await getMapKeys(`${root}.${type}.${alias}.models`);
+            const ids = await Promise.all(
+              keys.map((sub) =>
+                getProp(`${root}.${type}.${alias}.models.${sub}.id`).catch(
+                  () => null,
+                ),
+              ),
+            );
+            return { alias, ids };
+          } catch {
+            return { alias, ids: [] as (PropResponse | null)[] };
+          }
+        }),
+      );
+      for (const { alias, ids } of subResults) {
+        for (const r of ids) {
+          const v = r && typeof r.value === 'string' ? r.value : '';
+          if (v && v !== '<unset>') {
+            out.push({ type, alias, resource: v });
+          }
+        }
+      }
+    }
   }
   return out;
 }

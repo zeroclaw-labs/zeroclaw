@@ -415,8 +415,7 @@ fn configured_model_provider_api_key<'a>(
     config: &'a Config,
     provider_name: &str,
 ) -> Option<&'a str> {
-    let (family, alias) = provider_name
-        .split_once('.')
+    let (family, alias) = zeroclaw_config::schema::provider_profile_ref(provider_name)
         .unwrap_or((provider_name, "default"));
 
     config
@@ -437,7 +436,7 @@ fn create_doctor_model_provider(
         &zeroclaw_providers::ModelProviderRuntimeOptions::default(),
     );
 
-    match provider_name.split_once('.') {
+    match zeroclaw_config::schema::provider_profile_ref(provider_name) {
         Some((family, alias)) => zeroclaw_providers::create_model_provider_for_alias(
             config, family, alias, api_key, &options,
         ),
@@ -743,21 +742,60 @@ pub async fn update_context_windows(
         Option<String>,
         Option<String>,
         Option<usize>,
+        Option<String>,
     );
+
+    // One target per model a profile hosts: nested entries carry their own
+    // model id and context window, and their write path lands inside the
+    // `models.<alias>` subtable. A profile hosting only nested models is no
+    // longer skipped as "no model configured".
+    fn expand_profile_targets(
+        ty: &str,
+        alias: &str,
+        entry: &zeroclaw_config::schema::ModelProviderConfig,
+    ) -> Vec<ProviderTarget> {
+        let profile_ref = format!("{ty}.{alias}");
+        if entry.models.is_empty() {
+            return vec![(
+                profile_ref,
+                ty.to_string(),
+                alias.to_string(),
+                entry.model.clone().unwrap_or_default(),
+                entry.uri.clone(),
+                entry.api_key.clone(),
+                entry.context_window,
+                None,
+            )];
+        }
+        let mut model_aliases: Vec<&str> = entry.models.keys().map(String::as_str).collect();
+        model_aliases.sort_unstable();
+        model_aliases
+            .into_iter()
+            .map(|model_alias| {
+                let nested = &entry.models[model_alias];
+                (
+                    format!("{profile_ref}.{model_alias}"),
+                    ty.to_string(),
+                    alias.to_string(),
+                    nested
+                        .id
+                        .clone()
+                        .or_else(|| entry.model.clone())
+                        .unwrap_or_default(),
+                    entry.uri.clone(),
+                    entry.api_key.clone(),
+                    nested.context_window,
+                    Some(model_alias.to_string()),
+                )
+            })
+            .collect()
+    }
 
     // Collect all the data we need first to avoid borrow conflicts
     let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
         // Single provider - use find_by_name to look up by "type.alias" format
         if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
-            vec![(
-                model_provider.to_string(),
-                t.to_string(),
-                a.to_string(),
-                entry.model.clone().unwrap_or_default(),
-                entry.uri.clone(),
-                entry.api_key.clone(),
-                entry.context_window,
-            )]
+            expand_profile_targets(t, &a, entry)
         } else {
             anyhow::bail!("Model provider '{model_provider}' not found in config");
         }
@@ -767,22 +805,20 @@ pub async fn update_context_windows(
             .providers
             .models
             .iter_entries()
-            .map(|(t, a, e)| {
-                (
-                    format!("{t}.{a}"),
-                    t.to_string(),
-                    a.to_string(),
-                    e.model.clone().unwrap_or_default(),
-                    e.uri.clone(),
-                    e.api_key.clone(),
-                    e.context_window,
-                )
-            })
+            .flat_map(|(t, a, e)| expand_profile_targets(t, a, e))
             .collect()
     };
 
-    for (provider_ref, provider_type, alias, model, uri, api_key, existing_context_window) in
-        targets
+    for (
+        provider_ref,
+        provider_type,
+        alias,
+        model,
+        uri,
+        api_key,
+        existing_context_window,
+        model_alias,
+    ) in targets
     {
         // Skip if already has context_window set
         if let Some(ctx) = existing_context_window {
@@ -832,7 +868,15 @@ pub async fn update_context_windows(
                         )
                     );
                 } else {
-                    let path = format!("providers.models.{provider_type}.{alias}.context_window");
+                    // A nested model entry's window lands inside its
+                    // `models.<alias>` subtable — the profile-level path
+                    // would shadow nothing and silently do nothing.
+                    let path = match &model_alias {
+                        Some(model_alias) => format!(
+                            "providers.models.{provider_type}.{alias}.models.{model_alias}.context_window"
+                        ),
+                        None => format!("providers.models.{provider_type}.{alias}.context_window"),
+                    };
                     match config.set_prop_persistent(&path, &ctx.to_string()) {
                         Ok(_) => {
                             updated += 1;
@@ -911,21 +955,16 @@ pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Resu
 
 /// Collect the configured `(provider_ref, model)` pairs from config, optionally
 /// narrowed to a single target (matched by full `type.alias` ref or by bare
-/// family name).
+/// family name). Delegates to the shared config-level enumeration so the CLI
+/// surfaces and the doctor can never disagree about what a profile hosts.
 fn configured_model_entries(
     config: &Config,
     provider_override: Option<&str>,
 ) -> Vec<(String, Option<String>)> {
-    let filter = provider_override.map(str::trim).filter(|p| !p.is_empty());
     config
-        .providers
-        .models
-        .iter_entries()
-        .map(|(ty, alias, entry)| (format!("{ty}.{alias}"), entry.model.clone()))
-        .filter(|(provider_ref, _)| match filter {
-            Some(f) => provider_ref == f || provider_ref.split('.').next() == Some(f),
-            None => true,
-        })
+        .configured_model_entries(provider_override)
+        .into_iter()
+        .map(|e| (e.provider_ref, e.model_id))
         .collect()
 }
 
@@ -1184,11 +1223,62 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 }
             }
 
-            // Model configured
-            if let Some(model) = entry.model.as_deref() {
+            // Model configured — a profile hosting a `models` map reports one
+            // line per nested entry (its resolved id), so a nested-only
+            // profile is no longer misreported as "no model configured".
+            if !entry.models.is_empty() {
+                let mut nested_aliases: Vec<&str> =
+                    entry.models.keys().map(String::as_str).collect();
+                nested_aliases.sort_unstable();
+                for model_alias in nested_aliases {
+                    let model_id = config
+                        .resolve_model_selection(&format!("{label}.{model_alias}"))
+                        .and_then(|s| s.model_id);
+                    match model_id {
+                        Some(model) => items.push(DiagItem::ok(
+                            cat,
+                            format!("{label}: model: {model} (entry {model_alias})"),
+                        )),
+                        None => items.push(DiagItem::warn(
+                            cat,
+                            format!(
+                                "{label}: entry {model_alias} has no model id (set its `id` or \
+                                 the profile `model`)"
+                            ),
+                        )),
+                    }
+                }
+            } else if let Some(model) = entry.model.as_deref() {
                 items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
             } else {
                 items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // Nested model entries carry their own tuning; surface only the
+            // invalid values (a per-entry "unset" line would be noise — the
+            // profile-level lines above already summarize the unset state).
+            for (model_alias, model_entry) in &entry.models {
+                let entry_label = format!("{label}.{model_alias}");
+                if model_entry.context_window == Some(0) {
+                    items.push(DiagItem::error(
+                        cat,
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-context-window-zero",
+                            &[("provider_ref", &entry_label)],
+                        ),
+                    ));
+                }
+                if let Some(temperature) = model_entry.temperature
+                    && !(0.0..=2.0).contains(&temperature)
+                {
+                    items.push(DiagItem::error(
+                        cat,
+                        format!(
+                            "{entry_label}: temperature {temperature:.1} is out of range \
+                             (expected 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
             }
 
             // A missing value remains unknown until this profile is selected;
@@ -3508,6 +3598,134 @@ mod tests {
             alias2_ctx,
             Some(4096),
             "alias2 context_window should be set to mock fetch value"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_context_windows_targets_nested_model_entries() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+
+        // A profile hosting only nested entries and no profile-level model:
+        // previously skipped wholesale as "no model configured". One entry
+        // already carries a window and must be skipped; the other must get
+        // its window written INSIDE the `models.<alias>` subtable — the
+        // profile-level path would shadow nothing and silently do nothing.
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "gw")
+                .expect("openai provider type exists");
+            entry.models.insert(
+                "big".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o".into()),
+                    context_window: Some(64_000),
+                    ..Default::default()
+                },
+            );
+            entry.models.insert(
+                "cheap".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o-mini".into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // The fetch reports a per-model value so the test can observe WHICH
+        // model each probe (and therefore each write) targeted.
+        let mock_fetch: FetchContextWindowFn = Box::new(
+            |_type: &str, cfg: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(async move { cfg.model.as_deref().map(|m| m.chars().count() * 1000) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+            },
+        );
+        let updated = update_context_windows(&mut config, None, false, Some(mock_fetch))
+            .await
+            .expect("update_context_windows should succeed");
+
+        assert_eq!(updated, 1, "only the window-less nested entry is updated");
+
+        let entry = config
+            .providers
+            .models
+            .find("openai", "gw")
+            .expect("profile exists");
+        let cheap_ctx = entry.models.get("cheap").and_then(|e| e.context_window);
+        let big_ctx = entry.models.get("big").and_then(|e| e.context_window);
+        // "gpt-4o-mini" is 11 chars → the probe saw the nested entry's model.
+        assert_eq!(
+            cheap_ctx,
+            Some(11_000),
+            "the write must land on the nested entry's own context_window"
+        );
+        assert_eq!(
+            big_ctx,
+            Some(64_000),
+            "an entry that already has a window must be skipped"
+        );
+        assert_eq!(
+            entry.context_window, None,
+            "the profile-level window must not be touched when all models are nested"
+        );
+    }
+
+    #[test]
+    fn check_config_semantics_reports_nested_entries_as_configured() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
+        // Nested-only profile: no profile-level model, both entries carry
+        // ids. Previously this warned "no model configured".
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("openai", "gw")
+                .expect("openai provider type exists");
+            entry.models.insert(
+                "cheap".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o-mini".into()),
+                    ..Default::default()
+                },
+            );
+            // Entry with an invalid tuning value — surfaced per entry.
+            entry.models.insert(
+                "broken".to_string(),
+                zeroclaw_config::schema::ModelEntryConfig {
+                    id: Some("gpt-4o".into()),
+                    context_window: Some(0),
+                    temperature: Some(3.0),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+
+        assert!(
+            !messages.iter().any(|m| m.contains("no model configured")),
+            "a nested-only profile is not 'no model configured': {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("model: gpt-4o-mini (entry cheap)")),
+            "each nested entry's id is reported: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("openai.gw.broken")),
+            "invalid nested-entry tuning is reported against the entry: {messages:?}"
         );
     }
 }

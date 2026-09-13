@@ -825,7 +825,16 @@ function agentAliasJumpPath(
   // Channels and model_providers use dotted alias (`telegram.default`,
   // `anthropic.work`); split into the two URL segments. Single-tier
   // sections use the alias directly.
-  if (fieldKind === "channels" || fieldKind === "model_providers") {
+  if (fieldKind === "model_providers") {
+    // model_provider refs may be three-segment (`<type>.<alias>.<model>`);
+    // the edit surface is the profile page keyed by `<type>/<alias>`, so take
+    // the first two segments and drop any trailing `<model>`.
+    const [type, aliasSeg] = alias.split(".");
+    if (type && aliasSeg) {
+      return `${base}/${encodeURIComponent(type)}/${encodeURIComponent(aliasSeg)}`;
+    }
+  }
+  if (fieldKind === "channels") {
     const dot = alias.indexOf(".");
     if (dot > 0) {
       return `${base}/${encodeURIComponent(alias.slice(0, dot))}/${encodeURIComponent(alias.slice(dot + 1))}`;
@@ -1683,12 +1692,14 @@ function FieldRow({
   const [showComment, setShowComment] = useState(comment.length > 0);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
-  // Per-alias model field — `providers.models.<type>.<alias>.model`.
-  const isProviderModelField = /^providers\.models\.[^.]+\.[^.]+\.model$/.test(
-    entry.path,
-  );
-  // The same alias's `fallback_models` array — a list of model IDs from the
-  // same provider catalog, so it gets the same known-model dropdown per row.
+  // Per-alias model field — the profile-level `providers.models.<type>.<alias>.model`
+  // or a multi-model entry's `providers.models.<type>.<alias>.models.<model_alias>.id`.
+  // Both are provider-local model IDs that get the known-model dropdown.
+  const isProviderModelField =
+    /^providers\.models\.[^.]+\.[^.]+\.model$/.test(entry.path) ||
+    /^providers\.models\.[^.]+\.[^.]+\.models\.[^.]+\.id$/.test(entry.path);
+  // The same alias's `fallback_models` array (profile-level) — a list of model
+  // IDs from the same provider catalog, so it gets the same dropdown per row.
   const isProviderModelArrayField =
     /^providers\.models\.[^.]+\.[^.]+\.fallback_models$/.test(entry.path);
   // Either model field needs the provider's catalog fetched.

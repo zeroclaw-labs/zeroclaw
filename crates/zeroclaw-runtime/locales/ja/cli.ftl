@@ -709,6 +709,7 @@ cli-status-config = 設定:      {$v}
 cli-status-provider-indent = {"   "}ModelProvider:      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider:      {$family}.{$alias}
 cli-status-model = {"   "}モデル:         {$model}
+cli-status-model-entry = {"   "}モデル [{$alias}]：{$model}
 cli-status-observability = 📊 可観測性:  {$v}
 cli-status-trace-storage = 🧾 トレースストレージ:  {$mode} ({$path})
 cli-status-agents = 🛡️  エージェント:        {$v}

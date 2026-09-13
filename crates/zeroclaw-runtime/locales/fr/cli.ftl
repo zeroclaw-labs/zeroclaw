@@ -714,6 +714,7 @@ cli-status-config = Config :      {$v}
 cli-status-provider-indent = {"   "}ModelProvider :      {$family}.{$alias}
 cli-status-provider = 🤖 ModelProvider :      {$family}.{$alias}
 cli-status-model = {"   "}Modèle :         {$model}
+cli-status-model-entry = {"   "}Modèle [{$alias}] : {$model}
 cli-status-observability = 📊 Observabilité :  {$v}
 cli-status-trace-storage = 🧾 Stockage des traces :  {$mode} ({$path})
 cli-status-agents = 🛡️  Agents :        {$v}
