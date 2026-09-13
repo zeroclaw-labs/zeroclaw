@@ -30,8 +30,13 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Build docs, or promote an already deployed release without rebuilding."
+        type: choice
+        options: [build, promote-stable]
+        default: build
       tag:
-        description: "The version tag to deploy (e.g. v0.7.5, master). If omitted, builds 'master'."
+        description: "Version to build (default master), or exact final tag to promote (e.g. v0.8.5)."
         required: false
         default: "master"
 
@@ -44,6 +49,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'build'
     runs-on: ubuntu-24.04-arm
     steps:
       # A push to master may flip the stable pointer (docs/book/stable-version.txt).
@@ -267,6 +273,9 @@ jobs:
             mkdir -p "$TAG_SRC"
             rsync -a "$BUILD_ROOT/" "$TAG_SRC/"
           fi
+          # Receipt travels with the built version, including retries. Promotion
+          # compares this exact checkout commit with the current release tag.
+          git rev-parse HEAD > "$TAG_SRC/.docs-source-commit"
 
           pushd "$CLONE_DIR" > /dev/null
 
@@ -417,3 +426,45 @@ jobs:
             apply_run_slice
           done
           popd > /dev/null
+
+  promote-stable:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'promote-stable'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Promote deployed stable docs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # This job shares the workflow-wide gh-pages lock with normal builds.
+          # A missing gh-pages branch is an error: promotion never bootstraps it.
+          PAGES_DIR=$(mktemp -d)
+          git fetch --depth=1 origin refs/heads/gh-pages
+          git worktree add --detach "$PAGES_DIR" FETCH_HEAD
+          PAGES_SHA=$(git -C "$PAGES_DIR" rev-parse HEAD)
+          PROMOTE=(python3 scripts/docs/promote_stable.py
+            --pages "$PAGES_DIR" --repo "$GITHUB_REPOSITORY"
+            --master-sha "$GITHUB_SHA" --tag "$TAG" --minimum "$DOCS_MIN_VERSION")
+          "${PROMOTE[@]}"
+          if git -C "$PAGES_DIR" diff --quiet; then
+            echo "Stable docs already point to $TAG."
+            exit 0
+          fi
+          # Preserve the one-commit artifact branch. The lease rejects another
+          # writer instead of replacing a site that was not validated here.
+          git -C "$PAGES_DIR" checkout --orphan ghp-promotion
+          git -C "$PAGES_DIR" add --all
+          git -C "$PAGES_DIR" -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "docs: promote $TAG to stable (from $GITHUB_SHA)"
+          # Recheck live master, Latest, tag identity and locales before publish.
+          "${PROMOTE[@]}" --check-only
+          git -C "$PAGES_DIR" push --force-with-lease=refs/heads/gh-pages:"$PAGES_SHA" \
+            origin HEAD:refs/heads/gh-pages
