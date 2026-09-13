@@ -82,10 +82,14 @@ selector list grants no instances, and broad access requires the explicit
 Tool selectors compose by intersection at agent assembly: a session
 created by a constrained principal only receives the tools its
 `allowed_tools` names (an empty list yields a tool-less session), on top
-of whatever the agent's own risk profile allows. The narrowing binds when
-the session is created; selector changes apply to new sessions, while
-revoking a principal's session grants cuts off its existing sessions at
-the per-operation gate.
+of whatever the agent's own risk profile allows. At every admitted prompt,
+the current principal selector narrows static and already-activated deferred
+tools again; a removed tool cannot survive in an existing, resumed, or
+rehydrated session. Agent selectors are checked at the same prompt boundary.
+Deferred MCP instructions are shown only for the final exposed surface. A
+principal needs `tool_search` itself as well as the named deferred MCP tool
+to activate that tool. Constrained sessions fail closed for nested delegation
+until both principal tool and agent ceilings can be carried into that path.
 
 ## Breaking change: remote WSS requires authentication
 
