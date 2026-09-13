@@ -21,6 +21,7 @@ pub mod multimodal;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
+pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
