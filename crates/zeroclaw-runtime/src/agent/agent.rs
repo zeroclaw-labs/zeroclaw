@@ -1310,6 +1310,28 @@ impl Agent {
         }
     }
 
+    /// Apply a current principal tool ceiling to an existing session. This is
+    /// intentionally narrowing-only: session construction already intersects
+    /// the principal and agent policies, while a later policy refresh must
+    /// never let an old static or activated tool survive a removed grant.
+    pub fn narrow_to_principal_tools(&mut self, allowed: Option<&[String]>) {
+        let Some(allowed) = allowed else {
+            return;
+        };
+        self.tools
+            .retain(|tool| allowed.iter().any(|name| name == tool.name()));
+        if let Some(activated) = &self.activated_tools {
+            if let Ok(mut activated) = activated.lock() {
+                activated.retain_allowed(allowed);
+            }
+        }
+        // The deferred prompt text was assembled for an earlier surface. Do
+        // not advertise a tool-search route until a rehydrated/currently
+        // assembled session can derive it from the final exposed tools.
+        self.mcp_deferred_section.clear();
+        self.refresh_system_prompt();
+    }
+
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -1761,7 +1783,7 @@ impl Agent {
         let deferred_section = assembled.deferred_section().to_string();
         let pinned_section = assembled.pinned_section().to_string();
         let crate::tools::scoped::ScopedAssembled {
-            registry,
+            mut registry,
             delegate_handle: _,
             ask_user_handle,
             reaction_handle,
@@ -1774,6 +1796,13 @@ impl Agent {
             // already-consumed sibling fields via `..`.
             ..
         } = assembled;
+        // Nested delegation has no principal-agent ceiling parameter yet. A
+        // constrained principal can still use its correctly narrowed session,
+        // but cannot enter either bounded or independent delegation and lose
+        // that ceiling.
+        if principal_allowed_tools.is_some() {
+            registry.retain(|tool| tool.name() != "delegate");
+        }
         // Thread the sealed registry straight to the builder - `.tools(...)` now
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
         let tools = registry;

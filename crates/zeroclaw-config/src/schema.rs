@@ -6993,6 +6993,11 @@ pub struct ModelCostRates {
     /// providers that don't charge separately for prompt cache hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_per_mtok: Option<f64>,
+    /// Cache-write tokens (USD per 1M). Optional — premium providers may
+    /// charge separately to write prompt data into their cache. Leave unset
+    /// to price cache writes at the ordinary input rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 /// Rates for a TTS model, in USD per 1M characters.

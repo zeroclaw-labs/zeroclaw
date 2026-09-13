@@ -248,6 +248,14 @@ impl ActivatedToolSet {
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
+
+    /// Remove activated deferred tools that a newly narrowed principal may no
+    /// longer invoke. Callers resolve the principal policy from its canonical
+    /// source at the prompt boundary; this set retains no independent policy.
+    pub fn retain_allowed(&mut self, allowed: &[String]) {
+        self.tools
+            .retain(|name, _| allowed.iter().any(|allowed_name| allowed_name == name));
+    }
 }
 
 impl Default for ActivatedToolSet {

@@ -2812,6 +2812,13 @@ impl RpcDispatcher {
         // bound rather than changing unrelated prompt-fixture semantics.
         if self.auth.is_some() {
             self.selector_session_agent(Method::SessionPrompt, &agent_alias)?;
+            // `authorize` re-resolves the connection's current grants before
+            // this handler. Apply that same canonical selector to static and
+            // already-activated deferred tools before prompt-side effects.
+            agent
+                .lock()
+                .await
+                .narrow_to_principal_tools(self.principal_tool_narrowing().as_deref());
         }
 
         // Process inline attachments: upload each, append markers to prompt.
