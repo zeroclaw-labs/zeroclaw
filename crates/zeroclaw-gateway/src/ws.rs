@@ -102,7 +102,7 @@ impl<'a> GatewayCancelTokenRegistration<'a> {
             let mut cancel_tokens = state
                 .cancel_tokens
                 .lock()
-                .expect("cancel_tokens lock poisoned");
+                .unwrap_or_else(|error| error.into_inner());
             let pending_delete = cancel_tokens
                 .pending_deletions
                 .remove(session_key)
@@ -1199,8 +1199,8 @@ async fn process_chat_message(
     agent.set_session_prompt_attachments(attachments);
 
     // Derive the best-effort admission snapshot before this function marks a
-    // turn running or publishes its cancellation handle. A construction error
-    // must therefore leave no partially started WebSocket turn behind.
+    // turn running. Its caller already published the cancellation handle after
+    // queue admission; a construction error still leaves no started turn.
     let session_prompt_tools_allowed = session_prompts_enabled && state.session_backend.is_some();
     let session_prompt_budget =
         match websocket_session_prompt_budget(session_prompt_tools_allowed, || {

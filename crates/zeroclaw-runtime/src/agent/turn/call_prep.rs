@@ -119,6 +119,10 @@ pub(crate) async fn prepare_tool_calls(
         // later turn. Its body is intentionally limited to the provider,
         // explicit list results, and the exact approval surface; hooks are
         // independent extension points and therefore must not receive it.
+        // V1 deliberately excludes alternative hook policies for these tools.
+        // A redacted, metadata-only hook projection could be designed later,
+        // but it would establish a distinct hook-policy contract beyond this
+        // proposal and requires a separate architectural decision.
         if !incoming_sensitive_session_prompt && let Some(hooks) = ctx.hooks {
             match hooks
                 .run_before_tool_call(tool_name.clone(), tool_args.clone())

@@ -206,7 +206,6 @@ tool-session-prompt-error-missing-id = Missing 'id' parameter.
 tool-session-prompt-error-missing-content = Missing 'content' parameter.
 tool-session-prompt-error-list = Failed to list session prompts: { $err }
 tool-session-prompt-error-set = Failed to set session prompt: { $err }
-tool-session-prompt-error-budget = Session prompt was not saved because the current system-prompt budget would be exceeded.
 tool-session-prompt-error-delete = Failed to delete session prompt: { $err }
 tool-session-prompt-set-created = Session prompt '{ $id }' created; it applies on the next top-level turn.
 tool-session-prompt-set-updated = Session prompt '{ $id }' updated; it applies on the next top-level turn.

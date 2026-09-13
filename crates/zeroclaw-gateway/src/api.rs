@@ -2085,8 +2085,8 @@ pub(crate) fn signal_gateway_deletion_at_generation<'a>(
             cancelled_active_turn: true,
         };
     };
-    // A different active generation is a successor. Never publish a pending
-    // signal for it from this stale DELETE.
+    // A different active generation is a successor. A stale DELETE may retain
+    // a latch only for its expected generation, never for that successor.
     let pending = match cancellations
         .pending_deletions
         .entry(session_key.to_string())
