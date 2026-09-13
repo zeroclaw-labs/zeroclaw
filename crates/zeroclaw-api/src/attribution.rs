@@ -4,6 +4,13 @@ use strum_macros::{EnumIter, EnumString, IntoStaticStr};
 pub trait Attributable {
     fn role(&self) -> Role;
     fn alias(&self) -> &str;
+
+    /// Classifies whether a tool implementation is first-party native code or
+    /// an extension. The conservative default prevents a new wrapper from
+    /// inheriting native presentation privileges accidentally.
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
+    }
 }
 
 impl<T: Attributable + ?Sized> Attributable for std::sync::Arc<T> {
@@ -12,6 +19,9 @@ impl<T: Attributable + ?Sized> Attributable for std::sync::Arc<T> {
     }
     fn alias(&self) -> &str {
         (**self).alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        (**self).tool_provenance()
     }
 }
 
@@ -22,6 +32,9 @@ impl<T: Attributable + ?Sized> Attributable for Box<T> {
     fn alias(&self) -> &str {
         (**self).alias()
     }
+    fn tool_provenance(&self) -> ToolProvenance {
+        (**self).tool_provenance()
+    }
 }
 
 impl<T: Attributable + ?Sized> Attributable for &T {
@@ -31,6 +44,20 @@ impl<T: Attributable + ?Sized> Attributable for &T {
     fn alias(&self) -> &str {
         (**self).alias()
     }
+    fn tool_provenance(&self) -> ToolProvenance {
+        (**self).tool_provenance()
+    }
+}
+
+/// Trust origin of a registered tool implementation.
+///
+/// This is deliberately separate from [`ToolKind`]: first-party and extension
+/// tools can share a behavioral role, while presentation policy must not grant
+/// an extension the disclosure privileges of a native implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProvenance {
+    Native,
+    Extension,
 }
 
 /// Closed taxonomy of every role a thing can fill.
@@ -175,6 +202,8 @@ pub enum ToolKind {
     SopHistory,
     Wait,
     Plugin,
+    /// A tool supplied by a WebAssembly plugin rather than the native registry.
+    WasmPlugin,
 }
 
 /// Cron schedule shapes.
@@ -224,6 +253,7 @@ pub enum ModelProviderKind {
     Ollama,
     Gemini,
     GeminiCli,
+    GrokCli,
     GoogleAi,
     Mistral,
     Groq,
@@ -283,6 +313,7 @@ pub enum ModelProviderKind {
     Lepton,
     Synthetic,
     Opencode,
+    Zerorouter,
     Custom,
     Plugin,
 }

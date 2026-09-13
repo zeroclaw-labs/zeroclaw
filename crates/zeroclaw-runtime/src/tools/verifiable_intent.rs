@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use crate::verifiable_intent::error::ViError;
-use crate::verifiable_intent::types::{Constraint, Fulfillment};
+use crate::verifiable_intent::types::{Constraint, Fulfillment, MandateMode};
 use crate::verifiable_intent::verification::{
     ConstraintCheckResult, StrictnessMode, check_constraints, verify_sd_hash_binding,
     verify_timestamps,
@@ -189,7 +189,18 @@ fn execute_evaluate_constraints(
     let constraints: Vec<Constraint> = serde_json::from_value(constraints_value.clone())?;
     let fulfillment: Fulfillment = serde_json::from_value(fulfillment_value.clone())?;
 
-    let results = check_constraints(&constraints, &fulfillment, strictness);
+    // Nothing on this path establishes which mandate the constraints came from,
+    // so the caller could be describing either mode. `Autonomous` is the
+    // stricter reading and the only one under which a constraint list occurs at
+    // all: an open mandate carries constraints, while an immediate mandate
+    // carries final values. An unrecognized constraint is a violation here for
+    // that reason, whatever strictness is configured.
+    let results = check_constraints(
+        &constraints,
+        &fulfillment,
+        strictness,
+        MandateMode::Autonomous,
+    );
     let all_satisfied = results.iter().all(|r| r.satisfied);
 
     let summary: Vec<serde_json::Value> = results.iter().map(constraint_result_json).collect();
@@ -255,6 +266,7 @@ fn constraint_result_json(r: &ConstraintCheckResult) -> serde_json::Value {
     json!({
         "constraint_type": r.constraint_type,
         "satisfied": r.satisfied,
+        "skipped": r.skipped,
         "violations": r.violations.iter().map(|v: &ViError| v.to_string()).collect::<Vec<_>>(),
     })
 }
@@ -429,5 +441,79 @@ mod tests {
         let args = json!({ "operation": "bad_op" });
         let result = tool.execute(args).await.unwrap();
         assert!(!result.success);
+    }
+
+    /// An unrecognized constraint type used to fail the call at deserialization,
+    /// which reported nothing about the recognized constraints alongside it.
+    /// Now the list is evaluated and the unrecognized entry is reported as the
+    /// violation it is on this path.
+    #[tokio::test]
+    async fn unknown_constraint_is_reported_rather_than_failing_the_call() {
+        let tool = test_tool();
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [
+                {
+                    "type": "mandate.checkout.allowed_merchant",
+                    "allowed_merchants": [
+                        { "name": "Store A", "website": "https://store-a.example.com" }
+                    ]
+                },
+                { "type": "urn:example:experimental", "scope": "wide" }
+            ],
+            "fulfillment": {
+                "merchant": { "name": "Store A", "website": "https://store-a.example.com" }
+            },
+        });
+
+        let result = tool
+            .execute(args)
+            .await
+            .expect("an unrecognized constraint must not fail the whole call");
+
+        assert!(!result.success);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["all_satisfied"], false);
+
+        let merchant = &output["results"][0];
+        assert_eq!(
+            merchant["constraint_type"],
+            "mandate.checkout.allowed_merchant"
+        );
+        assert_eq!(merchant["satisfied"], true);
+        assert_eq!(merchant["skipped"], false);
+
+        let unknown = &output["results"][1];
+        assert_eq!(unknown["constraint_type"], "urn:example:experimental");
+        assert_eq!(unknown["satisfied"], false);
+        assert_eq!(unknown["skipped"], false);
+        let violation = unknown["violations"][0].as_str().unwrap();
+        assert!(
+            violation.starts_with("VI/UnknownConstraintType:"),
+            "unexpected violation: {violation}"
+        );
+    }
+
+    /// This path has no verified mandate, so it takes the stricter reading and
+    /// rejects an unrecognized constraint even though the tool was built with a
+    /// permissive policy.
+    #[tokio::test]
+    async fn unknown_constraint_is_rejected_even_under_a_permissive_policy() {
+        let policy = Arc::new(SecurityPolicy::default());
+        let tool = VerifiableIntentTool::new(policy, StrictnessMode::Permissive);
+        let args = json!({
+            "operation": "evaluate_constraints",
+            "constraints": [{ "type": "urn:example:experimental", "scope": "wide" }],
+            "fulfillment": {},
+        });
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(!result.success);
+        let output: serde_json::Value =
+            serde_json::from_str(result.output.as_str()).expect("tool output is JSON");
+        assert_eq!(output["results"][0]["satisfied"], false);
+        assert_eq!(output["results"][0]["skipped"], false);
     }
 }

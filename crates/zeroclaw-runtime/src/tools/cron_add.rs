@@ -273,7 +273,7 @@ impl Tool for CronAddTool {
                 },
                 "delivery": {
                     "type": "object",
-                    "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
+                    "description": "Optional delivery config to send job output to a channel after each run. When created from a chat turn, omitted fields default to announcing back to that conversation.",
                     "properties": {
                         "mode": {
                             "type": "string",
@@ -282,8 +282,8 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
-                            "description": "Channel type to deliver output to"
+                            "pattern": cron::cron_delivery_channel_pattern(),
+                            "description": "Channel to deliver output to: either a channel type ('telegram') or a configured instance's composite key ('telegram.work'). Supported types: telegram, discord, slack, mattermost, matrix, qq, whatsapp, webhook, lark, feishu, dingtalk, wechat, signal, email. From a chat turn this resolves to that conversation's own channel instance; pass the composite key to deliver elsewhere."
                         },
                         "to": {
                             "type": "string",
@@ -1220,18 +1220,36 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let schema = tool.parameters_schema();
-        let values: Vec<&str> = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
-            .as_array()
-            .expect("delivery.channel must have an enum")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect();
+        let pattern = schema["properties"]["delivery"]["properties"]["channel"]["pattern"]
+            .as_str()
+            .expect("delivery.channel must declare a pattern")
+            .to_string();
+        let channel = regex::Regex::new(&pattern).expect("delivery.channel pattern must compile");
 
-        assert_eq!(values.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
-        assert!(values.contains(&"dingtalk"));
-        assert!(values.contains(&"wechat"));
-        assert!(values.contains(&"signal"));
-        assert!(values.contains(&"email"));
+        // Every supported type is still admitted on its own ...
+        for supported in cron::CRON_DELIVERY_SCHEMA_CHANNELS {
+            assert!(
+                channel.is_match(supported),
+                "{supported} must be a valid delivery channel"
+            );
+        }
+        assert!(channel.is_match("dingtalk"));
+        assert!(channel.is_match("wechat"));
+        assert!(channel.is_match("signal"));
+        assert!(channel.is_match("email"));
+
+        // ... and so is the composite key the description tells the model to use.
+        assert!(
+            channel.is_match("telegram.work"),
+            "an aliased instance must satisfy the declared schema"
+        );
+        assert!(channel.is_match("discord.team-2"));
+        assert!(channel.is_match("telegram.pa_telegram"));
+
+        // Guidance is still machine-readable: unknown types stay rejected.
+        assert!(!channel.is_match("sms"));
+        assert!(!channel.is_match("telegram."));
+        assert!(!channel.is_match("telegram.work.extra"));
     }
 
     #[tokio::test]
@@ -1241,17 +1259,17 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
         let schema = tool.parameters_schema();
 
-        let channel_enum = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let pattern = schema["properties"]["delivery"]["properties"]["channel"]["pattern"]
+            .as_str()
+            .expect("delivery.channel must declare a pattern");
+        let channel = regex::Regex::new(pattern).expect("channel pattern must compile");
         assert!(
-            channel_enum.iter().any(|value| value == "webhook"),
-            "delivery.channel enum must include webhook"
+            channel.is_match("webhook"),
+            "delivery.channel must admit webhook"
         );
         assert!(
-            channel_enum.iter().any(|value| value == "whatsapp"),
-            "delivery.channel enum must include whatsapp"
+            channel.is_match("whatsapp"),
+            "delivery.channel must admit whatsapp"
         );
 
         let delivery_props = schema["properties"]["delivery"]["properties"]

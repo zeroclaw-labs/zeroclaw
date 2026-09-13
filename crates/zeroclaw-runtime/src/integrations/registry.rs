@@ -50,6 +50,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: info.desc.to_string(),
             category: IntegrationCategory::Chat,
             status: bool_to_status(info.configured),
+            key: Some(info.config_key.to_string()),
         });
 
     let toggles = config.integration_descriptors().into_iter().map(|d| {
@@ -59,6 +60,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: d.description.to_string(),
             category,
             status: bool_to_status(d.active),
+            key: None,
         }
     });
 
@@ -71,6 +73,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
                 description: String::new(),
                 category: IntegrationCategory::AiModel,
                 status,
+                key: Some(info.name.to_string()),
             }
         });
 
@@ -81,6 +84,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: (*desc).to_string(),
             category: IntegrationCategory::ToolsAutomation,
             status: IntegrationStatus::Active,
+            key: None,
         });
 
     let platforms = PLATFORMS.iter().map(|(name, available)| IntegrationEntry {
@@ -88,6 +92,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
         description: String::new(),
         category: IntegrationCategory::Platform,
         status: bool_to_status(*available),
+        key: None,
     });
 
     channels
@@ -102,7 +107,9 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::Config;
-    use zeroclaw_config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use zeroclaw_config::schema::{
+        IMessageConfig, MatrixConfig, MatrixStreamMode, StreamMode, TelegramConfig,
+    };
     use zeroclaw_config::traits::ChannelConfig;
 
     #[test]
@@ -174,7 +181,75 @@ mod tests {
                 "channel {:?} missing description text",
                 info.name,
             );
+            assert_eq!(
+                entry.key.as_deref(),
+                Some(info.config_key),
+                "channel {:?} entry must carry its schema config map key",
+                info.name,
+            );
         }
+    }
+
+    #[test]
+    fn config_backed_entries_resolve_through_their_map_key_contract() {
+        let config = Config::default();
+        for entry in all_integrations(&config).iter().filter(|entry| {
+            matches!(
+                entry.category,
+                IntegrationCategory::Chat | IntegrationCategory::AiModel
+            )
+        }) {
+            let key = entry
+                .key
+                .as_deref()
+                .unwrap_or_else(|| panic!("config-backed entry {:?} has no key", entry.name));
+            let path = match entry.category {
+                IntegrationCategory::Chat => format!("channels.{key}"),
+                IntegrationCategory::AiModel => format!("providers.models.{key}"),
+                _ => unreachable!(),
+            };
+            assert!(
+                config.get_map_keys(&path).is_some(),
+                "config-backed entry {:?} must resolve through map path `{path}`",
+                entry.name,
+            );
+        }
+    }
+
+    #[test]
+    fn ai_model_entries_carry_provider_family_key() {
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        for info in zeroclaw_providers::list_model_providers() {
+            let entry = entries
+                .iter()
+                .find(|e| e.category == IntegrationCategory::AiModel && e.name == info.display_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "AI-model entry for {:?} (display {:?}) must exist",
+                        info.name, info.display_name,
+                    )
+                });
+            assert_eq!(
+                entry.key.as_deref(),
+                Some(info.name),
+                "AI-model entry {:?} must carry the provider family key, not a display-name slug",
+                info.display_name,
+            );
+        }
+    }
+
+    #[test]
+    fn zai_entry_key_survives_display_name_slug_mismatch() {
+        // Regression: the Z.AI display name slugifies to
+        // `z-ai`, but the config slot is `providers.models.zai`.
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        let zai = entries
+            .iter()
+            .find(|e| e.category == IntegrationCategory::AiModel && e.key.as_deref() == Some("zai"))
+            .expect("Z.AI registry entry with family key `zai`");
+        assert_eq!(zai.name, "Z.AI");
     }
 
     #[test]
@@ -254,9 +329,14 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+                stream_tool_arguments: Vec::new(),
                 recovery_key: None,
                 password: None,
                 mention_only: false,

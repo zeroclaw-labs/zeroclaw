@@ -30,6 +30,8 @@ impl Drop for TerminalUtf8EraseGuard {
         };
         // Best-effort restoration: this guard only tweaks terminal line
         // discipline for interactive CLI input, and drop must not panic.
+        // SAFETY: `original` was initialized by a successful `tcgetattr` on
+        // this same descriptor, and the guard retains both until restoration.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSANOW, original);
         }
@@ -51,11 +53,15 @@ mod imp {
 
     pub(super) fn ensure_terminal_utf8_erase_for_fd(fd: libc::c_int) -> TerminalUtf8EraseGuard {
         let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `termios` points to writable, correctly aligned storage for
+        // one `libc::termios`; initialization is trusted only when rc is zero.
         let rc = unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) };
         if rc != 0 {
             return TerminalUtf8EraseGuard { fd, original: None };
         }
 
+        // SAFETY: the successful `tcgetattr` above initialized every byte of
+        // the `termios` output object.
         let original = unsafe { termios.assume_init() };
         if original.c_iflag & libc::IUTF8 != 0 {
             return TerminalUtf8EraseGuard { fd, original: None };
@@ -63,6 +69,8 @@ mod imp {
 
         let mut updated = original;
         updated.c_iflag |= libc::IUTF8;
+        // SAFETY: `updated` is a fully initialized `termios` value derived
+        // from this descriptor's state and remains live for the call.
         let rc = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &updated) };
         TerminalUtf8EraseGuard {
             fd,
@@ -481,6 +489,8 @@ mod tests {
     fn terminal_utf8_erase_guard_sets_and_restores_iutf8() {
         let mut master_fd = -1;
         let mut slave_fd = -1;
+        // SAFETY: both output pointers refer to live `c_int` storage; the
+        // optional name and termios/winsize inputs are intentionally null.
         let openpty_rc = unsafe {
             libc::openpty(
                 &mut master_fd,
@@ -492,6 +502,9 @@ mod tests {
         };
         assert_eq!(openpty_rc, 0, "openpty failed");
 
+        // SAFETY: `openpty` succeeded, so both descriptors are live. Each
+        // `MaybeUninit` output is read only after its `tcgetattr` succeeds,
+        // and both descriptors are closed exactly once at the end.
         unsafe {
             let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
             assert_eq!(libc::tcgetattr(slave_fd, original.as_mut_ptr()), 0);

@@ -8,37 +8,24 @@
 //! reach — that the operator's canonical *string* values arrive inside a live
 //! guest as the *typed* JSON its `config_schema` declares.
 //!
-//! Every test here runs the fixture through *admission* rather than handing the
-//! adapter a path: `admit_fixture` builds a real package, lets `PluginHost`
-//! confine and read it, and returns the `AdmittedComponent` that owns the exact
-//! bytes admission verified. The adapter never reopens the manifest path, so the
-//! component that executes is the file generation the host admitted.
-//!
 //! There is no skip path: a fixture that cannot be built is a test failure, so
 //! "the tool-plugin path works" is decided by CI rather than by whether a human
 //! provisioned an artifact.
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
-mod support;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use tempfile::TempDir;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::error::PluginError;
-use zeroclaw_plugins::host::{AdmittedComponent, PluginHost};
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::services::PluginHostServices;
-use zeroclaw_plugins::signature;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
-
-use support::admit_fixture;
 
 /// Build the in-tree tool fixture once per test binary and return its component.
 fn fixture() -> PathBuf {
@@ -81,6 +68,7 @@ fn test_limits() -> PluginLimits {
         max_memory_bytes: 256 * 1024 * 1024,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     }
 }
 
@@ -102,7 +90,6 @@ fn context(
         description: None,
         author: None,
         wasm_path: Some("tool-fixture.wasm".to_string()),
-        wasm_sha256: None,
         capabilities: vec![PluginCapability::Tool],
         permissions: vec![PluginPermission::ConfigRead],
         config_schema: Some(serde_json::json!({
@@ -117,6 +104,7 @@ fn context(
         })),
         signature: None,
         publisher_key: None,
+        egress: Default::default(),
     };
     let scope =
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Tool, "main", grants)
@@ -135,11 +123,6 @@ fn operator_section() -> HashMap<String, String> {
     ])
 }
 
-/// The host-service bundle a store is built with.
-///
-/// The host resolves this plugin's section from canonical state on every call
-/// rather than handing the store a materialized snapshot, so the config a guest
-/// observes is whatever the resolver returns at the moment it executes.
 fn host_services(
     manifest: PluginManifest,
     configured: Option<HashMap<String, String>>,
@@ -149,41 +132,11 @@ fn host_services(
     }))
 }
 
-/// Admit the fixture from a package directory the caller keeps alive.
-///
-/// `support::admit_fixture` drops its package as soon as it returns, which is
-/// what every other test here wants. This variant hands the package back so a
-/// test can rewrite the payload on disk *after* admission and then observe
-/// which bytes actually execute.
-fn admit_from_live_package(manifest: &PluginManifest) -> (TempDir, AdmittedComponent, PathBuf) {
-    let root = tempfile::tempdir().expect("create fixture package root");
-    let plugin_dir = root.path().join(&manifest.name);
-    std::fs::create_dir_all(&plugin_dir).expect("create fixture package directory");
-    let relative = manifest
-        .wasm_path
-        .as_deref()
-        .expect("executable fixture declares wasm_path");
-    let payload = plugin_dir.join(relative);
-    std::fs::copy(fixture(), &payload).expect("copy fixture payload into package");
-    std::fs::write(
-        plugin_dir.join("manifest.toml"),
-        toml::to_string(manifest).expect("serialize fixture manifest"),
-    )
-    .expect("write fixture manifest");
-
-    let host = PluginHost::from_plugins_dir(root.path()).expect("admit fixture package");
-    let details = host.tool_plugin_details();
-    assert_eq!(details.len(), 1, "fixture package must be admitted once");
-    let component = details[0].1.clone();
-    (root, component, payload)
-}
-
 #[tokio::test]
 async fn reference_plugin_reports_metadata() {
     let (manifest, scope) = context([]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, None);
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
     let meta = runtime::call_tool_metadata(&mut plugin)
@@ -209,9 +162,8 @@ async fn reference_plugin_reports_metadata() {
 #[tokio::test]
 async fn reference_plugin_materializes_typed_config_with_grant() {
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, Some(operator_section()));
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
@@ -235,9 +187,8 @@ async fn reference_plugin_materializes_typed_config_with_grant() {
 #[tokio::test]
 async fn reference_plugin_jails_config_without_grant() {
     let (manifest, scope) = context([]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, Some(operator_section()));
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
@@ -256,9 +207,8 @@ async fn reference_plugin_jails_config_without_grant() {
 #[tokio::test]
 async fn reference_plugin_strips_caller_forged_config_section() {
     let (manifest, scope) = context([]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, None);
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
@@ -280,9 +230,8 @@ async fn reference_plugin_strips_caller_forged_config_section() {
 #[tokio::test]
 async fn reference_plugin_applies_defaults_without_config() {
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, None);
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
@@ -302,9 +251,8 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
     // Instantiating first proves the rejection is not an artifact of a plugin
     // that never loaded: the component is live and simply never gets called.
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest.clone(), Some(operator_section()));
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
@@ -340,56 +288,14 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
     }
 
     // The guest is still callable with a valid section, so the rejections above
-    // were the config path failing, not the component.
+    // were the config path failing, not the component. The store's own service
+    // resolves that well-typed section lazily on this call.
     let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
         .await
         .expect("execute config-echo tool");
     assert_eq!(
         result.output.as_str(),
         "label=masked|uppercase=true|max_len=5|keys=3|text=HELLO"
-    );
-}
-
-/// The whole point of component admission, proven where it matters: in a live
-/// guest, not in a unit test over a struct field.
-///
-/// The manifest pins `wasm_sha256`, so admission verifies the digest against
-/// the bytes it actually read and keeps *those* bytes. The payload on disk is
-/// then replaced with a bare core module — a well-formed WASM file that is not
-/// a component. If any later stage reopened the manifest path, instantiation
-/// would fail outright. It instead runs, and produces the exact output line of
-/// the generation that was admitted.
-#[tokio::test]
-async fn reference_plugin_executes_the_exact_admitted_payload_bytes() {
-    let (mut manifest, _) = context([PluginPermission::ConfigRead]);
-    manifest.wasm_sha256 = Some(signature::sha256_hex(
-        &std::fs::read(fixture()).expect("read the built fixture payload"),
-    ));
-    let scope = PluginInstanceScope::from_manifest(
-        &manifest,
-        PluginCapability::Tool,
-        "main",
-        [PluginPermission::ConfigRead],
-    )
-    .expect("digest-pinned fixture manifest admits its effective grants");
-
-    let (_package, component, payload) = admit_from_live_package(&manifest);
-    std::fs::write(&payload, b"\0asm\x01\x00\x00\x00").expect("replace the admitted payload");
-
-    let services = host_services(manifest, Some(operator_section()));
-    let mut plugin = runtime::create_plugin(&component, &scope, &services, test_limits())
-        .await
-        .expect("the admitted bytes instantiate even after the file on disk was replaced");
-
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
-        .await
-        .expect("execute config-echo tool");
-
-    assert!(result.success);
-    assert_eq!(
-        result.output.as_str(),
-        "label=masked|uppercase=true|max_len=5|keys=3|text=HELLO",
-        "the executed component must be the exact generation admission verified"
     );
 }
 
@@ -400,11 +306,11 @@ async fn reference_plugin_rejects_work_past_fuel_budget() {
         max_memory_bytes: 256 * 1024 * 1024,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let (manifest, scope) = context([]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, None);
-    match runtime::create_plugin(&component, &scope, &services, starved).await {
+    match runtime::create_plugin(&fixture(), &scope, &services, starved).await {
         Ok(mut plugin) => {
             let result = runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#).await;
             assert!(
@@ -426,11 +332,11 @@ async fn reference_plugin_traps_when_memory_capped() {
         max_memory_bytes: 1,
         max_table_elements: 100_000,
         max_instances: 64,
+        call_timeout: std::time::Duration::from_secs(30),
     };
     let (manifest, scope) = context([]);
-    let component = admit_fixture(&fixture(), &manifest);
     let services = host_services(manifest, None);
-    let outcome = runtime::create_plugin(&component, &scope, &services, capped).await;
+    let outcome = runtime::create_plugin(&fixture(), &scope, &services, capped).await;
     assert!(
         outcome.is_err(),
         "a 1-byte memory cap must reject instantiation, got ok"

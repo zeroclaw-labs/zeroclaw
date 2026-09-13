@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
+pub mod cert_ledger;
 pub mod detect;
 pub mod docker;
 
@@ -23,6 +24,7 @@ pub mod otp;
 pub mod pairing;
 pub mod playbook;
 pub mod policy;
+pub mod principal_resolver;
 pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
@@ -37,7 +39,7 @@ pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]
 pub use detect::create_sandbox;
 pub use detect::linux_memcg_available;
-pub use detect::{SandboxPosture, sandbox_posture};
+pub use detect::{SandboxExtraRoots, SandboxPosture, sandbox_posture};
 pub use domain_matcher::DomainMatcher;
 #[allow(unused_imports)]
 pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};

@@ -86,11 +86,7 @@ impl TwitterChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Twitter users/me failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "Twitter users/me").await?;
 
         let data: serde_json::Value = resp.json().await?;
         let user_id = data
@@ -131,11 +127,7 @@ impl TwitterChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Twitter create tweet failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "Twitter create tweet").await?;
 
         let data: serde_json::Value = resp.json().await?;
         let tweet_id = data
@@ -164,11 +156,7 @@ impl TwitterChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Twitter DM send failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "Twitter DM send").await?;
 
         Ok(())
     }
@@ -447,7 +435,7 @@ fn split_tweet_text(text: &str, max_len: usize) -> Vec<String> {
         }
 
         // Find last space within limit.
-        let limit = crate::util::floor_char_boundary(remaining, max_len);
+        let limit = remaining.floor_char_boundary(max_len);
         let split_at = remaining[..limit].rfind(' ').unwrap_or(limit);
 
         chunks.push(remaining[..split_at].to_string());

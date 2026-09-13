@@ -21,6 +21,8 @@ use crate::{PluginCapability, PluginManifest, PluginPermission};
 
 const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_SCHEMA_DEPTH: usize = 32;
+/// Keep admission-time validator compilation bounded for wide object schemas.
+const MAX_SCHEMA_PROPERTIES: usize = 256;
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
 /// Ceiling on one compiled `pattern` program, in bytes.
@@ -114,7 +116,8 @@ impl ResolvedPluginConfig {
 }
 
 /// Host-injected config service. The closure resolves from canonical state on
-/// every call; the service itself carries no config values or schema snapshot.
+/// every call; the service carries only that source handle, not a materialized
+/// resolved view.
 #[derive(Clone)]
 #[cfg(any(feature = "plugins-wasmtime", test))]
 pub struct PluginConfigResolver {
@@ -277,14 +280,6 @@ fn compile_manifest_config(
         )));
     }
 
-    let validator = manifest_schema_options().build(schema).map_err(|error| {
-        invalid_manifest(format!(
-            "plugin '{}' config_schema cannot be compiled: {}",
-            manifest.name,
-            error.masked()
-        ))
-    })?;
-
     let properties = schema
         .get("properties")
         .and_then(Value::as_object)
@@ -294,6 +289,22 @@ fn compile_manifest_config(
                 manifest.name
             ))
         })?;
+    if properties.len() > MAX_SCHEMA_PROPERTIES {
+        return Err(invalid_manifest(format!(
+            "plugin '{}' config_schema declares {} root properties, exceeding the maximum of {MAX_SCHEMA_PROPERTIES}",
+            manifest.name,
+            properties.len()
+        )));
+    }
+
+    let validator = manifest_schema_options().build(schema).map_err(|error| {
+        invalid_manifest(format!(
+            "plugin '{}' config_schema cannot be compiled: {}",
+            manifest.name,
+            error.masked()
+        ))
+    })?;
+
     for (name, property) in properties {
         let kind = property_type(schema, property).map_err(|message| {
             invalid_manifest(format!(
@@ -706,6 +717,7 @@ mod tests {
             config_schema: schema,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         }
     }
 
@@ -1366,6 +1378,37 @@ x-secret = true
         let mut too_deep = object_schema(json!({}));
         too_deep["annotation"] = nested;
         assert!(validate_manifest_config(&manifest(Some(too_deep), true)).is_err());
+    }
+
+    #[test]
+    fn root_property_count_limit_is_enforced_at_admission() {
+        let at_limit = (0..MAX_SCHEMA_PROPERTIES)
+            .map(|index| (format!("key_{index}"), json!({"type": "string"})))
+            .collect::<serde_json::Map<_, _>>();
+        assert!(
+            validate_manifest_config(&manifest(
+                Some(object_schema(Value::Object(at_limit))),
+                true
+            ))
+            .is_ok()
+        );
+
+        let over_limit = (0..=MAX_SCHEMA_PROPERTIES)
+            .map(|index| {
+                (
+                    format!("key_{index}"),
+                    json!({"type": "string", "pattern": "(?=x)"}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let error = validate_manifest_config(&manifest(
+            Some(object_schema(Value::Object(over_limit))),
+            true,
+        ))
+        .expect_err("schema over the root property cap must fail closed");
+        assert!(matches!(error, PluginError::InvalidManifest(_)));
+        assert!(error.to_string().contains("root properties"));
+        assert!(error.to_string().contains("maximum of 256"));
     }
 
     #[test]

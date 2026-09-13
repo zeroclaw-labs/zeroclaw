@@ -53,6 +53,19 @@ type = "integer"
 type = "boolean"
 "#;
 
+fn toml_basic_string(value: &str) -> String {
+    toml::Value::String(value.to_owned()).to_string()
+}
+
+#[test]
+fn toml_basic_string_preserves_windows_path_separators() {
+    let plugins_dir = r"C:\Users\agent\plugins";
+    let config = format!("plugins_dir = {}", toml_basic_string(plugins_dir));
+    let parsed: toml::Value = toml::from_str(&config).expect("parse escaped plugin path");
+
+    assert_eq!(parsed["plugins_dir"].as_str(), Some(plugins_dir));
+}
+
 /// Build the in-tree tool fixture once per test binary and return its component.
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -141,6 +154,7 @@ fn seed_config_dir(dir: &std::path::Path) {
     )
     .unwrap();
     let instance_key = scope.id().config_entry_key().unwrap();
+    let plugins_dir_toml = toml_basic_string(&plugins_root.to_string_lossy());
 
     fs::write(
         dir.join("config.toml"),
@@ -149,14 +163,13 @@ fn seed_config_dir(dir: &std::path::Path) {
              [plugins]\n\
              enabled = true\n\
              auto_discover = true\n\
-             plugins_dir = \"{}\"\n\n\
+             plugins_dir = {plugins_dir_toml}\n\n\
              [[plugins.entries]]\n\
              name = \"{}\"\n\n\
              [plugins.entries.config]\n\
              label = \"masked\"\n\
              uppercase = \"true\"\n\
              max_len = \"5\"\n",
-            plugins_root.display(),
             instance_key
         ),
     )
@@ -188,10 +201,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
          neighbour fails manifest-shape validation and the config_read-without-\
          config_schema neighbour fails the config contract"
     );
-    // Discovery hands back the component admission already resolved, not a
-    // path to re-open: the bytes this test executes are the bytes admission
-    // read and pinned.
-    let (manifest, component) = details[0];
+    let (manifest, wasm_path) = details[0];
     assert_eq!(manifest.name, "tool-fixture");
     assert!(manifest.capabilities.contains(&PluginCapability::Tool));
     assert!(manifest.permissions.contains(&PluginPermission::ConfigRead));
@@ -217,15 +227,13 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     assert_eq!(section.get("uppercase").map(String::as_str), Some("true"));
     assert_eq!(section.get("max_len").map(String::as_str), Some("5"));
 
-    // The store resolves this section from the discovered manifest on every
-    // call, so the guest observes canonical host state rather than a snapshot
-    // taken at instantiation.
     let resolver_manifest = manifest.clone();
+    let resolver_section = section.clone();
     let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
-        resolve_plugin_config(&resolver_manifest, scope, Some(&section))
+        resolve_plugin_config(&resolver_manifest, scope, Some(&resolver_section))
     }));
     let mut plugin = runtime::create_plugin(
-        component,
+        wasm_path,
         &scope,
         &services,
         PluginLimits {
@@ -233,6 +241,7 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
             max_memory_bytes: 256 * 1024 * 1024,
             max_table_elements: 100_000,
             max_instances: 64,
+            call_timeout: std::time::Duration::from_secs(30),
         },
     )
     .await

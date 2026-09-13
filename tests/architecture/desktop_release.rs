@@ -3,6 +3,31 @@
 use std::{fs, path::Path};
 
 #[test]
+fn windows_desktop_manifest_selects_common_controls_v6() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = fs::read_to_string(root.join("apps/tauri/windows/app.manifest"))
+        .expect("Windows desktop manifest should be readable");
+
+    for required in [
+        "name=\"Microsoft.Windows.Common-Controls\"",
+        "version=\"6.0.0.0\"",
+        "publicKeyToken=\"6595b64144ccf1df\"",
+    ] {
+        assert!(
+            manifest.contains(required),
+            "Windows desktop manifest must select Common Controls v6: missing {required}"
+        );
+    }
+
+    let build_script = fs::read_to_string(root.join("apps/tauri/build.rs"))
+        .expect("Tauri build script should be readable");
+    assert!(
+        build_script.contains("app_manifest(include_str!(\"windows/app.manifest\"))"),
+        "Tauri must embed the guarded Windows application manifest"
+    );
+}
+
+#[test]
 fn macos_desktop_sidecar_embeds_the_web_artifact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = fs::read_to_string(root.join(".github/workflows/release-stable-manual.yml"))

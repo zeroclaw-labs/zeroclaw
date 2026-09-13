@@ -2,6 +2,7 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
+use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -40,6 +41,43 @@ fn load_openclaw_bootstrap_files(
     if inject_memory {
         inject_workspace_file(prompt, workspace_dir, "MEMORY.md", max_chars_per_file);
     }
+}
+
+fn append_project_context(
+    prompt: &mut String,
+    workspace_dir: &std::path::Path,
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    inject_memory: bool,
+) {
+    prompt.push_str("## Project Context\n\n");
+
+    if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+    {
+        match identity::load_aieos_identity(config, workspace_dir) {
+            Ok(Some(aieos_identity)) => {
+                let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
+                if !aieos_prompt.is_empty() {
+                    prompt.push_str(&aieos_prompt);
+                    prompt.push_str("\n\n");
+                }
+            }
+            Ok(None) => {
+                let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format.");
+                let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
+            }
+        }
+        return;
+    }
+
+    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+    load_openclaw_bootstrap_files(prompt, workspace_dir, max_chars, inject_memory);
 }
 
 /// Build the default system prompt.
@@ -156,12 +194,54 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // reported shell cannot drift from the executed one.
     shell_profile: Option<&ShellProfile>,
 ) -> String {
+    build_system_prompt_with_mode_and_effective_tools(
+        workspace_dir,
+        model_name,
+        tools,
+        |_| true,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        autonomy_config,
+        native_tool_specs_present,
+        skills_prompt_mode,
+        compact_context,
+        max_system_prompt_chars,
+        inject_memory,
+        show_tool_calls,
+        shell_profile,
+    )
+}
+
+/// Build the system prompt with the effective callable tool names supplied by
+/// the turn's assembled registry. The tool descriptions remain separately
+/// filtered for the prompt surface, while skill callable metadata uses this
+/// name set as its availability source of truth.
+#[allow(clippy::too_many_arguments)]
+pub fn build_system_prompt_with_mode_and_effective_tools(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    is_tool_available: impl Fn(&str) -> bool,
+    skills: &[Skill],
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    autonomy_config: Option<&zeroclaw_config::schema::RiskProfileConfig>,
+    native_tool_specs_present: bool,
+    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    compact_context: bool,
+    max_system_prompt_chars: usize,
+    inject_memory: bool,
+    show_tool_calls: bool,
+    shell_profile: Option<&ShellProfile>,
+) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
     let has_tools = !tools.is_empty() || native_tool_specs_present;
+    let read_skill_available = is_tool_available("read_skill");
     let skills_prompt_mode = crate::skills::skills_prompt_mode_with_loader_fallback(
         skills_prompt_mode,
-        tools.iter().any(|(name, _)| *name == "read_skill"),
+        read_skill_available,
     );
 
     // ── 0. Anti-narration (top priority) ───────────────────────
@@ -339,11 +419,22 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
+    if compact_context {
+        append_project_context(
+            &mut prompt,
+            workspace_dir,
+            identity_config,
+            bootstrap_max_chars,
+            inject_memory,
+        );
+    }
+
     if !skills.is_empty() {
-        prompt.push_str(&crate::skills::skills_to_prompt_with_mode(
+        prompt.push_str(&crate::skills::skills_to_prompt_with_mode_and_availability(
             skills,
             workspace_dir,
             skills_prompt_mode,
+            is_tool_available,
         ));
         prompt.push_str("\n\n");
     }
@@ -356,54 +447,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     );
 
     // ── 5. Bootstrap files (injected into context) ──────────────
-    prompt.push_str("## Project Context\n\n");
-
-    // Check if AIEOS identity is configured
-    if let Some(config) = identity_config {
-        if identity::is_aieos_configured(config) {
-            // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
-                Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
-                    if !aieos_prompt.is_empty() {
-                        prompt.push_str(&aieos_prompt);
-                        prompt.push_str("\n\n");
-                    }
-                }
-                Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(
-                        &mut prompt,
-                        workspace_dir,
-                        max_chars,
-                        inject_memory,
-                    );
-                }
-                Err(e) => {
-                    // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(
-                        &mut prompt,
-                        workspace_dir,
-                        max_chars,
-                        inject_memory,
-                    );
-                }
-            }
-        } else {
-            // OpenClaw format
-            let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-            load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, inject_memory);
-        }
-    } else {
-        // No identity config - use OpenClaw format
-        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, inject_memory);
+    if !compact_context {
+        append_project_context(
+            &mut prompt,
+            workspace_dir,
+            identity_config,
+            bootstrap_max_chars,
+            inject_memory,
+        );
     }
 
     // ── 6. Date ─────────────────────────────────────────────────
@@ -440,7 +491,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     }
 
-    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
+    // ── 8. Channel Capabilities (full copy skipped in compact_context
+    //       mode; the timestamp orientation below emits in both modes) ──
     if !compact_context {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
@@ -467,19 +519,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
-    } // end if !compact_context (Channel Capabilities)
+    } // end if !compact_context (full Channel Capabilities copy)
 
-    // ── 9. Truncation (max_system_prompt_chars budget) ──────────
-    if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        // Truncate on a char boundary, keeping the top portion (identity + safety).
-        let mut end = max_system_prompt_chars;
-        // Ensure we don't split a multi-byte UTF-8 character.
-        while !prompt.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        prompt.truncate(end);
-        prompt.push_str("\n\n[System prompt truncated to fit context budget]\n");
-    }
+    // Emitted unconditionally: small local models mistake the enrichment
+    // prefix for log/API data without this orientation. The prefix format
+    // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
+    //
+    // This orientation is runtime-owned and must survive the compact/finite
+    // `max_system_prompt_chars` budget: it is what stops small local models
+    // from reading the timestamp prefix as a log/API payload.
+    // Because truncation below keeps only the *top* portion of the prompt,
+    // the orientation is re-emitted inside the retained budget after any
+    // truncation rather than left in the truncatable tail.
+    append_timestamp_orientation(&mut prompt);
+
+    prompt = finalize_system_prompt(prompt, max_system_prompt_chars);
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -487,6 +541,55 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     } else {
         prompt
     }
+}
+
+/// Apply the final model-visible prompt budget in Unicode scalar values.
+pub fn finalize_system_prompt(mut prompt: String, max_chars: usize) -> String {
+    if max_chars > 0 && prompt.chars().count() > max_chars {
+        // The orientation is runtime-critical, so it must land inside the
+        // budget. Reserve room at the head-retained portion, then re-append it
+        // so it always survives even when the assembled prompt overflows.
+        let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
+        if max_chars >= orientation_chars {
+            // Keep the top portion (identity + safety) minus the required tail.
+            let end = max_chars - orientation_chars;
+            let byte_end = prompt
+                .char_indices()
+                .nth(end)
+                .map_or(prompt.len(), |(index, _)| index);
+            prompt.truncate(byte_end);
+            append_timestamp_orientation(&mut prompt);
+        } else {
+            // When the budget cannot hold both retained content and the
+            // critical tail, prioritize as much of the orientation as fits.
+            // This preserves the full orientation whenever possible without
+            // violating the configured prompt ceiling for very small budgets.
+            let end = max_chars.min(TIMESTAMP_ORIENTATION.chars().count());
+            let byte_end = TIMESTAMP_ORIENTATION
+                .char_indices()
+                .nth(end)
+                .map_or(TIMESTAMP_ORIENTATION.len(), |(index, _)| index);
+            prompt.clear();
+            prompt.push_str(&TIMESTAMP_ORIENTATION[..byte_end]);
+        }
+    }
+    prompt
+}
+
+/// Render only the skills section against an assembled effective tool surface.
+/// Context-free callers should continue using [`crate::skills::skills_to_prompt_with_mode`].
+pub fn build_skills_prompt_with_effective_tools(
+    skills: &[Skill],
+    workspace_dir: &std::path::Path,
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    is_tool_available: impl Fn(&str) -> bool,
+) -> String {
+    crate::skills::skills_to_prompt_with_mode_and_availability(
+        skills,
+        workspace_dir,
+        mode,
+        is_tool_available,
+    )
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -505,7 +608,6 @@ fn inject_workspace_file(
             if trimmed.is_empty() {
                 return;
             }
-            let _ = writeln!(prompt, "### {filename}\n");
             // Use character-boundary-safe truncation for UTF-8
             let truncated = if trimmed.chars().count() > max_chars {
                 trimmed
@@ -520,7 +622,7 @@ fn inject_workspace_file(
                 prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
-                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
+                    "\n\n[... {filename} truncated at {max_chars} chars — use `read {filename}` for full file]\n"
                 );
             } else {
                 prompt.push_str(trimmed);
@@ -529,7 +631,7 @@ fn inject_workspace_file(
         }
         Err(_) => {
             // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            let _ = writeln!(prompt, "[File not found: {filename}]\n");
         }
     }
 }
@@ -538,6 +640,89 @@ fn inject_workspace_file(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    #[test]
+    fn compact_skills_fall_back_to_full_when_loader_is_described_but_unavailable() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let skills = vec![Skill {
+            name: "fallback-test".to_string(),
+            description: "Verify loader fallback".to_string(),
+            description_localizations: Default::default(),
+            version: "1".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["INLINE_FALLBACK_INSTRUCTIONS".to_string()],
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[("read_skill", "Load skill instructions")],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Compact,
+            false,
+            0,
+            false,
+            false,
+            None,
+        );
+
+        assert!(prompt.contains("INLINE_FALLBACK_INSTRUCTIONS"));
+        assert!(!prompt.contains("read_skill(name)"));
+    }
+
+    fn prompt_with_compact_context(compact_context: bool) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            0,
+            true,
+            false,
+            None,
+        )
+    }
+
+    /// Build a prompt with a finite `max_system_prompt_chars` budget and
+    /// enough registered tools to overflow it, forcing the truncation path.
+    fn prompt_with_finite_budget(
+        compact_context: bool,
+        max_system_prompt_chars: usize,
+        tools: &[(&str, &str)],
+    ) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            tools,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            max_system_prompt_chars,
+            true,
+            false,
+            None,
+        )
+    }
 
     /// Helper: build the prompt with a given shell profile and one registered
     /// tool, named by `tool_name` so a caller can pick which command-taking
@@ -834,6 +1019,15 @@ mod tests {
     }
 
     #[test]
+    fn compact_context_carries_timestamp_orientation() {
+        let prompt = prompt_with_compact_context(true);
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "compact system prompt must orient the model on the date/time-prefix convention: {prompt}"
+        );
+    }
+
+    #[test]
     fn full_autonomy_authorizes_shell_when_registered() {
         let tools = [
             ("shell", "Run a shell command"),
@@ -890,6 +1084,275 @@ mod tests {
                 && !auth.contains("not blocked by any security policy"),
             "block must not claim the tools are exempt from all security policy"
         );
+    }
+
+    #[test]
+    fn non_compact_context_keeps_full_channel_capabilities_section() {
+        let prompt = prompt_with_compact_context(false);
+        assert!(
+            prompt.contains("You are running as a messaging bot"),
+            "full system prompt must retain the existing Channel Capabilities copy: {prompt}"
+        );
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "full system prompt must carry the timestamp orientation too: {prompt}"
+        );
+    }
+
+    #[test]
+    fn timestamp_orientation_survives_finite_budget_truncation() {
+        // Regression guard: finite `max_system_prompt_chars` is a supported production config,
+        // and the runtime-owned timestamp orientation must survive it rather
+        // than being chopped off in the truncatable tail. Register enough
+        // tools and pick a budget small enough to force the truncation path.
+        let tools: [(&str, &str); 12] = [
+            (
+                "shell",
+                "Run a shell command with a long description to add bulk",
+            ),
+            (
+                "file_read",
+                "Read a file with a long description to add bulk",
+            ),
+            (
+                "file_write",
+                "Write a file with a long description to add bulk",
+            ),
+            (
+                "file_edit",
+                "Edit a file with a long description to add bulk",
+            ),
+            (
+                "http_request",
+                "Make an HTTP request with a long description to add bulk",
+            ),
+            (
+                "web_search",
+                "Search the web with a long description to add bulk",
+            ),
+            (
+                "web_fetch",
+                "Fetch a page with a long description to add bulk",
+            ),
+            ("calculator", "Do math with a long description to add bulk"),
+            ("weather", "Get weather with a long description to add bulk"),
+            (
+                "memory_store",
+                "Store memory with a long description to add bulk",
+            ),
+            (
+                "memory_recall",
+                "Recall memory with a long description to add bulk",
+            ),
+            (
+                "canvas",
+                "Render to a canvas with a long description to add bulk",
+            ),
+        ];
+
+        for compact in [false, true] {
+            // A budget well below the assembled prompt length so truncation
+            // definitely runs, but large enough to hold the retained head plus
+            // the reserved orientation.
+            let budget = 600;
+            let prompt = prompt_with_finite_budget(compact, budget, &tools);
+
+            // Hitting the exact ceiling proves truncation ran without adding
+            // model-visible implementation metadata.
+            assert!(
+                prompt.chars().count() == budget && !prompt.contains("System prompt truncated"),
+                "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
+            );
+            // The runtime-owned orientation must survive inside the budget.
+            assert!(
+                prompt.contains("timestamp metadata added by the runtime"),
+                "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
+            );
+            assert!(
+                prompt.chars().count() <= budget,
+                "compact={compact}: prompt length {} exceeded budget {budget}",
+                prompt.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_orientation_respects_budgets_at_and_below_reserved_tail() {
+        let tools = [(
+            "shell",
+            "Run a shell command with enough description to overflow",
+        )];
+        let reserved = TIMESTAMP_ORIENTATION.chars().count();
+
+        for compact in [false, true] {
+            for budget in [
+                1,
+                TIMESTAMP_ORIENTATION.chars().count() - 1,
+                TIMESTAMP_ORIENTATION.chars().count(),
+                reserved - 1,
+                reserved,
+            ] {
+                let prompt = prompt_with_finite_budget(compact, budget, &tools);
+                assert!(
+                    prompt.chars().count() <= budget,
+                    "compact={compact}: prompt length {} exceeded budget {budget}",
+                    prompt.chars().count()
+                );
+
+                if budget >= TIMESTAMP_ORIENTATION.chars().count() {
+                    assert!(
+                        prompt.ends_with(TIMESTAMP_ORIENTATION),
+                        "compact={compact}: full orientation must survive budget {budget}: {prompt}"
+                    );
+                } else {
+                    assert!(
+                        TIMESTAMP_ORIENTATION.starts_with(&prompt),
+                        "compact={compact}: tiny budget {budget} must retain a bounded orientation prefix: {prompt}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_prompt_budget_counts_unicode_scalars_and_honors_exact_limit() {
+        let reserved = TIMESTAMP_ORIENTATION.chars().count();
+        let max_chars = reserved + 40;
+        let retained = "界".repeat(max_chars - reserved);
+        let prompt = format!("{}TAIL", "界".repeat(400));
+        let finalized = super::finalize_system_prompt(prompt, max_chars);
+
+        assert_eq!(finalized.chars().count(), max_chars);
+        assert!(finalized.starts_with(&retained));
+        assert!(!finalized.contains("System prompt truncated"));
+        assert!(finalized.ends_with(TIMESTAMP_ORIENTATION));
+        assert!(!finalized.contains("TAIL"));
+    }
+
+    #[test]
+    fn compact_prompt_prioritizes_bootstrap_before_skills_and_runtime_metadata() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "BOOTSTRAP_CONTRACT_REQUIRED",
+        )
+        .expect("write AGENTS.md");
+        let skills = vec![Skill {
+            name: "lower-priority".into(),
+            description: "LOW_PRIORITY_SKILL_METADATA".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "local-model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            Some(8_000),
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            false,
+            SkillsPromptInjectionMode::Compact,
+            true,
+            0,
+            true,
+            false,
+            None,
+        );
+
+        let safety = prompt.find("## Safety").expect("safety framing");
+        let project = prompt.find("## Project Context").expect("project context");
+        let bootstrap = prompt
+            .find("BOOTSTRAP_CONTRACT_REQUIRED")
+            .expect("bootstrap contract");
+        let skills = prompt.find("## Available Skills").expect("skill metadata");
+        let workspace = prompt.find("## Workspace").expect("workspace metadata");
+        let runtime = prompt.find("## Runtime").expect("runtime metadata");
+
+        assert!(safety < project);
+        assert!(project < bootstrap);
+        assert!(bootstrap < skills);
+        assert!(skills < workspace);
+        assert!(workspace < runtime);
+    }
+
+    #[test]
+    fn compact_full_assembly_enforces_unicode_budget_after_all_builder_sections() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            format!("BOOTSTRAP_CONTRACT_REQUIRED\n{}", "界".repeat(7_000)),
+        )
+        .expect("write AGENTS.md");
+        let skills = vec![Skill {
+            name: "lower-priority".into(),
+            description: "LOW_PRIORITY_SKILL_METADATA".into(),
+            description_localizations: Default::default(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        }];
+
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "local-model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            Some(8_000),
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            false,
+            SkillsPromptInjectionMode::Compact,
+            true,
+            8_000,
+            true,
+            false,
+            None,
+        );
+
+        assert_eq!(prompt.chars().count(), 8_000);
+        assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("BOOTSTRAP_CONTRACT_REQUIRED"));
+        assert!(!prompt.contains("System prompt truncated"));
+        assert!(prompt.ends_with(TIMESTAMP_ORIENTATION));
+        assert!(!prompt.contains("LOW_PRIORITY_SKILL_METADATA"));
+    }
+
+    #[test]
+    fn final_prompt_budget_preserves_orientation_priority_at_boundaries() {
+        let oversized = "界".repeat(400);
+        let orientation_chars = TIMESTAMP_ORIENTATION.chars().count();
+        let reserved = orientation_chars;
+
+        assert_eq!(
+            super::finalize_system_prompt(oversized.clone(), reserved - 1),
+            TIMESTAMP_ORIENTATION
+                .chars()
+                .take(reserved - 1)
+                .collect::<String>()
+        );
+        assert_eq!(
+            super::finalize_system_prompt(oversized.clone(), orientation_chars),
+            TIMESTAMP_ORIENTATION
+        );
+        assert_eq!(
+            super::finalize_system_prompt(oversized, 3),
+            TIMESTAMP_ORIENTATION.chars().take(3).collect::<String>()
+        );
+        assert_eq!(super::finalize_system_prompt("界TAIL".into(), 0), "界TAIL");
     }
 
     #[test]

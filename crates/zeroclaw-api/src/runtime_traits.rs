@@ -382,11 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn default_shell_dialect_is_posix() {
-        // Any adapter that does not override `shell_dialect` uses the
-        // conservative POSIX default. Concrete adapters report their actual
-        // execution sink, including the configured native shell dialect.
+    fn dummy_runtime_shell_dialect_matches_compilation_platform() {
         let runtime = DummyRuntime;
+        #[cfg(windows)]
+        assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
+        #[cfg(not(windows))]
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
     }
 

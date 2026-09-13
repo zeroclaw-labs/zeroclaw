@@ -42,11 +42,12 @@ Understand the runtime shape before writing code:
    `name`, `description`, and `parameters-schema`. These are cached; they are
    never re-asked. If that probe fails, registration fails; the host never
    substitutes synthetic metadata for a broken component.
-3. Per call, `WasmTool::execute` prevalidates live config, creates a **fresh
-   store** (new WASI context, new fuel budget, no state from the previous call),
-   and instantiates the component. The execution frame resolves the complete
-   config once, injects only non-secret values under `__config`, serves marked
-   secrets through the scoped `secrets` import, and invokes `execute`.
+3. Per call, `WasmTool::execute` resolves and validates config from canonical
+   state, creates a **fresh store** (new WASI context, new fuel budget, no state
+   from the previous call), and instantiates the component. That one resolved
+   object serves the whole frame: the host injects only its non-secret values
+   under `__config`, serves the schema-marked secrets through the scoped
+   `secrets` import, and invokes `execute`.
 
 The fresh-store-per-call model is the design constraint that matters most:
 a tool plugin is stateless by construction. Anything you want to persist
@@ -98,13 +99,13 @@ pub fn redact(input: &str, cfg: &RedactConfig) -> (String, usize) {
 }
 ```
 
-The guest receives the schema-materialized public JSON object, so deserialize
-it once instead of repeating string parsing. This example's schema makes every
+The guest receives the schema-materialized public JSON object, so deserialize it
+once instead of repeating string parsing. This example's schema makes every
 field optional, and `Default` owns their behavior when the host supplies `{}`.
 An empty object is normal when the operator has not configured the plugin or
 when the host denies the requested `config_read` grant. If a plugin cannot
-operate without a value, mark it required in `config_schema`; the host will
-then reject an empty object before guest code starts.
+operate without a value, mark it required in `config_schema`; the host will then
+reject an empty object before guest code starts.
 
 ## 3. Implement the world
 
@@ -277,8 +278,8 @@ resolve to `string`, `boolean`, `integer`, `number`, `array`, or `object`.
 The host resolves the section stored under the versioned config-entry key
 derived from this instance's package, `tool` capability, and binding,
 materializes it according to the package schema, validates the complete typed
-object, and partitions it. Only non-secret properties are merged into `execute`
-under the reserved `__config` key:
+object, and only then partitions it. Only the non-secret properties are merged
+into `execute` under the reserved `__config` key:
 
 - Any `__config` already present in the model-supplied arguments is deleted
   first. Spoofing is structurally impossible.
@@ -462,12 +463,13 @@ Two operational constraints worth repeating from the
 | Symptom | Likely cause |
 |---|---|
 | Plugin missing from `zeroclaw plugin list` | Plugin system disabled; malformed manifest; `wasm_path` file missing; signature policy rejected it. The startup log carries the specific skip warning. |
+| Present in `zeroclaw plugin list` but the tool never loads | `plugins.auto_discover` is `false` (the default). Auto-discovered tool and skill capabilities load only when `plugins.auto_discover = true`; `plugins.enabled = true` alone activates only explicitly-declared channels. Run `zeroclaw config set plugins.auto_discover true`. |
 | Tool rejected during registration | Config validation or the metadata probe failed. Check the log for the specific error; a probe failure usually means the component was built against mismatched WIT. |
 | Tool never selected by the model | Name collides with a built-in, or the description/schema do not tell the model when the tool applies. |
-| `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, or every validated property is marked secret. A `config_schema`/permission mismatch rejects the plugin instead. |
+| `__config` absent despite configured section | The effective scope denied `config_read`, the entry does not use the installation-printed full-instance key, the validated object is empty, or every validated property is marked secret. A `config_schema`/permission mismatch rejects the plugin instead. |
 | `secrets.get` returns `not-found` | The property is missing or is not a direct top-level string marked `x-secret = true` in the admitted schema. |
 | `secrets.get` returns `unavailable` | The call ran outside `execute`, config resolution failed, or the execution exhausted its fixed host-call budget. |
-| Call traps | Fuel or memory ceiling hit. Raise `plugins.limits.call_fuel` / `plugins.limits.max_memory_mb`, or do less per call. |
+| Call fails or traps | Fuel, wall-clock, or memory ceiling hit. Raise `plugins.limits.call_fuel`, `plugins.limits.call_timeout_ms`, or `plugins.limits.max_memory_mb` as appropriate, or do less per call. |
 | Load fails on a runtime-only host | You shipped `.wasm` to a host with no JIT; ship a version-matched `.cwasm` instead. |
 
 ## Next

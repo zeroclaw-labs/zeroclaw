@@ -59,6 +59,21 @@ impl ChannelSopTopic {
 
 // ── Channel approval types ──────────────────────────────────────
 
+/// Where a tool call sits in the batch the model issued for one turn.
+///
+/// This is the raw batch position, not an approval count. `index` counts every
+/// call the model asked for, including calls that never reach an approval
+/// prompt. An `Approval 2 of 2` counter would only be truthful once the
+/// approval-required set is known, which is after hooks and policy have run —
+/// later than the first card is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPosition {
+    /// 1-based position of this call within the batch.
+    pub index: u32,
+    /// Number of calls in the batch.
+    pub total: u32,
+}
+
 /// Compact description of a tool call presented to the user for approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelApprovalRequest {
@@ -68,6 +83,23 @@ pub struct ChannelApprovalRequest {
     /// diffs instead of a plain summary string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_arguments: Option<serde_json::Value>,
+    /// Position of this call in the model's tool-call batch, when the caller
+    /// knows it. `None` on paths that approve a single call with no batch to
+    /// count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<ApprovalPosition>,
+}
+
+impl ChannelApprovalRequest {
+    /// Batch position for an approval card, as `(index, total)`.
+    ///
+    /// Reports the position verbatim. Whether a counter is worth showing is
+    /// the renderer's decision, so that a caller handing the renderer a tuple
+    /// directly cannot bypass the rule.
+    #[must_use]
+    pub fn position_counter(&self) -> Option<(u32, u32)> {
+        self.position.map(|p| (p.index, p.total))
+    }
 }
 
 /// The operator's response to a channel-presented approval prompt.
@@ -338,7 +370,7 @@ pub struct ChannelMessage {
     /// when the platform supports multiple bot instances. Session-key
     /// construction uses this so two bots on the same platform compute
     /// distinct session IDs and don't share conversation history. `None`
-    /// for channels without an alias concept (webhook, cli).
+    /// for channels without an alias concept (cli).
     pub channel_alias: Option<String>,
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
@@ -419,6 +451,46 @@ pub enum ProgressEvent {
     RunningTool,
     CompactingContext,
     FinalizingResponse,
+}
+
+/// Origin of a rendered draft-progress entry.
+///
+/// Channels may display both variants identically, but must retain this value
+/// while coalescing updates so provider reasoning cannot be mistaken for
+/// generated status chrome when their rendered text happens to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftProgressKind {
+    /// Generated lifecycle or tool-status chrome.
+    Status,
+    /// Raw provider reasoning explicitly enabled for the channel.
+    Reasoning,
+}
+
+/// Rendered draft-progress text paired with its semantic origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftProgress {
+    /// Semantic source retained independently from the display string.
+    pub kind: DraftProgressKind,
+    /// Channel-ready display text after redaction.
+    pub text: String,
+}
+
+impl DraftProgress {
+    /// Create a generated status or tool-progress entry.
+    pub fn status(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Status,
+            text: text.into(),
+        }
+    }
+
+    /// Create a provider-reasoning entry.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            kind: DraftProgressKind::Reasoning,
+            text: text.into(),
+        }
+    }
 }
 
 impl RoomVisibility {
@@ -610,6 +682,27 @@ pub struct ForgeApiResponse {
     pub body: serde_json::Value,
 }
 
+/// What a channel can say about its own listener without performing any I/O.
+///
+/// See [`Channel::listener_health`]. The three states exist because a listener
+/// that has not connected yet and a listener that is working are different
+/// claims, and a caller that stamps "healthy" for both reports a channel as
+/// `ok` before it has ever reached the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerHealth {
+    /// No exchange has completed yet, so the channel has nothing to report.
+    /// Not a failure — a listener that has only just started is not yet
+    /// broken — but not evidence of health either.
+    Pending,
+    /// The most recent exchange succeeded, recently enough that it is still
+    /// evidence the channel works.
+    Healthy,
+    /// Either the most recent exchange failed, or the last success is old
+    /// enough that the channel will no longer vouch for it. Both mean a live
+    /// `listen()` is not proof the channel is working.
+    Unhealthy,
+}
+
 /// Core channel trait — implement for any messaging platform.
 ///
 /// Every `Channel` is `Attributable`: the orchestrator's spawn site opens
@@ -623,12 +716,49 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
+    /// Send the completed assistant response for a turn.
+    ///
+    /// Most channels use the ordinary send path. Channels with delivery
+    /// policy that applies only to final responses can override this without
+    /// changing the shared message shape or affecting system and approval
+    /// sends.
+    async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.send(message).await
+    }
+
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
         true
+    }
+
+    /// Listener health as the channel itself last observed it.
+    ///
+    /// `health_check` is an *active* probe: implementations reach the remote
+    /// service to answer it, and some of them send a real message or open a
+    /// broker connection to do so. That makes it safe to call on demand — from
+    /// `channel doctor` — and unsafe to call on a timer, so a recurring caller
+    /// must not use it.
+    ///
+    /// This is the recurring-safe counterpart. It is synchronous and returns
+    /// state the channel recorded while it was already talking to the service,
+    /// so reading it performs no I/O and cannot block, send, or connect.
+    ///
+    /// `None` — the default — means the channel offers no signal at all, and
+    /// the caller should fall back to whatever it knew before asking. A channel
+    /// that *does* implement this reports a [`ListenerHealth`], which is a
+    /// three-state answer rather than a boolean: "I have nothing to say yet" is
+    /// not the same claim as "I am working", and a caller that collapses them
+    /// reports a listener as healthy before it has ever connected.
+    ///
+    /// An implementation owns its own freshness rule, because only the channel
+    /// knows how often a working listener completes an exchange. A success from
+    /// long enough ago that it is no longer evidence must be reported as
+    /// [`ListenerHealth::Unhealthy`], not as `Healthy` forever.
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        None
     }
 
     /// Send a discrete-choice prompt with options.
@@ -802,6 +932,42 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _text: &str,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Show a batch of progress/status updates as one coalesced draft update.
+    ///
+    /// Channels with expensive edit APIs should override this so an upstream
+    /// burst does not turn into one awaited network edit per progress item.
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> anyhow::Result<()> {
+        for text in texts {
+            self.update_draft_progress(recipient, message_id, text)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Show a batch of progress updates without discarding their source kind.
+    ///
+    /// The default preserves compatibility for channels that only need text;
+    /// channels that coalesce semantically different progress should override
+    /// this method and keep the kind through their local draft buffer.
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> anyhow::Result<()> {
+        let texts = progress
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        self.update_draft_progress_batch(recipient, message_id, &texts)
+            .await
     }
 
     /// Show localized lifecycle progress produced from a typed runtime event.
@@ -1168,6 +1334,7 @@ mod tests {
                 file_name: "test.pdf".to_string(),
                 data: vec![1, 2, 3],
                 mime_type: Some("application/pdf".to_string()),
+                marker: None,
             },
         ]);
 

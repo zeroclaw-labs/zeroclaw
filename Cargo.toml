@@ -1,41 +1,45 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.4"
+version = "0.8.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
+homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.4" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.4" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.4", default-features = false }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.4" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.4" }
-zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.4" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.4" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.4" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.4", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.4" }
-zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.4", default-features = false }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.4", default-features = false }
-zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.4" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.4" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.4" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.4" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.4" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.4" }
-zerocode = { path = "apps/zerocode", version = "0.8.4" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.5" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.5" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.5", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.5" }
+zeroclaw-tls = { path = "crates/zeroclaw-tls", version = "0.8.5" }
+zeroclaw-relay-proto = { path = "crates/zeroclaw-relay-proto", version = "0.8.5" }
+zerorelay = { path = "apps/zerorelay", version = "0.8.5" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.5" }
+zeroclaw-commands = { path = "crates/zeroclaw-commands", version = "0.8.5" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.5" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.5" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.5", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.5" }
+zeroclaw-sop-graph = { path = "crates/zeroclaw-sop-graph", version = "0.8.5", default-features = false }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.5", default-features = false }
+zeroclaw-eval = { path = "crates/zeroclaw-eval", version = "0.8.5" }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.5" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.5" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.5" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.5" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.5" }
+zerocode = { path = "apps/zerocode", version = "0.8.5" }
 directories = "6.0"
 sys-locale = "0.3"
 
 [package]
 name = "zeroclaw"
 # Workspace crates are publish = false during microkernel transition.
-publish = false
+publish = true
 default-run = "zeroclaw"
 version.workspace = true
 edition.workspace = true
@@ -43,6 +47,8 @@ authors = ["theonlyhennygod"]
 license.workspace = true
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.zeroclaw.com"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
@@ -83,6 +89,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
+zeroclaw-tls = { workspace = true }
 zeroclaw-eval = { workspace = true, optional = true }
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }
@@ -110,7 +117,7 @@ directories = "6.0"
 toml = "1.0"
 
 # JSON Schema generation for config export
-schemars = "1.2"
+schemars = { version = "1.2", optional = true }
 
 # Logging - minimal
 
@@ -144,6 +151,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
+crossterm = { version = "0.29", optional = true }
 
 # Binary discovery (init system detection)
 which = { version = "8.0", optional = true }
@@ -165,6 +173,13 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
 # Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
+
+# Unix: the Quickstart checklist measures the terminal behind the descriptor
+# it draws on (TIOCGWINSZ). Linux additionally uses it for `desktop --install`,
+# which opens candidate `.desktop` entries with O_NONBLOCK|O_NOFOLLOW so a FIFO
+# or symlink planted in an XDG data dir cannot block or redirect the read.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Installer/surface metadata: which `[features]` are internal aggregates or
 # meta toggles rather than user-selectable rows. This bit is NOT derivable from
@@ -189,6 +204,7 @@ non_row_features = [
 dist_extra_features = [
     "channel-matrix",
     "channel-lark",
+    "channel-git",
     "whatsapp-web",
 ]
 
@@ -226,6 +242,7 @@ agent-runtime = [
     "dep:zeroclaw-runtime", "dep:zeroclaw-eval", "dep:zeroclaw-channels", "dep:zeroclaw-tools",
     "dep:rusqlite",
     "dep:which",
+    "dep:crossterm",
     "dep:tokio-tungstenite",
     "dep:rustls",
 ]
@@ -256,7 +273,7 @@ gateway = [
     "dep:zeroclaw-gateway",
     "dep:axum", "dep:tower",
 ]
-schema-export = ["zeroclaw-config/schema-export"]
+schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 acp-bridge = ["dep:tokio-tungstenite"]
 
 # Channels — each forwards to zeroclaw-channels.
@@ -318,7 +335,11 @@ dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
+plugins-wasm = [
+    "dep:zeroclaw-plugins",
+    "zeroclaw-runtime/plugins-wasm",
+    "zeroclaw-gateway?/plugins-wasm",
+]
 probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
@@ -399,6 +420,11 @@ strip = true
 panic = "abort"
 
 [dev-dependencies]
+# Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
+# so this package's integration-test helpers can mint the now-sealed engine tool
+# registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
+# binary build, so the assemble()-only seal holds in production.
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
@@ -436,6 +462,12 @@ path = "tests/test_live.rs"
 [[test]]
 name = "architecture"
 path = "tests/test_architecture.rs"
+
+# Cross-crate activation proof: a configured channel plugin reaching a real
+# WASM component. Needs `plugins-wasm-cranelift` and the wasm32-wasip2 target.
+[[test]]
+name = "plugin_channel_runtime_e2e"
+path = "tests/plugin_channel_runtime_e2e.rs"
 
 [[bench]]
 name = "agent_benchmarks"

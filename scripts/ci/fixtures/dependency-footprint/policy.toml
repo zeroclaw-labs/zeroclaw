@@ -1,0 +1,85 @@
+schema_version = 1
+edge_kinds = ["normal", "build"]
+
+[[profiles]]
+id = "foundation"
+package = "zeroclaw"
+mode = "no-default-features"
+
+[[profiles]]
+id = "agent-runtime"
+package = "zeroclaw"
+mode = "features"
+features = ["agent-runtime"]
+
+[[profiles]]
+id = "root-default"
+package = "zeroclaw"
+mode = "defaults"
+
+[[profiles]]
+id = "standard-distribution"
+package = "zeroclaw"
+mode = "selection"
+selection = "dist"
+
+[[profiles]]
+id = "ci-all"
+package = "zeroclaw"
+mode = "features"
+features = ["ci-all"]
+
+[[profiles]]
+id = "hardware-probe"
+package = "zeroclaw"
+mode = "features"
+features = ["agent-runtime", "probe", "zeroclaw-tools/probe"]
+
+[[profiles]]
+id = "channels-minimal"
+package = "zeroclaw-channels"
+mode = "no-default-features"
+
+[[profiles]]
+id = "channels-default"
+package = "zeroclaw-channels"
+mode = "defaults"
+
+[[contracts]]
+id = "hardware-package-present"
+profile = "hardware-probe"
+kind = "package"
+package = "zeroclaw-hardware"
+expect = "present"
+
+[[contracts]]
+id = "hardware-probe-enabled"
+profile = "hardware-probe"
+kind = "feature"
+package = "zeroclaw-hardware"
+feature = "probe"
+expect = "enabled"
+
+[[contracts]]
+id = "tools-probe-enabled"
+profile = "hardware-probe"
+kind = "feature"
+package = "zeroclaw-tools"
+feature = "probe"
+expect = "enabled"
+
+[[contracts]]
+id = "root-default-no-hardware-probe"
+profile = "root-default"
+kind = "feature"
+package = "zeroclaw-hardware"
+feature = "probe"
+expect = "forbidden"
+
+[[contracts]]
+id = "standard-distribution-no-hardware-probe"
+profile = "standard-distribution"
+kind = "feature"
+package = "zeroclaw-hardware"
+feature = "probe"
+expect = "forbidden"

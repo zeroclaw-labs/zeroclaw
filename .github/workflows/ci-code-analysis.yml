@@ -1,4 +1,4 @@
-# Static analysis — fast pattern checks on every PR, deep taint on master+schedule.
+# Static analysis — fast Semgrep pattern checks on every PR and master push.
 #
 # Semgrep: fast pattern scan (injection / path-traversal / unsafe patterns, plus
 #   config-layer surfaces CodeQL does not cover — GitHub Actions YAML, Dockerfiles,
@@ -7,12 +7,11 @@
 #   as SARIF to the GitHub Security tab. Report-only (no --error) — surfaced, never
 #   gating. .semgrepignore suppresses known false-positive surfaces (tests, examples,
 #   docs theme).
-# CodeQL (master push + daily): 10-30 min, inter-procedural taint tracking,
-#   SARIF results published to GitHub Security tab.
 #
-# We deliberately do NOT gate every PR on CodeQL. A 20-minute analysis that
-# sometimes times out on Rust is a productivity tax, not a security guarantee.
-# Semgrep covers the fast path; CodeQL catches what Semgrep misses.
+# Deep CodeQL taint analysis (Rust and JS/TS) lives in the sibling codeql.yml
+# (master push + daily schedule + manual dispatch). It is deliberately not
+# PR-triggered — see the rationale there — which also keeps it from rendering
+# as a permanently skipped check on every PR.
 
 name: Code Analysis
 
@@ -21,8 +20,6 @@ on:
     branches: [master]
   push:
     branches: [master]
-  schedule:
-    - cron: '37 5 * * *'   # daily at 05:37 UTC — random offset to spread load
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -42,7 +39,6 @@ jobs:
     permissions:
       contents: read
       security-events: write   # upload SARIF to the Security tab
-    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -71,39 +67,7 @@ jobs:
         if: always()
         # Fork PRs may have read-only tokens; trusted-event upload failures stay visible.
         continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
-        uses: github/codeql-action/upload-sarif@b0c4fd77f6c559021d78430ec4d0d169ae74a4eb # v3
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
         with:
           sarif_file: semgrep.sarif
           category: semgrep
-
-  # ── Deep taint analysis (master push + daily, ~15 min) ────────────────
-
-  codeql:
-    name: CodeQL
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      security-events: write
-    if: |
-      github.repository == 'zeroclaw-labs/zeroclaw' &&
-      github.ref == 'refs/heads/master' &&
-      (github.event_name == 'push' || github.event_name == 'schedule')
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: 1.96.1
-      - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@b0c4fd77f6c559021d78430ec4d0d169ae74a4eb # v3
-        with:
-          languages: rust
-          config-file: .github/codeql/codeql-config.yml
-      - name: Build
-        run: cargo build --locked --workspace --exclude zeroclaw-desktop --features ci-all
-        env:
-          CARGO_TERM_COLOR: always
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@b0c4fd77f6c559021d78430ec4d0d169ae74a4eb # v3

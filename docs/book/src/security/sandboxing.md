@@ -4,7 +4,25 @@ The runtime can wrap tool invocations in an OS-level sandbox that restricts file
 
 Sandbox settings live on a risk profile. Each agent points at a risk profile via `agents.<alias>.risk_profile`; the agent's sandbox enable/backend are read from that profile.
 
-`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
+**CLI model providers (for example `grok_cli`):** the external CLI is outside
+ZeroClaw's native tool-approval path. Risk-profile sandboxing above does not
+confine it. The `grok_cli` ACP provider therefore injects `--sandbox strict`,
+`--permission-mode dontAsk`, and an empty built-in tool set by default, and it
+rejects ACP permission requests (selecting `reject_once` when the CLI offers
+it, otherwise cancelling the request). Explicit bypass flags in alias
+`extra_args` instead select the request's `allow_once` option; this does not
+disable Grok's active OS sandbox or override its deny rules. Other permission
+modes remain fail closed. See
+[Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli).
+
+`sandbox_enabled = false` (or `sandbox_backend = "none"`) disables the
+profile's additional OS-level sandbox wrapper. Under the native runtime, that
+leaves tools without an OS sandbox. Under `[runtime] kind = "docker"`, the
+Docker runtime remains the container boundary and is reported as
+`docker-runtime`; these settings prevent a second sandbox container from
+wrapping the runtime's own `docker run`. See the canonical
+[Minimal working example](../providers/configuration.md#minimal-working-example)
+for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
 
@@ -25,7 +43,10 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.
-- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`.
+- **Forbidden paths**: absolute component-prefix rules from
+  `[risk_profiles.<alias>].forbidden_paths`. Competing allow and deny prefixes
+  use most-specific-match precedence, with deny winning ties; see
+  [Autonomy path rules](./autonomy.md#path-rules).
 
 ### Network
 

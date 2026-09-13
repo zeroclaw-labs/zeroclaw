@@ -23,12 +23,16 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "bedrock" => (Some("amazon-bedrock"), None),
         "gemini" => (Some("google"), Some("google")),
         "gemini_cli" => (Some("google"), Some("google")),
+        "grok_cli" => (Some("xai"), Some("x-ai")),
         "openrouter" => (Some("openrouter"), Some("openrouter")),
         "copilot" => (Some("github-copilot"), None),
         "minimax" => (Some("minimax"), Some("minimax")),
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
         "kilo" => (Some("kilo"), None),
+        // Self-hosted gateway: prices come live from its own /v1/models
+        // (PUBLIC_MODEL_LISTING), never from models.dev or OpenRouter.
+        "zerorouter" => (None, None),
         "ovh" => (Some("ovhcloud"), None),
         // Compat families — mirrors the consts in CompatFamilySpec impls.
         "moonshot" => (Some("moonshotai"), Some("moonshotai")),
@@ -322,6 +326,13 @@ mod tests {
     #[test]
     fn known_family_with_dual_sources_returns_both() {
         let (md, or) = catalog_source_for("xai").expect("xai is canonical");
+        assert_eq!(md, Some("xai"));
+        assert_eq!(or, Some("x-ai"));
+    }
+
+    #[test]
+    fn grok_cli_family_uses_xai_openrouter_prefix() {
+        let (md, or) = catalog_source_for("grok_cli").expect("grok_cli is registered");
         assert_eq!(md, Some("xai"));
         assert_eq!(or, Some("x-ai"));
     }

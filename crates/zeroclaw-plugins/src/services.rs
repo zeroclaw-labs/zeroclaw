@@ -67,7 +67,6 @@ pub(crate) fn test_host_services() -> PluginHostServices {
             description: None,
             author: None,
             wasm_path: None,
-            wasm_sha256: None,
             capabilities: vec![scope.id().capability()],
             permissions: vec![PluginPermission::ConfigRead],
             config_schema: Some(serde_json::json!({
@@ -78,6 +77,7 @@ pub(crate) fn test_host_services() -> PluginHostServices {
             })),
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         };
         resolve_plugin_config(&manifest, scope, None)
     }))

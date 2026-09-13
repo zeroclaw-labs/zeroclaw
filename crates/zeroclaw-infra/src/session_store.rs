@@ -8,9 +8,20 @@ use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
 
-type MutationLock = parking_lot::Mutex<()>;
+#[derive(Default)]
+pub(crate) struct MutationState {
+    migrated: bool,
+    receipt_state_uncertain: bool,
+}
 
-static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<MutationLock>>>> =
+pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
+
+struct MutationLockRecord {
+    lock: Weak<MutationLock>,
+    migrated: bool,
+}
+
+static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, MutationLockRecord>>> =
     OnceLock::new();
 
 /// Append-only JSONL session store for channel conversations.
@@ -25,6 +36,19 @@ impl SessionStore {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
+        {
+            let mut state = mutation_lock.lock();
+            match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
+                Ok(true) => mark_session_directory_migrated(&sessions_dir, &mut state)?,
+                Ok(false) => state.receipt_state_uncertain = false,
+                Err(error) => {
+                    state.receipt_state_uncertain = true;
+                    return Err(std::io::Error::other(format!(
+                        "Failed to inspect durable JSONL migration state: {error:#}"
+                    )));
+                }
+            }
+        }
         Ok(Self {
             sessions_dir,
             mutation_lock,
@@ -38,9 +62,13 @@ impl SessionStore {
     }
 
     /// Load all messages for a session from its JSONL file.
-    /// Returns an empty vec if the file does not exist or is unreadable.
+    /// Returns an empty vec if the path is not a regular JSONL session file or
+    /// the file is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let path = self.session_path(session_key);
+        if !is_regular_jsonl_session_file(&path) {
+            return Vec::new();
+        }
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(_) => return Vec::new(),
@@ -65,12 +93,23 @@ impl SessionStore {
 
     /// Append a single message to the session JSONL file.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
+    }
+
+    fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
+        let guard = self.mutation_lock.lock();
+        if guard.migrated || guard.receipt_state_uncertain {
+            return Err(std::io::Error::other(
+                "JSONL session store is inactive after SQLite migration",
+            ));
+        }
+        Ok(guard)
     }
 
     fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let path = self.session_path(session_key);
+        validate_jsonl_session_file_path(&path)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -87,7 +126,7 @@ impl SessionStore {
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         if messages.is_empty() {
             return Ok(false);
@@ -113,7 +152,7 @@ impl SessionStore {
     where
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         let Some(last) = messages.last_mut() else {
             return Ok(false);
@@ -125,7 +164,8 @@ impl SessionStore {
 
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
+        validate_jsonl_session_file_path(&self.session_path(session_key))?;
         let messages = self.load(session_key);
         self.rewrite(session_key, &messages)
     }
@@ -160,7 +200,10 @@ impl SessionStore {
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Ok(0);
+        }
         let count = self.load(session_key).len();
         if count > 0 {
             self.rewrite(session_key, &[])?;
@@ -168,25 +211,29 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a session's JSONL file. Returns `true` if the file existed.
+    /// Delete a regular session JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
-        if !path.exists() {
+        if !is_regular_jsonl_session_file(&path) {
             return Ok(false);
         }
         std::fs::remove_file(&path)?;
         Ok(true)
     }
 
-    /// Return the modification time of a session's JSONL file.
+    /// Return the modification time of a regular session JSONL file.
     pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
-        std::fs::metadata(self.session_path(session_key))
+        let path = self.session_path(session_key);
+        if !is_regular_jsonl_session_file(&path) {
+            return None;
+        }
+        std::fs::symlink_metadata(path)
             .and_then(|m| m.modified())
             .ok()
     }
 
-    /// List all session keys that have files on disk.
+    /// List all session keys that have regular JSONL files on disk.
     pub fn list_sessions(&self) -> Vec<String> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
             Ok(e) => e,
@@ -196,6 +243,9 @@ impl SessionStore {
         entries
             .filter_map(|entry| {
                 let entry = entry.ok()?;
+                if !is_regular_jsonl_session_file(&entry.path()) {
+                    return None;
+                }
                 let name = entry.file_name().into_string().ok()?;
                 name.strip_suffix(".jsonl").map(String::from)
             })
@@ -203,19 +253,90 @@ impl SessionStore {
     }
 }
 
-fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
+fn is_regular_jsonl_session_file(path: &Path) -> bool {
+    matches!(validate_jsonl_session_file_path(path), Ok(true))
+}
+
+/// Validate that a JSONL session path is absent or an existing regular file.
+/// Returns whether the regular file already exists.
+fn validate_jsonl_session_file_path(path: &Path) -> std::io::Result<bool> {
+    if path
+        .extension()
+        .is_none_or(|extension| extension != "jsonl")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path must have a .jsonl extension",
+        ));
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path must be a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
     let key = sessions_dir.canonicalize()?;
     let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let mut locks = registry.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
+    locks.retain(|_, record| record.migrated || record.lock.strong_count() > 0);
 
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(|record| record.lock.upgrade()) {
         return Ok(lock);
     }
 
-    let lock = Arc::new(MutationLock::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
+    let migrated = locks.get(&key).is_some_and(|record| record.migrated);
+    let lock = Arc::new(MutationLock::new(MutationState {
+        migrated,
+        receipt_state_uncertain: false,
+    }));
+    locks.insert(
+        key,
+        MutationLockRecord {
+            lock: Arc::downgrade(&lock),
+            migrated,
+        },
+    );
     Ok(lock)
+}
+
+pub(crate) fn mark_session_directory_migrated(
+    sessions_dir: &Path,
+    state: &mut MutationState,
+) -> std::io::Result<()> {
+    state.migrated = true;
+    state.receipt_state_uncertain = false;
+    let key = sessions_dir.canonicalize()?;
+    let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(record) = registry.lock().get_mut(&key) {
+        record.migrated = true;
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = true;
+}
+
+pub(crate) fn clear_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = false;
+}
+
+#[cfg(test)]
+pub(crate) fn forget_session_directory_migration_state_for_test(
+    sessions_dir: &Path,
+) -> std::io::Result<()> {
+    let key = sessions_dir.canonicalize()?;
+    if let Some(registry) = MUTATION_LOCKS.get() {
+        registry.lock().remove(&key);
+    }
+    Ok(())
 }
 
 impl SessionBackend for SessionStore {
@@ -275,20 +396,59 @@ impl SessionBackend for SessionStore {
         self.delete_session(session_key)
     }
 
-    /// Quick existence probe mirroring how `delete_session` decides whether
-    /// the session is on disk Checking file presence is the same
-    /// O(1) `stat` that `delete_session` itself performs.
+    /// Quick existence probe using the same regular-file policy as the other
+    /// JSONL session operations.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        is_regular_jsonl_session_file(&self.session_path(session_key))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(original, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(original, link)
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SessionEntrySnapshot {
+        entry_kind: &'static str,
+        link_target: Option<PathBuf>,
+        entry_contents: Option<Vec<u8>>,
+        tracked_target_contents: Option<Option<Vec<u8>>>,
+    }
+
+    fn snapshot_session_entry(path: &Path, tracked_target: Option<&Path>) -> SessionEntrySnapshot {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        let file_type = metadata.file_type();
+        SessionEntrySnapshot {
+            entry_kind: if file_type.is_symlink() {
+                "symlink"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "file"
+            } else {
+                "other"
+            },
+            link_target: file_type
+                .is_symlink()
+                .then(|| std::fs::read_link(path).unwrap()),
+            entry_contents: file_type.is_file().then(|| std::fs::read(path).unwrap()),
+            tracked_target_contents: tracked_target.map(|target| std::fs::read(target).ok()),
+        }
+    }
 
     #[test]
     fn round_trip_append_and_load() {
@@ -383,6 +543,103 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert!(sessions.contains(&"discord_bob".to_string()));
         assert!(sessions.contains(&"telegram_alice".to_string()));
+    }
+
+    #[test]
+    fn session_operations_accept_only_regular_jsonl_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let sessions_dir = tmp.path().join("sessions");
+
+        backend
+            .append("valid", &ChatMessage::user("persisted message"))
+            .unwrap();
+        std::fs::create_dir(sessions_dir.join("directory.jsonl")).unwrap();
+        std::fs::write(sessions_dir.join("notes.txt"), "not a session").unwrap();
+
+        let mut invalid_entries = vec![("directory", None)];
+
+        #[cfg(any(unix, windows))]
+        {
+            let linked = sessions_dir.join("linked.jsonl");
+            match symlink_file(&store.session_path("valid"), &linked) {
+                Ok(()) => {
+                    symlink_file(
+                        &sessions_dir.join("missing.jsonl"),
+                        &sessions_dir.join("dangling.jsonl"),
+                    )
+                    .unwrap();
+                    invalid_entries.extend([
+                        ("linked", Some(store.session_path("valid"))),
+                        ("dangling", Some(sessions_dir.join("missing.jsonl"))),
+                    ]);
+                }
+                #[cfg(windows)]
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                Err(error) => panic!("failed to create session symlink fixture: {error}"),
+            }
+        }
+
+        assert_eq!(store.list_sessions(), vec!["valid".to_string()]);
+        assert!(backend.session_exists("valid"));
+        assert_eq!(backend.load("valid").len(), 1);
+        assert!(store.session_mtime("valid").is_some());
+
+        for (key, _) in &invalid_entries {
+            assert!(!backend.session_exists(key), "{key} must not exist");
+            assert!(backend.load(key).is_empty(), "{key} must not load");
+            assert!(
+                store.session_mtime(key).is_none(),
+                "{key} must not expose an mtime"
+            );
+            assert_eq!(
+                backend.clear_messages(key).unwrap(),
+                0,
+                "{key} must not be cleared"
+            );
+            assert!(
+                !backend.delete_session(key).unwrap(),
+                "{key} must not be deleted"
+            );
+            assert!(
+                std::fs::symlink_metadata(store.session_path(key)).is_ok(),
+                "{key} filesystem entry must remain untouched"
+            );
+        }
+
+        let rejected_message = ChatMessage::user("must not be persisted");
+        let mut mutation_failures = Vec::new();
+        for (key, tracked_target) in &invalid_entries {
+            let path = store.session_path(key);
+            let before = snapshot_session_entry(&path, tracked_target.as_deref());
+            let append_result = backend.append(key, &rejected_message);
+            let compact_result = backend.compact(key);
+            let after = snapshot_session_entry(&path, tracked_target.as_deref());
+
+            if append_result.is_ok() || compact_result.is_ok() || after != before {
+                mutation_failures.push(format!(
+                    "{key}: append={append_result:?}, compact={compact_result:?}, before={before:?}, after={after:?}"
+                ));
+            }
+        }
+
+        backend
+            .append("new-session", &ChatMessage::user("new session works"))
+            .unwrap();
+        assert_eq!(backend.load("new-session").len(), 1);
+
+        assert!(
+            mutation_failures.is_empty(),
+            "append/compact must reject invalid entries without modifying entries or targets:\n{}",
+            mutation_failures.join("\n")
+        );
+
+        assert_eq!(backend.clear_messages("valid").unwrap(), 1);
+        assert!(backend.session_exists("valid"));
+        assert!(backend.delete_session("valid").unwrap());
+        assert!(!backend.session_exists("valid"));
+        assert!(sessions_dir.join("notes.txt").is_file());
     }
 
     #[test]
@@ -537,6 +794,7 @@ mod tests {
         writeln!(file, r#"{{"role":"user","content":"ok"}}"#).unwrap();
         writeln!(file, "corrupt line").unwrap();
         writeln!(file, r#"{{"role":"assistant","content":"hi"}}"#).unwrap();
+        drop(file);
 
         store.compact(key).unwrap();
 

@@ -143,6 +143,12 @@ group = "bridge_sh"
 prefix = "export "
 
 [[var]]
+path = "providers.models.zerorouter.gateway.api_key"
+value = "\"$ZEROROUTER_API_KEY\""
+group = "bridge_sh"
+prefix = "export "
+
+[[var]]
 path = "storage.qdrant.home.url"
 value = "\"$QDRANT_URL\""
 group = "bridge_sh"

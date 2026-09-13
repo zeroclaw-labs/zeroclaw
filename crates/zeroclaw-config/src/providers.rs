@@ -12,22 +12,23 @@ use super::schema::{
     DeepinfraModelProviderConfig, DeepmystModelProviderConfig, DeepseekModelProviderConfig,
     DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
     FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
-    GithubModelsModelProviderConfig, GlmModelProviderConfig, GroqModelProviderConfig,
-    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
-    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
-    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, ModelProviderConfig,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    GithubModelsModelProviderConfig, GlmModelProviderConfig, GrokCliModelProviderConfig,
+    GroqModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
+    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    ModelProviderConfig, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -159,6 +160,7 @@ macro_rules! for_each_model_provider_slot {
             (ollama, "ollama", OllamaModelProviderConfig),
             (gemini, "gemini", GeminiModelProviderConfig),
             (gemini_cli, "gemini_cli", GeminiCliModelProviderConfig),
+            (grok_cli, "grok_cli", GrokCliModelProviderConfig),
             (bedrock, "bedrock", BedrockModelProviderConfig),
             (telnyx, "telnyx", TelnyxModelProviderConfig),
             (together, "together", TogetherModelProviderConfig),
@@ -216,6 +218,7 @@ macro_rules! for_each_model_provider_slot {
             (opencode, "opencode", OpencodeModelProviderConfig),
             (kilocli, "kilocli", KiloCliModelProviderConfig),
             (kilo, "kilo", KiloModelProviderConfig),
+            (zerorouter, "zerorouter", ZerorouterModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -239,14 +242,24 @@ macro_rules! emit_model_providers_struct {
 for_each_model_provider_slot!(emit_model_providers_struct);
 
 impl ModelProviders {
+    /// Iterate every entry across every typed slot in a deterministic
+    /// order: slot order (as declared by `for_each_model_provider_slot!`)
+    /// first, then alias order within each slot. The alias maps are
+    /// `HashMap`s whose iteration order is seeded per process, so the
+    /// sort is what keeps "first entry" consumers — the gateway boot
+    /// default provider/model, first-run agent defaults, the
+    /// ACP-advertised default model — stable across restarts.
     pub fn iter_entries(&self) -> impl Iterator<Item = (&'static str, &str, &ModelProviderConfig)> {
         let mut out: Vec<(&'static str, &str, &ModelProviderConfig)> = Vec::new();
         macro_rules! emit_iter {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                 $(
-                    for (alias, cfg) in &self.$field {
-                        out.push(($type_str, alias.as_str(), &cfg.base));
-                    }
+                    let mut slot: Vec<(&String, &$cfg_ty)> = self.$field.iter().collect();
+                    slot.sort_by(|a, b| a.0.cmp(b.0));
+                    out.extend(
+                        slot.into_iter()
+                            .map(|(alias, cfg)| ($type_str, alias.as_str(), &cfg.base)),
+                    );
                 )+
             };
         }
@@ -254,7 +267,8 @@ impl ModelProviders {
         out.into_iter()
     }
 
-    /// Iterate every entry mutably across every typed slot.
+    /// Iterate every entry mutably across every typed slot, in the same
+    /// deterministic order as [`ModelProviders::iter_entries`].
     pub fn iter_entries_mut(
         &mut self,
     ) -> impl Iterator<Item = (&'static str, &str, &mut ModelProviderConfig)> {
@@ -262,14 +276,32 @@ impl ModelProviders {
         macro_rules! emit_iter_mut {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                 $(
-                    for (alias, cfg) in self.$field.iter_mut() {
-                        out.push(($type_str, alias.as_str(), &mut cfg.base));
-                    }
+                    let mut slot: Vec<(&String, &mut $cfg_ty)> = self.$field.iter_mut().collect();
+                    slot.sort_by(|a, b| a.0.cmp(b.0));
+                    out.extend(
+                        slot.into_iter()
+                            .map(|(alias, cfg)| ($type_str, alias.as_str(), &mut cfg.base)),
+                    );
                 )+
             };
         }
         for_each_model_provider_slot!(emit_iter_mut);
         out.into_iter()
+    }
+
+    /// First entry across every typed slot that declares a non-empty `model`,
+    /// in the existing `iter_entries` order. An entry without a `model`
+    /// cannot serve as an install-wide default — there is no model string to
+    /// pair with the provider — so entries without one are skipped instead of
+    /// seeding a provider/model mismatch at the consumer.
+    #[must_use]
+    pub fn first_entry_with_model(&self) -> Option<(&'static str, &str, &ModelProviderConfig)> {
+        self.iter_entries().find(|(_, _, base)| {
+            base.model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|model| !model.is_empty())
+        })
     }
 
     /// Resolve the family-default endpoint URI for `<family>.<alias>`. Returns
@@ -656,6 +688,89 @@ impl TranscriptionProviders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_iter_entries_sorts_aliases_within_each_slot() {
+        let mut providers = ModelProviders::default();
+        // Insert in non-sorted order: the alias maps are HashMaps whose
+        // iteration order is seeded per process, so only iter_entries' own
+        // sort can give first-entry consumers a stable pick across restarts.
+        for alias in ["zeta", "alpha", "mid"] {
+            providers
+                .custom
+                .insert(alias.to_string(), CustomModelProviderConfig::default());
+        }
+
+        let entries: Vec<(&str, &str)> = providers
+            .iter_entries()
+            .map(|(family, alias, _)| (family, alias))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("custom", "alpha"), ("custom", "mid"), ("custom", "zeta")]
+        );
+
+        // The mutable walk yields the same deterministic order. Collect
+        // owned copies so the immutable borrow above can end before
+        // iter_entries_mut takes the mutable one.
+        let mut_entries: Vec<(String, String)> = providers
+            .iter_entries_mut()
+            .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
+            .collect();
+        assert_eq!(
+            mut_entries,
+            vec![
+                ("custom".into(), "alpha".into()),
+                ("custom".into(), "mid".into()),
+                ("custom".into(), "zeta".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_entry_with_model_skips_model_less_entries() {
+        let mut providers = ModelProviders::default();
+        providers
+            .openai
+            .insert("alpha".to_string(), OpenAIModelProviderConfig::default());
+        providers.openai.insert(
+            "beta".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("beta-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        providers.ollama.insert(
+            "gamma".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gamma-model".to_string()),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        // Openai precedes ollama in slot order. Within openai, only "beta"
+        // has a model, so it is selected regardless of alias iteration order.
+        let first = providers
+            .first_entry_with_model()
+            .expect("an entry with a model must be found");
+        assert_eq!(
+            (first.0, first.1, first.2.model.as_deref()),
+            ("openai", "beta", Some("beta-model"))
+        );
+
+        // A whitespace-only model counts as unset, so the pick moves on to
+        // the next entry with a real model.
+        providers.openai.get_mut("beta").unwrap().base.model = Some("   ".to_string());
+        let first = providers
+            .first_entry_with_model()
+            .expect("a later entry with a model must be found");
+        assert_eq!((first.0, first.1), ("ollama", "gamma"));
+    }
 
     #[test]
     fn transcription_iter_entries_walks_every_typed_slot() {

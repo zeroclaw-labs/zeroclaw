@@ -1,12 +1,14 @@
 use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
+use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// Web search tool for searching the internet.
@@ -172,6 +174,12 @@ impl WebSearchTool {
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
+        // Throttling lives here rather than in `search_duckduckgo_at` so the
+        // wiremock-backed request tests that target the inner method do not
+        // each pay — and serialize on — a multi-second scrape gap.
+        DUCKDUCKGO_THROTTLE
+            .acquire(duckduckgo_gap(scrape_entropy()))
+            .await;
         self.search_duckduckgo_at("https://html.duckduckgo.com/html/", query)
             .await
     }
@@ -187,14 +195,22 @@ impl WebSearchTool {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("{}?q={}", endpoint_url, encoded_query);
 
+        let headers = duckduckgo_request_headers(scrape_entropy());
+
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            .user_agent(headers.user_agent);
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
         let client = builder.build()?;
 
-        let response = client.get(&search_url).send().await?;
+        let response = client
+            .get(&search_url)
+            .header("Accept", DUCKDUCKGO_ACCEPT)
+            .header("Accept-Language", headers.accept_language)
+            .header("DNT", "1")
+            .send()
+            .await?;
         let status = response.status();
         let final_url_is_block =
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
@@ -237,32 +253,35 @@ impl WebSearchTool {
             .collect();
 
         if link_matches.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via DuckDuckGo)", query)];
-
         let count = link_matches.len().min(self.max_results);
+        let mut blocks: Vec<Vec<String>> = Vec::with_capacity(count);
 
         for i in 0..count {
             let caps = &link_matches[i];
             let url_str = decode_ddg_redirect_url(&caps[1]);
             let title = strip_tags(&caps[2]);
 
-            lines.push(format!("{}. {}", i + 1, title.trim()));
-            lines.push(format!("   {}", url_str.trim()));
+            let mut block = vec![
+                format!("{}. {}", i + 1, title.trim()),
+                format!("   {}", url_str.trim()),
+            ];
 
             // Add snippet if available
             if i < snippet_matches.len() {
                 let snippet = strip_tags(&snippet_matches[i][1]);
                 let snippet = snippet.trim();
                 if !snippet.is_empty() {
-                    lines.push(format!("   {}", snippet));
+                    block.push(format!("   {}", cap_result_content(snippet)));
                 }
             }
+
+            blocks.push(block);
         }
 
-        Ok(lines.join("\n"))
+        Ok(render_results(results_header(query, "DuckDuckGo"), blocks))
     }
 
     async fn search_brave(&self, query: &str) -> anyhow::Result<String> {
@@ -445,10 +464,10 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via Tavily)", query)];
+        let mut blocks: Vec<Vec<String>> = Vec::new();
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
             let title = result
@@ -460,14 +479,14 @@ impl WebSearchTool {
             // so it doubles as the description for the LLM caller.
             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
             if !content.is_empty() {
-                lines.push(format!("   {}", content));
+                block.push(format!("   {}", cap_result_content(content)));
             }
+            blocks.push(block);
         }
 
-        Ok(lines.join("\n"))
+        Ok(render_results(results_header(query, "Tavily"), blocks))
     }
 
     /// Resolve the Jina AI API key from the boot-time snapshot, falling back
@@ -593,10 +612,10 @@ impl WebSearchTool {
         })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via Jina AI)", query)];
+        let mut blocks: Vec<Vec<String>> = Vec::new();
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
             let title = result
@@ -612,14 +631,14 @@ impl WebSearchTool {
                 .or_else(|| result.get("description").and_then(|d| d.as_str()))
                 .unwrap_or("");
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
             if !snippet.is_empty() {
-                lines.push(format!("   {}", snippet));
+                block.push(format!("   {}", cap_result_content(snippet)));
             }
+            blocks.push(block);
         }
 
-        Ok(lines.join("\n"))
+        Ok(render_results(results_header(query, "Jina AI"), blocks))
     }
 
     fn resolve_bocha_api_key(&self) -> anyhow::Result<String> {
@@ -741,7 +760,13 @@ impl WebSearchTool {
                 .get("msg")
                 .and_then(|m| m.as_str())
                 .unwrap_or("(no message)");
-            anyhow::bail!("Bocha AI search returned error (code {code}): {msg}");
+            // This returns before the capped success path, so `msg` is the one
+            // piece of provider-controlled text that would otherwise reach the
+            // model unbounded.
+            anyhow::bail!(
+                "Bocha AI search returned error (code {code}): {}",
+                cap_provider_error(msg)
+            );
         }
 
         let results = json
@@ -761,10 +786,10 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via Bocha)", query)];
+        let mut blocks: Vec<Vec<String>> = Vec::new();
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
             let title = result
@@ -789,8 +814,7 @@ impl WebSearchTool {
                 .or_else(|| result.get("dateLastCrawled").and_then(|d| d.as_str()))
                 .unwrap_or("");
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
 
             // Compact attribution line: "siteName · date" when either is present.
             let attribution = match (site.is_empty(), date.is_empty()) {
@@ -800,15 +824,17 @@ impl WebSearchTool {
                 (true, true) => String::new(),
             };
             if !attribution.is_empty() {
-                lines.push(attribution);
+                block.push(attribution);
             }
 
             if !body.is_empty() {
-                lines.push(format!("   {}", body));
+                block.push(format!("   {}", cap_result_content(body)));
             }
+
+            blocks.push(block);
         }
 
-        Ok(lines.join("\n"))
+        Ok(render_results(results_header(query, "Bocha"), blocks))
     }
 
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
@@ -828,10 +854,10 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via Brave)", query)];
+        let mut blocks: Vec<Vec<String>> = Vec::new();
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
             let title = result
@@ -844,14 +870,14 @@ impl WebSearchTool {
                 .and_then(|d| d.as_str())
                 .unwrap_or("");
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
             if !description.is_empty() {
-                lines.push(format!("   {}", description));
+                block.push(format!("   {}", cap_result_content(description)));
             }
+            blocks.push(block);
         }
 
-        Ok(lines.join("\n"))
+        Ok(render_results(results_header(query, "Brave"), blocks))
     }
 
     /// Resolve the SearXNG instance URL from the boot-time config or by
@@ -912,10 +938,7 @@ impl WebSearchTool {
                         .with_attrs(::serde_json::json!({"search_provider": "searxng"})),
                     "web_search: SearXNG instance URL not configured"
                 );
-                anyhow::Error::msg(
-                    "SearXNG instance URL not configured. Set [web_search] searxng_instance_url \
-                     in config.toml or the SEARXNG_INSTANCE_URL environment variable.",
-                )
+                anyhow::Error::msg(SEARXNG_NOT_CONFIGURED_MESSAGE.as_str())
             })
     }
 
@@ -970,10 +993,10 @@ impl WebSearchTool {
             })?;
 
         if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
+            return Ok(no_results_message(query));
         }
 
-        let mut lines = vec![format!("Search results for: {} (via SearXNG)", query)];
+        let mut blocks: Vec<Vec<String>> = Vec::new();
 
         for (i, result) in results.iter().take(self.max_results).enumerate() {
             let title = result
@@ -983,16 +1006,266 @@ impl WebSearchTool {
             let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
             if !content.is_empty() {
-                lines.push(format!("   {}", content));
+                block.push(format!("   {}", cap_result_content(content)));
+            }
+            blocks.push(block);
+        }
+
+        Ok(render_results(results_header(query, "SearXNG"), blocks))
+    }
+}
+
+// ── Output caps ──────────────────────────────────────────────────────────────
+//
+// Every provider response is untrusted, unbounded text that lands straight in
+// the model's context window. Jina and Bocha are the acute cases: both return
+// long markdown / AI-generated summaries per hit, so a single search can crowd
+// out a small model's entire context.
+//
+// Both limits are intentionally constants rather than config keys. There is no
+// concrete operator use case for tuning them (per AGENTS.md: no config keys
+// without one), and a key here would be one more surface to drift.
+
+/// Maximum characters of provider-supplied body text — snippet, description,
+/// content, or AI summary — kept per individual result.
+const MAX_RESULT_CONTENT_CHARS: usize = 500;
+
+/// Maximum characters of rendered search output, header line included. The
+/// omission note below is appended on top of this budget so the signal that
+/// trimming happened can never itself be trimmed away.
+const MAX_TOTAL_OUTPUT_CHARS: usize = 16_000;
+
+/// Maximum characters of the caller-supplied query echoed back into rendered
+/// output or a "no results" reply. The query is model-controlled and
+/// unbounded, so echoing it verbatim lets one oversized query consume — or on
+/// the "no results" path, entirely escape — the total output budget.
+const MAX_QUERY_ECHO_CHARS: usize = 200;
+
+/// Maximum characters of a provider-supplied error message quoted back to the
+/// model. Business-error text is as provider-controlled as result content, and
+/// it returns before the rendering caps rather than through them.
+const MAX_PROVIDER_ERROR_CHARS: usize = 500;
+
+/// Fluent key for the note appended when [`MAX_TOTAL_OUTPUT_CHARS`] forced
+/// results to be dropped or the output to be cut.
+const TRUNCATED_RESULTS_NOTE_KEY: &str = "tool-web-search-tool-note-truncated-results";
+
+/// Appended when [`MAX_TOTAL_OUTPUT_CHARS`] forced results to be dropped or
+/// the output to be cut, so the model knows the list it sees is partial.
+static TRUNCATED_RESULTS_NOTE: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(TRUNCATED_RESULTS_NOTE_KEY));
+
+/// Cap one provider-supplied body string, appending a visible `...` marker
+/// when text was dropped.
+///
+/// Truncation is by Unicode character, never by byte, so multibyte text is
+/// never split mid-codepoint.
+fn cap_result_content(text: &str) -> String {
+    truncate_with_ellipsis(text, MAX_RESULT_CONTENT_CHARS)
+}
+
+/// Cap the caller's query before it is echoed back to the model.
+fn cap_query_echo(query: &str) -> String {
+    truncate_with_ellipsis(query, MAX_QUERY_ECHO_CHARS)
+}
+
+/// Cap a provider-supplied error message before it is quoted back to the
+/// model.
+fn cap_provider_error(message: &str) -> String {
+    truncate_with_ellipsis(message, MAX_PROVIDER_ERROR_CHARS)
+}
+
+/// Header line for a rendered result list. Shared so the echoed query is
+/// bounded — and the wording stays identical — across all six providers.
+fn results_header(query: &str, provider: &str) -> String {
+    format!(
+        "Search results for: {} (via {provider})",
+        cap_query_echo(query)
+    )
+}
+
+/// The reply every provider returns when a search matched nothing.
+///
+/// One shared function rather than six copies: this path returns before
+/// [`render_results`], so it is the only place the echoed query is bounded at
+/// all, and a per-provider copy would be a per-provider chance to forget.
+fn no_results_message(query: &str) -> String {
+    format!("No results found for: {}", cap_query_echo(query))
+}
+
+/// Render a header line plus one line-block per result, bounded by
+/// [`MAX_TOTAL_OUTPUT_CHARS`].
+///
+/// Trimming happens at whole-result granularity so the model never receives a
+/// result cut off mid-field. Shared by all six provider parsers — the cap must
+/// not depend on which provider answered.
+fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
+    let mut out = header;
+    let mut used = out.chars().count();
+    let mut trimmed = false;
+
+    for (index, block) in blocks.into_iter().enumerate() {
+        let rendered = block.join("\n");
+        let cost = rendered.chars().count() + 1; // + the joining newline
+        // The first result is always emitted: a bare header is strictly less
+        // useful than one oversized result, and the hard cap below still
+        // bounds whatever that result contains.
+        if index > 0 && used + cost > MAX_TOTAL_OUTPUT_CHARS {
+            trimmed = true;
+            break;
+        }
+        out.push('\n');
+        out.push_str(&rendered);
+        used += cost;
+    }
+
+    // Only reachable when the always-emitted first result overshoots on its
+    // own (a pathological title or URL — those are not content-capped, since a
+    // truncated URL is useless for a `web_fetch` follow-up).
+    if used > MAX_TOTAL_OUTPUT_CHARS {
+        out = truncate_with_ellipsis(&out, MAX_TOTAL_OUTPUT_CHARS);
+        trimmed = true;
+    }
+
+    if trimmed {
+        out.push('\n');
+        out.push_str(TRUNCATED_RESULTS_NOTE.as_str());
+    }
+
+    out
+}
+
+// ── DuckDuckGo scrape hygiene ────────────────────────────────────────────────
+//
+// The default provider scrapes `html.duckduckgo.com`, and DuckDuckGo blocks
+// machines that look automated — which is why this module ships block
+// detection at all. Two cheap signals are worth removing: a single fixed
+// User-Agent, and a burst of back-to-back requests with no human-scale gap.
+
+/// Realistic desktop browser User-Agents, rotated per request. A single fixed
+/// UA is a trivially stable fingerprint across every ZeroClaw install.
+const DUCKDUCKGO_USER_AGENTS: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+];
+
+/// `Accept-Language` values varied alongside the User-Agent, so the header set
+/// as a whole varies rather than one field moving under a constant remainder.
+const DUCKDUCKGO_ACCEPT_LANGUAGES: &[&str] = &[
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.8",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.9,en-GB;q=0.7",
+];
+
+/// `Accept` value sent with every scrape. Static on purpose: real browsers
+/// send an essentially fixed value here, so varying it would stand out.
+const DUCKDUCKGO_ACCEPT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+
+/// The browser-shaped header set selected for one scrape request.
+struct DuckDuckGoRequestHeaders {
+    user_agent: &'static str,
+    accept_language: &'static str,
+}
+
+/// Select a header set from `entropy`. Pure and total: every input maps to a
+/// pool member, so there is no "unlucky value" that yields a ZeroClaw-branded
+/// or empty header.
+fn duckduckgo_request_headers(entropy: u64) -> DuckDuckGoRequestHeaders {
+    let ua_len = DUCKDUCKGO_USER_AGENTS.len() as u64;
+    let lang_len = DUCKDUCKGO_ACCEPT_LANGUAGES.len() as u64;
+    DuckDuckGoRequestHeaders {
+        user_agent: DUCKDUCKGO_USER_AGENTS[(entropy % ua_len) as usize],
+        // Divide out the UA index first so the language is not locked to the
+        // User-Agent in a fixed pairing.
+        accept_language: DUCKDUCKGO_ACCEPT_LANGUAGES[((entropy / ua_len) % lang_len) as usize],
+    }
+}
+
+/// Minimum randomized gap between two consecutive DuckDuckGo scrapes.
+const DUCKDUCKGO_MIN_GAP_MS: u64 = 500;
+/// Maximum randomized gap between two consecutive DuckDuckGo scrapes.
+const DUCKDUCKGO_MAX_GAP_MS: u64 = 2_000;
+
+/// Map raw entropy onto the inter-request gap, inclusive at both ends.
+fn duckduckgo_gap(entropy: u64) -> Duration {
+    let span = DUCKDUCKGO_MAX_GAP_MS - DUCKDUCKGO_MIN_GAP_MS + 1;
+    Duration::from_millis(DUCKDUCKGO_MIN_GAP_MS + entropy % span)
+}
+
+/// Non-cryptographic entropy for scrape jitter and header rotation.
+///
+/// Deliberately not `rand`: this crate does not otherwise depend on it, and
+/// the requirement here is only "not a fixed, fingerprintable pattern", not
+/// unpredictability against an adversary. A seeded xorshift64 over one atomic
+/// meets that at zero dependency cost.
+fn scrape_entropy() -> u64 {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+
+    let mut next = 0u64;
+    // `fetch_update` retries on contention, so concurrent callers advance the
+    // stream rather than reading the same value.
+    let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+        // xorshift64 requires non-zero state; `| 1` guarantees it even if the
+        // clock read fails or lands on a zero low word.
+        let mut x = if previous == 0 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+                | 1
+        } else {
+            previous
+        };
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        next = x;
+        Some(x)
+    });
+
+    next
+}
+
+/// Serializes scrape requests so concurrent searches cannot burst.
+#[derive(Default)]
+struct ScrapeThrottle {
+    /// Earliest instant at which the next scrape may start. `None` until the
+    /// first request has gone out.
+    next_allowed: tokio::sync::Mutex<Option<Instant>>,
+}
+
+impl ScrapeThrottle {
+    /// Block until this caller's turn, then reserve the following `gap`.
+    ///
+    /// The mutex is held across the sleep on purpose: that is what makes
+    /// concurrent callers queue behind one another. Releasing it before
+    /// sleeping would let every waiter observe the same `next_allowed` and
+    /// fire simultaneously — exactly the burst this exists to prevent.
+    async fn acquire(&self, gap: Duration) {
+        let mut next_allowed = self.next_allowed.lock().await;
+
+        if let Some(deadline) = *next_allowed {
+            let now = Instant::now();
+            if deadline > now {
+                tokio::time::sleep(deadline - now).await;
             }
         }
 
-        Ok(lines.join("\n"))
+        *next_allowed = Some(Instant::now() + gap);
     }
 }
+
+/// Process-global: DuckDuckGo rate-limits per source address, so the gap has
+/// to hold across every agent and tool instance in the process, not per tool.
+static DUCKDUCKGO_THROTTLE: LazyLock<ScrapeThrottle> = LazyLock::new(ScrapeThrottle::default);
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
     if let Some(index) = raw_url.find("uddg=") {
@@ -1006,7 +1279,24 @@ fn decode_ddg_redirect_url(raw_url: &str) -> String {
     raw_url.to_string()
 }
 
-const DUCKDUCKGO_BLOCK_MESSAGE: &str = "DuckDuckGo blocked the automated search request. Try configuring SearXNG, Brave, or Tavily as the web search provider.";
+/// Fluent key for the unconfigured-SearXNG guidance.
+const SEARXNG_NOT_CONFIGURED_KEY: &str = "tool-web-search-tool-error-searxng-not-configured";
+
+/// Names only surfaces that exist: no code reads a `SEARXNG_INSTANCE_URL` env
+/// var, so the env route is the generic `ZEROCLAW_<path>` override grammar
+/// (`.` -> `__`) implemented in `zeroclaw-config::env_overrides`.
+static SEARXNG_NOT_CONFIGURED_MESSAGE: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(SEARXNG_NOT_CONFIGURED_KEY));
+
+/// Fluent key for the DuckDuckGo block guidance.
+const DUCKDUCKGO_BLOCK_MESSAGE_KEY: &str = "tool-web-search-tool-error-duckduckgo-blocked";
+
+/// Addressed to the model, not to a human operator: this text is returned as a
+/// tool error and the model is the only reader. Retrying or rephrasing is the
+/// default instinct and the worst possible response — it deepens the block — so
+/// the message names the recoveries explicitly instead of describing the fault.
+static DUCKDUCKGO_BLOCK_MESSAGE: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(DUCKDUCKGO_BLOCK_MESSAGE_KEY));
 
 fn duckduckgo_block_message(
     status: reqwest::StatusCode,
@@ -1014,7 +1304,7 @@ fn duckduckgo_block_message(
     html_contains_block: bool,
 ) -> Option<&'static str> {
     if status == reqwest::StatusCode::FORBIDDEN || final_url_is_block || html_contains_block {
-        Some(DUCKDUCKGO_BLOCK_MESSAGE)
+        Some(DUCKDUCKGO_BLOCK_MESSAGE.as_str())
     } else {
         None
     }
@@ -1220,7 +1510,7 @@ mod tests {
         let message = duckduckgo_block_message(reqwest::StatusCode::FORBIDDEN, false, false)
             .expect("403 responses should be classified as a DuckDuckGo block");
 
-        assert!(message.contains("DuckDuckGo blocked"));
+        assert_eq!(message, DUCKDUCKGO_BLOCK_MESSAGE.as_str());
         assert!(message.contains("SearXNG"));
     }
 
@@ -1229,7 +1519,7 @@ mod tests {
         let message = duckduckgo_block_message(reqwest::StatusCode::OK, true, false)
             .expect("verification redirects should be classified as a DuckDuckGo block");
 
-        assert!(message.contains("DuckDuckGo blocked"));
+        assert_eq!(message, DUCKDUCKGO_BLOCK_MESSAGE.as_str());
         assert!(message.contains("SearXNG"));
     }
 
@@ -1238,7 +1528,7 @@ mod tests {
         let message = duckduckgo_block_message(reqwest::StatusCode::OK, false, true)
             .expect("verification form HTML should be classified as a DuckDuckGo block");
 
-        assert!(message.contains("DuckDuckGo blocked"));
+        assert_eq!(message, DUCKDUCKGO_BLOCK_MESSAGE.as_str());
         assert!(message.contains("SearXNG"));
     }
 
@@ -1360,7 +1650,7 @@ mod tests {
             .await
             .expect_err("403 should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1421,7 +1711,7 @@ mod tests {
             .await
             .expect_err("verification redirects should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1446,7 +1736,7 @@ mod tests {
             .await
             .expect_err("verification HTML should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1475,7 +1765,7 @@ mod tests {
             .await
             .expect_err("anomaly-modal page should be reported as a DuckDuckGo block");
 
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
+        assert!(err.to_string().contains(DUCKDUCKGO_BLOCK_MESSAGE.as_str()));
         assert!(err.to_string().contains("SearXNG"));
     }
 
@@ -1627,7 +1917,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("SearXNG instance URL not configured")
+                .contains(SEARXNG_NOT_CONFIGURED_MESSAGE.as_str())
         );
     }
 
@@ -2363,5 +2653,829 @@ mod tests {
         assert_eq!(body["count"], 5);
         assert_eq!(body["summary"], true);
         assert_eq!(body["freshness"], "noLimit");
+    }
+
+    // ── Format characterization ──────────────────────────────────────────
+    //
+    // These pin the *exact* rendered output of every provider parser for
+    // inputs that sit comfortably under both caps. They were written against
+    // the pre-cap implementation and must keep passing afterwards: capping is
+    // only allowed to change output that actually exceeds a cap.
+
+    #[test]
+    fn ddg_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let html = r#"
+            <a class="result__a" href="https://example.com/one">First Title</a>
+            <a class="result__a" href="https://example.org/two">Second Title</a>
+            <a class="result__snippet">First snippet</a>
+            <a class="result__snippet">Second snippet</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via DuckDuckGo)\n\
+             1. First Title\n   https://example.com/one\n   First snippet\n\
+             2. Second Title\n   https://example.org/two\n   Second snippet"
+        );
+    }
+
+    #[test]
+    fn brave_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("brave".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"web": {"results": [
+            {"title": "First Title", "url": "https://example.com/one", "description": "First body"},
+            {"title": "Second Title", "url": "https://example.org/two", "description": ""},
+        ]}});
+        let result = tool.parse_brave_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Brave)\n\
+             1. First Title\n   https://example.com/one\n   First body\n\
+             2. Second Title\n   https://example.org/two"
+        );
+    }
+
+    #[test]
+    fn tavily_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("tavily".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"results": [
+            {"title": "First Title", "url": "https://example.com/one", "content": "First body"},
+        ]});
+        let result = tool.parse_tavily_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Tavily)\n1. First Title\n   https://example.com/one\n   First body"
+        );
+    }
+
+    #[test]
+    fn searxng_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"results": [
+            {"title": "First Title", "url": "https://example.com/one", "content": "First body"},
+        ]});
+        let result = tool.parse_searxng_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via SearXNG)\n1. First Title\n   https://example.com/one\n   First body"
+        );
+    }
+
+    #[test]
+    fn jina_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("jina".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"data": [
+            {"title": "First Title", "url": "https://example.com/one", "content": "First body"},
+            {"title": "Second Title", "url": "https://example.org/two", "description": "Fallback body"},
+        ]});
+        let result = tool.parse_jina_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Jina AI)\n\
+             1. First Title\n   https://example.com/one\n   First body\n\
+             2. Second Title\n   https://example.org/two\n   Fallback body"
+        );
+    }
+
+    #[test]
+    fn bocha_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"code": 200, "data": {"webPages": {"value": [
+            {
+                "name": "First Title",
+                "url": "https://example.com/one",
+                "summary": "AI summary",
+                "snippet": "raw snippet",
+                "siteName": "Example Site",
+                "datePublished": "2025-01-15"
+            },
+            {"name": "Second Title", "url": "https://example.org/two", "snippet": "raw only"},
+        ]}}});
+        let result = tool.parse_bocha_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Bocha)\n\
+             1. First Title\n   https://example.com/one\n   Example Site · 2025-01-15\n   AI summary\n\
+             2. Second Title\n   https://example.org/two\n   raw only"
+        );
+    }
+
+    // ── Per-result content cap ───────────────────────────────────────────
+
+    #[test]
+    fn cap_result_content_leaves_text_at_or_under_the_cap_untouched() {
+        let exact = "x".repeat(MAX_RESULT_CONTENT_CHARS);
+        assert_eq!(cap_result_content(&exact), exact);
+
+        let under = "x".repeat(MAX_RESULT_CONTENT_CHARS - 1);
+        assert_eq!(cap_result_content(&under), under);
+
+        assert_eq!(cap_result_content(""), "");
+    }
+
+    #[test]
+    fn cap_result_content_marks_truncation_one_char_over_the_cap() {
+        let over = "x".repeat(MAX_RESULT_CONTENT_CHARS + 1);
+        let capped = cap_result_content(&over);
+
+        assert!(capped.ends_with("..."), "truncation must stay visible");
+        assert_eq!(
+            capped.chars().count(),
+            MAX_RESULT_CONTENT_CHARS + 3,
+            "cap keeps exactly {MAX_RESULT_CONTENT_CHARS} chars plus the marker"
+        );
+    }
+
+    /// The cap counts Unicode characters, so a multibyte body is never split
+    /// mid-codepoint. `é` is 2 bytes and `😀` is 4, so a byte-based cut at 500
+    /// would land inside a character for both and produce invalid UTF-8.
+    #[test]
+    fn cap_result_content_never_splits_a_multibyte_character() {
+        for filler in ["é", "猫", "😀"] {
+            let body = filler.repeat(MAX_RESULT_CONTENT_CHARS + 50);
+            let capped = cap_result_content(&body);
+
+            assert_eq!(
+                capped.chars().count(),
+                MAX_RESULT_CONTENT_CHARS + 3,
+                "char count must be the unit for {filler}"
+            );
+            assert!(capped.ends_with("..."));
+            // Every retained char must be intact — a split codepoint would
+            // have produced a replacement char or a shorter char count.
+            assert!(
+                capped.trim_end_matches('.').chars().all(|c| {
+                    let mut buf = [0u8; 4];
+                    c.encode_utf8(&mut buf) == filler
+                }),
+                "no character was mangled for {filler}"
+            );
+            // Byte length confirms the cut respected multibyte widths.
+            assert_eq!(
+                capped.len(),
+                MAX_RESULT_CONTENT_CHARS * filler.len() + 3,
+                "byte length must reflect whole characters for {filler}"
+            );
+        }
+    }
+
+    /// The cap must be applied by every provider parser — a provider that
+    /// skips it re-opens the context-flooding hole for its own users.
+    #[test]
+    fn every_provider_parser_caps_result_content() {
+        let long = "L".repeat(MAX_RESULT_CONTENT_CHARS + 400);
+        let expected = format!("{}...", "L".repeat(MAX_RESULT_CONTENT_CHARS));
+
+        let ddg = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let html = format!(
+            r#"<a class="result__a" href="https://example.com">T</a>
+               <a class="result__snippet">{long}</a>"#
+        );
+        let rendered = ddg.parse_duckduckgo_results(&html, "q").unwrap();
+        assert!(rendered.contains(&expected), "duckduckgo did not cap");
+        assert!(!rendered.contains(&long), "duckduckgo leaked full content");
+
+        let brave = WebSearchTool::new("brave".to_string(), None, None, 5, 15);
+        let rendered = brave
+            .parse_brave_results(
+                &serde_json::json!({"web": {"results": [
+                    {"title": "T", "url": "https://example.com", "description": long}
+                ]}}),
+                "q",
+            )
+            .unwrap();
+        assert!(rendered.contains(&expected), "brave did not cap");
+        assert!(!rendered.contains(&long), "brave leaked full content");
+
+        let tavily = WebSearchTool::new("tavily".to_string(), None, None, 5, 15);
+        let rendered = tavily
+            .parse_tavily_results(
+                &serde_json::json!({"results": [
+                    {"title": "T", "url": "https://example.com", "content": long}
+                ]}),
+                "q",
+            )
+            .unwrap();
+        assert!(rendered.contains(&expected), "tavily did not cap");
+        assert!(!rendered.contains(&long), "tavily leaked full content");
+
+        let searxng = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
+        let rendered = searxng
+            .parse_searxng_results(
+                &serde_json::json!({"results": [
+                    {"title": "T", "url": "https://example.com", "content": long}
+                ]}),
+                "q",
+            )
+            .unwrap();
+        assert!(rendered.contains(&expected), "searxng did not cap");
+        assert!(!rendered.contains(&long), "searxng leaked full content");
+
+        // Jina: both the primary `content` field and the `description`
+        // fallback have to go through the cap.
+        let jina = WebSearchTool::new("jina".to_string(), None, None, 5, 15);
+        let rendered = jina
+            .parse_jina_results(
+                &serde_json::json!({"data": [
+                    {"title": "T", "url": "https://example.com", "content": long},
+                    {"title": "T2", "url": "https://example.org", "description": long}
+                ]}),
+                "q",
+            )
+            .unwrap();
+        assert_eq!(
+            rendered.matches(&expected).count(),
+            2,
+            "jina must cap both the content field and the description fallback"
+        );
+        assert!(!rendered.contains(&long), "jina leaked full content");
+
+        // Bocha: both the preferred AI `summary` and the `snippet` fallback.
+        let bocha = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        let rendered = bocha
+            .parse_bocha_results(
+                &serde_json::json!({"code": 200, "data": {"webPages": {"value": [
+                    {"name": "T", "url": "https://example.com", "summary": long},
+                    {"name": "T2", "url": "https://example.org", "snippet": long}
+                ]}}}),
+                "q",
+            )
+            .unwrap();
+        assert_eq!(
+            rendered.matches(&expected).count(),
+            2,
+            "bocha must cap both the AI summary and the snippet fallback"
+        );
+        assert!(!rendered.contains(&long), "bocha leaked full content");
+    }
+
+    // ── Total output cap ─────────────────────────────────────────────────
+
+    #[test]
+    fn render_results_leaves_output_under_the_total_cap_unchanged() {
+        let rendered = render_results(
+            "header".to_string(),
+            vec![vec!["1. a".to_string()], vec!["2. b".to_string()]],
+        );
+
+        assert_eq!(rendered, "header\n1. a\n2. b");
+        assert!(!rendered.contains(TRUNCATED_RESULTS_NOTE.as_str()));
+    }
+
+    #[test]
+    fn render_results_drops_whole_results_and_notes_the_omission() {
+        // Each block is ~4000 chars, so the 16000-char budget admits four and
+        // has to drop the rest.
+        let blocks: Vec<Vec<String>> = (1..=8)
+            .map(|i| vec![format!("{i}. {}", "x".repeat(4_000))])
+            .collect();
+
+        let rendered = render_results("header".to_string(), blocks);
+
+        assert!(
+            rendered.ends_with(TRUNCATED_RESULTS_NOTE.as_str()),
+            "omission note must be the last thing the model reads"
+        );
+        assert!(
+            rendered.chars().count()
+                <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.chars().count() + 1,
+            "total output must stay within the budget plus the note"
+        );
+        assert!(rendered.contains("\n1. "), "first result must survive");
+        assert!(
+            !rendered.contains("\n8. "),
+            "overflowing results are dropped"
+        );
+        // Trimming is at whole-result granularity: any result that appears at
+        // all appears in full, never cut mid-line.
+        for i in 1..=8 {
+            let block = format!("\n{i}. {}", "x".repeat(4_000));
+            if rendered.contains(&format!("\n{i}. ")) {
+                assert!(
+                    rendered.contains(&block),
+                    "result {i} was emitted but truncated mid-result"
+                );
+            }
+        }
+    }
+
+    /// A single result can exceed the whole budget on its own, because titles
+    /// and URLs are deliberately not content-capped. The first result is still
+    /// emitted (a bare header helps nobody) but is hard-cut, and the note
+    /// survives on top of the budget.
+    #[test]
+    fn render_results_hard_caps_a_single_oversized_result() {
+        let rendered = render_results(
+            "header".to_string(),
+            vec![vec![format!(
+                "1. {}",
+                "x".repeat(MAX_TOTAL_OUTPUT_CHARS * 2)
+            )]],
+        );
+
+        assert!(rendered.ends_with(TRUNCATED_RESULTS_NOTE.as_str()));
+        assert!(rendered.starts_with("header\n1. x"));
+        assert!(
+            rendered.chars().count()
+                <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.chars().count() + 4,
+            "hard cap must bound even a single oversized result: {}",
+            rendered.chars().count()
+        );
+    }
+
+    /// End-to-end through a real parser rather than the helper alone.
+    #[test]
+    fn total_cap_applies_through_a_provider_parser() {
+        let tool = WebSearchTool::new("brave".to_string(), None, None, 10, 15);
+        let results: Vec<serde_json::Value> = (1..=10)
+            .map(|i| {
+                serde_json::json!({
+                    // Titles are not content-capped, so they are the realistic
+                    // way a provider can still blow the total budget.
+                    "title": format!("{i} {}", "T".repeat(5_000)),
+                    "url": "https://example.com",
+                    "description": "short"
+                })
+            })
+            .collect();
+
+        let rendered = tool
+            .parse_brave_results(&serde_json::json!({"web": {"results": results}}), "q")
+            .unwrap();
+
+        assert!(rendered.ends_with(TRUNCATED_RESULTS_NOTE.as_str()));
+        assert!(
+            rendered.chars().count()
+                <= MAX_TOTAL_OUTPUT_CHARS + TRUNCATED_RESULTS_NOTE.chars().count() + 4
+        );
+        assert!(rendered.contains("via Brave"), "header must survive");
+
+        // Trimming must drop whole results, not fall through to the hard-cut
+        // backstop: every title that appears at all appears in full.
+        for i in 1..=10 {
+            let title = format!("\n{i} {}", "T".repeat(5_000));
+            if rendered.contains(&format!("\n{i} ")) {
+                assert!(
+                    rendered.contains(&title),
+                    "result {i} was cut mid-title instead of being dropped whole"
+                );
+            }
+        }
+        assert!(
+            !rendered.contains("...\n"),
+            "no result should have been hard-cut: block dropping should have sufficed"
+        );
+    }
+
+    // ── Echoed-input bounds ──────────────────────────────────────────────
+
+    /// Build every provider's empty-result reply for one query.
+    fn empty_result_replies(query: &str) -> Vec<(&'static str, String)> {
+        let tool = |provider: &str| WebSearchTool::new(provider.to_string(), None, None, 5, 15);
+
+        vec![
+            (
+                "duckduckgo",
+                tool("duckduckgo")
+                    .parse_duckduckgo_results("<html><body>nothing</body></html>", query)
+                    .unwrap(),
+            ),
+            (
+                "brave",
+                tool("brave")
+                    .parse_brave_results(&serde_json::json!({"web": {"results": []}}), query)
+                    .unwrap(),
+            ),
+            (
+                "tavily",
+                tool("tavily")
+                    .parse_tavily_results(&serde_json::json!({"results": []}), query)
+                    .unwrap(),
+            ),
+            (
+                "searxng",
+                tool("searxng")
+                    .parse_searxng_results(&serde_json::json!({"results": []}), query)
+                    .unwrap(),
+            ),
+            (
+                "jina",
+                tool("jina")
+                    .parse_jina_results(&serde_json::json!({"data": []}), query)
+                    .unwrap(),
+            ),
+            (
+                "bocha",
+                tool("bocha")
+                    .parse_bocha_results(
+                        &serde_json::json!({"code": 200, "data": {"webPages": {"value": []}}}),
+                        query,
+                    )
+                    .unwrap(),
+            ),
+        ]
+    }
+
+    /// The empty-result reply echoes the caller's query, which is
+    /// model-controlled and unbounded. It returns before `render_results`, so
+    /// nothing else bounds it: without its own cap a huge query walks straight
+    /// past the advertised total cap on every provider.
+    #[test]
+    fn empty_result_replies_bound_the_echoed_query() {
+        // Multibyte on purpose: the cut must count characters, not bytes.
+        let query = "漢".repeat(MAX_QUERY_ECHO_CHARS + 5_000);
+        let prefix_chars = "No results found for: ".chars().count();
+
+        for (provider, rendered) in empty_result_replies(&query) {
+            assert!(
+                !rendered.contains(&query),
+                "{provider} echoed the whole query"
+            );
+            assert!(
+                rendered.chars().count() <= prefix_chars + MAX_QUERY_ECHO_CHARS + 3,
+                "{provider} exceeded the query-echo budget: {} chars",
+                rendered.chars().count()
+            );
+            assert_eq!(
+                rendered.chars().filter(|c| *c == '漢').count(),
+                MAX_QUERY_ECHO_CHARS,
+                "{provider} must keep whole characters up to the cap"
+            );
+            assert!(
+                !rendered.contains('\u{FFFD}'),
+                "{provider} split a codepoint"
+            );
+        }
+    }
+
+    /// A short query must still round-trip verbatim: the bound may only touch
+    /// output that actually exceeds it.
+    #[test]
+    fn empty_result_replies_leave_short_queries_verbatim() {
+        for (provider, rendered) in empty_result_replies("rust ownership") {
+            assert_eq!(
+                rendered, "No results found for: rust ownership",
+                "{provider} changed the reply for an under-cap query"
+            );
+        }
+    }
+
+    /// The success path echoes the query in its header too. `render_results`
+    /// keeps the total cap by hard-cutting the whole output, so an oversized
+    /// query technically stays inside the budget — but it does so by evicting
+    /// every result. Bounding the echo keeps the results.
+    #[test]
+    fn rendered_header_bounds_the_echoed_query() {
+        let query = "漢".repeat(MAX_QUERY_ECHO_CHARS + 5_000);
+        let tool = WebSearchTool::new("brave".to_string(), None, None, 5, 15);
+
+        let rendered = tool
+            .parse_brave_results(
+                &serde_json::json!({"web": {"results": [
+                    {"title": "T", "url": "https://example.com", "description": "short"}
+                ]}}),
+                &query,
+            )
+            .unwrap();
+
+        assert!(!rendered.contains(&query), "header echoed the whole query");
+        assert_eq!(
+            rendered.chars().filter(|c| *c == '漢').count(),
+            MAX_QUERY_ECHO_CHARS
+        );
+        assert!(
+            rendered.contains("1. T"),
+            "the query echo must not crowd out the results: {rendered}"
+        );
+        assert!(!rendered.contains(TRUNCATED_RESULTS_NOTE.as_str()));
+    }
+
+    /// Bocha reports business failures as a 200 with a non-200 `code` and a
+    /// provider-controlled `msg`. That message returns before the capped
+    /// success path, so it needs its own bound.
+    #[test]
+    fn bocha_business_error_bounds_the_provider_message() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+        // Multibyte on purpose, same reason as the query echo.
+        let msg = "é".repeat(MAX_PROVIDER_ERROR_CHARS + 20_000);
+        let prefix_chars = "Bocha AI search returned error (code 403): "
+            .chars()
+            .count();
+
+        let err = tool
+            .parse_bocha_results(&serde_json::json!({"code": 403, "msg": msg}), "q")
+            .expect_err("a non-200 code must be reported as an error")
+            .to_string();
+
+        assert!(
+            err.contains("code 403"),
+            "error semantics must be preserved: {err}"
+        );
+        assert!(!err.contains(&msg), "the whole provider message leaked");
+        assert!(
+            err.chars().count() <= prefix_chars + MAX_PROVIDER_ERROR_CHARS + 3,
+            "provider error exceeded its budget: {} chars",
+            err.chars().count()
+        );
+        assert_eq!(
+            err.chars().filter(|c| *c == 'é').count(),
+            MAX_PROVIDER_ERROR_CHARS,
+            "must keep whole characters up to the cap"
+        );
+        assert!(!err.contains('\u{FFFD}'), "split a codepoint");
+    }
+
+    /// A short provider message must survive verbatim.
+    #[test]
+    fn bocha_business_error_leaves_short_messages_verbatim() {
+        let tool = WebSearchTool::new("bocha".to_string(), None, None, 5, 15);
+
+        let err = tool
+            .parse_bocha_results(
+                &serde_json::json!({"code": 401, "msg": "invalid api key"}),
+                "q",
+            )
+            .expect_err("a non-200 code must be reported as an error")
+            .to_string();
+
+        assert_eq!(
+            err,
+            "Bocha AI search returned error (code 401): invalid api key"
+        );
+    }
+
+    // ── Message texts ────────────────────────────────────────────────────
+
+    /// Runtime tool text is contractually Fluent-backed, not inline literals.
+    /// Pin each message to its key: a key that is missing from the catalog
+    /// resolves to the `{key}` placeholder, so an unregistered key fails here
+    /// instead of shipping a brace-wrapped identifier to the model.
+    #[test]
+    fn user_facing_strings_resolve_through_the_tool_catalog() {
+        for (key, resolved) in [
+            (
+                DUCKDUCKGO_BLOCK_MESSAGE_KEY,
+                DUCKDUCKGO_BLOCK_MESSAGE.as_str(),
+            ),
+            (
+                SEARXNG_NOT_CONFIGURED_KEY,
+                SEARXNG_NOT_CONFIGURED_MESSAGE.as_str(),
+            ),
+            (TRUNCATED_RESULTS_NOTE_KEY, TRUNCATED_RESULTS_NOTE.as_str()),
+        ] {
+            let catalog = crate::i18n::get_required_tool_string(key);
+            assert_ne!(
+                catalog,
+                format!("{{{key}}}"),
+                "{key} is missing from the tool Fluent catalog"
+            );
+            assert!(!catalog.is_empty(), "{key} resolved to an empty string");
+            assert_eq!(
+                resolved, catalog,
+                "{key} must be read from the catalog, not inlined"
+            );
+        }
+    }
+
+    /// The block message is read by the model, not a human. It must forbid the
+    /// retry-and-rephrase reflex (which deepens the block) and name concrete
+    /// recoveries.
+    #[test]
+    fn duckduckgo_block_message_instructs_the_model() {
+        let message = DUCKDUCKGO_BLOCK_MESSAGE.as_str();
+
+        assert!(message.contains("rate-limiting"));
+        assert!(
+            message.contains("Do not retry or rephrase"),
+            "must forbid the retry reflex: {message}"
+        );
+        assert!(message.contains("web_fetch"), "must name the fallback tool");
+        for provider in ["SearXNG", "Brave", "Tavily"] {
+            assert!(message.contains(provider), "must name {provider}");
+        }
+        // The stale phrasing described the fault instead of the recovery.
+        assert!(!message.contains("DuckDuckGo blocked the automated search request"));
+    }
+
+    /// Regression: the old text pointed at a `SEARXNG_INSTANCE_URL` env var
+    /// that no code has ever read. The real surfaces are the config key and
+    /// the generic `ZEROCLAW_<path>` override grammar.
+    #[test]
+    fn searxng_missing_url_message_names_only_real_surfaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+
+        let tool = WebSearchTool::new_with_config(
+            "searxng".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            false,
+        );
+
+        let message = tool
+            .resolve_searxng_instance_url()
+            .expect_err("missing URL must error")
+            .to_string();
+
+        assert!(message.contains("[web_search] searxng_instance_url"));
+        assert!(message.contains("ZEROCLAW_web_search__searxng_instance_url"));
+        assert!(
+            !message.contains("SEARXNG_INSTANCE_URL environment variable"),
+            "must not advertise an env var nothing reads: {message}"
+        );
+    }
+
+    // ── DuckDuckGo scrape hygiene ────────────────────────────────────────
+
+    #[test]
+    fn duckduckgo_headers_are_always_drawn_from_the_pools() {
+        // Sweep the interesting arithmetic edges plus a spread of values.
+        let probes = [0u64, 1, 5, 6, 7, 23, 24, u64::MAX, u64::MAX - 1, 1 << 63];
+        for entropy in probes {
+            let headers = duckduckgo_request_headers(entropy);
+            assert!(
+                DUCKDUCKGO_USER_AGENTS.contains(&headers.user_agent),
+                "entropy {entropy} produced an off-pool UA"
+            );
+            assert!(
+                DUCKDUCKGO_ACCEPT_LANGUAGES.contains(&headers.accept_language),
+                "entropy {entropy} produced an off-pool language"
+            );
+        }
+    }
+
+    #[test]
+    fn duckduckgo_user_agents_look_like_browsers_not_zeroclaw() {
+        assert!(
+            DUCKDUCKGO_USER_AGENTS.len() > 1,
+            "a one-entry pool is not a rotation"
+        );
+        for ua in DUCKDUCKGO_USER_AGENTS {
+            assert!(ua.starts_with("Mozilla/5.0"), "not browser-shaped: {ua}");
+            assert!(
+                !ua.contains("ZeroClaw"),
+                "self-identifying UA defeats the purpose: {ua}"
+            );
+        }
+    }
+
+    #[test]
+    fn duckduckgo_headers_actually_rotate_across_the_pools() {
+        let uas: std::collections::HashSet<_> = (0..64)
+            .map(|e| duckduckgo_request_headers(e).user_agent)
+            .collect();
+        let langs: std::collections::HashSet<_> = (0..64)
+            .map(|e| duckduckgo_request_headers(e).accept_language)
+            .collect();
+
+        assert_eq!(uas.len(), DUCKDUCKGO_USER_AGENTS.len(), "UA pool unused");
+        assert_eq!(
+            langs.len(),
+            DUCKDUCKGO_ACCEPT_LANGUAGES.len(),
+            "language pool unused"
+        );
+    }
+
+    #[test]
+    fn duckduckgo_gap_stays_inside_the_configured_window() {
+        let probes = [0u64, 1, 500, 1_500, 1_501, u64::MAX, u64::MAX - 1];
+        for entropy in probes {
+            let gap = duckduckgo_gap(entropy).as_millis() as u64;
+            assert!(
+                (DUCKDUCKGO_MIN_GAP_MS..=DUCKDUCKGO_MAX_GAP_MS).contains(&gap),
+                "entropy {entropy} produced an out-of-window gap of {gap}ms"
+            );
+        }
+
+        // Both ends of the window are reachable, so the gap is a real range
+        // rather than a constant with decoration.
+        assert_eq!(duckduckgo_gap(0).as_millis() as u64, DUCKDUCKGO_MIN_GAP_MS);
+        assert_eq!(
+            duckduckgo_gap(DUCKDUCKGO_MAX_GAP_MS - DUCKDUCKGO_MIN_GAP_MS).as_millis() as u64,
+            DUCKDUCKGO_MAX_GAP_MS
+        );
+    }
+
+    #[test]
+    fn scrape_entropy_varies_between_calls() {
+        let values: std::collections::HashSet<u64> = (0..32).map(|_| scrape_entropy()).collect();
+        assert!(
+            values.len() > 24,
+            "entropy stream is too repetitive: {} distinct of 32",
+            values.len()
+        );
+        assert!(!values.contains(&0), "xorshift must never latch to zero");
+    }
+
+    /// The throttle is exercised with a short gap rather than the production
+    /// 500-2000ms window: the property under test is "the second caller waits
+    /// for the reserved gap", which does not depend on its size.
+    #[tokio::test]
+    async fn throttle_makes_the_next_scrape_wait_for_the_reserved_gap() {
+        let throttle = ScrapeThrottle::default();
+        let gap = Duration::from_millis(60);
+
+        let started = Instant::now();
+        throttle.acquire(gap).await;
+        assert!(
+            started.elapsed() < gap,
+            "the first scrape must not be delayed"
+        );
+
+        throttle.acquire(gap).await;
+        assert!(
+            started.elapsed() >= gap,
+            "the second scrape must wait out the reserved gap, waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Concurrent searches must queue rather than all reading the same
+    /// `next_allowed` and firing together — that burst is precisely what gets
+    /// the machine blocked.
+    #[tokio::test]
+    async fn throttle_serializes_concurrent_scrapes() {
+        let throttle = std::sync::Arc::new(ScrapeThrottle::default());
+        let gap = Duration::from_millis(50);
+
+        let started = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let throttle = throttle.clone();
+            handles.push(zeroclaw_spawn::spawn!(async move {
+                throttle.acquire(gap).await;
+                started.elapsed()
+            }));
+        }
+
+        let mut finishes = Vec::new();
+        for handle in handles {
+            finishes.push(handle.await.unwrap());
+        }
+        finishes.sort();
+
+        // Three callers, one immediate and two gapped: the last one cannot
+        // have been released before two full gaps elapsed.
+        assert!(
+            finishes[2] >= gap * 2,
+            "concurrent scrapes burst through the throttle: {finishes:?}"
+        );
+    }
+
+    /// The scrape request itself must carry browser-shaped headers, not just
+    /// the pools existing in isolation.
+    #[tokio::test]
+    async fn duckduckgo_request_sends_browser_shaped_headers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        tool.search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
+            .await
+            .expect("mock should answer");
+
+        let recorded = server.received_requests().await.expect("captured request");
+        assert_eq!(recorded.len(), 1);
+        let headers = &recorded[0].headers;
+
+        let user_agent = headers
+            .get("user-agent")
+            .expect("a User-Agent must be sent")
+            .to_str()
+            .unwrap();
+        assert!(
+            DUCKDUCKGO_USER_AGENTS.contains(&user_agent),
+            "UA must come from the rotation pool, got: {user_agent}"
+        );
+
+        let language = headers
+            .get("accept-language")
+            .expect("Accept-Language must be sent")
+            .to_str()
+            .unwrap();
+        assert!(
+            DUCKDUCKGO_ACCEPT_LANGUAGES.contains(&language),
+            "Accept-Language must come from the pool, got: {language}"
+        );
+
+        assert_eq!(headers.get("dnt").expect("DNT must be sent"), "1");
+        assert_eq!(
+            headers.get("accept").expect("Accept must be sent"),
+            DUCKDUCKGO_ACCEPT
+        );
     }
 }

@@ -150,7 +150,7 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
-    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
+    /// Inbound HTTP request. Live: gateway `/sop/*` and SOP-first `/webhook` routes.
     #[trigger(display = "path")]
     Webhook {
         /// Request path matched exactly against the event path.
@@ -694,6 +694,10 @@ pub struct SopEvent {
 pub enum SopRunStatus {
     Pending,
     Running,
+    /// An operator requested cancellation while work was in flight. The run
+    /// remains active and keeps its admission claim until the driver reaches
+    /// the next supported step boundary.
+    CancelRequested,
     WaitingApproval,
     /// Paused at a checkpoint in a deterministic workflow.
     PausedCheckpoint,
@@ -707,6 +711,7 @@ impl fmt::Display for SopRunStatus {
         match self {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
+            Self::CancelRequested => write!(f, "cancel_requested"),
             Self::WaitingApproval => write!(f, "waiting_approval"),
             Self::PausedCheckpoint => write!(f, "paused_checkpoint"),
             Self::Completed => write!(f, "completed"),
@@ -795,6 +800,12 @@ pub struct SopRun {
     pub total_steps: u32,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// Why this run reached a `Failed` terminal state, captured at the
+    /// transition that failed it. `None` while the run is live and for runs
+    /// that ended any other way. Serialized only when present, so runs
+    /// persisted before this field existed round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     pub step_results: Vec<SopStepResult>,
     /// ISO-8601 timestamp when the run entered WaitingApproval (for timeout tracking).
     #[serde(default)]
@@ -948,7 +959,9 @@ pub enum SopRunAction {
         step: SopStep,
         state_file: PathBuf,
     },
-    /// Routing selected a step whose dependencies are not yet satisfied.
+    /// No immediate execution is available. This covers dependency waits and
+    /// fail-closed lifecycle retries where the canonical run remains active
+    /// until persistence or maintenance reconciles it.
     Pending {
         run_id: String,
         sop_name: String,
@@ -957,6 +970,8 @@ pub enum SopRunAction {
     },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
+    /// The SOP run stopped at an operator-requested safe boundary.
+    Cancelled { run_id: String, sop_name: String },
     /// The SOP run failed.
     Failed {
         run_id: String,
@@ -1420,6 +1435,7 @@ path = "/sop/test"
             total_steps: 5,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,

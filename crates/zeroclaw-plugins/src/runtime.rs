@@ -5,13 +5,13 @@ use crate::PluginCapability;
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{
-    PluginState, PluginStoreSpec, call_plugin, call_store, call_tool_execute, engine,
-    load_component, wt, wt_instantiate,
+    PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_store, call_tool_execute,
+    engine, load_component, wt, wt_instantiate,
 };
-use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::services::PluginHostServices;
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
@@ -29,7 +29,7 @@ pub struct ToolMetadata {
 
 /// A warm tool plugin: store and bindings created once, reused per call.
 pub struct Plugin {
-    state: Arc<Mutex<(Store<PluginState>, ToolPlugin)>>,
+    state: Arc<Mutex<WarmPluginState<ToolPlugin>>>,
 }
 
 fn base_linker() -> Result<Linker<PluginState>> {
@@ -73,15 +73,33 @@ fn tool_linker_http() -> &'static Linker<PluginState> {
 /// prevents authority from drifting between instantiation and execution. The
 /// required service bundle resolves canonical live config for that same scope.
 pub async fn create_plugin(
-    component: &AdmittedComponent,
+    wasm_path: &Path,
     scope: &PluginInstanceScope,
     services: &PluginHostServices,
     limits: crate::component::PluginLimits,
 ) -> Result<Plugin> {
+    create_plugin_with_egress(wasm_path, scope, services, limits, None).await
+}
+
+/// [`create_plugin`], plus the host-owned egress authority for this instance.
+///
+/// `egress: None` is deny-by-default: the store still links `wasi:http` when the
+/// scope grants `HttpClient`, but every outbound request is refused. The service
+/// resolves policy per request rather than snapshotting it, so an operator's
+/// edit applies to the next dial.
+pub async fn create_plugin_with_egress(
+    wasm_path: &Path,
+    scope: &PluginInstanceScope,
+    services: &PluginHostServices,
+    limits: crate::component::PluginLimits,
+    egress: Option<crate::egress::EgressHostService>,
+) -> Result<Plugin> {
     scope.require_capability(PluginCapability::Tool)?;
-    let component = load_component(component)?;
+    let component = load_component(wasm_path)?;
     let mut store = crate::component::new_store(
-        PluginStoreSpec::new(scope.clone(), services.clone(), limits).with_granted_http(),
+        PluginStoreSpec::new(scope.clone(), services.clone(), limits)
+            .with_granted_http()
+            .with_egress_policy(egress),
     );
     let http = store.data().http_enabled();
     let linker = if http {
@@ -90,41 +108,59 @@ pub async fn create_plugin(
         tool_linker()
     };
     crate::component::ensure_http_coherent(&store, http)?;
-    let bindings: Result<_> = call_store!(store, async |store: &mut Store<PluginState>| {
+    let bindings = call_store!(store, async move |store: &mut Store<PluginState>| {
         wt_instantiate(
             ToolPlugin::instantiate_async(store, &component, linker).await,
             "failed to instantiate tool plugin",
         )
-    });
+    })?;
     Ok(Plugin {
-        state: Arc::new(Mutex::new((store, bindings?))),
+        state: Arc::new(Mutex::new(Some((store, bindings)))),
     })
 }
 
 /// Read the exported tool's metadata.
 pub async fn call_tool_metadata(plugin: &mut Plugin) -> Result<ToolMetadata> {
-    call_plugin!(
+    let name = call_plugin!(
         plugin,
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
-            let tool = bindings.zeroclaw_plugin_tool();
-            let name = wt(tool.call_name(&mut *store).await, "tool.name failed")?;
-            let description = wt(
-                tool.call_description(&mut *store).await,
-                "tool.description failed",
-            )?;
-            let schema_json = wt(
-                tool.call_parameters_schema(&mut *store).await,
-                "tool.parameters-schema failed",
-            )?;
-            let parameters_schema = serde_json::from_str(&schema_json)
-                .context("tool parameters-schema is not valid JSON")?;
-            Ok(ToolMetadata {
-                name,
-                description,
-                parameters_schema,
-            })
+            wt(
+                bindings.zeroclaw_plugin_tool().call_name(store).await,
+                "tool.name failed",
+            )
         }
-    )
+    )?;
+    let description = call_plugin!(
+        plugin,
+        async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_tool()
+                    .call_description(store)
+                    .await,
+                "tool.description failed",
+            )
+        }
+    )?;
+    let schema_json = call_plugin!(
+        plugin,
+        async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
+            wt(
+                bindings
+                    .zeroclaw_plugin_tool()
+                    .call_parameters_schema(store)
+                    .await,
+                "tool.parameters-schema failed",
+            )
+        }
+    )?;
+    let parameters_schema =
+        serde_json::from_str(&schema_json).context("tool parameters-schema is not valid JSON")?;
+    Ok(ToolMetadata {
+        name,
+        description,
+        parameters_schema,
+    })
 }
 
 /// Invoke the exported tool's `execute`, injecting its non-secret resolved config.
@@ -234,9 +270,8 @@ mod tests {
     #[tokio::test]
     async fn create_plugin_rejects_a_scope_for_another_capability() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
-        let component = AdmittedComponent::test_component(b"not-a-component");
         let result = create_plugin(
-            &component,
+            Path::new("/path/that/must/not-be-read.wasm"),
             &scope,
             &crate::services::test_host_services(),
             crate::component::test_limits(0),

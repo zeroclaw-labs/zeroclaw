@@ -800,6 +800,7 @@ mod tests {
             | SopRunAction::CheckpointWait { run_id, .. }
             | SopRunAction::Pending { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
+            | SopRunAction::Cancelled { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
         }
     }

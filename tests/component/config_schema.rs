@@ -189,6 +189,7 @@ fn gateway_config_toml_roundtrip() {
         host: "0.0.0.0".into(),
         require_pairing: false,
         pair_rate_limit_per_minute: 5,
+        webhook_secret: Some("synthetic-gateway-secret".into()),
         path_prefix: Some("/zeroclaw".into()),
         ..Default::default()
     };
@@ -200,6 +201,10 @@ fn gateway_config_toml_roundtrip() {
     assert_eq!(parsed.host, "0.0.0.0");
     assert!(!parsed.require_pairing);
     assert_eq!(parsed.pair_rate_limit_per_minute, 5);
+    assert_eq!(
+        parsed.webhook_secret.as_deref(),
+        Some("synthetic-gateway-secret")
+    );
     assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
 }
 

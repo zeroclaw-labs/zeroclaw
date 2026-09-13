@@ -71,7 +71,18 @@ For the shell tool specifically: if `allowed_commands` is non-empty, it's strict
 
 ## Path rules
 
-`workspace_only = true` restricts reads and writes to `<workspace>/**`. `forbidden_paths` always blocks regardless of workspace setting (covers the cases where `workspace_only` is off).
+`workspace_only = true` restricts reads and writes to `<workspace>/**`, plus any
+configured `allowed_roots` for the requested access mode. Absolute workspace,
+allow-root, and `forbidden_paths` entries use path-component prefixes. When
+more than one entry matches, the most specific prefix wins; a forbidden entry
+wins an equal-depth tie. A forbidden subtree can therefore block part of the
+workspace or an allowed root, while a narrow operator allow can remain usable
+beneath a broad default forbidden root such as `/home` or `/tmp`.
+
+Resolved file checks compare all matching entries after resolving filesystem
+aliases, so spelling a forbidden subtree through a symlink does not bypass the
+deny. These are absolute-prefix rules: they do not provide glob matching or
+workspace-relative ignore-pattern semantics.
 
 ## Sandbox
 

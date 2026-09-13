@@ -2,13 +2,13 @@
 
 use crate::PluginCapability;
 use crate::component::PluginLimits;
-use crate::host::AdmittedComponent;
 use crate::instance::PluginInstanceScope;
 use crate::runtime;
 use crate::services::PluginHostServices;
 use async_trait::async_trait;
 use serde_json::Value;
-use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use std::path::PathBuf;
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// A tool backed by a WASM plugin function.
@@ -16,15 +16,21 @@ pub struct WasmTool {
     name: String,
     description: String,
     parameters_schema: Value,
-    component: AdmittedComponent,
+    wasm_path: PathBuf,
     scope: PluginInstanceScope,
     services: PluginHostServices,
     limits: PluginLimits,
+    /// Host-owned egress authority for this instance. `None` is
+    /// deny-by-default: the store still links `wasi:http` when the scope grants
+    /// `HttpClient`, but every outbound request is refused. Held as the shared
+    /// service rather than a resolved allowlist so an operator's config edit
+    /// applies on the next request without rebuilding the tool.
+    egress: Option<crate::egress::EgressHostService>,
 }
 
 impl Attributable for WasmTool {
     fn role(&self) -> Role {
-        Role::Tool(ToolKind::Plugin)
+        Role::Tool(ToolKind::WasmPlugin)
     }
 
     fn alias(&self) -> &str {
@@ -34,6 +40,10 @@ impl Attributable for WasmTool {
         // component logging under distinct plugin attributes.
         &self.name
     }
+
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
+    }
 }
 
 impl WasmTool {
@@ -42,7 +52,7 @@ impl WasmTool {
         name: String,
         description: String,
         parameters_schema: Value,
-        component: AdmittedComponent,
+        wasm_path: PathBuf,
         scope: PluginInstanceScope,
         services: PluginHostServices,
         limits: PluginLimits,
@@ -53,11 +63,22 @@ impl WasmTool {
             name,
             description,
             parameters_schema,
-            component,
+            wasm_path,
             scope,
             services,
             limits,
+            egress: None,
         })
+    }
+
+    /// Attach the host's egress authority for this instance.
+    ///
+    /// Omitting this is safe by construction — the tool then has no network
+    /// reach — which is why it is a builder rather than a required argument.
+    #[must_use]
+    pub fn with_egress_policy(mut self, egress: Option<crate::egress::EgressHostService>) -> Self {
+        self.egress = egress;
+        self
     }
 
     /// Create a `WasmTool` by loading its required metadata exports.
@@ -66,20 +87,27 @@ impl WasmTool {
     /// instead of being registered with synthetic metadata. `services` must
     /// resolve canonical live config under the supplied instance scope.
     pub fn from_wasm(
-        component: AdmittedComponent,
+        wasm_path: PathBuf,
         scope: PluginInstanceScope,
         services: PluginHostServices,
         limits: PluginLimits,
+        egress: Option<crate::egress::EgressHostService>,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
         services.resolve_config(&scope)?;
         let probe = {
-            let component = component.clone();
+            let wasm_path = wasm_path.clone();
             let scope = scope.clone();
             let services = services.clone();
+            // The metadata probe instantiates the guest, so it runs under the
+            // same authority the tool will execute under — a component cannot
+            // use its `name()` export as an unpoliced egress window.
+            let egress = egress.clone();
             block_probe(async move {
-                let mut plugin =
-                    runtime::create_plugin(&component, &scope, &services, limits).await?;
+                let mut plugin = runtime::create_plugin_with_egress(
+                    &wasm_path, &scope, &services, limits, egress,
+                )
+                .await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -89,10 +117,11 @@ impl WasmTool {
             name: meta.name,
             description: meta.description,
             parameters_schema: meta.parameters_schema,
-            component,
+            wasm_path,
             scope,
             services,
             limits,
+            egress,
         })
     }
 }
@@ -135,9 +164,16 @@ impl Tool for WasmTool {
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
         self.services.resolve_config(&self.scope)?;
-        let mut plugin =
-            runtime::create_plugin(&self.component, &self.scope, &self.services, self.limits)
-                .await?;
+        // The authority handle travels to the fresh store; the *decision* is not
+        // read here. It is read inside the hooks, per request.
+        let mut plugin = runtime::create_plugin_with_egress(
+            &self.wasm_path,
+            &self.scope,
+            &self.services,
+            self.limits,
+            self.egress.clone(),
+        )
+        .await?;
         runtime::call_execute(&mut plugin, &args_json).await
     }
 }
@@ -150,13 +186,10 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
     fn tool_scope() -> PluginInstanceScope {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
-    }
-
-    fn component() -> AdmittedComponent {
-        AdmittedComponent::test_component(b"not-a-component")
     }
 
     #[test]
@@ -166,7 +199,7 @@ mod tests {
             "redact".to_string(),
             "does things".to_string(),
             schema.clone(),
-            component(),
+            PathBuf::from("/tmp/plugin.wasm"),
             tool_scope(),
             crate::services::test_host_services(),
             crate::component::test_limits(1_000),
@@ -175,6 +208,7 @@ mod tests {
         assert_eq!(tool.name(), "redact");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.role(), Role::Tool(ToolKind::WasmPlugin));
         assert_eq!(tool.alias(), "redact");
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
@@ -188,7 +222,7 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            component(),
+            PathBuf::from("/tmp/plugin.wasm"),
             scope,
             crate::services::test_host_services(),
             crate::component::test_limits(0),
@@ -208,7 +242,7 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            component(),
+            PathBuf::from("/tmp/plugin.wasm"),
             tool_scope(),
             services,
             crate::component::test_limits(0),
@@ -218,12 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn from_wasm_rejects_invalid_component_bytes() {
+    fn from_wasm_rejects_a_missing_component() {
         let result = WasmTool::from_wasm(
-            component(),
+            PathBuf::from("/path/that/must/not/exist.wasm"),
             tool_scope(),
             crate::services::test_host_services(),
             crate::component::test_limits(0),
+            None,
         );
 
         assert!(result.is_err());
@@ -237,10 +272,11 @@ mod tests {
             ))
         }));
         let error = WasmTool::from_wasm(
-            component(),
+            PathBuf::from("/path/that/must/not/exist.wasm"),
             tool_scope(),
             services,
             crate::component::test_limits(0),
+            None,
         )
         .err()
         .expect("invalid config must reject registration");
@@ -264,7 +300,7 @@ mod tests {
             "my_tool".to_string(),
             "does things".to_string(),
             serde_json::json!({}),
-            component(),
+            PathBuf::from("/path/that/must/not/exist.wasm"),
             tool_scope(),
             services,
             crate::component::test_limits(0),

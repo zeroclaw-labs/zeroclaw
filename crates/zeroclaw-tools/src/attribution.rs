@@ -3,7 +3,7 @@
 //! the tool's `name()` as its alias so log emissions can attribute
 //! tool activity with the same `<kind>.<alias>` composite the rest of
 
-use zeroclaw_api::attribution::ToolKind;
+use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
 use crate::ask_user::AskUserTool;
@@ -111,7 +111,7 @@ tool_attribution!(JiraTool, ToolKind::Plugin);
 tool_attribution!(KnowledgeTool, ToolKind::Plugin);
 tool_attribution!(LinkedInTool, ToolKind::Plugin);
 tool_attribution!(LlmTaskTool, ToolKind::Plugin);
-tool_attribution!(McpToolWrapper, ToolKind::Plugin);
+tool_attribution!(McpToolWrapper, ToolKind::Plugin, ToolProvenance::Extension);
 tool_attribution!(MemoryExportTool, ToolKind::Memory);
 tool_attribution!(MemoryForgetTool, ToolKind::Memory);
 tool_attribution!(MemoryPurgeTool, ToolKind::Memory);
@@ -148,12 +148,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::calculator::CalculatorTool;
-    use zeroclaw_api::attribution::{Attributable, Role};
+    use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
 
     #[test]
     fn macro_sets_role_to_tool_kind() {
         let tool = CalculatorTool;
         assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Native);
         assert_eq!(tool.alias(), "calculator");
     }
 
@@ -163,6 +164,27 @@ mod tests {
         let arc: Arc<CalculatorTool> = Arc::new(inner);
         assert_eq!(arc.alias(), "calculator");
         assert_eq!(arc.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(arc.tool_provenance(), ToolProvenance::Native);
+    }
+
+    #[test]
+    fn mcp_wrapper_is_an_extension_even_when_its_role_is_plugin() {
+        let registry = tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(crate::mcp_client::McpRegistry::connect_all(&[]))
+            .expect("empty registry");
+        let tool = McpToolWrapper::new(
+            "mcp__shell".to_string(),
+            crate::mcp_protocol::McpToolDef {
+                name: "shell".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            Arc::new(registry),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        );
+        assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]

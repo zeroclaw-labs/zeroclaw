@@ -12,8 +12,10 @@ pub mod install_sh;
 pub mod packaging;
 pub mod runtime_locales;
 pub mod setup_bat;
+pub mod sop_syntax;
 pub mod spec;
 pub mod tools_ftl;
+pub mod zerocode_themes;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
@@ -104,6 +106,14 @@ fn registry() -> Vec<Surface> {
             file: "Dockerfile.alpine",
             render: |root, cur| render_docker_arg(root, cur),
         },
+        // Base-image pins only: the relay builds `-p zerorelay` with no feature
+        // selection, so it carries no `docker-features-arg` zone and must not go
+        // through `render_docker_arg`.
+        Surface {
+            name: "dockerfile-zerorelay",
+            file: "apps/zerorelay/Dockerfile",
+            render: |root, cur| container_base::splice_zones(root, cur),
+        },
         Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
@@ -128,6 +138,11 @@ fn registry() -> Vec<Surface> {
             name: "docker-tags",
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
+        },
+        Surface {
+            name: "zerocode-themes",
+            file: "apps/zerocode/src/generated_themes.rs",
+            render: zerocode_themes::render_file,
         },
     ]
 }

@@ -99,28 +99,6 @@ pub(crate) fn tab_click_index(
     None
 }
 
-pub(crate) fn mode_bar_click(
-    mouse_col: u16,
-    mouse_row: u16,
-    bar_area: Rect,
-    labels: &[(&str, &str)],
-) -> Option<u8> {
-    if !in_rect(mouse_col, mouse_row, bar_area) {
-        return None;
-    }
-    let mut x = bar_area.x as usize;
-    for (i, (key, label)) in labels.iter().enumerate() {
-        let w = crate::display_width::display_width(key)
-            + crate::display_width::display_width(label)
-            + 1; // +1 for trailing " "
-        if (mouse_col as usize) >= x && (mouse_col as usize) < x + w {
-            return Some((i + 1) as u8);
-        }
-        x += w;
-    }
-    None
-}
-
 // ── Double-click tracker ─────────────────────────────────────────
 
 const DOUBLE_CLICK_MS: u128 = 400;
@@ -208,7 +186,7 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{help_hint_click, mode_bar_click, tab_click_index};
+    use super::{help_hint_click, tab_click_index};
     use ratatui::layout::Rect;
 
     fn bar(width: u16) -> Rect {
@@ -244,21 +222,6 @@ mod tests {
         assert_eq!(tab_click_index(0, 0, bar(20), &labels, 3), Some(0));
         assert_eq!(tab_click_index(7, 0, bar(20), &labels, 3), Some(1));
         assert_eq!(tab_click_index(5, 0, bar(20), &labels, 3), None);
-    }
-
-    // Regression: mode bar hit-testing must use display columns too. Each
-    // entry is `key` + `label` + a trailing space.
-    #[test]
-    fn mode_bar_click_uses_display_width_for_cjk() {
-        // entry0: key "" + label " 仪表板 " (3 CJK = 6 cols + 2 spaces = 8) + 1
-        //         trailing space = 9 cols -> covers 0..9.
-        // entry1: key "" + label " 聊天 " (2 CJK = 4 + 2 spaces = 6) + 1 = 7
-        //         cols -> covers 9..16.
-        let labels = [("", " 仪表板 "), ("", " 聊天 ")];
-        assert_eq!(mode_bar_click(0, 0, bar(30), &labels), Some(1));
-        assert_eq!(mode_bar_click(8, 0, bar(30), &labels), Some(1));
-        assert_eq!(mode_bar_click(9, 0, bar(30), &labels), Some(2));
-        assert_eq!(mode_bar_click(15, 0, bar(30), &labels), Some(2));
     }
 
     #[test]
