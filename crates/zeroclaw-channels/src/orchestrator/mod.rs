@@ -13363,6 +13363,40 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-qq")]
+        "qq" => {
+            let qq = config.channels.qq.get(alias).ok_or_else(not_configured)?;
+            // The listener collector skips a disabled alias, but cron and
+            // one-off delivery reach this arm without a live instance, so the
+            // off switch has to be honored here before the transport is built.
+            if !qq.enabled {
+                let message =
+                    format!("[channels.qq.{alias}] is disabled; set enabled = true to deliver");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"channel": format!("qq.{alias}")})),
+                    &message
+                );
+                anyhow::bail!("{message}");
+            }
+            let peers = config.channel_external_peers("qq", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                alias,
+                peer_resolver,
+            )
+            .with_proxy_url(qq.proxy_url.clone());
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-qq"))]
+        "qq" => {
+            anyhow::bail!("QQ channel requires the `channel-qq` feature");
+        }
         #[cfg(feature = "channel-lark")]
         "lark" | "feishu" => {
             // [channels.lark.<alias>] is the single source of truth for both
@@ -36042,6 +36076,29 @@ Done."#;
     }
 
     #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn one_off_send_resolves_dotted_qq_alias() {
+        // The QQ instance alias is the channel type in practice
+        // (`[channels.qq.qq]`), and a bare id only ever resolves a
+        // `default` alias, so the dotted form is the one operators use.
+        // It must reach the QQ arm rather than the dispatcher's reject path.
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = send_channel_message(&config, "qq.qq", "user:OPENID", "test message")
+            .await
+            .expect_err("unconfigured alias should fail after dotted ref resolution");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[channels.qq.qq] not configured"),
+            "dotted qq id should reach named channel resolution; got: {message}"
+        );
+        assert!(
+            !message.contains("unsupported delivery channel"),
+            "dotted qq id must not be reported as an unsupported delivery channel; got: {message}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(feature = "channel-linq")]
     async fn one_off_send_keeps_dotted_linq_alias_on_builder() {
         // `linq.<alias>` predates the announcement delegation and is resolved by
@@ -36093,7 +36150,6 @@ Done."#;
             "wecom",
             "wecom_ws",
             "wecom-ws",
-            "qq",
             "nostr",
             "clawdtalk",
             "reddit",
@@ -36217,6 +36273,59 @@ Done."#;
         assert!(
             msg.contains("[channels.email.default] not configured"),
             "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_routes_qq_to_qq_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "qq.qq", "user:OPENID", None, "hi")
+            .await
+            .expect_err("expected qq.qq to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "qq.qq must route to the QQ arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.qq.qq] not configured"),
+            "qq.qq must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_rejects_disabled_qq_alias() {
+        // Disabling an alias keeps its credentials, and the cron scheduler
+        // reaches this arm without consulting the listener collector, so the
+        // refusal has to come from the dispatcher itself.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.qq.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::QQConfig {
+                enabled: false,
+                app_id: "test-app-id".to_string(),
+                app_secret: "test-app-secret".to_string(),
+                // If the guard regresses, the send attempt lands on a refused
+                // loopback port instead of Tencent's API.
+                proxy_url: Some("http://127.0.0.1:1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "qq.work", "user:OPENID", None, "hi")
+            .await
+            .expect_err("a disabled qq alias must not be delivered to");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[channels.qq.work] is disabled"),
+            "disabled alias must report the off switch; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "disabled alias must reach the QQ arm; got: {msg}"
         );
     }
 
