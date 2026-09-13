@@ -7987,6 +7987,61 @@ async fn register_in_flight(
     }
 }
 
+/// Cancels older same-scope work living in OTHER history queues, at admission
+/// time.
+///
+/// The worker performs the same scan when it starts (and then waits for the
+/// cancelled turns to exit), but the worker of a DEBOUNCED turn only starts
+/// after its debounce window has elapsed. With debouncing enabled that left a
+/// whole window in which an older same-scope turn kept running — or, when it
+/// was itself still pending in its own window, was free to start afterwards —
+/// even though a newer same-scope message had already been admitted: the newer
+/// turn could not cancel it before its own window expired, and once it had
+/// finished there was no state left to find the older work with.
+///
+/// Running the same pass in the receiver — where every message is admitted in
+/// arrival order, before any debounce window and before its worker exists —
+/// makes admission order the single ordering point: the newest admitted message
+/// supersedes older same-scope work immediately, however each message is
+/// debounced. Only OLDER tasks are matched (`task_id` comes from the monotonic
+/// inbound sequence) and the history queue being admitted into is skipped, so
+/// same-history FIFO and thread-specific scope targeting are untouched.
+async fn supersede_older_foreign_scope_work(
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
+    history_key: &str,
+    interruption_scope: &str,
+    my_task_id: u64,
+) {
+    let mut map = in_flight.lock().await;
+    let mut emptied: Vec<String> = Vec::new();
+    for (key, entry) in map.iter_mut() {
+        if key == history_key {
+            continue;
+        }
+        if let Some(active) = entry.active.as_ref()
+            && active.interruption_scope == interruption_scope
+            && active.task_id < my_task_id
+        {
+            active.cancellation.cancel();
+        }
+        let mut keep = std::collections::VecDeque::with_capacity(entry.waiting.len());
+        while let Some(waiter) = entry.waiting.pop_front() {
+            if waiter.interruption_scope == interruption_scope && waiter.task_id < my_task_id {
+                waiter.cancellation.cancel();
+            } else {
+                keep.push_back(waiter);
+            }
+        }
+        entry.waiting = keep;
+        if entry.active.is_none() && entry.waiting.is_empty() {
+            emptied.push(key.clone());
+        }
+    }
+    for key in emptied {
+        map.remove(&key);
+    }
+}
+
 /// Atomically hands the active slot to the next queued waiter, or removes the
 /// scope entry when the queue is empty. Only the task currently holding the
 /// slot (`active.task_id == task_id`) may transition it; otherwise the record
@@ -8091,6 +8146,15 @@ async fn dispatch_worker(
     // history key and await their exit before starting, exactly like a
     // same-history predecessor is awaited in the waiter loop below.
     //
+    // The scan is NOT skipped when we have a same-history predecessor: that
+    // predecessor may never have dispatched at all (a debounced continuation
+    // superseded inside its debounce window by another message of the same
+    // history), so it cannot be assumed to have performed this cancellation
+    // for us. Running the scan while queued is safe: it only cancels OLDER
+    // same-scope work in OTHER history queues and never touches our own queue
+    // (that key is skipped), so the same-history FIFO and the thread-specific
+    // scope targeting are preserved.
+    //
     // Only OLDER tasks (lower `task_id` from the monotonic task sequence) are
     // cancelled: a newer foreign turn is a successor that will cancel us in
     // its own worker, so touching it would create a mutual-cancellation race
@@ -8111,7 +8175,7 @@ async fn dispatch_worker(
     // cancelled too, so a cancelled active cannot promote one of them into a
     // run parallel to ours.
     let mut wait_on = predecessor;
-    if interrupt_enabled && tracked && wait_on.is_none() {
+    if interrupt_enabled && tracked {
         let scope = state.interruption_scope.clone();
         let my_task_id = state.task_id;
         let foreign_wait: Vec<InFlightSenderTaskState> = {
@@ -8954,6 +9018,13 @@ async fn run_message_dispatch_loop(
         // inbound message cancel the actual latest one.)
         let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
 
+        // Interrupt configuration for this channel, read once for the
+        // admission-time supersession pass below (the worker reads it again for
+        // its own cross-history scan).
+        let interrupt_enabled = ctx
+            .interrupt_on_new_message
+            .enabled_for_channel(msg.channel.as_str());
+
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         let msg = if msg.channel != "cli" {
@@ -8975,22 +9046,92 @@ async fn run_message_dispatch_loop(
                 .await
             {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
-                    // Spawn a lightweight task that waits for the debounce window
-                    // to expire, then feeds the combined message through the normal
-                    // worker path below.
+                    // Debounced work is admitted into the in-flight map HERE, in
+                    // the receiver task, before its debounce window runs — not
+                    // after the timer fires. A continuation that is not yet in
+                    // the map is invisible to the cross-history interruption
+                    // scan and to the `/stop` scan, so an older pending turn
+                    // could still start processing (or deliver a reply) after a
+                    // newer same-scope message had already superseded it: the
+                    // newer turn finds nothing to cancel, and once it is done
+                    // there is no state left to find. Registering at admission
+                    // gives pending work the same visibility as a running turn;
+                    // the waiting task below wakes on cancellation and releases
+                    // the slot without ever dispatching.
                     let debounce_ctx = Arc::clone(&ctx);
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     // Same per-history backlog bound as the normal path.
                     let debounce_backlog_limit = max_in_flight_messages;
                     let mut debounce_msg = msg;
+                    let history_key =
+                        runtime_conversation_history_key(debounce_ctx.as_ref(), &debounce_msg);
+                    let state = InFlightSenderTaskState {
+                        task_id,
+                        interruption_scope: interruption_scope_key(&debounce_msg),
+                        cancellation: CancellationToken::new(),
+                        completion: Arc::new(InFlightTaskCompletion::new()),
+                    };
+                    let tracked = debounce_msg.channel != "cli" && !debounce_msg.passive_context;
+                    let predecessor = if tracked {
+                        match register_in_flight(
+                            &debounce_in_flight,
+                            &history_key,
+                            state.clone(),
+                            debounce_backlog_limit,
+                        )
+                        .await
+                        {
+                            RegisterOutcome::Active => None,
+                            RegisterOutcome::Queued(predecessor) => predecessor,
+                            RegisterOutcome::QueueFull => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})),
+                                    "dropping debounced channel message: per-history queue is full"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // Supersede older same-scope work the moment this
+                    // continuation is admitted, not when its debounce window
+                    // expires (see `supersede_older_foreign_scope_work`).
+                    if interrupt_enabled && tracked {
+                        supersede_older_foreign_scope_work(
+                            &debounce_in_flight,
+                            &history_key,
+                            &state.interruption_scope,
+                            state.task_id,
+                        )
+                        .await;
+                    }
                     workers.spawn(async move {
-                        let combined = match rx.await {
-                            Ok(combined) => combined,
-                            Err(_) => {
-                                // Receiver dropped — a newer message superseded this one.
+                        // Wait for the debounce window, but wake immediately when
+                        // this continuation is superseded or interrupted while
+                        // still pending: the queue slot taken at admission must
+                        // be released (promoting a successor), and a superseded
+                        // turn must never dispatch.
+                        let combined = tokio::select! {
+                            biased;
+                            _ = state.cancellation.cancelled() => {
+                                exit_tracked_state(&debounce_in_flight, &history_key, &state).await;
                                 return;
                             }
+                            result = rx => match result {
+                                Ok(combined) => combined,
+                                Err(_) => {
+                                    // Receiver dropped — a newer message with the
+                                    // same debounce key superseded this one.
+                                    exit_tracked_state(&debounce_in_flight, &history_key, &state)
+                                        .await;
+                                    return;
+                                }
+                            },
                         };
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
@@ -8999,45 +9140,7 @@ async fn run_message_dispatch_loop(
                         // debounce window ran) so this debounced turn keeps its
                         // inbound order position in the cross-history interrupt
                         // logic; a superseded task never reaches this point.
-                        let cancellation_token = CancellationToken::new();
-                        let completion = Arc::new(InFlightTaskCompletion::new());
-                        let state = InFlightSenderTaskState {
-                            task_id,
-                            interruption_scope: interruption_scope_key(&debounce_msg),
-                            cancellation: cancellation_token,
-                            completion: Arc::clone(&completion),
-                        };
-                        let predecessor = if debounce_msg.channel != "cli"
-                            && !debounce_msg.passive_context
-                        {
-                            match register_in_flight(
-                                &debounce_in_flight,
-                                &runtime_conversation_history_key(
-                                    debounce_ctx.as_ref(),
-                                    &debounce_msg,
-                                ),
-                                state.clone(),
-                                debounce_backlog_limit,
-                            )
-                            .await
-                            {
-                                RegisterOutcome::Active => None,
-                                RegisterOutcome::Queued(predecessor) => predecessor,
-                                RegisterOutcome::QueueFull => {
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                            .with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})),
-                                        "dropping debounced channel message: per-history queue is full"
-                                    );
-                                    return;
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
+                        //
                         // The global semaphore is passed to the worker and taken
                         // only after promotion, so queued debounced messages hold
                         // no permits (see `dispatch_worker`).
@@ -9045,7 +9148,7 @@ async fn run_message_dispatch_loop(
                             debounce_ctx,
                             debounce_msg,
                             debounce_in_flight,
-                            Arc::clone(&debounce_semaphore),
+                            debounce_semaphore,
                             state,
                             predecessor,
                         )
@@ -9076,10 +9179,12 @@ async fn run_message_dispatch_loop(
             cancellation: cancellation_token,
             completion: Arc::clone(&completion),
         };
-        let predecessor = if msg.channel != "cli" && !msg.passive_context {
+        let tracked = msg.channel != "cli" && !msg.passive_context;
+        let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+        let predecessor = if tracked {
             match register_in_flight(
                 &in_flight_by_sender,
-                &runtime_conversation_history_key(ctx.as_ref(), &msg),
+                &history_key,
                 state.clone(),
                 // The per-history backlog is capped by the same global budget:
                 // one slow history session (a root plus its thread follow-ups)
@@ -9109,6 +9214,20 @@ async fn run_message_dispatch_loop(
         } else {
             None
         };
+        // Supersede older same-scope work the moment this message is admitted,
+        // not when its worker starts: a debounced worker only starts after its
+        // debounce window, which would leave older same-scope work running for
+        // the whole window after the newer message arrived (see
+        // `supersede_older_foreign_scope_work`).
+        if interrupt_enabled && tracked {
+            supersede_older_foreign_scope_work(
+                &in_flight_by_sender,
+                &history_key,
+                &state.interruption_scope,
+                state.task_id,
+            )
+            .await;
+        }
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
@@ -35877,6 +35996,241 @@ This is an example JSON object for profile settings."#;
         assert!(
             sent_messages.iter().any(|m| m.contains("response-2")),
             "second turn's response must be delivered, got {:?}",
+            *sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_debounced_pending_turn_never_runs_after_newer_admission() {
+        // Ordering proof for pending debounce work: an older top-level turn (A)
+        // that is still inside its debounce window when a newer same-scope turn
+        // (B) is admitted must never start processing.
+        //
+        // A's window starts first and both windows are equal, so on a design
+        // that registers only when the timer fires A always wins the timer
+        // race, registers, and runs to completion — and B then finds nothing to
+        // cancel, because A's queue entry is already gone. Admission is the
+        // single ordering point instead: A is superseded the moment B is
+        // admitted, while A is still pending.
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: false,
+            release: Arc::new(tokio::sync::Notify::new()),
+            first_gated_call_started: Arc::new(tokio::sync::Notify::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.debounce_ms = 600;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut ctx = (*runtime_ctx).clone();
+        ctx.interrupt_on_new_message.slack = true;
+        let runtime_ctx = Arc::new(ctx);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        let top_level = |id: &str, content: &str| zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: content.into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some(id.into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+
+        tx.send(top_level("1741234567.100001", "first question"))
+            .await
+            .unwrap();
+        // B (same sender scope, its own history key) is admitted while A is
+        // still pending inside its window.
+        tx.send(top_level("1741234567.200002", "second question"))
+            .await
+            .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("dispatch loop must finish once the pending turn is superseded")
+            .unwrap();
+
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                completed.len(),
+                1,
+                "only the newest admitted turn may run, got {completed:?}"
+            );
+            assert!(
+                completed[0]
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("second question")),
+                "the newest turn must run to completion, got {:?}",
+                completed[0]
+            );
+        }
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !calls
+                    .iter()
+                    .flatten()
+                    .any(|(_, content)| content.contains("first question")),
+                "a pending turn superseded by a newer message must never enter processing, got {calls:?}"
+            );
+        }
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "a superseded pending turn must never overlap the newer turn"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-")),
+            "the newest turn's response must be delivered, got {:?}",
+            *sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_slack_top_level_stop_supersedes_debounced_pending_turn() {
+        // The stop half of the same guarantee: `/stop` finds its targets by
+        // scanning the in-flight map for the message's interruption scope, so
+        // pending debounce work must be registered there as well. Otherwise the
+        // operator gets "no in-flight task", the pending turn is left alone and
+        // starts working after the stop.
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: false,
+            release: Arc::new(tokio::sync::Notify::new()),
+            first_gated_call_started: Arc::new(tokio::sync::Notify::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.debounce_ms = 600;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut ctx = (*runtime_ctx).clone();
+        ctx.interrupt_on_new_message.slack = true;
+        let runtime_ctx = Arc::new(ctx);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        let top_level = |id: &str, content: &str| zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: content.into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some(id.into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+
+        tx.send(top_level("1741234567.100001", "first question"))
+            .await
+            .unwrap();
+        // `/stop` bypasses debouncing and carries no thread, yet it shares the
+        // top-level interruption scope of the pending turn.
+        tx.send(top_level("1741234567.300003", "/stop"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sent = channel_impl.sent_messages.lock().await;
+                if sent.iter().any(|m| m.contains("Stop signal sent")) {
+                    return;
+                }
+                drop(sent);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending debounce work must be visible to /stop");
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("dispatch loop must finish after /stop superseded the pending turn")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                calls.is_empty(),
+                "a stopped pending turn must never enter processing, got {calls:?}"
+            );
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                completed.is_empty(),
+                "a stopped pending turn must not complete, got {completed:?}"
+            );
+        }
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages
+                .iter()
+                .any(|m| m.contains("No in-flight task")),
+            "the pending turn must be found by the stop scan, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("response-")),
+            "a stopped pending turn must not deliver a response, got {:?}",
             *sent_messages
         );
     }
