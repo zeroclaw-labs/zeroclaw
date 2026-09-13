@@ -283,6 +283,7 @@ mod run_model_query_tests {
                     input_tokens: Some(100),
                     output_tokens: Some(20),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -330,6 +331,7 @@ mod run_model_query_tests {
                     input_tokens: Some(80),
                     output_tokens: Some(if rejected { 5 } else { 7 }),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -558,6 +560,7 @@ mod run_model_query_tests {
                         input_tokens: Some(80),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -604,6 +607,7 @@ mod run_model_query_tests {
                     input_tokens: Some(80),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             },

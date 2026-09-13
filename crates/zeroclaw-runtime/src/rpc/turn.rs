@@ -549,6 +549,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,

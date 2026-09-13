@@ -522,6 +522,7 @@ mod cost_usd_regression_tests {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
                 cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };
@@ -662,6 +663,7 @@ mod cost_usd_regression_tests {
             input_tokens: Some(10),
             output_tokens: Some(5),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let interpreted = interpret_chat_response(
             &ctx,

@@ -744,6 +744,7 @@ mod streaming_fallback_tests {
                     input_tokens: Some(20),
                     output_tokens: Some(7),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -768,6 +769,7 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     })),
                     Ok(StreamEvent::TextDelta(
                         zeroclaw_api::model_provider::StreamChunk::reasoning("private reasoning"),
@@ -863,6 +865,7 @@ mod streaming_fallback_tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 });

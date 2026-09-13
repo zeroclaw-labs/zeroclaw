@@ -985,6 +985,10 @@ fn all_tools_with_runtime_on_thread(
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
     // snapshot below.
+    // The `root_config`-derived tools below share ONE snapshot `Arc` instead
+    // of each taking a full `Config` clone: registry construction (per agent
+    // build and per channel-message turn) previously paid three deep copies.
+    let root_config_shared = Arc::new(root_config.clone());
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             shell_tool
@@ -1062,16 +1066,20 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
-            root_config.clone(),
+            Arc::clone(&root_config_shared),
             agent_alias,
             runtime.clone(),
         )),
         Arc::new(
-            SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
-                .with_subagent_caller(is_subagent_caller),
+            SpawnSubagentTool::new(
+                Arc::clone(&root_config_shared),
+                agent_alias,
+                security.clone(),
+            )
+            .with_subagent_caller(is_subagent_caller),
         ),
         Arc::new(SendMessageToPeerTool::new(
-            Arc::new(root_config.clone()),
+            Arc::clone(&root_config_shared),
             agent_alias,
         )),
         Arc::new(ModelRoutingConfigTool::new(
