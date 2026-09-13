@@ -842,6 +842,10 @@ where
     fn peer_label(&self) -> String {
         self.peer_label.clone()
     }
+
+    fn kind(&self) -> super::transport::TransportKind {
+        super::transport::TransportKind::Wss
+    }
 }
 
 // ── TLS acceptor ─────────────────────────────────────────────────
@@ -1199,8 +1203,13 @@ pub async fn run_wss_listener(
                         peer,
                         conn_cancel.clone(),
                     )
+                    // mTLS peer cert = transport/device admission (quota, audit);
+                    // transport credential = principal authentication at initialize.
+                    // The two layers compose: the cert admits the connection,
+                    // the token authenticates the principal.
                     .with_peer_cert_fingerprint(Some(peer_cert_fp))
-                    .with_connection_activity(activity);
+                    .with_connection_activity(activity)
+                    .with_transport(transport.kind(), transport.credential());
                     // The concrete dispatcher future carries the full request
                     // state machine. Keep that state heap-backed so an active
                     // WSS request does not depend on the executor worker's
@@ -1684,6 +1693,8 @@ mod accept_error_tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         client_sink
             .send(Message::Text(
@@ -1806,6 +1817,8 @@ mod accept_error_tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         client_sink
             .send(Message::Text(
@@ -2134,11 +2147,14 @@ mod accept_error_tests {
         let port1 = free_port().await;
         let addr1: std::net::SocketAddr = format!("127.0.0.1:{port1}").parse().unwrap();
 
-        let config1 = zeroclaw_config::schema::Config {
+        let mut config1 = zeroclaw_config::schema::Config {
             data_dir: tmp.path().to_path_buf(),
             config_path: tmp.path().join("config.toml"),
             ..Default::default()
         };
+        // A remote (WSS) connection must authenticate before it can run a
+        // privileged prompt: pair a native token for the test client.
+        config1.gateway.paired_tokens = vec!["zc_tok".to_string()];
         let queue1 = Arc::new(SessionActorQueue::new(4, 30, 60));
         let sessions1 = Arc::new(SessionStore::new(64, queue1));
         let ctx1 = RpcContext::for_persistence_tests(
@@ -2211,6 +2227,10 @@ mod accept_error_tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            // Present the paired native token: an unauthenticated remote
+            // connection cannot run the privileged prompt this test drives.
+            auth_token: Some("zc_tok".to_string()),
+            auth_provider: None,
         };
         client_sink1
             .send(Message::Text(
@@ -2295,11 +2315,13 @@ mod accept_error_tests {
             )
             .unwrap();
 
-            let config2 = zeroclaw_config::schema::Config {
+            let mut config2 = zeroclaw_config::schema::Config {
                 data_dir: tmp_path.clone(),
                 config_path: tmp_path.join("config.toml"),
                 ..Default::default()
             };
+            // The replacement generation authenticates the same client.
+            config2.gateway.paired_tokens = vec!["zc_tok".to_string()];
             let queue2 = Arc::new(SessionActorQueue::new(4, 30, 60));
             let sessions2 = Arc::new(SessionStore::new(64, queue2));
             let ctx2 = RpcContext::for_persistence_tests(
@@ -2369,6 +2391,9 @@ mod accept_error_tests {
                 tui_sig: None,
                 env: Default::default(),
                 client_capabilities: None,
+                // Same paired token for the replacement generation.
+                auth_token: Some("zc_tok".to_string()),
+                auth_provider: None,
             };
             client_sink2
                 .send(Message::Text(

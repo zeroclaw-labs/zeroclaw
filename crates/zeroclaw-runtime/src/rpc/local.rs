@@ -66,6 +66,10 @@ pub struct LocalTransport {
     reader: BufReader<LocalReadHalf>,
     writer_tx: mpsc::Sender<String>,
     peer_label: String,
+    /// Kernel-reported peer uid (Unix). `None` on Windows named pipes or
+    /// when the kernel query fails — absence of a credential, never a
+    /// credential of its own.
+    peer_uid: Option<u32>,
 }
 
 async fn run_writer<W>(
@@ -103,6 +107,7 @@ async fn run_writer<W>(
 impl LocalTransport {
     pub fn new(stream: LocalStream, cancel: CancellationToken) -> Self {
         let peer_label = platform::peer_label_from(&stream);
+        let peer_uid = platform::peer_uid_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, writer_rx) = mpsc::channel::<String>(64);
@@ -116,6 +121,7 @@ impl LocalTransport {
             reader: BufReader::new(read_half),
             writer_tx,
             peer_label,
+            peer_uid,
         }
     }
 }
@@ -143,6 +149,17 @@ impl RpcTransport for LocalTransport {
 
     fn peer_label(&self) -> String {
         self.peer_label.clone()
+    }
+
+    fn kind(&self) -> super::transport::TransportKind {
+        super::transport::TransportKind::Local
+    }
+
+    fn credential(&self) -> crate::security::auth_provider::Credential {
+        match self.peer_uid {
+            Some(uid) => crate::security::auth_provider::Credential::Peercred { uid },
+            None => crate::security::auth_provider::Credential::None,
+        }
     }
 }
 
@@ -231,7 +248,10 @@ pub async fn run_local_listener(
                         peer,
                         conn_cancel.clone(),
                     )
-                    .with_connection_activity(activity);
+                    .with_connection_activity(activity)
+                    // The transport's kind and kernel-supplied peer credential
+                    // feed principal authentication at `initialize`.
+                    .with_transport(transport.kind(), transport.credential());
                     tokio::select! {
                         _ = dispatcher.run(&mut transport) => {}
                         _ = conn_cancel.cancelled() => {}
@@ -651,14 +671,17 @@ mod platform {
     }
 
     pub fn peer_label_from(stream: &LocalStream) -> String {
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(cred) = stream.peer_cred() {
-                return format!("unix:pid={},uid={}", cred.pid().unwrap_or(0), cred.uid());
-            }
+        if let Ok(cred) = stream.peer_cred() {
+            return format!("unix:pid={},uid={}", cred.pid().unwrap_or(0), cred.uid());
         }
-        let _ = stream;
         "unix:unknown".to_string()
+    }
+
+    /// Kernel-reported peer uid (`SO_PEERCRED` on Linux, `getpeereid`-
+    /// equivalent on macOS/BSD via tokio's `peer_cred`). `None` when the
+    /// query fails — the caller treats that as no credential.
+    pub fn peer_uid_from(stream: &LocalStream) -> Option<u32> {
+        stream.peer_cred().ok().map(|cred| cred.uid())
     }
 }
 
@@ -720,6 +743,13 @@ mod platform {
 
     pub fn peer_label_from(_stream: &LocalStream) -> String {
         "pipe:local".to_string()
+    }
+
+    /// Named pipes carry no portable peer uid; the connection presents no
+    /// transport-intrinsic credential and authenticates explicitly (or
+    /// through the no-roster local compatibility path).
+    pub fn peer_uid_from(_stream: &LocalStream) -> Option<u32> {
+        None
     }
 
     fn path_to_pipe_name(path: &Path) -> String {
@@ -809,6 +839,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &params, 1).as_bytes())
@@ -894,6 +926,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         writer
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
@@ -2248,6 +2282,8 @@ mod tests {
             tui_sig: None,
             env: Default::default(),
             client_capabilities: None,
+            auth_token: None,
+            auth_provider: None,
         };
         write_half
             .write_all(rpc_request(Method::Initialize, &init_params, 1).as_bytes())
