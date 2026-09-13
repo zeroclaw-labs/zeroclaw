@@ -1,4 +1,4 @@
-tool-backup = Crear, listar, verificar y restaurar copias de seguridad del espacio de trabajo
+tool-backup = Crear, listar, verificar y restaurar copias de seguridad del directorio de datos compartidos
 tool-browser = Automatización web/navegador con backends conectables (agent-browser, rust-native, computer_use). Admite acciones DOM más acciones opcionales a nivel de SO (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) a través de un sidecar de uso de computadora. Use 'snapshot' para mapear elementos interactivos a refs (@e1, @e2). Aplica browser.allowed_domains para acciones de apertura.
 tool-browser-delegate = Delegar tareas basadas en navegador a una CLI con capacidad de navegador para interactuar con aplicaciones web como Teams, Outlook, Jira, Confluence
 tool-browser-open = Abrir una URL HTTPS aprobada en el navegador del sistema. Restricciones de seguridad: solo dominios de la lista de permitidos, sin hosts locales/privados, sin scraping.
@@ -34,7 +34,7 @@ tool-cron-remove = Eliminar un trabajo cron por id
 tool-cron-run = Forzar la ejecución de un trabajo cron inmediatamente y registrar el historial de ejecuciones
 tool-cron-runs = Listar el historial de ejecuciones recientes de un trabajo cron
 tool-cron-update = Parchear un trabajo cron existente (programación, comando, prompt, habilitado, entrega, modelo, etc.)
-tool-data-management = Retención, purga y estadísticas de almacenamiento de datos del espacio de trabajo
+tool-data-management = Vista previa de retención y estadísticas de almacenamiento del directorio de datos compartidos
 tool-delegate = Delegar una subtarea a un agente especializado. Use cuando: una tarea se beneficia de un modelo diferente (p. ej. resumen rápido, razonamiento profundo, generación de código). El subagente ejecuta un único prompt de forma predeterminada; con agentic=true puede iterar con un bucle de llamadas a herramientas filtrado.
 tool-file-edit = Editar un archivo reemplazando una coincidencia exacta de cadena con nuevo contenido
 tool-file-download = Descarga un archivo desde el endpoint remoto configurado y lo escribe en el espacio de trabajo del agente. Proporciona el identificador del documento que se va a obtener y una ruta de destino relativa al espacio de trabajo; la URL del endpoint está fijada por la configuración del host y nunca es controlada por el modelo. Los bytes se transmiten directamente al disco y no se cargan en el contexto del modelo. Devuelve el estado HTTP, el número de bytes escritos y la ruta de destino.
