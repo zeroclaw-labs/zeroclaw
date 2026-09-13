@@ -13366,6 +13366,21 @@ pub async fn deliver_announcement(
         #[cfg(feature = "channel-qq")]
         "qq" => {
             let qq = config.channels.qq.get(alias).ok_or_else(not_configured)?;
+            // The listener collector skips a disabled alias, but cron and
+            // one-off delivery reach this arm without a live instance, so the
+            // off switch has to be honored here before the transport is built.
+            if !qq.enabled {
+                let message =
+                    format!("[channels.qq.{alias}] is disabled; set enabled = true to deliver");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"channel": format!("qq.{alias}")})),
+                    &message
+                );
+                anyhow::bail!("{message}");
+            }
             let peers = config.channel_external_peers("qq", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
@@ -36277,6 +36292,40 @@ Done."#;
         assert!(
             msg.contains("[channels.qq.qq] not configured"),
             "qq.qq must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-qq")]
+    async fn deliver_announcement_rejects_disabled_qq_alias() {
+        // Disabling an alias keeps its credentials, and the cron scheduler
+        // reaches this arm without consulting the listener collector, so the
+        // refusal has to come from the dispatcher itself.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.qq.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::QQConfig {
+                enabled: false,
+                app_id: "test-app-id".to_string(),
+                app_secret: "test-app-secret".to_string(),
+                // If the guard regresses, the send attempt lands on a refused
+                // loopback port instead of Tencent's API.
+                proxy_url: Some("http://127.0.0.1:1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "qq.work", "user:OPENID", None, "hi")
+            .await
+            .expect_err("a disabled qq alias must not be delivered to");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[channels.qq.work] is disabled"),
+            "disabled alias must report the off switch; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "disabled alias must reach the QQ arm; got: {msg}"
         );
     }
 
