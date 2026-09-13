@@ -6454,7 +6454,7 @@ async fn process_channel_message_body(
     );
     let any_activation_policy = all_activation_skills
         .iter()
-        .any(|s| s.provider.is_some() || !s.blocked_tools_with_image.is_empty());
+        .any(zeroclaw_runtime::skills::Skill::has_activation_policy);
     if any_activation_policy {
         // Image presence comes from the typed attachment envelope captured
         // before media enrichment, never from message-text matching.

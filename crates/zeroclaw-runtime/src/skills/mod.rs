@@ -100,6 +100,18 @@ pub struct Skill {
     pub blocked_tools_with_image: Vec<String>,
 }
 
+impl Skill {
+    /// Whether this skill declares any auto-activation behavior: a provider
+    /// to switch the session to, or an image-turn tool denylist. This is the
+    /// single predicate behind the per-message activation scan and the
+    /// inferred-trigger filter in [`match_skill_activation`]; a skill with
+    /// neither can still be reached by explicit identity but has nothing to
+    /// enforce when it activates.
+    pub fn has_activation_policy(&self) -> bool {
+        self.provider.is_some() || !self.blocked_tools_with_image.is_empty()
+    }
+}
+
 /// Why the audited resolver dropped a candidate skill directory/file.
 /// Carries the human-readable detail the loader already logs, so the
 /// dashboard can show the same reason without re-running the audit.
@@ -702,7 +714,7 @@ pub fn match_skill_activation<'a>(
     // policy-free skill would activate nothing, so it is skipped here to keep
     // the deterministic winner among the skills that can actually act.
     for skill in skills {
-        if skill.provider.is_none() && skill.blocked_tools_with_image.is_empty() {
+        if !skill.has_activation_policy() {
             continue;
         }
         // 3. Trigger phrases, word-boundary matched. 4. `__image__` sentinel.
@@ -814,35 +826,6 @@ pub fn load_skills_for_agent(
     agent_alias: &str,
 ) -> Vec<Skill> {
     load_skills_for_agent_audited(workspace_dir, config, agent_alias).0
-}
-
-/// The skills this agent can load that declare auto-activation behavior
-/// (`provider` or `blocked_tools_with_image`), in loader order. An empty
-/// result means the per-message activation scan has nothing to consider.
-///
-/// This is a materialized view over [`load_skills_for_agent`], resolved on
-/// every call — deliberately **not** memoized behind a separate verdict.
-/// `blocked_tools_with_image` is a capability *restriction*, so the decision
-/// of whether to evaluate it has to reflect what is on disk right now: an
-/// independent memo with its own expiry could answer "no activation skills"
-/// for a skill that already exists, leaving the declared tool callable on the
-/// very image turn it is meant to block.
-///
-/// Freshness therefore rides on the canonical loader's content digest (see
-/// [`cache`]), which re-audits whenever the audited bytes change — including
-/// writes from another process, which no in-process invalidate hook can
-/// observe. The digest walk is the cost of that guarantee; a cache hit still
-/// skips the security audit, the Markdown/TOML parse, and shadow resolution,
-/// which is the expensive part.
-pub fn load_activation_candidates(
-    workspace_dir: &Path,
-    config: &zeroclaw_config::schema::Config,
-    agent_alias: &str,
-) -> Vec<Skill> {
-    load_skills_for_agent(workspace_dir, config, agent_alias)
-        .into_iter()
-        .filter(|s| s.provider.is_some() || !s.blocked_tools_with_image.is_empty())
-        .collect()
 }
 
 /// Origin tag for a pre-bundle skill, mirroring [`super::service`]'s
@@ -5796,13 +5779,25 @@ version = "0.1.0"
     /// from its own snapshot, so a skill written by another process (the CLI
     /// `skills install`, a direct directory edit) could be ignored for a full
     /// TTL — leaving a declared `blocked_tools_with_image` tool callable on
-    /// the image turn it exists to block. `load_activation_candidates`
-    /// resolves from the canonical loader, whose freshness key is a digest of
-    /// the audited bytes, so the write below lands immediately. The test
+    /// the image turn it exists to block. The orchestrator now resolves the
+    /// set from the canonical loader on every message, whose freshness key
+    /// is a digest of the audited bytes, so the write below lands
+    /// immediately. This test filters the same way the orchestrator does. The test
     /// deliberately performs NO `cache::invalidate()` after writing: passing
     /// only because of an invalidate would not prove the out-of-band case.
     #[test]
     fn activation_candidates_reflect_out_of_band_install_without_invalidate() {
+        fn activation_candidates(
+            workspace: &Path,
+            config: &zeroclaw_config::schema::Config,
+            agent_alias: &str,
+        ) -> Vec<Skill> {
+            load_skills_for_agent(workspace, config, agent_alias)
+                .into_iter()
+                .filter(Skill::has_activation_policy)
+                .collect()
+        }
+
         let install_root = TempDir::new().unwrap();
         let data_dir = TempDir::new().unwrap();
         let agent_workspace = TempDir::new().unwrap();
@@ -5819,7 +5814,7 @@ version = "0.1.0"
         // Prime the load cache so the assertion below cannot pass merely
         // because nothing had been cached yet.
         assert!(
-            load_activation_candidates(agent_workspace.path(), &config, agent_alias).is_empty(),
+            activation_candidates(agent_workspace.path(), &config, agent_alias).is_empty(),
             "a plain skill declares no auto-activation behavior"
         );
 
@@ -5839,7 +5834,7 @@ blocked_tools_with_image = ["some_tool"]
         )
         .unwrap();
 
-        let candidates = load_activation_candidates(agent_workspace.path(), &config, agent_alias);
+        let candidates = activation_candidates(agent_workspace.path(), &config, agent_alias);
         assert_eq!(
             candidates.len(),
             1,

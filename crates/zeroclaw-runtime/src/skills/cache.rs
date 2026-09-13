@@ -222,9 +222,10 @@ fn cached_load_in(
 /// This is an optimization, not the freshness mechanism: entries are keyed by
 /// a content digest of the directory, so an out-of-band edit is already
 /// noticed on the next load without any invalidate call. Skill-derived
-/// decisions — including [`super::load_activation_candidates`], which gates a
-/// capability restriction — therefore never serve a verdict computed against
-/// content that has since changed.
+/// decisions — including the per-message activation scan over
+/// [`super::load_skills_for_agent`], which gates a capability restriction —
+/// therefore never serve a verdict computed against content that has since
+/// changed.
 pub fn invalidate() {
     cache().write().unwrap_or_else(|e| e.into_inner()).clear();
 }
