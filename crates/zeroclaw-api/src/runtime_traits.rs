@@ -268,6 +268,34 @@ pub trait RuntimeAdapter: Send + Sync {
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command>;
 
+    /// Build a shell command using the caller's effective child `PATH`.
+    ///
+    /// On Unix, an adapter that emits a bare launcher must override this
+    /// method when `effective_path` is present and resolve that launcher from
+    /// the supplied path. The default fails closed instead of letting command
+    /// spawn repeat a lookup against a different working directory or path.
+    fn build_shell_command_with_effective_path(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        effective_path: Option<&OsStr>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let process = self.build_shell_command(command, workspace_dir)?;
+
+        #[cfg(unix)]
+        if effective_path.is_some() && !Path::new(process.as_std().get_program()).is_absolute() {
+            anyhow::bail!(
+                "runtime {} returned a bare shell launcher while an effective PATH was supplied; the adapter must resolve it to an absolute path",
+                self.name()
+            );
+        }
+
+        #[cfg(not(unix))]
+        let _ = effective_path;
+
+        Ok(process)
+    }
+
     /// Build a shell command process with runtime-visible environment names.
     ///
     /// `env_keys` contains variable names selected by the caller for
@@ -388,6 +416,26 @@ mod tests {
         assert_eq!(runtime.shell_dialect(), ShellDialect::WindowsCmd);
         #[cfg(not(windows))]
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_path_rejects_default_adapter_bare_launcher() {
+        let runtime = DummyRuntime;
+        let error = runtime
+            .build_shell_command_with_effective_path(
+                "hello-runtime",
+                Path::new("."),
+                Some(OsStr::new("/usr/bin")),
+            )
+            .expect_err("a bare launcher must not bypass the effective PATH contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("must resolve it to an absolute path"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]

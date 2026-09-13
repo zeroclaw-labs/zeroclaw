@@ -1,13 +1,28 @@
 pub mod docker;
+pub mod executable;
 pub mod native;
 
 pub use docker::DockerRuntime;
+pub use executable::{resolve_executable, resolve_executable_with_path};
 pub use native::NativeRuntime;
 pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfile};
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
+use std::ffi::OsStr;
 
 pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+    create_runtime_with_path(config, None)
+}
+
+/// Create a runtime, optionally resolving host launchers against an injected
+/// PATH before the runtime's child workspace is applied.
+pub fn create_runtime_with_path(
+    config: &RuntimeConfig,
+    path: Option<&OsStr>,
+) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
+    #[cfg(not(unix))]
+    let _ = path;
+
     match config.kind {
         RuntimeKind::Native => {
             let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
@@ -15,9 +30,47 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
             validate_shell(&shell)?;
             #[cfg(windows)]
             validate_shell_windows(&shell)?;
-            Ok(Box::new(NativeRuntime::with_shell(shell)))
+            #[cfg(unix)]
+            let shell_path = path
+                .map(|path| {
+                    let configured_shell = if zeroclaw_api::platform::is_android() {
+                        OsStr::new("/system/bin/sh")
+                    } else {
+                        OsStr::new(&shell)
+                    };
+                    resolve_executable_with_path(configured_shell, std::env::split_paths(path))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(format!(
+                                "native runtime shell {configured_shell:?} could not be resolved in the injected PATH"
+                            ))
+                        })
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            let shell_path = None;
+            Ok(Box::new(NativeRuntime::with_shell_and_resolved_path(
+                shell, shell_path,
+            )))
         }
-        RuntimeKind::Docker => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
+        RuntimeKind::Docker => {
+            #[cfg(unix)]
+            let docker_path = path
+                .map(|path| {
+                    resolve_executable_with_path(OsStr::new("docker"), std::env::split_paths(path))
+                        .map_err(|error| {
+                            anyhow::Error::new(error).context(
+                            "Docker runtime launcher could not be resolved in the injected PATH",
+                        )
+                        })
+                })
+                .transpose()?;
+            #[cfg(not(unix))]
+            let docker_path = None;
+            Ok(Box::new(DockerRuntime::with_resolved_launcher(
+                config.docker.clone(),
+                docker_path,
+            )))
+        }
         RuntimeKind::Cloudflare => anyhow::bail!(
             "runtime.kind='cloudflare' is not implemented yet. Use runtime.kind='native' for now."
         ),
@@ -26,8 +79,6 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
 
 #[cfg(unix)]
 fn validate_shell(shell: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     // Android pins the shell to /system/bin/sh; the configured value is never
     // used, so don't reject it.
     if zeroclaw_api::platform::is_android() {
@@ -39,54 +90,16 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
     }
 
     let path = std::path::Path::new(shell);
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else if path.components().count() > 1 {
+    if !path.is_absolute()
+        && (!matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || path.components().count() != 1
+            || shell.contains('/')
+            || shell.contains('\\'))
+    {
         anyhow::bail!(
             "runtime.shell {shell:?} is a relative path; use a bare name resolved on PATH (e.g. \"bash\") or an absolute path (e.g. \"/bin/bash\")"
-        );
-    } else {
-        match std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(shell))
-            .find(|candidate| candidate.is_file())
-        {
-            Some(found) => found,
-            None => anyhow::bail!(
-                "runtime.shell {shell:?} was not found on PATH; use an absolute path or install the shell"
-            ),
-        }
-    };
-
-    if !resolved.exists() {
-        anyhow::bail!(
-            "runtime.shell {shell:?} (resolved to {}) does not exist",
-            resolved.display()
-        );
-    }
-
-    let metadata = match resolved.metadata() {
-        Ok(metadata) => metadata,
-        Err(e) => anyhow::bail!(
-            "runtime.shell {shell:?} (resolved to {}) could not be inspected: {e}",
-            resolved.display()
-        ),
-    };
-    if !metadata.is_file() {
-        anyhow::bail!(
-            "runtime.shell {shell:?} (resolved to {}) is not a regular file",
-            resolved.display()
-        );
-    }
-
-    // Coarse check: reject only when no execute bit is set at all. A precise
-    // "can *we* execute it" test (uid/gid vs. the file owner) buys little —
-    // the kernel's spawn is the real authority (ACLs, caps, mount flags) — and
-    // this is a fail-fast sanity check, not a security gate.
-    let mode = metadata.permissions().mode();
-    if mode & 0o111 == 0 {
-        anyhow::bail!(
-            "runtime.shell {shell:?} (resolved to {}) is not executable",
-            resolved.display()
         );
     }
 
@@ -152,6 +165,53 @@ mod tests {
         assert!(rt.has_shell_access());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn factory_resolves_native_and_docker_launchers_from_injected_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let native_shell = dir.path().join("native-shell");
+        let docker = dir.path().join("docker");
+        for launcher in [&native_shell, &docker] {
+            std::fs::write(launcher, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let native = create_runtime_with_path(
+            &RuntimeConfig {
+                kind: RuntimeKind::Native,
+                shell: Some("native-shell".into()),
+                ..RuntimeConfig::default()
+            },
+            Some(dir.path().as_os_str()),
+        )
+        .unwrap();
+        let native_command = native
+            .build_shell_command("echo native", &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(
+            native_command.as_std().get_program(),
+            native_shell.canonicalize().unwrap().as_os_str()
+        );
+
+        let docker_runtime = create_runtime_with_path(
+            &RuntimeConfig {
+                kind: RuntimeKind::Docker,
+                ..RuntimeConfig::default()
+            },
+            Some(dir.path().as_os_str()),
+        )
+        .unwrap();
+        let docker_command = docker_runtime
+            .build_shell_command("echo docker", &std::env::temp_dir())
+            .unwrap();
+        assert_eq!(
+            docker_command.as_std().get_program(),
+            docker.canonicalize().unwrap().as_os_str()
+        );
+    }
+
     #[test]
     fn factory_cloudflare_errors() {
         let cfg = RuntimeConfig {
@@ -184,10 +244,11 @@ mod tests {
         let cmd = rt
             .build_shell_command("echo hi", &std::env::temp_dir())
             .unwrap();
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("\"sh\""),
-            "default shell should be 'sh', got: {debug}"
+        let expected = crate::platform::resolve_executable(std::ffi::OsStr::new("sh")).unwrap();
+        assert_eq!(
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "default shell should use the resolved executable path"
         );
     }
 
@@ -206,8 +267,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validate_shell_rejects_nonexistent_absolute_path() {
-        let err = validate_shell("/no/such/shell/binary").unwrap_err();
+    fn native_build_rejects_nonexistent_absolute_path() {
+        let err = NativeRuntime::with_shell("/no/such/shell/binary".into())
+            .build_shell_command("echo test", &std::env::temp_dir())
+            .unwrap_err();
         assert!(
             err.to_string().contains("does not exist"),
             "error should name the missing path, got: {err}"
@@ -216,9 +279,11 @@ mod tests {
 
     #[cfg(all(unix, not(target_os = "android")))]
     #[test]
-    fn validate_shell_rejects_directory() {
+    fn native_build_rejects_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let err = validate_shell(dir.path().to_str().unwrap()).unwrap_err();
+        let err = NativeRuntime::with_shell(dir.path().to_string_lossy().into_owned())
+            .build_shell_command("echo test", &std::env::temp_dir())
+            .unwrap_err();
         assert!(
             err.to_string().contains("not a regular file"),
             "error should identify the non-file shell target, got: {err}"
@@ -243,8 +308,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validate_shell_rejects_bare_name_not_on_path() {
-        let err = validate_shell("zc-no-such-shell-on-path").unwrap_err();
+    fn native_build_rejects_bare_name_not_on_path() {
+        let err = NativeRuntime::with_shell("zc-no-such-shell-on-path".into())
+            .build_shell_command("echo test", &std::env::temp_dir())
+            .unwrap_err();
         assert!(
             err.to_string().contains("not found on PATH"),
             "error should mention PATH, got: {err}"
@@ -253,13 +320,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validate_shell_rejects_nonexecutable_file() {
+    fn native_build_rejects_nonexecutable_file() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("not-executable");
         std::fs::write(&file, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = validate_shell(file.to_str().unwrap()).unwrap_err();
+        let err = NativeRuntime::with_shell(file.to_string_lossy().into_owned())
+            .build_shell_command("echo test", &std::env::temp_dir())
+            .unwrap_err();
         assert!(
             err.to_string().contains("not executable"),
             "error should mention executability, got: {err}"

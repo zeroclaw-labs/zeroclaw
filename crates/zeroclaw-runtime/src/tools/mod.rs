@@ -167,6 +167,7 @@ use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
@@ -579,6 +580,16 @@ impl AllToolsResult {
     }
 }
 
+fn runtime_for_all_tools(
+    root_config: &zeroclaw_config::schema::Config,
+    tui_env: Option<&HashMap<String, String>>,
+) -> anyhow::Result<Arc<dyn RuntimeAdapter>> {
+    let tui_path = tui_env.and_then(|env| env.get("PATH")).map(OsStr::new);
+    Ok(Arc::from(
+        zeroclaw_config::platform::create_runtime_with_path(&root_config.runtime, tui_path)?,
+    ))
+}
+
 /// Create full tool registry including memory tools and optional Composio
 #[allow(
     clippy::implicit_hasher,
@@ -603,13 +614,14 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
-) -> AllToolsResult {
-    all_tools_with_runtime(
+) -> anyhow::Result<AllToolsResult> {
+    let runtime = runtime_for_all_tools(root_config, tui_env.as_ref())?;
+    Ok(all_tools_with_runtime(
         config,
         security,
         risk_profile,
         agent_alias,
-        Arc::new(NativeRuntime::new()),
+        runtime,
         memory,
         composio_key,
         composio_entity_id,
@@ -626,7 +638,7 @@ pub fn all_tools(
         None,
         None,
         None,
-    )
+    ))
 }
 
 /// Peer groups that include `agent_alias`, cloned from `config`. Used as the
@@ -2091,6 +2103,53 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_uses_canonical_configured_shell_from_tui_path() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let shell = tmp.path().join("all-tools-configured-shell");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut root_config = Config::default();
+        root_config.runtime.shell = Some("all-tools-configured-shell".to_string());
+        let path = std::env::join_paths([
+            OsString::new(),
+            OsString::from("relative-decoy"),
+            shell.parent().unwrap().as_os_str().to_os_string(),
+        ])
+        .unwrap();
+        let tui_env = HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+        let runtime = runtime_for_all_tools(&root_config, Some(&tui_env)).unwrap();
+        let command = runtime
+            .build_shell_command("echo all-tools", tmp.path())
+            .unwrap();
+
+        assert_eq!(
+            command.as_std().get_program(),
+            shell.canonicalize().unwrap().as_os_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tools_runtime_rejects_empty_or_relative_only_tui_path() {
+        use std::ffi::OsString;
+
+        for path in [OsString::new(), OsString::from("relative-only")] {
+            let mut root_config = Config::default();
+            root_config.runtime.shell = Some("all-tools-missing-shell".to_string());
+            let tui_env =
+                HashMap::from([("PATH".to_string(), path.to_string_lossy().into_owned())]);
+
+            assert!(runtime_for_all_tools(&root_config, Some(&tui_env)).is_err());
+        }
+    }
+
     #[cfg(feature = "plugins-wasm")]
     #[test]
     fn plugin_host_services_isolate_live_instance_keys() {
@@ -2708,6 +2767,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
 
         assert!(
@@ -2777,6 +2837,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
 
         let web_search = tools
@@ -2842,6 +2903,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -3775,6 +3837,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -3823,6 +3886,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -4046,6 +4110,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -4085,6 +4150,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
@@ -4126,6 +4192,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
@@ -4166,6 +4233,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
@@ -4200,6 +4268,7 @@ permissions = ["http_client"]
             is_subagent_caller,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools
         .iter()
         .map(|t| t.name().to_string())
@@ -4274,6 +4343,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -4337,6 +4407,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(
@@ -4382,6 +4453,7 @@ permissions = ["http_client"]
             false,
             None,
         )
+        .expect("all_tools test registry should build")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 

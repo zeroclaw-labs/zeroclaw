@@ -117,7 +117,7 @@ impl DirectCodingCliExecutor {
 #[async_trait]
 impl CodingCliExecutor for DirectCodingCliExecutor {
     async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
-        let mut process = Command::new(host_native_program(&command.program)?);
+        let mut process = Command::new(host_native_program_for_command(&command)?);
         process.args(&command.args);
         process.env_clear();
         for (key, value) in command.env {
@@ -141,33 +141,65 @@ pub fn host_native_program(program: &OsStr) -> Result<OsString, CodingCliExecuti
     }
 }
 
+pub fn host_native_program_for_command(
+    command: &CodingCliCommand,
+) -> Result<OsString, CodingCliExecutionError> {
+    #[cfg(target_os = "windows")]
+    {
+        host_native_windows_program(&command.program)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        match command
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == OsStr::new("PATH"))
+        {
+            Some((_, path)) => host_native_non_windows_program_with_path(
+                &command.program,
+                std::env::split_paths(path),
+            ),
+            None => host_native_non_windows_program(&command.program),
+        }
+    }
+}
+
 fn find_claude_on_path() -> Option<OsString> {
     which::which("claude")
         .ok()
         .map(|path| path.into_os_string())
 }
 
-fn missing_claude_error() -> CodingCliExecutionError {
-    CodingCliExecutionError::Prepare(anyhow::Error::msg(
-        "Claude Code executable 'claude' was not found on PATH before applying the workspace working directory",
-    ))
-}
-
 fn host_native_non_windows_program(program: &OsStr) -> Result<OsString, CodingCliExecutionError> {
-    host_native_non_windows_program_with(program, find_claude_on_path)
+    zeroclaw_config::platform::resolve_executable(program)
+        .map(|path| path.into_os_string())
+        .map_err(|error| {
+            let detail = error.to_string();
+            CodingCliExecutionError::Prepare(anyhow::Error::new(error).context(format!(
+                "Unix coding CLI executable {program:?} could not be resolved before applying the workspace working directory: {detail}"
+            )))
+        })
 }
 
-fn host_native_non_windows_program_with<F>(
+#[cfg(not(target_os = "windows"))]
+fn host_native_non_windows_program_with_path<I, P>(
     program: &OsStr,
-    find_claude: F,
+    path_entries: I,
 ) -> Result<OsString, CodingCliExecutionError>
 where
-    F: FnOnce() -> Option<OsString>,
+    I: IntoIterator<Item = P>,
+    P: AsRef<std::path::Path>,
 {
-    match program.to_str() {
-        Some("claude") => find_claude().ok_or_else(missing_claude_error),
-        _ => Ok(program.to_os_string()),
-    }
+    zeroclaw_config::platform::resolve_executable_with_path(program, path_entries)
+        .map(|path| path.into_os_string())
+        .map_err(|error| {
+            let detail = error.to_string();
+            CodingCliExecutionError::Prepare(anyhow::Error::new(error).context(format!(
+                "Unix coding CLI executable {program:?} could not be resolved before applying the workspace working directory: {detail}"
+            )))
+        })
 }
 
 fn host_native_windows_program(program: &OsStr) -> Result<OsString, CodingCliExecutionError> {
@@ -274,36 +306,59 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn host_native_program_leaves_names_neutral_on_non_windows() {
-        if !cfg!(target_os = "windows") {
-            assert_eq!(
-                host_native_program(OsStr::new("codex")).unwrap(),
-                OsString::from("codex")
-            );
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("codex");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            host_native_non_windows_program_with_path(OsStr::new("codex"), [dir.path()]).unwrap(),
+            program.canonicalize().unwrap().into_os_string()
+        );
     }
 
     #[test]
-    fn host_native_non_windows_program_resolves_claude_before_workspace_cwd() {
+    #[cfg(not(target_os = "windows"))]
+    fn host_native_non_windows_program_resolves_every_program_before_workspace_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("claude");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
-            host_native_non_windows_program_with(OsStr::new("claude"), || Some(OsString::from(
-                "/usr/local/bin/claude"
-            )))
-            .unwrap(),
-            OsString::from("/usr/local/bin/claude")
+            host_native_non_windows_program_with_path(OsStr::new("claude"), [dir.path()]).unwrap(),
+            program.canonicalize().unwrap().into_os_string()
         );
-        let error = host_native_non_windows_program_with(OsStr::new("claude"), || None)
-            .expect_err("unresolved Unix Claude path should fail closed");
+        let error = host_native_non_windows_program_with_path(
+            OsStr::new("missing-coding-cli"),
+            [dir.path()],
+        )
+        .expect_err("unresolved Unix Claude path should fail closed");
         assert!(
             error.to_string().contains("was not found on PATH"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn command_specific_path_is_authoritative_for_launcher_resolution() {
+        let first = tempfile::tempdir().unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        let program = selected.path().join("codex");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut command = CodingCliCommand::new("codex", PathBuf::from("."), 5);
+        command.env("PATH", first.path().as_os_str());
+        command.env("PATH", selected.path().as_os_str());
+
         assert_eq!(
-            host_native_non_windows_program_with(OsStr::new("codex"), || Some(OsString::from(
-                "/tmp/claude"
-            )))
-            .unwrap(),
-            OsString::from("codex")
+            host_native_program_for_command(&command).unwrap(),
+            program.canonicalize().unwrap().into_os_string()
         );
     }
 

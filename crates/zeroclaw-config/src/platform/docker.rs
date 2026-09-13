@@ -27,11 +27,27 @@ pub enum DockerWorkspaceMountError {
 #[derive(Debug, Clone)]
 pub struct DockerRuntime {
     config: DockerRuntimeConfig,
+    /// Absolute launcher resolved by the TUI-aware runtime factory, when one
+    /// was supplied. Ambient callers continue resolving at command build time.
+    resolved_launcher: Option<PathBuf>,
 }
 
 impl DockerRuntime {
     pub fn new(config: DockerRuntimeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolved_launcher: None,
+        }
+    }
+
+    pub(crate) fn with_resolved_launcher(
+        config: DockerRuntimeConfig,
+        resolved_launcher: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            config,
+            resolved_launcher,
+        }
     }
 
     fn workspace_mount_path(&self, workspace_dir: &Path) -> Result<PathBuf> {
@@ -82,13 +98,58 @@ impl DockerRuntime {
         Ok(resolved)
     }
 
+    fn validated_workspace_mount(&self, workspace_dir: &Path) -> Result<Option<PathBuf>> {
+        if !self.config.mount_workspace {
+            return Ok(None);
+        }
+
+        self.workspace_mount_path(workspace_dir)
+            .with_context(|| {
+                format!(
+                    "Failed to validate workspace mount path {}",
+                    workspace_dir.display()
+                )
+            })
+            .map(Some)
+    }
+
     fn build_shell_command_inner(
         &self,
         command: &str,
         workspace_dir: &Path,
         env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("docker");
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+
+        #[cfg(unix)]
+        let docker = if let Some(resolved_launcher) = &self.resolved_launcher {
+            resolved_launcher.clone()
+        } else {
+            crate::platform::resolve_executable(OsStr::new("docker")).map_err(|error| {
+                anyhow::Error::new(error).context(
+                    "Docker runtime launcher could not be resolved before command construction",
+                )
+            })?
+        };
+        #[cfg(not(unix))]
+        let docker = PathBuf::from("docker");
+
+        self.build_shell_command_with_launcher(
+            command,
+            host_workspace.as_deref(),
+            env_keys,
+            &docker,
+        )
+    }
+
+    fn build_shell_command_with_launcher(
+        &self,
+        command: &str,
+        host_workspace: Option<&Path>,
+        env_keys: &[&OsStr],
+        docker: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let mut process = tokio::process::Command::new(docker);
         process
             .arg("run")
             .arg("--rm")
@@ -117,14 +178,7 @@ impl DockerRuntime {
             process.arg("--env").arg(key);
         }
 
-        if self.config.mount_workspace {
-            let host_workspace = self.workspace_mount_path(workspace_dir).with_context(|| {
-                format!(
-                    "Failed to validate workspace mount path {}",
-                    workspace_dir.display()
-                )
-            })?;
-
+        if let Some(host_workspace) = host_workspace {
             process
                 .arg("--volume")
                 .arg(format!("{}:/workspace:rw", host_workspace.display()))
@@ -139,6 +193,37 @@ impl DockerRuntime {
             .arg(command);
 
         Ok(process)
+    }
+
+    #[cfg(test)]
+    fn build_shell_command_for_test(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+        self.build_shell_command_with_launcher(
+            command,
+            host_workspace.as_deref(),
+            &[],
+            Path::new("docker"),
+        )
+    }
+
+    #[cfg(test)]
+    fn build_shell_command_with_env_keys_for_test(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+        self.build_shell_command_with_launcher(
+            command,
+            host_workspace.as_deref(),
+            env_keys,
+            Path::new("docker"),
+        )
     }
 }
 
@@ -199,6 +284,38 @@ impl RuntimeAdapter for DockerRuntime {
     ) -> anyhow::Result<tokio::process::Command> {
         self.build_shell_command_inner(command, workspace_dir, env_keys)
     }
+
+    fn build_shell_command_with_effective_path(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        effective_path: Option<&OsStr>,
+    ) -> anyhow::Result<tokio::process::Command> {
+        #[cfg(unix)]
+        if let Some(path) = effective_path {
+            let host_workspace = self.validated_workspace_mount(workspace_dir)?;
+            let resolved_launcher = crate::platform::resolve_executable_with_path(
+                OsStr::new("docker"),
+                std::env::split_paths(path),
+            )
+            .map_err(|error| {
+                anyhow::Error::new(error).context(
+                    "Docker runtime launcher could not be resolved in the effective child PATH",
+                )
+            })?;
+            return self.build_shell_command_with_launcher(
+                command,
+                host_workspace.as_deref(),
+                &[],
+                &resolved_launcher,
+            );
+        }
+
+        #[cfg(not(unix))]
+        let _ = effective_path;
+
+        self.build_shell_command(command, workspace_dir)
+    }
 }
 
 #[cfg(test)]
@@ -242,7 +359,7 @@ mod tests {
 
         let workspace = std::env::temp_dir();
         let command = runtime
-            .build_shell_command("echo hello", &workspace)
+            .build_shell_command_for_test("echo hello", &workspace)
             .unwrap();
         let debug = format!("{command:?}");
 
@@ -266,7 +383,7 @@ mod tests {
         let secret_value = "secret-value-should-not-appear-in-docker-args";
 
         let command = runtime
-            .build_shell_command_with_env_keys(
+            .build_shell_command_with_env_keys_for_test(
                 "printf '%s' \"$ZC_CLI_TOKEN\"",
                 &std::env::temp_dir(),
                 &[
@@ -292,7 +409,7 @@ mod tests {
             ..DockerRuntimeConfig::default()
         });
 
-        let result = runtime.build_shell_command_with_env_keys(
+        let result = runtime.build_shell_command_with_env_keys_for_test(
             "echo hello",
             &std::env::temp_dir(),
             &[std::ffi::OsStr::new("ZC_CLI_TOKEN=secret")],
@@ -313,7 +430,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
 
         let err = runtime
-            .build_shell_command("echo test", outside.path())
+            .build_shell_command_for_test("echo test", outside.path())
             .unwrap_err();
         let message = format!("{err:#}");
 
@@ -339,7 +456,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
 
         let err = runtime
-            .build_shell_command("echo test", &workspace)
+            .build_shell_command_for_test("echo test", &workspace)
             .unwrap_err();
         let message = format!("{err:#}");
 
@@ -365,7 +482,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
 
         let err = runtime
-            .build_shell_command("echo test", &workspace)
+            .build_shell_command_for_test("echo test", &workspace)
             .unwrap_err();
         let message = format!("{err:#}");
 
@@ -387,7 +504,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
 
         let command = runtime
-            .build_shell_command("echo test", &workspace)
+            .build_shell_command_for_test("echo test", &workspace)
             .unwrap();
         let canonical_workspace = workspace.canonicalize().unwrap();
         let expected_mount = format!("{}:/workspace:rw", canonical_workspace.display());
@@ -411,7 +528,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
         let workspace = std::env::temp_dir();
         let cmd = runtime
-            .build_shell_command("echo hello", &workspace)
+            .build_shell_command_for_test("echo hello", &workspace)
             .unwrap();
         let debug = format!("{cmd:?}");
         assert!(
@@ -429,7 +546,7 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
         let workspace = std::env::temp_dir();
         let cmd = runtime
-            .build_shell_command("echo hello", &workspace)
+            .build_shell_command_for_test("echo hello", &workspace)
             .unwrap();
         let debug = format!("{cmd:?}");
         assert!(
@@ -446,7 +563,7 @@ mod tests {
             ..DockerRuntimeConfig::default()
         };
         let runtime = DockerRuntime::new(cfg);
-        let result = runtime.build_shell_command("echo test", Path::new("/"));
+        let result = runtime.build_shell_command_for_test("echo test", Path::new("/"));
         assert!(
             result.is_err(),
             "mounting filesystem root (/) must be refused"
@@ -467,12 +584,64 @@ mod tests {
         let runtime = DockerRuntime::new(cfg);
         let workspace = std::env::temp_dir();
         let cmd = runtime
-            .build_shell_command("echo hello", &workspace)
+            .build_shell_command_for_test("echo hello", &workspace)
             .unwrap();
         let debug = format!("{cmd:?}");
         assert!(
             !debug.contains("--memory"),
             "should not include --memory when not configured"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_effective_path_uses_injected_absolute_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("docker");
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = DockerRuntime::new(DockerRuntimeConfig {
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        });
+
+        let path = std::env::join_paths([
+            PathBuf::new(),
+            PathBuf::from("relative-decoy"),
+            dir.path().to_path_buf(),
+        ])
+        .unwrap();
+        let command = runtime
+            .build_shell_command_with_effective_path(
+                "echo hello",
+                dir.path(),
+                Some(path.as_os_str()),
+            )
+            .unwrap();
+        assert_eq!(
+            command.as_std().get_program(),
+            launcher.canonicalize().unwrap().as_os_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_effective_path_rejects_empty_and_relative_only_values() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        for path in [
+            std::ffi::OsString::new(),
+            std::ffi::OsString::from("relative-only"),
+        ] {
+            let error = runtime
+                .build_shell_command_with_effective_path(
+                    "echo hello",
+                    &std::env::temp_dir(),
+                    Some(path.as_os_str()),
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("not found on PATH"));
+        }
     }
 }
