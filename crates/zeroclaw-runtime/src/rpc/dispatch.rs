@@ -10925,8 +10925,10 @@ mod tests {
             .set_session_prompt(&format!("rpc_{sid}"), "task", "original context")
             .unwrap();
         // Freeze the per-ID lifecycle boundary, then queue deletion followed
-        // by same-ID session/new. The latter must not install until the delete
-        // has completed, even though it replaces the caller-supplied ID.
+        // by a same-ID cross-mode session/new. A same-mode `session/new`
+        // intentionally resumes before queue admission, so it cannot model a
+        // replacement here. The cross-mode request must not install until the
+        // delete has completed, even though it replaces the caller-supplied ID.
         let guard = sessions.session_queue.acquire(sid).await.unwrap();
         let dispatcher = Arc::new(dispatcher);
         let delete_dispatcher = dispatcher.clone();
@@ -10943,6 +10945,7 @@ mod tests {
             new_dispatcher
                 .handle_session_new_for_test(&json!({
                     "agent_alias": "test-agent",
+                    "chat_mode": "acp",
                     "session_id": sid,
                 }))
                 .await
