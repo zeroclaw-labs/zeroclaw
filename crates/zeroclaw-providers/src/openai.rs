@@ -968,6 +968,7 @@ pub(crate) async fn run_responses_sse(
     .await;
 }
 
+#[derive(Clone)]
 pub struct OpenAiResponsesModelProvider {
     alias: String,
     responses_url: String,
@@ -1336,12 +1337,10 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let messages_owned = request.messages.to_vec();
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
-        let responses_url = self.responses_url.clone();
         let count_tokens = options.count_tokens;
-        let reasoning_effort = self.reasoning_effort.clone();
-        let max_tokens = self.max_tokens;
         let client = self.streaming_client();
         let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
+        let provider = self.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1353,24 +1352,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             };
             let tools = convert_tools(tools_owned.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = has_responses_tools(tools.as_deref());
-            let reasoning = reasoning_effort
-                .as_deref()
-                .map(|effort| ResponsesApiReasoning {
-                    effort: effort.to_string(),
-                });
-            let req = ResponsesApiRequest {
-                model,
-                input,
-                instructions,
-                stream: true,
-                tools,
-                tool_choice: has_tools.then(|| "auto".to_string()),
-                parallel_tool_calls: has_tools.then_some(true),
-                temperature,
-                max_output_tokens: max_tokens,
-                reasoning,
-            };
+            let req = provider.build_request(instructions, input, tools, &model, temperature, true);
             if let Some(alias) = alias.as_deref() {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -1390,7 +1372,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             }
 
             let request_builder = client
-                .post(&responses_url)
+                .post(&provider.responses_url)
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("Accept", "text/event-stream")
                 .json(&req);
