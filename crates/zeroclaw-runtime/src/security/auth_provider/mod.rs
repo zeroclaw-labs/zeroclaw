@@ -134,7 +134,7 @@ pub trait AuthProvider: Send + Sync {
 /// The configured set of providers, selected by name. **Default-deny**: an
 /// empty registry rejects everything, an unknown selection rejects, a
 /// mis-kinded credential rejects, and a selected provider's denial is final.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn AuthProvider>>,
     by_name: HashMap<String, usize>,

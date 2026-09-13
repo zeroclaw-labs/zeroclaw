@@ -21,8 +21,12 @@
 //! and roster edits reach established connections at their next privileged
 //! operation.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use parking_lot::RwLock;
 
 use zeroclaw_api::grants::ResolvedGrants;
 use zeroclaw_api::jsonrpc::error_codes::{AUTH_REQUIRED, FORBIDDEN};
@@ -37,7 +41,7 @@ use crate::security::auth_provider::{
     Credential, NativeAuthProvider, OidcAuthProvider, PeercredAuthProvider, ProviderRegistry,
     UidRoster,
 };
-use crate::security::principal_resolver::PrincipalResolver;
+use crate::security::principal_resolver::{PrincipalResolver, ResolvedPrincipal, ResolverPolicy};
 
 /// The authenticated state one connection holds after `initialize`.
 /// Grants are a stamped resolution, not a snapshot: the gate re-resolves
@@ -57,6 +61,24 @@ pub struct ConnectionAuth {
     /// authenticated with one — non-secret evidence for live revocation
     /// checks against the pairing authority. Never the bearer itself.
     pub native_token_hash: Option<String>,
+    /// Non-secret evidence that can be rechecked after a policy generation
+    /// changes. Bearers themselves never outlive initialize.
+    pub local_evidence: LocalCredentialEvidence,
+}
+
+/// Only non-secret, local authentication evidence retained on a connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalCredentialEvidence {
+    /// Live pairing membership is rechecked by the retained SHA-256 hash.
+    NativeTokenHash,
+    /// The kernel-supplied uid is reclassified against the accepted roster.
+    Peercred { uid: u32 },
+    /// Legacy local shared-operator mode remains valid only while no roster
+    /// exists in the accepted policy.
+    LocalCompatibility,
+    /// An OIDC verifier policy change invalidates the connection: the bearer
+    /// is deliberately not retained, so the client must initialize again.
+    Oidc,
 }
 
 /// A handshake or authorization denial, pre-mapped to its JSON-RPC error.
@@ -83,29 +105,34 @@ impl AuthDenied {
 
     pub(crate) fn from_deny_reason(reason: DenyReason) -> Self {
         match reason {
-            DenyReason::NoCredential => Self::auth_required(
-                "Authentication required: present auth_token in initialize, or connect \
-                 from a mapped local uid",
+            DenyReason::NoCredential => Self::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-required-token",
+            )),
+            DenyReason::BadCredential => Self::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-credential-rejected",
+            )),
+            DenyReason::TokenExpired => Self::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-credential-expired",
+            )),
+            DenyReason::MfaRequired => Self::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-assurance-required",
+            )),
+            DenyReason::UnknownProvider => Self::auth_required(
+                crate::i18n::get_required_cli_string("rpc-auth-unknown-provider"),
             ),
-            DenyReason::BadCredential => Self::auth_required("Credential rejected"),
-            DenyReason::TokenExpired => {
-                Self::auth_required("Credential expired: re-initialize with a fresh token")
-            }
-            DenyReason::MfaRequired => {
-                Self::auth_required("Authentication assurance not met (MFA/ACR required)")
-            }
-            DenyReason::UnknownProvider => Self::auth_required("Unknown auth_provider selection"),
-            DenyReason::NotEntitled => Self::forbidden(
-                "Authenticated, but no permission profile grants this identity anything",
-            ),
-            DenyReason::AliasNotEntitled => {
-                Self::forbidden("Principal is not entitled to the requested agent")
-            }
-            DenyReason::Misconfigured => {
-                Self::forbidden("Authentication is misconfigured on this daemon (fail closed)")
-            }
+            DenyReason::NotEntitled => Self::forbidden(crate::i18n::get_required_cli_string(
+                "rpc-auth-not-entitled",
+            )),
+            DenyReason::AliasNotEntitled => Self::forbidden(crate::i18n::get_required_cli_string(
+                "rpc-auth-alias-not-entitled",
+            )),
+            DenyReason::Misconfigured => Self::forbidden(crate::i18n::get_required_cli_string(
+                "rpc-auth-misconfigured",
+            )),
             // DenyReason is non_exhaustive; anything unknown fails closed.
-            _ => Self::auth_required("Credential rejected"),
+            _ => Self::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-credential-rejected",
+            )),
         }
     }
 }
@@ -113,30 +140,29 @@ impl AuthDenied {
 /// The daemon's inbound-auth layer: providers, resolver, and live local
 /// bindings. One instance per daemon generation, shared by every
 /// connection.
-pub struct RpcInboundAuth {
+struct AcceptedAuthState {
     registry: ProviderRegistry,
     resolver: PrincipalResolver,
     uid_roster: Arc<UidRoster>,
-    pairing: Arc<PairingGuard>,
-    /// Whether any `[users]` roster entry exists in the CURRENT policy —
-    /// once true, the no-credential local compatibility path is closed.
-    local_roster_configured: AtomicBool,
-    /// Live view of `security.trust_daemon_uid`, shared with the peercred
-    /// provider so narrowing it applies without restart.
+    local_roster_configured: bool,
     trust_daemon_uid: Arc<AtomicBool>,
+    daemon_uid: u32,
+    deny_all: bool,
 }
 
-impl RpcInboundAuth {
-    /// Build from a validated config and the daemon's canonical live
-    /// pairing authority (the same instance the gateway serves `/pair`
-    /// and revocation from).
-    pub fn from_config(config: &Config, pairing: Arc<PairingGuard>) -> anyhow::Result<Self> {
+impl AcceptedAuthState {
+    fn from_config(
+        config: &Config,
+        pairing: Arc<PairingGuard>,
+        generation: u64,
+    ) -> anyhow::Result<Self> {
         let uid_roster = Arc::new(UidRoster::from_config(config));
         let trust_daemon_uid = Arc::new(AtomicBool::new(config.security.trust_daemon_uid));
+        let daemon_uid = PeercredAuthProvider::current_process_uid();
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(NativeAuthProvider::new(Arc::clone(&pairing))))?;
         registry.register(Arc::new(PeercredAuthProvider::new(
-            PeercredAuthProvider::current_process_uid(),
+            daemon_uid,
             Arc::clone(&trust_daemon_uid),
             Arc::clone(&uid_roster),
         )))?;
@@ -148,14 +174,111 @@ impl RpcInboundAuth {
                 config.oidc[alias].clone(),
             )?))?;
         }
-        // An invalid auth config must never become a serving policy, but
-        // refusing to boot would also refuse the repair. Install an EMPTY
-        // policy instead: every principal resolution then fails closed (no
-        // roster, no mappings, no grants) until a valid reload lands, so the
-        // daemon boots to be repaired while ordinary privileged
-        // authentication stays denied.
-        let resolver = match PrincipalResolver::from_config(config) {
-            Ok(resolver) => resolver,
+        Ok(Self {
+            registry,
+            resolver: PrincipalResolver::with_generation(
+                ResolverPolicy::from_config(config)?,
+                generation,
+            ),
+            uid_roster,
+            local_roster_configured: !config.users.is_empty(),
+            trust_daemon_uid,
+            daemon_uid,
+            deny_all: false,
+        })
+    }
+
+    fn deny_all(config: &Config, pairing: Arc<PairingGuard>, generation: u64) -> Self {
+        let daemon_uid = PeercredAuthProvider::current_process_uid();
+        let uid_roster = Arc::new(UidRoster::from_config(config));
+        let trust_daemon_uid = Arc::new(AtomicBool::new(false));
+        let mut registry = ProviderRegistry::new();
+        // These providers keep the handshake surface stable while resolution
+        // below denies every identity until a valid auth policy is accepted.
+        registry
+            .register(Arc::new(NativeAuthProvider::new(pairing)))
+            .expect("unique native provider");
+        registry
+            .register(Arc::new(PeercredAuthProvider::new(
+                daemon_uid,
+                Arc::clone(&trust_daemon_uid),
+                Arc::clone(&uid_roster),
+            )))
+            .expect("unique peercred provider");
+        Self {
+            registry,
+            resolver: PrincipalResolver::with_generation(ResolverPolicy::default(), generation),
+            uid_roster,
+            local_roster_configured: true,
+            trust_daemon_uid,
+            daemon_uid,
+            deny_all: true,
+        }
+    }
+
+    fn resolve(&self, identity: &AuthenticatedIdentity) -> Result<ResolvedPrincipal, DenyReason> {
+        if self.deny_all {
+            return Err(DenyReason::NotEntitled);
+        }
+        self.resolver.resolve(identity)
+    }
+
+    fn revalidates_local_evidence(
+        &self,
+        identity: &AuthenticatedIdentity,
+        evidence: &LocalCredentialEvidence,
+        native_token_hash: Option<&str>,
+        pairing: &PairingGuard,
+    ) -> Result<(), DenyReason> {
+        let reverified = match evidence {
+            LocalCredentialEvidence::NativeTokenHash => native_token_hash
+                .is_some_and(|hash| pairing.token_hash_is_paired(hash))
+                .then(|| AuthenticatedIdentity::shared_operator(AuthMethod::Native)),
+            LocalCredentialEvidence::Peercred { uid }
+                if *uid == self.daemon_uid && self.trust_daemon_uid.load(Ordering::Relaxed) =>
+            {
+                Some(AuthenticatedIdentity::shared_operator(AuthMethod::Peercred))
+            }
+            LocalCredentialEvidence::Peercred { uid } => {
+                self.uid_roster.principal_id_for(*uid).map(|principal_id| {
+                    AuthenticatedIdentity::new(
+                        zeroclaw_api::principal::IdentitySubject::Roster { principal_id },
+                        AuthMethod::Peercred,
+                    )
+                })
+            }
+            LocalCredentialEvidence::LocalCompatibility if !self.local_roster_configured => Some(
+                AuthenticatedIdentity::shared_operator(AuthMethod::SharedOperator),
+            ),
+            // A changed OIDC verifier must not keep accepting an identity
+            // verified under a prior policy; the bearer is not retained.
+            LocalCredentialEvidence::Oidc => None,
+            _ => None,
+        };
+        match reverified {
+            Some(reverified)
+                if reverified.subject == identity.subject
+                    && reverified.method == identity.method =>
+            {
+                Ok(())
+            }
+            _ => Err(DenyReason::BadCredential),
+        }
+    }
+}
+
+/// The daemon's inbound-auth layer. The accepted state is a single snapshot:
+/// registry, resolver/generation, uid roster, and local trust posture are
+/// rebuilt and published together or not at all.
+pub struct RpcInboundAuth {
+    state: RwLock<Arc<AcceptedAuthState>>,
+    pairing: Arc<PairingGuard>,
+}
+
+impl RpcInboundAuth {
+    pub fn from_config(config: &Config, pairing: Arc<PairingGuard>) -> anyhow::Result<Self> {
+        let state = match AcceptedAuthState::from_config(config, Arc::clone(&pairing), 1) {
+            Ok(state) => state,
             Err(error) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -164,20 +287,13 @@ impl RpcInboundAuth {
                         .with_attrs(::serde_json::json!({ "error": format!("{error}") })),
                     "Authorization config is invalid; installing a deny-all policy until it is repaired and reloaded"
                 );
-                PrincipalResolver::new(
-                    crate::security::principal_resolver::ResolverPolicy::default(),
-                )
+                AcceptedAuthState::deny_all(config, Arc::clone(&pairing), 1)
             }
         };
-        let auth = Self {
-            registry,
-            resolver,
-            uid_roster,
+        Ok(Self {
+            state: RwLock::new(Arc::new(state)),
             pairing,
-            local_roster_configured: AtomicBool::new(!config.users.is_empty()),
-            trust_daemon_uid,
-        };
-        Ok(auth)
+        })
     }
 
     /// Test-only permissive layer: empty auth config, fresh pairing guard.
@@ -190,9 +306,21 @@ impl RpcInboundAuth {
         Arc::new(Self::from_config(config, pairing).expect("test auth config is valid"))
     }
 
-    /// The shared resolver (generation source).
-    pub fn resolver(&self) -> &PrincipalResolver {
-        &self.resolver
+    fn state(&self) -> Arc<AcceptedAuthState> {
+        Arc::clone(&self.state.read())
+    }
+
+    /// Current authorization generation from the accepted snapshot.
+    pub fn generation(&self) -> u64 {
+        self.state().resolver.generation()
+    }
+
+    /// Resolve against one coherent accepted snapshot.
+    pub fn resolve(
+        &self,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<ResolvedPrincipal, DenyReason> {
+        self.state().resolve(identity)
     }
 
     /// The live pairing authority, for per-operation revocation checks.
@@ -202,7 +330,8 @@ impl RpcInboundAuth {
 
     /// The handshake's advertised provider names.
     pub fn provider_names(&self) -> Vec<String> {
-        self.registry
+        self.state()
+            .registry
             .names()
             .into_iter()
             .map(str::to_owned)
@@ -218,13 +347,37 @@ impl RpcInboundAuth {
     /// invalid it returns the error and nothing here changes — the previous
     /// policy, roster, flags, and generation all stay in effect.
     pub fn refresh_from_config(&self, config: &Config) -> anyhow::Result<u64> {
-        let generation = self.resolver.replace_from_config(config)?;
-        self.uid_roster.replace_from_config(config);
-        self.local_roster_configured
-            .store(!config.users.is_empty(), Ordering::Release);
-        self.trust_daemon_uid
-            .store(config.security.trust_daemon_uid, Ordering::Release);
+        let mut slot = self.state.write();
+        let generation = slot.resolver.generation().saturating_add(1);
+        let next = AcceptedAuthState::from_config(config, Arc::clone(&self.pairing), generation)?;
+        *slot = Arc::new(next);
         Ok(generation)
+    }
+
+    /// Prove that an auth snapshot can be compiled before a caller persists
+    /// a config edit. The caller still uses [`Self::refresh_from_config`] to
+    /// publish it after the save boundary.
+    pub fn validate_refresh_from_config(&self, config: &Config) -> anyhow::Result<()> {
+        let generation = self.generation().saturating_add(1);
+        let _ = AcceptedAuthState::from_config(config, Arc::clone(&self.pairing), generation)?;
+        Ok(())
+    }
+
+    /// Recheck non-secret local evidence and resolve one newly accepted
+    /// generation. OIDC changes require initialize because this stage never
+    /// retains the bearer that could be reverified.
+    pub fn revalidate_and_resolve(
+        &self,
+        auth: &ConnectionAuth,
+    ) -> Result<ResolvedPrincipal, DenyReason> {
+        let state = self.state();
+        state.revalidates_local_evidence(
+            &auth.identity,
+            &auth.local_evidence,
+            auth.native_token_hash.as_deref(),
+            &self.pairing,
+        )?;
+        state.resolve(&auth.identity)
     }
 
     /// Authenticate one `initialize` handshake into a [`ConnectionAuth`].
@@ -235,7 +388,8 @@ impl RpcInboundAuth {
         auth_token: Option<&str>,
         auth_provider: Option<&str>,
     ) -> Result<ConnectionAuth, AuthDenied> {
-        let (outcome, native_token_hash) = if let Some(token) = auth_token {
+        let state = self.state();
+        let (outcome, native_token_hash, local_evidence) = if let Some(token) = auth_token {
             // Explicit credential wins over the transport-intrinsic one.
             // Unnamed bearers select the native pairing provider — a fixed
             // default, not a scan.
@@ -243,13 +397,22 @@ impl RpcInboundAuth {
             let credential = Credential::Bearer(token.to_owned());
             let hash = (selection == "native").then(|| PairingGuard::token_hash(token));
             (
-                self.registry.resolve_named(selection, &credential).await,
+                state.registry.resolve_named(selection, &credential).await,
                 hash,
+                if selection == "native" {
+                    LocalCredentialEvidence::NativeTokenHash
+                } else {
+                    LocalCredentialEvidence::Oidc
+                },
             )
         } else if transport_credential.is_transport_intrinsic() {
             (
-                self.registry.route_transport(&transport_credential).await,
+                state.registry.route_transport(&transport_credential).await,
                 None,
+                match transport_credential {
+                    Credential::Peercred { uid } => LocalCredentialEvidence::Peercred { uid },
+                    _ => unreachable!(),
+                },
             )
         } else {
             match transport {
@@ -258,21 +421,21 @@ impl RpcInboundAuth {
                 // the credential and the connection is the shared
                 // operator. The moment a roster exists this path closes —
                 // a failed or absent credential never falls back.
-                TransportKind::Local if !self.local_roster_configured.load(Ordering::Acquire) => (
+                TransportKind::Local if !state.local_roster_configured => (
                     AuthOutcome::Verified(AuthenticatedIdentity::shared_operator(
                         AuthMethod::SharedOperator,
                     )),
                     None,
+                    LocalCredentialEvidence::LocalCompatibility,
                 ),
                 TransportKind::Local => {
                     return Err(AuthDenied::auth_required(
-                        "A local user roster is configured: connect from a mapped uid or \
-                         present auth_token in initialize",
+                        crate::i18n::get_required_cli_string("rpc-auth-local-roster-required"),
                     ));
                 }
                 TransportKind::Wss => {
                     return Err(AuthDenied::auth_required(
-                        "Remote connections must present auth_token in initialize",
+                        crate::i18n::get_required_cli_string("rpc-auth-remote-token-required"),
                     ));
                 }
             }
@@ -282,8 +445,7 @@ impl RpcInboundAuth {
             AuthOutcome::Verified(identity) => identity,
             AuthOutcome::Denied { reason } => return Err(AuthDenied::from_deny_reason(reason)),
         };
-        let resolved = self
-            .resolver
+        let resolved = state
             .resolve(&identity)
             .map_err(AuthDenied::from_deny_reason)?;
         Ok(ConnectionAuth {
@@ -292,6 +454,7 @@ impl RpcInboundAuth {
             grants: resolved.grants,
             generation: resolved.generation,
             native_token_hash,
+            local_evidence,
         })
     }
 }
@@ -301,7 +464,7 @@ mod tests {
     use super::*;
     use zeroclaw_api::grants::{Resource, Verb};
     use zeroclaw_api::principal::{ActorKind, PrincipalId};
-    use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+    use zeroclaw_config::schema::{OidcConfig, PermissionProfileConfig, UserConfig};
 
     fn base_config() -> Config {
         Config::default()
@@ -448,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_bumps_generation_and_rebinds_the_roster() {
         let auth = auth_for(&config_with_roster(4242), &[]);
-        let before = auth.resolver().generation();
+        let before = auth.generation();
         // Roster entry removed: local no-credential path stays CLOSED?
         // No — with the roster gone the compatibility path reopens, and
         // the previously mapped uid loses its principal.
@@ -468,6 +631,94 @@ mod tests {
         assert_eq!(
             denied.code, AUTH_REQUIRED,
             "unbound uid denies after refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_refresh_preserves_the_complete_accepted_snapshot() {
+        let config = config_with_roster(4242);
+        let auth = auth_for(&config, &[]);
+        let before_generation = auth.generation();
+        let before_names = auth.provider_names();
+
+        let mut rejected = config;
+        rejected.users.clear();
+        rejected.security.trust_daemon_uid = false;
+        rejected.oidc.insert("broken".into(), OidcConfig::default());
+        assert!(auth.refresh_from_config(&rejected).is_err());
+        assert_eq!(auth.generation(), before_generation);
+        assert_eq!(auth.provider_names(), before_names);
+        assert!(
+            auth.authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .is_ok(),
+            "a rejected candidate must not leak its roster or trust changes"
+        );
+    }
+
+    #[test]
+    fn refresh_rebuilds_the_live_oidc_provider_registry() {
+        let auth = auth_for(&config_with_roster(4242), &[]);
+        assert!(!auth.provider_names().iter().any(|name| name == "oidc.corp"));
+
+        let mut with_oidc = config_with_roster(4242);
+        with_oidc.oidc.insert(
+            "corp".into(),
+            OidcConfig {
+                issuer: "https://sso.example.com".into(),
+                audience: "zeroclaw".into(),
+                claim_path: "groups".into(),
+                profile_map: std::collections::HashMap::from([("ops".into(), "operator".into())]),
+                ..OidcConfig::default()
+            },
+        );
+        auth.refresh_from_config(&with_oidc)
+            .expect("valid OIDC config refreshes");
+        assert!(auth.provider_names().iter().any(|name| name == "oidc.corp"));
+
+        auth.refresh_from_config(&config_with_roster(4242))
+            .expect("valid OIDC removal refreshes");
+        assert!(!auth.provider_names().iter().any(|name| name == "oidc.corp"));
+    }
+
+    #[tokio::test]
+    async fn invalid_startup_denies_shared_operator_routes() {
+        let mut invalid = base_config();
+        invalid.oidc.insert("broken".into(), OidcConfig::default());
+        let auth = auth_for(&invalid, &["zc_tok"]);
+        for (transport, token) in [
+            (TransportKind::Local, None),
+            (TransportKind::Wss, Some("zc_tok")),
+        ] {
+            auth.authenticate(transport, Credential::None, token, None)
+                .await
+                .expect_err("invalid startup policy must deny every principal");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_peercred_is_reverified_before_grants_are_reused() {
+        let config = config_with_roster(4242);
+        let auth = auth_for(&config, &[]);
+        let conn = auth
+            .authenticate(
+                TransportKind::Local,
+                Credential::Peercred { uid: 4242 },
+                None,
+                None,
+            )
+            .await
+            .expect("initial peer credential");
+        auth.refresh_from_config(&base_config())
+            .expect("valid replacement policy");
+        assert!(
+            auth.revalidate_and_resolve(&conn).is_err(),
+            "a removed uid cannot retain old grants through a stale connection"
         );
     }
 
