@@ -2681,14 +2681,18 @@ impl RpcDispatcher {
 
         // Keep the terminal count aligned with session/new and session/messages:
         // it is the durable projected conversation length, not the number of
-        // visible TUI bubbles or local user turns.
+        // visible TUI bubbles or local user turns. The store maintains this
+        // counter as turns are appended, so reading it here avoids hydrating
+        // the whole history on every turn end.
         let message_count = match chat_mode {
-            crate::rpc::types::ChatMode::Acp => self
-                .ctx
-                .acp_session_store
-                .as_ref()
-                .and_then(|store| store.load_session(&req.session_id).ok().flatten())
-                .map(|data| conversation_message_entries(&data.messages).len()),
+            crate::rpc::types::ChatMode::Acp => {
+                self.ctx.acp_session_store.as_ref().and_then(|store| {
+                    store
+                        .projected_message_count(&req.session_id)
+                        .ok()
+                        .flatten()
+                })
+            }
             crate::rpc::types::ChatMode::Chat => self
                 .ctx
                 .session_backend
@@ -10456,6 +10460,79 @@ mod tests {
         assert_eq!(entries[4].kind, MessageEntryKind::ToolResult);
         assert_eq!(entries[4].tool_call_id.as_deref(), Some("orphan"));
         assert_eq!(entries[4].tool_output.as_deref(), Some("late result"));
+    }
+
+    #[test]
+    fn projected_entry_count_matches_conversation_message_entries() {
+        use zeroclaw_api::model_provider::projected_entry_count;
+        use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+        let msgs = vec![
+            ConversationMessage::Chat(ChatMessage::user("plain chat")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("batch with text".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "shared".into(),
+                        name: "shell".into(),
+                        arguments: r#"{"command":"pwd"}"#.into(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "solo".into(),
+                        name: "read".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "shared".into(),
+                content: "/tmp".into(),
+                tool_name: "shell".into(),
+            }]),
+            ConversationMessage::AssistantToolCalls {
+                text: Some(String::new()),
+                tool_calls: vec![ToolCall {
+                    id: "shared".into(),
+                    name: "shell".into(),
+                    arguments: r#"{"command":"ls"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "solo".into(),
+                    content: "contents".into(),
+                    tool_name: "read".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "shared".into(),
+                    content: "second fold".into(),
+                    tool_name: "shell".into(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "orphan".into(),
+                    content: "late result".into(),
+                    tool_name: "shell".into(),
+                },
+            ]),
+        ];
+
+        assert_eq!(
+            projected_entry_count(&msgs),
+            conversation_message_entries(&msgs).len()
+        );
+        // 1 chat + (text + 2 calls) + folded result + empty-text-batch call
+        // + 2 folded results + 1 orphan result.
+        assert_eq!(projected_entry_count(&msgs), 6);
     }
 
     #[test]
