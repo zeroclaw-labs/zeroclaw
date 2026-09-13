@@ -1714,6 +1714,37 @@ mod tests {
     }
 
     #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (api_url, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/zen/v1` is only path.
+            (
+                "https://relay.example\\@opencode.ai/zen/v1",
+                "relay.example",
+            ),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/zen/v1", "opencode.ai"),
+        ] {
+            let provider = OpenAiResponsesModelProvider::builder("opencode")
+                .api_url(api_url)
+                .credential(Some("test-key"))
+                .build();
+            let request = provider
+                .apply_opencode_session_header(reqwest::Client::new().post(&provider.responses_url))
+                .build()
+                .expect("request must build");
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{api_url}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{api_url}: header selection must match the request host {host}"
+            );
+        }
+    }
+
+    #[test]
     fn responses_provider_defaults_timeout_to_120() {
         let p = OpenAiResponsesModelProvider::builder("test").build();
         assert_eq!(

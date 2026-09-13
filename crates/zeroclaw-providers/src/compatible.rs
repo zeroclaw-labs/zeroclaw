@@ -5859,16 +5859,44 @@ mod tests {
             .build()
     }
 
+    /// Request as the chat paths build it, addressed to the real endpoint,
+    /// without sending anything.
+    fn built_opencode_request(provider: &OpenAiCompatibleModelProvider) -> reqwest::Request {
+        provider
+            .apply_opencode_session_header(
+                reqwest::Client::new().post(provider.chat_completions_url()),
+            )
+            .build()
+            .expect("request must build")
+    }
+
     /// Header value as it would go on the wire, without sending anything.
     fn built_session_header(provider: &OpenAiCompatibleModelProvider) -> Option<String> {
-        let request = provider
-            .apply_opencode_session_header(reqwest::Client::new().post(provider.base_url.clone()))
-            .build()
-            .expect("request must build");
-        request
+        built_opencode_request(provider)
             .headers()
             .get(OPENCODE_SESSION_HEADER)
             .map(|value| value.to_str().expect("header must be ASCII").to_string())
+    }
+
+    #[test]
+    fn opencode_session_header_follows_the_built_request_destination() {
+        // Header selection must agree with the parser that addresses the
+        // request, not with a textual reading of the configured URI.
+        for (base_url, expected_host) in [
+            // `\` ends the authority; `@opencode.ai/v1` is only path.
+            ("https://relay.example\\@opencode.ai/v1", "relay.example"),
+            // A percent-encoded host decodes to the relay.
+            ("https://%6fpencode.ai/v1", "opencode.ai"),
+        ] {
+            let request = built_opencode_request(&opencode_provider(base_url));
+            let host = request.url().host_str().expect("request must have a host");
+            assert_eq!(host, expected_host, "{base_url}");
+            assert_eq!(
+                request.headers().contains_key(OPENCODE_SESSION_HEADER),
+                host == "opencode.ai",
+                "{base_url}: header selection must match the request host {host}"
+            );
+        }
     }
 
     #[test]

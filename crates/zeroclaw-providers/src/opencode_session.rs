@@ -60,40 +60,21 @@ const AFFINITY_DOMAIN: &str = "zeroclaw.opencode.session.v1";
 /// needs and keeps the header short.
 const TOKEN_BYTES: usize = 16;
 
-/// Extract the host from `base_url`, tolerating a missing scheme, userinfo, a
-/// port, and an IPv6 literal.
+/// Domain name the HTTP client will connect to for `base_url`, or `None` when
+/// there is none: an unparseable or scheme-less URL, or an IP literal.
 ///
-/// Hand-rolled rather than pulled from a URL crate because this is the only
-/// parsing this crate needs and the accepted shapes are covered by tests.
-fn host_of(base_url: &str) -> Option<&str> {
-    let after_scheme = base_url
-        .split_once("://")
-        .map_or(base_url, |(_scheme, rest)| rest);
-    // The authority ends at the first path, query, or fragment delimiter.
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|authority| !authority.is_empty())?;
-    // `user:pass@host` — the last '@' separates userinfo from the host, so a
-    // password containing '@' cannot smuggle a host past this.
-    let host_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_userinfo, host)| host);
-
-    let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
-        // IPv6 literal. Never the OpenCode relay, but must not be mis-split on
-        // the colons inside the address.
-        after_bracket.split_once(']').map(|(host, _port)| host)?
-    } else {
-        host_port
-            .split_once(':')
-            .map_or(host_port, |(host, _port)| host)
-    };
-
-    // A fully-qualified name may carry a trailing dot; `opencode.ai.` is the
-    // same host as `opencode.ai`.
-    let host = host.trim_end_matches('.');
-    (!host.is_empty()).then_some(host)
+/// Parsed with `reqwest::Url`, the same WHATWG parser reqwest applies to every
+/// request URL, so the host classified here is the host the request reaches. A
+/// hand-rolled split disagrees with that parser on inputs such as
+/// `https://relay.example\@opencode.ai` (the `\` ends the authority, so the
+/// request goes to `relay.example`) and `https://%6fpencode.ai` (decoded to
+/// `opencode.ai`), which would send the header off-relay or drop it on-relay.
+fn host_of(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    // The parser keeps a fully-qualified name's trailing dot; `opencode.ai.`
+    // is the same host as `opencode.ai`.
+    let host = url.domain()?.trim_end_matches('.');
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// True when `base_url` addresses the OpenCode relay.
@@ -177,7 +158,27 @@ mod tests {
         assert!(is_opencode_target("https://OpenCode.AI/zen/v1"));
         assert!(is_opencode_target("https://opencode.ai:443/zen/v1"));
         assert!(is_opencode_target("https://opencode.ai./zen/v1"));
-        assert!(is_opencode_target("opencode.ai/zen/v1"));
+    }
+
+    #[test]
+    fn classifies_the_host_the_request_reaches() {
+        // Under the parser reqwest uses, `\` ends the authority: the request
+        // goes to `relay.example` and must not carry the header.
+        assert_eq!(
+            host_of("https://relay.example\\@opencode.ai/v1").as_deref(),
+            Some("relay.example")
+        );
+        assert!(!is_opencode_target(
+            "https://relay.example\\@opencode.ai/v1"
+        ));
+        // A percent-encoded host decodes to the relay and must carry it.
+        assert_eq!(
+            host_of("https://%6fpencode.ai/v1").as_deref(),
+            Some("opencode.ai")
+        );
+        assert!(is_opencode_target("https://%6fpencode.ai/v1"));
+        // reqwest cannot send a scheme-less URL, so there is no destination.
+        assert!(!is_opencode_target("opencode.ai/zen/v1"));
     }
 
     #[test]
@@ -199,7 +200,7 @@ mod tests {
     #[test]
     fn ipv6_literal_is_not_a_target_and_does_not_panic() {
         assert!(!is_opencode_target("http://[::1]:8080/v1"));
-        assert_eq!(host_of("http://[::1]:8080/v1"), Some("::1"));
+        assert_eq!(host_of("http://[::1]:8080/v1"), None);
         // Unterminated bracket must yield no host rather than panicking.
         assert_eq!(host_of("http://[::1"), None);
     }
