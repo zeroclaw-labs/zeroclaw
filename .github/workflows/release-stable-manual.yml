@@ -401,6 +401,23 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      # Validate before either architecture compiles. Absent credential groups
+      # retain optional signing/notarization; partial or rejected groups fail.
+      # Signing requires a certificate and identity; its PKCS#12 password may
+      # be empty and is forwarded unchanged to Tauri below.
+      # Certificate import, signing identity and bundle acceptance are still
+      # checked by Tauri. Export credentials only at the bundling step below.
+      - name: Validate Apple notarization credentials
+        timeout-minutes: 5
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python3 scripts/release/apple_preflight.py
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: web-dist
@@ -499,10 +516,9 @@ jobs:
             exit 1
           fi
 
-      # Code-signing + notarization are optional: when the APPLE_* secrets are
-      # configured the Tauri bundler picks them up from the environment and
-      # signs/notarizes the app; when absent the build stays unsigned (ad-hoc),
-      # exactly as before. Secrets never gate the build itself.
+      # The preflight checked completeness and notarization authentication.
+      # Keep credentials out of earlier build steps; Tauri now imports the
+      # certificate, validates the signing identity and notarizes the bundle.
       - name: Enable macOS signing (when secrets are configured)
         shell: bash
         env:
@@ -560,7 +576,7 @@ jobs:
       # validates online (Gatekeeper must reach Apple on first open). Notarize
       # the .dmg too and staple the ticket into it so the downloaded installer
       # validates fully offline. Guarded on APPLE_ID so unsigned builds skip
-      # cleanly — secrets never gate the build.
+      # cleanly when notarization credentials are absent.
       - name: Notarize and staple the .dmg (offline-valid installer)
         if: ${{ env.APPLE_ID != '' }}
         shell: bash
