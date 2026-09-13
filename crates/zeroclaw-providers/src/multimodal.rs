@@ -2113,6 +2113,158 @@ const GIF_ANIMATION_SCRATCH_BYTES_PER_PIXEL: u64 = 8;
 /// accepted types is **12 B/px** (15 peak − 3 min output).
 const APNG_SCRATCH_BYTES_PER_PIXEL: u64 = 12;
 
+/// JPEG coefficient samples are signed 16-bit values. `zune-jpeg` keeps a
+/// full padded coefficient plane for progressive images (and for baseline
+/// images whose scans do not contain every component), so the projection must
+/// account for those planes before admitting a decode. The row-sized buffers
+/// used by baseline upsampling are covered by the additional scratch factor in
+/// [`jpeg_auxiliary_allocation`].
+const JPEG_COEFFICIENT_BYTES_PER_SAMPLE: u64 = 2;
+// The largest upsampling ratio accepted by zune-jpeg is 4x4. Charging 32
+// copies of one padded coefficient row covers the row/row_up, upsample
+// destination and conversion scratch vectors even for that shape.
+const JPEG_SCRATCH_ROWS_MULTIPLIER: u64 = 32;
+
+#[derive(Debug, Clone, Copy)]
+struct JpegComponentSampling {
+    horizontal: u8,
+    vertical: u8,
+}
+
+/// Header information needed to conservatively project zune-jpeg's
+/// coefficient allocation. This parser only walks marker lengths and SOF;
+/// entropy-coded data is never touched.
+#[derive(Debug)]
+struct JpegFrameHeader {
+    width: u32,
+    height: u32,
+    components: Vec<JpegComponentSampling>,
+}
+
+fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
+    if bytes.get(..2) != Some(&[0xff, 0xd8]) {
+        return None;
+    }
+
+    let mut offset = 2usize;
+    while offset < bytes.len() {
+        while bytes.get(offset) == Some(&0xff) {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+
+        // SOI, EOI, restart markers and TEM carry no length. A SOF must
+        // precede entropy data, so encountering a stuffed byte here means the
+        // header is malformed and cannot be projected precisely.
+        if marker == 0
+            || marker == 0xd8
+            || marker == 0xd9
+            || (0xd0..=0xd7).contains(&marker)
+            || marker == 0x01
+        {
+            continue;
+        }
+
+        let length_bytes = bytes.get(offset..offset + 2)?;
+        let segment_len = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if segment_len < 2 {
+            return None;
+        }
+        let payload_start = offset + 2;
+        let payload_end = payload_start.checked_add(segment_len - 2)?;
+        let payload = bytes.get(payload_start..payload_end)?;
+
+        // SOF0..SOF3, SOF5..SOF7, SOF9..SOFB and SOFCD..SOFC are the DCT
+        // frame markers accepted by zune-jpeg. Lossless SOFs are retained in
+        // the set and receive the same conservative coefficient bound.
+        let is_sof = matches!(
+            marker,
+            0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf
+        );
+        if is_sof {
+            if payload.len() < 6 {
+                return None;
+            }
+            let component_count = usize::from(payload[5]);
+            let components_end = 6usize.checked_add(component_count.checked_mul(3)?)?;
+            if component_count == 0 || components_end > payload.len() {
+                return None;
+            }
+
+            let mut components = Vec::with_capacity(component_count);
+            for component in payload[6..components_end].chunks_exact(3) {
+                let sampling = component[1];
+                let horizontal = sampling >> 4;
+                let vertical = sampling & 0x0f;
+                if horizontal == 0 || vertical == 0 {
+                    return None;
+                }
+                components.push(JpegComponentSampling {
+                    horizontal,
+                    vertical,
+                });
+            }
+
+            return Some(JpegFrameHeader {
+                width: u32::from_be_bytes([0, 0, payload[3], payload[4]]),
+                height: u32::from_be_bytes([0, 0, payload[1], payload[2]]),
+                components,
+            });
+        }
+
+        offset = payload_end;
+    }
+
+    None
+}
+
+/// Conservative JPEG auxiliary allocation (coefficients plus row scratch),
+/// derived from the SOF dimensions and sampling factors. Returns `None` for a
+/// malformed/unprojectable header; callers then use a worst-case fallback so
+/// malformed input is refused rather than admitted cheaply.
+fn jpeg_auxiliary_allocation(bytes: &[u8], width: u32, height: u32) -> Option<u64> {
+    let header = jpeg_frame_header(bytes)?;
+    let width = u64::from(width.max(header.width));
+    let height = u64::from(height.max(header.height));
+    let h_max = u64::from(header.components.iter().map(|c| c.horizontal).max()?);
+    let v_max = u64::from(header.components.iter().map(|c| c.vertical).max()?);
+    if h_max == 0 || v_max == 0 {
+        return None;
+    }
+
+    let mcu_width = h_max.checked_mul(8)?;
+    let mcu_height = v_max.checked_mul(8)?;
+    let mcu_columns = width.checked_add(mcu_width - 1)?.checked_div(mcu_width)?;
+    let mcu_rows = height
+        .checked_add(mcu_height - 1)?
+        .checked_div(mcu_height)?;
+
+    let mut coefficient_bytes = 0u64;
+    let mut row_bytes = 0u64;
+    for component in &header.components {
+        let horizontal = u64::from(component.horizontal);
+        let vertical = u64::from(component.vertical);
+        let blocks_x = mcu_columns.checked_mul(horizontal)?;
+        let blocks_y = mcu_rows.checked_mul(vertical)?;
+        let blocks = blocks_x.checked_mul(blocks_y)?;
+        let component_bytes = blocks
+            .checked_mul(64)?
+            .checked_mul(JPEG_COEFFICIENT_BYTES_PER_SAMPLE)?;
+        coefficient_bytes = coefficient_bytes.checked_add(component_bytes)?;
+
+        // Baseline decoding reuses a row, but its upsampling and conversion
+        // vectors can overlap that row. Charging several rows is conservative
+        // and keeps the bound independent of the selected output colorspace.
+        let row = blocks_x
+            .checked_mul(64)?
+            .checked_mul(JPEG_COEFFICIENT_BYTES_PER_SAMPLE)?;
+        row_bytes = row_bytes.checked_add(row)?;
+    }
+
+    coefficient_bytes.checked_add(row_bytes.checked_mul(JPEG_SCRATCH_ROWS_MULTIPLIER)?)
+}
+
 /// How each format's animation scratch splits between state the decoder keeps
 /// for the whole animation and work it redoes for every frame.
 ///
@@ -2274,6 +2426,19 @@ fn projected_allocation(source: &str, mime: &str, bytes: &[u8]) -> anyhow::Resul
             } else {
                 0
             }
+        }
+        image::ImageFormat::Jpeg => {
+            // zune-jpeg's full-image coefficient planes are not visible via
+            // `ImageDecoder::total_bytes`. Use the SOF-derived bound, falling
+            // back to a deliberately expensive estimate when a malformed
+            // header cannot be projected. The latter is only reached for
+            // input that will fail full decode anyway, and ensures it cannot
+            // sneak past the pre-decode per-image cap.
+            jpeg_auxiliary_allocation(bytes, width, height).unwrap_or_else(|| {
+                pixels
+                    .saturating_mul(8)
+                    .saturating_add(u64::from(width).saturating_mul(64).saturating_mul(8))
+            })
         }
         _ => 0,
     };
@@ -3079,6 +3244,28 @@ mod tests {
         buf.into_inner()
     }
 
+    fn jpeg_sof_header(width: u16, height: u16, sampling: &[(u8, u8)]) -> Vec<u8> {
+        let segment_len = 8usize + sampling.len() * 3;
+        let mut bytes = vec![
+            0xff,
+            0xd8,
+            0xff,
+            0xc0,
+            (segment_len >> 8) as u8,
+            segment_len as u8,
+            8,
+            (height >> 8) as u8,
+            height as u8,
+            (width >> 8) as u8,
+            width as u8,
+            sampling.len() as u8,
+        ];
+        for (index, &(horizontal, vertical)) in sampling.iter().enumerate() {
+            bytes.extend_from_slice(&[(index + 1) as u8, (horizontal << 4) | vertical, 0]);
+        }
+        bytes
+    }
+
     /// A tiny PNG whose IHDR declares `width` x `height`. The payload stays a
     /// few dozen bytes, so it sails past `validate_size`; only the decode
     /// limits stop it. Used to prove a decompression bomb is refused before
@@ -3661,6 +3848,32 @@ mod tests {
                 .await
                 .unwrap_err();
         assert_eq!(multimodal_error_kind(&err), "corrupt_image");
+    }
+
+    #[test]
+    fn jpeg_projection_accounts_for_padded_sampling_coefficients_and_scratch() {
+        // 17x9 pixels with 4:2:0 sampling: the Y plane uses 3x2 blocks and
+        // each chroma plane uses 2x1. Every coefficient is an i16 in zune-
+        // jpeg's progressive/full-image path.
+        let bytes = jpeg_sof_header(17, 9, &[(2, 2), (1, 1), (1, 1)]);
+        let auxiliary = jpeg_auxiliary_allocation(&bytes, 17, 9)
+            .expect("synthetic SOF should yield a conservative projection");
+        let coefficient_bytes = (6 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE;
+        let row_scratch =
+            (3 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE * JPEG_SCRATCH_ROWS_MULTIPLIER;
+        assert_eq!(auxiliary, coefficient_bytes + row_scratch);
+    }
+
+    #[test]
+    fn oversized_jpeg_coefficients_are_refused_before_decode() {
+        // A 6000x6000 progressive 1x1 grayscale JPEG needs 72 MB of i16
+        // coefficients before its 36 MB output buffer, so it must fail the
+        // 64 MiB per-image admission check without entering the decoder.
+        let bytes = jpeg_sof_header(6000, 6000, &[(1, 1)]);
+        let auxiliary = jpeg_auxiliary_allocation(&bytes, 6000, 6000).unwrap();
+        let projected = 6000u64 * 6000 * 1 + auxiliary;
+        assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
+        assert!(per_image_cap_refusal("large.jpg", "image/jpeg", projected).is_some());
     }
 
     #[tokio::test]
