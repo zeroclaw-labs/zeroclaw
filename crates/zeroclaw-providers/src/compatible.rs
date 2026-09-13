@@ -444,6 +444,17 @@ pub struct OpenAiCompatibleBuilder {
 }
 
 impl OpenAiCompatibleBuilder {
+    /// The configured `[multimodal]` policy this provider normalizes under.
+    ///
+    /// Defaults to `MultimodalConfig::default()`; `apply_compat_options`
+    /// overwrites it with the operator's configured policy so the provider
+    /// boundary does not re-trim history under different rules than the
+    /// runtime already applied.
+    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
+        self
+    }
+
     /// Human-readable display name (e.g. `"Groq"`, `"MiniMax"`). Surfaced
     /// in logs, `Attributable` output, and the onboarding UI. Required.
     pub fn display_name(mut self, name: &str) -> Self {
@@ -492,14 +503,6 @@ impl OpenAiCompatibleBuilder {
     /// Set the policy for image markers in native role=`tool` results.
     pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
         self.tool_result_image_policy = policy;
-        self
-    }
-
-    /// Set the root `[multimodal]` policy used when expanding `[IMAGE:...]`
-    /// markers into inline data URIs. Without this the provider falls back to
-    /// library defaults and operator limits never reach the outbound request.
-    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
-        self.multimodal = config;
         self
     }
 
@@ -2351,11 +2354,19 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    /// Normalize image markers into inline data URIs for the upstream request.
+    ///
+    /// Takes the configured policy rather than `MultimodalConfig::default()`:
+    /// this pass decodes pixels and applies `max_images` / `max_image_size_mb`,
+    /// so running it under defaults would re-trim a history the runtime had
+    /// already accepted under the operator's configuration.
     async fn normalize_messages_for_upstream(
         &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = self.multimodal.clone();
+        // Provider policy may strip image markers from native tool results
+        // before normalization; the normalization itself then runs under the
+        // configured `[multimodal]` policy rather than defaults.
         let sanitized;
         let messages = if self.tool_result_image_policy == ToolResultImagePolicy::Omit {
             sanitized = messages
@@ -2375,7 +2386,8 @@ impl OpenAiCompatibleModelProvider {
         } else {
             messages
         };
-        let prepared = multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared =
+            multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
         Ok(prepared.messages)
     }
 
@@ -6322,12 +6334,14 @@ mod tests {
         // config field alone would still pass if the expansion pass kept
         // using library defaults.
         let temp = tempfile::tempdir().unwrap();
-        // Minimal PNG signature bytes are enough for MIME detection.
-        let png = [0x89u8, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        // Use a complete decodable image: content validation now performs
+        // pixel decoding after MIME detection, so a bare signature is
+        // correctly rejected as a corrupt image.
+        let png = boundary_test_png();
         let first = temp.path().join("first.png");
         let second = temp.path().join("second.png");
-        std::fs::write(&first, png).unwrap();
-        std::fs::write(&second, png).unwrap();
+        std::fs::write(&first, &png).unwrap();
+        std::fs::write(&second, &png).unwrap();
 
         // One image per message: `trim_old_images` evicts whole messages, so
         // co-locating both in a single message would exercise that eviction
@@ -7527,8 +7541,12 @@ mod tests {
             content: format!("Caption please [IMAGE:{}]", path_str),
         };
 
+        // Omit-policy tool-result stripping must not touch user-message
+        // normalization: this user image still rewrites to a data URI with
+        // the policy active.
         let mut provider = make_model_provider("test", "https://example.com", None);
         provider.tool_result_image_policy = ToolResultImagePolicy::Omit;
+
         let normalized = provider
             .normalize_messages_for_upstream(std::slice::from_ref(&msg))
             .await
@@ -7546,6 +7564,92 @@ mod tests {
         );
     }
 
+    /// A real 1x1 PNG. Content validation drops undecodable bytes, so a bare
+    /// signature would be skipped before reaching the boundary assertions.
+    fn boundary_test_png() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_honours_the_configured_multimodal_policy() {
+        // The provider boundary re-normalizes messages, and that pass now
+        // decodes pixels and applies `max_images`. Under
+        // `MultimodalConfig::default()` it would trim to 4 images, silently
+        // discarding one the runtime had already accepted under a configured
+        // `max_images = 8`. The configured policy must reach the provider.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut markers = String::from("compare these");
+        for index in 0..5 {
+            let path = tmp.path().join(format!("shot{index}.png"));
+            std::fs::write(&path, boundary_test_png()).expect("write fixture");
+            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+        }
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: markers,
+        };
+
+        let configured = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 8,
+            max_image_size_mb: 10,
+            ..Default::default()
+        };
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .multimodal(configured)
+            .build();
+
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+
+        let content = &normalized[0].content;
+        let surviving = content.matches("[IMAGE:data:image/png;base64,").count();
+        assert_eq!(
+            surviving, 5,
+            "all five images must survive the configured max_images = 8; \
+             a default-config boundary pass would have trimmed to 4: {content}"
+        );
+
+        // The default policy is what the boundary used before this fix. With
+        // per-image eviction the same five-image message is trimmed to the
+        // default cap of 4 — the oldest image is evicted even though the
+        // operator's configuration had accepted all five. That boundary-side
+        // re-trim is the data loss the configured policy prevents, so pin it
+        // so a regression cannot quietly restore the default-config pass.
+        let default_provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let default_normalized = default_provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+        let default_surviving = default_normalized[0]
+            .content
+            .matches("[IMAGE:data:image/png;base64,")
+            .count();
+        assert_eq!(
+            default_surviving, 4,
+            "under the default max_images = 4 the boundary pass evicts the oldest image; \
+             that re-trim is what the configured policy prevents"
+        );
+    }
     #[tokio::test]
     async fn normalize_messages_for_upstream_omit_preserves_tool_envelope() {
         let provider = OpenAiCompatibleModelProvider::builder("test")

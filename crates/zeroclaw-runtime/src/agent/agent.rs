@@ -1281,6 +1281,11 @@ impl Agent {
         self.temperature
     }
 
+    #[cfg(test)]
+    pub fn multimodal_config_for_test(&self) -> &zeroclaw_config::schema::MultimodalConfig {
+        &self.multimodal_config
+    }
+
     pub fn set_model_name(&mut self, model_name: String) {
         self.model_name = model_name;
     }
@@ -1291,6 +1296,14 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    /// Refreshes the `[multimodal]` policy snapshot alongside a live provider
+    /// swap. The provider boundary carries its own clone of the same policy,
+    /// so both must move together or the runtime preparation pass and the
+    /// provider boundary disagree after a refresh.
+    pub fn set_multimodal_config(&mut self, config: zeroclaw_config::schema::MultimodalConfig) {
+        self.multimodal_config = config;
     }
 
     pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
@@ -2210,16 +2223,8 @@ impl Agent {
                     .and_then(|r| r.api_key.as_deref());
                 let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
+                let runtime_options =
+                    switch_runtime_options(full_config.as_ref(), &new_model_provider);
 
                 zeroclaw_providers::create_routed_model_provider_with_options(
                     full_config.as_ref(),
@@ -3321,6 +3326,30 @@ impl Agent {
 
         listen_handle.abort();
         Ok(())
+    }
+}
+
+/// Runtime options for the provider a live model switch rebuilds.
+///
+/// Dotted aliases resolve their entry through `provider_runtime_options_for_alias`;
+/// a bare family reference has no entry, and must take the config-owned
+/// `[multimodal]` policy through `provider_runtime_options_for_bare_family`
+/// rather than `ModelProviderRuntimeOptions::default()`. The default embeds
+/// `max_images = 4` / `max_image_size_mb = 5`, so a bare-family switch built
+/// on defaults would re-normalize already-prepared history under narrower
+/// caps than the operator configured and silently drop images.
+///
+/// A free function so a regression can pin the switch path's options
+/// directly — the rebuilt provider box is opaque to the runtime's tests.
+fn switch_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+    new_model_provider: &str,
+) -> zeroclaw_providers::ModelProviderRuntimeOptions {
+    match new_model_provider.split_once('.') {
+        Some((family, alias)) => {
+            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias)
+        }
+        None => zeroclaw_providers::provider_runtime_options_for_bare_family(config),
     }
 }
 
@@ -5715,7 +5744,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
 
             // The vision provider will fail to connect to localhost:9, but the
             // prompt rebuild and provider-visible transcript happen before the
@@ -5763,7 +5792,7 @@ mod tests {
                 Some(mm_config),
             );
 
-            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+            let msg = "describe this image [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
             let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
 
             let result = agent.turn_streamed(msg, event_tx, None).await;
@@ -7367,9 +7396,17 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("agent-turn.png");
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
         std::fs::write(
             &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
         )
         .expect("write fixture");
 
@@ -7422,9 +7459,17 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("tempdir");
         let image_path = temp.path().join("agent-stream.png");
+        // A real 1x1 PNG: content validation drops undecodable bytes, so a
+        // bare signature would be skipped before reaching the provider.
         std::fs::write(
             &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+                0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92,
+                0xEF, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            ],
         )
         .expect("write fixture");
 
@@ -7761,7 +7806,7 @@ mod tests {
         seed_old_trim_test_turn(&mut agent);
 
         let error = agent
-            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]")
+            .turn("inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]")
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
@@ -7791,7 +7836,7 @@ mod tests {
 
         let error = agent
             .turn_streamed(
-                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]",
+                "inspect [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]",
                 event_tx,
                 None,
             )
@@ -11718,6 +11763,31 @@ mod tests {
             "provider_name must update on a provider-only switch"
         );
         assert_eq!(agent.model_name, "shared-name");
+    }
+
+    #[test]
+    fn model_switch_options_carry_the_configured_policy_for_bare_families() {
+        // A live switch to a bare family rebuilds the provider from the
+        // config. Building it on `ModelProviderRuntimeOptions::default()`
+        // reset the provider boundary to `max_images = 4` /
+        // `max_image_size_mb = 5`, so a request the operator had configured
+        // for 8 images was re-trimmed to 4 after the switch. The switch path
+        // must resolve the config-owned policy for bare families, the same
+        // way dotted aliases resolve theirs.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = switch_runtime_options(&config, "ollama");
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare-family switch must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare-family switch must carry the configured max_image_size_mb, not the default 5"
+        );
     }
 
     #[test]
