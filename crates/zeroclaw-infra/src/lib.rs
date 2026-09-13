@@ -201,4 +201,127 @@ mod tests {
         assert!(message.contains("Failed to open session DB"));
         assert!(message.contains("unable to open database file"));
     }
+
+    /// The ownership contract is single-sourced: `supports_atomic_claim()`
+    /// must agree with what `claim_session_agent_alias` actually does on every
+    /// built-in backend, so a capability probe can never gate a claim path on
+    /// a probe that disagrees with the behaviour it claims to predict.
+    #[test]
+    fn supports_atomic_claim_agrees_with_claim_behavior_across_backends() {
+        use crate::session_backend::ClaimOutcome;
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let tmp = TempDir::new().unwrap();
+
+        // SQLite implements the atomic claim: probe says yes, claim on an
+        // unowned id is `Claimed`, and a same-alias re-claim stays `Claimed`.
+        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
+        assert!(
+            sqlite.supports_atomic_claim(),
+            "sqlite must support atomic claim"
+        );
+        match sqlite.claim_session_agent_alias("k", "alice") {
+            Ok(ClaimOutcome::Claimed) => {}
+            other => panic!("sqlite claim of unowned id must be Claimed, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                sqlite.claim_session_agent_alias("k", "alice"),
+                Ok(ClaimOutcome::Claimed)
+            ),
+            "sqlite same-alias re-claim must stay Claimed"
+        );
+
+        // JSONL does not track ownership: probe says no, and the claim fails
+        // closed with `Err(Unsupported)`. The probe must agree with that.
+        let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
+        assert!(
+            !jsonl.supports_atomic_claim(),
+            "jsonl must not support atomic claim"
+        );
+        let err = jsonl
+            .claim_session_agent_alias("k", "alice")
+            .expect_err("jsonl claim must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+
+        // A custom third-party double that does a real compare-and-set claim
+        // (mutex held across read + write) must speak the same contract: it
+        // implements `supports_atomic_claim` truthfully so the probe and the
+        // behaviour it drives agree, exactly like the built-in SQLite backend.
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct AtomicClaimDouble {
+            owners: Mutex<HashMap<String, String>>,
+        }
+        impl SessionBackend for AtomicClaimDouble {
+            fn load(&self, _k: &str) -> Vec<ChatMessage> {
+                Vec::new()
+            }
+            fn append(&self, _k: &str, _m: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _k: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                self.owners.lock().unwrap().keys().cloned().collect()
+            }
+            fn set_session_agent_alias(&self, k: &str, alias: &str) -> std::io::Result<()> {
+                self.owners
+                    .lock()
+                    .unwrap()
+                    .insert(k.to_string(), alias.to_string());
+                Ok(())
+            }
+            fn get_session_agent_alias(&self, k: &str) -> std::io::Result<Option<String>> {
+                Ok(self.owners.lock().unwrap().get(k).cloned())
+            }
+            fn claim_session_agent_alias(
+                &self,
+                k: &str,
+                alias: &str,
+            ) -> std::io::Result<ClaimOutcome> {
+                let mut g = self.owners.lock().unwrap();
+                match g.get(k) {
+                    None => {
+                        g.insert(k.to_string(), alias.to_string());
+                        Ok(ClaimOutcome::Claimed)
+                    }
+                    Some(owner) if owner == alias => Ok(ClaimOutcome::Claimed),
+                    Some(owner) => Ok(ClaimOutcome::Conflict(owner.clone())),
+                }
+            }
+            fn supports_atomic_claim(&self) -> bool {
+                true
+            }
+        }
+
+        let custom = AtomicClaimDouble {
+            owners: Mutex::new(HashMap::new()),
+        };
+        assert!(
+            custom.supports_atomic_claim(),
+            "custom CAS double must probe true"
+        );
+        match custom.claim_session_agent_alias("k", "bob") {
+            Ok(ClaimOutcome::Claimed) => {}
+            other => panic!("custom CAS claim of unowned id must be Claimed, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                custom.claim_session_agent_alias("k", "bob"),
+                Ok(ClaimOutcome::Claimed)
+            ),
+            "custom CAS double same-alias re-claim must stay Claimed"
+        );
+        // A second alias must be rejected as a conflict, not silently steal.
+        assert!(
+            matches!(
+                custom.claim_session_agent_alias("k", "carol"),
+                Ok(ClaimOutcome::Conflict(_))
+            ),
+            "custom CAS double must reject a cross-alias claim"
+        );
+    }
 }

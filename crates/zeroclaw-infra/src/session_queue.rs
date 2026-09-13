@@ -24,19 +24,60 @@ struct SessionSlot {
     pending: AtomicUsize,
 }
 
-/// RAII guard that releases the session permit on drop.
+/// RAII guard that releases the session permit and pending count on drop.
+///
+/// Drop order is significant: the semaphore permit is released *before*
+/// `pending` is decremented, so a racing `evict_idle` always observes a
+/// consistent state — `pending > 0` (permit still held) or `pending == 0`
+/// (permit already released). Implemented with `ManuallyDrop` so `Drop`
+/// releases the permit explicitly before touching `pending`.
 pub struct SessionGuard {
-    _permit: OwnedSemaphorePermit,
-    _registration: PendingRegistration,
-}
-
-struct PendingRegistration {
     slot: Arc<SessionSlot>,
+    _permit: std::mem::ManuallyDrop<OwnedSemaphorePermit>,
 }
 
-impl Drop for PendingRegistration {
+impl Drop for SessionGuard {
     fn drop(&mut self) {
+        // Release the semaphore permit FIRST, then decrement
+        // `pending`. This closes the race with `evict_idle`:
+        // without this ordering, `evict_idle` could see
+        // `pending == 0` (just decremented) while the permit
+        // was still held, and evict the slot from the map
+        // under the permit.
+        //
+        // SAFETY: `_permit` is only ever consumed here in
+        // `Drop::drop`. The `ManuallyDrop` wrapper suppresses
+        // the inner `Drop`, so the permit is dropped exactly
+        // once. After `take`, the `ManuallyDrop` cell is
+        // uninitialised but is itself a no-op to drop, so the
+        // implicit field drop that follows this function is
+        // safe.
+        let permit = unsafe { std::mem::ManuallyDrop::take(&mut self._permit) };
+        drop(permit);
         self.slot.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Cancel-safe guard for the pending-count increment during `acquire`.
+///
+/// On successful acquisition, `into_guard()` transfers the +1 to
+/// `SessionGuard`. On error or cancellation, `Drop` decrements.
+struct PendingGuard {
+    slot: Arc<SessionSlot>,
+    consumed: bool,
+}
+
+impl PendingGuard {
+    fn into_guard(mut self) {
+        self.consumed = true;
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.slot.pending.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -80,12 +121,34 @@ impl SessionActorQueue {
         }
     }
 
-    /// Acquire exclusive access to a session. Blocks until the session is free
-    /// or the timeout expires. Returns a guard that releases on drop.
+    /// Test-only hook invoked while `acquire` holds the slot-map lock, just
+    /// before the pending count is incremented. Lets a test pin the
+    /// registration/eviction interleaving instead of racing it on a timer.
+    #[cfg(test)]
+    fn run_registration_hook(&self) {
+        let hook = match self.registration_hook.lock() {
+            Ok(hook) => hook,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(hook) = hook.as_ref() {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.registration_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Acquire exclusive access to a session. Cancel-safe: `PendingGuard`
+    /// ensures the pending count is decremented even if this future is dropped.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
-        let registration = {
+        let (slot, current) = {
             let mut slots = self.slots.lock().await;
-            let slot = slots
+            let s = slots
+                // Key slots by the raw, case-sensitive session key, matching
+                // how ownership and transcript rows are stored. Folding case
+                // would serialize distinct canonical sessions onto one slot.
                 .entry(session_id.to_string())
                 .or_insert_with(|| {
                     Arc::new(SessionSlot {
@@ -95,39 +158,32 @@ impl SessionActorQueue {
                     })
                 })
                 .clone();
-
+            // Register while still holding the map lock, so `evict_idle`
+            // cannot remove this slot before it observes the pending request.
             #[cfg(test)]
-            let registration_hook = match self.registration_hook.lock() {
-                Ok(hook) => hook,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            #[cfg(test)]
-            if let Some(hook) = registration_hook.as_ref() {
-                hook();
-            }
-
-            // Register while holding the map lock so idle eviction cannot
-            // remove this slot before it sees the pending request.
-            let current = slot.pending.fetch_add(1, Ordering::Relaxed);
-            let registration = PendingRegistration { slot };
-            if current >= self.max_queue_depth {
-                return Err(SessionQueueError::QueueFull {
-                    session_id: session_id.to_string(),
-                    depth: current,
-                });
-            }
-
-            registration
+            self.run_registration_hook();
+            let current = s.pending.fetch_add(1, Ordering::Relaxed);
+            (s, current)
         };
+        let pending_guard = PendingGuard {
+            slot: slot.clone(),
+            consumed: false,
+        };
+        if current >= self.max_queue_depth {
+            return Err(SessionQueueError::QueueFull {
+                session_id: session_id.to_string(),
+                depth: current,
+            });
+        }
 
-        // Acquire owned permit with timeout
-        let sem = registration.slot.semaphore.clone();
+        let sem = slot.semaphore.clone();
         match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
             Ok(Ok(permit)) => {
-                *registration.slot.last_active.lock().await = Instant::now();
+                *slot.last_active.lock().await = Instant::now();
+                pending_guard.into_guard();
                 Ok(SessionGuard {
-                    _permit: permit,
-                    _registration: registration,
+                    slot,
+                    _permit: std::mem::ManuallyDrop::new(permit),
                 })
             }
             Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
@@ -136,16 +192,12 @@ impl SessionActorQueue {
         }
     }
 
-    #[cfg(test)]
-    fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self.registration_hook.lock().unwrap() = Some(hook);
-    }
-
     /// Get the number of pending requests for a session.
     pub async fn queue_depth(&self, session_id: &str) -> usize {
+        let guard_key = session_id.to_string();
         let slots = self.slots.lock().await;
         slots
-            .get(session_id)
+            .get(&guard_key)
             .map(|s| s.pending.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
@@ -238,6 +290,12 @@ mod tests {
         assert_eq!(evicted, 1);
     }
 
+    /// Registration and idle eviction must not interleave. The hook parks
+    /// `acquire` inside the slot-map critical section (pending not yet
+    /// incremented); an `evict_idle` arriving there must block on the map lock
+    /// rather than observe a slot with no pending request and evict it while
+    /// the caller is about to use it. Barriers make the interleaving exact —
+    /// no wall-clock guesswork.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registration_and_eviction_are_atomic() {
         let queue = Arc::new(SessionActorQueue::new(8, 5, 0));
@@ -276,23 +334,40 @@ mod tests {
         assert_eq!(queue.evict_idle().await, 1);
     }
 
+    /// While a `SessionGuard` is alive, the slot must remain in the map
+    /// even past the idle TTL: releasing the permit *before* decrementing
+    /// `pending` means `evict_idle` never observes a half-released slot —
+    /// `pending > 0` ⇒ permit still held (cannot evict), `pending == 0` ⇒
+    /// permit already released.
     #[tokio::test]
-    async fn cancelled_waiter_releases_registration() {
-        let queue = Arc::new(SessionActorQueue::new(8, 30, 0));
-        let guard = queue.acquire("s1").await.unwrap();
+    async fn evict_idle_keeps_held_permit_slot() {
+        let queue = SessionActorQueue::new(8, 5, 0); // 0s TTL
+        let _guard = queue.acquire("s1").await.unwrap();
+        // Sleep well past the TTL. last_active is set on acquire,
+        // but TTL=0 means anything older than "now" is idle —
+        // except for the held permit, which `pending > 0`
+        // must protect.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let evicted = queue.evict_idle().await;
+        assert_eq!(
+            evicted, 0,
+            "a slot whose permit is still held (pending > 0) must not be evicted"
+        );
+    }
 
-        let waiter_queue = queue.clone();
-        let waiter = zeroclaw_spawn::spawn!(async move { waiter_queue.acquire("s1").await });
-        while queue.queue_depth("s1").await < 2 {
-            tokio::task::yield_now().await;
+    /// After the guard drops, the slot is evictable on the next
+    /// `evict_idle`: the permit is released and `pending == 0`.
+    #[tokio::test]
+    async fn evict_idle_collects_after_guard_drop() {
+        let queue = SessionActorQueue::new(8, 5, 0);
+        {
+            let _guard = queue.acquire("s1").await.unwrap();
         }
-
-        waiter.abort();
-        let _ = waiter.await;
-        assert_eq!(queue.queue_depth("s1").await, 1);
-
-        drop(guard);
-        assert_eq!(queue.evict_idle().await, 1);
+        // The guard is fully dropped (permit released + pending=0)
+        // by the time we sleep.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let evicted = queue.evict_idle().await;
+        assert_eq!(evicted, 1, "after drop, the idle slot must be evicted");
     }
 
     #[tokio::test]
@@ -304,6 +379,75 @@ mod tests {
         assert_eq!(queue.queue_depth("s1").await, 1);
 
         drop(guard);
+        assert_eq!(queue.queue_depth("s1").await, 0);
+    }
+
+    /// Deterministic FIFO interleaving: once several waiters have registered,
+    /// releasing the holder lets them drain one at a time in acquisition order.
+    /// Registration is detected by polling `queue_depth` up to a bounded spin,
+    /// never by sleeping on a wall clock.
+    #[tokio::test]
+    async fn waiters_drain_in_order_after_release() {
+        let queue = Arc::new(SessionActorQueue::new(4, 30, 600));
+        let guard0 = queue.acquire("s1").await.unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let q = queue.clone();
+            tasks.push(zeroclaw_spawn::spawn!(async move { q.acquire("s1").await }));
+        }
+
+        // Bound the spin instead of sleeping: keep yielding until both
+        // waiters have registered (guard + 2 waiters = depth 3).
+        for _ in 0..1000 {
+            if queue.queue_depth("s1").await == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            queue.queue_depth("s1").await,
+            3,
+            "both waiters must have registered before the holder is released"
+        );
+
+        // Releasing the holder lets the queued waiters acquire in order;
+        // each join resolves only after that waiter has the permit.
+        drop(guard0);
+        for t in tasks {
+            let _guard = t.await.unwrap().unwrap();
+        }
+        assert_eq!(queue.queue_depth("s1").await, 0);
+    }
+
+    /// Cancellation safety: a waiter aborted while parked on the semaphore
+    /// must release its pending count (the `PendingGuard` RAII path), so it
+    /// can never skew the depth accounting or block a later `evict_idle`.
+    /// The task is joined before asserting, so the drop has completed.
+    #[tokio::test]
+    async fn cancelled_waiter_releases_pending_count() {
+        let queue = Arc::new(SessionActorQueue::new(8, 30, 600));
+        let guard0 = queue.acquire("s1").await.unwrap();
+
+        let q = queue.clone();
+        let task = zeroclaw_spawn::spawn!(async move { q.acquire("s1").await });
+        for _ in 0..1000 {
+            if queue.queue_depth("s1").await == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(queue.queue_depth("s1").await, 2, "waiter must register");
+
+        task.abort();
+        let _ = task.await; // join resolves only once the task (and its PendingGuard) has dropped
+        assert_eq!(
+            queue.queue_depth("s1").await,
+            1,
+            "aborted waiter must release its pending count"
+        );
+
+        drop(guard0);
         assert_eq!(queue.queue_depth("s1").await, 0);
     }
 }

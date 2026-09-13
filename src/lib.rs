@@ -609,6 +609,28 @@ pub enum MigrateCommands {
         #[arg(long)]
         reindex: bool,
     },
+
+    /// Backfill session ownership metadata for pre-migration sessions
+    SessionOwnership {
+        /// List unowned sessions without claiming any
+        #[arg(long)]
+        list: bool,
+
+        /// Session key to claim ownership of. Requires
+        /// `--agent-alias` to record a target owner — without it,
+        /// the session would be permanently inaccessible, so the
+        /// CLI refuses the write.
+        #[arg(long, requires = "agent_alias")]
+        claim: Option<String>,
+
+        /// Agent alias to assign ownership to
+        #[arg(long)]
+        agent_alias: Option<String>,
+
+        /// Skip the confirmation prompt and proceed
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Reject a `--to` value that is shaped like a flag.
