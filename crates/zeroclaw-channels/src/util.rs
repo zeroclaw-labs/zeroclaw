@@ -323,6 +323,90 @@ pub(crate) fn parse_attachment_markers_of_kinds(
     (cleaned.trim().to_string(), attachments)
 }
 
+/// Minimum reply size, in bytes, that earns a voice note. Byte-measured, so a
+/// non-ASCII reply clears the floor with fewer characters than an ASCII one.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+const MIN_VOICE_REPLY_BYTES: usize = 40;
+
+/// Bytes allowed between the brackets of a leading expressive audio tag. Real
+/// tags are short (`[whispers]`, `[strong French accent]`); the bound keeps a
+/// long bracketed block from passing as one.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+const MAX_AUDIO_TAG_INNER_BYTES: usize = 32;
+
+/// Classify a reply that opens with `[`. Returns the skip reason when the
+/// bracketed run is machine output, or `None` when it is an expressive audio
+/// tag (`[whispers]`, `[very excited]`) decorating real prose.
+///
+/// Audio tags are stage directions that TTS engines interpret rather than
+/// speak, so a reply opening with one is prose and belongs in a voice note.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+fn leading_bracket_skip_reason(content: &str) -> Option<&'static str> {
+    let after_open = content.strip_prefix('[')?;
+
+    // JSON-looking openers: `[{`, `["`, `[0`-`[9`, `[]`.
+    if after_open.starts_with(|c: char| matches!(c, '{' | '"' | ']') || c.is_ascii_digit()) {
+        return Some("json_array");
+    }
+
+    // No closing bracket at all, so nothing identifies this as a tag.
+    let Some(close) = after_open.find(']') else {
+        return Some("unclosed_bracket");
+    };
+    let inner = &after_open[..close];
+    let tail = &after_open[close + 1..];
+
+    // Attachment markers always carry `:` (`[IMAGE:/path]`), because both
+    // parsers key on `split_once(':')`. Audio tags never do, so the colon is
+    // what keeps a filesystem path from being read aloud.
+    if inner.contains(':') {
+        return Some("attachment_marker");
+    }
+    // Markdown link: `[text](url)`. Without this the URL would be spoken.
+    if tail.starts_with('(') {
+        return Some("markdown_link");
+    }
+    // Too long to be a stage direction, so treat it as an unknown bracketed
+    // block and keep the pre-existing rejection rather than guessing.
+    if inner.len() > MAX_AUDIO_TAG_INNER_BYTES {
+        return Some("bracketed_prefix");
+    }
+
+    None
+}
+
+/// Why a reply was not queued as a TTS voice note, or `None` when it is worth
+/// speaking. Voice chats mirror the agent's prose, not its plumbing: URLs,
+/// JSON, code blocks, raw tool output and one-line status make poor audio.
+#[cfg(any(feature = "channel-telegram", feature = "whatsapp-web", test))]
+pub(crate) fn voice_reply_skip_reason(content: &str) -> Option<&'static str> {
+    if content.len() <= MIN_VOICE_REPLY_BYTES {
+        return Some("too_short");
+    }
+    if content.starts_with("http") {
+        return Some("url_prefix");
+    }
+    if content.starts_with('{') {
+        return Some("json_object");
+    }
+    if let Some(reason) = leading_bracket_skip_reason(content) {
+        return Some(reason);
+    }
+    if content.starts_with("Error") {
+        return Some("error_prefix");
+    }
+    if content.contains("```") {
+        return Some("code_fence");
+    }
+    if content.contains("tool_call") {
+        return Some("tool_call_marker");
+    }
+    if content.contains("wttr.in") {
+        return Some("weather_tool_output");
+    }
+    None
+}
+
 /// A native location pin parsed from a `[LOCATION:...]` marker. Shared by
 /// both WhatsApp backends (web protobuf send and Cloud API JSON send).
 #[cfg(any(feature = "whatsapp-web", feature = "channel-whatsapp-cloud", test))]
@@ -464,7 +548,9 @@ pub(crate) fn build_yesno_approval_prompt(
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
+    position: Option<(u32, u32)>,
 ) -> String {
+    let position_line = approval_position_line(position);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
@@ -480,8 +566,43 @@ pub(crate) fn build_yesno_approval_prompt(
         ],
     );
     format!(
-        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
     )
+}
+
+/// Localized `Tool call 2 of 3` line for an approval prompt, already
+/// newline-terminated, or empty when there is no counter to show.
+///
+/// Kept here so every adapter renders the same wording from the same
+/// catalogue key and the phrasing cannot drift per channel.
+#[cfg(any(
+    feature = "channel-discord",
+    feature = "channel-signal",
+    feature = "channel-slack",
+    feature = "channel-whatsapp-cloud",
+    feature = "whatsapp-web",
+    feature = "channel-matrix",
+    feature = "channel-telegram",
+    feature = "channel-lark",
+    test
+))]
+pub(crate) fn approval_position_line(position: Option<(u32, u32)>) -> String {
+    match position {
+        // `1 of 1` tells the operator nothing they did not already know. The
+        // rule lives here so no adapter has to remember it.
+        Some((_, total)) if total <= 1 => String::new(),
+        Some((index, total)) => {
+            let text = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-approval-position",
+                &[
+                    ("index", index.to_string().as_str()),
+                    ("total", total.to_string().as_str()),
+                ],
+            );
+            format!("{text}\n")
+        }
+        None => String::new(),
+    }
 }
 
 /// Localized text-reply approval prompt using approve/deny/always reply
@@ -492,7 +613,9 @@ pub(crate) fn build_approve_deny_approval_prompt(
     token: &str,
     tool_name: &str,
     arguments_summary: &str,
+    position: Option<(u32, u32)>,
 ) -> String {
+    let position_line = approval_position_line(position);
     let heading = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-heading-shout");
     let tool_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-tool-label");
     let args_label = zeroclaw_runtime::i18n::get_required_cli_string("channel-approval-args-label");
@@ -508,7 +631,7 @@ pub(crate) fn build_approve_deny_approval_prompt(
         ],
     );
     format!(
-        "{heading} [{token}]\n{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
+        "{heading} [{token}]\n{position_line}{tool_label}: {tool_name}\n{args_label}: {arguments_summary}\n\n{reply}"
     )
 }
 
@@ -887,6 +1010,153 @@ mod tests {
         );
     }
 
+    /// A reply opening with an ElevenLabs v3 expressive audio tag is prose
+    /// written for speech, so it must reach TTS rather than be filtered out
+    /// as machine output.
+    #[test]
+    fn voice_reply_accepts_leading_audio_tags() {
+        for content in [
+            "[dramatic] Signori, si alza il sipario sulla serata.",
+            "[exhales] Ascoltate, ascoltate... e l'aria della sera.",
+            "[very excited] Ho finito di preparare il tuo riepilogo!",
+            "[pause 2s] Adesso arriva la parte piu interessante del racconto.",
+            "[strong French accent] Bonjour, comment allez-vous aujourd'hui?",
+            "[whispers][slowly] Ascoltate bene quello che sto per dire.",
+        ] {
+            assert_eq!(voice_reply_skip_reason(content), None, "input: {content}");
+        }
+    }
+
+    /// The control case from the report: prose with no leading bracket was
+    /// always voiced and must stay that way.
+    #[test]
+    fn voice_reply_accepts_plain_prose() {
+        assert_eq!(
+            voice_reply_skip_reason("Si apra il sipario, si accordi l'orchestra!"),
+            None
+        );
+    }
+
+    /// The bracket clause still has to reject genuine machine output. An
+    /// attachment marker reaching TTS would read a filesystem path aloud.
+    #[test]
+    fn voice_reply_rejects_bracketed_machine_output() {
+        for (content, expected) in [
+            (
+                "[{\"a\":1},{\"b\":2}] ecco il meteo di oggi per Roma.",
+                "json_array",
+            ),
+            (
+                "[\"alpha\",\"beta\",\"gamma\",\"delta\",\"epsilon\"]",
+                "json_array",
+            ),
+            (
+                "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]",
+                "json_array",
+            ),
+            (
+                "[] plus filler text to clear the length floor here",
+                "json_array",
+            ),
+            (
+                "[IMAGE:/home/pi/chart.png] Ecco il grafico richiesto.",
+                "attachment_marker",
+            ),
+            (
+                "[VOICE:/tmp/zeroclaw/out.ogg] Nota vocale registrata.",
+                "attachment_marker",
+            ),
+            (
+                "[DOCUMENT:https://example.com/report.pdf] Ecco il file.",
+                "attachment_marker",
+            ),
+            (
+                "[Guida](https://example.com/docs) ecco il link utile.",
+                "markdown_link",
+            ),
+            (
+                "[unclosed tag and a sentence that never closes it",
+                "unclosed_bracket",
+            ),
+            (
+                "[didascalia molto lunga che sfora il limite dei tag] ok",
+                "bracketed_prefix",
+            ),
+        ] {
+            assert_eq!(
+                voice_reply_skip_reason(content),
+                Some(expected),
+                "input: {content}"
+            );
+        }
+    }
+
+    /// The clauses that predate the audio-tag fix keep their behavior.
+    #[test]
+    fn voice_reply_rejects_non_bracket_machine_output() {
+        for (content, expected) in [
+            (
+                "{\"ok\":true,\"result\":{\"message_id\":123456}}",
+                "json_object",
+            ),
+            (
+                "https://example.com/a/very/long/path/that/clears",
+                "url_prefix",
+            ),
+            (
+                "Error: the provider refused the request again.",
+                "error_prefix",
+            ),
+            (
+                "Ecco:\n```bash\nls -la\n``` e poi fammi sapere tutto.",
+                "code_fence",
+            ),
+            (
+                "Ho ricevuto un tool_call malformato, riprovo.",
+                "tool_call_marker",
+            ),
+            (
+                "Meteo da wttr.in: Roma 21 gradi, cielo sereno.",
+                "weather_tool_output",
+            ),
+        ] {
+            assert_eq!(
+                voice_reply_skip_reason(content),
+                Some(expected),
+                "input: {content}"
+            );
+        }
+    }
+
+    /// The length floor is measured on the full reply, tag included, so a
+    /// leading tag can never shorten a reply into rejection.
+    #[test]
+    fn voice_reply_length_floor_is_measured_on_the_full_reply() {
+        assert_eq!(voice_reply_skip_reason(&"x".repeat(41)), None);
+        assert_eq!(voice_reply_skip_reason(&"x".repeat(40)), Some("too_short"));
+        assert_eq!(
+            voice_reply_skip_reason(&format!("[whispers]{}", "x".repeat(31))),
+            None
+        );
+        assert_eq!(voice_reply_skip_reason("[laughs]"), Some("too_short"));
+        assert_eq!(
+            voice_reply_skip_reason("[dramatic] Ciao!"),
+            Some("too_short")
+        );
+    }
+
+    /// Pins the classifier so a refactor that breaks tag recognition or the
+    /// marker guard fails loudly rather than silently.
+    #[test]
+    fn leading_bracket_classifier_distinguishes_tags_from_markers() {
+        assert_eq!(leading_bracket_skip_reason("[whispers] rest"), None);
+        assert_eq!(
+            leading_bracket_skip_reason("[IMAGE:/x] rest"),
+            Some("attachment_marker")
+        );
+        assert_eq!(leading_bracket_skip_reason("no bracket here"), None);
+    }
+
     #[test]
     fn location_marker_parses_coordinates_name_and_address() {
         // Bare coordinates.
@@ -1038,7 +1308,7 @@ mod tests {
         // by Discord's plaintext fallback, Signal, WhatsApp, and Slack's
         // polling-mode fallback.
         let token = "ab12cd";
-        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la");
+        let prompt = super::build_yesno_approval_prompt(token, "shell", "ls -la", None);
         assert!(
             prompt.contains(token),
             "prompt should echo the token verbatim; got {prompt:?}"
@@ -1066,12 +1336,78 @@ mod tests {
     }
 
     #[test]
+    fn approval_prompt_shows_batch_position_when_batch_has_several_calls() {
+        // Back-to-back cards from one message are indistinguishable before the
+        // operator taps, so a multi-call batch must say which call it is.
+        let prompt = super::build_yesno_approval_prompt("ab12cd", "shell", "ls -la", Some((2, 3)));
+        assert!(
+            prompt.contains('2') && prompt.contains('3'),
+            "prompt should carry the batch counter; got {prompt:?}"
+        );
+        // The counter belongs above the tool line so it is read first.
+        let counter_at = prompt
+            .find('2')
+            .expect("counter should be present in the prompt");
+        let tool_at = prompt
+            .find("shell")
+            .expect("tool name should be present in the prompt");
+        assert!(
+            counter_at < tool_at,
+            "counter should precede the tool line; got {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn approval_prompt_omits_position_for_a_single_call_batch() {
+        // `1 of 1` tells the operator nothing, and every adapter would
+        // otherwise have to special-case it.
+        let with_single = super::build_yesno_approval_prompt("ab12cd", "shell", "x", Some((1, 1)));
+        let without = super::build_yesno_approval_prompt("ab12cd", "shell", "x", None);
+        assert_eq!(
+            with_single, without,
+            "a one-call batch should render exactly as an unpositioned prompt"
+        );
+    }
+
+    #[test]
+    fn position_counter_reports_raw_batch_position_not_approval_count() {
+        use zeroclaw_api::channel::{ApprovalPosition, ChannelApprovalRequest};
+
+        // The batch is three calls and only the second needs approval. The
+        // card must read "2 of 3" — the model-issued position — rather than
+        // "1 of 1", which would be the approval-required count. Computing the
+        // latter would require the approval set before the first card renders.
+        let request = ChannelApprovalRequest {
+            tool_name: "stake_tx_build".to_string(),
+            arguments_summary: "action: deactivate".to_string(),
+            raw_arguments: None,
+            position: Some(ApprovalPosition { index: 2, total: 3 }),
+        };
+
+        assert_eq!(request.position_counter(), Some((2, 3)));
+    }
+
+    #[test]
+    fn position_counter_is_absent_without_a_position() {
+        use zeroclaw_api::channel::ChannelApprovalRequest;
+
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+
+        assert_eq!(request.position_counter(), None);
+    }
+
+    #[test]
     fn approve_deny_approval_prompt_matches_matrix_own_parser_keywords() {
         // Same desync guard as above, for Matrix's `approve`/`deny`/`always`
         // reply shape (Matrix uses its own parser, not
         // `parse_approval_reply`, but the keyword contract is identical).
         let token = "AB12CD34";
-        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la");
+        let prompt = super::build_approve_deny_approval_prompt(token, "shell", "ls -la", None);
         assert!(prompt.contains(token));
         for word in ["approve", "deny", "always"] {
             let reply = format!("{token} {word}");
@@ -1141,6 +1477,8 @@ mod tests {
                     ("approve_command", "TKN approve"),
                     ("deny_command", "TKN deny"),
                     ("always_command", "TKN always"),
+                    ("index", "1"),
+                    ("total", "2"),
                 ],
             );
             assert_ne!(

@@ -16,6 +16,7 @@ pub struct ModelRates {
     pub input_per_mtok: Option<f64>,
     pub output_per_mtok: Option<f64>,
     pub cached_input_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 impl ModelRates {
@@ -25,9 +26,12 @@ impl ModelRates {
         self.input_per_mtok.is_none()
             && self.output_per_mtok.is_none()
             && self.cached_input_per_mtok.is_none()
+            && self.cache_write_per_mtok.is_none()
     }
 
-    /// True when every dimension carries a rate (nothing left to fill).
+    /// True when the billing-critical dimensions carry a rate. Cache writes
+    /// are optional: without a write rate they stay priced at the plain
+    /// input rate, so they never block completeness.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.input_per_mtok.is_some()
@@ -48,6 +52,7 @@ impl ModelRates {
             cached_input_per_mtok: self
                 .cached_input_per_mtok
                 .or(fallback.cached_input_per_mtok),
+            cache_write_per_mtok: self.cache_write_per_mtok.or(fallback.cache_write_per_mtok),
         }
     }
 }
@@ -63,12 +68,13 @@ fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
 
 /// Normalize a provider's `/models` [`ModelPricing`] (per-token strings) into
 /// per-1M-token [`ModelRates`]. `prompt`→input, `completion`→output,
-/// `input_cache_read`→cached.
+/// `input_cache_read`→cached, `input_cache_write`→cache write.
 pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
     ModelRates {
         input_per_mtok: per_token_str_to_mtok(&pricing.prompt),
         output_per_mtok: per_token_str_to_mtok(&pricing.completion),
         cached_input_per_mtok: per_token_str_to_mtok(&pricing.input_cache_read),
+        cache_write_per_mtok: per_token_str_to_mtok(&pricing.input_cache_write),
     }
 }
 
@@ -406,6 +412,7 @@ fn assemble_snapshot(
                     cached_input_per_mtok: slot
                         .cached_input_per_mtok
                         .or(rates.cached_input_per_mtok),
+                    cache_write_per_mtok: slot.cache_write_per_mtok.or(rates.cache_write_per_mtok),
                 };
             }
         }
@@ -521,6 +528,7 @@ mod tests {
                 input_per_mtok: Some(0.3),
                 output_per_mtok: Some(1.2),
                 cached_input_per_mtok: Some(0.06),
+                cache_write_per_mtok: None,
             },
         );
         // The cost path passes the bare family: direct hit.
@@ -606,14 +614,21 @@ mod tests {
             input_per_mtok: Some(input),
             output_per_mtok: None,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         }
     }
 
-    fn full_rate(input: Option<f64>, output: Option<f64>, cached: Option<f64>) -> ModelRates {
+    fn full_rate(
+        input: Option<f64>,
+        output: Option<f64>,
+        cached: Option<f64>,
+        write: Option<f64>,
+    ) -> ModelRates {
         ModelRates {
             input_per_mtok: input,
             output_per_mtok: output,
             cached_input_per_mtok: cached,
+            cache_write_per_mtok: write,
         }
     }
 
@@ -631,7 +646,10 @@ mod tests {
         gateway.insert("minimax/m2.7".to_string(), rate(0.3));
         gateway.insert("slug".to_string(), rate(0.7)); // matched via suffix
         // Gateway prices input+output for `partial` but leaves cache_read unset.
-        gateway.insert("partial".to_string(), full_rate(Some(2.0), Some(4.0), None));
+        gateway.insert(
+            "partial".to_string(),
+            full_rate(Some(2.0), Some(4.0), None, None),
+        );
         let gateway_results = vec![(wanted.as_slice(), gateway)];
 
         let mut md = HashMap::new();
@@ -642,7 +660,7 @@ mod tests {
         // models.dev has all three for `partial`; only cache_read should be used.
         md.insert(
             "partial".to_string(),
-            full_rate(Some(9.9), Some(9.9), Some(0.5)),
+            full_rate(Some(9.9), Some(9.9), Some(0.5), None),
         );
         let models_dev = HashMap::from([("kilo".to_string(), md)]);
 

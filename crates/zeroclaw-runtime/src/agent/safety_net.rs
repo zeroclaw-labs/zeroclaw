@@ -78,6 +78,7 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     TokenUsage {
         input_tokens: Some(input),
         cached_input_tokens: None,
+        cache_creation_input_tokens: None,
         output_tokens: Some(output),
     }
 }

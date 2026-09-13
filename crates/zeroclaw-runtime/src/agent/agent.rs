@@ -3713,6 +3713,7 @@ mod tests {
                             input_tokens: Some(13),
                             output_tokens: Some(7),
                             cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
                         },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
@@ -6140,6 +6141,7 @@ mod tests {
             input_tokens: Some(1_000_000),
             output_tokens: Some(1_000_000),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
 
         let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -8476,6 +8478,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -11103,6 +11106,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
@@ -11189,6 +11193,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
@@ -11293,6 +11298,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -11394,6 +11400,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -12211,6 +12218,7 @@ mod approval_route_tests {
             tool_name: "shell".into(),
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
+            position: None,
         }
     }
 
