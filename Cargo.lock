@@ -13853,6 +13853,7 @@ dependencies = [
  "async-trait",
  "futures-util",
  "parking_lot",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "strum 0.28.0",
@@ -14477,6 +14478,15 @@ name = "zeroclaw-tool-secret-plugin-fixture"
 version = "0.0.0"
 dependencies = [
  "serde_json",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
+name = "zeroclaw-tool-sequential-fixture"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "waki",
  "wit-bindgen 0.51.0",
 ]
 
