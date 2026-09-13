@@ -1723,16 +1723,44 @@ impl RpcDispatcher {
         // gateway exposes for this agent; ACP (Code) sessions skip it to keep
         // `session/new` prompt
         let initialize_mcp = session_should_initialize_mcp(&chat_mode);
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
-            Arc::clone(&self.ctx.config),
-            &req.agent_alias,
-            cwd_path,
-            initialize_mcp,
-            exclude_memory,
-            tui_env,
-            self.ctx.sop_engine.clone(),
-            self.ctx.sop_audit.clone(),
-        )
+        let acp_session_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            Some(
+                self.ctx
+                    .acp_session_store
+                    .clone()
+                    .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?,
+            )
+        } else {
+            None
+        };
+        let mut agent = Box::pin(async {
+            if let Some(store) = acp_session_store {
+                crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
+                    Arc::clone(&self.ctx.config),
+                    &req.agent_alias,
+                    cwd_path,
+                    initialize_mcp,
+                    exclude_memory,
+                    tui_env,
+                    self.ctx.sop_engine.clone(),
+                    self.ctx.sop_audit.clone(),
+                    store,
+                )
+                .await
+            } else {
+                crate::agent::agent::Agent::from_live_config_with_tui_env(
+                    Arc::clone(&self.ctx.config),
+                    &req.agent_alias,
+                    cwd_path,
+                    initialize_mcp,
+                    exclude_memory,
+                    tui_env,
+                    self.ctx.sop_engine.clone(),
+                    self.ctx.sop_audit.clone(),
+                )
+                .await
+            }
+        })
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
         agent.set_interaction_context(
@@ -2172,9 +2200,12 @@ impl RpcDispatcher {
         sid: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
         let store = self.ctx.acp_session_store.clone()?;
+        let store_for_load = Arc::clone(&store);
         let sid_owned = sid.to_string();
-        let loaded =
-            tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
+        let loaded = tokio::task::spawn_blocking(move || {
+            store_for_load.load_session_for_restore(&sid_owned)
+        })
+        .await;
         let data = match loaded {
             Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
             Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
@@ -2226,7 +2257,7 @@ impl RpcDispatcher {
         let exclude_memory = true;
         // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
         // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
-        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env(
+        let mut agent = crate::agent::agent::Agent::from_live_config_with_tui_env_and_acp_sessions(
             Arc::clone(&self.ctx.config),
             &data.agent_alias,
             cwd_path,
@@ -2235,6 +2266,7 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            store,
         )
         .await
         .ok()?;
@@ -9640,6 +9672,161 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
         (dispatcher, sessions, chat_backend, acp_store)
+    }
+
+    async fn execute_session_tool_as(
+        agent: &Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        current_session_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> zeroclaw_api::tool::ToolResult {
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(current_session_id.to_string()), async {
+                agent
+                    .lock()
+                    .await
+                    .execute_tool_for_test(tool_name, args)
+                    .await
+                    .unwrap_or_else(|| panic!("{tool_name} should be registered"))
+                    .unwrap_or_else(|error| panic!("{tool_name} should execute: {error}"))
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn rpc_acp_agents_receive_owned_session_tools_on_create_and_rehydrate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let current = "11111111-1111-4111-8111-111111111111";
+        let previous = "22222222-2222-4222-8222-222222222222";
+        let foreign = "33333333-3333-4333-8333-333333333333";
+        let unknown = "44444444-4444-4444-8444-444444444444";
+        acp_store
+            .create_session(previous, "test-agent", "/previous")
+            .unwrap();
+        acp_store
+            .append_turn(
+                previous,
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "durable prior RPC answer",
+                ))],
+            )
+            .unwrap();
+        acp_store
+            .create_session(foreign, "other-agent", "/foreign")
+            .unwrap();
+
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": current,
+            }))
+            .await
+            .expect("real RPC session/new should create an ACP agent");
+
+        let fresh = sessions
+            .get_agent(current)
+            .await
+            .expect("fresh RPC ACP agent should be live");
+        let listed = execute_session_tool_as(&fresh, current, "sessions_list", json!({})).await;
+        assert!(listed.success);
+        assert!(listed.output.contains(current));
+        assert!(listed.output.contains(previous));
+        assert!(!listed.output.contains(foreign));
+
+        let history = execute_session_tool_as(
+            &fresh,
+            current,
+            "sessions_history",
+            json!({"session_id": previous}),
+        )
+        .await;
+        assert!(history.success);
+        assert!(history.output.contains("durable prior RPC answer"));
+
+        let foreign_history = execute_session_tool_as(
+            &fresh,
+            current,
+            "sessions_history",
+            json!({"session_id": foreign}),
+        )
+        .await;
+        let unknown_history = execute_session_tool_as(
+            &fresh,
+            current,
+            "sessions_history",
+            json!({"session_id": unknown}),
+        )
+        .await;
+        assert!(!foreign_history.success);
+        assert!(!unknown_history.success);
+        assert_eq!(
+            foreign_history.error.unwrap().replace(foreign, "<id>"),
+            unknown_history.error.unwrap().replace(unknown, "<id>"),
+            "a foreign ACP session must be indistinguishable from an unknown id"
+        );
+
+        let send = execute_session_tool_as(
+            &fresh,
+            current,
+            "sessions_send",
+            json!({"session_id": previous, "message": "hello"}),
+        )
+        .await;
+        assert!(!send.success);
+        let send_error = send.error.unwrap();
+        assert!(send_error.contains("sessions_send"));
+        assert!(send_error.contains("ACP"));
+        assert!(send_error.contains("Code"));
+
+        assert!(sessions.remove(current).await);
+        let rehydrated = dispatcher
+            .rehydrate_reaped_session(current)
+            .await
+            .expect("real RPC rehydration should rebuild the ACP agent");
+        let rehydrated_list =
+            execute_session_tool_as(&rehydrated, current, "sessions_list", json!({})).await;
+        assert!(rehydrated_list.success);
+        assert!(rehydrated_list.output.contains(current));
+        assert!(rehydrated_list.output.contains(previous));
+        assert!(!rehydrated_list.output.contains(foreign));
+        let rehydrated_history = execute_session_tool_as(
+            &rehydrated,
+            current,
+            "sessions_history",
+            json!({"session_id": previous}),
+        )
+        .await;
+        assert!(rehydrated_history.success);
+        assert!(
+            rehydrated_history
+                .output
+                .contains("durable prior RPC answer")
+        );
+
+        let chat_id = "chat-control";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "chat",
+                "session_id": chat_id,
+            }))
+            .await
+            .expect("real RPC session/new should create the Chat control");
+        let chat = sessions
+            .get_agent(chat_id)
+            .await
+            .expect("Chat control should be live");
+        let chat_list = execute_session_tool_as(&chat, chat_id, "sessions_list", json!({})).await;
+        assert!(chat_list.success);
+        assert!(!chat_list.output.contains(current));
+        assert!(!chat_list.output.contains(previous));
+        assert!(!chat_list.output.contains(foreign));
     }
 
     #[tokio::test]
