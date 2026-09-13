@@ -186,8 +186,16 @@ impl PrincipalResolver {
     /// stamped generation, so an uninitialized consumer can't look fresh).
     #[must_use]
     pub fn new(policy: ResolverPolicy) -> Self {
+        Self::with_generation(policy, 1)
+    }
+
+    /// Install an initial policy at an already-established authorization
+    /// generation. The inbound RPC state uses this while atomically replacing
+    /// its whole compiled authentication snapshot.
+    #[must_use]
+    pub fn with_generation(policy: ResolverPolicy, generation: u64) -> Self {
         Self {
-            state: RwLock::new((Arc::new(policy), 1)),
+            state: RwLock::new((Arc::new(policy), generation.max(1))),
         }
     }
 

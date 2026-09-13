@@ -733,14 +733,20 @@ impl RpcDispatcher {
             .as_secs();
         {
             let Some(auth) = self.auth.as_ref() else {
-                return Err(AuthDenied::auth_required("First call must be 'initialize'"));
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-first-call-initialize",
+                ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
             };
             if let Some(expires_at) = auth.principal.expires_at
                 && expires_at <= now
             {
-                return Err(AuthDenied::auth_required(
-                    "Credential expired: re-initialize with a fresh token",
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-credential-expired",
                 ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
             }
             if let Some(revalidate_by) = auth.principal.revalidate_by
                 && revalidate_by <= now
@@ -748,29 +754,34 @@ impl RpcDispatcher {
                 // Fail closed at the revalidation deadline. The client
                 // holds the credential and revalidates by re-initializing,
                 // which re-verifies against the live authority.
-                return Err(AuthDenied::auth_required(
-                    "Credential revalidation due: re-initialize to revalidate",
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-revalidation-due",
                 ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
             }
             if let Some(hash) = auth.native_token_hash.as_deref()
                 && !self.ctx.auth.pairing().token_hash_is_paired(hash)
             {
-                return Err(AuthDenied::auth_required(
-                    "Pairing token revoked: re-pair and re-initialize",
+                let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                    "rpc-auth-pairing-revoked",
                 ));
+                self.audit_auth_denial(method, &denied);
+                return Err(denied);
             }
         }
         // Authorization-policy generation moved: re-resolve grants from
         // the retained identity so profile/mapping/roster changes reach
         // this established connection now, not at reconnect.
-        let current_generation = self.ctx.auth.resolver().generation();
+        let current_generation = self.ctx.auth.generation();
         let stale_identity = self
             .auth
             .as_ref()
             .filter(|auth| auth.generation != current_generation)
             .map(|auth| auth.identity.clone());
-        if let Some(identity) = stale_identity {
-            match self.ctx.auth.resolver().resolve(&identity) {
+        if stale_identity.is_some() {
+            let stale_auth = self.auth.as_ref().expect("stale auth exists").clone();
+            match self.ctx.auth.revalidate_and_resolve(&stale_auth) {
                 Ok(resolved) => {
                     if let Some(auth) = self.auth.as_mut() {
                         auth.principal = resolved.principal;
@@ -782,63 +793,100 @@ impl RpcDispatcher {
                     // The current policy grants this identity nothing:
                     // drop the binding entirely.
                     self.auth = None;
-                    return Err(AuthDenied::from_deny_reason(reason));
+                    let denied = AuthDenied::from_deny_reason(reason);
+                    self.audit_auth_denial(method, &denied);
+                    return Err(denied);
                 }
             }
         }
         let Some(auth) = self.auth.as_ref() else {
-            return Err(AuthDenied::auth_required("First call must be 'initialize'"));
+            let denied = AuthDenied::auth_required(crate::i18n::get_required_cli_string(
+                "rpc-auth-first-call-initialize",
+            ));
+            self.audit_auth_denial(method, &denied);
+            return Err(denied);
         };
         if !auth.grants.permits(resource, verb) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::System)
-                    .with_attrs(::serde_json::json!({
-                        "method": method.wire_name(),
-                        "resource": resource.to_string(),
-                        "verb": verb.to_string(),
-                        "principal_id": auth.principal.id.as_str(),
-                        "auth_provider": auth.principal.auth_provider_label(),
-                    })),
-                "RPC authorization denied"
-            );
-            return Err(AuthDenied::forbidden(format!(
+            let denied = AuthDenied::forbidden(format!(
                 "Principal is not granted {resource}:{verb} (required by {})",
                 method.wire_name()
-            )));
+            ));
+            self.audit_auth_denial(method, &denied);
+            return Err(denied);
         }
         Ok(())
     }
 
+    fn audit_auth_denial(&self, method: Method, denied: &crate::rpc::auth::AuthDenied) {
+        let (principal_id, auth_provider) = self
+            .auth
+            .as_ref()
+            .map(|auth| {
+                (
+                    Some(auth.principal.id.as_str()),
+                    Some(auth.principal.auth_provider_label()),
+                )
+            })
+            .unwrap_or((None, None));
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::System)
+                .with_attrs(::serde_json::json!({
+                    "method": method.wire_name(),
+                    "reason": denied.message,
+                    "code": denied.code,
+                    "principal_id": principal_id,
+                    "auth_provider": auth_provider,
+                })),
+            "RPC authorization denied"
+        );
+    }
+
     /// Fine-grained config-path selector. Composes with the coarse
     /// `Config` grant the gate already enforced: both are required.
-    fn selector_config_write(&self, path: &str) -> Result<(), JsonRpcError> {
+    fn selector_config_write(&self, method: Method, path: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
         if auth.grants.may_write_config(path) {
             Ok(())
         } else {
-            Err(rpc_err(
+            let denied = rpc_err(
                 FORBIDDEN,
                 format!("Principal is not granted config write access to {path:?}"),
-            ))
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            Err(denied)
         }
     }
 
-    /// Fine-grained agent selector for `session/new`. The principal's tool
-    /// selector composes separately through
+    /// Fine-grained agent selector for session admission. The principal's
+    /// tool selector composes separately through
     /// [`Self::principal_tool_narrowing`] at agent assembly.
-    fn selector_session_agent(&self, alias: &str) -> Result<(), JsonRpcError> {
+    fn selector_session_agent(&self, method: Method, alias: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
         };
         if !auth.grants.may_use_agent(alias) {
-            return Err(rpc_err(
+            let denied = rpc_err(
                 FORBIDDEN,
                 format!("Principal is not entitled to agent {alias:?}"),
-            ));
+            );
+            self.audit_auth_denial(
+                method,
+                &crate::rpc::auth::AuthDenied {
+                    code: denied.code,
+                    message: denied.message.clone(),
+                },
+            );
+            return Err(denied);
         }
         Ok(())
     }
@@ -897,7 +945,6 @@ impl RpcDispatcher {
         let resolved = self
             .ctx
             .auth
-            .resolver()
             .resolve(&identity)
             .expect("the shared operator always resolves");
         self.auth = Some(crate::rpc::auth::ConnectionAuth {
@@ -906,6 +953,7 @@ impl RpcDispatcher {
             grants: resolved.grants,
             generation: resolved.generation,
             native_token_hash: None,
+            local_evidence: crate::rpc::auth::LocalCredentialEvidence::LocalCompatibility,
         });
     }
 
@@ -970,53 +1018,12 @@ impl RpcDispatcher {
 
     /// Flush dirty config paths to disk.
     ///
-    /// `_guard` is never read — it is a witness reminding the caller to
-    /// serialize on `ctx.config_write_lock` for the whole read-mutate-flush
-    /// critical section. It is NOT compile-time proof of holding *that*
-    /// mutex (a guard is not statically tied to a specific instance); the
-    /// `debug_assert!` below catches a caller holding a look-alike guard
-    /// from the wrong mutex. The invariant lives on
-    /// [`RpcContext::config_write_lock`]: every mutation of `ctx.config`
-    /// must hold it, and a bypassing writer that re-dirties a just-saved
-    /// path during a flush loses disk persistence of that write.
-    ///
-    /// Clone the config out of the lock (parking_lot guards are !Send, so
-    /// the clone can't be held across `snapshot.save_dirty().await`), save
-    /// the clone to disk, then remove only the paths that were actually
-    /// saved from the LIVE config's dirty set. This must NOT swap the live
-    /// config wholesale: a write landed on `ctx.config` while this method
-    /// awaits disk I/O would otherwise be overwritten by the stale snapshot
-    /// on write-back, silently erasing an in-memory change that was never
-    /// given a chance to be saved.
-    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
-        debug_assert!(
-            self.ctx.config_write_lock.try_lock().is_err(),
-            "flush_config caller must hold ctx.config_write_lock"
-        );
-        let mut snapshot = self.ctx.config.read().clone();
-        let saved_paths = snapshot.dirty_paths.clone();
-        snapshot
-            .save_dirty()
-            .await
-            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
-        self.ctx
-            .config
-            .write()
-            .dirty_paths
-            .retain(|path| !saved_paths.contains(path));
-        Ok(())
-    }
-
     /// Save `snapshot` to disk, then install it as the live config.
     ///
-    /// `_guard` is the same serialization witness as in
-    /// [`Self::flush_config`] (a reminder, not compile-time proof — see
-    /// there). Unlike `flush_config`, this deliberately swaps: callers pass
-    /// a clone that was itself mutated beyond just `dirty_paths` (e.g. an
-    /// alias rename), and installing that mutated snapshot wholesale is the
-    /// point. Holding `config_write_lock` is what makes the swap safe — no
-    /// other handler can land a concurrent `config` write while this is in
-    /// flight.
+    /// `_guard` is a witness that the caller serializes the whole
+    /// read-mutate-save-swap critical section on `config_write_lock`. Holding
+    /// that lock prevents a concurrent write from being lost while disk I/O
+    /// awaits, and lets auth publication consume the exact saved snapshot.
     async fn save_and_swap_config(
         &self,
         mut snapshot: zeroclaw_config::schema::Config,
@@ -1036,6 +1043,15 @@ impl RpcDispatcher {
                 format!("Authorization config rejected; nothing was saved: {e}"),
             )
         })?;
+        self.ctx
+            .auth
+            .validate_refresh_from_config(&snapshot)
+            .map_err(|e| {
+                rpc_err(
+                    INVALID_PARAMS,
+                    format!("Authorization config rejected; nothing was saved: {e}"),
+                )
+            })?;
         snapshot
             .save_dirty()
             .await
@@ -1058,6 +1074,26 @@ impl RpcDispatcher {
                 "config saved but the authorization policy was rejected; the previous policy remains in effect"
             );
         }
+        Ok(())
+    }
+
+    /// Exercise the historical dirty-path persistence boundary directly.
+    /// Production mutations now use `save_and_swap_config` so the accepted
+    /// auth snapshot and persisted config stay one transaction.
+    #[cfg(test)]
+    async fn flush_config(&self, _guard: &ConfigWriteGuard) -> Result<(), JsonRpcError> {
+        debug_assert!(self.ctx.config_write_lock.try_lock().is_err());
+        let mut snapshot = self.ctx.config.read().clone();
+        let saved_paths = snapshot.dirty_paths.clone();
+        snapshot
+            .save_dirty()
+            .await
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
+        self.ctx
+            .config
+            .write()
+            .dirty_paths
+            .retain(|path| !saved_paths.contains(path));
         Ok(())
     }
 
@@ -1894,7 +1930,7 @@ impl RpcDispatcher {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
-        self.selector_session_agent(&req.agent_alias)?;
+        self.selector_session_agent(Method::SessionNew, &req.agent_alias)?;
         let resuming = req.session_id.is_some();
         let session_id = req
             .session_id
@@ -2761,18 +2797,28 @@ impl RpcDispatcher {
                 }
             },
         };
+        // Session/new performs this selector only for the initial admission.
+        // Reused and rehydrated sessions enter through session/prompt, so
+        // enforce the same agent/tool posture before any prompt-side effect.
+        let agent_alias = self
+            .ctx
+            .sessions
+            .get_agent_alias(sid)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        // `process_line` has already run the coarse SessionPrompt gate for
+        // production traffic. Direct unit handlers intentionally bypass that
+        // transport boundary, so only apply the selector when a connection is
+        // bound rather than changing unrelated prompt-fixture semantics.
+        if self.auth.is_some() {
+            self.selector_session_agent(Method::SessionPrompt, &agent_alias)?;
+        }
 
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
         if !req.attachments.is_empty() {
             use super::attachments::process_file_entry;
 
-            let agent_alias = self
-                .ctx
-                .sessions
-                .get_agent_alias(sid)
-                .await
-                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             let upload_root = self
                 .ctx
                 .config
@@ -3932,7 +3978,7 @@ impl RpcDispatcher {
 
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
-        self.selector_config_write(&req.prop)?;
+        self.selector_config_write(Method::ConfigSet, &req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         // Clone the live config and perform every mutation — alias creation,
@@ -4312,16 +4358,15 @@ impl RpcDispatcher {
 
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
-        self.selector_config_write(&req.prop)?;
+        self.selector_config_write(Method::ConfigDelete, &req.prop)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        {
-            let mut config = self.ctx.config.write();
-            config
-                .set_prop_persistent(&req.prop, "")
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
-        }
-        self.flush_config(&config_write_guard).await?;
+        let mut working = self.ctx.config.read().clone();
+        working
+            .set_prop_persistent(&req.prop, "")
+            .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
+        self.save_and_swap_config(working, &config_write_guard)
+            .await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -4359,26 +4404,30 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_create(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyCreateParams = parse_params(params)?;
-        self.selector_config_write(&format!("{}.{}", req.path, req.key))?;
+        self.selector_config_write(
+            Method::ConfigMapKeyCreate,
+            &format!("{}.{}", req.path, req.key),
+        )?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let mut working = self.ctx.config.read().clone();
         let created = {
-            let mut config = self.ctx.config.write();
             // Shared guarded boundary: enforces the reserved-agent rule (the
             // `default` runtime fallback) on this surface too, so the RPC create
             // path cannot author an `agents.default` the rename guard then traps.
             let created = zeroclaw_config::alias_refs::create_map_key_checked(
-                &mut config,
+                &mut working,
                 &req.path,
                 &req.key,
             )
             .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
             if created {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+                working.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
             created
         };
         if created {
-            self.flush_config(&config_write_guard).await?;
+            self.save_and_swap_config(working, &config_write_guard)
+                .await?;
         }
         to_result(ConfigMapKeyCreateResult {
             path: req.path,
@@ -4389,20 +4438,24 @@ impl RpcDispatcher {
 
     async fn handle_config_map_key_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeyDeleteParams = parse_params(params)?;
-        self.selector_config_write(&format!("{}.{}", req.path, req.key))?;
+        self.selector_config_write(
+            Method::ConfigMapKeyDelete,
+            &format!("{}.{}", req.path, req.key),
+        )?;
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
+        let mut working = self.ctx.config.read().clone();
         let deleted = {
-            let mut config = self.ctx.config.write();
-            let deleted = config
+            let deleted = working
                 .delete_map_key(&req.path, &req.key)
                 .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
             if deleted {
-                config.mark_dirty(&format!("{}.{}", req.path, req.key));
+                working.mark_dirty(&format!("{}.{}", req.path, req.key));
             }
             deleted
         };
         if deleted {
-            self.flush_config(&config_write_guard).await?;
+            self.save_and_swap_config(working, &config_write_guard)
+                .await?;
         }
         to_result(ConfigMapKeyDeleteResult {
             path: req.path,
@@ -4418,8 +4471,16 @@ impl RpcDispatcher {
         };
         // A rename mutates both the old and new key paths.
         if let Err(err) = self
-            .selector_config_write(&format!("{}.{}", req.path, req.from))
-            .and_then(|()| self.selector_config_write(&format!("{}.{}", req.path, req.to)))
+            .selector_config_write(
+                Method::ConfigMapKeyRename,
+                &format!("{}.{}", req.path, req.from),
+            )
+            .and_then(|()| {
+                self.selector_config_write(
+                    Method::ConfigMapKeyRename,
+                    &format!("{}.{}", req.path, req.to),
+                )
+            })
         {
             return Box::pin(std::future::ready(Err(err)));
         }
@@ -4437,19 +4498,20 @@ impl RpcDispatcher {
                     .await;
             }
 
+            let mut working = self.ctx.config.read().clone();
             let renamed = {
-                let mut config = self.ctx.config.write();
-                let renamed = config
+                let renamed = working
                     .rename_map_key(&req.path, &req.from, &req.to)
                     .map_err(|e| rpc_err(INVALID_PARAMS, e))?;
                 if renamed {
-                    config.mark_dirty(&format!("{}.{}", req.path, req.from));
-                    config.mark_dirty(&format!("{}.{}", req.path, req.to));
+                    working.mark_dirty(&format!("{}.{}", req.path, req.from));
+                    working.mark_dirty(&format!("{}.{}", req.path, req.to));
                 }
                 renamed
             };
             if renamed {
-                self.flush_config(&config_write_guard).await?;
+                self.save_and_swap_config(working, &config_write_guard)
+                    .await?;
             }
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
@@ -6521,16 +6583,19 @@ mod tests {
             .expect_err("ungranted resource-verb is refused");
         assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
 
-        // Remove the roster entry: the next privileged operation on this
-        // ESTABLISHED connection re-resolves at the new generation and is
-        // denied — no reconnect, no restart.
+        // Remove the roster entry: the next privileged operation rechecks the
+        // kernel uid at the new generation before resolving, then denies the
+        // now-unmapped local credential without reconnect or restart.
         ctx.auth
             .refresh_from_config(&zeroclaw_config::schema::Config::default())
             .expect("the default config is a valid refresh");
         let denied = dispatcher
             .authorize(Method::SessionList, Resource::Sessions, Verb::Read)
             .expect_err("removed roster entry revokes established authorization");
-        assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
+        assert_eq!(
+            denied.code,
+            zeroclaw_api::jsonrpc::error_codes::AUTH_REQUIRED
+        );
     }
 
     #[tokio::test]
@@ -6603,13 +6668,17 @@ mod tests {
             .handle_initialize(&json!({}))
             .await
             .expect("alice authenticates");
-        assert!(alice.selector_config_write("cron.enabled").is_ok());
+        assert!(
+            alice
+                .selector_config_write(Method::ConfigSet, "cron.enabled")
+                .is_ok()
+        );
         let denied = alice
-            .selector_config_write("gateway.port")
+            .selector_config_write(Method::ConfigSet, "gateway.port")
             .expect_err("outside the granted subtree");
         assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
         let denied = alice
-            .selector_session_agent("main")
+            .selector_session_agent(Method::SessionNew, "main")
             .expect_err("no agent selector granted");
         assert_eq!(denied.code, zeroclaw_api::jsonrpc::error_codes::FORBIDDEN);
 
@@ -6645,7 +6714,7 @@ mod tests {
         // ...and the constrained tool selector now composes as per-session
         // narrowing instead of refusing the session.
         alice
-            .selector_session_agent("any-agent")
+            .selector_session_agent(Method::SessionNew, "any-agent")
             .expect("constrained tools narrow the session, not refuse it");
         assert_eq!(
             alice.principal_tool_narrowing(),
@@ -6683,7 +6752,10 @@ mod tests {
         bob.handle_initialize(&json!({}))
             .await
             .expect("bob authenticates");
-        assert!(bob.selector_session_agent("any-agent").is_ok());
+        assert!(
+            bob.selector_session_agent(Method::SessionNew, "any-agent")
+                .is_ok()
+        );
         assert_eq!(
             bob.principal_tool_narrowing(),
             None,
