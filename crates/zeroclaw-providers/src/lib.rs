@@ -1130,6 +1130,52 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
     })
 }
 
+/// Whether a provider error reports that native tool/function calling is not
+/// accepted by the endpoint.
+///
+/// This is intentionally message-based because custom OpenAI-compatible
+/// gateways report this family of 400/422 failures with different JSON shapes.
+/// Callers must still gate use of this predicate on an actual native-tools
+/// request so an unrelated provider message cannot trigger a downgrade.
+pub fn rejects_native_tool_calling(error: &(dyn std::error::Error + 'static)) -> bool {
+    rejects_native_tool_calling_message(&format_error_chain(error))
+}
+
+/// Message-only form of [`rejects_native_tool_calling`] for stream adapters
+/// that preserve provider failures as rendered stream errors.
+pub fn rejects_native_tool_calling_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let clauses = error_message_clauses(&message);
+    clauses.into_iter().any(|clause| {
+        let mentions_native_tools = mentions_tools_token(clause)
+            || clause.contains("tool_choice")
+            || clause.contains("function_call")
+            || clause.contains("function calling")
+            || clause.contains("function call");
+        let reports_rejection = [
+            "400",
+            "bad request",
+            "422",
+            "unprocessable",
+            "not supported",
+            "unsupported",
+            "unknown parameter",
+            "unrecognized field",
+            "invalid request",
+            "not allowed",
+            "cannot be used",
+            "can't be used",
+            "does not support",
+            "validation failed",
+            "was not in request",
+        ]
+        .iter()
+        .any(|hint| clause.contains(hint));
+
+        mentions_native_tools && reports_rejection
+    })
+}
+
 /// Format an error including its full source chain and sanitize the result.
 pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut formatted = String::new();
@@ -4069,6 +4115,35 @@ mod tests {
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"reasoning_effort is not supported with tools for model gpt-4.1"}}"#
         ));
+    }
+
+    #[test]
+    fn native_tool_rejection_detection_matches_400_tools_errors() {
+        let error = anyhow::Error::msg(
+            r#"Custom API error (400 Bad Request): {"error":{"message":"tools are not supported by this endpoint"}}"#,
+        );
+        assert!(rejects_native_tool_calling(error.as_ref()));
+
+        let tool_choice = anyhow::Error::msg(
+            r#"Custom API error (400 Bad Request): {"error":{"message":"unknown parameter: tool_choice"}}"#,
+        );
+        assert!(rejects_native_tool_calling(tool_choice.as_ref()));
+
+        let function_calling =
+            anyhow::Error::msg("422 Unprocessable Entity: function calling is not supported");
+        assert!(rejects_native_tool_calling(function_calling.as_ref()));
+    }
+
+    #[test]
+    fn native_tool_rejection_detection_ignores_unrelated_provider_errors() {
+        let auth = anyhow::Error::msg("401 Unauthorized: invalid API key");
+        assert!(!rejects_native_tool_calling(auth.as_ref()));
+
+        let model = anyhow::Error::msg("400 Bad Request: model toolformer-v2 is unknown");
+        assert!(!rejects_native_tool_calling(model.as_ref()));
+
+        let reasoning = anyhow::Error::msg("400 Bad Request: reasoning_effort is unsupported");
+        assert!(!rejects_native_tool_calling(reasoning.as_ref()));
     }
 
     #[test]
