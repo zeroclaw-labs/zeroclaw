@@ -75,6 +75,7 @@ mod tests {
             &serde_json::json!({"path": "test.txt"}),
             &ApprovalResponse::Always,
             "cli",
+            None,
         );
 
         // Now file_write should be in session allowlist.
@@ -91,6 +92,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Always,
             "cli",
+            None,
         );
 
         // shell is in always_ask, so it still needs approval.
@@ -105,6 +107,7 @@ mod tests {
             &serde_json::json!({}),
             &ApprovalResponse::Yes,
             "cli",
+            None,
         );
         assert!(mgr.needs_approval("file_write"));
     }
@@ -120,12 +123,14 @@ mod tests {
             &serde_json::json!({"command": "rm -rf ./build/"}),
             &ApprovalResponse::No,
             "cli",
+            None,
         );
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "out.txt", "content": "hello"}),
             &ApprovalResponse::Yes,
             "cli",
+            None,
         );
 
         let log = mgr.audit_log();
@@ -144,6 +149,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Yes,
             "telegram",
+            None,
         );
 
         let log = mgr.audit_log();
@@ -264,6 +270,7 @@ mod tests {
             &serde_json::json!({"path": "test.txt"}),
             &ApprovalResponse::Always,
             "telegram",
+            None,
         );
 
         assert!(!mgr.needs_approval("file_write"));
@@ -278,6 +285,7 @@ mod tests {
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Always,
             "telegram",
+            None,
         );
 
         // shell is in always_ask, so it still needs approval even after "Always".
@@ -301,6 +309,7 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            intent: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();

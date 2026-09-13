@@ -1217,6 +1217,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        approval,
                     };
                     execute_tools_parallel(
                         &executable_calls,
@@ -1235,6 +1236,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         activated_tools,
                         excluded_tools,
                         model_switch_callback: model_switch_callback.as_ref(),
+                        approval,
                     };
                     execute_tools_sequential(
                         &executable_calls,

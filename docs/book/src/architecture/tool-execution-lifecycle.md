@@ -101,10 +101,25 @@ Preparation happens before the executor runs a tool:
 
 1. `before_tool_call` hooks may cancel or rewrite the name/arguments.
 2. Channel delivery defaults may be injected for channel-aware tools.
-3. The runtime clears any "approved" marker in arguments.
-4. The approval gate evaluates the tool against the `ApprovalManager`.
-5. Approved calls get the runtime-approved marker restored.
-6. Duplicate-call guards remove repeated identical calls unless the tool is
+3. The runtime clears any "approved" marker in arguments: the approval bit
+   is runtime plumbing, never a model-facing parameter (RFC #7155 §5.1).
+4. For shell-family tools, the gate first RESOLVES the actual command
+   against the risk profile's compiled three-tier rule table
+   (`zeroclaw-config::tool_policy`): a `Deny` is rejected with no prompt
+   (no approval can change it), an `Allow` proceeds without a prompt, and
+   only an `Ask` routes to the approval flow. Unmatched commands resolve
+   to `Ask` (fail-closed into approval rather than a blanket reject).
+5. The approval gate evaluates the tool against the `ApprovalManager`
+   (tool-name layer) and prompts through the available front door.
+6. An approved shell command mints a single-use `TrustedConfirmation`
+   bound to the command's action fingerprint (the complete action facts:
+   executable as typed, arguments, env assignments, cwd, and dialect, hashed
+   under a version-tagged domain); the confirmation is consumed at
+   dispatch, and only a `Consumed` outcome restores the approved marker.
+   "Always approve" answers mint a narrow session rule (exact executable
+   plus the approved argument prefix) rather than pre-approving the whole
+   tool.
+7. Duplicate-call guards remove repeated identical calls unless the tool is
    exempt.
 
 Approval has different front doors:
@@ -117,13 +132,25 @@ Approval has different front doors:
 - `DenyWithEdit` / replacement responses are sanitized and become synthetic
   tool results; the original tool does not execute.
 
+Approval prompts may show an agent-stated `intent` next to the real command,
+explicitly labeled untrusted (RFC #7155 §5.5): it is a display aid only;
+authorization always binds the action fingerprint, and changing the intent
+satisfies no approval.
+
 Approval is a pre-execution control. It is not a receipt, and it is not proof
-that a tool ran. Audit entries record the decision and the deciding channel or
-backchannel.
+that a tool ran. Audit entries record the decision, the deciding channel or
+backchannel, and (when a confirmation was minted) its action fingerprint,
+trusted route, and terminal state.
 
 Prompt-required shell calls have an extra loop guard: if the agent repeats the
 same prompt-required shell call before approval, the loop aborts instead of
 prompting over and over.
+
+The rule layer is a policy decision, not an OS-level containment: a `Deny`
+or consumed confirmation authorizes the command under the configured
+policy, while filesystem/workspace confinement, sandboxing, and the
+forbidden-path scans remain separate enforcement layers that still apply
+(see the security overview).
 
 ## Dispatch, cancellation, and ordering
 

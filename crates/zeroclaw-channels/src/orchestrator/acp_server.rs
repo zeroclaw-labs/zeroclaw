@@ -823,8 +823,13 @@ impl AcpServer {
                     .model_provider_for_agent(&agent_alias)
                     .and_then(|mp| mp.model.clone())
                     .unwrap_or_default();
+                // `anyhow::Error::to_string()` only renders the outer context,
+                // which hid actionable provider failures (for example, an API
+                // key prefix mismatch) behind "Failed to create agent". Keep
+                // the complete chain while applying the provider sanitizer
+                // before exposing it over the RPC boundary.
                 let error = zeroclaw_runtime::security::scrub(
-                    &zeroclaw_providers::sanitize_api_error(&e.to_string()),
+                    &zeroclaw_providers::format_error_chain(e.as_ref()),
                 );
                 ::zeroclaw_log::scope!(
                     session_key: session_id.as_str(),
@@ -1063,7 +1068,10 @@ impl AcpServer {
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
+                message: format!(
+                    "Failed to create agent: {}",
+                    zeroclaw_providers::format_error_chain(e.as_ref())
+                ),
                 data: None,
             });
 
@@ -1277,7 +1285,10 @@ impl AcpServer {
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
+                message: format!(
+                    "Failed to create agent: {}",
+                    zeroclaw_providers::format_error_chain(e.as_ref())
+                ),
                 data: None,
             });
 

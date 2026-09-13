@@ -1890,7 +1890,11 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.to_lowercase().contains("not allowed"));
+        assert!(
+            output
+                .to_lowercase()
+                .contains("high-risk command is disallowed")
+        );
     }
 
     #[tokio::test]

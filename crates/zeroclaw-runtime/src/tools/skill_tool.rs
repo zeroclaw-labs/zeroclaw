@@ -168,11 +168,16 @@ impl Tool for SkillShellTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let command = self.substitute_args(&args);
 
-        // Security validation — always requires explicit approval (approved=true)
-        // since skill tools are user-defined and should be treated as medium-risk.
+        // Security validation (RFC 7155 §5.1): the skill tool presents NO
+        // confirmation — an operator's approval of the *skill invocation*
+        // did not approve this exact command (the model supplies the
+        // substituted arguments), so risk-tier commands fail closed with
+        // "requires operator approval" rather than silently running as they
+        // did under the pre-RFC hardcoded `approved = true`. Allowlisted
+        // low-risk skill commands are unaffected.
         match self.security.validate_command_execution_for_shell(
             &command,
-            true,
+            false,
             self.runtime.shell_dialect(),
         ) {
             Ok(_) => {}

@@ -12,6 +12,7 @@ pub mod memory_traits;
 pub mod model_provider;
 pub mod observability_traits;
 pub mod peripherals_traits;
+pub mod permission;
 pub mod plan;
 pub mod platform;
 pub mod plugin;
