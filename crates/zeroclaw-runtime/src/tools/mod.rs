@@ -1975,10 +1975,10 @@ fn register_plugin_tools(
 
     for scope in admitted {
         let package = scope.id().package().to_string();
-        let Some((manifest, wasm_path)) = details
+        let Some((manifest, component)) = details
             .iter()
-            .copied()
             .find(|(manifest, _)| manifest.name == package)
+            .map(|(manifest, component)| (*manifest, *component))
         else {
             continue;
         };
@@ -2001,7 +2001,7 @@ fn register_plugin_tools(
         }
 
         let tool = zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
-            wasm_path.to_path_buf(),
+            component.clone(),
             scope,
             services.clone(),
             plugin_limits,
