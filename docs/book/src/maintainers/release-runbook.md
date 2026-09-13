@@ -469,11 +469,42 @@ recreate `gh-pages` or change the supported-version window.
 ### What happens automatically
 
 - The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
-- "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
-- **Ordering matters:** the tag deploy must land `/vX.Y.Z/` on `gh-pages` *before* a master deploy can flip the stable pointer to it. In the normal release sequence the version-bump PR merges first (Step 2), so its `master` docs deploy typically runs *before* `Release Stable` creates and deploys the tag. That earlier master deploy finds `/vX.Y.Z/` absent and deliberately retains the previous pointer; the flip is deferred (see the deferred-flip logic in `docs-deploy.yml`). The `deploy-docs` job then creates `/vX.Y.Z/`, and the flip publishes on the *next* master deploy after the dir is live. Note that `deploy-docs` only dispatches the tag build and does not wait for it: a green `deploy-docs` job means the dispatch was accepted, not that the docs run finished. After `/vX.Y.Z/` is live, dispatch `docs-deploy.yml` with `tag=master` to publish the stable-pointer flip (and confirm the dispatched runs actually succeeded in the Actions tab).
-- `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
+- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. There is no duplicate `/stable/` tree.
+- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer without another full master build.
+- `gh-pages` is ephemeral: publication replaces it with a single orphan commit. Normal builds enforce retention via `DOCS_KEEP_VERSIONS` (master, the stable pointer target, and the newest N final releases). Promotion preserves all existing version directories.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
+
+### Promote an already deployed release
+
+Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
+`promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
+The default `build` mode retains the normal build behavior.
+
+Promotion updates only `stable-version.txt`, `index.html`, and `versions.json` at
+the site root. It installs no Rust or mdBook tools and preserves every locale,
+the API reference, shared chrome, and retention state. The workflow's existing
+`gh-pages` concurrency group serializes both modes; promotion also uses an exact
+push lease so it cannot replace a site changed by another writer.
+
+The helper requires the dispatch commit to remain protected master's current
+head, its committed pointer to match the requested tag, and GitHub Latest to name
+that same public final release. It resolves the tag to a commit and compares it
+with the deployed version's `.docs-source-commit` receipt. Every locale listed in
+that release's `locales.toml` must have a nonempty landing page. Missing or
+inconsistent metadata, API errors, prereleases, versions below the docs floor,
+and numeric version downgrades fail before publication. The live checks repeat
+immediately before the push. If master advances while the run waits, dispatch a
+fresh run. Repeating a successful promotion is safe.
+
+Deployments made before source receipts were introduced need one normal `build`
+dispatch for that release tag before promotion can verify their source. Do not
+create a receipt by hand. Promotion does not rewrite page-level canonical or
+language-alternate tags, or `sitemap.xml`; those SEO fields refresh on the next
+normal docs deploy. If an immediate SEO refresh is required, use a normal master
+build. A downgrade requires a separately reviewed manual rollback; this mode has
+no rollback override. Reverting the workflow change removes the manual mode but
+does not change the already published pointer.
 
 ### Bootstrapping `gh-pages`
 
