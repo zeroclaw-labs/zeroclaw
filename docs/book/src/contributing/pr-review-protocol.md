@@ -242,6 +242,8 @@ gh pr review <number> --repo zeroclaw-labs/zeroclaw \
 
 Always show the full draft and get explicit approval from the human before posting. Continuation words like "next" or "move on" don't count as approval, only an unambiguous "yes" / "approve" / "go" does.
 
+Preserve submitted review history. A substantive re-review of a later head must be a new formal review bound to that head, even when the verdict is unchanged; use `### ✅ Resolved` to acknowledge earlier findings. Edit an existing review only to correct what that review said about the head it originally assessed, such as a typo or inaccurate statement; never replace it with findings from a later head.
+
 ## After posting
 
 If a session-level handoff file exists (`tmp/handoff.md`), update it with the verdict, the head commit reviewed, and what remains open. The handoff is what lets a new session pick up cold without re-reading the whole conversation.

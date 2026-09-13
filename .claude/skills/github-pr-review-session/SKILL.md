@@ -5,15 +5,9 @@ description: "Human-reviewer co-pilot for ZeroClaw PR reviews. Use this skill wh
 
 # ZeroClaw PR Review Session — Human Reviewer Co-Pilot
 
-You are assisting the **active `gh` account holder** in conducting PR reviews
-for the `zeroclaw-labs/zeroclaw` repository. Reviewer identity is resolved from
-`tmp/handoff.md` at session start (the `reviewer:` field); if absent, detect it
-via `gh auth status` and persist it to the handoff immediately so continuation
-sessions reuse it without a redundant call. You read everything, cross-check
-against the local source, write the review body, and post it via `gh` — but the
-judgment and identity are the reviewer's. Every review is posted under the
-logged-in account, in the first-person voice of that reviewer — never as "an AI"
-or in a third party's voice.
+You are assisting the **active `gh` account holder** in conducting PR reviews for the `zeroclaw-labs/zeroclaw` repository. Cached reviewer identity in `tmp/handoff.md` is session context; verify the active account before posting.
+
+You read everything, cross-check against the local source, write the review body, and post it via `gh`. The judgment and identity are the reviewer's. Every review is posted under the logged-in account, in the first-person voice of that reviewer, never as "an AI" or in a third party's voice.
 
 ---
 
@@ -73,16 +67,10 @@ is 1234 ready to merge
 
 ### Phase 1 — Load context
 
-1. **Resolve reviewer identity.** Check whether `tmp/handoff.md` contains a
-   stored `reviewer:` field. If it does, use that value for all subsequent `gh`
-   commands and review prose. If it does not (new session or no handoff yet),
-   run `gh auth status` to capture the active account login, record the result
-   as `reviewer: <login>` in `tmp/handoff.md` immediately, and use it for the
-   rest of the session. Never hardcode any identity.
+1. **Resolve reviewer identity.** Use the cached `reviewer:` field in `tmp/handoff.md` for orientation, or read the active login with `gh api user --jq .login` when absent. Never hardcode an identity.
 2. Read `tmp/handoff.md`. Establish which PRs have already been reviewed this
    session, which verdict was posted, and what commit that verdict was on.
-3. For the target PR, check if `tmp/review-<number>.md` already exists. If it
-   does, read it — this session already posted a review for this PR.
+3. Read `tmp/review-<number>.md` if present. It may be an unposted draft; establish prior publication from the PR's submitted reviews, including the author and reviewed commit.
 4. If working in queue mode, identify the next PR that needs attention based on
    the handoff.
 
@@ -153,13 +141,13 @@ fetches sequentially wastes time and the results are independent.
 3. Show the draft to the active reviewer before posting. Prefer a link to
    `tmp/review-<number>.md` plus a short summary; if the full draft needs to be
    inline, paste it as regular text rather than a fenced Markdown block.
-4. Post using the verdict flag from the decision tree:
+4. Immediately before posting, verify the active login with `gh api user --jq .login`. If it differs from the identity used for the approved draft, reconcile the draft and confirmation before proceeding. Post using the verdict flag from the decision tree:
    ```bash
    gh pr review <number> --repo zeroclaw-labs/zeroclaw \
      <--approve | --request-changes | --comment> \
      --body-file tmp/review-<number>.md
    ```
-5. Confirm the post succeeded.
+5. Confirm the submitted review through the PR reviews API, checking its remote ID, author, body, verdict, and reviewed commit. A local file does not prove publication.
 
 ### Phase 3.5 — Milestone alignment
 
@@ -307,16 +295,11 @@ These norms are documented in
 1. **Always read `tmp/handoff.md` first.** It carries session state and the
    cached reviewer identity — reading it first avoids a redundant auth call on
    warm sessions.
-2. **Always resolve reviewer identity from the handoff before falling back to
-   `gh auth status`.** If the handoff has no `reviewer:` field, detect it,
-   write it to the handoff immediately, and use it for the rest of the session.
-   Never hardcode a username.
+2. **Verify the active reviewer before posting.** Cached identity is sufficient for orientation, not publication.
 3. **Always follow the protocol in
    `docs/book/src/contributing/pr-review-protocol.md`.** Do not improvise the
    fetch sequence or skip the foundations document step.
-4. **Always write to `tmp/review-<number>.md` before posting.** The tmp file
-   is the source of truth for what was posted. It also lets you inspect before
-   posting if the user asks.
+4. **Always write to `tmp/review-<number>.md` before posting.** The file holds the intended text; the submitted remote review establishes what was posted.
 5. **Always apply the PR-review Markdown checkpoint before showing or posting.**
    Formal review findings must use H3 headings that start with the taxonomy
    emoji, such as `### 🔴 Blocking — ...`; headings such as
