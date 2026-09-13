@@ -259,11 +259,14 @@ ZeroClaw automatically persists ACP sessions to SQLite. No configuration is requ
 What is persisted:
 
 - Session metadata: `sessionId`, `workspaceDir`, `created_at`, `last_activity`
-- Full conversation history: every `ConversationMessage` written after each completed `session/prompt` turn, in one atomic transaction per turn
+- Finalized conversation history: every final `ConversationMessage` from a completed turn, including partial output retained after cancellation, written in one atomic transaction per turn; a failed or empty turn discards its checkpoint
+- In-progress checkpoints: the accepted prompt plus assistant text, tool calls, and tool results are saved before their corresponding updates are sent to the client
+
+If a process stops during a turn, the next resume recovers the saved checkpoint once and appends an interruption marker to the client-visible transcript. Provider replay uses a separate safe projection: it keeps partial assistant text, omits the synthetic interruption marker and unmatched native tool exchanges, and limits each persisted tool-result payload to 16 KiB at a UTF-8 boundary plus a truncation marker. Thinking events and approval prompts are not checkpointed.
 
 Sessions survive process restarts. A session created in one `zeroclaw acp` invocation can be loaded or resumed in a later one, as long as the same `workspace_dir` is in use (and therefore the same `acp-sessions.db` file).
 
-Sessions are not automatically deleted. Use `session/close` to deactivate a session without deleting it, then `session/load` or `session/resume` to bring it back.
+Sessions are not automatically deleted. `session/close` removes the live owner but retains ACP history so the session can be loaded or resumed. `session/kill` also records a durable tombstone, so the session cannot be resumed. `session/delete` removes the selected ACP history and checkpoint before releasing its live owner; if durable deletion fails, the live session remains available and the RPC returns an error.
 
 ### `session/load` _(ZeroClaw extension)_
 
