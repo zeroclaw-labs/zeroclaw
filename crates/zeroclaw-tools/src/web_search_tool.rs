@@ -1,6 +1,7 @@
 use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
+use crate::helpers::response_body;
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
@@ -11,19 +12,101 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
+/// User-Agent sent on Serply requests. Serply is fronted by Cloudflare, which
+/// rejects requests that carry no User-Agent at all.
+const SERPLY_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
+
+/// Hard cap on the bytes buffered from a Serply success response.
+///
+/// `max_results`, `cap_result_content`, and the render caps bound only the
+/// parsed projection of the body, not how much the HTTP client buffers in
+/// order to build the JSON value, so the success body is streamed through the
+/// shared bounded reader up to this limit before decoding. A well-formed SERP
+/// payload is a few tens of KiB; 1 MiB leaves generous headroom while keeping
+/// a misbehaving or compromised upstream from forcing an arbitrarily large
+/// allocation in a long-lived runtime.
+const SERPLY_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Non-disclosing description of a `config.toml` parse failure.
+///
+/// `toml::de::Error` renders an annotated snippet through `Display`, and that
+/// snippet quotes the offending source line verbatim; `Debug` and `message()`
+/// can carry fragments of it too. None of the three is used as the disclosure
+/// boundary here, because the offending line is very often the credential line
+/// itself: an operator who writes an unquoted key while rotating it would
+/// otherwise put the whole `serply_api_key = ...` line into the model-visible
+/// tool error and into the persisted log attributes, neither of which the
+/// runtime scrubs on that path. Only a stable code and a line number derived
+/// from the error span leave this type.
+struct SerplyConfigParseFailure {
+    code: &'static str,
+    line: Option<usize>,
+}
+
+impl SerplyConfigParseFailure {
+    /// Stable identifier for this failure, safe to log and to show.
+    const CODE: &'static str = "config_toml_parse_failed";
+
+    fn new(contents: &str, error: &toml::de::Error) -> Self {
+        // `span()` is a byte range into `contents`. Counting the newlines
+        // before it yields a 1-based line number and nothing else: no source
+        // text crosses this boundary.
+        let line = error.span().and_then(|span| {
+            contents
+                .get(..span.start)
+                .map(|before| before.matches('\n').count() + 1)
+        });
+        Self {
+            code: Self::CODE,
+            line,
+        }
+    }
+
+    /// Attributes recorded to the log. Constants and numbers only.
+    fn log_attrs(&self, path: &Path) -> ::serde_json::Value {
+        ::serde_json::json!({
+            "path": path.display().to_string(),
+            "search_provider": "serply",
+            "error_code": self.code,
+            "error_line": self.line,
+        })
+    }
+
+    /// Message handed back to the caller, and through it to the model.
+    fn message(&self, path: &Path) -> String {
+        let location = match self.line {
+            Some(line) => format!(" at line {line}"),
+            None => String::new(),
+        };
+        format!(
+            "Failed to parse config file {} for Serply API key: invalid TOML{}. \
+             Fix the syntax there and retry. The parser's own message is withheld \
+             because it quotes the offending line, which may be the credential.",
+            path.display(),
+            location,
+        )
+    }
+}
+
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
-/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly).
+/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
+/// Serply (Google web results, requires API key).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
-/// The Bocha key has no boot-time snapshot at all — it is always resolved from
-/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
-/// canonical `[web_search] bocha_api_key` field stays the single source of
-/// truth and rotation/removal takes effect without a restart.
+/// The Bocha and Serply keys have no boot-time snapshot at all: they are
+/// always resolved from `config.toml` at use time (see `resolve_bocha_api_key`
+/// and `resolve_serply_api_key`), so the canonical `[web_search]` key fields
+/// stay the single source of truth and rotation/removal takes effect without a
+/// restart. The one exception is a schema-mirror env override
+/// (`ZEROCLAW_web_search__serply_api_key`): the loader applies it to the
+/// in-memory `Config` only, so the runtime hands the effective value to
+/// `with_serply_api_key_override` and the resolver uses it instead of the
+/// on-disk field for the lifetime of the process.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,
@@ -33,6 +116,11 @@ pub struct WebSearchTool {
     boot_tavily_api_key: Option<String>,
     /// Boot-time Jina AI key snapshot.
     boot_jina_api_key: Option<String>,
+    /// Effective Serply credential when `ZEROCLAW_web_search__serply_api_key`
+    /// was applied by the config loader. The outer `Option` records that an
+    /// override is active; an inner `None` (blank override) means "not
+    /// configured" and must not fall back to the on-disk key.
+    serply_api_key_override: Option<Option<String>>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
@@ -56,6 +144,7 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: None,
             boot_jina_api_key: jina_api_key,
+            serply_api_key_override: None,
             searxng_instance_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -81,12 +170,26 @@ impl WebSearchTool {
             boot_brave_api_key: brave_api_key,
             boot_tavily_api_key: tavily_api_key,
             boot_jina_api_key: jina_api_key,
+            serply_api_key_override: None,
             searxng_instance_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
             secrets_encrypt,
         }
+    }
+
+    /// Record the schema-mirror env override state for the Serply key.
+    ///
+    /// Pass `Some(value)` when the config loader applied
+    /// `ZEROCLAW_web_search__serply_api_key` (`value` is the in-memory
+    /// credential, `None` for a blank override) and `None` when no override is
+    /// active, in which case the key keeps being resolved from `config.toml`
+    /// at use time.
+    pub fn with_serply_api_key_override(mut self, override_key: Option<Option<String>>) -> Self {
+        self.serply_api_key_override =
+            override_key.map(|key| key.filter(|value| !value.is_empty()));
+        self
     }
 
     /// Resolve the Brave API key, preferring the boot-time value but falling
@@ -837,6 +940,186 @@ impl WebSearchTool {
         Ok(render_results(results_header(query, "Bocha"), blocks))
     }
 
+    /// Build the "not configured" error for the Serply key, logging which
+    /// lookup produced it (`env_override` or `config`).
+    fn serply_api_key_not_configured(source: &'static str) -> anyhow::Error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"search_provider": "serply", "source": source})),
+            "web_search: Serply API key not configured"
+        );
+        anyhow::Error::msg(
+            "Serply API key not configured. Set [web_search] serply_api_key in \
+             config.toml (or ZEROCLAW_web_search__serply_api_key). Obtain one at \
+             https://serply.io",
+        )
+    }
+
+    fn resolve_serply_api_key(&self) -> anyhow::Result<String> {
+        // A schema-mirror env override is the effective credential for this
+        // process: it wins over any stored key, and a blank override means
+        // "not configured" rather than silently sending the on-disk value.
+        if let Some(override_key) = &self.serply_api_key_override {
+            return override_key
+                .clone()
+                .ok_or_else(|| Self::serply_api_key_not_configured("env_override"));
+        }
+
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "serply",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Serply API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for Serply API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            let failure = SerplyConfigParseFailure::new(&contents, &e);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(failure.log_attrs(&self.config_path)),
+                "web_search: failed to parse config for Serply API key"
+            );
+            anyhow::Error::msg(failure.message(&self.config_path))
+        })?;
+
+        let raw_key = config
+            .web_search
+            .serply_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| Self::serply_api_key_not_configured("config"))?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Serply API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    async fn search_serply(&self, query: &str) -> anyhow::Result<String> {
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+        self.search_serply_with_client(&client, "https://api.serply.io/v1/search/", query)
+            .await
+    }
+
+    async fn search_serply_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let api_key = self.resolve_serply_api_key()?;
+
+        // Serply is a GET API: the query and result count travel as query-string
+        // parameters and the key only as the `X-Api-Key` header. The API sits
+        // behind Cloudflare, which rejects requests without a User-Agent, so one
+        // is always sent (reqwest sends none by default).
+        let num = self.max_results.to_string();
+        let response = client
+            .get(url)
+            .query(&[("q", query), ("num", num.as_str())])
+            .header("X-Api-Key", &api_key)
+            .header("User-Agent", SERPLY_USER_AGENT)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|err| transport_search_failure("serply", "request", &err))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("serply", status));
+        }
+
+        // The success body is streamed through the shared bounded reader
+        // before JSON decoding: the parse/render caps bound only the parsed
+        // projection, so decoding straight off the response would let the
+        // upstream dictate how much this long-lived process buffers. The
+        // query-bearing URL also rides along on read and decode failures, so
+        // the response path is normalized the same way as the request path.
+        let body = response_body::read_bounded(response, Some(SERPLY_RESPONSE_LIMIT_BYTES))
+            .await
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => transport_search_failure("serply", "response", err),
+                None => bounded_body_search_failure("serply", "body"),
+            })?;
+        if body.overflowed {
+            return Err(bounded_body_search_failure("serply", "oversized"));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes)
+            .map_err(|_| bounded_body_search_failure("serply", "decode"))?;
+        self.parse_serply_results(&json, query)
+    }
+
+    fn parse_serply_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "serply"})),
+                    "web_search: invalid Serply response"
+                );
+                anyhow::Error::msg("Invalid Serply API response")
+            })?;
+
+        if results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("link").and_then(|u| u.as_str()).unwrap_or("");
+            let description = result
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
+            if !description.is_empty() {
+                block.push(format!("   {}", cap_result_content(description)));
+            }
+            blocks.push(block);
+        }
+
+        Ok(render_results(results_header(query, "Serply"), blocks))
+    }
+
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         let results = json
             .get("web")
@@ -1078,7 +1361,7 @@ fn cap_provider_error(message: &str) -> String {
 }
 
 /// Header line for a rendered result list. Shared so the echoed query is
-/// bounded — and the wording stays identical — across all six providers.
+/// bounded — and the wording stays identical — across all seven providers.
 fn results_header(query: &str, provider: &str) -> String {
     format!(
         "Search results for: {} (via {provider})",
@@ -1088,7 +1371,7 @@ fn results_header(query: &str, provider: &str) -> String {
 
 /// The reply every provider returns when a search matched nothing.
 ///
-/// One shared function rather than six copies: this path returns before
+/// One shared function rather than seven copies: this path returns before
 /// [`render_results`], so it is the only place the echoed query is bounded at
 /// all, and a per-provider copy would be a per-provider chance to forget.
 fn no_results_message(query: &str) -> String {
@@ -1099,7 +1382,7 @@ fn no_results_message(query: &str) -> String {
 /// [`MAX_TOTAL_OUTPUT_CHARS`].
 ///
 /// Trimming happens at whole-result granularity so the model never receives a
-/// result cut off mid-field. Shared by all six provider parsers — the cap must
+/// result cut off mid-field. Shared by all seven provider parsers — the cap must
 /// not depend on which provider answered.
 fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
     let mut out = header;
@@ -1340,17 +1623,70 @@ fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
 /// makes them visible to the agent.
 fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
     let search_status = classify_http_status(status);
-    let hint = match search_status {
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status={}, http={status}). {}",
+        search_status.as_str(),
+        search_status_hint(search_status)
+    ))
+}
+
+/// Actionable hint matching a `search_status` class, shared by the HTTP-status
+/// and transport failure builders so the agent sees one vocabulary.
+fn search_status_hint(search_status: SearchStatus) -> &'static str {
+    match search_status {
         SearchStatus::Blocked | SearchStatus::Unavailable => {
             "Provider may be transiently unavailable or blocking the request; retry, or try a different provider (SearXNG, Brave, or Tavily)."
         }
         SearchStatus::ClientError => {
             "The provider refused the request; verify the query, credentials, billing or quota, and provider configuration."
         }
+    }
+}
+
+/// Build a provider transport-failure error (request send or response decode)
+/// that is safe to forward to the model.
+///
+/// `reqwest::Error` displays the request URL, and for GET providers that URL
+/// carries the model-supplied query, so the raw error must never reach the
+/// model-visible tool result (the runtime forwards `execute` errors as text).
+/// Only the provider, the failing stage and a coarse failure category survive;
+/// the URL and the error's source chain are dropped. Mirrors the
+/// `search_status=` tagging of `http_search_failure`, with `transport=` in
+/// place of `http=`.
+fn transport_search_failure(provider: &str, stage: &str, err: &reqwest::Error) -> anyhow::Error {
+    let (search_status, category) = if err.is_timeout() {
+        (SearchStatus::Unavailable, "timeout")
+    } else if err.is_connect() {
+        (SearchStatus::Unavailable, "connect")
+    } else if err.is_decode() {
+        (SearchStatus::Unavailable, "decode")
+    } else if err.is_body() {
+        (SearchStatus::Unavailable, "body")
+    } else if err.is_redirect() {
+        (SearchStatus::Unavailable, "redirect")
+    } else if err.is_builder() || err.is_request() {
+        (SearchStatus::ClientError, "request")
+    } else {
+        (SearchStatus::Unavailable, "transport")
     };
     anyhow::Error::msg(format!(
-        "{provider} search failed (search_status={}, http={status}). {hint}",
-        search_status.as_str()
+        "{provider} search failed (search_status={}, transport={category}, stage={stage}). {}",
+        search_status.as_str(),
+        search_status_hint(search_status)
+    ))
+}
+
+/// Build a provider failure for the bounded success-body path (stream read,
+/// byte-cap overflow, or JSON decode of the capped bytes), mirroring
+/// `transport_search_failure`'s tag vocabulary. `category` is a compile-time
+/// tag (`body`, `oversized`, `decode`); the response bytes, the JSON parse
+/// error (which can quote body fragments), and the query-bearing URL never
+/// reach the message.
+fn bounded_body_search_failure(provider: &str, category: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status={}, transport={category}, stage=response). {}",
+        SearchStatus::Unavailable.as_str(),
+        search_status_hint(SearchStatus::Unavailable)
     ))
 }
 
@@ -1432,6 +1768,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
             WebSearchProviderRoute::Jina => self.search_jina(query).await?,
             WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
+            WebSearchProviderRoute::Serply => self.search_serply(query).await?,
         };
 
         Ok(ToolResult {
@@ -2190,6 +2527,7 @@ mod tests {
             boot_brave_api_key: None,
             boot_tavily_api_key: None,
             boot_jina_api_key: None,
+            serply_api_key_override: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),
             max_results: 5,
             timeout_secs: 15,
@@ -2655,6 +2993,699 @@ mod tests {
         assert_eq!(body["freshness"], "noLimit");
     }
 
+    /// Build a Serply-routed tool over `config_path`. Like Bocha, there is no
+    /// boot-time Serply key parameter: the key always comes from config.
+    fn serply_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "serply".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            secrets_encrypt,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execute_serply_without_api_key() {
+        // No config field: resolve_serply_api_key must error before any
+        // network call is attempted.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = serply_tool(config_path, false);
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Serply API key not configured")
+        );
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_reads_from_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"fresh-serply-from-disk\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, false);
+        let key = tool.resolve_serply_api_key().unwrap();
+        assert_eq!(key, "fresh-serply-from-disk");
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_decrypts_encrypted_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("serply-secret-key").unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nserply_api_key = \"{}\"\n", encrypted),
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, true);
+        let key = tool.resolve_serply_api_key().unwrap();
+        assert_eq!(key, "serply-secret-key");
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_tracks_rotation_and_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"initial-key\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path.clone(), false);
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "initial-key");
+        // Operator rotates the key on disk: the same tool instance must pick
+        // up the new value.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "rotated-key");
+        // Operator removes the key: the tool must fail instead of serving
+        // any previously observed value.
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let result = tool.resolve_serply_api_key();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Serply API key not configured")
+        );
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_env_override_without_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = serply_tool(config_path, false)
+            .with_serply_api_key_override(Some(Some("env-only-key".to_string())));
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "env-only-key");
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_env_override_wins_over_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path.clone(), false)
+            .with_serply_api_key_override(Some(Some("env-key".to_string())));
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "env-key");
+        // The override is process-effective: on-disk edits do not displace it.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "env-key");
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_blank_env_override_does_not_fall_back_to_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        // `ZEROCLAW_web_search__serply_api_key=` reaches the tool either as an
+        // explicit `None` (the loader clears the `Option`) or as an empty string.
+        for blank in [None, Some(String::new())] {
+            let tool =
+                serply_tool(config_path.clone(), false).with_serply_api_key_override(Some(blank));
+            let err = tool.resolve_serply_api_key().unwrap_err().to_string();
+            assert!(err.contains("Serply API key not configured"), "{err}");
+        }
+    }
+
+    /// A credential written without quotes: valid-looking to an operator
+    /// mid-rotation, invalid TOML to the parser, and the exact case where the
+    /// parser's own rendering would quote the credential back.
+    const MALFORMED_SERPLY_KEY_LINE: &str =
+        "[web_search]\nserply_api_key = sk-live-serply-DO-NOT-LEAK-9f3a2b\n";
+    const MALFORMED_SERPLY_SECRET: &str = "sk-live-serply-DO-NOT-LEAK-9f3a2b";
+
+    #[test]
+    fn test_serply_toml_parse_error_display_would_leak_the_credential_line() {
+        // Guards the tests below: if a toml upgrade ever stops quoting the
+        // offending line, this fails and tells us the fixture no longer
+        // reproduces the disclosure the fix exists to prevent.
+        let error = toml::from_str::<zeroclaw_config::schema::Config>(MALFORMED_SERPLY_KEY_LINE)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(MALFORMED_SERPLY_SECRET),
+            "fixture no longer reproduces the raw-line disclosure: {error}"
+        );
+    }
+
+    #[test]
+    fn test_serply_config_parse_error_is_not_model_visible_credential() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, MALFORMED_SERPLY_KEY_LINE).unwrap();
+        let tool = serply_tool(config_path.clone(), false);
+
+        let err = tool.resolve_serply_api_key().unwrap_err();
+        // `execute` hands this string to the model verbatim, so check the
+        // rendering the runtime uses as well as the bare message.
+        for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(MALFORMED_SERPLY_SECRET),
+                "model-visible error leaked the credential: {rendered}"
+            );
+        }
+        let message = err.to_string();
+        assert!(message.contains("invalid TOML"), "{message}");
+        assert!(message.contains("at line 2"), "{message}");
+    }
+
+    #[test]
+    fn test_serply_config_parse_failure_log_attrs_carry_no_source_text() {
+        let failure = SerplyConfigParseFailure::new(
+            MALFORMED_SERPLY_KEY_LINE,
+            &toml::from_str::<zeroclaw_config::schema::Config>(MALFORMED_SERPLY_KEY_LINE)
+                .unwrap_err(),
+        );
+        let path = Path::new("/tmp/zeroclaw/config.toml");
+        let attrs = failure.log_attrs(path);
+
+        // This is the value handed to `record!`, so it is exactly what the
+        // writer persists for this event.
+        let serialized = attrs.to_string();
+        assert!(
+            !serialized.contains(MALFORMED_SERPLY_SECRET),
+            "persisted log attributes leaked the credential: {serialized}"
+        );
+        assert_eq!(attrs["error_code"], "config_toml_parse_failed");
+        assert_eq!(attrs["error_line"], 2);
+        assert_eq!(attrs["search_provider"], "serply");
+        assert_eq!(attrs["path"], "/tmp/zeroclaw/config.toml");
+    }
+
+    #[test]
+    fn test_serply_config_parse_failure_without_span_omits_the_line() {
+        // A parse failure the parser cannot place still has to produce a
+        // usable message rather than an empty or misleading location.
+        let failure = SerplyConfigParseFailure {
+            code: SerplyConfigParseFailure::CODE,
+            line: None,
+        };
+        let path = Path::new("/tmp/zeroclaw/config.toml");
+        let message = failure.message(path);
+        assert!(message.contains("invalid TOML."), "{message}");
+        assert!(!message.contains("at line"), "{message}");
+        assert_eq!(
+            failure.log_attrs(path)["error_line"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_serply_with_malformed_config_hides_the_credential() {
+        // End to end through the tool surface the model actually calls.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, MALFORMED_SERPLY_KEY_LINE).unwrap();
+        let tool = serply_tool(config_path, false);
+
+        let err = tool.execute(json!({"query": "test"})).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains(MALFORMED_SERPLY_SECRET),
+            "tool history leaked the credential: {rendered}"
+        );
+        assert!(rendered.contains("invalid TOML"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn test_serply_request_carries_env_override_key_not_stored_key() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .and(header("x-api-key", "env-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, false)
+            .with_serply_api_key_override(Some(Some("env-key".to_string())));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        tool.search_serply_with_client(&client, &format!("{}/v1/search/", server.uri()), "rust")
+            .await
+            .expect("the request must authenticate with the env-override key");
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(recorded.len(), 1);
+        let sent = recorded[0]
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            sent, "env-key",
+            "the stored key must not be sent while an override is active"
+        );
+    }
+
+    #[test]
+    fn test_parse_serply_results_empty() {
+        let tool = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "results": [],
+            "related_searches": {"images": [], "text": []},
+            "total": null
+        });
+        let result = tool.parse_serply_results(&json, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_serply_results_with_data() {
+        let tool = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "results": [
+                {
+                    "title": "Serply Example Title",
+                    "link": "https://example.com/a",
+                    "description": "first description body",
+                    "position": 1,
+                    "realPosition": 1,
+                    "result_type": "organic",
+                    "metadata": {"display_url": "example.com", "attributes": ["1 Apr 2026"]}
+                },
+                {
+                    "title": "Second Result",
+                    "link": "https://example.org/b",
+                    "position": 2
+                }
+            ],
+            "related_searches": {"images": [], "text": []}
+        });
+        let result = tool.parse_serply_results(&json, "test").unwrap();
+        assert!(result.contains("via Serply"));
+        assert!(result.contains("Serply Example Title"));
+        assert!(result.contains("https://example.com/a"));
+        assert!(result.contains("first description body"));
+        // A result without a description still renders its title and link.
+        assert!(result.contains("2. Second Result"));
+        assert!(result.contains("https://example.org/b"));
+        // Ranking metadata is not echoed to the model.
+        assert!(!result.contains("realPosition"));
+        assert!(!result.contains("display_url"));
+    }
+
+    #[test]
+    fn test_parse_serply_results_invalid_response() {
+        let tool = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        // Serply reports auth failures as a bare `detail` object.
+        let json = serde_json::json!({"detail": "Invalid API key"});
+        let result = tool.parse_serply_results(&json, "test");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid Serply API response")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_request_uses_api_key_header_and_query_params() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .and(header("x-api-key", "serply-test-key"))
+            .and(header("user-agent", SERPLY_USER_AGENT))
+            .and(query_param("q", "what is rust"))
+            .and(query_param("num", "5"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"serply-test-key\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, false);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let result = tool
+            .search_serply_with_client(
+                &client,
+                &format!("{}/v1/search/", server.uri()),
+                "what is rust",
+            )
+            .await
+            .expect("request should succeed against the mock");
+        assert!(
+            result.contains("No results found"),
+            "parser should report empty results: {result}"
+        );
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(recorded.len(), 1, "expected exactly one GET /v1/search/");
+
+        // The key travels only in the header: never in the URL or a body.
+        let query_string = recorded[0].url.query().unwrap_or("");
+        assert!(!query_string.contains("serply-test-key"));
+        assert!(!query_string.contains("api_key"));
+        assert!(recorded[0].body.is_empty());
+    }
+
+    // ── Serply transport-error boundary ──────────────────────────────────
+    //
+    // Serply is a GET provider, so the request URL carries the model-supplied
+    // query. `reqwest::Error` displays that URL; the runtime forwards tool
+    // errors into the model-visible history verbatim. These tests pin that a
+    // failed send or decode yields a provider-only, category-tagged error and
+    // that neither the raw query nor its percent-encoded form leaks through.
+
+    /// Long multibyte query used by the transport-error regressions. Long
+    /// enough that a leaked URL would dominate the message, multibyte so the
+    /// percent-encoded form differs from the raw text.
+    const SERPLY_PRIVATE_QUERY_FRAGMENT: &str = "私的な検索クエリ ";
+    /// Percent-encoding of `私`, the first character of the fragment above.
+    const SERPLY_PRIVATE_QUERY_ENCODED_MARKER: &str = "%E7%A7%81";
+
+    fn serply_private_query() -> String {
+        SERPLY_PRIVATE_QUERY_FRAGMENT.repeat(40)
+    }
+
+    fn assert_serply_transport_error_is_query_free(
+        err: &anyhow::Error,
+        query: &str,
+        endpoint: &str,
+    ) {
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("serply search failed (search_status="),
+            "error must carry the provider + search_status tag: {message}"
+        );
+        assert!(
+            !message.contains(query) && !message.contains(SERPLY_PRIVATE_QUERY_FRAGMENT.trim()),
+            "raw query leaked into the model-visible error: {message}"
+        );
+        assert!(
+            !message.contains(SERPLY_PRIVATE_QUERY_ENCODED_MARKER) && !message.contains("q="),
+            "percent-encoded query leaked into the model-visible error: {message}"
+        );
+        assert!(
+            !message.contains(endpoint)
+                && !message.contains("http://")
+                && !message.contains("https://"),
+            "request URL leaked into the model-visible error: {message}"
+        );
+        assert!(
+            message.contains("Provider may be transiently unavailable"),
+            "transport failures must keep the actionable hint: {message}"
+        );
+    }
+
+    fn serply_tool_with_key(api_key: &str) -> (tempfile::TempDir, WebSearchTool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nserply_api_key = \"{api_key}\"\n"),
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, false);
+        (tmp, tool)
+    }
+
+    #[tokio::test]
+    async fn test_serply_request_timeout_error_is_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("{}/v1/search/", server.uri());
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("a 5 s response against a 200 ms client timeout must fail");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=timeout, stage=request"),
+            "timeout must be classified as an unavailable request-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_connection_refused_error_is_query_free() {
+        // Bind then drop an ephemeral port so the connect is refused
+        // deterministically without touching the network.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("http://{addr}/v1/search/");
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("connecting to a closed port must fail");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=connect, stage=request"),
+            "refused connection must be classified as an unavailable request-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_response_decode_error_is_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("<html>upstream gateway page, not JSON</html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("{}/v1/search/", server.uri());
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("a non-JSON 200 body must fail to decode");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=decode, stage=response"),
+            "undecodable body must be classified as an unavailable response-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_oversized_response_is_rejected_and_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 200 whose valid-JSON body exceeds the byte cap: the bounded reader
+        // must reject it instead of handing a multi-megabyte value to
+        // serde_json, and the rejection must stay query-free.
+        let padding = "x".repeat(SERPLY_RESPONSE_LIMIT_BYTES);
+        let body = format!("{{\"results\": [], \"padding\": \"{padding}\"}}");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("{}/v1/search/", server.uri());
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("a body over the byte cap must be rejected");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=oversized, stage=response"),
+            "an over-cap body must be classified as an unavailable response-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_bounded_reader_stops_at_the_cap_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A chunked response with no Content-Length whose terminal chunk is
+        // withheld until the test releases it. The server streams one byte
+        // more than the cap and then parks, so the only way the call can
+        // return before the 15 s client timeout is for the bounded reader to
+        // stop at the cap instead of buffering the unterminated stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = SERPLY_RESPONSE_LIMIT_BYTES + 1;
+            while remaining > 0 {
+                let chunk_len = remaining.min(chunk.len());
+                stream
+                    .write_all(format!("{chunk_len:x}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk[..chunk_len]).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                remaining -= chunk_len;
+            }
+            let _ = release_rx.await;
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("http://{addr}/v1/search/");
+
+        let started = Instant::now();
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("an over-cap unterminated stream must be rejected");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=oversized, stage=response"),
+            "an over-cap chunked body must be classified as oversized, not timeout: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the reader must stop at the cap while the server still holds the stream open"
+        );
+
+        drop(release_tx);
+        let _ = server.await;
+    }
+
     // ── Format characterization ──────────────────────────────────────────
     //
     // These pin the *exact* rendered output of every provider parser for
@@ -2758,6 +3789,22 @@ mod tests {
             "Search results for: rust (via Bocha)\n\
              1. First Title\n   https://example.com/one\n   Example Site · 2025-01-15\n   AI summary\n\
              2. Second Title\n   https://example.org/two\n   raw only"
+        );
+    }
+
+    #[test]
+    fn serply_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"results": [
+            {"title": "First Title", "link": "https://example.com/one", "description": "First body", "position": 1},
+            {"title": "Second Title", "link": "https://example.org/two", "position": 2},
+        ]});
+        let result = tool.parse_serply_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Serply)\n\
+             1. First Title\n   https://example.com/one\n   First body\n\
+             2. Second Title\n   https://example.org/two"
         );
     }
 
@@ -2908,6 +3955,18 @@ mod tests {
             "bocha must cap both the AI summary and the snippet fallback"
         );
         assert!(!rendered.contains(&long), "bocha leaked full content");
+
+        let serply = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        let rendered = serply
+            .parse_serply_results(
+                &serde_json::json!({"results": [
+                    {"title": "T", "link": "https://example.com", "description": long}
+                ]}),
+                "q",
+            )
+            .unwrap();
+        assert!(rendered.contains(&expected), "serply did not cap");
+        assert!(!rendered.contains(&long), "serply leaked full content");
     }
 
     // ── Total output cap ─────────────────────────────────────────────────
@@ -3072,6 +4131,12 @@ mod tests {
                         &serde_json::json!({"code": 200, "data": {"webPages": {"value": []}}}),
                         query,
                     )
+                    .unwrap(),
+            ),
+            (
+                "serply",
+                tool("serply")
+                    .parse_serply_results(&serde_json::json!({"results": []}), query)
                     .unwrap(),
             ),
         ]

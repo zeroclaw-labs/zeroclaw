@@ -6,6 +6,7 @@ pub enum WebSearchProviderRoute {
     Tavily,
     Jina,
     Bocha,
+    Serply,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -44,6 +45,7 @@ const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
 const BOCHA_PROVIDER: &str = "bocha";
+const SERPLY_PROVIDER: &str = "serply";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -82,8 +84,15 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
                 used_fallback: false,
             }
         }
+        "serply" | "serply-search" | "serply_search" | "serply-io" | "serply_io" => {
+            WebSearchProviderResolution {
+                route: WebSearchProviderRoute::Serply,
+                canonical_provider: SERPLY_PROVIDER,
+                used_fallback: false,
+            }
+        }
         // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, Bocha.
+        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, Bocha, Serply.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -165,6 +174,23 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Bocha);
             assert_eq!(resolved.canonical_provider, BOCHA_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_serply() {
+        let serply_aliases = [
+            "serply",
+            "serply-search",
+            "serply_search",
+            "serply-io",
+            "serply_io",
+        ];
+        for alias in serply_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Serply);
+            assert_eq!(resolved.canonical_provider, SERPLY_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }
