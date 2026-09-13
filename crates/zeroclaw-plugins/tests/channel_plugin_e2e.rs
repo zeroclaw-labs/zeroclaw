@@ -6,6 +6,8 @@
 
 #![cfg(feature = "plugins-wasm-cranelift")]
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -25,6 +27,8 @@ use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::wasm_channel::WasmChannel;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
+
+use support::admit_fixture;
 
 fn fixture() -> PathBuf {
     static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
@@ -86,6 +90,7 @@ fn manifest() -> PluginManifest {
         description: None,
         author: None,
         wasm_path: Some("channel-fixture.wasm".to_string()),
+        wasm_sha256: None,
         capabilities: vec![PluginCapability::Channel],
         // Every fixture channel is ConfigRead-granted so the typed-config and
         // scoped-secret contract is exercised on every instantiation. The
@@ -155,7 +160,8 @@ async fn build_channel(binding: &str, services: &PluginHostServices) -> WasmChan
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
 
-    WasmChannel::from_wasm(endpoint, &fixture(), services, limits())
+    let component = admit_fixture(&fixture(), &manifest);
+    WasmChannel::from_wasm(endpoint, &component, services, limits())
         .await
         .expect("instantiate fixture channel")
 }
@@ -190,7 +196,8 @@ async fn channel_with(
     )
     .expect("admit fixture scope");
     let endpoint = PluginChannelEndpoint::new(scope, "plugin").expect("bind fixture endpoint");
-    WasmChannel::from_wasm(endpoint, &fixture(), &services, limits)
+    let component = admit_fixture(&fixture(), &manifest);
+    WasmChannel::from_wasm(endpoint, &component, &services, limits)
         .await
         .expect("instantiate fixture channel")
 }

@@ -38,17 +38,19 @@ one.
 2. **Discover.** The loader scans the resolved plugins directory
    (`[plugins] plugins_dir`, default `~/.zeroclaw/plugins/`) for subdirectories
    containing a `manifest.toml`.
-3. **Validate shape.** Each manifest must declare at least one capability, its
-   package directory must match its canonical name, and a non-skill plugin must
-   name a confined relative `wasm_path`. Traversal and symlink paths are
-   rejected. A malformed manifest is skipped with a warning, never loaded.
+3. **Validate shape.** Each manifest must declare at least one capability, and
+   a non-skill plugin must name a confined relative `wasm_path`. Traversal and
+   symlink paths are rejected. A malformed manifest is skipped with a warning,
+   never loaded.
 4. **Enforce signature policy.** Each plugin is checked against the configured
    `[plugins.security] signature_mode` and `trusted_publisher_keys`. A plugin
    that fails the policy is dropped from the loaded set, not surfaced as a tool.
 5. **Admit executable bytes.** The host opens the confined component once,
    verifies any declared `wasm_sha256`, and retains those exact bytes. In
    `strict` mode the signed manifest must declare this digest. Adapters compile
-   the admitted buffer rather than reopening its path.
+   the admitted buffer rather than reopening its path. This is an execution
+   identity guarantee for the retained bytes, not a claim of race-free
+   filesystem namespace resolution.
 6. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. Tool dispatch resolves names first-match, so a
    plugin tool that collides with a built-in name is never selected; give plugin
