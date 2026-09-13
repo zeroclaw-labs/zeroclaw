@@ -24,6 +24,7 @@ pub mod otp;
 pub mod pairing;
 pub mod playbook;
 pub mod policy;
+pub mod principal_resolver;
 pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
