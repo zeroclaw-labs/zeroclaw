@@ -6,7 +6,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelConversationScope, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage,
+};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
@@ -735,6 +737,7 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    passive_group_context: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
     /// Outcome of the most recent `getUpdates` exchange and when it completed,
@@ -1084,6 +1087,7 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            passive_group_context: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
             poll_health: Mutex::new(None),
@@ -1127,6 +1131,34 @@ impl TelegramChannel {
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
         self
+    }
+
+    /// Record unaddressed group messages as passive context instead of dropping them.
+    pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
+        self.passive_group_context = enabled;
+        self
+    }
+
+    /// When `passive_group_context` is enabled, group messages (addressed or
+    /// not) are scoped to the room so passive turns and later replies share
+    /// one conversation history. Non-group or disabled falls back to sender.
+    fn group_context_scope(
+        passive_group_context: bool,
+        is_group: bool,
+    ) -> ChannelConversationScope {
+        if passive_group_context && is_group {
+            ChannelConversationScope::ReplyTarget
+        } else {
+            ChannelConversationScope::default()
+        }
+    }
+
+    fn should_record_passive_group_context(
+        passive_group_context: bool,
+        is_group: bool,
+        addressed_to_bot: bool,
+    ) -> bool {
+        passive_group_context && is_group && !addressed_to_bot
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -3028,6 +3060,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments,
             subject: None,
+            conversation_scope: Self::group_context_scope(
+                self.passive_group_context,
+                Self::is_group_message(message),
+            ),
 
             ..Default::default()
         })
@@ -3482,6 +3518,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            conversation_scope: Self::group_context_scope(
+                self.passive_group_context,
+                Self::is_group_message(message),
+            ),
 
             ..Default::default()
         }))
@@ -3691,14 +3731,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
+        let mut passive_context = false;
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            // If the user is replying directly to the bot's message, bypass
-            // the mention check — replies are an unambiguous signal of intent.
-            if !Self::contains_bot_mention(text, bot_username) {
+            // A direct reply to the bot's message is an unambiguous signal
+            // of intent, so it counts as addressed alongside an @-mention.
+            let addressed = Self::contains_bot_mention(text, bot_username) || {
                 let bot_id = *self.bot_id.lock();
-                if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
+            };
+            if !addressed {
+                if Self::should_record_passive_group_context(
+                    self.passive_group_context,
+                    is_group,
+                    addressed,
+                ) {
+                    passive_context = true;
+                } else {
                     return None;
                 }
             }
@@ -3725,7 +3775,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let content = if self.mention_only && is_group && !passive_context {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
@@ -3770,6 +3820,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
+            passive_context,
+            conversation_scope: Self::group_context_scope(self.passive_group_context, is_group),
 
             ..Default::default()
         })
@@ -4925,25 +4977,28 @@ impl TelegramChannel {
         update: &serde_json::Value,
         msg: ChannelMessage,
     ) -> bool {
-        if self.ack_reactions
-            && let Some((reaction_chat_id, reaction_message_id)) =
-                Self::extract_update_message_target(update)
-        {
-            self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
-        }
+        // Silent observation: nothing here may tell the room the bot is answering.
+        if !msg.passive_context {
+            if self.ack_reactions
+                && let Some((reaction_chat_id, reaction_message_id)) =
+                    Self::extract_update_message_target(update)
+            {
+                self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
+            }
 
-        // Send one typing indicator for the logical inbound message. A media
-        // group reaches this helper only after all members are materialized.
-        let typing_body = serde_json::json!({
-            "chat_id": &msg.reply_target,
-            "action": "typing"
-        });
-        let _ = self
-            .http_client()
-            .post(self.api_url("sendChatAction"))
-            .json(&typing_body)
-            .send()
-            .await;
+            // Send one typing indicator for the logical inbound message. A media
+            // group reaches this helper only after all members are materialized.
+            let typing_body = serde_json::json!({
+                "chat_id": &msg.reply_target,
+                "action": "typing"
+            });
+            let _ = self
+                .http_client()
+                .post(self.api_url("sendChatAction"))
+                .json(&typing_body)
+                .send()
+                .await;
+        }
 
         tx.send(msg).await.is_ok()
     }
@@ -6261,6 +6316,38 @@ impl UpdateDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_record_passive_group_context_matches_predicate() {
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            false, true, false
+        ));
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            true, false, false
+        ));
+        assert!(!TelegramChannel::should_record_passive_group_context(
+            true, true, true
+        ));
+        assert!(TelegramChannel::should_record_passive_group_context(
+            true, true, false
+        ));
+    }
+
+    #[test]
+    fn group_context_scope_uses_reply_target_for_passive_groups() {
+        assert_eq!(
+            TelegramChannel::group_context_scope(true, true),
+            ChannelConversationScope::ReplyTarget
+        );
+        assert_eq!(
+            TelegramChannel::group_context_scope(true, false),
+            ChannelConversationScope::default()
+        );
+        assert_eq!(
+            TelegramChannel::group_context_scope(false, true),
+            ChannelConversationScope::default()
+        );
+    }
 
     #[test]
     fn scrub_masks_poll_error_url() {
@@ -7877,6 +7964,70 @@ mod tests {
             .expect_parsed("reply-thread photo should parse");
         assert_eq!(reply.reply_target, "-100200300");
         assert_eq!(reply.thread_ts, None);
+    }
+
+    #[tokio::test]
+    async fn opted_in_group_media_shares_the_text_conversation_scope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let photo_bytes = tiny_jpeg();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_1\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes.clone()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 4242, "username": "testbot" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // The media mention gate reads the cached bot username synchronously,
+        // so prime it the way the live listener does before the first update.
+        ch.get_bot_username().await;
+
+        let photo = ch
+            .try_parse_attachment_message(&serde_json::json!({
+                "message": {
+                    "message_id": 42,
+                    "chat": { "id": -100_200_300, "type": "supergroup" },
+                    "from": { "username": "alice", "id": 99 },
+                    "photo": [ { "file_id": "best", "file_size": 20 } ],
+                    "caption": "@testbot look at this"
+                }
+            }))
+            .await
+            .expect_parsed("group photo should parse");
+
+        assert_eq!(
+            photo.conversation_scope,
+            ChannelConversationScope::ReplyTarget,
+            "admitted group media must share the opted-in group history, not fall back to sender scope"
+        );
     }
 
     #[tokio::test]
@@ -15680,6 +15831,80 @@ mod tests {
         assert_eq!(
             edit_body["reply_markup"],
             serde_json::json!({ "inline_keyboard": [] })
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_group_message_reaches_history_without_any_side_effect() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "id": 4242, "username": "testbot" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/bot[^/]+/(sendChatAction|setMessageReaction)$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_passive_group_context(true)
+        .with_ack_reactions(true)
+        .with_api_base(mock_server.uri());
+        ch.get_bot_username().await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 7,
+            "message": {
+                "message_id": 11,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "just chatting with bob"
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+
+        let recorded = rx
+            .try_recv()
+            .expect("passive message must still be recorded");
+        assert!(recorded.passive_context, "message should be passive");
+
+        // The ack reaction is fired from a spawned task, so give it a chance to
+        // reach the mock before asserting that it never happened.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let side_effects: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with("/sendChatAction") || p.ends_with("/setMessageReaction"))
+            .collect();
+        assert!(
+            side_effects.is_empty(),
+            "passive observation must stay silent, but the bot called: {side_effects:?}"
         );
     }
 
