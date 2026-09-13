@@ -805,13 +805,145 @@ pub(crate) fn plugin_host_services(
     zeroclaw_plugins::services::PluginHostServices::new(config)
 }
 
-/// Create full tool registry including memory tools and optional Composio.
+/// Stack reserved for the dedicated registry-builder thread. The registry
+/// build is a deep synchronous subtree — ~100 tool constructors plus 18
+/// full-`Config` clones — measured at ~1.5–1.7 MiB of stack on x86_64 Linux
+/// debug builds, with Windows frames some 10–25% larger. Reserving roughly
+/// twice the measured worst case keeps the builder off every caller's stack
+/// budget without itself becoming a new cliff.
+const TOOL_REGISTRY_BUILD_STACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Force-compile the process-global lazy regexes used on the turn path.
+///
+/// A cold `regex` compile descends through ~40 `regex_automata` NFA compiler
+/// frames. `scrub_credentials` reaches `SENSITIVE_KV_REGEX` from deep inside
+/// the turn loop (`make_query_summary` → memory rendering), so a first-turn
+/// compile lands that recursion on the turn's stack. Every turn path builds
+/// a tool registry first, so warming them here — on the registry-builder
+/// thread, before any turn stack exists — keeps the recursion off every
+/// caller. Runs at most once per process.
+fn warm_lazy_regexes() {
+    std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KV_REGEX);
+    std::sync::LazyLock::force(&crate::agent::turn::redact::SENSITIVE_KEY_REGEX);
+    std::sync::LazyLock::force(&crate::agent::loop_::IMAGE_DATA_URI_REGEX);
+    std::sync::LazyLock::force(&crate::agent::history::LOCAL_IMAGE_PATH_RE);
+    zeroclaw_providers::multimodal::warm_lazy_regexes();
+}
+
+/// Create the full tool registry on a dedicated builder thread.
+///
+/// The registry build is the deepest synchronous subtree reachable from
+/// `session/new` and from every turn path. Built inline it consumed the RPC
+/// caller's stack down to a few KiB of the 2 MiB `session/new` regression
+/// budget, so any change deepening it overflowed Windows debug builds. The
+/// build now runs on a thread with its own explicit stack; the caller's
+/// stack pays only the cheap per-call prep below.
+///
+/// Ordering and panic semantics are unchanged: the caller blocks until the
+/// registry is built (as the inline build did), and a builder panic is
+/// resumed on the caller's thread. The borrowed parameters
+/// (`browser_config`/`http_config`/`web_fetch_config`/`agents`/
+/// `root_config`) are semantically independent at the API boundary — tests
+/// deliberately pass divergent values — so they are cloned once on the
+/// caller and moved into the builder.
 #[allow(
     clippy::implicit_hasher,
     clippy::too_many_arguments,
     clippy::type_complexity
 )]
 pub fn all_tools_with_runtime(
+    config: Arc<Config>,
+    security: &Arc<SecurityPolicy>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    agent_alias: &str,
+    runtime: Arc<dyn RuntimeAdapter>,
+    memory: Arc<dyn Memory>,
+    composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
+    browser_config: &zeroclaw_config::schema::BrowserConfig,
+    http_config: &zeroclaw_config::schema::HttpRequestConfig,
+    web_fetch_config: &zeroclaw_config::schema::WebFetchConfig,
+    workspace_dir: &std::path::Path,
+    agents: &HashMap<String, AliasedAgentConfig>,
+    fallback_api_key: Option<&str>,
+    root_config: &zeroclaw_config::schema::Config,
+    canvas_store: Option<CanvasStore>,
+    is_subagent_caller: bool,
+    tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
+    // Live config handle for `send_via` peer-group authority. `Some` from the
+    // channel daemon (so reloads take effect); `None` for one-shot / non-channel
+    // callers, which fall back to a snapshot of `root_config`.
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+) -> AllToolsResult {
+    let security = Arc::clone(security);
+    let risk_profile = risk_profile.clone();
+    let agent_alias = agent_alias.to_string();
+    let composio_key = composio_key.map(str::to_string);
+    let composio_entity_id = composio_entity_id.map(str::to_string);
+    let fallback_api_key = fallback_api_key.map(str::to_string);
+    let workspace_dir = workspace_dir.to_path_buf();
+    let browser_config = browser_config.clone();
+    let http_config = http_config.clone();
+    let web_fetch_config = web_fetch_config.clone();
+    let agents = agents.clone();
+    let root_config = root_config.clone();
+    let builder = move || {
+        // Warm the lazy regexes BEFORE the registry build and BEFORE any
+        // turn can start: LazyLock runs the initializer on whichever thread
+        // reaches it first, so a turn racing an un-joined warmup would
+        // compile the regex (a ~40-frame regex_automata recursion) on the
+        // turn's own stack. Doing this first on the builder thread also
+        // means the compile never lands on a turn stack; it costs one
+        // cold-process delay of a few hundred milliseconds, once.
+        warm_lazy_regexes();
+        all_tools_with_runtime_on_thread(
+            config,
+            &security,
+            &risk_profile,
+            &agent_alias,
+            runtime,
+            memory,
+            composio_key.as_deref(),
+            composio_entity_id.as_deref(),
+            &browser_config,
+            &http_config,
+            &web_fetch_config,
+            &workspace_dir,
+            &agents,
+            fallback_api_key.as_deref(),
+            &root_config,
+            canvas_store,
+            is_subagent_caller,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            live_config,
+        )
+    };
+    let handle = std::thread::Builder::new()
+        .name("zeroclaw-tool-registry".into())
+        .stack_size(TOOL_REGISTRY_BUILD_STACK_BYTES)
+        .spawn(builder)
+        .expect("tool-registry builder thread should spawn");
+    match handle.join() {
+        Ok(result) => result,
+        // Preserve the inline build's panic semantics: a builder panic is
+        // resumed on the caller's thread exactly as if it had unwound
+        // through the caller's frames.
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Registry build body; runs on the dedicated builder thread spawned by
+/// [`all_tools_with_runtime`].
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+fn all_tools_with_runtime_on_thread(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,

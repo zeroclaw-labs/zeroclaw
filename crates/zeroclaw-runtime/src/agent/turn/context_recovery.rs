@@ -63,7 +63,7 @@ pub(crate) async fn try_recover_context_overflow(
     event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
     on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
-    context_token_budget: usize,
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
@@ -78,6 +78,7 @@ pub(crate) async fn try_recover_context_overflow(
         // forced below the current size. Never splits a tool_use/tool_result
         // pair, never silently shrinks a result. Whole turns or nothing.
         let tokens_now = estimate_history_tokens(history);
+        // Preserve the established reactive policy after a context overflow.
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
         let result = trim_to_recent_turns(owned, budget);
@@ -139,7 +140,7 @@ pub(crate) async fn try_recover_context_overflow(
         }
 
         let system_floor = crate::agent::history::estimate_system_floor_tokens(history);
-        if system_floor >= context_token_budget {
+        if system_floor >= context_limits.context_token_budget {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -147,12 +148,12 @@ pub(crate) async fn try_recover_context_overflow(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "system_floor": system_floor,
-                        "budget": context_token_budget,
+                        "budget": context_limits.context_token_budget,
                         "error_key": "context_floor_exceeds_budget",
                     })),
                 crate::agent::history::context_floor_remediation(
                     system_floor,
-                    context_token_budget,
+                    context_limits.context_token_budget,
                 )
             );
         } else {
@@ -184,6 +185,15 @@ mod tests {
         h
     }
 
+    fn limits(context_token_budget: usize) -> zeroclaw_config::schema::ResolvedContextLimits {
+        zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: context_token_budget.max(32_000),
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            context_token_budget,
+        }
+    }
+
     /// The `CompactingContext` lifecycle state is only reachable through this
     /// recovery path, so it must be exercised with a live draft channel rather
     /// than the `None` sender the other cases use — otherwise the state is
@@ -202,7 +212,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
+            limits(32_000),
         )
         .await;
 
@@ -234,7 +244,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
+            limits(32_000),
         )
         .await;
 
@@ -269,7 +279,7 @@ mod tests {
             None,
             Some(&delta_tx),
             &observer,
-            32_000,
+            limits(32_000),
         )
         .await;
 
@@ -295,9 +305,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            limits(32_000),
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -341,9 +358,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 100)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            limits(100),
+        )
+        .await;
 
         assert!(
             !recovered,
@@ -369,9 +393,16 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            limits(32_000),
+        )
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -402,9 +433,16 @@ mod tests {
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, None, &observer, budget)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            None,
+            &observer,
+            limits(budget),
+        )
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

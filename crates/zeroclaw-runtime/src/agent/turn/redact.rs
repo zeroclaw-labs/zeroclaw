@@ -9,7 +9,7 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
 
@@ -56,7 +56,7 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
-static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)"#).unwrap()
 });
 const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
