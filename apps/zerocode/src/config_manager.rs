@@ -11,6 +11,7 @@ use crossterm::{
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
@@ -31,6 +32,12 @@ pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
+/// Ask terminals implementing XTSHIFTESCAPE to report Shift-modified mouse
+/// events to the application instead of reserving Shift for local selection.
+pub(crate) fn mouse_shift_capture_sequence(capture: bool) -> &'static str {
+    if capture { "\x1b[>1s" } else { "\x1b[>0s" }
 }
 
 fn type_template_label(template: &ConfigTemplateEntry) -> String {
@@ -59,6 +66,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        Print(mouse_shift_capture_sequence(true)),
         EnableBracketedPaste,
     )?;
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
@@ -78,6 +86,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     execute!(
         term.backend_mut(),
         DisableBracketedPaste,
+        Print(mouse_shift_capture_sequence(false)),
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -4787,6 +4796,7 @@ fn edit_in_external_editor(
     let _ = execute!(
         term.backend_mut(),
         PopKeyboardEnhancementFlags,
+        Print(mouse_shift_capture_sequence(false)),
         LeaveAlternateScreen
     );
     let _ = disable_raw_mode();
@@ -4800,7 +4810,11 @@ fn edit_in_external_editor(
 
     // Restore TUI.
     let _ = enable_raw_mode();
-    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        Print(mouse_shift_capture_sequence(true))
+    );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
@@ -4831,6 +4845,12 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_shift_capture_uses_xtshiftescape_sequences() {
+        assert_eq!(mouse_shift_capture_sequence(true), "\x1b[>1s");
+        assert_eq!(mouse_shift_capture_sequence(false), "\x1b[>0s");
+    }
 
     #[test]
     fn config_scalar_validation_rejects_invalid_integer() {

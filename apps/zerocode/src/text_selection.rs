@@ -1,11 +1,14 @@
 //! Rendered-text selection primitives shared by interactive ZeroCode panes.
 
+use std::collections::BTreeMap;
+
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 
 use crate::mouse;
@@ -49,41 +52,117 @@ pub(crate) enum TextRowBreak {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextSnapshot {
     pub(crate) area: Rect,
-    pub(crate) cells: Vec<TextCell>,
-    pub(crate) row_breaks: Vec<TextRowBreak>,
+    /// First transcript-global rendered row projected into `area`.
+    pub(crate) scroll: u16,
+    pub(crate) total_rows: u16,
+    pub(crate) cells: BTreeMap<u16, Vec<TextCell>>,
+    pub(crate) row_breaks: BTreeMap<u16, TextRowBreak>,
 }
 
 impl TextSnapshot {
     pub(crate) fn capture(frame: &mut Frame, area: Rect, row_breaks: Vec<TextRowBreak>) -> Self {
-        use unicode_width::UnicodeWidthStr;
+        Self::capture_at(frame, area, area.height, 0, row_breaks)
+    }
 
-        let buffer = frame.buffer_mut();
-        let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(area.height));
-        for y in area.y..area.y.saturating_add(area.height) {
-            let mut column = 0;
-            while column < area.width {
-                let symbol = buffer[(area.x + column, y)].symbol().to_string();
-                let width = (UnicodeWidthStr::width(symbol.as_str()) as u16)
-                    .max(1)
-                    .min(area.width - column);
-                cells.push(TextCell {
-                    symbol,
-                    span_start: column,
-                });
-                for _ in 1..width {
-                    cells.push(TextCell {
-                        symbol: String::new(),
-                        span_start: column,
-                    });
-                }
-                column += width;
-            }
-        }
+    pub(crate) fn capture_at(
+        frame: &mut Frame,
+        area: Rect,
+        total_rows: u16,
+        scroll: u16,
+        row_breaks: Vec<TextRowBreak>,
+    ) -> Self {
+        let rows = extract_buffer_rows(frame.buffer_mut(), area.x, area.y, area.width, area.height);
+        Self::from_rows(area, total_rows, scroll, scroll, rows, row_breaks)
+    }
+
+    pub(crate) fn capture_lines(
+        lines: Vec<Line<'_>>,
+        area: Rect,
+        total_rows: u16,
+        start_row: u16,
+        height: u16,
+        local_scroll: u16,
+        row_breaks: Vec<TextRowBreak>,
+    ) -> Self {
+        let buffer_area = Rect::new(0, 0, area.width, height.max(1));
+        let mut buffer = Buffer::empty(buffer_area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((local_scroll, 0))
+            .render(buffer_area, &mut buffer);
+        let rows = extract_buffer_rows(&buffer, 0, 0, area.width, height);
+        Self::from_rows(area, total_rows, start_row, start_row, rows, row_breaks)
+    }
+
+    fn from_rows(
+        area: Rect,
+        total_rows: u16,
+        scroll: u16,
+        start_row: u16,
+        rows: Vec<Vec<TextCell>>,
+        row_breaks: Vec<TextRowBreak>,
+    ) -> Self {
+        let cells = rows
+            .into_iter()
+            .enumerate()
+            .map(|(offset, cells)| (start_row.saturating_add(offset as u16), cells))
+            .collect();
+        let row_breaks = row_breaks
+            .into_iter()
+            .enumerate()
+            .map(|(offset, row_break)| (start_row.saturating_add(offset as u16), row_break))
+            .collect();
         Self {
             area,
+            scroll,
+            total_rows,
             cells,
             row_breaks,
         }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.area.width, other.area.width);
+        debug_assert_eq!(self.total_rows, other.total_rows);
+        self.area = other.area;
+        self.scroll = other.scroll;
+        self.cells.extend(other.cells);
+        self.row_breaks.extend(other.row_breaks);
+    }
+
+    pub(crate) fn missing_row_ranges(&self, start: u16, end: u16) -> Vec<(u16, u16)> {
+        let mut ranges = Vec::new();
+        let mut missing_start = None;
+        for row in start..=end {
+            if self.cells.contains_key(&row) {
+                if let Some(start) = missing_start.take() {
+                    ranges.push((start, row - 1));
+                }
+            } else if missing_start.is_none() {
+                missing_start = Some(row);
+            }
+        }
+        if let Some(start) = missing_start {
+            ranges.push((start, end));
+        }
+        ranges
+    }
+
+    pub(crate) fn retain_viewport(&mut self) {
+        let end = self.scroll.saturating_add(self.area.height);
+        self.cells
+            .retain(|row, _| *row >= self.scroll && *row < end);
+        self.row_breaks
+            .retain(|row, _| *row >= self.scroll && *row < end);
+    }
+
+    pub(crate) fn set_viewport(&mut self, area: Rect, scroll: u16) {
+        self.area = area;
+        self.scroll = scroll;
+    }
+
+    pub(crate) fn content_height(&self) -> u16 {
+        self.total_rows
     }
 
     pub(crate) fn point_at(&self, column: u16, row: u16) -> Option<CellPoint> {
@@ -92,17 +171,17 @@ impl TextSnapshot {
         }
         Some(CellPoint {
             column: column - self.area.x,
-            row: row - self.area.y,
+            row: self.scroll.saturating_add(row - self.area.y),
         })
     }
 
     fn cell(&self, point: CellPoint) -> Option<&TextCell> {
-        if point.column >= self.area.width || point.row >= self.area.height {
+        if point.column >= self.area.width || point.row >= self.content_height() {
             return None;
         }
-        let index =
-            usize::from(point.row) * usize::from(self.area.width) + usize::from(point.column);
-        self.cells.get(index)
+        self.cells
+            .get(&point.row)
+            .and_then(|row| row.get(usize::from(point.column)))
     }
 
     pub(crate) fn has_text_at(&self, point: CellPoint) -> bool {
@@ -170,17 +249,11 @@ impl TextSnapshot {
         }
 
         let (start, end) = self.selection_bounds(selection)?;
-        let start_row = usize::from(start.row);
-        let end_row = usize::from(end.row);
         let mut text = String::new();
 
-        for row_idx in start_row..=end_row {
-            let first_col = if row_idx == start_row {
-                start.column
-            } else {
-                0
-            };
-            let last_col = if row_idx == end_row {
+        for row in start.row..=end.row {
+            let first_col = if row == start.row { start.column } else { 0 };
+            let last_col = if row == end.row {
                 end.column
             } else {
                 self.area.width.saturating_sub(1)
@@ -188,10 +261,7 @@ impl TextSnapshot {
 
             let mut row_text = String::new();
             for column in first_col..=last_col {
-                let point = CellPoint {
-                    column,
-                    row: row_idx as u16,
-                };
+                let point = CellPoint { column, row };
                 let Some(cell) = self.cell(point) else {
                     continue;
                 };
@@ -200,10 +270,10 @@ impl TextSnapshot {
                 }
             }
             let row_text = row_text.trim_end_matches(' ');
-            if row_idx > start_row {
+            if row > start.row {
                 match self
                     .row_breaks
-                    .get(row_idx)
+                    .get(&row)
                     .copied()
                     .unwrap_or(TextRowBreak::Hard)
                 {
@@ -218,13 +288,87 @@ impl TextSnapshot {
         text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
     }
 
+    pub(crate) fn word_selection_at(&self, point: CellPoint) -> Option<TextSelection> {
+        let cell = self.cell(point)?;
+        let origin = self.cell(CellPoint {
+            column: cell.span_start,
+            row: point.row,
+        })?;
+        if origin.symbol.chars().all(char::is_whitespace) {
+            return None;
+        }
+        let is_word = origin
+            .symbol
+            .chars()
+            .any(|ch| ch.is_alphanumeric() || ch == '_');
+        let matches_class = |column| {
+            let point = CellPoint {
+                column,
+                row: point.row,
+            };
+            let Some(cell) = self.cell(point) else {
+                return false;
+            };
+            let Some(origin) = self.cell(CellPoint {
+                column: cell.span_start,
+                row: point.row,
+            }) else {
+                return false;
+            };
+            !origin.symbol.chars().all(char::is_whitespace)
+                && origin
+                    .symbol
+                    .chars()
+                    .any(|ch| ch.is_alphanumeric() || ch == '_')
+                    == is_word
+        };
+
+        let mut start = cell.span_start;
+        while start > 0 && matches_class(start - 1) {
+            start = self
+                .cell(CellPoint {
+                    column: start - 1,
+                    row: point.row,
+                })?
+                .span_start;
+        }
+        let mut end = cell.span_start;
+        while end + 1 < self.area.width && matches_class(end + 1) {
+            end += 1;
+        }
+
+        Some(TextSelection {
+            anchor: CellPoint {
+                column: start,
+                row: point.row,
+            },
+            head: CellPoint {
+                column: end,
+                row: point.row,
+            },
+            dragged: true,
+        })
+    }
+
     pub(crate) fn selection_anchor_rect(&self, selection: TextSelection) -> Option<Rect> {
         if !selection.dragged {
             return None;
         }
         let (start, end) = selection.normalized();
-        let y = self.area.y.saturating_add(start.row);
-        let height = end.row.saturating_sub(start.row).saturating_add(1);
+        let visible_start = start.row.max(self.scroll);
+        let visible_end = end.row.min(
+            self.scroll
+                .saturating_add(self.area.height)
+                .saturating_sub(1),
+        );
+        if visible_end < visible_start {
+            return None;
+        }
+        let y = self
+            .area
+            .y
+            .saturating_add(visible_start.saturating_sub(self.scroll));
+        let height = visible_end.saturating_sub(visible_start).saturating_add(1);
         Some(Rect::new(self.area.x, y, self.area.width, height))
     }
 
@@ -238,14 +382,53 @@ impl TextSnapshot {
             return;
         };
         let buffer = frame.buffer_mut();
-        for row in 0..self.area.height {
+        for screen_row in 0..self.area.height {
             for column in 0..self.area.width {
-                if Self::bounds_contain(start, end, CellPoint { column, row }) {
-                    buffer[(self.area.x + column, self.area.y + row)].set_style(style);
+                let point = CellPoint {
+                    column,
+                    row: self.scroll.saturating_add(screen_row),
+                };
+                if Self::bounds_contain(start, end, point) {
+                    buffer[(self.area.x + column, self.area.y + screen_row)].set_style(style);
                 }
             }
         }
     }
+}
+
+fn extract_buffer_rows(
+    buffer: &Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+) -> Vec<Vec<TextCell>> {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut rows = Vec::with_capacity(usize::from(height));
+    for row in y..y.saturating_add(height) {
+        let mut cells = Vec::with_capacity(usize::from(width));
+        let mut column = 0;
+        while column < width {
+            let symbol = buffer[(x + column, row)].symbol().to_string();
+            let width = (UnicodeWidthStr::width(symbol.as_str()) as u16)
+                .max(1)
+                .min(width - column);
+            cells.push(TextCell {
+                symbol,
+                span_start: column,
+            });
+            for _ in 1..width {
+                cells.push(TextCell {
+                    symbol: String::new(),
+                    span_start: column,
+                });
+            }
+            column += width;
+        }
+        rows.push(cells);
+    }
+    rows
 }
 
 pub(crate) fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
