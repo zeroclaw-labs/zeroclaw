@@ -151,6 +151,9 @@ jobs:
       - name: Test release version preparation failures
         run: python3 scripts/release/bump-version.test.py
 
+      - name: Test early Apple release credential validation
+        run: python3 scripts/release/apple_preflight_test.py
+
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
