@@ -65,6 +65,8 @@ cli-wechat-login-confirmed-missing-field = Login confirmed but {$field} missing.
 cli-wechat-connected = ✅ WeChat connected!
 cli-wechat-bound-success = ✅ WeChat account bound successfully. You can talk to ZeroClaw now.
 cli-wechat-invalid-bind-code = ❌ Invalid bind code. Please try again.
+cli-wechat-bind-denied = ❌ This account is blocked by an `ignore` entry in the runtime config. Ask the operator to remove it, then retry with the same code.
+cli-wechat-bind-not-saved = ❌ Could not save the binding, so nothing changed. Your code is still valid; ask the operator to check the config file, then retry.
 
 cli-skills-list-about = List all installed skills
 cli-skills-audit-about = Audit a skill source directory or installed skill name
@@ -426,6 +428,8 @@ channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$c
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
+channel-line-bind-denied = ❌ This account is blocked by an `ignore` entry. Ask the operator to remove it, then retry.
+channel-line-bind-not-saved = ❌ Could not save the binding, so nothing changed. Your code is still valid; ask the operator to check the config file, then retry.
 channel-telegram-cmd-new-desc = Start a new conversation session
 channel-telegram-cmd-clear-desc = Clear this conversation session
 channel-telegram-cmd-stop-desc = Cancel the current in-flight task
