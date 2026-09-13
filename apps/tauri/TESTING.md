@@ -18,12 +18,7 @@ On launch:
    `web/src/App.tsx`) sends first-time users — no agents yet, Quickstart never
    completed — to `/quickstart`. Returning users land on the dashboard.
 
-> The app looks for a gateway on `127.0.0.1:42617`: it reuses a running
-> daemon, or spawns `zeroclaw daemon` itself (preferring a kernel bundled
-> next to the app executable, then `PATH` and the common install dirs — see
-> `src/daemon.rs::find_zeroclaw_binary`). The self-contained installer below
-> bundles the kernel as a Tauri sidecar — the "full experience" distribution
-> from architecture RFC fnd-001, D5.
+> The app looks for a gateway on `127.0.0.1:42617`: it reuses a running daemon, or starts the discovered kernel with `zeroclaw service run-desktop-daemon --port 42617` (preferring a kernel bundled next to the app executable, then `PATH` and the common install dirs — see `src/daemon.rs::find_zeroclaw_binary`). Before launch, Desktop verifies that the kernel accepts this supervisor command. An externally installed kernel must therefore support the Desktop supervisor command; an older unsupported kernel produces an actionable startup error instead of falling back to an uncaptured daemon. The self-contained installer below bundles the matching kernel as a Tauri sidecar — the "full experience" distribution from architecture RFC fnd-001, D5.
 >
 > **Run `zeroclaw daemon`, not `zeroclaw gateway start`.** Both serve the
 > dashboard on 42617, but only the daemon attaches the supervisor that powers
@@ -31,6 +26,8 @@ On launch:
 > a standalone `gateway start` has no supervisor and returns
 > `503 "no daemon supervisor — running as standalone gateway"`, so the new agent
 > won't go live until the process is restarted. The daemon hot-reloads instead.
+
+The desktop supervisor writes combined daemon stdout and stderr to `<config-dir>/logs/zeroclaw-desktop-daemon.log`, where `<config-dir>` follows canonical config resolution precedence: `ZEROCLAW_CONFIG_DIR`, then `ZEROCLAW_DATA_DIR`, then deprecated `ZEROCLAW_WORKSPACE`, then Homebrew/default resolution. The capture is capped at 8 MiB and retains the newest tail when the cap is crossed.
 
 ## Self-contained build (bundled kernel)
 
@@ -107,6 +104,7 @@ open /Applications/ZeroClaw.app
   normal dashboard, not the Quickstart.
 - Quit from the tray → relaunch → splash → dashboard again (tray icon persists
   in the menu bar).
+- Inspect `<config-dir>/logs/zeroclaw-desktop-daemon.log` after startup to verify combined stdout/stderr capture; the file stays at or below 8 MiB and keeps the newest tail during continuous output.
 
 ### Native command boundary
 
