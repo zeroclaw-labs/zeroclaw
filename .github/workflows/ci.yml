@@ -115,6 +115,9 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Test release version preparation failures
+        run: python3 scripts/release/bump-version.test.py
+
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 

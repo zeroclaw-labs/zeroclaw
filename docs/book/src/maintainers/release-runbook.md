@@ -54,7 +54,7 @@ Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the two
 #### sh
 
 ```sh
-./scripts/release/bump-version.sh    # version from Cargo.toml
+./scripts/release/bump-version.sh --release    # version from Cargo.toml
 ```
 
 </div>
@@ -73,6 +73,13 @@ in step automatically, so never hand-edit a generated region. Live release
 availability remains hand-authored and is not inferred by the generator. This
 script also refreshes the Nix git dependency hashes (`nix/hashes.json`) via
 `scripts/dev/refresh-nix-hashes.sh`.
+
+Release mode requires `cargo`, `jq`, `nix-prefetch-git`, `perl`, `sha256sum`,
+the lockfile, and the Nix refresh script before it edits files. It stops if
+lockfile resolution, Nix hashes, or installer generation fails. A failure can
+leave earlier edits in the worktree: inspect them and rerun after fixing the
+reported prerequisite. Do not commit an incomplete bump. Without `--release`,
+the script retains its best-effort behavior for local preparation.
 
 ### Refresh and pin translations
 
