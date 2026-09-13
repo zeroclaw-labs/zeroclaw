@@ -23210,11 +23210,12 @@ triggers = ["log food"]
 
         let executions = Arc::new(AtomicUsize::new(0));
         let tools = Arc::new(
-            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-                Box::new(CountingPriceTool {
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingPriceTool {
                     executions: Arc::clone(&executions),
-                }) as Box<dyn Tool>,
-            ]),
+                },
+            )
+                as Box<dyn Tool>]),
         );
         let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
             Arc::new(zeroclaw_config::schema::Config::default()),
