@@ -3453,6 +3453,7 @@ impl Channel for WhatsAppWebChannel {
             &token,
             &request.tool_name,
             &request.arguments_summary,
+            request.position_counter(),
         );
         if binding.is_group {
             // Say so in the prompt. The token is now readable by everyone in
@@ -5935,6 +5936,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         let err = channel
@@ -5997,6 +5999,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: "ls -la".to_string(),
                 raw_arguments: None,
+                position: None,
             };
             channel
                 .request_approval(recipient, &request)
@@ -6055,7 +6058,7 @@ mod tests {
         let dm_token = token_of(&dm);
         assert_eq!(
             dm,
-            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la"),
+            crate::util::build_yesno_approval_prompt(&dm_token, "shell", "ls -la", None),
             "the direct-chat prompt must be exactly what the shared builder produces"
         );
 
@@ -6073,7 +6076,7 @@ mod tests {
             group,
             format!(
                 "{}\n\n{group_warning}",
-                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la")
+                crate::util::build_yesno_approval_prompt(&group_token, "shell", "ls -la", None)
             ),
             "the group prompt must be the shared builder's output plus exactly one warning"
         );
@@ -6388,6 +6391,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: format!("echo {word}"),
                 raw_arguments: None,
+                position: None,
             };
 
             let asking = channel.request_approval(&chat, &request);
@@ -6526,6 +6530,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
         let err = channel
             .request_approval("1@s.whatsapp.net", &request)
@@ -7390,6 +7395,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         let decision = channel
@@ -7467,6 +7473,7 @@ mod tests {
                 tool_name: "shell".to_string(),
                 arguments_summary: "ls".to_string(),
                 raw_arguments: None,
+                position: None,
             };
 
             let started = tokio::time::Instant::now();

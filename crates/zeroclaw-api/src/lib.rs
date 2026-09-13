@@ -22,6 +22,7 @@ pub mod schema;
 pub mod session_keys;
 pub mod tool;
 pub mod vad;
+pub mod webhook;
 
 /// Reserved names for tools that manage durable session-prompt attachments.
 /// Every policy and presentation boundary must use this single vocabulary.

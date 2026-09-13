@@ -26,10 +26,11 @@ pub(crate) async fn gate_tool_approval(
     tool_name: &str,
     tool_args: &serde_json::Value,
     iteration: usize,
+    position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
     let session_prompt_mutation = is_session_prompt_mutation(tool_name);
     if session_prompt_mutation && ctx.session_prompt_approval_required {
-        return gate_session_prompt_approval(ctx, tool_name, tool_args).await;
+        return gate_session_prompt_approval(ctx, tool_name, tool_args, position).await;
     }
 
     let mut approval_requirement = ctx
@@ -58,6 +59,7 @@ pub(crate) async fn gate_tool_approval(
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
                     raw_arguments: Some(request.arguments.clone()),
+                    position: Some(position),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 let response = if let Some(cancel) = ctx.cancellation_token {
@@ -413,6 +415,7 @@ async fn gate_session_prompt_approval(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
+    position: zeroclaw_api::channel::ApprovalPosition,
 ) -> ApprovalGateOutcome {
     let denied = |reason: &str| {
         ApprovalGateOutcome::Deny(ToolExecutionOutcome {
@@ -441,6 +444,7 @@ async fn gate_session_prompt_approval(
             // Prompt content belongs only on the approval surface, never in the
             // generic structured arguments that downstream event consumers log.
             raw_arguments: None,
+            position: Some(position),
         };
         let response = if let Some(cancel) = ctx.cancellation_token {
             tokio::select! {
@@ -567,7 +571,13 @@ mod tests {
         };
 
         let arguments = serde_json::json!({"command": "sleep 60"});
-        let approval_wait = gate_tool_approval(&ctx, "shell", &arguments, 0);
+        let approval_wait = gate_tool_approval(
+            &ctx,
+            "shell",
+            &arguments,
+            0,
+            zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
+        );
         tokio::pin!(approval_wait);
         let line = tokio::select! {
             outcome = &mut approval_wait => panic!("approval completed before cancellation: {}", matches!(outcome, ApprovalGateOutcome::Cancelled)),
@@ -678,6 +688,7 @@ mod tests {
                 "session_prompt_set",
                 &serde_json::json!({"id": "task", "content": marker}),
                 0,
+                zeroclaw_api::channel::ApprovalPosition { index: 1, total: 1 },
             )
             .await;
 
