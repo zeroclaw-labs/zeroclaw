@@ -184,6 +184,10 @@ pub struct RpcContext {
     /// Certificate paths fail closed on `None` rather than issuing
     /// credentials with no trail.
     pub cert_audit: Option<Arc<crate::security::audit::AuditLogger>>,
+    /// Inbound authentication layer: providers, shared resolver, and the
+    /// live pairing/roster authorities. Always present — a default config
+    /// yields the legacy local shared-operator behavior, never a bypass.
+    pub auth: Arc<crate::rpc::auth::RpcInboundAuth>,
 }
 
 impl RpcContext {
@@ -201,6 +205,7 @@ impl RpcContext {
             data_dir.clone(),
         )
         .ok();
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -218,11 +223,13 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit,
+            auth,
         })
     }
 
     #[cfg(test)]
     pub fn minimal(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -240,6 +247,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -254,6 +262,7 @@ impl RpcContext {
             config.data_dir.clone(),
         )
         .ok();
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -271,6 +280,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit,
+            auth,
         })
     }
 
@@ -280,6 +290,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         event_tx: tokio::sync::broadcast::Sender<Value>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -297,6 +308,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -306,6 +318,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -323,6 +336,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -332,6 +346,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         memory: Arc<dyn zeroclaw_api::memory_traits::Memory>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -349,6 +364,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -358,6 +374,7 @@ impl RpcContext {
         sessions: Arc<SessionStore>,
         cost_tracker: Arc<CostTracker>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -375,6 +392,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -385,6 +403,7 @@ impl RpcContext {
         session_backend: Option<Arc<dyn SessionBackend>>,
         acp_session_store: Option<Arc<AcpSessionStore>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -402,6 +421,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 
@@ -412,6 +432,7 @@ impl RpcContext {
         gateway_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
         reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
         Arc::new(Self {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -429,6 +450,7 @@ impl RpcContext {
             sop_audit: None,
             hooks: None,
             cert_audit: None,
+            auth,
         })
     }
 }
