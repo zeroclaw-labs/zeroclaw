@@ -1441,6 +1441,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.start_conversation': 'Send a message to start the conversation',
     'agent.type_message': 'Type a message...',
     'agent.attach_image': 'Attach image',
+    'agent.cmd_help_upload': 'Attach an image via the file picker',
     'agent.drop_to_attach': 'Drop images to attach',
     'agent.upload_failed': 'Image upload failed: {error}',
     'agent.upload_not_image': '{name} is not an image — only PNG, JPEG, GIF, and WebP can be attached.',

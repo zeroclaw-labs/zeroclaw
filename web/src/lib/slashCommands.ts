@@ -13,7 +13,7 @@ import { t } from '@/lib/i18n';
  */
 
 /** Canonical command name (without the leading slash). */
-export type CommandName = 'help' | 'clear' | 'new' | 'model';
+export type CommandName = 'help' | 'clear' | 'new' | 'model' | 'upload';
 
 export interface CommandSpec {
   /** Command name without the leading slash, e.g. `help`. */
@@ -33,6 +33,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: 'clear', usage: '/clear', descriptionKey: 'agent.cmd_help_clear' },
   { name: 'new', usage: '/new', descriptionKey: 'agent.cmd_help_new' },
   { name: 'model', usage: '/model [name]', descriptionKey: 'agent.cmd_help_model' },
+  { name: 'upload', usage: '/upload', descriptionKey: 'agent.cmd_help_upload' },
 ] as const;
 
 export interface ParsedCommand {
