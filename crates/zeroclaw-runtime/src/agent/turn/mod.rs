@@ -2951,6 +2951,7 @@ mod active_route_context_tests {
                 input_tokens: Some(6_000),
                 output_tokens: Some(100),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             reasoning_content: None,
         };

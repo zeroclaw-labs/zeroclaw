@@ -6209,6 +6209,7 @@ mod tests {
                 usage: Some(zeroclaw_providers::traits::TokenUsage {
                     input_tokens: Some(100),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                     output_tokens: Some(20),
                 }),
                 reasoning_content: None,
@@ -12154,6 +12155,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(100),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(20),
                     }),
                     reasoning_content: None,
@@ -12328,6 +12330,7 @@ vision_model_provider = "custom.vision"
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(100),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(20),
                     }),
                     reasoning_content: None,
