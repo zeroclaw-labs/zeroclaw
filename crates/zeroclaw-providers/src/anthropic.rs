@@ -1887,6 +1887,7 @@ impl AnthropicModelProvider {
                 input_tokens: if any_reported { Some(total) } else { None },
                 output_tokens: u.output_tokens,
                 cached_input_tokens: u.cache_read_input_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
             }
         });
 
@@ -2409,6 +2410,7 @@ impl AnthropicModelProvider {
                                 input_tokens: normalized_input,
                                 output_tokens,
                                 cached_input_tokens,
+                                cache_creation_input_tokens,
                             })))
                             .await;
                     }

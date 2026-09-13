@@ -1217,6 +1217,10 @@ struct UsageInfo {
 struct PromptTokensDetails {
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     cached_tokens: Option<u64>,
+    /// Cache-write tokens reported by translating gateways that forward
+    /// Anthropic usage (`prompt_tokens_details.cache_creation_input_tokens`).
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 impl UsageInfo {
@@ -1228,12 +1232,20 @@ impl UsageInfo {
         })
     }
 
+    fn cache_creation_input_tokens(&self) -> Option<u64> {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cache_creation_input_tokens)
+    }
+
     fn into_provider_usage(self) -> zeroclaw_api::model_provider::TokenUsage {
         let cached_input_tokens = self.cached_input_tokens();
+        let cache_creation_input_tokens = self.cache_creation_input_tokens();
         zeroclaw_api::model_provider::TokenUsage {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens,
         }
     }
 }
@@ -8434,6 +8446,27 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(150));
         assert_eq!(usage.output_tokens, Some(60));
         assert_eq!(usage.cached_input_tokens, Some(120));
+    }
+
+    #[test]
+    fn api_response_parses_gateway_cache_creation_tokens() {
+        // Translating gateways forward Anthropic's cache-write counter inside
+        // `prompt_tokens_details` when providers include that usage detail.
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_tokens_details": {
+                    "cached_tokens": 120,
+                    "cache_creation_input_tokens": 25
+                }
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(120));
+        assert_eq!(usage.cache_creation_input_tokens, Some(25));
     }
 
     #[test]
