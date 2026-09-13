@@ -919,7 +919,7 @@ impl RpcDispatcher {
                     .grants
                     .allowed_agents
                     .iter()
-                    .any(|alias| alias == zeroclaw_api::grants::WILDCARD)
+                    .any(|alias| alias.as_str() == zeroclaw_api::grants::WILDCARD)
         }) {
             agent.disable_principal_unaware_nested_tools();
         }

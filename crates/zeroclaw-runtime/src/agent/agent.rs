@@ -5198,6 +5198,7 @@ mod tests {
                     id: format!("call-{i}"),
                     name: (*name).into(),
                     arguments: "{}".into(),
+                    extra_content: None,
                 })
                 .collect(),
             usage: None,
