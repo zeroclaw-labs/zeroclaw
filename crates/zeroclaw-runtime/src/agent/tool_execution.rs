@@ -71,10 +71,10 @@ pub(crate) struct ToolDispatchContext<'a> {
 }
 
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
-    let name = name.trim();
-    excluded_tools
-        .iter()
-        .any(|excluded| excluded.trim().eq_ignore_ascii_case(name))
+    // The one interpretation of an exclusion entry, shared with the registry
+    // filter, the skill-scoped wrapper, and the pipeline so an indirect route
+    // cannot read the same declaration more narrowly than this one does.
+    zeroclaw_api::tool::is_excluded_tool(name, excluded_tools)
 }
 
 fn unavailable_tool_outcome(

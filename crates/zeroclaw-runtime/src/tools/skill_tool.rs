@@ -394,10 +394,7 @@ impl Tool for SkillBuiltinTool {
         // tool through the wrapper. This mirrors the delegate/nested-loop
         // enforcement, keeping the wrapper on the same monotonic ceiling.
         let ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
-        if ceiling
-            .iter()
-            .any(|excluded| excluded.as_str() == target_name)
-        {
+        if zeroclaw_api::tool::is_excluded_tool(target_name, &ceiling) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
@@ -891,6 +888,41 @@ mod tests {
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ToolResult::ok("ran"))
+        }
+    }
+
+    /// Regression: the wrapper reads a ceiling entry the same way direct
+    /// dispatch does. Direct dispatch has always trimmed and folded case, so a
+    /// wrapper comparing the entry byte-for-byte would execute a target the
+    /// operator's declaration removed.
+    #[tokio::test]
+    async fn skill_wrapper_honors_a_loosely_spelled_ceiling_entry() {
+        for spelling in ["  ShElL  ", "SHELL", "\tshell\n"] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let target: Arc<dyn Tool> = Arc::new(CountingTargetTool {
+                name: "shell".to_string(),
+                calls: Arc::clone(&calls),
+            });
+            let wrapper = SkillBuiltinTool::new(
+                "my_skill",
+                &sample_builtin_skill_tool(),
+                target,
+                HashMap::new(),
+            );
+
+            let res = crate::agent::tool_ceiling::with_tool_ceiling(
+                &[spelling.to_string()],
+                wrapper.execute(serde_json::json!({})),
+            )
+            .await
+            .expect("wrapper returns a result");
+
+            assert!(!res.success, "{spelling:?} must block the target");
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the excluded target must not execute for {spelling:?}"
+            );
         }
     }
 

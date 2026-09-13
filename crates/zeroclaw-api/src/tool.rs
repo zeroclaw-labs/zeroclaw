@@ -365,6 +365,34 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
     false
 }
 
+/// Does `excluded` name `tool_name` for the purposes of an exclusion list?
+///
+/// One interpretation of an exclusion entry, shared by every place that
+/// enforces one. Entries reach the runtime from several sources, including a
+/// skill manifest an operator hand-wrote, so surrounding whitespace and casing
+/// must not decide whether a restriction holds: a declaration that blocks a
+/// tool on direct dispatch has to block the same tool when it is reached
+/// through a wrapper or a pipeline step. Comparing byte-for-byte in one place
+/// and loosely in another is what lets an indirect route stay open after the
+/// direct one closes.
+///
+/// ASCII case folding matches the tool namespace, whose names are ASCII
+/// identifiers (`shell`, `file_write`, `TodoWrite`, `srv__tool`).
+#[must_use]
+pub fn exclusion_entry_matches(excluded: &str, tool_name: &str) -> bool {
+    excluded.trim().eq_ignore_ascii_case(tool_name.trim())
+}
+
+/// Is `tool_name` excluded by any entry in `excluded`?
+///
+/// See [`exclusion_entry_matches`] for why the comparison is shared.
+#[must_use]
+pub fn is_excluded_tool(tool_name: &str, excluded: &[String]) -> bool {
+    excluded
+        .iter()
+        .any(|entry| exclusion_entry_matches(entry, tool_name))
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Tool name (used in LLM function calling)

@@ -116,9 +116,13 @@ async fn a_child_loop_cannot_call_what_the_parent_turn_removed() {
             // Exactly what `delegate` now passes: no static exclusions of
             // its own, plus the originating turn's ceiling.
             let inherited = crate::agent::tool_ceiling::current_tool_ceiling();
-            let child_tools: Vec<Box<dyn Tool>> = vec![Box::new(BlockedTool {
-                calls: Arc::clone(&self.blocked_calls),
-            })];
+            let child_tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    BlockedTool {
+                        calls: Arc::clone(&self.blocked_calls),
+                    },
+                )
+                    as Box<dyn Tool>]);
             let child_provider = ScriptedProvider::new(vec![
                 tool_response(vec![tool_call("c1", "blocked_tool")]),
                 text_response("child done"),
@@ -187,14 +191,14 @@ async fn a_child_loop_cannot_call_what_the_parent_turn_removed() {
     }
 
     let blocked_calls = Arc::new(AtomicUsize::new(0));
-    let parent_tools: Vec<Box<dyn Tool>> = vec![
+    let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
         Box::new(NestingTool {
             blocked_calls: Arc::clone(&blocked_calls),
-        }),
+        }) as Box<dyn Tool>,
         Box::new(BlockedTool {
             calls: Arc::clone(&blocked_calls),
         }),
-    ];
+    ]);
     let parent_provider = ScriptedProvider::new(vec![
         tool_response(vec![tool_call("t1", "nest")]),
         text_response("parent done"),

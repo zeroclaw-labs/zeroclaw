@@ -645,6 +645,9 @@ mod tests {
     fn compact_skills_fall_back_to_full_when_loader_is_described_but_unavailable() {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let skills = vec![Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "fallback-test".to_string(),
             description: "Verify loader fallback".to_string(),
             description_localizations: Default::default(),
@@ -1238,6 +1241,9 @@ mod tests {
         )
         .expect("write AGENTS.md");
         let skills = vec![Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "lower-priority".into(),
             description: "LOW_PRIORITY_SKILL_METADATA".into(),
             description_localizations: Default::default(),
@@ -1293,6 +1299,9 @@ mod tests {
         )
         .expect("write AGENTS.md");
         let skills = vec![Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "lower-priority".into(),
             description: "LOW_PRIORITY_SKILL_METADATA".into(),
             description_localizations: Default::default(),

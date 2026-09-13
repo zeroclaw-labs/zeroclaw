@@ -163,7 +163,7 @@ impl PipelineTool {
 
         // Validate the full request before any sequential or parallel step starts.
         for step in &request.steps {
-            if turn_excluded.iter().any(|ex| ex == &step.tool) {
+            if zeroclaw_api::tool::is_excluded_tool(&step.tool, &turn_excluded) {
                 return Err(PipelineError::ExcludedByTurnCeiling(step.tool.clone()));
             }
             let globally_allowed = self.allowed_set.contains(&step.tool);
@@ -1033,6 +1033,38 @@ mod tests {
             1,
             "control proves reachability"
         );
+    }
+
+    /// Regression: a declaration's whitespace and casing must not decide
+    /// whether the pipeline honors it. `blocked_tools_with_image` entries are
+    /// hand-written, and direct dispatch has always compared them loosely, so a
+    /// pipeline step reading the same entry strictly would reopen the tool the
+    /// operator removed.
+    #[tokio::test]
+    async fn pipeline_honors_a_loosely_spelled_ceiling_entry() {
+        use std::sync::atomic::Ordering;
+        for parallel in [false, true] {
+            for spelling in ["  ShElL  ", "SHELL", "\tshell\n"] {
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let req = serde_json::json!({
+                    "steps": [{ "tool": "shell", "args": {} }],
+                    "parallel": parallel
+                });
+                let entry = spelling.to_string();
+                let blocked =
+                    counting_pipeline(Arc::clone(&calls), Arc::new(move || vec![entry.clone()]));
+                let res = blocked.execute(req).await.unwrap();
+                assert!(
+                    !res.success,
+                    "step must be refused for {spelling:?} (parallel={parallel})"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "excluded tool must not run for {spelling:?} (parallel={parallel})"
+                );
+            }
+        }
     }
 
     /// Regression: the same enforcement for the parallel dispatch, which spawns

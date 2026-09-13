@@ -20652,6 +20652,9 @@ BTC is currently around $65,000 based on latest tool output."#
         config.security.nat64_prefixes = vec!["not-a-prefix".into()];
         let security = Arc::new(SecurityPolicy::default());
         let skills = vec![zeroclaw_runtime::skills::Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "ops".into(),
             description: "Operations helpers".into(),
             description_localizations: Default::default(),
@@ -22446,7 +22449,9 @@ blocked_tools_with_image = ["test_blocked_tool"]
             workspace_dir,
             provider_cache_seed,
             Arc::new(ModelCaptureModelProvider::default()),
-            Arc::new(vec![]),
+            Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             AutonomyLevel::default(),
             Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -22467,7 +22472,7 @@ blocked_tools_with_image = ["test_blocked_tool"]
         workspace_dir: std::path::PathBuf,
         provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>>,
         default_model_provider: Arc<dyn ModelProvider>,
-        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+        tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
         autonomy_level: AutonomyLevel,
         approval_manager: Arc<ApprovalManager>,
     ) -> (Arc<ChannelRuntimeContext>, Arc<TelegramRecordingChannel>) {
@@ -23030,9 +23035,13 @@ triggers = ["log food"]
             write_image_toolblock_skill(workspace.path());
 
             let executions = Arc::new(AtomicUsize::new(0));
-            let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
-                executions: Arc::clone(&executions),
-            })]);
+            let tools = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(CountingPriceTool {
+                        executions: Arc::clone(&executions),
+                    }) as Box<dyn Tool>,
+                ]),
+            );
             let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
                 Arc::new(zeroclaw_config::schema::Config::default()),
                 workspace.path().to_path_buf(),
@@ -23085,9 +23094,13 @@ triggers = ["log food"]
         // workspace.
         let executions = Arc::new(AtomicUsize::new(0));
         let make_ctx = || {
-            let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
-                executions: Arc::clone(&executions),
-            })]);
+            let tools = Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(CountingPriceTool {
+                        executions: Arc::clone(&executions),
+                    }) as Box<dyn Tool>,
+                ]),
+            );
             skill_activation_test_ctx_with_tooling(
                 Arc::new(zeroclaw_config::schema::Config::default()),
                 workspace.path().to_path_buf(),
@@ -23196,9 +23209,13 @@ triggers = ["log food"]
             .expect_parsed("photo update should parse");
 
         let executions = Arc::new(AtomicUsize::new(0));
-        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(CountingPriceTool {
-            executions: Arc::clone(&executions),
-        })]);
+        let tools = Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                Box::new(CountingPriceTool {
+                    executions: Arc::clone(&executions),
+                }) as Box<dyn Tool>,
+            ]),
+        );
         let (ctx, _channel) = skill_activation_test_ctx_with_tooling(
             Arc::new(zeroclaw_config::schema::Config::default()),
             workspace.path().to_path_buf(),
@@ -26514,6 +26531,9 @@ triggers = ["log food"]
     fn channel_strict_non_native_prompt_keeps_skill_tools_non_callable() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "ops".into(),
             description: "Operations helpers".into(),
             description_localizations: Default::default(),

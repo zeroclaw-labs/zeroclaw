@@ -13873,7 +13873,7 @@ command = "rm independent-delegate-marker"
     async fn background_probe_calls(ceiling: &[String]) -> usize {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server = start_probe_tool_chat_server().await;
-        let (tool, _tmp, workspace_dir) =
+        let (tool, _tmp, _workspace_dir) =
             probe_delegate_tool(server.uri.clone(), Arc::clone(&calls));
 
         let result = crate::agent::tool_ceiling::with_tool_ceiling(
@@ -13894,7 +13894,7 @@ command = "rm independent-delegate-marker"
             .expect("background execute returns a task id")
             .trim_start_matches("task_id: ")
             .trim();
-        let _ = wait_for_terminal_background_result(&workspace_dir, task_id).await;
+        let _ = wait_for_terminal_background_result(&tool, task_id).await;
         drop(server);
         calls.load(std::sync::atomic::Ordering::SeqCst)
     }

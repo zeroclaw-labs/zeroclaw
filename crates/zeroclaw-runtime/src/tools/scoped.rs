@@ -615,12 +615,12 @@ impl ScopedToolRegistry {
         // Skills and deferred MCP helpers are registered after the built-in filter,
         // so the explicit denylist must subtract once more at the final boundary.
         if let Some(excluded) = security.excluded_tools.as_deref() {
-            tools_registry.retain(|t| !excluded.iter().any(|ex| ex == t.name()));
+            tools_registry.retain(|t| !zeroclaw_api::tool::is_excluded_tool(t.name(), excluded));
             // The registry and prompt surfaces must move together: if `tool_search`
             // itself is excluded, the deferred-MCP prompt section - which always
             // instructs the model to call `tool_search` - must not survive either,
             // or the model is told to call a tool the policy just removed.
-            if excluded.iter().any(|ex| ex == "tool_search") {
+            if zeroclaw_api::tool::is_excluded_tool("tool_search", excluded) {
                 deferred_section.clear();
             }
         }
@@ -1148,6 +1148,9 @@ mod tests {
         let mut config = Config::default();
         config.security.nat64_prefixes = vec!["2001:4860:4860::/96".to_string()];
         let skill = Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "net".to_string(),
             description: "network skill".to_string(),
             description_localizations: Default::default(),

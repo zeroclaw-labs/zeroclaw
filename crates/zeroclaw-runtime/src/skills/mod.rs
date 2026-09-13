@@ -1604,8 +1604,27 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         location: Some(path.to_path_buf()),
         provider: manifest.skill.provider,
         triggers: manifest.skill.triggers,
-        blocked_tools_with_image: manifest.skill.blocked_tools_with_image,
+        blocked_tools_with_image: canonical_blocked_tools(manifest.skill.blocked_tools_with_image),
     })
+}
+
+/// Canonicalize a declared `blocked_tools_with_image` list at the boundary
+/// where it enters the runtime.
+///
+/// The list is a capability restriction an operator hand-wrote, and everything
+/// downstream reads it through
+/// [`zeroclaw_api::tool::is_excluded_tool`]. Trimming here and dropping entries
+/// that name nothing keeps a stray `["  "]` out of the turn's exclusion set,
+/// where it would otherwise be carried to every enforcement point and matched
+/// against every tool name. Casing is deliberately preserved: the entry is
+/// still what the operator wrote, and the shared matcher is what decides
+/// whether it names a given tool.
+fn canonical_blocked_tools(declared: Vec<String>) -> Vec<String> {
+    declared
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
 }
 
 /// Load a skill from a SKILL.md file (simpler format)
@@ -4892,6 +4911,43 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
         );
     }
 
+    /// Regression: a declared ceiling entry is canonicalized at the manifest
+    /// boundary. Surrounding whitespace is removed and entries that name
+    /// nothing are dropped, so a stray `["  "]` is never carried into the
+    /// turn's exclusion set.
+    #[test]
+    fn canonicalizes_declared_blocked_tools() {
+        assert_eq!(
+            canonical_blocked_tools(vec![
+                "  shell  ".to_string(),
+                "\tfile_write\n".to_string(),
+                "   ".to_string(),
+                String::new(),
+            ]),
+            vec!["shell".to_string(), "file_write".to_string()],
+            "entries are trimmed and empty ones dropped"
+        );
+    }
+
+    /// Regression: casing survives canonicalization, and the shared matcher is
+    /// what decides whether an entry names a tool. Every enforcement point
+    /// reads the declaration through that matcher, so a wrapper or a pipeline
+    /// step cannot interpret `"  ShElL  "` more narrowly than direct dispatch
+    /// does and leave an indirect route open.
+    #[test]
+    fn a_loosely_spelled_ceiling_entry_still_names_its_tool() {
+        let declared = canonical_blocked_tools(vec!["  ShElL  ".to_string()]);
+        assert_eq!(declared, vec!["ShElL".to_string()], "casing is preserved");
+        assert!(
+            zeroclaw_api::tool::is_excluded_tool("shell", &declared),
+            "the shared matcher must still recognize the tool"
+        );
+        assert!(
+            !zeroclaw_api::tool::is_excluded_tool("shell_other", &declared),
+            "loose matching must not spill onto a different tool"
+        );
+    }
+
     /// Regression: an empty or whitespace-only trigger must never activate.
     /// It would otherwise compile to `\b\b` and match nearly every message,
     /// silently switching the skill's provider on unrelated turns.
@@ -5596,6 +5652,9 @@ mod prompt_callable_name_tests {
     #[test]
     fn invalid_nat64_optional_seam_omits_http_but_keeps_shell() {
         let skill = Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "ops".to_string(),
             description: "d".to_string(),
             description_localizations: Default::default(),

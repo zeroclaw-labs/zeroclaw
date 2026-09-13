@@ -523,7 +523,7 @@ pub fn native_tool_specs_present_for_turn(
     // Name-only presence check mirroring `build_iteration_tool_specs`'s
     // filtering, without assembling any specs tools are present if
     // the registry or the activated deferred set has a non-excluded name.
-    let is_excluded = |name: &str| excluded_tools.iter().any(|ex| ex == name);
+    let is_excluded = |name: &str| zeroclaw_api::tool::is_excluded_tool(name, excluded_tools);
     if tools_registry.iter().any(|tool| !is_excluded(tool.name())) {
         return Ok(true);
     }
@@ -13889,6 +13889,9 @@ Let me check the result."#;
             delegate_tool: None,
         };
         let skill = crate::skills::Skill {
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
             name: "ops".into(),
             description: "Operations helpers".into(),
             description_localizations: Default::default(),
