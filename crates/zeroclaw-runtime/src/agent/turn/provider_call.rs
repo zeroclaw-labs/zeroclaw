@@ -350,6 +350,15 @@ pub(crate) async fn call_provider(
                             {
                                 scope.mark_stream_recovery_semantic_empty();
                             }
+                            if request_tools.is_some()
+                                && custom_provider_alias(active_model_provider_name).is_some()
+                                && zeroclaw_providers::rejects_native_tool_calling_message(
+                                    &stream_err.to_string(),
+                                )
+                            {
+                                scope.record_stream_recovery_failure(&stream_err);
+                                (Err(stream_err), false, false, String::new())
+                            } else {
                             scope.record_stream_recovery_failure(&stream_err);
                             // A terminal stream error means the provider already
                             // exhausted its own retry/fallback budget producing
@@ -442,6 +451,7 @@ pub(crate) async fn call_provider(
                                 };
                                 (result, false, false, String::new())
                             }
+                            }
                         }
                     }
                 }))))
@@ -526,6 +536,13 @@ pub(crate) async fn call_provider(
         streamed_protocol_suppressed,
         streamed_visible_text,
     })
+}
+
+pub(crate) fn custom_provider_alias(model_provider_name: &str) -> Option<&str> {
+    model_provider_name
+        .strip_prefix("custom.")
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
 }
 
 #[cfg(test)]

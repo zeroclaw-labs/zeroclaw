@@ -12,6 +12,8 @@ If the service speaks OpenAI chat-completions, this is a config-only change. The
 
 This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
+Custom OpenAI-compatible aliases default to native tool calling. If a gateway rejects `tools`, `tool_choice`, or function-calling fields, set `native_tools = false` on `[providers.models.custom.<alias>]` to skip the native request and use prompt-guided tools directly.
+
 For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text:
 
 ```toml
