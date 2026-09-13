@@ -601,6 +601,10 @@ mod tests {
 
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
+        // The production `set` path writes the process-global runtime proxy
+        // state; hold the shared test guard so concurrent reader tests see a
+        // consistent value and this test's writes are restored afterwards.
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -635,6 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
+        let _proxy_state = crate::test_support::RuntimeProxyStateGuard::acquire().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
