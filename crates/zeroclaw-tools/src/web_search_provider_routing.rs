@@ -6,6 +6,7 @@ pub enum WebSearchProviderRoute {
     Tavily,
     Jina,
     Bocha,
+    Keenable,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -44,6 +45,7 @@ const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
 const BOCHA_PROVIDER: &str = "bocha";
+const KEENABLE_PROVIDER: &str = "keenable";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -82,8 +84,13 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
                 used_fallback: false,
             }
         }
+        "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Keenable,
+            canonical_provider: KEENABLE_PROVIDER,
+            used_fallback: false,
+        },
         // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, Bocha.
+        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, Bocha, Keenable.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -165,6 +172,17 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Bocha);
             assert_eq!(resolved.canonical_provider, BOCHA_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_keenable() {
+        let keenable_aliases = ["keenable", "keenable-search", "keenable_search"];
+        for alias in keenable_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
+            assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

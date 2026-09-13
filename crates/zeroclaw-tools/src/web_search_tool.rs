@@ -14,16 +14,20 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
-/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly).
+/// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
+/// Keenable (keyless public endpoint; an optional API key lifts rate limits).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
-/// The Bocha key has no boot-time snapshot at all — it is always resolved from
-/// `config.toml` at use time (see `resolve_bocha_api_key`), so the
-/// canonical `[web_search] bocha_api_key` field stays the single source of
-/// truth and rotation/removal takes effect without a restart.
+/// The Bocha and Keenable keys have no boot-time snapshot at all: they are
+/// always resolved from `config.toml` at use time (see `resolve_bocha_api_key`
+/// and `resolve_keenable_api_key`), so the canonical `[web_search]` fields
+/// stay the single source of truth and rotation/removal takes effect without
+/// a restart. The one value Keenable carries is the schema-mirror env
+/// override (`ZEROCLAW_web_search__keenable_api_key`), which the config
+/// loader applies in memory only and which never appears on disk.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,
@@ -41,6 +45,14 @@ pub struct WebSearchTool {
     config_path: PathBuf,
     /// Whether secret encryption is enabled (needed to create a `SecretStore`).
     secrets_encrypt: bool,
+    /// Effective `[web_search] keenable_api_key` while the schema-mirror env
+    /// override is active. `None` means no override: the key is re-read from
+    /// `config.toml` on every call so rotation and removal on disk take
+    /// effect. `Some("")` is a deliberate blank override that forces keyless
+    /// search and never falls back to a key stored on disk. Env vars do not
+    /// change for the life of the process, so this is not a snapshot of
+    /// live policy; the disk field stays the source of truth otherwise.
+    keenable_api_key_override: Option<String>,
 }
 
 impl WebSearchTool {
@@ -61,6 +73,7 @@ impl WebSearchTool {
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
             secrets_encrypt: false,
+            keenable_api_key_override: None,
         }
     }
 
@@ -86,7 +99,34 @@ impl WebSearchTool {
             timeout_secs: timeout_secs.max(1),
             config_path,
             secrets_encrypt,
+            keenable_api_key_override: None,
         }
+    }
+
+    /// Read the effective schema-mirror env override for the Keenable key out
+    /// of a loaded `Config`. The loader has already applied
+    /// `ZEROCLAW_web_search__keenable_api_key` to the in-memory field and
+    /// recorded the path in `env_overridden_paths`; this returns that value,
+    /// blank included, only while the override is active, and `None` when the
+    /// on-disk field is the source of truth.
+    pub fn keenable_api_key_override(config: &zeroclaw_config::schema::Config) -> Option<String> {
+        config
+            .prop_is_env_overridden(KEENABLE_API_KEY_PROP_PATH)
+            .then(|| {
+                config
+                    .web_search
+                    .keenable_api_key
+                    .clone()
+                    .unwrap_or_default()
+            })
+    }
+
+    /// Carry the Keenable env override into the tool. The runtime factory
+    /// passes `Self::keenable_api_key_override(config)`; without this call
+    /// the tool resolves the key from `config.toml` on every request.
+    pub fn with_keenable_api_key_override(mut self, override_value: Option<String>) -> Self {
+        self.keenable_api_key_override = override_value;
+        self
     }
 
     /// Resolve the Brave API key, preferring the boot-time value but falling
@@ -837,6 +877,243 @@ impl WebSearchTool {
         Ok(render_results(results_header(query, "Bocha"), blocks))
     }
 
+    /// Resolve the optional Keenable API key from `[web_search] keenable_api_key`.
+    ///
+    /// Like Bocha, there is no boot-time snapshot: the config field is the
+    /// single source of truth and is re-read (and decrypted) on every call, so
+    /// adding, rotating, or removing the key takes effect without a restart.
+    /// Unlike every other keyed provider the key is optional: `Ok(None)`
+    /// means "use the public endpoint", not a configuration error.
+    ///
+    /// An active env override wins outright. The config loader has already
+    /// applied it to the in-memory `Config`, and the disk file does not carry
+    /// it (`save()` masks env-injected values back out), so rereading
+    /// `config.toml` here would lose an env-only key and would resurrect a
+    /// stored key that a blank override was set to suppress.
+    fn resolve_keenable_api_key(&self) -> anyhow::Result<Option<String>> {
+        if let Some(value) = &self.keenable_api_key_override {
+            return Ok(Some(value.clone()).filter(|k| !k.is_empty()));
+        }
+
+        // `WebSearchTool::new` leaves the config path empty: there is nothing
+        // to read, so the tool is keyless by construction.
+        if self.config_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "keenable",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Keenable API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for Keenable API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        // Deliberately not `format!("{e}")`: the parser's message quotes the
+        // offending source line, and a malformed `keenable_api_key` line is
+        // the credential itself. Only the stable code and a line number
+        // derived from the error span leave this function. A broken config
+        // is an error, not a fall-through to keyless search.
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            let line = toml_error_line(&contents, &e);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(keenable_config_parse_attrs(&self.config_path, line)),
+                "web_search: failed to parse config for Keenable API key"
+            );
+            let location = line.map(|n| format!(", line={n}")).unwrap_or_default();
+            anyhow::Error::msg(format!(
+                "Failed to parse config file {} for Keenable API key \
+                 (error_code={KEENABLE_CONFIG_PARSE_ERROR_CODE}{location}). \
+                 Fix the TOML syntax; the parser message is withheld because \
+                 it can quote the offending line.",
+                self.config_path.display()
+            ))
+        })?;
+
+        let Some(raw_key) = config.web_search.keenable_api_key.filter(|k| !k.is_empty()) else {
+            return Ok(None);
+        };
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            // An encrypted-but-empty value is "no key", not a broken key.
+            Ok(Some(plaintext).filter(|k| !k.is_empty()))
+        } else {
+            Ok(Some(raw_key))
+        }
+    }
+
+    /// Build the Keenable HTTP client. Redirects are disabled: reqwest drops
+    /// `Authorization` and cookies when a redirect leaves the origin but keeps
+    /// custom headers, so following a 3xx would replay the POST, `X-API-Key`
+    /// included, to whatever origin the response named. A redirect therefore
+    /// surfaces as its own status and is classified like any other non-2xx
+    /// answer. `search_keenable` and the redirect regression both build their
+    /// client here so the policy under test is the policy that ships.
+    fn keenable_client(&self) -> reqwest::Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .redirect(reqwest::redirect::Policy::none());
+        zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search").build()
+    }
+
+    async fn search_keenable(&self, query: &str) -> anyhow::Result<String> {
+        let client = self.keenable_client()?;
+        self.search_keenable_with_client(&client, KEENABLE_API_BASE_URL, query)
+            .await
+    }
+
+    /// Inner Keenable request, parameterized on the HTTP client and API base
+    /// URL so request-shape tests can target a local mock server. The endpoint
+    /// path is chosen here, not by the caller: a configured key selects
+    /// `/v1/search` with an `X-API-Key` header, no key selects the public
+    /// `/v1/search/public`. Both carry `X-Keenable-Title`, which the public
+    /// endpoint requires (it answers 400 without it). Production calls always
+    /// go through [`Self::search_keenable`].
+    async fn search_keenable_with_client(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let api_key = self.resolve_keenable_api_key()?;
+        let path = if api_key.is_some() {
+            KEENABLE_SEARCH_PATH
+        } else {
+            KEENABLE_PUBLIC_SEARCH_PATH
+        };
+        let url = format!("{}{path}", base_url.trim_end_matches('/'));
+
+        // `snippet_max_length` is a hint (the API rounds up to a word
+        // boundary). Sizing it to the per-result cap keeps the provider from
+        // shipping text that `cap_result_content` would drop anyway.
+        let body = serde_json::json!({
+            "query": query,
+            "max_results": self.max_results,
+            "snippet_max_length": MAX_RESULT_CONTENT_CHARS,
+        });
+
+        let mut request = client
+            .post(&url)
+            .header(KEENABLE_TITLE_HEADER, KEENABLE_APP_TITLE)
+            .json(&body);
+        if let Some(key) = api_key.as_deref() {
+            request = request.header("X-API-Key", key);
+        }
+
+        let response = request.send().await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("keenable", status));
+        }
+
+        // The body is provider-controlled and arrives before any of the
+        // output caps apply, so it is read through the shared bounded reader,
+        // which stops pulling from the socket one byte past the limit. An
+        // oversized body is rejected whole: nothing is decoded and nothing
+        // of it is echoed.
+        let body = crate::helpers::response_body::read_bounded(
+            response,
+            Some(KEENABLE_MAX_RESPONSE_BYTES),
+        )
+        .await?;
+        if body.overflowed {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "search_provider": "keenable",
+                        "limit_bytes": KEENABLE_MAX_RESPONSE_BYTES,
+                    })),
+                "web_search: Keenable response exceeded the size limit"
+            );
+            anyhow::bail!(
+                "keenable search failed: response body exceeded {KEENABLE_MAX_RESPONSE_BYTES} \
+                 bytes and was not decoded"
+            );
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes).map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"search_provider": "keenable"})),
+                "web_search: Keenable response is not JSON"
+            );
+            anyhow::Error::msg("Invalid Keenable API response: body is not JSON")
+        })?;
+        self.parse_keenable_results(&json, query)
+    }
+
+    fn parse_keenable_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "keenable"})),
+                    "web_search: invalid Keenable response"
+                );
+                anyhow::Error::msg("Invalid Keenable API response")
+            })?;
+
+        if results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            // `snippet` carries the page text; `description` is a legacy field
+            // that is normally empty, so it is only a fallback.
+            let content = result
+                .get("snippet")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| result.get("description").and_then(|d| d.as_str()))
+                .unwrap_or("");
+
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
+            if !content.is_empty() {
+                block.push(format!("   {}", cap_result_content(content)));
+            }
+            blocks.push(block);
+        }
+
+        Ok(render_results(results_header(query, "Keenable"), blocks))
+    }
+
     fn parse_brave_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
         let results = json
             .get("web")
@@ -1017,6 +1294,33 @@ impl WebSearchTool {
     }
 }
 
+// ── Keenable ─────────────────────────────────────────────────────────────────
+
+/// Keenable API origin. The search path is chosen per request by
+/// `search_keenable_with_client` depending on whether a key is configured.
+const KEENABLE_API_BASE_URL: &str = "https://api.keenable.ai";
+/// Keyed search endpoint (`X-API-Key` header).
+const KEENABLE_SEARCH_PATH: &str = "/v1/search";
+/// Keyless search endpoint, rate-limited per client IP.
+const KEENABLE_PUBLIC_SEARCH_PATH: &str = "/v1/search/public";
+/// Names the calling application to the API. Mandatory on the public
+/// endpoint, harmless on the keyed one, so it is always sent.
+const KEENABLE_TITLE_HEADER: &str = "X-Keenable-Title";
+const KEENABLE_APP_TITLE: &str = "zeroclaw";
+/// Dotted prop-path of the key field, in the form `Config::prop_is_env_overridden`
+/// takes. Its env-var spelling is `ZEROCLAW_web_search__keenable_api_key`.
+const KEENABLE_API_KEY_PROP_PATH: &str = "web_search.keenable_api_key";
+/// Stable code for a `config.toml` that fails to parse while the Keenable key
+/// is being resolved. The parser's own message quotes the offending source
+/// line, which for a broken `keenable_api_key = "..."` line is the credential,
+/// so only this code and a derived line number reach logs and tool history.
+const KEENABLE_CONFIG_PARSE_ERROR_CODE: &str = "web_search.keenable.config_parse_error";
+/// Upper bound on a Keenable response body, enforced while the body streams
+/// in and before any JSON decoding. A full page of results is tens of
+/// kilobytes; anything past this is not a search response the tool would
+/// render, so it is rejected instead of buffered.
+const KEENABLE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 // ── Output caps ──────────────────────────────────────────────────────────────
 //
 // Every provider response is untrusted, unbounded text that lands straight in
@@ -1078,7 +1382,7 @@ fn cap_provider_error(message: &str) -> String {
 }
 
 /// Header line for a rendered result list. Shared so the echoed query is
-/// bounded — and the wording stays identical — across all six providers.
+/// bounded — and the wording stays identical — across all seven providers.
 fn results_header(query: &str, provider: &str) -> String {
     format!(
         "Search results for: {} (via {provider})",
@@ -1088,7 +1392,7 @@ fn results_header(query: &str, provider: &str) -> String {
 
 /// The reply every provider returns when a search matched nothing.
 ///
-/// One shared function rather than six copies: this path returns before
+/// One shared function rather than seven copies: this path returns before
 /// [`render_results`], so it is the only place the echoed query is bounded at
 /// all, and a per-provider copy would be a per-provider chance to forget.
 fn no_results_message(query: &str) -> String {
@@ -1099,7 +1403,7 @@ fn no_results_message(query: &str) -> String {
 /// [`MAX_TOTAL_OUTPUT_CHARS`].
 ///
 /// Trimming happens at whole-result granularity so the model never receives a
-/// result cut off mid-field. Shared by all six provider parsers — the cap must
+/// result cut off mid-field. Shared by all seven provider parsers — the cap must
 /// not depend on which provider answered.
 fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
     let mut out = header;
@@ -1354,6 +1658,29 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
     ))
 }
 
+/// One-based line of a TOML parse failure, derived from the error span so the
+/// parser's own text, which quotes the offending line, never has to be
+/// rendered. `None` when the parser attached no span.
+fn toml_error_line(contents: &str, error: &toml::de::Error) -> Option<usize> {
+    let start = error.span()?.start.min(contents.len());
+    let newlines = contents.as_bytes()[..start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    Some(newlines + 1)
+}
+
+/// Structured attributes for the Keenable config-parse failure record: the
+/// path, the stable error code, and the derived line. No parser output.
+fn keenable_config_parse_attrs(config_path: &Path, line: Option<usize>) -> serde_json::Value {
+    serde_json::json!({
+        "path": config_path.display().to_string(),
+        "search_provider": "keenable",
+        "error_code": KEENABLE_CONFIG_PARSE_ERROR_CODE,
+        "line": line,
+    })
+}
+
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1432,6 +1759,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
             WebSearchProviderRoute::Jina => self.search_jina(query).await?,
             WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
+            WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
         };
 
         Ok(ToolResult {
@@ -2195,6 +2523,7 @@ mod tests {
             timeout_secs: 15,
             config_path: PathBuf::new(),
             secrets_encrypt: false,
+            keenable_api_key_override: None,
         };
         let url = tool.resolve_searxng_instance_url().unwrap();
         assert_eq!(url, "https://searx.example.com");
@@ -2655,6 +2984,717 @@ mod tests {
         assert_eq!(body["freshness"], "noLimit");
     }
 
+    // ── Keenable ─────────────────────────────────────────────────────────
+
+    fn keenable_tool(config_path: PathBuf, secrets_encrypt: bool) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "keenable".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            secrets_encrypt,
+        )
+    }
+
+    #[test]
+    fn test_resolve_keenable_api_key_is_none_without_config_field() {
+        // No key in config is the supported zero-config case, not an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+
+        let tool = keenable_tool(config_path, false);
+        assert_eq!(tool.resolve_keenable_api_key().unwrap(), None);
+    }
+
+    #[test]
+    fn test_resolve_keenable_api_key_is_none_with_empty_config_path() {
+        // `WebSearchTool::new` has no config path at all; that must resolve
+        // to keyless rather than to a "failed to read config" error.
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        assert_eq!(tool.resolve_keenable_api_key().unwrap(), None);
+    }
+
+    #[test]
+    fn test_resolve_keenable_api_key_reads_from_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"fresh-keenable-from-disk\"\n",
+        )
+        .unwrap();
+
+        let tool = keenable_tool(config_path, false);
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("fresh-keenable-from-disk")
+        );
+    }
+
+    #[test]
+    fn test_resolve_keenable_api_key_decrypts_encrypted_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("keenable-secret-key").unwrap();
+
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nkeenable_api_key = \"{}\"\n", encrypted),
+        )
+        .unwrap();
+
+        let tool = keenable_tool(config_path, true);
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("keenable-secret-key")
+        );
+    }
+
+    #[test]
+    fn test_resolve_keenable_api_key_tracks_rotation_and_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"initial-key\"\n",
+        )
+        .unwrap();
+
+        let tool = keenable_tool(config_path.clone(), false);
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("initial-key")
+        );
+
+        // Operator rotates the key on disk — same tool instance must pick
+        // up the new value.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("rotated-key")
+        );
+
+        // Operator removes the key — the tool must drop back to the public
+        // endpoint instead of serving any previously observed value.
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        assert_eq!(tool.resolve_keenable_api_key().unwrap(), None);
+    }
+
+    #[test]
+    fn test_keenable_api_key_override_follows_the_loader_override_state() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.web_search.keenable_api_key = Some("stored-key".to_string());
+        // Not overridden: the on-disk field stays the source of truth and the
+        // in-memory value is not carried into the tool.
+        assert_eq!(WebSearchTool::keenable_api_key_override(&config), None);
+
+        config
+            .env_overridden_paths
+            .insert(KEENABLE_API_KEY_PROP_PATH.to_string());
+        assert_eq!(
+            WebSearchTool::keenable_api_key_override(&config).as_deref(),
+            Some("stored-key")
+        );
+
+        // A blank override is still an override, whichever way the loader
+        // represents an empty value.
+        config.web_search.keenable_api_key = Some(String::new());
+        assert_eq!(
+            WebSearchTool::keenable_api_key_override(&config).as_deref(),
+            Some("")
+        );
+        config.web_search.keenable_api_key = None;
+        assert_eq!(
+            WebSearchTool::keenable_api_key_override(&config).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn test_resolve_keenable_api_key_override_ignores_disk_rotation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"disk-key\"\n",
+        )
+        .unwrap();
+        let tool = keenable_tool(config_path.clone(), false)
+            .with_keenable_api_key_override(Some("env-key".to_string()));
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("env-key")
+        );
+
+        // Env vars do not rotate on disk: a later edit or removal of the
+        // stored key changes nothing while the override is active.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("env-key")
+        );
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        assert_eq!(
+            tool.resolve_keenable_api_key().unwrap().as_deref(),
+            Some("env-key")
+        );
+    }
+
+    /// Mount a catch-all 200 on `server`, run one search through the
+    /// production client, and hand back the single request it recorded.
+    async fn keenable_single_request(
+        tool: &WebSearchTool,
+        server: &wiremock::MockServer,
+    ) -> wiremock::Request {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "what is rust",
+                "results": []
+            })))
+            .mount(server)
+            .await;
+
+        let client = tool
+            .keenable_client()
+            .expect("client builder should succeed without a proxy");
+        tool.search_keenable_with_client(&client, &server.uri(), "what is rust")
+            .await
+            .expect("request should succeed against the mock");
+
+        let mut recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(recorded.len(), 1, "expected exactly one request");
+        recorded.remove(0)
+    }
+
+    #[tokio::test]
+    async fn test_keenable_env_only_key_selects_the_keyed_endpoint() {
+        let server = wiremock::MockServer::start().await;
+
+        // Nothing on disk; the key exists only as an env override.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = keenable_tool(config_path, false)
+            .with_keenable_api_key_override(Some("env-only-key".to_string()));
+
+        let request = keenable_single_request(&tool, &server).await;
+        assert_eq!(request.url.path(), "/v1/search");
+        assert_eq!(
+            request
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("env-only-key"),
+            "an env-only key must not fall through to the public endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_keenable_env_override_takes_precedence_over_the_stored_key() {
+        let server = wiremock::MockServer::start().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"disk-key\"\n",
+        )
+        .unwrap();
+        let tool = keenable_tool(config_path, false)
+            .with_keenable_api_key_override(Some("env-key".to_string()));
+
+        let request = keenable_single_request(&tool, &server).await;
+        assert_eq!(request.url.path(), "/v1/search");
+        assert_eq!(
+            request
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("env-key"),
+            "the env override must win over the key stored on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_keenable_blank_env_override_does_not_send_the_stored_key() {
+        let server = wiremock::MockServer::start().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"disk-key\"\n",
+        )
+        .unwrap();
+        let tool =
+            keenable_tool(config_path, false).with_keenable_api_key_override(Some(String::new()));
+
+        let request = keenable_single_request(&tool, &server).await;
+        assert_eq!(
+            request.url.path(),
+            "/v1/search/public",
+            "a blank override means keyless search, not the stored key"
+        );
+        assert!(
+            !request.headers.contains_key("x-api-key"),
+            "a blank override must suppress the stored key entirely"
+        );
+    }
+
+    #[test]
+    fn test_parse_keenable_results_empty() {
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"query": "test", "results": []});
+        let result = tool.parse_keenable_results(&json, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_keenable_results_with_data() {
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "query": "test",
+            "results": [
+                {
+                    "title": "Keenable Example",
+                    "url": "https://example.com/keenable",
+                    "description": "",
+                    "snippet": "Page text returned as the snippet",
+                    "acquired_at": "2025-01-15T00:00:00Z"
+                }
+            ]
+        });
+        let result = tool.parse_keenable_results(&json, "test").unwrap();
+        assert!(result.contains("Keenable Example"));
+        assert!(result.contains("https://example.com/keenable"));
+        assert!(result.contains("Page text returned as the snippet"));
+        assert!(result.contains("via Keenable"));
+    }
+
+    #[test]
+    fn test_parse_keenable_results_falls_back_to_description() {
+        // `snippet` is the primary body field; an empty one must not shadow a
+        // populated `description`.
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({
+            "results": [
+                {
+                    "title": "Only Description",
+                    "url": "https://example.com/desc",
+                    "description": "Description text",
+                    "snippet": ""
+                }
+            ]
+        });
+        let result = tool.parse_keenable_results(&json, "test").unwrap();
+        assert!(result.contains("Description text"));
+    }
+
+    #[test]
+    fn test_parse_keenable_results_invalid_response() {
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"error": "unexpected"});
+        let result = tool.parse_keenable_results(&json, "test");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid Keenable API response")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_keenable_keyless_request_uses_public_endpoint_and_title_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/search/public"))
+            .and(header("x-keenable-title", "zeroclaw"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "what is rust",
+                "results": []
+            })))
+            .mount(&server)
+            .await;
+
+        // A config file with no key: the resolver must read it and still
+        // choose the public endpoint.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = keenable_tool(config_path, false);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let result = tool
+            .search_keenable_with_client(&client, &server.uri(), "what is rust")
+            .await
+            .expect("request should succeed against the mock");
+        assert!(
+            result.contains("No results found"),
+            "parser should report empty results: {result}"
+        );
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "expected exactly one POST /v1/search/public"
+        );
+        assert!(
+            !recorded[0].headers.contains_key("x-api-key"),
+            "keyless request must not carry an X-API-Key header"
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&recorded[0].body).expect("body should be JSON");
+        assert!(body.get("api_key").is_none());
+        assert_eq!(body["query"], "what is rust");
+        assert_eq!(body["max_results"], 5);
+        assert_eq!(body["snippet_max_length"], MAX_RESULT_CONTENT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn test_keenable_keyed_request_uses_api_key_header_and_keyed_endpoint() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .and(header("x-api-key", "keenable-test-key"))
+            .and(header("x-keenable-title", "zeroclaw"))
+            .and(header("content-type", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "what is rust",
+                "results": []
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"keenable-test-key\"\n",
+        )
+        .unwrap();
+        let tool = keenable_tool(config_path, false);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let result = tool
+            .search_keenable_with_client(&client, &server.uri(), "what is rust")
+            .await
+            .expect("request should succeed against the mock");
+        assert!(result.contains("No results found"));
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(recorded.len(), 1, "expected exactly one POST /v1/search");
+
+        // Auth must NOT leak into the body — the header is the only auth channel.
+        let body: serde_json::Value =
+            serde_json::from_slice(&recorded[0].body).expect("body should be JSON");
+        assert!(body.get("api_key").is_none());
+        assert!(body.get("apiKey").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_keenable_rate_limit_surfaces_as_unavailable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // The public endpoint's per-IP limit answers 429 with a Retry-After
+        // header and a JSON body; the tool must classify it, not parse it.
+        Mock::given(method("POST"))
+            .and(path("/v1/search/public"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "3")
+                    .set_body_json(serde_json::json!({
+                        "error": "Rate limit exceeded",
+                        "message": "Too many requests",
+                        "retryAfter": 3
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let err = tool
+            .search_keenable_with_client(&client, &server.uri(), "what is rust")
+            .await
+            .expect_err("429 must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains("keenable search failed"), "{msg}");
+        assert!(msg.contains("search_status=unavailable"), "{msg}");
+        assert!(msg.contains("http=429"), "{msg}");
+    }
+
+    /// A malformed `keenable_api_key` line must not surface the line itself:
+    /// not in the resolver error, not in the structured log record, and not
+    /// in what the tool executor hands back to the model.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_keenable_config_parse_failure_withholds_the_offending_line() {
+        const SECRET: &str = "kn-live-7f3a9c2e-DISTINCTIVE-5b8d1e0f";
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        // An unterminated string: the parser quotes this line in its message.
+        let contents = format!("[web_search]\nkeenable_api_key = \"{SECRET}\n");
+        std::fs::write(&config_path, &contents).unwrap();
+
+        // The premise the test guards against: the parser text carries the
+        // credential, and the derived line number points at it.
+        let parse_err = toml::from_str::<zeroclaw_config::schema::Config>(&contents)
+            .expect_err("an unterminated string must not parse");
+        assert!(
+            parse_err.to_string().contains(SECRET),
+            "premise: the parser message quotes the source line"
+        );
+        let line = toml_error_line(&contents, &parse_err);
+        assert_eq!(line, Some(2));
+
+        let attrs = keenable_config_parse_attrs(&config_path, line).to_string();
+        assert!(!attrs.contains(SECRET), "log attributes leak: {attrs}");
+        assert!(attrs.contains(KEENABLE_CONFIG_PARSE_ERROR_CODE), "{attrs}");
+        assert!(attrs.contains("\"line\":2"), "{attrs}");
+
+        let tool = keenable_tool(config_path, false);
+        let err = tool
+            .resolve_keenable_api_key()
+            .expect_err("a broken config must not degrade to keyless search");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(SECRET), "resolver error leaks: {msg}");
+        assert!(msg.contains(KEENABLE_CONFIG_PARSE_ERROR_CODE), "{msg}");
+        assert!(msg.contains("line=2"), "{msg}");
+
+        // The record exactly as the log pipeline serializes it.
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(event) = rx.recv().await
+                    && event.get("message").and_then(|value| value.as_str())
+                        == Some("web_search: failed to parse config for Keenable API key")
+                {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("expected the parse-failure log record before timeout");
+        let serialized = event.to_string();
+        assert!(
+            !serialized.contains(SECRET),
+            "log record leaks: {serialized}"
+        );
+        assert_eq!(
+            event["attributes"]["error_code"],
+            KEENABLE_CONFIG_PARSE_ERROR_CODE
+        );
+        assert_eq!(event["attributes"]["line"], 2);
+        assert!(event["attributes"].get("error").is_none(), "{serialized}");
+
+        // End to end through the executor entry point, with no network call.
+        let err = tool
+            .execute(serde_json::json!({"query": "what is rust"}))
+            .await
+            .expect_err("execute must surface the parse failure, not search keyless");
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(SECRET), "tool error leaks: {msg}");
+        assert!(msg.contains(KEENABLE_CONFIG_PARSE_ERROR_CODE), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_keenable_keyed_request_does_not_follow_a_cross_origin_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let origin = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+
+        // The configured origin answers with a redirect to a different origin.
+        // Following it would replay the POST, `X-API-Key` included, there.
+        Mock::given(method("POST"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/v1/search", elsewhere.uri()).as_str(),
+            ))
+            .mount(&origin)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "what is rust",
+                "results": []
+            })))
+            .mount(&elsewhere)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkeenable_api_key = \"keenable-test-key\"\n",
+        )
+        .unwrap();
+        let tool = keenable_tool(config_path, false);
+        let client = tool
+            .keenable_client()
+            .expect("client builder should succeed without a proxy");
+
+        let err = tool
+            .search_keenable_with_client(&client, &origin.uri(), "what is rust")
+            .await
+            .expect_err("a redirect must surface as a failure, not be followed");
+        let msg = err.to_string();
+        assert!(msg.contains("keenable search failed"), "{msg}");
+        assert!(msg.contains("http=307"), "{msg}");
+
+        let first = origin.received_requests().await.unwrap();
+        assert_eq!(first.len(), 1, "the configured origin sees one request");
+        assert!(first[0].headers.contains_key("x-api-key"));
+        let second = elsewhere.received_requests().await.unwrap();
+        assert!(
+            second.is_empty(),
+            "the redirect target must never receive the request or the key: {second:?}"
+        );
+    }
+
+    /// An HTTP 200 whose chunked body never ends must be rejected once it
+    /// crosses the cap, and the client must stop reading at that point rather
+    /// than buffer to completion. The server here keeps the stream open and
+    /// keeps writing until the client closes the connection; if the client
+    /// only stopped consuming, the server's writes would stall and the
+    /// timeout below would fail the test.
+    #[tokio::test]
+    async fn test_keenable_oversized_chunked_response_is_rejected_before_decoding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CHUNK_BYTES: usize = 64 * 1024;
+        // Far more than the cap: only an early close by the client stops it.
+        let total_chunks = KEENABLE_MAX_RESPONSE_BYTES / CHUNK_BYTES * 8;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut head = Vec::new();
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.expect("read request head");
+                assert!(read > 0, "client closed before finishing the request");
+                head.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("write response head");
+
+            // A JSON document that never ends: an open results array whose
+            // first snippet the filler chunks keep extending.
+            let prefix = b"{\"results\":[{\"snippet\":\"";
+            let mut opening = format!("{:x}\r\n", prefix.len()).into_bytes();
+            opening.extend_from_slice(prefix);
+            opening.extend_from_slice(b"\r\n");
+            stream
+                .write_all(&opening)
+                .await
+                .expect("write opening chunk");
+
+            let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
+            frame.extend_from_slice(&vec![b'a'; CHUNK_BYTES]);
+            frame.extend_from_slice(b"\r\n");
+            let mut sent = 0_usize;
+            let mut client_closed = false;
+            for _ in 0..total_chunks {
+                if stream.write_all(&frame).await.is_err() {
+                    client_closed = true;
+                    break;
+                }
+                sent += CHUNK_BYTES;
+            }
+            (sent, client_closed)
+        });
+
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let client = tool
+            .keenable_client()
+            .expect("client builder should succeed without a proxy");
+        let err = tool
+            .search_keenable_with_client(&client, &format!("http://{addr}"), "what is rust")
+            .await
+            .expect_err("a body past the cap must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("keenable search failed"), "{msg}");
+        assert!(
+            msg.contains(&KEENABLE_MAX_RESPONSE_BYTES.to_string()),
+            "{msg}"
+        );
+        assert!(!msg.contains("aaaa"), "error echoes the body: {msg}");
+
+        let (sent, client_closed) = tokio::time::timeout(Duration::from_secs(20), server)
+            .await
+            .expect("the client must close the connection instead of stalling the server")
+            .expect("server task");
+        assert!(client_closed, "the client never closed the connection");
+        assert!(
+            sent < total_chunks * CHUNK_BYTES,
+            "the server wrote the whole body ({sent} bytes): the client buffered to completion"
+        );
+    }
+
     // ── Format characterization ──────────────────────────────────────────
     //
     // These pin the *exact* rendered output of every provider parser for
@@ -2758,6 +3798,28 @@ mod tests {
             "Search results for: rust (via Bocha)\n\
              1. First Title\n   https://example.com/one\n   Example Site · 2025-01-15\n   AI summary\n\
              2. Second Title\n   https://example.org/two\n   raw only"
+        );
+    }
+
+    #[test]
+    fn keenable_render_format_is_stable_under_caps() {
+        let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
+        let json = serde_json::json!({"query": "rust", "results": [
+            {
+                "title": "First Title",
+                "url": "https://example.com/one",
+                "description": "",
+                "snippet": "First snippet",
+                "acquired_at": "2025-01-15T00:00:00Z"
+            },
+            {"title": "Second Title", "url": "https://example.org/two", "description": "Second description", "snippet": ""},
+        ]});
+        let result = tool.parse_keenable_results(&json, "rust").unwrap();
+        assert_eq!(
+            result,
+            "Search results for: rust (via Keenable)\n\
+             1. First Title\n   https://example.com/one\n   First snippet\n\
+             2. Second Title\n   https://example.org/two\n   Second description"
         );
     }
 
