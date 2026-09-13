@@ -121,6 +121,9 @@ jobs:
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
 
+      - name: Test crates.io publish ordering and preflight
+        run: python3 scripts/release/publish_crates_test.py
+
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
 

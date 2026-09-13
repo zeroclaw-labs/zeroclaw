@@ -121,8 +121,8 @@ fn release_crates(crates: &[Crate]) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Internal dependency edges that affect publish order. Dev-dependencies are
-/// excluded: cargo strips them when packaging, so a dev-only cycle is legal.
+/// The root's normal/build dependency closure. Versioned dev-dependencies also
+/// affect publishing; scripts/release/publish_order.py owns that full graph.
 fn internal_deps(krate: &Crate, workspace_names: &BTreeSet<String>) -> BTreeSet<String> {
     ["dependencies", "build-dependencies"]
         .iter()
@@ -394,7 +394,7 @@ fn publish_order_is_streamed_and_exercised_by_preflight() {
     );
 
     let order = script
-        .find("ORDER=\"$(python3 - \"$VERSION\" 3<<<\"$META\"")
+        .find("ORDER=\"$(python3 \"$REPO_ROOT/scripts/release/publish_order.py\" \"$VERSION\" <<<\"$META\"")
         .expect("publisher streams metadata into its order helper");
     let dry_run = script
         .find("if [[ $EXECUTE -eq 0 ]]")
