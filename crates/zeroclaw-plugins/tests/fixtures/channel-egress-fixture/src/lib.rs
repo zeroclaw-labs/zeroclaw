@@ -24,7 +24,7 @@ mod component {
 
     use exports::zeroclaw::plugin::channel::{
         ApprovalRequest, ApprovalResponse, ChannelCapabilities, Guest as Channel, InboundMessage,
-        SendMessage,
+        SendMessage, WebhookRejection, WebhookRequest, WebhookResponse,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     // Point-of-use config import. The channel WIT world's `configure` takes no
@@ -207,6 +207,17 @@ mod component {
 
         fn supports_free_form_ask() -> bool {
             true
+        }
+
+        // The current channel WIT contract requires these exports even when the
+        // fixture does not advertise webhook ingress. Keep them inert so this
+        // component remains focused on the outbound-egress boundary.
+        fn webhook_path() -> Option<String> {
+            None
+        }
+
+        fn parse_webhook(_request: WebhookRequest) -> Result<WebhookResponse, WebhookRejection> {
+            Err(WebhookRejection::BadRequest("unsupported".to_string()))
         }
     }
 
