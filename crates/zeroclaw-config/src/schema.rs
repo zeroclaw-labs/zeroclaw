@@ -3993,8 +3993,9 @@ impl Config {
     }
 
     /// Return the first concrete `model` string available for use as a
-    /// default: the model declared by the first entry that has one, in the
-    /// iteration order of
+    /// default: the model declared by the first entry that has one. Entries
+    /// are visited in macro slot order, then sorted alias order within each
+    /// slot, as implemented by
     /// [`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model).
     /// Returns `None` only when no model-provider entry has any model
     /// configured at all.
@@ -6730,6 +6731,7 @@ pub struct CostConfig {
     /// input_per_mtok = 15.0
     /// output_per_mtok = 75.0
     /// cached_input_per_mtok = 1.5
+    /// cache_write_per_mtok = 18.75
     ///
     /// [cost.rates.providers.tts.openai."tts-1-hd"]
     /// per_mchar = 30.0
@@ -6879,6 +6881,10 @@ impl CostRatesConfig {
                 format!("{prefix}.cached_input_per_mtok"),
                 rates.cached_input_per_mtok,
             )?;
+            validate_rate(
+                format!("{prefix}.cache_write_per_mtok"),
+                rates.cache_write_per_mtok,
+            )?;
         }
 
         let mut tts_rates: Vec<_> = self.providers.tts.iter_entries().collect();
@@ -6970,6 +6976,12 @@ pub struct ModelCostRates {
     /// providers that don't charge separately for prompt cache hits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_input_per_mtok: Option<f64>,
+    /// Cache-write tokens (USD per 1M). Optional — the premium providers
+    /// charge to write prompt data into their cache (Anthropic bills 1.25x
+    /// the input rate for the 5-minute TTL and 2x for the 1-hour TTL).
+    /// Leave unset to keep pricing cache writes at the plain input rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 /// Rates for a TTS model, in USD per 1M characters.
@@ -14382,216 +14394,252 @@ impl ChannelsConfig {
         vec![
             ChannelInfo {
                 kind: "telegram",
+                config_key: "telegram",
                 name: "Telegram",
                 desc: "connect your bot",
                 configured: !self.telegram.is_empty(),
             },
             ChannelInfo {
                 kind: "discord",
+                config_key: "discord",
                 name: "Discord",
                 desc: "connect your bot",
                 configured: !self.discord.is_empty(),
             },
             ChannelInfo {
                 kind: "slack",
+                config_key: "slack",
                 name: "Slack",
                 desc: "connect your bot",
                 configured: !self.slack.is_empty(),
             },
             ChannelInfo {
                 kind: "mattermost",
+                config_key: "mattermost",
                 name: "Mattermost",
                 desc: "connect to your bot",
                 configured: !self.mattermost.is_empty(),
             },
             ChannelInfo {
                 kind: "imessage",
+                config_key: "imessage",
                 name: "iMessage",
                 desc: "macOS only",
                 configured: !self.imessage.is_empty(),
             },
             ChannelInfo {
                 kind: "matrix",
+                config_key: "matrix",
                 name: "Matrix",
                 desc: "self-hosted chat",
                 configured: !self.matrix.is_empty(),
             },
             ChannelInfo {
                 kind: "signal",
+                config_key: "signal",
                 name: "Signal",
                 desc: "An open-source, encrypted messaging service",
                 configured: !self.signal.is_empty(),
             },
             ChannelInfo {
                 kind: "whatsapp",
+                config_key: "whatsapp",
                 name: "WhatsApp",
                 desc: "Business Cloud API",
                 configured: !self.whatsapp.is_empty(),
             },
             ChannelInfo {
                 kind: "whatsapp-web",
+                config_key: "whatsapp",
                 name: "WhatsApp Web",
                 desc: "native WhatsApp Web (wa-rs)",
                 configured: self.whatsapp.values().any(|c| c.is_web_config()),
             },
             ChannelInfo {
                 kind: "linq",
+                config_key: "linq",
                 name: "Linq",
                 desc: "iMessage/RCS/SMS via Linq API",
                 configured: !self.linq.is_empty(),
             },
             ChannelInfo {
                 kind: "nextcloud",
+                config_key: "nextcloud_talk",
                 name: "NextCloud Talk",
                 desc: "NextCloud Talk platform",
                 configured: !self.nextcloud_talk.is_empty(),
             },
             ChannelInfo {
                 kind: "email",
+                config_key: "email",
                 name: "Email",
                 desc: "Email over IMAP/SMTP",
                 configured: !self.email.is_empty(),
             },
             ChannelInfo {
                 kind: "gmail-push",
+                config_key: "gmail_push",
                 name: "Gmail Push",
                 desc: "Gmail Pub/Sub push notifications",
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
                 kind: "twitch",
+                config_key: "twitch",
                 name: "Twitch",
                 desc: "Twitch chat (IRC)",
                 configured: !self.twitch.is_empty(),
             },
             ChannelInfo {
                 kind: "irc",
+                config_key: "irc",
                 name: "IRC",
                 desc: "IRC over TLS",
                 configured: !self.irc.is_empty(),
             },
             ChannelInfo {
                 kind: "lark",
+                config_key: "lark",
                 name: "Lark",
                 desc: "Lark Bot",
                 configured: !self.lark.is_empty(),
             },
             ChannelInfo {
                 kind: "dingtalk",
+                config_key: "dingtalk",
                 name: "DingTalk",
                 desc: "DingTalk Stream Mode",
                 configured: !self.dingtalk.is_empty(),
             },
             ChannelInfo {
                 kind: "wecom",
+                config_key: "wecom",
                 name: "WeCom",
                 desc: "WeCom Bot Webhook",
                 configured: !self.wecom.is_empty(),
             },
             ChannelInfo {
                 kind: "wecom-ws",
+                config_key: "wecom_ws",
                 name: "WeCom WebSocket",
                 desc: "WeCom AI Bot long connection",
                 configured: !self.wecom_ws.is_empty(),
             },
             ChannelInfo {
                 kind: "wechat",
+                config_key: "wechat",
                 name: "WeChat",
                 desc: "WeChat iLink Bot",
                 configured: !self.wechat.is_empty(),
             },
             ChannelInfo {
                 kind: "qq",
+                config_key: "qq",
                 name: "QQ Official",
                 desc: "Tencent QQ Bot",
                 configured: !self.qq.is_empty(),
             },
             ChannelInfo {
                 kind: "nostr",
+                config_key: "nostr",
                 name: "Nostr",
                 desc: "Nostr DMs",
                 configured: !self.nostr.is_empty(),
             },
             ChannelInfo {
                 kind: "clawdtalk",
+                config_key: "clawdtalk",
                 name: "ClawdTalk",
                 desc: "ClawdTalk Channel",
                 configured: !self.clawdtalk.is_empty(),
             },
             ChannelInfo {
                 kind: "reddit",
+                config_key: "reddit",
                 name: "Reddit",
                 desc: "Reddit bot (OAuth2)",
                 configured: !self.reddit.is_empty(),
             },
             ChannelInfo {
                 kind: "bluesky",
+                config_key: "bluesky",
                 name: "Bluesky",
                 desc: "AT Protocol",
                 configured: !self.bluesky.is_empty(),
             },
             ChannelInfo {
                 kind: "git",
+                config_key: "git",
                 name: "Git",
                 desc: "Git forge (GitHub, Gitea, Forgejo): issues, PRs & events",
                 configured: !self.git.is_empty(),
             },
             ChannelInfo {
                 kind: "twitter",
+                config_key: "twitter",
                 name: "X/Twitter",
                 desc: "X/Twitter Bot via API v2",
                 configured: !self.twitter.is_empty(),
             },
             ChannelInfo {
                 kind: "mochat",
+                config_key: "mochat",
                 name: "Mochat",
                 desc: "Mochat Customer Service",
                 configured: !self.mochat.is_empty(),
             },
             ChannelInfo {
                 kind: "line",
+                config_key: "line",
                 name: "LINE",
                 desc: "connect your LINE bot",
                 configured: !self.line.is_empty(),
             },
             ChannelInfo {
                 kind: "voice-call",
+                config_key: "voice_call",
                 name: "Voice Call",
                 desc: "outbound voice call channel",
                 configured: !self.voice_call.is_empty(),
             },
             ChannelInfo {
                 kind: "voice-wake",
+                config_key: "voice_wake",
                 name: "VoiceWake",
                 desc: "voice wake word detection",
                 configured: !self.voice_wake.is_empty(),
             },
             ChannelInfo {
                 kind: "mqtt",
+                config_key: "mqtt",
                 name: "MQTT",
                 desc: "MQTT SOP Listener",
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
                 kind: "amqp",
+                config_key: "amqp",
                 name: "AMQP",
                 desc: "AMQP topic consumer",
                 configured: !self.amqp.is_empty(),
             },
             ChannelInfo {
                 kind: "filesystem",
+                config_key: "filesystem",
                 name: "Filesystem",
                 desc: "filesystem change SOP listener",
                 configured: !self.filesystem.is_empty(),
             },
             ChannelInfo {
                 kind: "webhook",
+                config_key: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
             ChannelInfo {
                 kind: "plugin",
+                config_key: "plugin",
                 name: "Plugin",
                 desc: "installed WASM channel plugin",
                 configured: !self.plugin.is_empty(),
@@ -31502,6 +31550,28 @@ model = "primary-model"
         );
         // resolve_default_model returns the first non-empty model across all model_providers.
         assert!(config.resolve_default_model().is_some());
+
+        // Two aliases in one family: the pick is deterministic (slot order,
+        // then alias order), not HashMap iteration order.
+        config.providers.models.openrouter.insert(
+            "beta".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("beta-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openrouter.insert(
+            "aaa".to_string(),
+            OpenRouterModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("aaa-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(config.resolve_default_model().as_deref(), Some("aaa-model"),);
     }
 
     #[test]
@@ -33884,6 +33954,7 @@ group_policy = "disabled"
             ("output_per_mtok", f64::NAN),
             ("cached_input_per_mtok", f64::INFINITY),
             ("input_per_mtok", f64::MAX),
+            ("cache_write_per_mtok", f64::MAX),
         ] {
             let mut rates = CostRatesConfig::default();
             rates.providers.models.openai.insert(
@@ -33892,6 +33963,7 @@ group_policy = "disabled"
                     input_per_mtok: (field == "input_per_mtok").then_some(value),
                     output_per_mtok: (field == "output_per_mtok").then_some(value),
                     cached_input_per_mtok: (field == "cached_input_per_mtok").then_some(value),
+                    cache_write_per_mtok: (field == "cache_write_per_mtok").then_some(value),
                 },
             );
             let error = validate_config_with_cost_rates(rates)
@@ -33953,6 +34025,7 @@ group_policy = "disabled"
                 input_per_mtok: Some(0.0),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.0),
+                cache_write_per_mtok: Some(0.0),
             },
         );
         rates.providers.tts.openai.insert(
@@ -33987,6 +34060,7 @@ group_policy = "disabled"
                 input_per_mtok: Some(crate::cost::MAX_SANE_USD_RATE),
                 output_per_mtok: Some(0.0),
                 cached_input_per_mtok: Some(0.0),
+                cache_write_per_mtok: Some(0.0),
             },
         );
 

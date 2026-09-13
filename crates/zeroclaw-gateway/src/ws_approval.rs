@@ -177,6 +177,7 @@ mod tests {
             tool_name: "file_write".to_string(),
             arguments_summary: "path=a.txt".to_string(),
             raw_arguments: None,
+            position: None,
         }
     }
 

@@ -4328,6 +4328,7 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             },
             FailureEvents::default(),
             anyhow::Error::new(TerminalProviderTypedError),
@@ -4394,6 +4395,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -4414,6 +4416,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -4460,6 +4463,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -4480,6 +4484,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -6638,6 +6643,7 @@ mod tests {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             false,
             Some(anyhow::Error::msg(
@@ -9059,6 +9065,7 @@ mod tests {
                         input_tokens: Some(10),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     })),
                     Err(Self::stream_error()),
                 ])

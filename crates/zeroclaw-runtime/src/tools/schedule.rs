@@ -12,16 +12,20 @@ use zeroclaw_config::schema::Config;
 /// Tool that lets the agent manage recurring and one-shot scheduled tasks.
 pub struct ScheduleTool {
     security: Arc<SecurityPolicy>,
-    config: Config,
+    config: Arc<Config>,
     runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for shell command validation.
     agent_alias: String,
 }
 
 impl ScheduleTool {
+    /// `config` is a shared snapshot: every constructor site in
+    /// `all_tools_with_runtime` wraps the same `Arc`, so building the tool
+    /// registry costs one full `Config` copy per build instead of one per
+    /// `root_config`-derived tool.
     pub fn new_with_runtime(
         security: Arc<SecurityPolicy>,
-        config: Config,
+        config: Arc<Config>,
         agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
@@ -43,7 +47,7 @@ impl ScheduleTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(security, config, agent_alias, runtime)
+        Self::new_with_runtime(security, Arc::new(config), agent_alias, runtime)
     }
 }
 
@@ -958,7 +962,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::for_agent(&config, TEST_AGENT).unwrap());
         let runtime: Arc<dyn RuntimeAdapter> =
             Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
-        let tool = ScheduleTool::new_with_runtime(security, config, TEST_AGENT, runtime);
+        let tool = ScheduleTool::new_with_runtime(security, Arc::new(config), TEST_AGENT, runtime);
 
         let result = tool
             .execute(json!({
