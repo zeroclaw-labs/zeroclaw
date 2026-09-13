@@ -907,7 +907,9 @@ impl SessionStore {
 
     /// Start the narrow admission interval in which a lifecycle request must
     /// latch instead of looking only for a registered token. The caller holds
-    /// the per-session queue permit and has already validated this generation.
+    /// the per-session queue permit and has resolved this live generation;
+    /// it may perform its final validation while the marker is held so a
+    /// concurrent lifecycle request cannot miss the admission window.
     pub(crate) fn begin_pre_registration_admission<'a>(
         &'a self,
         id: &'a str,
