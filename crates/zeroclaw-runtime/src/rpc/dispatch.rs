@@ -4022,9 +4022,10 @@ impl RpcDispatcher {
     ///
     /// Holds `config_write_lock` from the first staged entry through the
     /// swap, so no concurrent config writer can interleave with the batch.
-    /// `config/set` has no per-path write check today; if one is added, it
-    /// must run here for every entry before the first is staged, so a batch
-    /// never permits a write the caller could not make one entry at a time.
+    /// Every entry's path passes the same `selector_config_write` check a
+    /// single `config/set` applies, and all of them are checked before the
+    /// first entry is staged, so a batch never permits a write the caller
+    /// could not make one entry at a time.
     async fn handle_config_set_many(&self, params: &Value) -> RpcResult {
         let req: ConfigSetManyParams = parse_params(params)?;
         if req.sets.is_empty() {
@@ -4032,6 +4033,18 @@ impl RpcDispatcher {
                 INVALID_PARAMS,
                 "config/set-many requires at least one entry in `sets`",
             ));
+        }
+        for (index, entry) in req.sets.iter().enumerate() {
+            self.selector_config_write(Method::ConfigSetMany, &entry.prop)
+                .map_err(|e| {
+                    rpc_err(
+                        e.code,
+                        format!(
+                            "config/set-many entry {index} (`{}`) refused; nothing was applied: {}",
+                            entry.prop, e.message
+                        ),
+                    )
+                })?;
         }
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
         // Boxed for the same stack-frame reason as in `handle_config_set`.
@@ -13745,6 +13758,182 @@ mod tests {
             4242,
             "a refused commit must not install the staged snapshot"
         );
+    }
+
+    /// A roster principal bound through the real local handshake (peer
+    /// credential `uid`), over a TempDir-rooted config so a commit can save.
+    async fn authenticated_roster_dispatcher(
+        tmp: &tempfile::TempDir,
+        mut config: zeroclaw_config::schema::Config,
+        uid: u32,
+    ) -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config.save().await.expect("seed config.toml");
+        let ctx = enforcement_ctx(config);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "unix:test".into()).with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid },
+        );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("roster principal authenticates");
+        (dispatcher, rx)
+    }
+
+    /// Every entry is checked against the caller's config-path selector
+    /// before the first is staged: one refused path refuses the batch
+    /// wholesale, even when the entries before it are individually allowed.
+    #[tokio::test]
+    async fn config_set_many_refuses_wholesale_when_any_path_is_outside_the_selector() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = roster_config(4242);
+        {
+            let profile = config.permission_profiles.get_mut("reader").unwrap();
+            profile.config_write_paths = vec!["gateway.*".into()];
+            profile.grants.insert(
+                zeroclaw_api::grants::Resource::Config,
+                vec![zeroclaw_api::grants::Verb::Update],
+            );
+        }
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("create anthropic.default");
+        let port_before = config.gateway.port;
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+        let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [
+                {"prop": "gateway.port", "value": port_before + 1},
+                {"prop": "providers.models.anthropic.default.model", "value": "denied-model"},
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"],
+            json!(FORBIDDEN),
+            "a path outside the selector must refuse the batch: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("entry 1"),
+            "error must name the refused entry: {message}"
+        );
+        assert_eq!(
+            dispatcher.ctx.config.read().gateway.port,
+            port_before,
+            "the allowed entry before the refused one must not have been applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            disk_before,
+            "nothing may reach disk"
+        );
+
+        // Control: the same principal may batch the allowed path alone, so
+        // it was the selector — not the coarse Config:Update gate — that
+        // refused above.
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [{"prop": "gateway.port", "value": port_before + 1}]}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "a batch within the selector must commit: {response}"
+        );
+        assert_eq!(dispatcher.ctx.config.read().gateway.port, port_before + 1);
+    }
+
+    /// The motivating case: `save_and_swap_config` validates the auth
+    /// sections before persisting, so a `[users.<name>]` entry cannot be
+    /// authored one field at a time in either order — each single
+    /// `config/set` is refused. The same two writes in one batch commit.
+    #[tokio::test]
+    async fn config_set_many_authors_a_user_whose_fields_are_refused_one_at_a_time() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.permission_profiles.insert(
+            "admin".into(),
+            PermissionProfileConfig {
+                admin: true,
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config
+            .create_map_key("permission_profiles", "operator")
+            .expect("create permission_profiles.operator");
+        config.users.insert(
+            "root-operator".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["admin".into()],
+            },
+        );
+        let (mut dispatcher, mut rx) = authenticated_roster_dispatcher(&tmp, config, 4242).await;
+        let disk_before = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+
+        for (entry, missing) in [
+            (
+                json!({"prop": "users.bob.uid", "value": 1001}),
+                "users.bob.permission_profiles is required",
+            ),
+            (
+                json!({"prop": "users.bob.permission_profiles", "value": ["operator"]}),
+                "users.bob.uid is required",
+            ),
+        ] {
+            let response = rpc_roundtrip(&mut dispatcher, &mut rx, "config/set", entry).await;
+            let message = response["error"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a lone write must be refused: {response}"));
+            assert!(
+                message.contains(missing),
+                "refusal must name the missing co-required field: {message}"
+            );
+            assert!(
+                !dispatcher.ctx.config.read().users.contains_key("bob"),
+                "a refused single write must not install a half-authored user"
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+                disk_before,
+                "a refused single write must not reach disk"
+            );
+        }
+
+        let response = rpc_roundtrip(
+            &mut dispatcher,
+            &mut rx,
+            "config/set-many",
+            json!({"sets": [
+                {"prop": "users.bob.uid", "value": 1001},
+                {"prop": "users.bob.permission_profiles", "value": ["operator"]},
+            ]}),
+        )
+        .await;
+        assert!(
+            response.get("error").is_none(),
+            "the same two writes in one batch must commit: {response}"
+        );
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&on_disk).unwrap();
+        let bob = reparsed
+            .users
+            .get("bob")
+            .unwrap_or_else(|| panic!("users.bob must reach disk; on-disk file:\n{on_disk}"));
+        assert_eq!(bob.uid, Some(1001));
+        assert_eq!(bob.permission_profiles, vec!["operator".to_string()]);
     }
 
     #[tokio::test]
