@@ -13086,11 +13086,20 @@ mod tests {
         (dispatcher, rx)
     }
 
+    /// Calibrated stack budget for the constrained-stack regression below.
+    /// Tokio worker threads default to 2 MiB; on macOS/aarch64, debug builds
+    /// need ~1.1 MB of execution stack for a `session/new` dispatch now that
+    /// the largest dispatch branches are heap-pinned, and needed ~2.0 MB
+    /// before that. 1.5 MiB sits between the two: a new inline branch pushing
+    /// the requirement back toward the old level fails this test, while the
+    /// current shape passes with margin.
+    const CONSTRAINED_STACK_BYTES: usize = 1536 * 1024;
+
     #[test]
-    fn process_line_session_new_creates_session_on_two_megabyte_stack() {
+    fn process_line_session_new_creates_session_on_constrained_stack() {
         std::thread::Builder::new()
             .name("rpc-session-new-stack-regression".into())
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(CONSTRAINED_STACK_BYTES)
             .spawn(|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -13122,7 +13131,7 @@ mod tests {
             })
             .expect("stack regression thread should spawn")
             .join()
-            .expect("session/new should not exhaust a two-megabyte stack");
+            .expect("session/new should not exhaust the constrained stack");
     }
 
     /// `process_line`'s exhaustive `match` sizes its generated state machine
@@ -13136,7 +13145,7 @@ mod tests {
     /// bound: the intent is to catch a new multi-hundred-KB branch, not to
     /// force every incidental size change through this test.
     #[test]
-    fn process_line_future_stays_small_enough_for_a_two_megabyte_stack() {
+    fn process_line_future_stays_small_enough_for_a_constrained_stack() {
         let tmp = tempfile::TempDir::new().expect("temporary test directory");
         let config = make_acp_test_config(&tmp);
         let (mut dispatcher, _sessions, _rx) = make_acp_test_dispatcher_with_receiver(config);
@@ -13147,7 +13156,7 @@ mod tests {
             "process_line's future grew to {size} bytes; a new or changed handler is now \
              inlined into this match without Box::pin, which can overflow the 2MB Windows \
              thread stack this exists to protect (see \
-             process_line_session_new_creates_session_on_two_megabyte_stack). Box::pin the \
+             process_line_session_new_creates_session_on_constrained_stack). Box::pin the \
              large new branch the same way ConfigSet, QuickstartApply, and the other handlers \
              above are"
         );
