@@ -2193,7 +2193,7 @@ fn jpeg_frame_header(bytes: &[u8]) -> Option<JpegFrameHeader> {
             }
 
             let mut components = Vec::with_capacity(component_count);
-            for component in payload[6..components_end].chunks_exact(3) {
+            for component in payload[6..components_end].as_chunks::<3>().0 {
                 let sampling = component[1];
                 let horizontal = sampling >> 4;
                 let vertical = sampling & 0x0f;
@@ -3852,15 +3852,16 @@ mod tests {
 
     #[test]
     fn jpeg_projection_accounts_for_padded_sampling_coefficients_and_scratch() {
-        // 17x9 pixels with 4:2:0 sampling: the Y plane uses 3x2 blocks and
+        // 17x9 pixels with 4:2:0 sampling: two padded MCU columns make the Y
+        // plane use 4x2 blocks and
         // each chroma plane uses 2x1. Every coefficient is an i16 in zune-
         // jpeg's progressive/full-image path.
         let bytes = jpeg_sof_header(17, 9, &[(2, 2), (1, 1), (1, 1)]);
         let auxiliary = jpeg_auxiliary_allocation(&bytes, 17, 9)
             .expect("synthetic SOF should yield a conservative projection");
-        let coefficient_bytes = (6 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE;
+        let coefficient_bytes = (8 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE;
         let row_scratch =
-            (3 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE * JPEG_SCRATCH_ROWS_MULTIPLIER;
+            (4 + 2 + 2) * 64 * JPEG_COEFFICIENT_BYTES_PER_SAMPLE * JPEG_SCRATCH_ROWS_MULTIPLIER;
         assert_eq!(auxiliary, coefficient_bytes + row_scratch);
     }
 
