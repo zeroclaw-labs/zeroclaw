@@ -87,26 +87,27 @@ not use `git log --pretty=format:"%an"` alone — it misses `Co-Authored-By`
 contributors.
 
 ```bash
-gh api graphql -f query='
-{ repository(owner:"zeroclaw-labs", name:"zeroclaw") {
-    ref(qualifiedName:"refs/heads/master") { target { ... on Commit {
-      history(first:100) {
+gh api graphql -f oid="<full SHA from Phase 2>" -f query='
+query($oid: GitObjectID!) {
+  repository(owner:"zeroclaw-labs", name:"zeroclaw") {
+    object(oid:$oid) { ... on Commit {
+      oid
+      authors(first:100) {
         pageInfo { hasNextPage endCursor }
-        nodes { oid authors(first:10) { nodes { user { login } email } } }
-      } } } } } }'
+        nodes { name user { login } email }
+      }
+    } }
+} }'
 ```
 
-Page by adding `after:"<endCursor>"` while `hasNextPage` is true. Cross-reference
-each `oid` against the Phase 2 SHA list to stay in range, collect unique logins,
-then exclude:
+Resolve each exact SHA from Phase 2; requests may be batched. Paginate `authors` with `after:"<endCursor>"` when needed. Report unavailable commits or unresolved human logins instead of silently omitting them. Collect unique logins, then exclude:
 
 - logins ending in `[bot]`, plus `web-flow`, `dependabot`, `github-actions`,
   `blacksmith`
-- emails matching `*noreply*`
 - AI model names as author names: `Claude`, `Copilot`, `ChatGPT`, `Codex`,
   `Gemini`, and anything matching `^(gpt|claude|gemini|copilot)-`
 
-Sort case-insensitively and prefix each with `@`.
+Retain human contributors using noreply addresses. Sort case-insensitively and prefix each login with `@`.
 
 ### Phase 4 — Write the changelog
 
@@ -164,8 +165,7 @@ to `master` directly.
    trivial typo fix in docs).
 4. **Always use the GraphQL contributor path.** `git log --format="%an"` alone is
    not acceptable — it produces an incomplete contributor list.
-5. **Always apply the full filter list.** Bots, noreply addresses, and AI model
-   names must be excluded from the contributor section.
+5. **Exclude bots and AI/tool attribution.** A noreply address alone is not evidence that a contributor is a bot.
 6. **Always write to `tmp/CHANGELOG-next.md` first.** The user reviews before the
    file is committed to the repository root.
 7. **Always confirm before committing.** Show the user the exact commit message

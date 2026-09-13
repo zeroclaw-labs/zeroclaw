@@ -126,10 +126,7 @@ calling it `supported`.
 
 ### Step 4: Check the issue tracker for `planned` verdicts
 
-A slot with no module in the tree is not automatically `none`. Before marking
-`none`, check whether the competitor has an open feature request tracking it,
-which makes the cell `planned` instead. Neither project publishes a ROADMAP.md
-or project board, so the open issue tracker is the authoritative planned signal.
+A slot with no module in the tree is not automatically `none`. Before marking `none`, check for an accepted maintainer commitment or roadmap entry supporting `planned`. An open feature request alone does not establish a plan.
 
 Search at the title level and filter to genuine requests, not incidental
 mentions in bug reports:
@@ -140,13 +137,7 @@ gh search issues --repo openclaw/openclaw --state open "<slot> in:title" --json 
 gh search issues --repo NousResearch/hermes-agent --state open "<slot> in:title" --json number,title,url
 ```
 
-A raw keyword count is noise: an issue that merely mentions "bedrock" is not a
-roadmap commitment, and a bug filed against a slot proves that slot is already
-`supported` (people only file bugs against features that exist). A title like
-`Feature Request: add <slot> as a native provider` with `state: open` and no
-module in the tree is `planned`. Record the issue number and the check date in
-the TOML header so the verdict is auditable. Re-verify against the tree: if the
-feature request was since merged, the slot is `supported`, not `planned`.
+A raw keyword count is noise: an issue that merely mentions "bedrock" is not a roadmap commitment. Bug reports and merged feature requests are leads to inspect the implementing tree and wiring, not proof of `supported`. Record the supporting issue or roadmap reference and check date in the TOML header so the verdict is auditable.
 
 ### Step 5: Write the TOML
 
@@ -196,9 +187,7 @@ why, so the verdicts are auditable from the log.
 - Read the live rendered page for the row set, not the existing TOML keys.
 - Verify loose alias matches against module contents before marking `supported`;
   downgrade speech/image-only or different-product matches to `none`.
-- Before marking a slot `none`, check the competitor's open issue tracker: an
-  open feature request with no module in the tree makes the cell `planned`, not
-  `none`. A bug filed against a slot proves it is already `supported`.
+- Before marking a slot `none`, check for an accepted maintainer commitment or roadmap entry supporting `planned`. Use the tree and wiring to establish implementation status; issues alone do not prove support.
 - Keep the TOML `Sources` header current, including the `checked` date and the
   pinned per-repo commit SHA the columns were walked against.
 - Run `cargo test -p xtask --lib feature_matrix` before committing; the guard is
