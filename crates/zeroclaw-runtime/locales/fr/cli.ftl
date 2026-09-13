@@ -1094,3 +1094,4 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+tool-git-operations-error-docker-runtime-write-unsupported = Les commandes d’écriture Git ne sont pas disponibles avec l’environnement d’exécution Docker, car elles ne peuvent pas être confinées à son conteneur.

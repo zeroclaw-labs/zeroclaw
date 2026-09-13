@@ -1089,3 +1089,4 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。

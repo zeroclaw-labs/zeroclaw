@@ -62,8 +62,11 @@ tool-file-download-error-move = No se pudo mover el archivo descargado a su luga
 tool-file-download-success = Se descargaron { $written } bytes en { $dest_path } ({ $status })
 tool-file-read = Leer el contenido de un archivo con números de línea. Admite lectura parcial mediante offset y limit. Los archivos binarios e imágenes se rechazan (use la herramienta image_info para imágenes). Establezca encoding="base64" para devolver bytes en bruto codificados en base64 (para archivos binarios como .pdf/.xlsx/.docx); offset/limit se ignoran en ese modo.
 tool-file-write = Escribir contenido en un archivo del espacio de trabajo
-tool-git-operations = Realizar operaciones Git estructuradas (status, diff, log, branch, commit, add, checkout, stash). Proporciona salida JSON analizada e integra con la política de seguridad para controles de autonomía.
+tool-git-operations = Realizar operaciones Git estructuradas (status, diff, log, branch, commit, add, checkout, stash, worktree). Proporciona salida JSON analizada e integra con la política de seguridad para controles de autonomía.
 tool-git-operations-error-not-in-repo = No se encuentra en un repositorio Git en '{ $path }'. Elija una ruta dentro de un árbol de trabajo Git, pase 'path' para un subdirectorio del repositorio, o inicialice un repositorio antes de ejecutar git_operations.
+tool-git-operations-error-repository-outside-authorized-roots = No se puede acceder a ningún repositorio Git dentro de las raíces autorizadas para '{ $path }'. Elija una ruta dentro de un repositorio cubierto por la raíz permitida aplicable, o inicialice un repositorio antes de ejecutar git_operations.
+tool-git-operations-error-repository-not-authorized = Los metadatos del repositorio Git en '{ $path }' no están autorizados para esta operación. Elija un repositorio cubierto por la raíz permitida aplicable.
+tool-git-operations-error-path-not-authorized = La ruta Git '{ $path }' no está autorizada para esta operación. Elija una ruta cubierta por la raíz permitida aplicable.
 tool-git-forge-error-requires-field = { $resource }.{ $action } requiere '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requiere 'number'.
 tool-git-forge-error-issue-close-reason = issue.close 'reason' debe ser 'completed' o 'not_planned'.

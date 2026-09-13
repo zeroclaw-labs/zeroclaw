@@ -66,7 +66,7 @@ pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
 pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
-pub use zeroclaw_tools::git_operations::GitOperationsTool;
+pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
 pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
 pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
@@ -648,6 +648,26 @@ struct RuntimeShellAssembly {
     sandbox: Arc<dyn Sandbox>,
 }
 
+/// Adapts the runtime's canonical per-agent sandbox to the Git tool without
+/// making the lower-level tools crate depend on the runtime crate.
+struct RuntimeGitCommandBoundary {
+    sandbox: Arc<dyn Sandbox>,
+    runtime_kind: zeroclaw_config::schema::RuntimeKind,
+}
+
+impl GitCommandBoundary for RuntimeGitCommandBoundary {
+    fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+        if self.runtime_kind == zeroclaw_config::schema::RuntimeKind::Docker {
+            anyhow::bail!(crate::i18n::get_required_cli_string(
+                "tool-git-operations-error-docker-runtime-write-unsupported"
+            ));
+        }
+        self.sandbox
+            .wrap_command(command)
+            .map_err(anyhow::Error::from)
+    }
+}
+
 /// Pair the canonical runtime kind with one shared sandbox instance for every
 /// runtime-backed executor assembled by the production tool registry.
 fn runtime_shell_assembly(
@@ -956,9 +976,12 @@ pub fn all_tools_with_runtime(
         )),
         Arc::new(ModelSwitchTool::new(security.clone(), config.clone())),
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
-        Arc::new(GitOperationsTool::new(
+        Arc::new(GitOperationsTool::new_with_command_boundary(
             security.clone(),
-            workspace_dir.to_path_buf(),
+            Arc::new(RuntimeGitCommandBoundary {
+                sandbox: sandbox.clone(),
+                runtime_kind: root_config.runtime.kind,
+            }),
         )),
         Arc::new(PushoverTool::new(
             security.clone(),
@@ -2062,6 +2085,36 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
         SopApprovalConfig,
     };
+
+    #[test]
+    fn git_write_boundary_rejects_docker_runtime_writes() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Docker,
+        };
+        let mut command = std::process::Command::new("git");
+
+        let error = boundary.wrap_command(&mut command).unwrap_err();
+
+        assert!(
+            error.to_string() != "{tool-git-operations-error-docker-runtime-write-unsupported}",
+            "Docker runtime must reject Git writes before a write-classified Git command can spawn: {error}"
+        );
+        assert_eq!(command.get_program(), "git");
+    }
+
+    #[test]
+    fn git_write_boundary_preserves_native_none_mode() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Native,
+        };
+        let mut command = std::process::Command::new("git");
+
+        boundary.wrap_command(&mut command).unwrap();
+
+        assert_eq!(command.get_program(), "git");
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
