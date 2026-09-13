@@ -1,10 +1,10 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, BarChart2, FolderOpen, Paperclip, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
-import { ApiError, uploadChatImage } from '@/lib/api';
+import { ApiError, uploadChatFile } from '@/lib/api';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import {
@@ -339,13 +339,13 @@ export function AgentChatInner({
     }
   };
 
-  // ── Image upload (picker + drag-and-drop) ──────────────────────────────
+  // ── File upload (picker + drag-and-drop) ───────────────────────────────
   // Both gestures funnel into one helper: upload each file, then append the
-  // returned [IMAGE:<path>] marker to the draft so the user can add context
-  // before sending. The gateway sniffs the payload by magic bytes; the
-  // client-side type filter only spares an obviously wrong file the round
-  // trip. Failures surface as chat-local messages (same channel as unknown
-  // slash commands), never as sent messages.
+  // returned marker ([IMAGE:…] for provider-loadable images, [Document: …]
+  // otherwise) to the draft so the user can add context before sending. The
+  // gateway decides the kind from filename and payload bytes. Failures
+  // surface as chat-local messages (same channel as unknown slash commands),
+  // never as sent messages.
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -353,18 +353,14 @@ export function AgentChatInner({
   // overlay stable while the pointer crosses inner boundaries.
   const dragDepthRef = useRef(0);
 
-  const uploadImages = useCallback(async (files: Iterable<File>) => {
+  const uploadFiles = useCallback(async (files: Iterable<File>) => {
     const list = Array.from(files);
     if (list.length === 0) return;
     setUploading(true);
     try {
       for (const file of list) {
-        if (file.type && !file.type.startsWith('image/')) {
-          addLocalMessage(t('agent.upload_not_image').replace('{name}', file.name));
-          continue;
-        }
         try {
-          const res = await uploadChatImage(agentAlias, file);
+          const res = await uploadChatFile(agentAlias, file);
           applyInput((prev) => `${prev && !prev.endsWith(' ') ? `${prev} ` : prev}${res.marker} `);
         } catch (err) {
           const message = err instanceof ApiError
@@ -400,7 +396,7 @@ export function AgentChatInner({
     e.preventDefault();
     dragDepthRef.current = 0;
     setDragActive(false);
-    void uploadImages(e.dataTransfer.files);
+    void uploadFiles(e.dataTransfer.files);
   };
 
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -756,11 +752,10 @@ export function AgentChatInner({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
             multiple
             className="hidden"
             onChange={(e) => {
-              if (e.target.files) void uploadImages(e.target.files);
+              if (e.target.files) void uploadFiles(e.target.files);
               // Reset so picking the same file again re-fires onChange.
               e.target.value = '';
             }}
@@ -771,12 +766,12 @@ export function AgentChatInner({
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading}
             className="flex-shrink-0 w-10 px-0"
-            aria-label={t('agent.attach_image')}
-            title={t('agent.attach_image')}
+            aria-label={t('agent.attach_file')}
+            title={t('agent.attach_file')}
           >
             {uploading
               ? <Loader2 className="h-4 w-4 animate-spin" />
-              : <ImagePlus className="h-4 w-4" />}
+              : <Paperclip className="h-4 w-4" />}
           </Button>
           <textarea
             ref={inputRef}
