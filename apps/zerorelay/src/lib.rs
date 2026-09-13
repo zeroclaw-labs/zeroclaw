@@ -21,7 +21,10 @@
 //! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption.
 #![allow(clippy::disallowed_methods)]
 
-mod ws_accept;
+mod enroll_proxy;
+mod enroll_route;
+mod frontdoor;
+mod frontdoor_assets;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -96,6 +99,15 @@ const DAEMON_WRITE_STALL: Duration = Duration::from_secs(60);
 /// drains a 256-slot channel instantly; needing longer than this means the link
 /// is wedged, and the client is refused exactly as if it were gone.
 const DAEMON_HANDOFF_BUDGET: Duration = Duration::from_secs(5);
+
+/// Concurrent browser frontdoor HTTP sessions (see `Inner::frontdoor_permits`).
+///
+/// Small on purpose. Each session can hold an enrollment route open against a
+/// daemon, and enrollment is an operator-driven, one-at-a-time act - not a
+/// traffic plane. A relay under a browser flood should shed frontdoor sessions
+/// long before it degrades the relay plane, which is why this pool is both
+/// separate from and much smaller than `max_pending_handshakes`.
+const MAX_FRONTDOOR_SESSIONS: usize = 16;
 
 /// Which daemons may register a rendezvous on this relay.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +291,20 @@ pub struct RelayConfig {
     /// shared-token modes one permitted party can mint unlimited signing keys
     /// and node-ids, so the registry needs its own aggregate bound.
     pub max_registered_nodes: usize,
+    /// Serve the browser enrollment frontdoor (page + enrollment routes) from
+    /// this relay.
+    ///
+    /// OFF by default, and a narrowing of the blind-forwarder guarantee in two
+    /// distinct ways. A relay that serves enrollment code is a TRUSTED CODE
+    /// ORIGIN for those browsers, and - because a browser cannot speak the
+    /// daemon's TLS enrollment protocol - this relay also becomes a PRINCIPAL in
+    /// their enrollment: it performs the exchange itself and sees the pairing
+    /// code and the issued certificate. It does not see the private key, which
+    /// the browser generates and keeps.
+    ///
+    /// zerocode/native enrollment is relay-blind regardless of this knob, and
+    /// the RPC plane is unaffected.
+    pub frontdoor_enabled: bool,
 }
 
 impl RelayConfig {
@@ -311,6 +337,7 @@ impl Default for RelayConfig {
             max_pending_handshakes: 256,
             handshake_timeout: Duration::from_secs(10),
             max_registered_nodes: 1024,
+            frontdoor_enabled: false,
         }
     }
 }
@@ -489,6 +516,17 @@ struct Inner {
     /// Pre-admission handshake permits (see `RelayConfig::max_pending_handshakes`).
     handshake_permits: Arc<tokio::sync::Semaphore>,
     handshake_timeout: Duration,
+    /// Serve the browser frontdoor on plain HTTP hits (opt-in; see
+    /// [`RelayConfig::frontdoor_enabled`]).
+    frontdoor_enabled: bool,
+    /// Concurrent frontdoor HTTP sessions.
+    ///
+    /// Deliberately a SEPARATE pool from `handshake_permits`. A frontdoor
+    /// session performs a whole enrollment exchange, which is far longer than a
+    /// handshake, so charging it to the pre-admission pool would let browser
+    /// traffic shed the daemons and clients that pool exists to protect. This
+    /// bounds the frontdoor on its own instead.
+    frontdoor_permits: Arc<tokio::sync::Semaphore>,
     max_registered_nodes: usize,
     daemons: Mutex<HashMap<String, DaemonHandle>>,
     next_conn: AtomicU64,
@@ -573,6 +611,8 @@ impl RelayServer {
                     cfg.max_pending_handshakes.max(1),
                 )),
                 handshake_timeout: cfg.handshake_timeout,
+                frontdoor_enabled: cfg.frontdoor_enabled,
+                frontdoor_permits: Arc::new(tokio::sync::Semaphore::new(MAX_FRONTDOOR_SESSIONS)),
                 max_registered_nodes: cfg.max_registered_nodes.max(1),
                 daemons: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
@@ -665,15 +705,40 @@ impl RelayServer {
                     } else {
                         None
                     };
-                    match ws_accept::accept_websocket(accepted).await {
-                        Ok(ws_accept::Accepted::WebSocket(w)) => Some((w, cert_node_id)),
-                        Ok(ws_accept::Accepted::Rejected) | Err(_) => None,
+                    match frontdoor::accept(accepted, hs_inner.frontdoor_enabled).await {
+                        Ok(frontdoor::Accepted::WebSocket(w)) => {
+                            Some(Classified::WebSocket(w, cert_node_id))
+                        }
+                        Ok(frontdoor::Accepted::Http(session)) => {
+                            Some(Classified::Frontdoor(session))
+                        }
+                        Ok(frontdoor::Accepted::Rejected) | Err(_) => None,
                     }
                 };
-                let Ok(Some((ws, cert_node_id))) =
-                    tokio::time::timeout_at(deadline, handshake).await
+                let Ok(Some(classified)) = tokio::time::timeout_at(deadline, handshake).await
                 else {
-                    return; // shed: timed out or never became a relay WebSocket
+                    return; // shed: timed out or never became a relay connection
+                };
+                let (ws, cert_node_id) = match classified {
+                    Classified::WebSocket(ws, cert_node_id) => (ws, cert_node_id),
+                    // A frontdoor session is served OUTSIDE the handshake
+                    // deadline: that budget bounds how long a socket may take to
+                    // become a relay connection, while an enrollment exchange is
+                    // a whole multi-second conversation with a daemon. It is
+                    // bounded instead by its own session budget and its own
+                    // permit pool, and it releases the pre-admission permit so
+                    // browser traffic cannot shed daemons and clients.
+                    Classified::Frontdoor(session) => {
+                        drop(permit);
+                        let Ok(frontdoor_permit) =
+                            inner.frontdoor_permits.clone().try_acquire_owned()
+                        else {
+                            return; // at frontdoor capacity: shed this session
+                        };
+                        let _frontdoor_permit = frontdoor_permit;
+                        frontdoor::serve_http(session, inner).await;
+                        return;
+                    }
                 };
                 let mut ws = *ws;
                 let first = match tokio::time::timeout_at(deadline, next_control(&mut ws)).await {
@@ -687,6 +752,21 @@ impl RelayServer {
             });
         }
     }
+}
+
+/// What an accepted socket turned out to be, once its request head was read.
+///
+/// The two arms have different lifetimes on purpose: a WebSocket continues under
+/// the pre-admission handshake deadline, while a frontdoor session is served
+/// after it (see the accept loop).
+enum Classified<S> {
+    /// A relay WebSocket, with the outer-mTLS-derived target node-id if any.
+    WebSocket(
+        Box<WebSocketStream<frontdoor::PrefixedIo<S>>>,
+        Option<String>,
+    ),
+    /// A plain HTTP request for the opt-in browser frontdoor.
+    Frontdoor(frontdoor::HttpSession<S>),
 }
 
 /// The target node-id for a client: the outer client cert CN (outer-mTLS variant)
