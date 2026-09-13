@@ -5225,6 +5225,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     Box::new(NamedMockTool::new("forbidden")),
+                    Box::new(NamedMockTool::new("keep")),
                 ],
             ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
@@ -5233,12 +5234,16 @@ mod tests {
             .workspace_dir(tmp.path().to_path_buf())
             .build()
             .unwrap();
-        agent.narrow_to_principal_tools(Some(&["echo".into()]));
-        assert_eq!(agent.tool_names(), vec!["echo"]);
+        agent.narrow_to_principal_tools(Some(&["echo".into(), "keep".into()]));
+        assert_eq!(agent.tool_names(), vec!["echo", "keep"]);
         assert_eq!(agent.turn("first turn").await.unwrap(), "done");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(format!("{:?}", agent.history).contains("Unknown tool: forbidden"));
-        agent.narrow_to_principal_tools(Some(&[]));
+        // Keep a harmless capability so the second turn still uses the tool
+        // protocol and must reject the model's request for the removed echo.
+        // Empty-surface behavior is covered by the RPC selector matrix.
+        agent.narrow_to_principal_tools(Some(&["keep".into()]));
+        assert_eq!(agent.tool_names(), vec!["keep"]);
         assert_eq!(agent.turn("after revocation").await.unwrap(), "done");
         assert_eq!(
             calls.load(Ordering::SeqCst),
