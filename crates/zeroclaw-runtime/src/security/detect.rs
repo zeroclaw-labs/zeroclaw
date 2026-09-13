@@ -284,8 +284,9 @@ pub fn create_sandbox(
 }
 
 /// Whether `policy`'s `deny_write`/`deny_read` denials are NOT enforced by
-/// any active sandbox backend. Currently always `true` whenever any denial
-/// is configured: `create_selected_sandbox` does not forward `policy` to any
+/// any active sandbox backend. Currently always `true`: RFC 6996 made the
+/// default write guardrails always-on, so every resolved policy carries
+/// denials — and `create_selected_sandbox` does not forward `policy` to any
 /// backend constructor (Landlock/Bubblewrap/Seatbelt/Docker/Firejail), so
 /// enforcement against arbitrary shell/script child-process I/O is
 /// application-layer-only (`SecurityPolicy`, `zeroclaw-config`) regardless of

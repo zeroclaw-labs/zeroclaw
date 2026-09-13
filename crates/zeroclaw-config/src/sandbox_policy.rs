@@ -1,3 +1,4 @@
+use crate::autonomy::AutonomyLevel;
 use crate::schema::{
     DEFAULT_ALLOW_WRITE, MANDATORY_DENY_WRITE, RiskProfileConfig, SandboxPolicyConfig,
 };
@@ -31,15 +32,37 @@ pub struct EffectiveSandboxInputs {
     /// deliberate override of whatever `allow_write` held, not an operator grant this
     /// flag protects.
     pub allow_write_is_explicit: bool,
-    /// `sandbox_policy.deny_write.unwrap_or_default()` plus the
-    /// [`MANDATORY_DENY_WRITE`] guardrail list when
-    /// `mandatory_deny_write_enabled` is true.
+    /// RFC 6996: `true` when `allow_write` was compat-derived from a
+    /// NON-EMPTY legacy `allowed_roots` under effective
+    /// `workspace_only = false` (including `Full` autonomy). The merged set
+    /// ([`DEFAULT_ALLOW_WRITE`] ∪ `allowed_roots`) is then enforced as a REAL
+    /// write allowlist at the app layer — an intentional conversion of the
+    /// historical additive-only behavior. An empty/omitted legacy list derives
+    /// nothing (`false`): it must never narrow an unrestricted profile to the
+    /// default write roots, because the legacy field cannot distinguish
+    /// "omitted" from an explicit `[]`.
+    pub allow_write_compat_allowlist: bool,
+    /// `workspace_only` after autonomy resolution: always `false` at `Full`
+    /// autonomy regardless of the configured value (existing behavior,
+    /// preserved by RFC 6996). This is the single decision point both the
+    /// write-grant resolution below and the app-layer policy
+    /// (`SecurityPolicy::from_profiles`) consume, so the two surfaces cannot
+    /// disagree on what `workspace_only` means.
+    pub effective_workspace_only: bool,
+    /// Operator-supplied `deny_write` entries ONLY (`sandbox_policy
+    /// .deny_write.unwrap_or_default()`). The [`MANDATORY_DENY_WRITE`]
+    /// guardrail list is always active (RFC 6996: no all-or-nothing switch)
+    /// and is enforced separately from these absolute, exception-proof
+    /// entries — see `SecurityPolicy::is_resolved_path_allowed` and
+    /// `SandboxPolicy::from_effective` (which merges the list back for the
+    /// OS-sandbox view).
     pub deny_write: Vec<String>,
-    pub mandatory_deny_write_enabled: bool,
-    pub allowed_domains: Vec<String>,
-    pub denied_domains: Vec<String>,
-    pub allow_unix_sockets: Vec<String>,
-    pub bubblewrap_args: Vec<String>,
+    /// Per-entry exceptions to the [`MANDATORY_DENY_WRITE`] guardrail list
+    /// (`sandbox_policy.guardrail_exceptions`, default `[]`). An exception
+    /// uses the same matching rules as a guardrail entry and re-permits only
+    /// the named file or subtree; operator `deny_write` entries are never
+    /// relaxable. A non-empty list emits a visible WARN.
+    pub guardrail_exceptions: Vec<String>,
 }
 
 impl EffectiveSandboxInputs {
@@ -50,17 +73,30 @@ impl EffectiveSandboxInputs {
     ///    explicit `Some(vec![])`), else legacy `forbidden_paths`.
     /// 2. `allow_read` — `sandbox_policy.allow_read` if `Some`, else legacy
     ///    `allowed_roots`.
-    /// 3. `allow_write` — `workspace_only = true` always wins (overrides any
-    ///    `allow_write`, `Some` or `None`); otherwise `sandbox_policy.allow_write`
-    ///    if `Some` (exactly, no legacy merge — even if it happens to equal the
-    ///    old default shape); otherwise (`None`) [`DEFAULT_ALLOW_WRITE`] merged
-    ///    with legacy `allowed_roots`.
+    /// 3. `allow_write` — `sandbox_policy.allow_write` if `Some` (exactly, no
+    ///    legacy merge — even if it happens to equal the old default shape —
+    ///    and authoritative regardless of `workspace_only`, which scopes only
+    ///    the implicit grant); effective `workspace_only = true` (configured
+    ///    `workspace_only` at any autonomy below `Full`) with `None` → the
+    ///    workspace root only; otherwise (`None`) [`DEFAULT_ALLOW_WRITE`]
+    ///    merged with legacy `allowed_roots`. When that legacy list is
+    ///    NON-EMPTY the merged set is a real write allowlist
+    ///    (`allow_write_compat_allowlist`); an empty legacy list derives
+    ///    nothing and writes stay unrestricted mod `deny_write`.
     /// 4. `deny_write` — operator value (`sandbox_policy.deny_write.unwrap_or_default()`)
-    ///    plus, when `mandatory_deny_write_enabled`, any [`MANDATORY_DENY_WRITE`]
-    ///    entries missing from it.
+    ///    only. The [`MANDATORY_DENY_WRITE`] guardrail list is always active
+    ///    and enforced separately; `guardrail_exceptions` relaxes individual
+    ///    guardrail entries per-entry (RFC 6996).
     #[must_use]
     pub fn from_profile(profile: &RiskProfileConfig, workspace: &Path) -> Self {
         let sp = &profile.sandbox_policy;
+        // Single decision point for the Full-autonomy rule (RFC 6996): at
+        // `Full`, `workspace_only` is always treated as `false`, matching the
+        // pre-canonical app-layer behavior. Resolved here — before any
+        // downstream consumer reads the raw field — so the OS-sandbox resolver
+        // and the app-layer path guard cannot disagree.
+        let effective_workspace_only =
+            profile.workspace_only && profile.level != AutonomyLevel::Full;
 
         let deny_read = sp
             .deny_read
@@ -71,20 +107,35 @@ impl EffectiveSandboxInputs {
             .clone()
             .unwrap_or_else(|| profile.allowed_roots.clone());
         let allow_write_is_explicit = sp.allow_write.is_some();
-        let allow_write = resolve_allow_write(sp, profile, workspace);
+        // RFC 6996 compat conversion: only a NON-EMPTY legacy list derives a
+        // write allowlist. Empty reads as absent (the legacy field cannot
+        // distinguish omitted from an explicit `[]`).
+        let allow_write_compat_allowlist = !allow_write_is_explicit
+            && !effective_workspace_only
+            && !profile.allowed_roots.is_empty();
+        let allow_write = resolve_allow_write(sp, effective_workspace_only, profile, workspace);
         let deny_write = resolve_deny_write(sp);
+
+        if !sp.guardrail_exceptions.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "sandbox_policy: guardrail exception(s) active: default write-deny \
+                 guardrails are relaxed for the named paths only; operator deny_write \
+                 entries remain enforced"
+            );
+        }
 
         Self {
             deny_read,
             allow_read,
             allow_write,
             allow_write_is_explicit,
+            allow_write_compat_allowlist,
+            effective_workspace_only,
             deny_write,
-            mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
-            allowed_domains: sp.allowed_domains.clone(),
-            denied_domains: sp.denied_domains.clone(),
-            allow_unix_sockets: sp.allow_unix_sockets.clone(),
-            bubblewrap_args: sp.bubblewrap_args.clone(),
+            guardrail_exceptions: sp.guardrail_exceptions.clone(),
         }
     }
 
@@ -109,86 +160,64 @@ impl EffectiveSandboxInputs {
             allow_read: sp.allow_read.clone().unwrap_or_default(),
             allow_write,
             allow_write_is_explicit,
+            // No profile → no legacy compat derivation possible.
+            allow_write_compat_allowlist: false,
+            effective_workspace_only: false,
             deny_write: resolve_deny_write(sp),
-            mandatory_deny_write_enabled: sp.mandatory_deny_write_enabled,
-            allowed_domains: sp.allowed_domains.clone(),
-            denied_domains: sp.denied_domains.clone(),
-            allow_unix_sockets: sp.allow_unix_sockets.clone(),
-            bubblewrap_args: sp.bubblewrap_args.clone(),
+            guardrail_exceptions: sp.guardrail_exceptions.clone(),
         }
     }
 }
 
+/// Operator-supplied `deny_write` entries only. The [`MANDATORY_DENY_WRITE`]
+/// guardrail list is NOT merged here: guardrails are always active (RFC 6996
+/// removed the all-or-nothing switch) and are enforced at check time with
+/// their own suffix-matching rules and per-entry exceptions, so the two
+/// cannot be collapsed into one prefix-matched list.
 fn resolve_deny_write(sp: &SandboxPolicyConfig) -> Vec<String> {
-    let mut deny_write = sp.deny_write.clone().unwrap_or_default();
-    if sp.mandatory_deny_write_enabled {
-        // Deduplication is string-based (pre-resolution). An operator entry like
-        // "/home/user/.bashrc" will not prevent the default ".bashrc" entry from
-        // also being added; both resolve independently. This is intentional — semantic
-        // path equivalence checking is not performed here.
-        let missing: Vec<String> = MANDATORY_DENY_WRITE
-            .iter()
-            .filter(|e| !deny_write.iter().any(|d| d == *e))
-            .map(|e| (*e).to_string())
-            .collect();
-        deny_write.extend(missing);
-    } else {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "sandbox_policy: mandatory_deny_write_enabled=false; \
-             default write-deny guardrails (shell configs, git hooks, .env, etc.) \
-             are not enforced for this profile"
-        );
-    }
-    deny_write
+    sp.deny_write.clone().unwrap_or_default()
 }
 
-/// Resolve `allow_write` with `workspace_only` priority, presence-preserving
-/// canonical precedence, and `allowed_roots` compat fallback.
+/// Resolve `allow_write` with presence-preserving canonical precedence,
+/// `workspace_only` implicit-grant scoping, and `allowed_roots` compat fallback.
 ///
-/// - `workspace_only = true` always wins and overrides any concurrently set
-///   `allow_write` (`Some` or `None`).
 /// - `allow_write: Some(v)` wins outright — `v` exactly, no legacy merge, even
-///   when `v` happens to be shaped like the old default.
+///   when `v` happens to be shaped like the old default — and regardless of
+///   `workspace_only`. Per RFC 6996, `workspace_only` scopes only the
+///   IMPLICIT workspace grant; an explicit canonical `allow_write` (including
+///   an explicit `[]`) is authoritative for every path, workspace included.
+/// - Effective `workspace_only = true` with `allow_write: None` → the
+///   workspace root only (legacy behavior preserved).
 /// - `allow_write: None` — [`DEFAULT_ALLOW_WRITE`] merged with legacy
 ///   `allowed_roots` (dedup, defaults first). The top-level `allowed_roots`
 ///   field historically granted extra write access on top of the default
-///   workspace/temp roots, not a replacement of them.
+///   workspace/temp roots, not a replacement of them. When that legacy list
+///   is non-empty the merged set is a real write allowlist (see
+///   `EffectiveSandboxInputs::allow_write_compat_allowlist`).
 fn resolve_allow_write(
     sp: &SandboxPolicyConfig,
+    effective_workspace_only: bool,
     profile: &RiskProfileConfig,
     workspace: &Path,
 ) -> Vec<String> {
-    if profile.workspace_only {
-        if sp.allow_write.is_some() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "sandbox_policy: workspace_only=true overrides custom allow_write; \
-                 allow_write will be restricted to the workspace root"
-            );
-        }
+    if let Some(v) = &sp.allow_write {
+        return v.clone();
+    }
+
+    if effective_workspace_only {
         return vec![workspace.to_string_lossy().into_owned()];
     }
 
-    match &sp.allow_write {
-        Some(v) => v.clone(),
-        None => {
-            let mut merged: Vec<String> = DEFAULT_ALLOW_WRITE
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-            for root in &profile.allowed_roots {
-                if !merged.contains(root) {
-                    merged.push(root.clone());
-                }
-            }
-            merged
+    let mut merged: Vec<String> = DEFAULT_ALLOW_WRITE
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for root in &profile.allowed_roots {
+        if !merged.contains(root) {
+            merged.push(root.clone());
         }
     }
+    merged
 }
 
 /// Resolved OS-level sandbox policy derived from a `RiskProfileConfig`.
@@ -210,11 +239,11 @@ pub struct SandboxPolicy {
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
     pub deny_write: Vec<PathBuf>,
-    pub allowed_domains: Vec<String>,
-    pub denied_domains: Vec<String>,
-    pub allow_unix_sockets: Vec<PathBuf>,
-    pub bubblewrap_args: Vec<String>,
-    pub mandatory_deny_write_enabled: bool,
+    /// Per-entry guardrail exceptions (`guardrail_exceptions`), carried raw
+    /// (suffix-matched at check time; workspace-agnostic, so no rebase
+    /// re-resolution is needed). Empty means every
+    /// [`MANDATORY_DENY_WRITE`] entry is enforced as-is.
+    pub guardrail_exceptions: Vec<String>,
 }
 
 impl Default for SandboxPolicy {
@@ -256,16 +285,26 @@ impl SandboxPolicy {
     /// workspace rebase) do not have to re-derive precedence.
     #[must_use]
     pub fn from_effective(effective: &EffectiveSandboxInputs, workspace: &Path) -> Self {
+        // OS-sandbox view: the always-on [`MANDATORY_DENY_WRITE`] guardrails
+        // are merged into the resolved `deny_write` list (an OS backend
+        // denies by enumeration, so it needs the full set). The app-layer
+        // path guard does NOT use this merged list — it enforces operator
+        // entries and guardrails separately with RFC 6996 suffix matching and
+        // per-entry exceptions, which a flat prefix-matched list cannot
+        // express.
+        let mut deny_write = resolve_paths(&effective.deny_write, workspace);
+        for entry in MANDATORY_DENY_WRITE {
+            let resolved = resolve_path(entry, workspace);
+            if !deny_write.contains(&resolved) {
+                deny_write.push(resolved);
+            }
+        }
         Self {
             deny_read: resolve_paths(&effective.deny_read, workspace),
             allow_read: resolve_paths(&effective.allow_read, workspace),
             allow_write: resolve_paths(&effective.allow_write, workspace),
-            deny_write: resolve_paths(&effective.deny_write, workspace),
-            allowed_domains: effective.allowed_domains.clone(),
-            denied_domains: effective.denied_domains.clone(),
-            allow_unix_sockets: resolve_paths(&effective.allow_unix_sockets, workspace),
-            bubblewrap_args: effective.bubblewrap_args.clone(),
-            mandatory_deny_write_enabled: effective.mandatory_deny_write_enabled,
+            deny_write,
+            guardrail_exceptions: effective.guardrail_exceptions.clone(),
         }
     }
 }
@@ -273,8 +312,67 @@ impl SandboxPolicy {
 // ── path utilities ───────────────────────────────────────────────────────────
 
 /// Expand `~` and resolve relative paths against `workspace`.
-fn resolve_paths(paths: &[String], workspace: &Path) -> Vec<PathBuf> {
+pub(crate) fn resolve_paths(paths: &[String], workspace: &Path) -> Vec<PathBuf> {
     paths.iter().map(|p| resolve_path(p, workspace)).collect()
+}
+
+/// RFC 6996 guardrail/exception entry matching against a resolved target path.
+///
+/// Two entry shapes, mirroring the RFC's matching rules:
+///
+/// - **Anchored entries** (`~/...` or absolute): expanded through
+///   [`resolve_path`] and prefix-matched against `resolved` — the entry names
+///   one specific location, so the match is rooted there.
+/// - **Relative entries** (bare names like `.bashrc`, or `path/segment`
+///   forms like `.git/hooks/`): matched as a contiguous component run against
+///   `resolved`'s components, so the entry matches at any depth under a
+///   covered root (the caller gates on covered roots). An entry with a
+///   trailing `/` is a DIRECTORY entry: it matches the directory itself and
+///   every descendant. Without the trailing slash it is a FILE entry: it
+///   matches only when the run is the FINAL components of `resolved`.
+///
+/// No glob syntax in this slice. Nested repositories need no special case:
+/// a nested repo's own `.git/hooks/` is covered by the same run match as the
+/// top-level one.
+pub(crate) fn guardrail_entry_matches(entry: &str, resolved: &Path, workspace: &Path) -> bool {
+    let is_directory_entry = entry.ends_with('/');
+    let expanded = shellexpand::tilde(entry);
+    let anchored = expanded.starts_with('/') || expanded.starts_with('~');
+
+    if anchored {
+        let resolved_entry = resolve_path(entry, workspace);
+        return resolved.starts_with(&resolved_entry);
+    }
+
+    let entry_components: Vec<String> = entry
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .map(|c| c.trim_end_matches('/').to_string())
+        .collect();
+    if entry_components.is_empty() {
+        return false;
+    }
+
+    let target: Vec<String> = resolved
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if target.len() < entry_components.len() {
+        return false;
+    }
+
+    if !is_directory_entry {
+        // FILE entry: the run must be the final components of the target.
+        return target[target.len() - entry_components.len()..] == entry_components[..];
+    }
+
+    // DIRECTORY entry: the run may appear at any component position — the
+    // directory itself (run final) or any descendant (run followed by more).
+    (0..=target.len() - entry_components.len())
+        .any(|start| target[start..start + entry_components.len()] == entry_components[..])
 }
 
 pub(crate) fn resolve_path(p: &str, workspace: &Path) -> PathBuf {
@@ -330,11 +428,11 @@ mod tests {
     #[test]
     fn default_profile_resolves_without_panic() {
         let policy = SandboxPolicy::from_risk_profile(&RiskProfileConfig::default(), ws());
-        assert!(policy.mandatory_deny_write_enabled);
         assert!(
             !policy.deny_write.is_empty(),
-            "guardrail list must be present"
+            "guardrail list must always be present (RFC 6996: no disable switch)"
         );
+        assert!(policy.guardrail_exceptions.is_empty());
     }
 
     #[test]
@@ -453,13 +551,41 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_always_overrides_allow_write() {
+    fn explicit_allow_write_is_authoritative_over_workspace_only() {
+        // RFC 6996: workspace_only scopes only the IMPLICIT workspace grant.
+        // An explicit canonical allow_write replaces it outright — the
+        // workspace root is writable only by being named in the list.
         let mut profile = RiskProfileConfig {
             workspace_only: true,
             ..RiskProfileConfig::default()
         };
-        // Set a custom allow_write — workspace_only must still win
-        profile.sandbox_policy.allow_write = Some(vec!["/should_be_overridden".to_string()]);
+        profile.sandbox_policy.allow_write = Some(vec!["/custom".to_string()]);
+        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
+        assert_eq!(policy.allow_write, vec![PathBuf::from("/custom")]);
+    }
+
+    #[test]
+    fn explicit_empty_allow_write_wins_over_workspace_only() {
+        // Explicit [] is a real (empty) allowlist, not "absent".
+        let mut profile = RiskProfileConfig {
+            workspace_only: true,
+            ..RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec![]);
+        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
+        assert!(
+            policy.allow_write.is_empty(),
+            "explicit empty allow_write must win over workspace_only, got {:?}",
+            policy.allow_write
+        );
+    }
+
+    #[test]
+    fn workspace_only_scopes_implicit_grant_when_allow_write_omitted() {
+        let profile = RiskProfileConfig {
+            workspace_only: true,
+            ..RiskProfileConfig::default()
+        };
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert_eq!(policy.allow_write, vec![ws().to_path_buf()]);
     }
@@ -476,7 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_deny_write_merges_only_missing_entries() {
+    fn guardrails_merge_onto_operator_deny_write_deduped() {
+        // RFC 6996: the guardrail list is always active — there is no switch.
+        // The OS-sandbox view (`SandboxPolicy`) merges operator entries and
+        // the defaults into one deny list, deduplicated.
         let mut profile = RiskProfileConfig::default();
         let mut extended: Vec<String> = MANDATORY_DENY_WRITE
             .iter()
@@ -484,11 +613,13 @@ mod tests {
             .collect();
         extended.push("/extra_blocked".to_string());
         profile.sandbox_policy.deny_write = Some(extended);
-        profile.sandbox_policy.mandatory_deny_write_enabled = true;
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         for entry in MANDATORY_DENY_WRITE {
             assert!(
-                policy.deny_write.iter().any(|p| p.ends_with(entry)),
+                policy
+                    .deny_write
+                    .iter()
+                    .any(|p| p.ends_with(entry.trim_end_matches('/'))),
                 "missing guardrail: {entry}"
             );
         }
@@ -501,12 +632,15 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_deny_write_disabled_skips_guardrail_merge() {
+    fn operator_deny_write_resolves_without_guardrails_in_effective_inputs() {
+        // The app-layer view (EffectiveSandboxInputs) keeps operator entries
+        // ONLY — guardrails are enforced separately with suffix matching and
+        // per-entry exceptions, so they must not be collapsed into the
+        // prefix-matched operator list.
         let mut profile = RiskProfileConfig::default();
         profile.sandbox_policy.deny_write = Some(vec!["/only_this".to_string()]);
-        profile.sandbox_policy.mandatory_deny_write_enabled = false;
-        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
-        assert_eq!(policy.deny_write, vec![PathBuf::from("/only_this")]);
+        let effective = EffectiveSandboxInputs::from_profile(&profile, ws());
+        assert_eq!(effective.deny_write, vec!["/only_this".to_string()]);
     }
 
     #[test]
@@ -515,6 +649,83 @@ mod tests {
         profile.sandbox_policy.deny_read = Some(vec!["relative/dir".to_string()]);
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.contains(&ws().join("relative/dir")));
+    }
+
+    #[test]
+    fn guardrail_directory_entry_covers_directory_and_descendants() {
+        // RFC 6996 + closing record: a trailing-`/` entry covers the
+        // directory itself and every descendant, at any depth under covered
+        // roots (nested repos included).
+        assert!(guardrail_entry_matches(
+            ".vscode/",
+            Path::new("/w/.vscode"),
+            ws()
+        ));
+        assert!(guardrail_entry_matches(
+            ".vscode/",
+            Path::new("/w/.vscode/settings.json"),
+            ws()
+        ));
+        assert!(
+            guardrail_entry_matches(
+                ".git/hooks/",
+                Path::new("/w/sub/repo/.git/hooks/pre-commit"),
+                ws()
+            ),
+            "a nested repo's own .git/hooks must be covered by the same suffix rule"
+        );
+        // Component boundaries are exact — a longer name is not a match.
+        assert!(!guardrail_entry_matches(
+            ".vscode/",
+            Path::new("/w/.vscode-extended/settings.json"),
+            ws()
+        ));
+    }
+
+    #[test]
+    fn guardrail_file_entry_matches_final_component_only() {
+        assert!(
+            guardrail_entry_matches(".bashrc", Path::new("/w/sub/.bashrc"), ws()),
+            "bare entry matches at any depth"
+        );
+        assert!(
+            !guardrail_entry_matches(".bashrc", Path::new("/w/sub/.bashrc/inner.sh"), ws()),
+            "a file entry does not cover a directory that happens to share the name"
+        );
+        assert!(!guardrail_entry_matches(
+            ".bashrc",
+            Path::new("/w/.bashrc-backup"),
+            ws()
+        ));
+    }
+
+    #[test]
+    fn guardrail_anchored_entry_prefix_matches() {
+        let home = resolve_path("~/.bashrc", ws());
+        assert!(guardrail_entry_matches("~/.bashrc", &home, ws()));
+        assert!(
+            !guardrail_entry_matches("~/.bashrc", &ws().join(".bashrc"), ws()),
+            "the anchored home entry does not cover the workspace copy"
+        );
+    }
+
+    #[test]
+    fn guardrail_path_segment_entry_matches_relative_suffix() {
+        assert!(guardrail_entry_matches(
+            "shared/skills/",
+            Path::new("/install/shared/skills/bundle/skill.md"),
+            ws()
+        ));
+        assert!(guardrail_entry_matches(
+            "shared/skills/",
+            Path::new("/install/shared/skills"),
+            ws()
+        ));
+        assert!(!guardrail_entry_matches(
+            "shared/skills/",
+            Path::new("/install/shared/other/skills"),
+            ws()
+        ));
     }
 
     #[test]
@@ -563,8 +774,27 @@ mod tests {
         assert_eq!(old_policy.allow_write, new_policy.allow_write);
         assert_eq!(old_policy.deny_write, new_policy.deny_write);
         assert_eq!(
-            old_policy.mandatory_deny_write_enabled,
-            new_policy.mandatory_deny_write_enabled
+            old_policy.guardrail_exceptions,
+            new_policy.guardrail_exceptions
         );
+
+        // Composition case: workspace_only=true (implicit grant) is expressed
+        // old-style by the flag alone and new-style by naming the workspace in
+        // an explicit allow_write — the resolved policies must match, because
+        // an explicit canonical list is authoritative over the implicit grant.
+        let old_style_ws_only = RiskProfileConfig {
+            workspace_only: true,
+            ..RiskProfileConfig::default()
+        };
+        let mut new_style_ws_only = RiskProfileConfig {
+            workspace_only: true,
+            ..RiskProfileConfig::default()
+        };
+        new_style_ws_only.sandbox_policy.allow_write =
+            Some(vec![ws().to_string_lossy().into_owned()]);
+
+        let old_ws = SandboxPolicy::from_risk_profile(&old_style_ws_only, ws());
+        let new_ws = SandboxPolicy::from_risk_profile(&new_style_ws_only, ws());
+        assert_eq!(old_ws.allow_write, new_ws.allow_write);
     }
 }

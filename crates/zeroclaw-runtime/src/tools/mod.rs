@@ -1830,6 +1830,132 @@ mod tests {
         SopApprovalConfig,
     };
 
+    /// RFC 6996 canonical boundary coverage: every tool in the default
+    /// registry whose arguments name filesystem paths, with one DENIED and
+    /// one ALLOWED probe per boundary. `shell` is intentionally absent — it
+    /// owns its own dialect-aware command validation and must not be wrapped
+    /// in the generic POSIX `PathGuardedTool` (see `default_tools`).
+    ///
+    /// This list doubles as the CI guard: a tool added to `default_tools`
+    /// whose name is missing here fails
+    /// `default_registry_names_are_all_classified`, and a probe whose
+    /// policy-denied path stops being denied fails the coverage loop — a new
+    /// tool cannot ship without a conscious boundary classification.
+    /// Config-gated tools with their own internal canonical checks
+    /// (`file_upload`, `file_upload_bundle`, `file_download`,
+    /// `git_operations`, `image_info`) enforce the same resolver at their own
+    /// operation boundary and are covered by their per-tool tests.
+    fn boundary_probes() -> Vec<(&'static str, serde_json::Value, serde_json::Value)> {
+        vec![
+            (
+                "file_read",
+                serde_json::json!({"path": "/outside/secret.txt"}),
+                serde_json::json!({"path": "probe.txt"}),
+            ),
+            (
+                "deliver_file",
+                serde_json::json!({"path": "/outside/secret.txt"}),
+                serde_json::json!({"path": "probe.txt"}),
+            ),
+            (
+                "file_write",
+                serde_json::json!({"path": "/outside/new.txt", "content": "x"}),
+                serde_json::json!({"path": "out.txt", "content": "x"}),
+            ),
+            (
+                "file_edit",
+                serde_json::json!({"path": "/outside/edit.txt", "old_string": "a", "new_string": "b"}),
+                serde_json::json!({"path": "edit.txt", "old_string": "hello", "new_string": "world"}),
+            ),
+            (
+                "glob_search",
+                serde_json::json!({"pattern": "*.txt", "path": "/outside"}),
+                serde_json::json!({"pattern": "*.txt"}),
+            ),
+            (
+                "content_search",
+                serde_json::json!({"pattern": "x", "path": "/outside"}),
+                serde_json::json!({"pattern": "hello"}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn default_registry_path_boundaries_enforce_canonical_policy() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("probe.txt"), "hello probe").unwrap();
+        std::fs::write(tmp.path().join("edit.txt"), "hello").unwrap();
+
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            workspace_only: true,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let security = Arc::new(SecurityPolicy::from_profiles(&profile, None, tmp.path()));
+        let tools = default_tools(security);
+
+        for (name, denied_args, allowed_args) in boundary_probes() {
+            let tool = tools.iter().find(|t| t.name() == name).unwrap_or_else(|| {
+                panic!("boundary probe tool {name} missing from default registry")
+            });
+
+            // DENIED: the canonical resolver must refuse the out-of-workspace
+            // path before the tool runs.
+            let denied = tool
+                .execute(denied_args.clone())
+                .await
+                .expect("policy denial is a ToolResult, not an Err");
+            assert!(
+                !denied.success
+                    && denied
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.to_lowercase().contains("polic")),
+                "{name}: expected a policy denial for {denied_args}, got success={} error={:?}",
+                denied.success,
+                denied.error
+            );
+
+            // ALLOWED: the in-workspace probe must NOT be policy-denied (the
+            // tool may still fail for its own reasons — missing context,
+            // schema strictness — but never with a policy error).
+            let allowed = tool.execute(allowed_args.clone()).await;
+            let policy_blocked = match &allowed {
+                Ok(r) => {
+                    !r.success
+                        && r.error
+                            .as_deref()
+                            .is_some_and(|e| e.to_lowercase().contains("polic"))
+                }
+                Err(e) => e.to_string().to_lowercase().contains("polic"),
+            };
+            assert!(
+                !policy_blocked,
+                "{name}: in-workspace probe {allowed_args} must not be policy-denied, got {allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_registry_names_are_all_classified() {
+        let profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::from_profiles(&profile, None, tmp.path()));
+        let tools = default_tools(security);
+
+        let mut known: Vec<&str> = boundary_probes().iter().map(|(name, _, _)| *name).collect();
+        known.push("shell"); // own dialect-aware validation, see `default_tools`.
+        for tool in &tools {
+            assert!(
+                known.contains(&tool.name()),
+                "tool `{}` is registered in `default_tools` but has no RFC 6996 boundary \
+                 classification: either add a deny+allow probe to `boundary_probes` (and a \
+                 guard, if it names filesystem paths) or document why it is not a \
+                 filesystem boundary",
+                tool.name()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
         use zeroclaw_tools::tool_search::ToolAccessPolicy;

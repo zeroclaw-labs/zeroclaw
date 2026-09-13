@@ -342,16 +342,20 @@ pub struct SecurityPolicy {
     pub allowed_roots_write_only: Vec<PathBuf>,
     /// Paths write-side tools must refuse to write to even when they fall inside
     /// `workspace_dir`, `allowed_roots`, or `allowed_roots_write_only`. Resolved from
-    /// `RiskProfileConfig.sandbox_policy` (operator-supplied `deny_write` plus, when
-    /// `mandatory_deny_write_enabled` is true, the default guardrail list — shell
-    /// configs, git hooks, `.env`, `.mcp.json`, etc.) via
-    /// [`crate::sandbox_policy::SandboxPolicy::from_risk_profile`], the same resolver
-    /// whose output is passed to `zeroclaw-runtime::security::detect::create_sandbox`
-    /// (that call does not yet forward the resolved policy to individual OS sandbox
-    /// backends). Checked in [`Self::is_resolved_path_allowed`] before any allow-grant,
-    /// mirroring the "deny_write overrides allow_write" contract documented on
-    /// `SandboxPolicyConfig`.
+    /// the OPERATOR-supplied `sandbox_policy.deny_write` only — absolute and
+    /// exception-proof (RFC 6996). The always-on
+    /// [`crate::schema::MANDATORY_DENY_WRITE`] guardrail list is enforced
+    /// separately (suffix-matched, per-entry relaxable via `guardrail_exceptions`)
+    /// in [`Self::is_resolved_path_allowed`]; the same resolver
+    /// ([`crate::sandbox_policy::EffectiveSandboxInputs::from_profile`]) feeds both,
+    /// so the app-layer guard and the OS-sandbox view cannot diverge.
     pub deny_write: Vec<PathBuf>,
+    /// Per-entry exceptions to the [`crate::schema::MANDATORY_DENY_WRITE`]
+    /// guardrail list (`sandbox_policy.guardrail_exceptions`, default `[]`).
+    /// An exception uses the guardrail matching rules and re-permits only the
+    /// named file or subtree; sibling defaults stay denied, and operator
+    /// `deny_write` entries are never relaxable.
+    pub guardrail_exceptions: Vec<String>,
     /// Post-precedence, pre-path-resolution raw sandbox inputs this policy's
     /// `forbidden_paths`/`allowed_roots*`/`deny_write` were derived from (see
     /// [`crate::sandbox_policy::EffectiveSandboxInputs`]). Not a second policy
@@ -412,6 +416,52 @@ impl SecurityPolicy {
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name))
     }
+}
+
+/// Process-wide latch for the RFC 6996 compat-narrowing warning: one WARN
+/// per risk profile per process, so long-running daemons that rebuild
+/// policies per session do not spam the log on every delegation.
+static COMPAT_NARROWING_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// Whether `policy`'s profile was intentionally narrowed by the RFC 6996
+/// compatibility conversion — a non-empty legacy `allowed_roots` under
+/// effective `workspace_only = false` (including `Full` autonomy) now derives
+/// a real write allowlist instead of the historical additive-only,
+/// unrestricted-elsewhere behavior.
+fn is_compat_narrowed(policy: &SecurityPolicy) -> bool {
+    policy.sandbox_inputs.allow_write_compat_allowlist
+}
+
+/// Emit the one-time upgrade warning for a compat-narrowed profile. Returns
+/// whether this call was the first for the profile (i.e. the warning fired),
+/// which keeps the latch unit-testable.
+fn warn_once_compat_allowlist_narrowing(policy: &SecurityPolicy) -> bool {
+    if !is_compat_narrowed(policy) {
+        return false;
+    }
+    let profile_name = policy.risk_profile_name.clone();
+    let warned = COMPAT_NARROWING_WARNED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = warned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !guard.insert(profile_name) {
+        return false;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({"risk_profile": policy.risk_profile_name})),
+        "sandbox_policy: legacy allowed_roots now derives a WRITE ALLOWLIST (RFC 6996): \
+         writes outside the workspace, /tmp, and the listed allowed_roots are denied \
+         for this profile; previously writes were unrestricted elsewhere. To restore \
+         the old behavior, remove allowed_roots or set an explicit \
+         sandbox_policy.allow_write."
+    );
+    true
 }
 
 /// Default allowed commands for Unix platforms.
@@ -587,6 +637,10 @@ pub enum EscalationViolation {
     /// parent ⊆ child, so the child can ADD write-deny entries but
     /// never DROP them.
     DenyWriteDroppedByChild { path: PathBuf },
+    /// Child carries a default-guardrail exception the parent does not
+    /// share. An exception re-permits writes to a path the parent's
+    /// guardrails deny, so an unshared exception is itself an escalation.
+    GuardrailExceptionNotInParent { entry: String },
     /// Child raises `shell_env_passthrough` to leak env vars the
     /// parent declined to forward.
     ShellEnvPassthroughExpanded { variable: String },
@@ -656,6 +710,10 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent drops deny_write entry {path:?} that the parent enforces"
             ),
+            Self::GuardrailExceptionNotInParent { entry } => write!(
+                f,
+                "subagent guardrail exception {entry:?} is not shared by the parent — it would re-permit a write the parent's guardrails deny"
+            ),
             Self::ShellEnvPassthroughExpanded { variable } => write!(
                 f,
                 "subagent shell_env_passthrough entry {variable:?} is not present on the parent's list"
@@ -709,6 +767,7 @@ impl Default for SecurityPolicy {
             allowed_roots_read_only: Vec::new(),
             allowed_roots_write_only: Vec::new(),
             deny_write: Vec::new(),
+            guardrail_exceptions: Vec::new(),
             sandbox_inputs: crate::sandbox_policy::EffectiveSandboxInputs {
                 deny_read: default_forbidden_paths(),
                 allow_read: Vec::new(),
@@ -717,12 +776,10 @@ impl Default for SecurityPolicy {
                     .map(|s| (*s).to_string())
                     .collect(),
                 allow_write_is_explicit: false,
+                allow_write_compat_allowlist: false,
+                effective_workspace_only: true,
                 deny_write: Vec::new(),
-                mandatory_deny_write_enabled: true,
-                allowed_domains: Vec::new(),
-                denied_domains: Vec::new(),
-                allow_unix_sockets: Vec::new(),
-                bubblewrap_args: Vec::new(),
+                guardrail_exceptions: Vec::new(),
             },
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
@@ -933,12 +990,14 @@ struct SandboxDerivedTiers {
 /// intersection; `allowed_roots_write_only` is `allow_write` minus the
 /// intersection, minus the workspace root itself, minus the resolved
 /// [`crate::schema::DEFAULT_ALLOW_WRITE`] roots — but ONLY when `allow_write`
-/// arrived via the omitted-field fallback (`effective.allow_write_is_explicit
-/// == false`). The schema default write roots exist to satisfy OS-sandbox
-/// bind-mount needs when the operator never touched `allow_write`, not as an
-/// app-layer grant (see `SandboxPolicyConfig` docs) — but an operator who
-/// explicitly writes `sandbox_policy.allow_write = ["/tmp"]` must get that
-/// grant for real, even though it is shaped identically to the default. See
+/// carries no app-layer authority (`effective.allow_write_is_explicit ==
+/// false && effective.allow_write_compat_allowlist == false`). The schema
+/// default write roots exist to satisfy OS-sandbox bind-mount needs when the
+/// operator never touched `allow_write`, not as an app-layer grant (see
+/// `SandboxPolicyConfig` docs) — but an operator who explicitly writes
+/// `sandbox_policy.allow_write = ["/tmp"]`, or a profile whose legacy
+/// `allowed_roots` compat-derives a real allowlist (RFC 6996), must get those
+/// grants for real, even when shaped identically to the defaults. See
 /// `explicit_tmp_allow_write_is_honored_by_app_path_guard`.
 fn sandbox_derived_tiers(
     effective: &crate::sandbox_policy::EffectiveSandboxInputs,
@@ -960,7 +1019,16 @@ fn sandbox_derived_tiers(
         .cloned()
         .collect();
 
-    let mut excluded_from_write_only: Vec<PathBuf> = if effective.allow_write_is_explicit {
+    // The write-only tier excludes the implicit-coverage roots (defaults +
+    // workspace) only when NO write allowlist is authoritative — the implicit
+    // workspace blanket grant in `is_resolved_path_allowed` covers them
+    // instead. An EXPLICIT `allow_write` or a compat-derived allowlist
+    // (RFC 6996) withdraws that blanket, so every listed root — workspace and
+    // `/tmp` included — is then the only thing keeping those paths writable
+    // and must survive into a real tier.
+    let write_boundary_authoritative =
+        effective.allow_write_is_explicit || effective.allow_write_compat_allowlist;
+    let mut excluded_from_write_only: Vec<PathBuf> = if write_boundary_authoritative {
         Vec::new()
     } else {
         crate::schema::DEFAULT_ALLOW_WRITE
@@ -968,13 +1036,7 @@ fn sandbox_derived_tiers(
             .map(|s| crate::sandbox_policy::resolve_path(s, workspace_dir))
             .collect()
     };
-    // The workspace root is dropped from the write-only tier only when the
-    // workspace carries its own implicit write grant — i.e. when `allow_write`
-    // was omitted, so `is_resolved_path_allowed` still grants the workspace
-    // blanket-style. Under an EXPLICIT `allow_write` that blanket grant is
-    // withdrawn, so a workspace entry in the explicit list is the only thing
-    // keeping the workspace writable and must survive into a real tier.
-    if !effective.allow_write_is_explicit {
+    if !write_boundary_authoritative {
         excluded_from_write_only.push(workspace_dir.to_path_buf());
     }
 
@@ -989,7 +1051,12 @@ fn sandbox_derived_tiers(
         allowed_roots,
         allowed_roots_read_only,
         allowed_roots_write_only,
-        deny_write: resolved.deny_write,
+        // Operator entries ONLY. `SandboxPolicy::from_effective` (used above
+        // for the allow sets) merges the MANDATORY_DENY_WRITE guardrails into
+        // its `deny_write` for the OS-sandbox view; the app-layer guard
+        // instead enforces guardrails separately with suffix matching and
+        // per-entry exceptions, so it must not consume that merged list.
+        deny_write: crate::sandbox_policy::resolve_paths(&effective.deny_write, workspace_dir),
     }
 }
 
@@ -3314,22 +3381,92 @@ impl SecurityPolicy {
         None
     }
 
+    /// Whether `resolved` sits under a root the policy grants writes to:
+    /// the workspace, any write-capable tier root, or — when write access is
+    /// unrestricted (`workspace_only = false`, no explicit and no
+    /// compat-derived allowlist) — everywhere (RFC 6996 closing record:
+    /// "when write access is unrestricted, default write guardrails apply
+    /// everywhere"). Guardrails follow the write grant they protect.
+    fn under_writable_root(&self, resolved: &Path) -> bool {
+        if !self.workspace_only
+            && !self.sandbox_inputs.allow_write_is_explicit
+            && !self.sandbox_inputs.allow_write_compat_allowlist
+        {
+            return true;
+        }
+        let workspace_root = canonicalize_best_effort(&self.workspace_dir);
+        resolved.starts_with(&workspace_root)
+            || self
+                .allowed_roots
+                .iter()
+                .chain(self.allowed_roots_write_only.iter())
+                .any(|root| resolved.starts_with(canonicalize_best_effort(root)))
+    }
+
+    /// RFC 6996 default write-guardrail evaluation for `resolved`. Returns
+    /// `true` when an always-on [`crate::schema::MANDATORY_DENY_WRITE`]
+    /// entry covers the target and no per-entry exception re-permits it.
+    /// Operator `deny_write` entries are checked separately (before this,
+    /// exception-proof). Anchored entries (`~/…`, absolute) carry their own
+    /// location and apply wherever they land; relative entries are gated on
+    /// [`Self::under_writable_root`].
+    fn write_guardrail_denies(&self, resolved: &Path) -> bool {
+        use crate::sandbox_policy::guardrail_entry_matches;
+
+        // A matching exception lifts the DEFAULT guardrail deny effect for
+        // this specific path only: siblings stay denied (the exception entry
+        // must name the exact file or subtree to re-permit).
+        if self
+            .guardrail_exceptions
+            .iter()
+            .any(|e| guardrail_entry_matches(e, resolved, &self.workspace_dir))
+        {
+            return false;
+        }
+
+        let gated_off_covered_roots = !self.under_writable_root(resolved);
+        for entry in crate::schema::MANDATORY_DENY_WRITE {
+            let expanded = shellexpand::tilde(entry);
+            let anchored = expanded.starts_with('/') || expanded.starts_with('~');
+            if gated_off_covered_roots && !anchored {
+                continue;
+            }
+            if guardrail_entry_matches(entry, resolved, &self.workspace_dir) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
         if is_null_device(resolved) {
             return true;
         }
 
-        // `deny_write` guardrails (shell configs, git hooks, `.env`, `.mcp.json`, plus
-        // any operator-supplied `sandbox_policy.deny_write` entries) override every
-        // other write grant, including the workspace root and explicit allowed roots —
-        // see `SandboxPolicyConfig` docs ("deny_write overrides allow_write"). Checked
-        // first so a guardrail path stays write-protected even inside an otherwise
-        // writable workspace or allowed root.
+        // Operator-supplied `deny_write` entries are ABSOLUTE and
+        // exception-proof (RFC 6996): anchored prefix match, overrides every
+        // other write grant including the workspace root and explicit allowed
+        // roots. Checked first so an operator denial can never be lifted by a
+        // grant, a guardrail exception, or the compat path below.
         for denied in &self.deny_write {
             let canonical = canonicalize_best_effort(denied);
             if resolved.starts_with(&canonical) {
                 return false;
             }
+        }
+
+        // Default write guardrails (shell configs, git hooks, `.env`,
+        // `.mcp.json`, editor/agent control dirs) are always active — there
+        // is no all-or-nothing disable switch. RFC 6996 matching: suffix
+        // match on resolved components (bare name at any depth under a
+        // covered root; directory entries cover the directory and its
+        // descendants; nested repos covered by the same rule). Guardrails
+        // follow the write grant they protect: they apply under the
+        // workspace and every writable root, and EVERYWHERE when write is
+        // unrestricted. A per-entry exception re-permits only the named
+        // file or subtree — siblings stay denied.
+        if self.write_guardrail_denies(resolved) {
+            return false;
         }
 
         // Prefer canonical workspace root so `/a/../b` style config paths don't
@@ -3340,14 +3477,18 @@ impl SecurityPolicy {
             .unwrap_or_else(|_| self.workspace_dir.clone());
         // The workspace carries an implicit write grant, but only while no
         // canonical write allowlist exists. An EXPLICIT `allow_write` (including
-        // an explicit empty list) is authoritative for every path, workspace
-        // descendants included — the workspace then stays writable only by being
-        // named in that list, which lands it in a write-capable tier checked
-        // below. Without this gate a narrow explicit allowlist silently kept the
-        // whole workspace writable, contradicting the
-        // `SandboxPolicyConfig::allow_write` contract ("All other paths are
-        // denied for writes").
-        if !self.sandbox_inputs.allow_write_is_explicit && resolved.starts_with(&workspace_root) {
+        // an explicit empty list), or a compat-derived allowlist from a
+        // non-empty legacy `allowed_roots` (RFC 6996), is authoritative for
+        // every path, workspace descendants included — the workspace then
+        // stays writable only by being named in that list, which lands it in a
+        // write-capable tier checked below. Without this gate a narrow
+        // allowlist silently kept the whole workspace writable, contradicting
+        // the `SandboxPolicyConfig::allow_write` contract ("All other paths
+        // are denied for writes").
+        if !self.sandbox_inputs.allow_write_is_explicit
+            && !self.sandbox_inputs.allow_write_compat_allowlist
+            && resolved.starts_with(&workspace_root)
+        {
             return true;
         }
 
@@ -3381,16 +3522,25 @@ impl SecurityPolicy {
         }
 
         // Legacy behavior: workspace_only = false with an OMITTED allow_write
-        // means "no write confinement" (the pre-sandbox_policy default — the
-        // user explicitly opted out of workspace confinement, and there is no
-        // canonical allowlist to be authoritative over). An EXPLICIT
-        // allow_write (including an explicit empty list) is the canonical
-        // write allowlist and must be authoritative regardless of
-        // workspace_only — see `SandboxPolicyConfig::allow_write` rustdoc
-        // ("All other paths are denied for writes"). Without this check, a
-        // narrow explicit allow_write combined with workspace_only = false
-        // silently degraded into "anything goes" for every unlisted path.
-        if !self.workspace_only && !self.sandbox_inputs.allow_write_is_explicit {
+        // AND no compat-derived allowlist means "no write confinement" (the
+        // pre-sandbox_policy default — the user explicitly opted out of
+        // workspace confinement, and there is no canonical allowlist to be
+        // authoritative over). An EXPLICIT allow_write (including an explicit
+        // empty list) is the canonical write allowlist and must be
+        // authoritative regardless of workspace_only — see
+        // `SandboxPolicyConfig::allow_write` rustdoc ("All other paths are
+        // denied for writes"). A NON-EMPTY legacy `allowed_roots` under
+        // effective `workspace_only = false` (incl. `Full` autonomy)
+        // compat-derives a real allowlist the same way (RFC 6996 intentional
+        // conversion of the historical additive-only behavior); an EMPTY
+        // legacy list derives nothing and must not narrow an unrestricted
+        // profile to the default write roots. Without this check, a narrow
+        // allowlist combined with workspace_only = false silently degraded
+        // into "anything goes" for every unlisted path.
+        if !self.workspace_only
+            && !self.sandbox_inputs.allow_write_is_explicit
+            && !self.sandbox_inputs.allow_write_compat_allowlist
+        {
             return true;
         }
 
@@ -3781,6 +3931,23 @@ impl SecurityPolicy {
             }
         }
 
+        // Guardrail exceptions re-permit writes the DEFAULT guardrail list
+        // denies. A child exception the parent does not share would open a
+        // write path the parent keeps denied, so every child exception must
+        // appear verbatim on the parent's list (same matching rules both
+        // sides — string equality on entries).
+        for child_exception in &self.guardrail_exceptions {
+            if !parent
+                .guardrail_exceptions
+                .iter()
+                .any(|p| p == child_exception)
+            {
+                return Err(EscalationViolation::GuardrailExceptionNotInParent {
+                    entry: child_exception.clone(),
+                });
+            }
+        }
+
         // shell_env_passthrough is a leak surface: every child entry
         // must already be on the parent's list.
         for var in &self.shell_env_passthrough {
@@ -3831,15 +3998,6 @@ impl SecurityPolicy {
         runtime_profile: Option<&crate::schema::RuntimeProfileConfig>,
         workspace_dir: &Path,
     ) -> Self {
-        // When autonomy is Full, disable workspace_only so the agent can
-        // access paths outside the workspace. Forbidden-path checks still
-        // apply, preventing access to sensitive system directories.
-        let effective_workspace_only = if risk_profile.level == AutonomyLevel::Full {
-            false
-        } else {
-            risk_profile.workspace_only
-        };
-
         let runtime_default = crate::schema::RuntimeProfileConfig::default();
         let runtime = runtime_profile.unwrap_or(&runtime_default);
 
@@ -3855,10 +4013,15 @@ impl SecurityPolicy {
         // surfaces disagree outright. `sandbox_derived_tiers` further splits the
         // resolved read/write sets into the three app-layer tiers (see its doc
         // comment for the intersection logic).
+        //
+        // `effective_workspace_only` (the Full-autonomy ⇒ `false` rule) is
+        // decided INSIDE the resolver, not re-derived here, so both surfaces
+        // consume the same decision (RFC 6996 single-resolver contract).
         let sandbox_inputs = crate::sandbox_policy::EffectiveSandboxInputs::from_profile(
             risk_profile,
             workspace_dir,
         );
+        let effective_workspace_only = sandbox_inputs.effective_workspace_only;
         let tiers = sandbox_derived_tiers(&sandbox_inputs, workspace_dir);
 
         // `forbidden_paths` stores the SAME raw strings `sandbox_inputs.deny_read`
@@ -3891,6 +4054,7 @@ impl SecurityPolicy {
             allowed_roots_read_only: tiers.allowed_roots_read_only,
             allowed_roots_write_only: tiers.allowed_roots_write_only,
             deny_write: tiers.deny_write,
+            guardrail_exceptions: sandbox_inputs.guardrail_exceptions.clone(),
             sandbox_inputs,
             max_actions_per_hour: runtime.max_actions_per_hour,
             max_cost_per_day_cents: runtime.max_cost_per_day_cents,
@@ -3949,6 +4113,12 @@ impl SecurityPolicy {
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
+        // RFC 6996 upgrade boundary: a profile with effective
+        // `workspace_only = false` and a non-empty legacy `allowed_roots` went
+        // from unrestricted writes to a compat-derived write allowlist. Warn
+        // once per process per profile, naming the profile and the restoring
+        // edit, so the narrowing is never silent.
+        warn_once_compat_allowlist_narrowing(&policy);
         policy.config_path = Some(config.config_path.clone());
         // Runtime data dir: same predicate extends there so state files
         // that the gateway constructs with `&config.data_dir`
@@ -8070,7 +8240,14 @@ mod tests {
         };
         new_style.sandbox_policy.deny_read = Some(vec!["/secret".to_string()]);
         new_style.sandbox_policy.allow_read = Some(vec!["/extra".to_string()]);
-        new_style.sandbox_policy.allow_write = Some(vec!["/extra".to_string()]);
+        // The canonical equivalent of a non-empty legacy `allowed_roots` is an
+        // explicit allow_write naming the same set the compat path derives:
+        // DEFAULT_ALLOW_WRITE ("." + /tmp) ∪ the legacy roots.
+        new_style.sandbox_policy.allow_write = Some(vec![
+            ".".to_string(),
+            "/tmp".to_string(),
+            "/extra".to_string(),
+        ]);
 
         let old_policy = SecurityPolicy::from_risk_profile(&old_style, workspace);
         let new_policy = SecurityPolicy::from_risk_profile(&new_style, workspace);
@@ -8088,19 +8265,21 @@ mod tests {
             );
         }
 
-        // Write parity holds for paths both configs make an explicit
-        // decision about (the denied /secret region, the granted /extra
-        // root). It deliberately does NOT hold for an unlisted path like
-        // /other: old-style's legacy `allowed_roots` + `workspace_only =
-        // false` preserves the historical permissive fallthrough for
-        // compatibility (no canonical field was ever set to be
-        // authoritative), while new-style's explicit `allow_write` is the
-        // canonical allowlist and must deny anything not in it — see
-        // `explicit_allow_write_denies_unlisted_path_when_workspace_only_false`.
-        // Asserting these diverge here (rather than dropping /other from the
-        // loop) is what would have caught this precedence bug in the first
-        // place.
-        for probe in [Path::new("/secret/data.txt"), Path::new("/extra/file.txt")] {
+        // RFC 6996 compat conversion: a non-empty legacy `allowed_roots` under
+        // `workspace_only = false` compat-derives a REAL write allowlist
+        // (default write roots ∪ the legacy roots), intentionally replacing
+        // the historical additive-only, permissive-elsewhere behavior. That
+        // means write parity now holds for EVERY probe, including the
+        // unlisted /other path — old-style and new-style must agree that it
+        // is denied. Before the RFC was accepted, old-style kept a permissive
+        // fallthrough here; that divergence was the compat gap this test
+        // originally pinned.
+        for probe in [
+            Path::new("/secret/data.txt"),
+            Path::new("/extra/file.txt"),
+            Path::new("/other/file.txt"),
+            Path::new("/workspace/file.txt"),
+        ] {
             assert_eq!(
                 old_policy.is_resolved_path_allowed(probe),
                 new_policy.is_resolved_path_allowed(probe),
@@ -8108,9 +8287,9 @@ mod tests {
             );
         }
         assert!(
-            old_policy.is_resolved_path_allowed(Path::new("/other/file.txt")),
-            "old-style legacy allowed_roots + workspace_only=false preserves the permissive \
-             fallthrough for an unlisted path"
+            !old_policy.is_resolved_path_allowed(Path::new("/other/file.txt")),
+            "old-style legacy allowed_roots + workspace_only=false is now a compat-derived \
+             write allowlist (RFC 6996): unlisted paths are denied"
         );
         assert!(
             !new_policy.is_resolved_path_allowed(Path::new("/other/file.txt")),
@@ -8550,12 +8729,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_only_keeps_workspace_writable_despite_explicit_allow_write() {
-        // workspace_only = true overrides allow_write entirely (allow_write is
-        // forced to the workspace root). Gating the implicit workspace grant on
-        // explicitness must not strand that override: the workspace stays
-        // writable through the resolved write tier, and the overridden explicit
-        // entry gains nothing.
+    fn workspace_only_explicit_allow_write_replaces_implicit_grant() {
+        // RFC 6996: workspace_only = true scopes only the IMPLICIT workspace
+        // grant. An explicit canonical allow_write is authoritative for every
+        // path — the workspace stays writable only by being named in the list
+        // (see `explicit_allow_write_naming_workspace_grants_workspace_descendants`
+        // for the "." migration spelling), and an entry the operator DID list
+        // gains write access even though it sits outside the workspace.
         let workspace = Path::new("/workspace");
         let mut profile = crate::schema::RiskProfileConfig {
             workspace_only: true,
@@ -8565,13 +8745,288 @@ mod tests {
         let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
 
         assert!(
-            policy.is_resolved_path_allowed(Path::new("/workspace/file.txt")),
-            "workspace_only must keep the workspace writable even with an explicit allow_write"
+            policy.is_resolved_path_allowed(Path::new("/granted/file.txt")),
+            "an explicit allow_write entry must stay authoritative over workspace_only"
         );
         assert!(
-            !policy.is_resolved_path_allowed(Path::new("/granted/file.txt")),
-            "workspace_only overrides the explicit allow_write entry"
+            !policy.is_resolved_path_allowed(Path::new("/workspace/file.txt")),
+            "an explicit allow_write that does not name the workspace withdraws its implicit grant"
         );
+    }
+
+    #[test]
+    fn nonempty_legacy_allowed_roots_derive_real_write_allowlist() {
+        // RFC 6996 intentional conversion: `workspace_only = false` + a
+        // NON-EMPTY legacy `allowed_roots` historically meant additive-only
+        // (extra roots, writes still unrestricted elsewhere). The canonical
+        // resolver now enforces the merged set (default write roots ∪
+        // allowed_roots) as a real allowlist: paths outside it are denied.
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/extra/file.txt")),
+            "the legacy root must stay writable"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/workspace/file.txt")),
+            "the default workspace root is part of the derived allowlist and stays writable"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/tmp/scratch.txt"))
+                || policy.is_resolved_path_allowed(Path::new("/private/tmp/scratch.txt")),
+            "/tmp is part of the derived allowlist and stays writable (probe tolerates the \
+             macOS /tmp → /private/tmp canonicalization)"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/elsewhere/file.txt")),
+            "paths outside the derived allowlist are no longer writable (RFC 6996 conversion)"
+        );
+    }
+
+    #[test]
+    fn compat_narrowing_warning_fires_once_per_profile() {
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let mut policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+        policy.risk_profile_name = "supervised".to_string();
+        assert!(is_compat_narrowed(&policy));
+
+        // First call for this profile warns; the second is silent.
+        assert!(warn_once_compat_allowlist_narrowing(&policy));
+        assert!(!warn_once_compat_allowlist_narrowing(&policy));
+
+        // An unnarrowed profile never warns.
+        let plain = SecurityPolicy::from_risk_profile(
+            &crate::schema::RiskProfileConfig::default(),
+            workspace,
+        );
+        assert!(!is_compat_narrowed(&plain));
+        assert!(!warn_once_compat_allowlist_narrowing(&plain));
+    }
+
+    #[test]
+    fn empty_legacy_allowed_roots_derive_no_allowlist() {
+        // Closing-record boundary: an EMPTY legacy `allowed_roots` reads as
+        // absent (the legacy field cannot distinguish omitted from `[]`), so
+        // it must NOT narrow an unrestricted profile to the default roots.
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec![],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/elsewhere/file.txt")),
+            "empty legacy allowed_roots must not convert the profile into a write allowlist"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_legacy_allowed_roots_derive_write_allowlist() {
+        // `workspace_only` is always treated as false at Full autonomy, so a
+        // non-empty legacy list converts there too — the RFC's compat table
+        // names `Full` explicitly.
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            workspace_only: true,
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/extra/file.txt")),
+            "the legacy root must stay writable at Full autonomy"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/elsewhere/file.txt")),
+            "Full autonomy + non-empty legacy allowed_roots is a write allowlist"
+        );
+    }
+
+    #[test]
+    fn explicit_allow_write_suppresses_compat_allowlist_derivation() {
+        // Explicit canonical wins outright: no legacy merge, and the derived
+        // allowlist flag must not fire (it is only for the None fallback).
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/custom".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/custom/file.txt")),
+            "the explicit entry is authoritative"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/extra/file.txt")),
+            "legacy allowed_roots must not merge into an explicit allow_write"
+        );
+    }
+
+    #[test]
+    fn guardrail_exception_repermits_only_the_named_file() {
+        // RFC 6996: per-entry exception re-permits the named file or subtree
+        // only; sibling defaults stay denied. Unrestricted profile so the
+        // closing-record "guardrails apply everywhere" scope is exercised.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.guardrail_exceptions = vec![".vscode/settings.json".to_string()];
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/workspace/.vscode/settings.json")),
+            "the named exception target is re-permitted"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/.vscode/launch.json")),
+            "sibling defaults stay denied"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/.env")),
+            "every other guardrail entry stays enforced"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/elsewhere/.env")),
+            "under unrestricted write, guardrails apply everywhere (closing record)"
+        );
+    }
+
+    #[test]
+    fn guardrail_exception_cannot_lift_operator_deny_write() {
+        // Operator deny_write entries are absolute and exception-proof.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.deny_write = Some(vec!["/workspace/locked".to_string()]);
+        profile.sandbox_policy.guardrail_exceptions = vec!["locked".to_string()];
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/locked/file.txt")),
+            "an exception must never relax an operator deny_write entry"
+        );
+    }
+
+    #[test]
+    fn nested_repo_git_hooks_are_guardrail_denied() {
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig::default();
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy
+                .is_resolved_path_allowed(Path::new("/workspace/sub/repo/.git/hooks/pre-commit")),
+            "a nested repo's .git/hooks must be denied by the same suffix rule"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/.bashrc")),
+            "top-level guardrail files stay denied"
+        );
+    }
+
+    #[test]
+    fn zeroclaw_control_surfaces_are_guardrail_denied() {
+        // B7 / closing record: install config, secret key, auth profiles,
+        // per-agent identity/SOP, and shared skill bundles join the default
+        // guardrail list.
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig::default();
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        for denied in [
+            "/workspace/config.toml",
+            "/workspace/.secret_key",
+            "/workspace/auth-profiles.json",
+            "/workspace/IDENTITY.md",
+            "/workspace/SOUL.md",
+            "/workspace/shared/skills/bundle/skill.md",
+        ] {
+            assert!(
+                !policy.is_resolved_path_allowed(Path::new(denied)),
+                "ZeroClaw control surface {denied} must be write-denied by default"
+            );
+        }
+    }
+
+    #[test]
+    fn guardrails_do_not_apply_outside_covered_roots_when_write_is_bounded() {
+        // Relative guardrail entries follow the write grant: under a
+        // bounded profile they apply under the workspace and writable roots
+        // only. (Under unrestricted write they apply everywhere — see
+        // `guardrail_exception_repermits_only_the_named_file`.)
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.allow_write = Some(vec![".".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/.env")),
+            "inside the writable workspace the guardrail applies"
+        );
+        // Outside every writable root the write is denied by the allowlist
+        // itself; the guardrail verdict must not leak into readable grants —
+        // verified indirectly by ensuring the allowlist, not the guardrail,
+        // is what denies: the same path under a shared exception stays denied.
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/elsewhere/.env")),
+            "outside the allowlist the write is denied by the boundary itself"
+        );
+    }
+
+    #[test]
+    fn child_guardrail_exception_not_shared_by_parent_is_escalation() {
+        let workspace = Path::new("/workspace");
+        let parent_profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let mut child_profile = parent_profile.clone();
+        child_profile
+            .sandbox_policy
+            .guardrail_exceptions
+            .push(".vscode/settings.json".to_string());
+
+        let parent = SecurityPolicy::from_risk_profile(&parent_profile, workspace);
+        let child = SecurityPolicy::from_risk_profile(&child_profile, workspace);
+
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("an unshared guardrail exception must be an escalation");
+        assert!(matches!(
+            err,
+            EscalationViolation::GuardrailExceptionNotInParent { .. }
+        ));
+
+        // The same exception shared by both sides is fine.
+        let mut parent_with_exception = parent_profile.clone();
+        parent_with_exception
+            .sandbox_policy
+            .guardrail_exceptions
+            .push(".vscode/settings.json".to_string());
+        let parent2 = SecurityPolicy::from_risk_profile(&parent_with_exception, workspace);
+        assert!(child.ensure_no_escalation_beyond(&parent2).is_ok());
     }
 
     #[test]

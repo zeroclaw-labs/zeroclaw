@@ -14,11 +14,56 @@ pub struct SecurityStatusReport {
     pub agent_enabled: bool,
     pub risk_profile: RiskProfileStatus,
     pub sandbox: SandboxStatus,
+    pub filesystem: FilesystemPolicyStatus,
     pub workspace: WorkspaceStatus,
     pub credentials: CredentialStatus,
     pub gateway: GatewayStatus,
     pub warnings: Vec<String>,
 }
+
+/// RFC 6996 two-layer filesystem enforcement facts, reported separately and
+/// never collapsed: canonical-policy application-layer enforcement is
+/// independent of any OS backend, and an active backend that does not (yet)
+/// consume the canonical policy provides baseline confinement only — it must
+/// not be reported as canonical-policy enforcement.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FilesystemPolicyStatus {
+    /// Canonical `sandbox_policy` is actively checked by the covered
+    /// application tools regardless of which sandbox backend (if any) is
+    /// selected. Always `true` in this slice — immediate application-layer
+    /// enforcement is part of the accepted contract.
+    pub canonical_app_layer_enforced: bool,
+    /// The exact tools covered by application-layer enforcement. Enumerated,
+    /// never implied: nothing outside this list (in particular no arbitrary
+    /// shell/script child-process I/O) is confined by the canonical policy.
+    pub covered_tools: Vec<&'static str>,
+    /// Whether the active OS sandbox backend consumes the resolved canonical
+    /// policy. `false` until per-backend wiring lands (RFC 6996 Phase 2);
+    /// until then a backend provides its own baseline confinement only.
+    pub backend_enforces_canonical_policy: bool,
+    /// Number of always-on default write-guardrail entries.
+    pub guardrail_entries: usize,
+    /// Number of per-entry guardrail exceptions configured on this profile.
+    pub guardrail_exceptions: usize,
+}
+
+/// Tools whose read and mutation operations route through the canonical
+/// `sandbox_policy` checks (RFC 6996). Keep in sync with the enforcement
+/// matrix in `docs/book/src/security/sandboxing.md` and the
+/// `boundary_probes` coverage list in `zeroclaw-runtime::tools`.
+pub const FILESYSTEM_COVERED_TOOLS: &[&str] = &[
+    "file_read",
+    "deliver_file",
+    "image_info",
+    "glob_search",
+    "content_search",
+    "file_write",
+    "file_edit",
+    "file_upload",
+    "file_upload_bundle",
+    "file_download",
+    "git_operations",
+];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RiskProfileStatus {
@@ -154,6 +199,23 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
             "gateway allows public bind without TLS enabled",
         ));
     }
+    // RFC 6996 truthfulness: always state the two enforcement layers
+    // separately and enumerate the covered tools — an active backend must
+    // never read as canonical-policy enforcement, and nothing may imply
+    // shell/child-process I/O is confined. Standing warning, independent of
+    // which backend is selected (selecting a backend name does not suppress
+    // it), mirroring the runtime WARN in `security::detect`.
+    {
+        let covered = FILESYSTEM_COVERED_TOOLS.join(", ");
+        warnings.push(crate::ta(
+            "cli-security-status-warning-filesystem-app-layer-only",
+            &[("tools", &covered)],
+            "filesystem policy is enforced at the application layer for the \
+             covered file/repository tools only; arbitrary shell or \
+             child-process I/O is not confined, and no OS sandbox backend \
+             consumes sandbox_policy yet (RFC 6996 Phase 2)",
+        ));
+    }
 
     Ok(SecurityStatusReport {
         source: format!("agents.{agent_alias}.risk_profile"),
@@ -175,6 +237,13 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
             active_backend: sandbox.active_backend.to_string(),
             active_description: sandbox.active_description.to_string(),
             fallback: sandbox.fallback,
+        },
+        filesystem: FilesystemPolicyStatus {
+            canonical_app_layer_enforced: true,
+            covered_tools: FILESYSTEM_COVERED_TOOLS.to_vec(),
+            backend_enforces_canonical_policy: false,
+            guardrail_entries: zeroclaw_config::schema::MANDATORY_DENY_WRITE.len(),
+            guardrail_exceptions: resolved.policy.guardrail_exceptions.len(),
         },
         workspace: WorkspaceStatus {
             workspace_dir: resolved.policy.workspace_dir.display().to_string(),
@@ -271,6 +340,26 @@ pub fn print_report(report: &SecurityStatusReport) {
                 ("description", &report.sandbox.active_description),
             ],
             "Sandbox"
+        )
+    );
+    let fs_covered = report.filesystem.covered_tools.join(", ");
+    let fs_guardrails = report.filesystem.guardrail_entries.to_string();
+    let fs_exceptions = report.filesystem.guardrail_exceptions.to_string();
+    let fs_backend = report
+        .filesystem
+        .backend_enforces_canonical_policy
+        .to_string();
+    println!(
+        "{}",
+        crate::ta(
+            "cli-security-status-filesystem",
+            &[
+                ("covered", &fs_covered),
+                ("backend", &fs_backend),
+                ("guardrails", &fs_guardrails),
+                ("exceptions", &fs_exceptions),
+            ],
+            "Filesystem: application-layer enforcement active for {$covered}; backend consumes canonical policy: {$backend}; guardrails: {$guardrails} ({$exceptions} exception(s))",
         )
     );
     let workspace_only = report.workspace.workspace_only.to_string();
@@ -614,5 +703,55 @@ mod tests {
         let config = Config::default();
         let err = build_report(&config, "missing").expect_err("missing agent should error");
         assert!(err.to_string().contains("agents.missing"));
+    }
+
+    #[test]
+    fn filesystem_enforcement_reports_two_layers_and_covered_tools() {
+        // RFC 6996: the report must enumerate the exact covered tools, keep
+        // canonical app-layer enforcement separate from backend confinement,
+        // and never imply shell/child-process I/O is confined.
+        let mut config = config_with_agent("ops", "ops-risk", RiskProfileConfig::default());
+        config
+            .agents
+            .get_mut("ops")
+            .expect("ops agent")
+            .risk_profile = "ops-risk".into();
+        let mut profile = RiskProfileConfig::default();
+        profile.sandbox_policy.guardrail_exceptions = vec![".vscode/settings.json".to_string()];
+        config.risk_profiles.insert("ops-risk".to_string(), profile);
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        assert!(report.filesystem.canonical_app_layer_enforced);
+        assert!(!report.filesystem.backend_enforces_canonical_policy);
+        assert_eq!(
+            report.filesystem.covered_tools,
+            FILESYSTEM_COVERED_TOOLS.to_vec()
+        );
+        assert!(
+            !report.filesystem.covered_tools.contains(&"shell"),
+            "the covered list must never imply the shell tool is confined"
+        );
+        assert_eq!(report.filesystem.guardrail_exceptions, 1);
+        assert_eq!(
+            report.filesystem.guardrail_entries,
+            zeroclaw_config::schema::MANDATORY_DENY_WRITE.len()
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("application layer")),
+            "the standing warning must state the enforcement layer: {:?}",
+            report.warnings
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("child-process I/O is not confined")),
+            "the standing warning must not imply shell confinement: {:?}",
+            report.warnings
+        );
     }
 }

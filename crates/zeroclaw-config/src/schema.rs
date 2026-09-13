@@ -12413,9 +12413,10 @@ fn is_valid_env_var_name(name: &str) -> bool {
 ///    - `allow_read: None` falls back to the top-level `RiskProfileConfig.allowed_roots`.
 ///    - `allow_write: None` falls back to [`DEFAULT_ALLOW_WRITE`] merged with the legacy
 ///      `allowed_roots` compat field (unless `workspace_only = true`, which always wins).
-///    - `deny_write` always receives the [`MANDATORY_DENY_WRITE`] guardrail merge when
-///      `mandatory_deny_write_enabled` (the default), on top of whatever operator value
-///      (`None` or `Some`) is present.
+///    - `deny_write` stays operator-only in the effective inputs; the
+///      [`MANDATORY_DENY_WRITE`] guardrail list is always active on top of it
+///      (RFC 6996: no all-or-nothing switch), relaxable per entry via
+///      `guardrail_exceptions`.
 ///
 ///    An explicit `Some(v)` — even one shaped identically to a prior default — always wins
 ///    outright over the legacy fallback; only `None` (the field was never written) triggers
@@ -12426,16 +12427,21 @@ fn is_valid_env_var_name(name: &str) -> bool {
 /// `PathGuardedTool` read paths) via `SecurityPolicy`, regardless of which OS sandbox backend
 /// (if any) is active. They are NOT enforced against arbitrary shell/script child-process I/O
 /// until per-backend OS sandbox wiring lands (tracked per RFC 6996 Phase 2 as follow-up PRs,
-/// one per backend). `allowed_domains`, `denied_domains`, `allow_unix_sockets`, and
-/// `bubblewrap_args` are accepted and carried through the resolved policy but are fully inert
-/// — no enforcement surface consumes them yet.
+/// one per backend).
+///
+/// **No network fields.** Per RFC 6996, this filesystem slice exposes no network-shaped
+/// fields: `allowed_domains`, `denied_domains`, `allow_unix_sockets`, and raw
+/// `bubblewrap_args` escape-hatch flags are rejected at parse time rather than accepted
+/// and silently ignored. A public schema field with no enforcement behind it is worse than
+/// no field at all — an operator cannot distinguish "no policy configured" from "policy
+/// accepted but silently ignored" by reading the schema alone. They are reintroduced only
+/// alongside the separately reviewed network-policy RFC and its enforcing consumer.
 ///
 /// Filesystem read semantics: deny-then-allow (`allow_read` overrides `deny_read`).
 /// Filesystem write semantics: allow-only (`deny_write` overrides `allow_write`).
-/// Network semantics: `denied_domains` checked first, then `allowed_domains`.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SandboxPolicyConfig {
     /// Paths denied for read access. `~` is expanded to the user home directory.
     /// Accepts `forbidden_paths` as a compat alias within the `sandbox_policy` table.
@@ -12459,30 +12465,22 @@ pub struct SandboxPolicyConfig {
     #[serde(default)]
     pub allow_write: Option<Vec<String>>,
     /// Write exceptions within `allow_write` regions. Takes precedence over `allow_write`.
-    /// Same `Option` presence semantics as `deny_read`. `None` still receives the
-    /// [`MANDATORY_DENY_WRITE`] guardrail merge when `mandatory_deny_write_enabled`.
+    /// Same `Option` presence semantics as `deny_read`. Operator entries are
+    /// absolute and exception-proof; the always-on [`MANDATORY_DENY_WRITE`]
+    /// guardrail list is enforced on top of them (see `guardrail_exceptions`
+    /// for the per-entry relaxation).
     #[serde(default)]
     pub deny_write: Option<Vec<String>>,
-    /// Network domains the sandbox may reach via proxy. Accepted and carried into
-    /// the resolved policy, but **not yet enforced**: no OS sandbox backend consumes
-    /// it yet (`create_sandbox()` does not forward the resolved policy to individual
-    /// backends until backend wiring lands). Once enforced, the intended semantics
-    /// are: empty list = no network, wildcard prefix supported (`*.github.com`).
-    pub allowed_domains: Vec<String>,
-    /// Domains explicitly blocked; intended to be checked before `allowed_domains`
-    /// once enforced. Same inert status as `allowed_domains` — see that field's doc.
-    pub denied_domains: Vec<String>,
-    /// Unix socket paths the sandbox may access (macOS only; ignored on Linux).
-    /// Same inert status as `allowed_domains` — accepted but not yet enforced.
-    pub allow_unix_sockets: Vec<String>,
-    /// Raw extra bwrap flags appended last (Bubblewrap backend only, escape hatch).
-    /// Same inert status as `allowed_domains` — accepted but not yet enforced.
-    pub bubblewrap_args: Vec<String>,
-    /// When `true`, the default `deny_write` guardrail list (shell configs, git hooks,
-    /// `.env`, `.mcp.json`, etc.) is merged into the resolved policy by the runtime
-    /// resolver regardless of any operator-supplied `allow_write`. Set `false` per
-    /// profile as an escape hatch; emits a WARN log at runtime.
-    pub mandatory_deny_write_enabled: bool,
+    /// Per-entry exceptions to the default write guardrail list
+    /// ([`MANDATORY_DENY_WRITE`]) — RFC 6996. There is deliberately no switch
+    /// that disables the whole default list at once: an exception entry uses
+    /// the same matching rules as a guardrail entry and re-permits only the
+    /// named file or subtree for writes; every sibling default entry stays
+    /// enforced. Exceptions never relax operator-supplied `deny_write`
+    /// entries (those are absolute) and never weaken `deny_read`. A
+    /// non-empty list emits a visible WARN at policy construction.
+    #[serde(default)]
+    pub guardrail_exceptions: Vec<String>,
 }
 
 /// Default `allow_write` roots used when `SandboxPolicyConfig.allow_write` is
@@ -12491,10 +12489,13 @@ pub struct SandboxPolicyConfig {
 pub const DEFAULT_ALLOW_WRITE: &[&str] = &[".", "/tmp"];
 
 /// Default `deny_write` guardrail entries merged into the resolved policy
-/// whenever `mandatory_deny_write_enabled` is `true` (the default), regardless
-/// of whether `deny_write` was configured. Covers shell configs, git hooks,
-/// and other files an agent should never be able to rewrite even with broad
-/// write access.
+/// regardless of whether `deny_write` was configured (RFC 6996: there is no
+/// switch that disables the whole list; relaxation is per-entry via
+/// `SandboxPolicyConfig::guardrail_exceptions`). Covers shell configs, git
+/// hooks, and other files an agent should never be able to rewrite even with
+/// broad write access. Directory entries (trailing `/`) cover the directory
+/// and all its descendants; a bare entry matches that file name at any depth
+/// under a covered root.
 pub const MANDATORY_DENY_WRITE: &[&str] = &[
     ".bashrc",
     ".bash_profile",
@@ -12510,23 +12511,20 @@ pub const MANDATORY_DENY_WRITE: &[&str] = &[
     ".claude/agents/",
     ".vscode/",
     ".idea/",
+    // ZeroClaw's own control surfaces (RFC 6996 closing record — the addition
+    // was pre-approved inside the accepted rollout): install config, the
+    // install secret key, provider auth profiles, per-agent identity/SOP
+    // files, and the install-shared skill bundles. An agent must not be able
+    // to rewrite any of these even with broad write access. Per-agent skills
+    // under an agent's own workspace are deliberately NOT listed — the
+    // skill_manage tool owns that surface by design.
+    "config.toml",
+    ".secret_key",
+    "auth-profiles.json",
+    "IDENTITY.md",
+    "SOUL.md",
+    "shared/skills/",
 ];
-
-impl Default for SandboxPolicyConfig {
-    fn default() -> Self {
-        Self {
-            deny_read: None,
-            allow_read: None,
-            allow_write: None,
-            deny_write: None,
-            allowed_domains: vec![],
-            denied_domains: vec![],
-            allow_unix_sockets: vec![],
-            bubblewrap_args: vec![],
-            mandatory_deny_write_enabled: true,
-        }
-    }
-}
 
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
@@ -30030,8 +30028,8 @@ default_temperature = 0.7
     async fn sandbox_policy_config_defaults() {
         let p = SandboxPolicyConfig::default();
         assert!(
-            p.mandatory_deny_write_enabled,
-            "mandatory deny write must be on by default"
+            p.guardrail_exceptions.is_empty(),
+            "guardrail exceptions must default to empty (every default entry enforced)"
         );
         // allow_write/deny_read/etc default to None (omitted) — presence,
         // not shape, distinguishes "operator never set this" from "operator
@@ -30049,10 +30047,6 @@ default_temperature = 0.7
             "default allow_write must include /tmp"
         );
         assert!(p.deny_read.is_none(), "default deny_read must be omitted");
-        assert!(
-            p.allowed_domains.is_empty(),
-            "default allowed_domains must be empty (no network)"
-        );
     }
 
     #[test]
@@ -30060,20 +30054,42 @@ default_temperature = 0.7
         let toml_in = r#"
             deny_read = ["~/.ssh"]
             allow_write = ["."]
-            allowed_domains = ["api.example.com"]
-            mandatory_deny_write_enabled = false
+            guardrail_exceptions = [".vscode/settings.json"]
         "#;
         let p: SandboxPolicyConfig =
             toml::from_str(toml_in).expect("deserialize SandboxPolicyConfig");
         assert_eq!(p.deny_read, Some(vec!["~/.ssh".to_string()]));
         assert_eq!(p.allow_write, Some(vec![".".to_string()]));
-        assert_eq!(p.allowed_domains, vec!["api.example.com"]);
-        assert!(!p.mandatory_deny_write_enabled);
+        assert_eq!(
+            p.guardrail_exceptions,
+            vec![".vscode/settings.json".to_string()]
+        );
         // fields not set in the TOML must fall back to None (omitted), not
         // an empty Vec — an operator writing `allow_read = []` explicitly is
         // a materially different config from never mentioning `allow_read`.
         assert!(p.allow_read.is_none());
-        assert!(p.denied_domains.is_empty());
+        assert!(p.deny_write.is_none());
+    }
+
+    #[test]
+    async fn sandbox_policy_config_rejects_network_fields() {
+        // RFC 6996: no network-shaped fields without an enforcing consumer.
+        // Parsing must fail closed with a clear error, never accept-and-ignore.
+        for network_key in [
+            "allowed_domains = [\"api.example.com\"]",
+            "denied_domains = []",
+            "allow_unix_sockets = []",
+            "bubblewrap_args = [\"--unshare-net\"]",
+        ] {
+            let toml_in = format!("deny_read = [\"~/.ssh\"]\n{network_key}\n");
+            let err = toml::from_str::<SandboxPolicyConfig>(&toml_in)
+                .expect_err("network fields must be rejected by the filesystem slice");
+            assert!(
+                err.to_string()
+                    .contains(network_key.split_whitespace().next().unwrap_or("")),
+                "error for {network_key} must name the rejected key, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -33763,7 +33779,7 @@ group_policy = "disabled"
             "allow_read",
             "allow_write",
             "deny_write",
-            "mandatory_deny_write_enabled",
+            "guardrail_exceptions",
         ] {
             let expected = format!("risk_profiles.default.sandbox_policy.{leaf}");
             assert!(
@@ -33792,12 +33808,13 @@ group_policy = "disabled"
             "get_prop must report the configured denials, got {shown}"
         );
 
-        let bool_path = "risk_profiles.default.sandbox_policy.mandatory_deny_write_enabled";
-        config.set_prop(bool_path, "false").unwrap();
-        assert!(
-            !config.risk_profiles["default"]
+        let bool_path = "risk_profiles.default.sandbox_policy.guardrail_exceptions";
+        config.set_prop(bool_path, ".vscode/settings.json").unwrap();
+        assert_eq!(
+            config.risk_profiles["default"]
                 .sandbox_policy
-                .mandatory_deny_write_enabled
+                .guardrail_exceptions,
+            vec![".vscode/settings.json".to_string()]
         );
     }
 
