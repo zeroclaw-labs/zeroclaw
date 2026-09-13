@@ -483,6 +483,7 @@ impl CopilotModelProvider {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         let choice = api_response.choices.into_iter().next().ok_or_else(|| {
             ::zeroclaw_log::record!(

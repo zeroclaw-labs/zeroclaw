@@ -1627,7 +1627,7 @@ fn with_existing_initialized_connection<T>(
     f(&conn).map(Some)
 }
 
-fn with_initialized_connection<T>(
+pub(super) fn with_initialized_connection<T>(
     config: &Config,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
@@ -1788,6 +1788,9 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         "shell_output_format",
         "TEXT NOT NULL DEFAULT 'wrapped'",
     )?;
+
+    #[cfg(feature = "plugins-wasm")]
+    super::outbox::initialize_schema(conn)?;
 
     Ok(())
 }

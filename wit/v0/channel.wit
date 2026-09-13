@@ -64,6 +64,19 @@ interface channel {
         in-reply-to: option<string>,
     }
 
+    /// Where a tool call sits in the batch the model issued for one turn.
+    ///
+    /// This is the raw batch position, not an approval count: `index` counts
+    /// every call the model asked for, including calls that never reach an
+    /// approval prompt.
+    @unstable(feature = plugins-wit-v0)
+    record approval-position {
+        /// 1-based position of this call within the batch.
+        index: u32,
+        /// Number of calls in the batch.
+        total: u32,
+    }
+
     /// A compact description of a tool call presented to the operator for
     /// approval.
     @unstable(feature = plugins-wit-v0)
@@ -72,6 +85,9 @@ interface channel {
         arguments-summary: string,
         /// JSON-encoded raw arguments; `none` when not available.
         raw-arguments: option<json-string>,
+        /// Batch position, when the runtime knows it; `none` on paths that
+        /// approve a single call with no batch to count.
+        position: option<approval-position>,
     }
 
     /// The operator's response to a channel-presented approval prompt.
@@ -85,6 +101,37 @@ interface channel {
         always-approve,
         /// Deny this call and supply an edited replacement for the arguments.
         deny-with-edit(string),
+    }
+
+    /// A webhook rejection with an explicit public HTTP classification. The
+    /// string is bounded private diagnostic context for attributed host logs,
+    /// is never returned to the unauthenticated caller, and must not contain
+    /// credentials or raw secret values.
+    @unstable(feature = plugins-wit-v0)
+    variant webhook-rejection {
+        /// Platform signature or authenticity verification failed (HTTP 401).
+        unauthorized(string),
+        /// The authenticated payload is malformed or unsupported (HTTP 400).
+        bad-request(string),
+    }
+
+    /// Exact HTTP request metadata and bytes supplied by the gateway.
+    @unstable(feature = plugins-wit-v0)
+    record webhook-request {
+        method: string,
+        /// Raw query, without the leading `?`; never synthesized from headers.
+        query: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// A verified request either delivers messages or answers the provider.
+    @unstable(feature = plugins-wit-v0)
+    variant webhook-response {
+        messages(list<inbound-message>),
+        /// HTTP 200 text body; never enters sender policy, deduplication, or
+        /// agent delivery. At most 4096 UTF-8 bytes; excess returns opaque 502.
+        reply(string),
     }
 
     /// Bitmask of optional capabilities this plugin implements.
@@ -110,6 +157,8 @@ interface channel {
     ///   `request-approval`                 → `ok(none)`
     ///   `request-choice`                   → `ok(none)`
     ///   `supports-free-form-ask`           → `true`
+    ///   `webhook-path`                     → `none`
+    ///   `parse-webhook`                    → `err(bad-request("unsupported"))`
     ///
     /// All corresponding functions must still be exported by the plugin
     /// (stub implementations are sufficient); the runtime simply never calls
@@ -138,6 +187,8 @@ interface channel {
         request-approval,
         request-choice,
         supports-free-form-ask,
+        /// Serves inbound webhooks through `webhook-path` + `parse-webhook`.
+        webhook-ingress,
     }
 
     // ── Required methods (no Rust default) ────────────────────────────────────
@@ -300,6 +351,22 @@ interface channel {
     /// `ask-user` questions via the standard send + poll flow.
     /// Stub: return `true`.
     supports-free-form-ask: func() -> bool;
+
+    /// The gateway route segment this channel serves. The host mounts it under
+    /// `/plugin/<segment>`. A valid segment is 1–64 ASCII letters, digits,
+    /// hyphens, or underscores; any other value rejects this channel instance.
+    /// Called once at load time.
+    /// Gated by `webhook-ingress`; stub: return `none`.
+    webhook-path: func() -> option<string>;
+
+    /// Authenticate and decode a GET or POST webhook. The request carries the
+    /// gateway's method, raw query, lowercase UTF-8 headers, and exact body.
+    /// Resolve scoped config and secrets at this point of use and verify the
+    /// platform's authenticity before returning messages or a challenge reply.
+    /// Keep diagnostic strings private to host logs.
+    /// Gated by `webhook-ingress`; stub: return
+    /// `err(bad-request("unsupported"))`.
+    parse-webhook: func(request: webhook-request) -> result<webhook-response, webhook-rejection>;
 }
 
 /// A component that exports `channel` is a messaging-platform channel plugin.

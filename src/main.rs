@@ -915,6 +915,8 @@ mod peripherals;
 #[cfg(feature = "agent-runtime")]
 mod platform;
 #[cfg(feature = "plugins-wasm")]
+mod plugin_catalog;
+#[cfg(feature = "plugins-wasm")]
 mod plugin_registry;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
@@ -3312,7 +3314,7 @@ fn which_zerocode_on_path() -> bool {
 #[cfg(feature = "plugins-wasm")]
 #[derive(Subcommand, Debug)]
 enum PluginCommands {
-    /// List installed plugins
+    /// List installed and cached-registry plugins
     List,
     /// Search an installable plugin registry
     Search {
@@ -5953,6 +5955,14 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+                #[cfg(feature = "gateway")]
+                let plugin_webhooks = Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new());
+                #[cfg(feature = "gateway")]
+                let channel_plugin_webhooks = Some(Arc::clone(&plugin_webhooks));
+                #[cfg(not(feature = "gateway"))]
+                let channel_plugin_webhooks: Option<
+                    Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+                > = None;
 
                 // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
                 // (or empty) by default, so SOP runtime behavior is off until an
@@ -5997,8 +6007,9 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = Arc::clone(&plugin_webhooks);
                         Box::pin(async move {
-                            Box::pin(zeroclaw_gateway::run_gateway(
+                            Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
                                 config,
@@ -6009,7 +6020,10 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 pairing,
-                                ready_tx,
+                                zeroclaw_gateway::GatewaySupervision::new(
+                                    ready_tx,
+                                    plugin_webhooks,
+                                ),
                             ))
                             .await
                         })
@@ -6019,19 +6033,22 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let plugin_webhooks = channel_plugin_webhooks.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let plugin_webhooks = plugin_webhooks.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            let channels = zeroclaw_channels::orchestrator::start_channels_with_plugin_webhooks(
                                 config,
                                 Some(canvas_store),
                                 cancel,
                                 sop_engine,
                                 sop_audit,
-                            ))
-                            .await
+                                plugin_webhooks,
+                            );
+                            Box::pin(channels).await
                         })
                     }
                 }));
@@ -8553,20 +8570,7 @@ Add pricing to the active provider profile or supply a catalog entry."
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
                 let host = plugin_host_with_configured_security(&config)?;
-                let plugins = host.list_plugins();
-                if plugins.is_empty() {
-                    println!("{}", t("cli-plugins-none", "No plugins installed."));
-                } else {
-                    println!("{}", t("cli-plugins-installed", "Installed plugins:"));
-                    for p in &plugins {
-                        println!(
-                            "  {} v{} — {}",
-                            p.name,
-                            p.version,
-                            p.description.as_deref().unwrap_or("(no description)")
-                        );
-                    }
-                }
+                plugin_catalog::print(&config, &host);
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
                     eprintln!(
