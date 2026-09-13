@@ -99,6 +99,12 @@ Prebuilt components from the earlier experimental worlds are not a conformance
 target; this is an intentional pre-stability break while `wit/v0/.frozen` is
 absent.
 
+The experimental channel world also includes the `webhook-ingress` capability,
+`webhook-rejection` variant, and `webhook-path` / `parse-webhook` exports. Every
+channel component must export the documented stubs even when it does not claim
+webhook ingress. This addition changes the generated component ABI, so a host
+upgrade requires rebuilding non-webhook channel components too.
+
 **Targeting a minor bump (e.g. 0.1 → 0.2):** recompile. No source changes
 needed for items added via `@since`.
 
