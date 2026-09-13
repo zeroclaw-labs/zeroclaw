@@ -652,10 +652,16 @@ struct RuntimeShellAssembly {
 /// making the lower-level tools crate depend on the runtime crate.
 struct RuntimeGitCommandBoundary {
     sandbox: Arc<dyn Sandbox>,
+    runtime_kind: zeroclaw_config::schema::RuntimeKind,
 }
 
 impl GitCommandBoundary for RuntimeGitCommandBoundary {
     fn wrap_command(&self, command: &mut std::process::Command) -> anyhow::Result<()> {
+        if self.runtime_kind == zeroclaw_config::schema::RuntimeKind::Docker {
+            anyhow::bail!(
+                "Git write commands are unavailable with the Docker runtime because they cannot be confined to its container"
+            );
+        }
         self.sandbox
             .wrap_command(command)
             .map_err(anyhow::Error::from)
@@ -974,6 +980,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             Arc::new(RuntimeGitCommandBoundary {
                 sandbox: sandbox.clone(),
+                runtime_kind: root_config.runtime.kind,
             }),
         )),
         Arc::new(PushoverTool::new(
@@ -2078,6 +2085,38 @@ mod tests {
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, MemoryConfig,
         SopApprovalConfig,
     };
+
+    #[test]
+    fn git_write_boundary_rejects_docker_runtime_before_spawning() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Docker,
+        };
+        let mut command = std::process::Command::new("git");
+
+        let error = boundary.wrap_command(&mut command).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Git write commands are unavailable with the Docker runtime"),
+            "Docker runtime must reject Git writes before a host command can spawn: {error}"
+        );
+        assert_eq!(command.get_program(), "git");
+    }
+
+    #[test]
+    fn git_write_boundary_preserves_native_none_mode() {
+        let boundary = RuntimeGitCommandBoundary {
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            runtime_kind: zeroclaw_config::schema::RuntimeKind::Native,
+        };
+        let mut command = std::process::Command::new("git");
+
+        boundary.wrap_command(&mut command).unwrap();
+
+        assert_eq!(command.get_program(), "git");
+    }
 
     #[tokio::test]
     async fn mcp_capability_tools_respect_policy() {
