@@ -13030,16 +13030,17 @@ impl OidcConfig {
                 ),
             }
         }
-        if self.claim_path.trim().is_empty() {
+        if self.profile_map.is_empty() && self.service_profile_map.is_empty() {
+            anyhow::bail!(
+                "oidc.{alias} requires profile_map or service_profile_map: map at least one \
+                 verified identity value to a permission profile or every identity from this issuer \
+                 will be denied"
+            );
+        }
+        if !self.profile_map.is_empty() && self.claim_path.trim().is_empty() {
             anyhow::bail!(
                 "oidc.{alias}.claim_path is required: set the dotted path to the \
                  claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
-            );
-        }
-        if self.profile_map.is_empty() {
-            anyhow::bail!(
-                "oidc.{alias}.profile_map is required: map at least one claim value to a \
-                 permission profile or every identity from this issuer will be denied"
             );
         }
         Ok(())
@@ -26248,6 +26249,32 @@ mod tests {
         config
             .validate()
             .expect("a service map naming a configured profile is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_only_profile_map_does_not_require_a_claim_path() {
+        let mut config = auth_config();
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.claim_path.clear();
+        oidc.profile_map.clear();
+        oidc.service_profile_map
+            .insert("worker".to_string(), "operator".to_string());
+
+        config
+            .validate()
+            .expect("a service-only OIDC map naming a configured profile is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_requires_a_human_or_service_profile_map() {
+        let mut config = auth_config();
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.profile_map.clear();
+        oidc.service_profile_map.clear();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("profile_map"), "got: {err}");
+        assert!(err.contains("service_profile_map"), "got: {err}");
     }
 
     #[::core::prelude::v1::test]
