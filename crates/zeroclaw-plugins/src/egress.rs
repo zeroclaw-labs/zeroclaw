@@ -2,8 +2,9 @@
 //!
 //! Transport adapters submit an [`EgressRequest`], then dial only the pinned
 //! addresses returned by [`AuthorizedEgress`]. Policy is resolved at each
-//! request, while live-connection accounting is shared across every transport
-//! and store belonging to the same logical plugin instance.
+//! request, while live-connection accounting is shared process-wide by every
+//! transport, store, service, and tool registry that represents the same
+//! logical plugin instance.
 //!
 //! Linkers expose only the imports selected by an admitted instance's effective
 //! grants. This service repeats that grant check at the operation boundary, then
@@ -22,7 +23,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use zeroclaw_infra::net_guard::{
     Nat64Prefix, NetworkGuardError, PrivateNetworkAccess, ResolvedDestination, egress_host_matches,
@@ -262,47 +263,112 @@ impl EgressRequest {
     }
 }
 
-#[derive(Default)]
-struct ConnectionCounts {
-    by_instance: Mutex<HashMap<PluginInstanceId, usize>>,
+/// Live connection accounting for every plugin instance in this process.
+///
+/// # Why this state is process-global
+///
+/// A live connection is *runtime* state: the socket this instance holds open
+/// right now either exists or it does not, and there is exactly one truth about
+/// that per process. This is deliberately not the same kind of fact as an
+/// admission or policy decision, which is derived from canonical config every
+/// time it is asked and therefore must never acquire a global counter. Nothing
+/// about the operator's policy is cached here — only how many slots are
+/// currently held. The ceiling those counts are compared against is still read
+/// live from the resolver on every acquire, so lowering it applies to the next
+/// connection.
+///
+/// # Why per-service counting was wrong
+///
+/// `EgressHostService` used to own its counts, so a clone shared them but an
+/// independently built service did not. Production builds a *fresh* service per
+/// `all_tools_with_runtime` call, and the same canonical instance is registered
+/// by several independent paths — the agent loop, the gateway, the channels
+/// orchestrator, and the delegate tool. Each registry therefore handed the same
+/// instance a full budget, and N registries multiplied the operator's ceiling by
+/// N. Keying on the canonical [`PluginInstanceId`] puts every one of those
+/// registries on the same count.
+#[derive(Clone, Default)]
+struct ConnectionRegistry {
+    by_instance: Arc<Mutex<HashMap<PluginInstanceId, Arc<InstanceConnections>>>>,
 }
 
-impl ConnectionCounts {
+impl ConnectionRegistry {
+    /// The one registry every service built by [`EgressHostService::new`] uses.
+    fn shared() -> Self {
+        static SHARED: OnceLock<ConnectionRegistry> = OnceLock::new();
+        SHARED.get_or_init(ConnectionRegistry::default).clone()
+    }
+
+    /// This instance's counter, created on first use.
+    ///
+    /// The map holds a strong reference for the life of the process, and that
+    /// is the point rather than an oversight. A `Weak` map would be tidier but
+    /// unsound here: no counter outlives the request that acquired against it,
+    /// so every entry would drop between connections and quietly reset the
+    /// ceiling to zero — a leak of budget rather than of memory. Growth is
+    /// bounded by the number of distinct instance identities the host admits,
+    /// which is the operator's installed plugin set; a guest cannot mint one.
+    fn counter(&self, instance: &PluginInstanceId) -> Arc<InstanceConnections> {
+        Arc::clone(self.lock().entry(instance.clone()).or_default())
+    }
+
+    fn acquire(
+        &self,
+        instance: &PluginInstanceId,
+        limit: usize,
+    ) -> Result<ConnectionLease, EgressError> {
+        self.counter(instance).acquire(instance, limit)
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<PluginInstanceId, Arc<InstanceConnections>>> {
+        self.by_instance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    fn live(&self, instance: &PluginInstanceId) -> usize {
+        self.lock()
+            .get(instance)
+            .map_or(0, |connections| *connections.lock())
+    }
+}
+
+/// One instance's live connection count, shared by every service that
+/// represents that instance.
+#[derive(Default)]
+struct InstanceConnections {
+    live: Mutex<usize>,
+}
+
+impl InstanceConnections {
     fn acquire(
         self: &Arc<Self>,
         instance: &PluginInstanceId,
         limit: usize,
     ) -> Result<ConnectionLease, EgressError> {
-        let mut counts = self
-            .by_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let count = counts.entry(instance.clone()).or_default();
-        if *count >= limit {
+        let mut live = self.lock();
+        if *live >= limit {
             return Err(EgressError::ConnectionLimitReached {
                 instance: instance_label(instance),
                 limit,
             });
         }
-        *count += 1;
+        *live += 1;
         Ok(ConnectionLease {
-            counts: Arc::clone(self),
-            instance: instance.clone(),
+            connections: Arc::clone(self),
         })
     }
 
-    fn release(&self, instance: &PluginInstanceId) {
-        let mut counts = self
-            .by_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let remove = counts.get_mut(instance).is_some_and(|count| {
-            *count = count.saturating_sub(1);
-            *count == 0
-        });
-        if remove {
-            counts.remove(instance);
-        }
+    fn release(&self) {
+        let mut live = self.lock();
+        *live = live.saturating_sub(1);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.live.lock().unwrap_or_else(|error| error.into_inner())
     }
 }
 
@@ -317,21 +383,18 @@ fn instance_label(instance: &PluginInstanceId) -> String {
 
 // Dropping the authorized token returns capacity to the shared budget.
 struct ConnectionLease {
-    counts: Arc<ConnectionCounts>,
-    instance: PluginInstanceId,
+    connections: Arc<InstanceConnections>,
 }
 
 impl fmt::Debug for ConnectionLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConnectionLease")
-            .field("instance", &self.instance)
-            .finish_non_exhaustive()
+        f.debug_struct("ConnectionLease").finish_non_exhaustive()
     }
 }
 
 impl Drop for ConnectionLease {
     fn drop(&mut self) {
-        self.counts.release(&self.instance);
+        self.connections.release();
     }
 }
 
@@ -364,11 +427,30 @@ impl AuthorizedEgress {
     }
 }
 
+/// Test-only stand-in for `tokio::net::lookup_host`.
+///
+/// A deterministic closure from a requested host and port to an address set,
+/// used only to model a resolver whose answer changes between calls (DNS
+/// rebinding) without depending on real DNS or resolver ordering. Production
+/// has no equivalent and never installs one.
+#[cfg(test)]
+type TestAddressResolver = Arc<dyn Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync>;
+
 /// Shared service injected into plugin stores and cloned across transports.
+///
+/// Policy is per service, because a service is built around one resolver.
+/// Connection accounting is not: it comes from the process-wide
+/// connection registry, so two services built independently for the same
+/// canonical instance spend one budget rather than one each.
 #[derive(Clone)]
 pub struct EgressHostService {
     resolver: EgressPolicyResolver,
-    counts: Arc<ConnectionCounts>,
+    connections: ConnectionRegistry,
+    /// Test-only DNS override. `None` in every production build (the field
+    /// does not exist there at all), so the resolve path stays the shipped
+    /// `lookup_host` call.
+    #[cfg(test)]
+    resolver_override: Option<TestAddressResolver>,
 }
 
 impl fmt::Debug for EgressHostService {
@@ -379,11 +461,61 @@ impl fmt::Debug for EgressHostService {
 
 impl EgressHostService {
     /// Construct one service around a live canonical policy resolver.
+    ///
+    /// The connection budget it enforces is the process-wide one for each
+    /// instance it sees, so an operator's ceiling holds no matter how many tool
+    /// registries end up representing the same instance.
     #[must_use]
     pub fn new(resolver: EgressPolicyResolver) -> Self {
         Self {
             resolver,
-            counts: Arc::new(ConnectionCounts::default()),
+            connections: ConnectionRegistry::shared(),
+            #[cfg(test)]
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose connection accounting is private to it.
+    ///
+    /// Test-only. Tests share one process with the real registry, so a test
+    /// holding a lease would otherwise be able to exhaust another test's
+    /// ceiling. Tests that are *about* the sharing use
+    /// [`EgressHostService::new`] with an instance identity unique to that
+    /// test, which is the only way to observe the shared registry without
+    /// depending on what else is running.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_private_connection_accounting(resolver: EgressPolicyResolver) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose DNS resolution is replaced by a deterministic closure.
+    ///
+    /// Test-only. The override stands in for `tokio::net::lookup_host`, so a
+    /// test can pin one answer and then observe that a *different* later answer
+    /// is never dialed — the DNS-rebinding / TOCTOU property, made deterministic
+    /// and free of any dependence on resolver ordering. Accounting is private to
+    /// the caller for the same reason [`Self::with_private_connection_accounting`]
+    /// is. Production has no equivalent constructor and never sets the override.
+    ///
+    /// The gate matches the *caller's*: the only caller is in [`crate::wasi_http`]'s
+    /// tests, and that module exists only under `plugins-wasmtime`. A wider gate
+    /// makes this dead code on the default feature surface, which the `default
+    /// features, all targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    #[must_use]
+    pub(crate) fn with_test_resolver(
+        resolver: EgressPolicyResolver,
+        addresses: impl Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: Some(Arc::new(addresses)),
         }
     }
 
@@ -399,6 +531,15 @@ impl EgressHostService {
     /// or connection-budget acquisition fails.
     pub async fn authorize(&self, request: EgressRequest) -> Result<AuthorizedEgress, EgressError> {
         let policy = self.resolve_policy(&request)?;
+        // Test-only DNS override. Production never installs one, so under
+        // `not(test)` this block compiles to nothing and the resolution below is
+        // exactly the shipped `lookup_host` path. Under test it lets a case pin
+        // the first answer and prove a later, different answer is never dialed.
+        #[cfg(test)]
+        if let Some(resolver) = &self.resolver_override {
+            let addresses = resolver(request.host(), request.port());
+            return self.authorize_with_policy(request, addresses, &policy);
+        }
         let addresses = tokio::net::lookup_host((request.host(), request.port()))
             .await
             .map_err(|error| EgressError::DnsFailed {
@@ -426,6 +567,23 @@ impl EgressHostService {
     ) -> Result<AuthorizedEgress, EgressError> {
         let policy = self.resolve_policy(&request)?;
         self.authorize_with_policy(request, addresses, &policy)
+    }
+
+    /// Live connection count held for one instance.
+    ///
+    /// Test-only: the budget is observable in production solely through
+    /// [`EgressError::ConnectionLimitReached`], and adapters must not be able to
+    /// read or reset it. Tests that prove a failed dial returns its slot need to
+    /// see the count itself, not just that a later acquire happened to succeed.
+    ///
+    /// The gate matches the *caller's*, not just `test`: the only caller is in
+    /// [`crate::wasi_http`]'s tests, and that module exists only under
+    /// `plugins-wasmtime`. A wider gate makes this dead code on the default
+    /// feature surface, which is exactly what the `default features, all
+    /// targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    pub(crate) fn live_connections(&self, instance: &PluginInstanceId) -> usize {
+        self.connections.live(instance)
     }
 
     fn resolve_policy(&self, request: &EgressRequest) -> Result<EgressPolicy, EgressError> {
@@ -459,8 +617,11 @@ impl EgressHostService {
             policy.private_access(&request.host),
             &policy.nat64_prefixes,
         )?;
+        // The ceiling comes from the policy this request just resolved, never
+        // from a value cached alongside the count: an operator who lowers
+        // `max_connections_per_instance` binds the next connection.
         let lease = self
-            .counts
+            .connections
             .acquire(request.instance_id(), policy.max_connections_per_instance)?;
         Ok(AuthorizedEgress {
             request,
@@ -622,13 +783,14 @@ pub enum EgressError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::{PluginCapability, PluginManifest, PluginPermission};
 
     use super::*;
 
-    fn scope_with_grants(
+    fn scope_in_package(
+        package: &str,
         binding: &str,
         grants: impl IntoIterator<Item = PluginPermission>,
     ) -> PluginInstanceScope {
@@ -638,7 +800,7 @@ mod tests {
             PluginPermission::SocketClient,
         ];
         let manifest = PluginManifest {
-            name: "egress-fixture".to_string(),
+            name: package.to_string(),
             version: "0.0.0-test".to_string(),
             description: None,
             author: None,
@@ -648,20 +810,29 @@ mod tests {
             config_schema: None,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         };
         PluginInstanceScope::from_manifest(&manifest, PluginCapability::Channel, binding, grants)
             .unwrap()
     }
 
+    fn scope_with_grants(
+        binding: &str,
+        grants: impl IntoIterator<Item = PluginPermission>,
+    ) -> PluginInstanceScope {
+        scope_in_package("egress-fixture", binding, grants)
+    }
+
+    fn all_grants() -> [PluginPermission; 3] {
+        [
+            PluginPermission::HttpClient,
+            PluginPermission::WebSocketClient,
+            PluginPermission::SocketClient,
+        ]
+    }
+
     fn scope(binding: &str) -> PluginInstanceScope {
-        scope_with_grants(
-            binding,
-            [
-                PluginPermission::HttpClient,
-                PluginPermission::WebSocketClient,
-                PluginPermission::SocketClient,
-            ],
-        )
+        scope_with_grants(binding, all_grants())
     }
 
     fn addr(ip: &str, port: u16) -> SocketAddr {
@@ -676,7 +847,20 @@ mod tests {
         EgressPolicy::new(&owned(hosts), &owned(allow_private), &[], limit).unwrap()
     }
 
+    /// A service with accounting private to the test that built it.
+    ///
+    /// Everything below except the sharing regressions is about policy, and
+    /// policy is per service. Isolating the counts keeps concurrently running
+    /// tests from spending each other's ceilings through the process registry.
     fn service(policy: EgressPolicy) -> EgressHostService {
+        EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+            move |_| Ok(policy.clone()),
+        ))
+    }
+
+    /// A service built exactly the way production builds one: bound to the
+    /// process-wide connection registry.
+    fn shared_service(policy: EgressPolicy) -> EgressHostService {
         EgressHostService::new(EgressPolicyResolver::new(move |_| Ok(policy.clone())))
     }
 
@@ -1017,6 +1201,95 @@ mod tests {
                 .authorize_addresses(second(), [addr("1.1.1.1", 6667)])
                 .is_ok()
         );
+    }
+
+    /// The sharing regression.
+    ///
+    /// Production never clones one service around the process. It builds a
+    /// fresh [`EgressHostService`] per `all_tools_with_runtime` call, and the
+    /// agent loop, the gateway, the channels orchestrator, and the delegate
+    /// tool each register the same canonical instance through a registry of
+    /// their own. When the count lived in the service, every one of those
+    /// registries handed that instance a full budget. These two services share
+    /// nothing but the instance identity.
+    #[test]
+    fn one_budget_is_shared_by_services_built_independently_for_one_instance() {
+        // Packages unique to this test. The registry is process-wide, so the
+        // instance identity is what keeps the assertions deterministic under a
+        // parallel test runner.
+        const INSTANCE: &str = "egress-shared-ceiling-fixture";
+        const OTHER: &str = "egress-other-ceiling-fixture";
+
+        let granted = policy(&["api.example.com"], &[], 1);
+        let first_registry = shared_service(granted.clone());
+        let second_registry = shared_service(granted);
+
+        let authorize = |service: &EgressHostService, package: &str| {
+            let request = EgressRequest::new(
+                scope_in_package(package, "main", all_grants()),
+                EgressTransport::Tls,
+                "api.example.com",
+                443,
+            )
+            .unwrap();
+            service.authorize_addresses(request, [addr("1.1.1.1", 443)])
+        };
+
+        let held = authorize(&first_registry, INSTANCE).unwrap();
+        assert!(
+            matches!(
+                authorize(&second_registry, INSTANCE),
+                Err(EgressError::ConnectionLimitReached { limit: 1, .. })
+            ),
+            "a second registry must not grant the same instance a second budget"
+        );
+        assert!(
+            authorize(&second_registry, OTHER).is_ok(),
+            "the ceiling is shared per instance, not seized process-wide"
+        );
+
+        drop(held);
+        assert!(
+            authorize(&second_registry, INSTANCE).is_ok(),
+            "a slot released in one registry must come back in every registry"
+        );
+    }
+
+    /// The count is shared; the ceiling it is compared against is not cached
+    /// with it. An operator who lowers `max_connections_per_instance` binds the
+    /// next connection rather than the next restart.
+    #[test]
+    fn the_connection_ceiling_is_re_read_from_policy_on_every_acquire() {
+        let ceiling = Arc::new(AtomicUsize::new(2));
+        let configured = Arc::clone(&ceiling);
+        let service = EgressHostService::with_private_connection_accounting(
+            EgressPolicyResolver::new(move |_| {
+                EgressPolicy::new(
+                    &owned(&["api.example.com"]),
+                    &[],
+                    &[],
+                    configured.load(Ordering::SeqCst),
+                )
+            }),
+        );
+        let authorize = || {
+            service.authorize_addresses(
+                request("main", EgressTransport::Tls, "api.example.com", 443),
+                [addr("1.1.1.1", 443)],
+            )
+        };
+
+        let held = authorize().unwrap();
+        ceiling.store(1, Ordering::SeqCst);
+        assert!(
+            matches!(
+                authorize(),
+                Err(EgressError::ConnectionLimitReached { limit: 1, .. })
+            ),
+            "a lowered ceiling must bind the next acquire"
+        );
+        drop(held);
+        assert!(authorize().is_ok());
     }
 
     #[test]

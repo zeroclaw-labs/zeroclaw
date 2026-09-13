@@ -181,6 +181,7 @@ mod tests {
                 input_schema: serde_json::json!({"type": "object"}),
             },
             Arc::new(registry),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
         );
         assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
         assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);

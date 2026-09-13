@@ -11,7 +11,9 @@
   - changed-files:
       - any-glob-to-any-file:
           - "Cargo.toml"
+          - "**/Cargo.toml"
           - "Cargo.lock"
+          - "**/Cargo.lock"
           - "deny.toml"
           - ".github/dependabot.yml"
 
@@ -38,6 +40,7 @@
           - "src/commands/**"
           - "src/alias_cli/**"
           - "src/cli_input.rs"
+          - "src/memory/cli.rs"
           - "crates/zeroclaw-commands/**"
           - "crates/zeroclaw-runtime/src/cli_input.rs"
 
@@ -389,7 +392,9 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/hardware/**"
+          - "src/peripherals/mod.rs"
           - "crates/zeroclaw-hardware/**"
+          - "crates/zeroclaw-api/src/peripherals_traits.rs"
           - "firmware/**"
 
 "web":
@@ -493,12 +498,6 @@
       - any-glob-to-any-file:
           - "src/service/**"
           - "crates/zeroclaw-runtime/src/service/**"
-
-"skillforge":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/skillforge/**"
-          - "crates/zeroclaw-runtime/src/skillforge/**"
 
 "skills":
   - changed-files:

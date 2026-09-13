@@ -12,7 +12,8 @@ use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
 use crate::observability::Observer;
-use crate::tools::{ActivatedToolSet, Tool};
+use crate::tools::ActivatedToolSet;
+use crate::tools::scoped::ScopedToolRegistry;
 
 /// The resolved model binding: which provider, model, and temperature a turn
 /// uses. The base layer any LLM call needs; [`ResolvedAgentExecution`] composes
@@ -106,8 +107,9 @@ impl ResolvedModelAccess<'_> {
 pub struct ResolvedAgentExecution<'a> {
     /// Provider + model + temperature.
     pub model_access: ResolvedModelAccess<'a>,
-    /// The tools available this turn (gated per the agent's policy upstream).
-    pub tools_registry: &'a [Box<dyn Tool>],
+    /// The tools available this turn, sealed as a [`ScopedToolRegistry`] so the
+    /// engine can only be handed a registry minted by `assemble()` (the seal).
+    pub tools_registry: &'a ScopedToolRegistry,
     /// Telemetry/audit sink.
     pub observer: &'a dyn Observer,
     /// Suppress stderr output (subagents/reviews run silent).
@@ -154,7 +156,7 @@ pub struct ResolvedAgentExecution<'a> {
 /// the borrowed sinks, channels, and policy handles a path holds for the turn.
 /// A grouped input layer (not stored state); `resolve` spreads it into the bundle.
 pub struct ResolvedIo<'a> {
-    pub tools_registry: &'a [Box<dyn Tool>],
+    pub tools_registry: &'a ScopedToolRegistry,
     pub observer: &'a dyn Observer,
     pub silent: bool,
     pub approval: Option<&'a ApprovalManager>,
@@ -262,6 +264,7 @@ mod run_model_query_tests {
                     input_tokens: Some(100),
                     output_tokens: Some(20),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -309,6 +312,7 @@ mod run_model_query_tests {
                     input_tokens: Some(80),
                     output_tokens: Some(if rejected { 5 } else { 7 }),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             })
@@ -533,6 +537,7 @@ mod run_model_query_tests {
                         input_tokens: Some(80),
                         output_tokens: Some(5),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 },
@@ -579,6 +584,7 @@ mod run_model_query_tests {
                     input_tokens: Some(80),
                     output_tokens: Some(5),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             },

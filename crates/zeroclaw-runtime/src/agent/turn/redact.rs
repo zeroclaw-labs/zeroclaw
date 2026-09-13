@@ -1,6 +1,10 @@
 //! Credential redaction for the rendering layer (logs, observer events, and
-//! UI-facing turn events). This never runs on the data path: tool results fed
-//! back to the model and signed by HMAC receipts always carry raw bytes.
+//! UI-facing turn events). The success data path is untouched: a successful
+//! tool result fed back to the model and signed by an HMAC receipt carries
+//! raw bytes. The one data-path exception is the failure arms of
+//! `execute_one_tool`, which fold a tool's detailed error body into the
+//! model-visible text and scrub that combined string first, so a reflected
+//! token in a 4xx/5xx body is not forwarded to the model provider.
 
 use regex::Regex;
 use std::sync::LazyLock;

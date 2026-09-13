@@ -22,8 +22,8 @@ Last verified against the `v0.8.2` release cycle.
 6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
-That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+That is the entire process. Everything else (crates.io, Docker, website
+redeploy, Scoop, AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
 detects the stable GitHub release through its own autobump service. You do not
 need to do anything for those unless a job explicitly fails or Homebrew's
 external bump remains stale.
@@ -124,7 +124,7 @@ If the PR also changes `[workspace.package] rust-version` or pinned Rust toolcha
 
 Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
 adds. If the PR raises a toolchain floor, also apply `risk:high` and route it
-through lane D. Get one maintainer review. Merge when CI is green. The **Installer Drift**
+through lane D. Get two independent Core Team approvals. Merge only when CI is green. The **Installer Drift**
 gate in CI fails the PR if a generated surface is out of sync with the spec, so
 a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit
@@ -319,6 +319,7 @@ Everything else is skipped with a logged reason:
 ```
 ==> skip release-stable-manual:publish (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:docker (not on dry-run-safe allowlist)
+==> skip release-stable-manual:crates (not on dry-run-safe allowlist)
 ==> skip release-stable-manual:redeploy-website (not on dry-run-safe allowlist)
 ==> skip docs-deploy:deploy (not on dry-run-safe allowlist)
 ==> skip daily-audit:advisories (not on dry-run-safe allowlist)
@@ -351,7 +352,7 @@ not real defects:
 
 - Jobs that depend on a real release tag (`publish` creating a GitHub
   Release).
-- Environment-gated jobs (`publish`, `docker`): the
+- Environment-gated jobs (`publish`, `docker`, and the crates publisher): the
   approval UI doesn't exist locally.
 - OIDC-based federated identity tokens.
 
@@ -385,15 +386,17 @@ re-trigger. Do not try to work around it.
 
 ## Step 5: Approve the environment gates
 
-Two jobs are gated by GitHub environment protection rules. When each becomes
+Three jobs are gated by GitHub environment protection rules. When each becomes
 pending you will see a **"Waiting for review"** banner in the workflow run.
 
-Approve both when they appear:
+Approve all three when they appear. Approve `crates-io` only after its tokenless
+package preflight is green:
 
 | Environment | Job | What it does |
 |---|---|---|
 | `github-releases` | `publish` | Creates the GitHub Release and uploads assets |
 | `docker` | `docker` | Pushes images to GHCR |
+| `crates-io` | `crates / Publish to crates.io` | Publishes the verified 23-crate workspace in dependency order |
 
 If you miss the approval window and a job times out, re-run only the failed
 job from the workflow run page; you do not need to restart from scratch.
@@ -424,7 +427,7 @@ inside the stable release workflow. You do not need a separate Docker check if
 all release jobs are green. If a maintainer instead starts the release by
 pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
 confirm that sibling run is green before treating container publication as
-complete. Scoop and AUR need separate attention only when their jobs show red.
+complete. crates.io, Scoop, and AUR need separate attention only when their jobs show red.
 Homebrew Core is external to this workflow; its
 [autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
 its own schedule.
@@ -530,6 +533,14 @@ failed distribution job does not invalidate the release itself. For Scoop
 credential failures, use Scoop Bucket Canary instead of treating a generic dry
 run as credential proof; the canary enables the fail-closed
 `credential_canary` path.
+
+**The crates.io publisher stopped after uploading some crates:** Do not bump the
+version or start a second release. crates.io versions cannot be replaced or
+deleted. Fix the failing crate at the same release commit, then re-run
+`Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
+every `<crate>@<version>` first and skips versions that already landed. Read the
+Publish step for the last successful crate. If preflight failed, no upload was
+attempted and the problem is still reversible.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

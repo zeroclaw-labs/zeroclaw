@@ -949,8 +949,6 @@ pub fn logs(config: &Config, init_system: InitSystem, lines: usize, follow: bool
 }
 
 fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
-    // Try the launchd log files first (StandardOutPath / StandardErrorPath from the plist).
-    // These are the most reliable source since they capture all daemon output.
     let exe = std::env::current_exe().ok();
     let homebrew_var_dir = exe.as_ref().and_then(|e| homebrew_var_dir_from_exe(e));
     let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
@@ -966,38 +964,19 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    // Prefer stderr log (most informative), fall back to stdout
-    let log_file = if stderr_log.exists() {
-        stderr_log
-    } else if stdout_log.exists() {
-        stdout_log
+    let targets = if follow {
+        follow_log_targets(&stdout_log, &stderr_log)
     } else {
+        service_log_targets(&stdout_log, &stderr_log)
+    };
+    if targets.is_empty() {
         bail!(
             "No log files found in {}. Is the service installed?",
             logs_dir.display()
         );
-    };
-
-    if follow {
-        let status = Command::new("tail")
-            .args(["-n", &lines.to_string(), "-f"])
-            .arg(&log_file)
-            .status()
-            .context("Failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with non-zero status");
-        }
-    } else {
-        let status = Command::new("tail")
-            .args(["-n", &lines.to_string()])
-            .arg(&log_file)
-            .status()
-            .context("Failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with non-zero status");
-        }
     }
-    Ok(())
+    report_empty_capture(&targets, &logs_dir, follow);
+    tail_files(&targets, lines, follow)
 }
 
 fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
@@ -1013,21 +992,22 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             }
         }
         InitSystem::Openrc => {
-            // OpenRC logs go to /var/log/<service>/error.log (as configured in the init script).
             let log_dir = linux_openrc_log_dir(config);
-            let log_file = log_dir.join("error.log");
-            if !log_file.exists() {
-                // Fall back to access log
-                let access_log = log_dir.join("access.log");
-                if !access_log.exists() {
-                    bail!(
-                        "No log files found at {}. Is the service installed?",
-                        log_dir.display()
-                    );
-                }
-                return tail_file(&access_log, lines, follow);
+            let access_log = log_dir.join("access.log");
+            let error_log = log_dir.join("error.log");
+            let targets = if follow {
+                follow_log_targets(&access_log, &error_log)
+            } else {
+                service_log_targets(&access_log, &error_log)
+            };
+            if targets.is_empty() {
+                bail!(
+                    "No log files found at {}. Is the service installed?",
+                    log_dir.display()
+                );
             }
-            tail_file(&log_file, lines, follow)?;
+            report_empty_capture(&targets, &log_dir, follow);
+            tail_files(&targets, lines, follow)?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -1044,61 +1024,113 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    let log_file = if stderr_log.exists() {
-        stderr_log
-    } else if stdout_log.exists() {
-        stdout_log
-    } else {
+    let targets = service_log_targets(&stdout_log, &stderr_log);
+    let Some((primary, rest)) = targets.split_first() else {
         bail!(
             "No log files found in {}. Is the service installed?",
             logs_dir.display()
         );
     };
+    report_empty_capture(&targets, &logs_dir, follow);
+    let label_each = !rest.is_empty();
 
-    if follow {
-        // Windows: use PowerShell Get-Content -Wait for tail -f equivalent
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "Get-Content -Path '{}' -Tail {} -Wait",
-                    log_file.display().to_string(),
-                    lines
-                ),
-            ])
-            .status()
-            .context("Failed to run PowerShell Get-Content")?;
-        if !status.success() {
-            bail!("PowerShell Get-Content exited with non-zero status");
+    if !follow {
+        for path in &targets {
+            if label_each {
+                println!("==> {} <==", path.display());
+            }
+            run_get_content(path, lines, false)?;
         }
-    } else {
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "Get-Content -Path '{}' -Tail {}",
-                    log_file.display().to_string(),
-                    lines
-                ),
-            ])
-            .status()
-            .context("Failed to run PowerShell Get-Content")?;
-        if !status.success() {
-            bail!("PowerShell Get-Content exited with non-zero status");
-        }
+        return Ok(());
+    }
+
+    // `Get-Content -Wait` blocks on one path, so only the primary stream is followed.
+    for path in rest {
+        println!("==> {} <==", path.display());
+        run_get_content(path, lines, false)?;
+    }
+    if label_each {
+        println!("==> {} <==", primary.display());
+    }
+    run_get_content(primary, lines, true)
+}
+
+fn get_content_command(path: &Path, lines: usize, follow: bool) -> String {
+    let quoted = path.display().to_string().replace('\'', "''");
+    let wait = if follow { " -Wait" } else { "" };
+    format!("Get-Content -LiteralPath '{quoted}' -Tail {lines}{wait}")
+}
+
+fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
+    let status = Command::new("powershell")
+        .args(["-Command", &get_content_command(path, lines, follow)])
+        .status()
+        .context("Failed to run PowerShell Get-Content")?;
+    if !status.success() {
+        bail!("PowerShell Get-Content exited with non-zero status");
     }
     Ok(())
 }
 
-/// Tail a log file using the system `tail` command.
-fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
-    let mut args = vec!["-n".to_string(), lines.to_string()];
-    if follow {
-        args.push("-f".to_string());
+fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    let candidates = [primary, secondary];
+    let with_content: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|path| has_content(path))
+        .map(|path| path.to_path_buf())
+        .collect();
+    if !with_content.is_empty() {
+        return with_content;
     }
-    let status = Command::new("tail")
-        .args(&args)
-        .arg(path)
+    candidates
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.to_path_buf())
+        .collect()
+}
+
+fn follow_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    // A follower keeps the empty stream too: it is where a later failure lands.
+    [primary, secondary]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+fn has_content(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
+}
+
+fn report_empty_capture(targets: &[PathBuf], logs_dir: &Path, follow: bool) {
+    if targets.iter().any(|path| has_content(path)) {
+        return;
+    }
+    if follow {
+        eprintln!(
+            "No daemon output captured yet in {}; waiting for new output.",
+            logs_dir.display()
+        );
+    } else {
+        eprintln!("No daemon output captured yet in {}.", logs_dir.display());
+    }
+}
+
+fn tail_command(paths: &[PathBuf], lines: usize, follow: bool) -> Command {
+    let mut command = Command::new("tail");
+    command.arg("-n").arg(lines.to_string());
+    if follow {
+        command.arg("-f");
+    }
+    command.args(paths);
+    command
+}
+
+fn tail_files(paths: &[PathBuf], lines: usize, follow: bool) -> Result<()> {
+    if paths.is_empty() {
+        bail!("No log files to tail");
+    }
+    let status = tail_command(paths, lines, follow)
         .status()
         .context("Failed to run tail")?;
     if !status.success() {
@@ -2857,20 +2889,183 @@ mod service_helper_tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn tail_file_errors_on_missing_file() {
-        let missing = Path::new("/tmp/zeroclaw-test-nonexistent-log-file.log");
-        let result = tail_file(missing, 10, false);
+    fn tail_files_errors_on_missing_file() {
+        let missing = PathBuf::from("/tmp/zeroclaw-test-nonexistent-log-file.log");
+        let result = tail_files(&[missing], 10, false);
         assert!(result.is_err(), "tail on missing file should fail");
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn tail_file_reads_existing_file() {
+    fn tail_files_reads_existing_file() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let log = dir.path().join("test-tail.log");
         fs::write(&log, "line1\nline2\nline3\nline4\nline5\n").unwrap();
-        // tail should succeed on existing file
-        let result = tail_file(&log, 3, false);
+        let result = tail_files(&[log], 3, false);
         assert!(result.is_ok(), "tail on existing file should succeed");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn tail_files_reads_every_named_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let first = dir.path().join("first.log");
+        let second = dir.path().join("second.log");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let result = tail_files(&[first, second], 3, false);
+        assert!(result.is_ok(), "tail on two existing files should succeed");
+    }
+
+    #[test]
+    fn tail_files_rejects_an_empty_selection() {
+        let result = tail_files(&[], 10, false);
+        assert!(result.is_err(), "tail with no paths should fail");
+    }
+
+    #[test]
+    fn service_log_targets_skips_the_stream_without_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log],
+            "an empty capture file must not hide the stream that has output"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_lists_both_streams_when_both_have_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "provider error\n").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log, stderr_log],
+            "both streams carry output, so both are shown, primary first"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_keeps_empty_files_so_follow_can_attach() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log, stderr_log],
+            "a daemon that has not written yet is still followable"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_is_empty_when_nothing_was_captured() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+
+        assert!(
+            service_log_targets(&stdout_log, &stderr_log).is_empty(),
+            "no capture files means the caller reports a missing install"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_ignores_a_missing_counterpart() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log],
+            "a capture file that was never created is not a target"
+        );
+    }
+
+    #[test]
+    fn get_content_command_uses_literal_path_and_doubles_quotes() {
+        let command = get_content_command(Path::new("C:\\logs\\o'brien[1].log"), 25, true);
+        assert_eq!(
+            command,
+            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Tail 25 -Wait"
+        );
+    }
+
+    #[test]
+    fn get_content_command_omits_wait_without_follow() {
+        let command = get_content_command(Path::new("C:\\logs\\daemon.stdout.log"), 50, false);
+        assert_eq!(
+            command,
+            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Tail 50"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn follow_sees_a_failure_written_to_stderr_after_startup() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        let targets = follow_log_targets(&stdout_log, &stderr_log);
+        let mut viewer = tail_command(&targets, 10, true)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("tail should start");
+        let output = viewer.stdout.take().expect("tail stdout is piped");
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let saw = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match line_rx.recv_timeout(left) {
+                    Ok(line) if line.contains(needle) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+
+        let attached = saw("daemon.stderr.log <==");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&stderr_log)
+            .unwrap()
+            .write_all(b"launchd capture failed: child exited\n")
+            .unwrap();
+        let delivered = saw("launchd capture failed");
+        let _ = viewer.kill();
+        let _ = viewer.wait();
+
+        assert!(attached, "the follower must open the empty stderr file");
+        assert!(
+            delivered,
+            "a failure appended to stderr must reach the running viewer"
+        );
     }
 }

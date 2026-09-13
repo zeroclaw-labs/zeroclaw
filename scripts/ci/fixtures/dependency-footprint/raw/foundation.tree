@@ -1,0 +1,3 @@
+zeroclaw v0.8.4 (/fixture/checkout)	features:
+dep-crate v1.0.0	features:
+dep-crate v2.0.0	features:__rustls,feature-a (*)

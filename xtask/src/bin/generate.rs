@@ -20,6 +20,12 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Render the source-backed SOP syntax reference.
+    SopSyntax {
+        /// Regenerate to memory and diff against on-disk; nonzero on drift.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print the resolved feature list for a build selection, comma-joined.
     /// Surfaces and CI consume this instead of hardcoding feature names.
     Features {
@@ -40,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Installers { targets, check } => xtask::generate::run(&targets, check),
+        Cmd::SopSyntax { check } => xtask::generate::sop_syntax::run(check),
         Cmd::Features {
             selection,
             target,

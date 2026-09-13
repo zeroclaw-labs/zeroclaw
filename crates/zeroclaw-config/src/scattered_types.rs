@@ -64,6 +64,38 @@ pub use zeroclaw_api::model_provider::{
     MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams,
 };
 
+/// User-facing control for Anthropic's `thinking.display` beta
+/// (`thinking-display-updates-2026-08-18`), which shapes how thinking blocks
+/// come back: omitted, as progress updates, or summarized. `Off` (the default)
+/// leaves the field out of requests entirely, matching pre-beta behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplayMode {
+    #[default]
+    Off,
+    Omitted,
+    Updates,
+    Summarized,
+}
+
+impl HasPropKind for ThinkingDisplayMode {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
+
+impl ThinkingDisplayMode {
+    /// Map to the wire-level `ThinkingDisplay`. `Off` maps to `None` so
+    /// requests with the default setting carry no `display` key at all.
+    pub fn to_display(self) -> Option<zeroclaw_api::model_provider::ThinkingDisplay> {
+        match self {
+            Self::Off => None,
+            Self::Omitted => Some(zeroclaw_api::model_provider::ThinkingDisplay::Omitted),
+            Self::Updates => Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates),
+            Self::Summarized => Some(zeroclaw_api::model_provider::ThinkingDisplay::Summarized),
+        }
+    }
+}
+
 /// Configuration for thinking/reasoning level control.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -76,6 +108,10 @@ pub struct ThinkingConfig {
     pub native_thinking: bool,
     #[serde(default)]
     pub budget_tokens: HashMap<String, u32>,
+    /// Anthropic `thinking.display` beta control. Only meaningful when
+    /// `native_thinking` is enabled and the provider is Anthropic.
+    #[serde(default)]
+    pub display: ThinkingDisplayMode,
 }
 
 impl Default for ThinkingConfig {
@@ -84,6 +120,7 @@ impl Default for ThinkingConfig {
             default_level: ThinkingLevel::Medium,
             native_thinking: false,
             budget_tokens: HashMap::new(),
+            display: ThinkingDisplayMode::Off,
         }
     }
 }
@@ -211,7 +248,7 @@ impl Default for EvalConfig {
 }
 
 fn default_eval_suite_dir() -> String {
-    "evals".to_string()
+    "evals/regression".to_string()
 }
 fn default_eval_mode() -> String {
     "replay".to_string()
@@ -225,6 +262,9 @@ fn default_eval_mode() -> String {
 #[prefix = "eval"]
 pub struct EvalHarnessConfig {
     /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    /// Defaults to `evals/regression`, the CI-gating suite. Planned sibling suites
+    /// `evals/capability/` (tracked, non-gating) and `evals/live/` (real-provider,
+    /// never in CI) live alongside it.
     #[serde(default = "default_eval_suite_dir")]
     pub suite_dir: String,
     /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.

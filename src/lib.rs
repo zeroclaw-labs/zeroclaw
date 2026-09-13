@@ -71,8 +71,6 @@ pub mod memory;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod multimodal;
 #[cfg(feature = "agent-runtime")]
-pub mod nodes;
-#[cfg(feature = "agent-runtime")]
 pub mod observability;
 #[cfg(feature = "agent-runtime")]
 pub mod peripherals;

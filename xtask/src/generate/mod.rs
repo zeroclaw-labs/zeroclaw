@@ -12,6 +12,7 @@ pub mod install_sh;
 pub mod packaging;
 pub mod runtime_locales;
 pub mod setup_bat;
+pub mod sop_syntax;
 pub mod spec;
 pub mod tools_ftl;
 pub mod zerocode_themes;
@@ -104,6 +105,14 @@ fn registry() -> Vec<Surface> {
             name: "dockerfile-alpine",
             file: "Dockerfile.alpine",
             render: |root, cur| render_docker_arg(root, cur),
+        },
+        // Base-image pins only: the relay builds `-p zerorelay` with no feature
+        // selection, so it carries no `docker-features-arg` zone and must not go
+        // through `render_docker_arg`.
+        Surface {
+            name: "dockerfile-zerorelay",
+            file: "apps/zerorelay/Dockerfile",
+            render: |root, cur| container_base::splice_zones(root, cur),
         },
         Surface {
             name: "pkgbuild",

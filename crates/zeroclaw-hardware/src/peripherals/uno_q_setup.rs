@@ -161,23 +161,23 @@ fn deploy_local(bridge_dir: Option<&std::path::Path>) -> Result<()> {
 fn write_embedded_bridge(dest: &std::path::Path) -> Result<()> {
     let app_yaml = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/app.yaml"
+        "/firmware/uno-q-bridge/app.yaml"
     ));
     let sketch_ino = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/sketch/sketch.ino"
+        "/firmware/uno-q-bridge/sketch/sketch.ino"
     ));
     let sketch_yaml = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/sketch/sketch.yaml"
+        "/firmware/uno-q-bridge/sketch/sketch.yaml"
     ));
     let main_py = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/python/main.py"
+        "/firmware/uno-q-bridge/python/main.py"
     ));
     let requirements = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../firmware/uno-q-bridge/python/requirements.txt"
+        "/firmware/uno-q-bridge/python/requirements.txt"
     ));
 
     std::fs::write(dest.join("app.yaml"), app_yaml)?;

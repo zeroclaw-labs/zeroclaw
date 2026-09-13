@@ -8,14 +8,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// A single keystroke pattern.
-///
-/// On darwin, most `CONTROL` chords are translated to `SUPER` at match time.
-/// Terminal-owned chords such as Ctrl+C, Ctrl+G, and Ctrl+K stay literal so
-/// host shortcuts do not shadow ZeroCode actions.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Chord {
     pub code: KeyCode,
     pub modifiers: KeyModifiers,
+    primary: bool,
 }
 
 impl Chord {
@@ -23,6 +20,7 @@ impl Chord {
         Self {
             code,
             modifiers: KeyModifiers::NONE,
+            primary: false,
         }
     }
 
@@ -31,11 +29,27 @@ impl Chord {
     }
 
     pub const fn with(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self { code, modifiers }
+        Self {
+            code,
+            modifiers,
+            primary: false,
+        }
     }
 
     pub const fn ctrl(c: char) -> Self {
         Self::with(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    pub const fn primary(c: char) -> Self {
+        Self::with_primary(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    pub const fn with_primary(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self {
+            code,
+            modifiers,
+            primary: true,
+        }
     }
 
     pub const fn shift(code: KeyCode) -> Self {
@@ -44,21 +58,47 @@ impl Chord {
 
     pub fn matches(&self, event: &KeyEvent) -> bool {
         event.code == self.code
-            && normalise_mods(self.code, self.modifiers)
-                == normalise_mods(event.code, event.modifiers)
+            && self.effective_modifiers() == effective_event_modifiers(event.code, event.modifiers)
     }
 
-    /// `Ctrl+K` on most platforms; `⌘K` on darwin. On darwin, a
-    /// host-reserved chord's control label is the literal word `Ctrl`
-    /// (not the `⌘` glyph) and needs a separator to stay readable —
-    /// see `control_display_label`.
+    /// Whether two chords claim the same key event.
+    ///
+    /// Not `==`. [`matches`](Self::matches) compares effective event
+    /// modifiers, so two chords that differ on the wire can still own one
+    /// event when one uses platform-primary intent.
+    #[must_use]
+    pub fn same_key(&self, other: &Self) -> bool {
+        self.code == other.code && self.effective_modifiers() == other.effective_modifiers()
+    }
+
+    pub(crate) fn effective_modifiers(&self) -> KeyModifiers {
+        effective_event_modifiers(self.code, self.modifiers_for_event())
+    }
+
+    fn modifiers_for_event(&self) -> KeyModifiers {
+        let mut modifiers = self.modifiers;
+        if self.primary {
+            #[cfg(target_os = "macos")]
+            modifiers.insert(KeyModifiers::SUPER);
+            #[cfg(not(target_os = "macos"))]
+            modifiers.insert(KeyModifiers::CONTROL);
+        }
+        modifiers
+    }
+
     pub fn display(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
         let mut literal_word_control = false;
+        if self.primary {
+            parts.push(if cfg!(target_os = "macos") {
+                "⌘"
+            } else {
+                "Ctrl"
+            });
+        }
         if self.modifiers.contains(KeyModifiers::CONTROL) {
-            let label = control_display_label(&self.code);
-            literal_word_control = cfg!(target_os = "macos") && label == "Ctrl";
-            parts.push(label);
+            literal_word_control = true;
+            parts.push("Ctrl");
         }
         if self.modifiers.contains(KeyModifiers::SUPER) {
             parts.push(if cfg!(target_os = "macos") {
@@ -89,8 +129,9 @@ impl Chord {
 
     pub fn wire(&self) -> String {
         let mut out = String::new();
-        // Modifier tokens walk the canonical registry so render and
-        // parse share one source of truth — no string-literal arms.
+        if self.primary {
+            out.push_str("primary+");
+        }
         for (token, flag) in MOD_TOKENS {
             if self.modifiers.contains(*flag) {
                 out.push_str(token);
@@ -102,12 +143,10 @@ impl Chord {
     }
 }
 
-/// Canonical modifier token registry. Walked by both `wire()` (render)
-/// and `from_str` (parse), so the two directions can never drift.
-/// `super` is accepted on parse but never emitted on non-darwin; the
-/// Ctrl→Super normalisation stays purely at match time.
+/// Canonical non-primary modifier token registry. Walked by both `wire()`
+/// (render) and `from_str` (parse), so the two directions can never drift.
 const MOD_TOKENS: &[(&str, KeyModifiers)] = &[
-    ("ctrl", KeyModifiers::CONTROL),
+    ("control", KeyModifiers::CONTROL),
     ("alt", KeyModifiers::ALT),
     ("shift", KeyModifiers::SHIFT),
     ("super", KeyModifiers::SUPER),
@@ -198,10 +237,7 @@ impl FromStr for Chord {
         // `"+"` yields two empty segments and the parse fails.
         if trimmed.chars().count() == 1 {
             let code = parse_keycode(trimmed)?;
-            return Ok(Chord {
-                code,
-                modifiers: KeyModifiers::NONE,
-            });
+            return Ok(Chord::key(code));
         }
         let mut segments: Vec<&str> = trimmed.split('+').collect();
         // Last segment is the key (case preserved so 'G' stays distinct
@@ -210,16 +246,25 @@ impl FromStr for Chord {
             .pop()
             .ok_or_else(|| ChordParseError(s.to_string()))?;
         let mut modifiers = KeyModifiers::NONE;
+        let mut primary = false;
         for seg in segments {
             let lower = seg.to_lowercase();
-            let flag = MOD_TOKENS
-                .iter()
-                .find_map(|(t, f)| (*t == lower).then_some(*f))
-                .ok_or_else(|| ChordParseError(s.to_string()))?;
-            modifiers.insert(flag);
+            if lower == "primary" {
+                primary = true;
+            } else {
+                let flag = MOD_TOKENS
+                    .iter()
+                    .find_map(|(t, f)| (*t == lower).then_some(*f))
+                    .ok_or_else(|| ChordParseError(s.to_string()))?;
+                modifiers.insert(flag);
+            }
         }
         let code = parse_keycode(key_token)?;
-        Ok(Chord { code, modifiers })
+        Ok(Chord {
+            code,
+            modifiers,
+            primary,
+        })
     }
 }
 
@@ -236,39 +281,7 @@ impl<'de> Deserialize<'de> for Chord {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn normalise_mods(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
-    if m.contains(KeyModifiers::CONTROL) && !is_host_reserved_chord(&code) {
-        m.remove(KeyModifiers::CONTROL);
-        m.insert(KeyModifiers::SUPER);
-    }
-    strip_redundant_shift(code, m)
-}
-
-#[cfg(target_os = "macos")]
-fn is_host_reserved_chord(code: &KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::Char('c' | 'C' | 'g' | 'G' | 'k' | 'K' | 'n' | 'N' | 's' | 'S') | KeyCode::F(1)
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn control_display_label(code: &KeyCode) -> &'static str {
-    if is_host_reserved_chord(code) {
-        "Ctrl"
-    } else {
-        "⌘"
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn control_display_label(_code: &KeyCode) -> &'static str {
-    "Ctrl"
-}
-
-#[cfg(not(target_os = "macos"))]
-fn normalise_mods(code: KeyCode, m: KeyModifiers) -> KeyModifiers {
+fn effective_event_modifiers(code: KeyCode, m: KeyModifiers) -> KeyModifiers {
     strip_redundant_shift(code, m)
 }
 
@@ -371,12 +384,30 @@ mod tests {
         assert!(chord.matches(&event));
     }
 
+    #[test]
+    fn ctrl_chord_stays_literal_control_on_every_platform() {
+        let chord = Chord::ctrl('x');
+        let control = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(chord.matches(&control));
+        assert_eq!(chord.display(), "Ctrl+x");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn ctrl_chord_matches_super_event_on_darwin() {
-        let chord = Chord::ctrl('x');
+    fn primary_chord_matches_super_event_on_darwin() {
+        let chord = Chord::primary('x');
         let event = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SUPER);
         assert!(chord.matches(&event));
+        assert_eq!(chord.display(), "⌘x");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn primary_chord_matches_control_event_on_non_darwin() {
+        let chord = Chord::primary('x');
+        let event = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(chord.matches(&event));
+        assert_eq!(chord.display(), "Ctrl+x");
     }
 
     #[cfg(target_os = "macos")]
@@ -390,12 +421,8 @@ mod tests {
         assert!(chord.matches(&quit));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn terminal_safe_chords_stay_literal_ctrl_on_darwin() {
-        // Terminal-owned chords must retain literal Control
-        // matching (not the host-reserved Command event) and display
-        // with the literal word "Ctrl" plus a separator on darwin.
+    fn literal_control_is_key_independent() {
         for c in ['n', 's', 'g', 'k'] {
             let chord = Chord::ctrl(c);
             let ctrl = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
@@ -422,12 +449,6 @@ mod tests {
     #[test]
     fn display_ctrl_on_non_darwin() {
         assert_eq!(Chord::ctrl('k').display(), "Ctrl+k");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn display_ctrl_on_darwin() {
-        assert_eq!(Chord::ctrl('x').display(), "⌘x");
     }
 
     #[cfg(target_os = "macos")]
@@ -465,6 +486,8 @@ mod tests {
     fn wire_round_trips_modifiers() {
         for c in [
             Chord::ctrl('k'),
+            Chord::primary('r'),
+            Chord::with_primary(KeyCode::Char('x'), KeyModifiers::CONTROL),
             Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
             Chord::shift(KeyCode::Up),
             Chord::with(
@@ -496,7 +519,12 @@ mod tests {
     #[test]
     fn wire_is_os_independent_lowercase() {
         // Never emits the darwin glyphs — same on every platform.
-        assert_eq!(Chord::ctrl('k').wire(), "ctrl+k");
+        assert_eq!(Chord::ctrl('k').wire(), "control+k");
+        assert_eq!(Chord::primary('r').wire(), "primary+r");
+        assert_eq!(
+            Chord::with_primary(KeyCode::Char('x'), KeyModifiers::CONTROL).wire(),
+            "primary+control+x"
+        );
         assert_eq!(Chord::key(KeyCode::PageUp).wire(), "pageup");
         assert_eq!(Chord::char(' ').wire(), "space");
     }
@@ -522,9 +550,9 @@ mod tests {
             Chord::from_str("Enter").unwrap(),
             Chord::key(KeyCode::Enter)
         );
-        assert_eq!(Chord::from_str("CTRL+k").unwrap(), Chord::ctrl('k'));
-        assert_eq!(Chord::from_str("ctrl+k").unwrap(), Chord::ctrl('k'));
-        assert_eq!(Chord::from_str("Ctrl+K").unwrap(), Chord::ctrl('K'));
+        assert_eq!(Chord::from_str("CONTROL+k").unwrap(), Chord::ctrl('k'));
+        assert_eq!(Chord::from_str("primary+k").unwrap(), Chord::primary('k'));
+        assert_eq!(Chord::from_str("Control+K").unwrap(), Chord::ctrl('K'));
         assert_eq!(
             Chord::from_str("Shift+Up").unwrap(),
             Chord::shift(KeyCode::Up)
@@ -533,6 +561,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_unknown_modifier_and_key() {
+        assert!(Chord::from_str("ctrl+k").is_err());
         assert!(Chord::from_str("hyper+k").is_err());
         assert!(Chord::from_str("ctrl+nope").is_err());
         assert!(Chord::from_str("").is_err());
@@ -542,7 +571,7 @@ mod tests {
     fn serde_round_trips_through_json() {
         let c = Chord::ctrl('s');
         let json = serde_json::to_string(&c).unwrap();
-        assert_eq!(json, "\"ctrl+s\"");
+        assert_eq!(json, "\"control+s\"");
         let back: Chord = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }

@@ -21,12 +21,6 @@ ignore = [
     # matrix-org/matrix-rust-sdk#6859 asks matrix-sdk to move off the imbl stack;
     # drop this entry once a matrix-sdk release no longer pulls bitmaps.
     { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained; transitive via matrix-sdk -> eyeball-im -> imbl; no safe upgrade; upstream matrix-org/matrix-rust-sdk#6859" },
-    # The current lock graph retains lru 0.16 through nostr-sdk 0.44. The affected Nostr
-    # caches use EventId keys and unit values, so they do not expose the
-    # panic-on-drop prerequisite described by this advisory. Remove this entry
-    # when the nostr-sdk 0.45 migration tracked in #9602 lands. The Security
-    # job enforces the exact residual lockfile path before running cargo-deny.
-    { id = "RUSTSEC-2026-0253", reason = "lru 0.16 remains transitive through nostr-sdk 0.44; affected caches use EventId keys and unit values; nostr-sdk 0.45 migration tracked in #9602" },
 ]
 
 [licenses]
@@ -152,6 +146,11 @@ version = "=0.27.2"
 [[bans.skip]]
 name = "strum_macros"
 version = "=0.27.2"
+
+[[bans.skip]]
+name = "syn"
+version = "=2.0.117"
+reason = "whatsapp-rust 0.7 requires async-trait >=0.1.91 (syn 3); existing proc macros still require syn 2"
 
 [[bans.skip]]
 name = "thiserror"

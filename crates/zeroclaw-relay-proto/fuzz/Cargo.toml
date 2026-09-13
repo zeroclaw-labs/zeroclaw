@@ -1,0 +1,33 @@
+# cargo-fuzz harness for the relay wire protocol's parsers (threat A12). This is a
+# SEPARATE workspace (the empty [workspace] table below detaches it from the
+# parent) so a normal `cargo build`/clippy never tries to compile libfuzzer; it is
+# built with `cargo +nightly fuzz build` (see scripts/dev/fuzz.sh).
+[package]
+name = "zeroclaw-relay-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zeroclaw-relay-proto = { path = ".." }
+
+[[bin]]
+name = "control_from_json"
+path = "fuzz_targets/control_from_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_data"
+path = "fuzz_targets/decode_data.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace.
+[workspace]

@@ -5,6 +5,7 @@ pub mod chain;
 pub mod config;
 pub mod event;
 pub mod layer;
+mod log_bridge;
 pub mod migrate;
 pub mod observer_bridge;
 pub mod reader;

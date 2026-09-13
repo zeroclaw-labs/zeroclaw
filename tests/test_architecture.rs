@@ -20,3 +20,6 @@ mod desktop_release;
 
 #[path = "architecture/container_release.rs"]
 mod container_release;
+
+#[path = "architecture/publish_contract.rs"]
+mod publish_contract;

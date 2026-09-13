@@ -58,26 +58,7 @@ impl SqliteMemory {
     /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
     pub fn new_named(alias: &str, workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
-        let _startup_guard = acquire_sqlite_startup_lock();
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Self::open_connection(&db_path, None)?;
-        conn.execute_batch(
-            // foreign_keys is OFF by default in SQLite and is a
-            // per-connection PRAGMA, so the multi-agent migration's
-            // `REFERENCES agents(id)` constraint would be unenforced
-            // without this. Set it before any writes flow through.
-            "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
-             PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
-        )?;
-        Self::init_schema(&conn)?;
-        zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(&db_path, &conn)?;
-        Self::init_schema(&conn)?;
+        let conn = Self::open_and_initialize(&db_path, None)?;
         Ok(Self {
             alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
@@ -100,26 +81,7 @@ impl SqliteMemory {
         search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
-        let _startup_guard = acquire_sqlite_startup_lock();
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let conn = Self::open_connection(&db_path, open_timeout_secs)?;
-
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
-             PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
-        )?;
-
-        Self::init_schema(&conn)?;
-        zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(&db_path, &conn)?;
-        Self::init_schema(&conn)?;
+        let conn = Self::open_and_initialize(&db_path, open_timeout_secs)?;
 
         Ok(Self {
             alias: alias.to_string(),
@@ -130,6 +92,36 @@ impl SqliteMemory {
             cache_max,
             search_mode,
         })
+    }
+
+    /// Open and initialize a memory database using the canonical startup
+    /// sequence shared by all writable SQLite entry points.
+    pub(crate) fn open_and_initialize(
+        db_path: &Path,
+        open_timeout_secs: Option<u64>,
+    ) -> anyhow::Result<Connection> {
+        let _startup_guard = acquire_sqlite_startup_lock();
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let conn = Self::open_connection(db_path, open_timeout_secs)?;
+        conn.execute_batch(
+            // foreign_keys is OFF by default in SQLite and is a
+            // per-connection PRAGMA, so the multi-agent migration's
+            // `REFERENCES agents(id)` constraint would be unenforced
+            // without this. Set it before any writes flow through.
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA mmap_size    = 8388608;
+             PRAGMA cache_size   = -2000;
+             PRAGMA temp_store   = MEMORY;",
+        )?;
+        Self::init_schema(&conn)?;
+        zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(db_path, &conn)?;
+        Self::init_schema(&conn)?;
+        Ok(conn)
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).

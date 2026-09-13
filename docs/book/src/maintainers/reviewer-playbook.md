@@ -13,22 +13,24 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 | Situation | Action | Section |
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
-| Risk is high or unclear | Treat as `risk:high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
+| Risk or security-boundary classification is unclear | Classify upward and resolve it with a maintainer before merge | [Review depth matrix](#review-depth-matrix) |
 | Diff adds a parallel interpretive surface | Verify it is derived from, or explicitly points to, the canonical source | [Drift-surface review](#drift-surface-review) |
 | Automation output is wrong or noisy | Apply the override protocol | [Automation override](#automation-override) |
 | Need to hand off to another maintainer | Use the handoff template | [Handoff](#handoff) |
 
 ## Review depth matrix
 
-| Risk label | Typical paths | Minimum depth | Required evidence |
+| Trigger | Typical work | Minimum depth | Required evidence |
 |---|---|---|---|
-| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
-| `risk:medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk:high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
+| `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
+| `risk:medium` | Ordinary behavioral runtime, gateway, provider, channel, tool, config, application, and CI work | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
+| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals | Security and failure-mode checks, rollback clarity |
 
-When uncertain, treat as higher risk.
+`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers the same deep-review and two-independent-Core-approval path. Automated review does not count as a Core Team approval.
 
-Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk:manual` when a maintainer correction should not be overwritten on the next pushed update.
+When uncertain, classify upward and ask a maintainer to resolve the boundary before merge.
+
+Risk labels are currently manual. #9345 keeps any future risk classifier report-only until maintainers separately enable mutation. Follow the [labels automation contract](./labels.md#automation-contract): `risk:manual` freezes automated risk replacement when a maintainer correction should persist, but it never lowers the review or approval requirement.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -108,7 +110,7 @@ drives downstream coverage.
 
 ### Deep-review checklist (high-risk only)
 
-For `risk:high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.
+For PRs carrying `risk:high` or `domain:security`, verify a concrete example in each category. One concrete instance beats five generic claims.
 
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
@@ -177,6 +179,14 @@ If Discussions are not being reviewed on the documented cadence, do not present 
 
 ### PR backlog pruning
 
+Use the report-only queue snapshot when selecting the next review pass:
+
+```bash
+python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table
+```
+
+The command is an on-demand view of live GitHub state, not a durable queue or a source of merge authority. This `all` snapshot runs the shared lanes independently, so one PR can appear in more than one lane; add `--author LOGIN` to include `mine`. Use `--queue near-ready` to start with maintainer-routed PRs whose GitHub search status is successful; this prioritizes candidates that may be closer to merge without claiming that they are mergeable or sufficiently approved. Use `--format json` for inspection or downstream reporting and `--format links` for GitHub search links. GitHub search supplies the candidate lists; the script reads timelines only for author-action age and reviews only for current-head second-Core routing. Missing or ambiguous detail remains unknown. Confirm mergeability, checks, and approval applicability during the actual review. Prioritize and review `Depends on #...` parents before children; when a parent is not reviewable, defer deep child review unless a bounded independent slice benefits from early review, then refresh and revalidate the child after the parent lands. Stacked PRs remain a separate report lane and do not become review-ready merely because they are old.
+
 When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
@@ -196,7 +206,7 @@ If the underlying bug or feature is still valid, preserve it in an issue, tracke
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`.
+1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`; the override does not bypass the `risk:high OR domain:security` approval rule.
 2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
 3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
 4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.

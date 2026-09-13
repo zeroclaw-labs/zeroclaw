@@ -2463,4 +2463,276 @@ mod tests {
             "install_web_dist must sweep residue from previous runs"
         );
     }
+
+    #[cfg(windows)]
+    mod windows_runtime_tests {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Output, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_CHILD";
+        const READY_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_READY";
+        const RELEASE_ENV: &str = "ZEROCLAW_WINDOWS_UPDATE_RUNTIME_TEST_RELEASE";
+        const CHILD_TEST: &str =
+            "commands::update::tests::windows_runtime_tests::windows_update_runtime_child";
+        const POLL_INTERVAL: Duration = Duration::from_millis(10);
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+        struct LockedTestExecutable {
+            child: Option<Child>,
+            ready: PathBuf,
+            release: PathBuf,
+        }
+
+        impl LockedTestExecutable {
+            fn spawn(executable: &Path, marker_dir: &Path, label: &str) -> Self {
+                let ready = marker_dir.join(format!("{label}.ready"));
+                let release = marker_dir.join(format!("{label}.release"));
+                let child = Command::new(executable)
+                    .arg(CHILD_TEST)
+                    .arg("--exact")
+                    .arg("--test-threads=1")
+                    .env(CHILD_ENV, "1")
+                    .env(READY_ENV, &ready)
+                    .env(RELEASE_ENV, &release)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap_or_else(|error| {
+                        panic!("failed to spawn locked test executable {executable:?}: {error}")
+                    });
+                Self {
+                    child: Some(child),
+                    ready,
+                    release,
+                }
+            }
+
+            fn pid(&self) -> u32 {
+                self.child
+                    .as_ref()
+                    .expect("locked test executable must be running")
+                    .id()
+            }
+
+            fn wait_ready(&mut self) {
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    if self.ready.is_file() {
+                        return;
+                    }
+                    let child_status = self
+                        .child
+                        .as_mut()
+                        .expect("locked test executable child is still present")
+                        .try_wait();
+                    match child_status {
+                        Ok(Some(status)) => {
+                            self.fail(format!(
+                                "locked test executable exited before ready: {status}"
+                            ));
+                        }
+                        Err(error) => {
+                            self.fail(format!(
+                                "failed to poll locked test executable before ready: {error}"
+                            ));
+                        }
+                        Ok(None) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        self.fail("timed out waiting for locked test executable readiness".into());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+
+            fn release_and_wait(mut self) {
+                std::fs::write(&self.release, b"release").unwrap_or_else(|error| {
+                    panic!(
+                        "failed to write child release marker {:?}: {error}",
+                        self.release
+                    )
+                });
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                loop {
+                    let child_status = self
+                        .child
+                        .as_mut()
+                        .expect("locked test executable child is still present")
+                        .try_wait();
+                    match child_status {
+                        Ok(Some(status)) => {
+                            let child = self.child.take().unwrap();
+                            let output = child
+                                .wait_with_output()
+                                .expect("failed to collect locked test executable output");
+                            assert!(
+                                output.status.success(),
+                                "locked test executable exited unsuccessfully ({status}): {}",
+                                child_output(&output)
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            self.fail(format!("failed to poll released test executable: {error}"));
+                        }
+                        Ok(None) => {}
+                    }
+                    if Instant::now() >= deadline {
+                        self.fail("timed out waiting for released test executable".into());
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
+
+            fn fail(&mut self, reason: String) -> ! {
+                let mut child = self
+                    .child
+                    .take()
+                    .expect("locked test executable child exists");
+                let _ = child.kill();
+                let details = match child.wait_with_output() {
+                    Ok(output) => child_output(&output),
+                    Err(error) => format!("failed to collect child output: {error}"),
+                };
+                panic!("{reason}; {details}");
+            }
+        }
+
+        impl Drop for LockedTestExecutable {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        fn child_output(output: &Output) -> String {
+            format!(
+                "stdout: {}; stderr: {}",
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+
+        fn copy_current_test_executable(destination: &Path) {
+            let source = std::env::current_exe().expect("resolve current test executable");
+            std::fs::copy(&source, destination).unwrap_or_else(|error| {
+                panic!("copy current test executable to {destination:?}: {error}")
+            });
+        }
+
+        fn sidecar_path_for_pid(target: &Path, pid: u32, suffix: &str) -> PathBuf {
+            let mut name = target.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".{pid}.{suffix}"));
+            target.with_file_name(name)
+        }
+
+        #[test]
+        fn windows_update_runtime_child() {
+            if std::env::var(CHILD_ENV).ok().as_deref() != Some("1") {
+                return;
+            }
+            let ready = PathBuf::from(
+                std::env::var_os(READY_ENV).expect("child ready marker path must be configured"),
+            );
+            let release = PathBuf::from(
+                std::env::var_os(RELEASE_ENV)
+                    .expect("child release marker path must be configured"),
+            );
+            std::fs::write(&ready, b"ready").expect("write child ready marker");
+
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+            while !release.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for child release marker {:?}",
+                    release
+                );
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+
+        #[tokio::test]
+        async fn windows_swap_binary_handles_locked_sidecars() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("zeroclaw.exe");
+            let preexisting_seed = tmp.path().join("preexisting.exe");
+            copy_current_test_executable(&target);
+            copy_current_test_executable(&preexisting_seed);
+
+            let mut target_child = LockedTestExecutable::spawn(&target, tmp.path(), "target");
+            target_child.wait_ready();
+            let mut preexisting_child =
+                LockedTestExecutable::spawn(&preexisting_seed, tmp.path(), "preexisting");
+            preexisting_child.wait_ready();
+
+            let parent_sidecar = sidecar_path(&target, "old");
+            assert_eq!(
+                parent_sidecar,
+                sidecar_path_for_pid(&target, std::process::id(), "old"),
+                "production sidecar must include the current process ID"
+            );
+            let preexisting_sidecar = sidecar_path_for_pid(&target, preexisting_child.pid(), "old");
+            assert_ne!(
+                parent_sidecar, preexisting_sidecar,
+                "parent sidecar must not collide with a sidecar from another process"
+            );
+            std::fs::rename(&preexisting_seed, &preexisting_sidecar).unwrap();
+
+            let new = tmp.path().join("replacement.bin");
+            std::fs::write(&new, b"replacement bytes").unwrap();
+            swap_binary(&new, &target).await.unwrap();
+
+            assert_eq!(std::fs::read(&target).unwrap(), b"replacement bytes");
+            assert!(
+                parent_sidecar.is_file(),
+                "running target must leave its parent sidecar in place"
+            );
+            assert!(
+                preexisting_sidecar.is_file(),
+                "running pre-existing sidecar must survive the sweep"
+            );
+
+            target_child.release_and_wait();
+            preexisting_child.release_and_wait();
+            sweep_stale_sidecars(&target).await;
+
+            assert!(!parent_sidecar.exists());
+            assert!(!preexisting_sidecar.exists());
+        }
+
+        #[tokio::test]
+        async fn windows_swap_failure_restores_then_rolls_back_locked_target() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("zeroclaw.exe");
+            copy_current_test_executable(&target);
+            let original = std::fs::read(&target).unwrap();
+            let backup = tmp.path().join("zeroclaw.bak");
+            std::fs::write(&backup, b"backup bytes").unwrap();
+            let missing = tmp.path().join("missing.exe");
+
+            let mut target_child = LockedTestExecutable::spawn(&target, tmp.path(), "rollback");
+            target_child.wait_ready();
+
+            assert!(swap_binary(&missing, &target).await.is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            assert!(!sidecar_path(&target, "old").exists());
+
+            let rollback_sidecar = sidecar_path(&target, "rollback-old");
+            rollback_binary(&backup, &target).await.unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"backup bytes");
+            assert!(
+                rollback_sidecar.is_file(),
+                "rollback residue must remain while the original image is mapped"
+            );
+
+            target_child.release_and_wait();
+            sweep_stale_sidecars(&target).await;
+            assert!(!rollback_sidecar.exists());
+        }
+    }
 }

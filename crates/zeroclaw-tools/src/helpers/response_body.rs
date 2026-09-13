@@ -38,7 +38,11 @@ pub(crate) async fn read_bounded(
     Ok(BoundedBody { bytes, overflowed })
 }
 
-pub(crate) async fn read_text(
+/// Read a response body up to `limit` bytes and return UTF-8-safe text.
+///
+/// The boolean is true when the response exceeded the limit. The reader
+/// retains at most one byte beyond the limit to detect overflow.
+pub async fn read_text(
     response: reqwest::Response,
     limit: Option<usize>,
 ) -> anyhow::Result<(String, bool)> {

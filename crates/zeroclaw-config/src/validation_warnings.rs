@@ -29,16 +29,16 @@ pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withhe
 ///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
-/// - `whatsapp_chat_policy_inert`: a WhatsApp Web `dm_policy` / `group_policy` /
-///   `self_chat_mode` is set but the transport only consults them under
-///   `mode = "personal"`, so it currently has no effect.
-/// - `whatsapp_empty_group_allowlist_permits_all`: `allowed_groups` is empty in
-///   a configuration where that list is the only group gate, so it permits every
-///   group the linked account belongs to. Raised for `mode = "business"` (which
-///   never consults `group_policy`) and for `mode = "personal"` with
-///   `group_policy = "allowlist"`. Personal mode with `group_policy = "ignore"`
-///   already drops every group message, and `group_policy = "all"` is an explicit
-///   opt-in to open access, so neither is reported.
+/// - `whatsapp_chat_policy_inert`: a WhatsApp Web `self_chat_mode` is set but
+///   the transport only consults it under `mode = "personal"`, so it currently
+///   has no effect. `dm_policy` and `group_policy` apply under both modes and
+///   are never reported under this code.
+/// - `whatsapp_empty_group_list_serves_no_group`: `allowed_groups` is empty and
+///   `group_policy` is `"allowlist"`, so the channel answers no group where an
+///   empty list used to admit every group at the identity gate. A migration
+///   notice about lost capability, not a fail-open alarm. `"all"` admits every
+///   group before and after, and `"ignore"` rejects every group before and
+///   after under BOTH modes, so neither is reported.
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).

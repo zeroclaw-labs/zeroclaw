@@ -36,7 +36,10 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
-    client: Client,
+    /// Operator `[multimodal]` policy for this provider's own image-marker
+    /// expansion pass. Resolved once at construction from
+    /// `ModelProviderRuntimeOptions`.
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,12 +143,16 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
-            client: Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            multimodal: options.multimodal.clone(),
         })
+    }
+
+    fn http_client(&self) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
+            "model_provider.openai",
+            300,
+            10,
+        )
     }
 }
 
@@ -617,6 +624,7 @@ pub(crate) fn parse_responses_usage(usage: Option<&Value>) -> Option<TokenUsage>
             input_tokens,
             output_tokens,
             cached_input_tokens,
+            cache_creation_input_tokens: None,
         },
     )
 }
@@ -1314,7 +1322,7 @@ impl OpenAiCodexModelProvider {
         request: &ResponsesRequest,
     ) -> reqwest::RequestBuilder {
         let mut request_builder = self
-            .client
+            .http_client()
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1498,8 +1506,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         messages.push(ChatMessage::user(message));
 
         // Normalize images: convert file paths to data URIs
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
@@ -1514,8 +1522,8 @@ impl ModelProvider for OpenAiCodexModelProvider {
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         // Normalize image markers: convert file paths to data URIs
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
@@ -1529,9 +1537,9 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
         let prepared =
-            crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
+            crate::multimodal::prepare_messages_for_provider(request.messages, &self.multimodal)
+                .await?;
         let (instructions, input) = build_responses_input(&prepared.messages);
         let response = self
             .send_responses_request(input, instructions, convert_tools(request.tools), model)
@@ -1572,17 +1580,20 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let config = zeroclaw_config::schema::MultimodalConfig::default();
-            let prepared =
-                match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(StreamError::ModelProvider(err.to_string())))
-                            .await;
-                        return;
-                    }
-                };
+            let prepared = match crate::multimodal::prepare_messages_for_provider(
+                &messages,
+                &provider.multimodal,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             let creds = match provider.resolve_credentials().await {
                 Ok(c) => c,
@@ -1689,6 +1700,7 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
+        crate::RuntimeProxyTestGuard,
     ) {
         use axum::http::header;
         use axum::response::IntoResponse;
@@ -1697,6 +1709,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
+        let proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
         let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -1747,7 +1760,147 @@ mod tests {
         };
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
-        (provider, captured, server_handle, temp_dir)
+        (provider, captured, server_handle, temp_dir, proxy_guard)
+    }
+
+    #[test]
+    fn provider_construction_carries_operator_multimodal_policy() {
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 2,
+            ..Default::default()
+        };
+
+        let options = ModelProviderRuntimeOptions {
+            multimodal,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+
+        // Every `prepare_messages_for_provider` call in this adapter uses this
+        // field; defaults would drop the operator's image limits.
+        assert_eq!(provider.multimodal.max_images, 1);
+        assert_eq!(provider.multimodal.max_image_size_mb, 2);
+    }
+
+    #[tokio::test]
+    async fn codex_responses_provider_honors_runtime_proxy_after_construction() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(format!("http://{direct_addr}")),
+            zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let request = ResponsesRequest {
+            model: "gpt-5".to_string(),
+            input: vec![serde_json::json!({
+                "role": "user",
+                "content": "hello"
+            })],
+            instructions: DEFAULT_CODEX_INSTRUCTIONS.to_string(),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "medium".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+        let request_builder =
+            provider.responses_request_builder("test-key", None, None, true, &request);
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response_body: serde_json::Value = request_builder
+            .json(&request)
+            .send()
+            .await
+            .expect("codex Responses request should succeed through runtime proxy")
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            response_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied")
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            1,
+            "runtime proxy server should receive the Codex Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Codex Responses endpoint must not be contacted when runtime proxy applies"
+        );
     }
 
     #[test]
@@ -1818,6 +1971,7 @@ mod tests {
             [StreamEvent::Usage(TokenUsage {
                 input_tokens: Some(120),
                 cached_input_tokens: Some(45),
+                cache_creation_input_tokens: None,
                 output_tokens: Some(30),
             })]
         ));
@@ -1870,7 +2024,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_propagates_non_streaming_responses_usage() {
-        let (provider, _captured, server_handle, _temp_dir) =
+        let (provider, _captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
                 "output_text": "ok",
                 "output": [],
@@ -1932,7 +2086,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
-        let (provider, captured, server_handle, _temp_dir) =
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
                 "output_text": "ok",
                 "output": []
@@ -2035,14 +2189,15 @@ mod tests {
 
     #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_decode_fails() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
-            MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
-            MockCodexReply::Json(serde_json::json!({
-                "output_text": "fallback ok",
-                "output": []
-            })),
-        ])
-        .await;
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text": "fallback ok",
+                    "output": []
+                })),
+            ])
+            .await;
 
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
@@ -2070,7 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\ndata: not-json\n\ndata: [DONE]\n",
             ),
@@ -2107,7 +2262,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_does_not_retry_stream_api_error_events() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n",
             ),
@@ -2140,7 +2295,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_does_not_retry_failed_http_status() {
-        let (provider, captured, server_handle, _temp_dir) =
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Status(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "server down",

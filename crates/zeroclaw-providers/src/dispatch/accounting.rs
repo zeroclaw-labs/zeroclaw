@@ -499,10 +499,12 @@ pub(crate) fn current_billable_usage() -> Option<TokenUsage> {
                     let input = usage.input_tokens?;
                     let output = usage.output_tokens?;
                     let cached = usage.cached_input_tokens.unwrap_or(0);
+                    let creation = usage.cache_creation_input_tokens.unwrap_or(0);
                     let next = TokenUsage {
                         input_tokens: Some(input),
                         output_tokens: Some(output),
                         cached_input_tokens: Some(cached),
+                        cache_creation_input_tokens: Some(creation),
                     };
                     match &mut total {
                         Some(total) => {
@@ -510,6 +512,8 @@ pub(crate) fn current_billable_usage() -> Option<TokenUsage> {
                             total.output_tokens = total.output_tokens?.checked_add(output);
                             total.cached_input_tokens =
                                 total.cached_input_tokens?.checked_add(cached);
+                            total.cache_creation_input_tokens =
+                                total.cache_creation_input_tokens?.checked_add(creation);
                         }
                         None => total = Some(next),
                     }
@@ -573,6 +577,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: None,
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             })),
             AttemptUsageOutcome::Missing
         ));
@@ -581,6 +586,7 @@ mod tests {
                 input_tokens: Some(0),
                 output_tokens: Some(0),
                 cached_input_tokens: Some(0),
+                cache_creation_input_tokens: None,
             })),
             AttemptUsageOutcome::Complete(_)
         ));
@@ -589,6 +595,7 @@ mod tests {
                 input_tokens: None,
                 output_tokens: Some(1),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             })),
             AttemptUsageOutcome::Invalid {
                 reason: InvalidUsageReason::MissingInput,
@@ -600,6 +607,7 @@ mod tests {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
                 cached_input_tokens: Some(2),
+                cache_creation_input_tokens: None,
             })),
             AttemptUsageOutcome::Invalid {
                 reason: InvalidUsageReason::CachedInputExceedsInput,
@@ -611,6 +619,7 @@ mod tests {
                 input_tokens: Some(u64::MAX),
                 output_tokens: Some(1),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             })),
             AttemptUsageOutcome::Invalid {
                 reason: InvalidUsageReason::TotalOverflow,
@@ -640,6 +649,7 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(2),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
         assert!(collector.close().0.is_empty());
     }
@@ -657,6 +667,7 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(2),
             cached_input_tokens: Some(1),
+            cache_creation_input_tokens: None,
         });
 
         let (report, _) = collector.close();
@@ -667,6 +678,7 @@ mod tests {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
                     cached_input_tokens: Some(1),
+                    cache_creation_input_tokens: None,
                 })
             }
         ));
@@ -685,6 +697,7 @@ mod tests {
             input_tokens: None,
             output_tokens: Some(2),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         let (report, _) = collector.close();
@@ -706,6 +719,7 @@ mod tests {
                     input_tokens: None,
                     output_tokens: Some(2),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 };
                 lease.observe_stream_usage(invalid.clone());
                 lease.set_unknown();
@@ -758,6 +772,7 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(2),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         let (report, _) = collector.close();
@@ -778,11 +793,13 @@ mod tests {
             input_tokens: Some(10),
             output_tokens: Some(2),
             cached_input_tokens: Some(1),
+            cache_creation_input_tokens: None,
         });
         lease.observe_stream_usage(TokenUsage {
             input_tokens: Some(15),
             output_tokens: Some(3),
             cached_input_tokens: Some(2),
+            cache_creation_input_tokens: None,
         });
 
         let (report, _) = collector.close();
@@ -793,6 +810,7 @@ mod tests {
                     input_tokens: Some(15),
                     output_tokens: Some(3),
                     cached_input_tokens: Some(2),
+                    cache_creation_input_tokens: None,
                 })
             }
         ));
@@ -813,6 +831,7 @@ mod tests {
             input_tokens: Some(99),
             output_tokens: Some(1),
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         assert!(matches!(
@@ -866,6 +885,7 @@ mod tests {
                 input_tokens: Some(9),
                 output_tokens: Some(1),
                 cached_input_tokens: None,
+                cache_creation_input_tokens: None,
             });
         });
 

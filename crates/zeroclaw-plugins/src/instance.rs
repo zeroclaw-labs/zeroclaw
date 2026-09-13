@@ -288,6 +288,7 @@ fn test_manifest(
         config_schema: None,
         signature: None,
         publisher_key: None,
+        egress: crate::PluginEgressDeclaration::default(),
     }
 }
 

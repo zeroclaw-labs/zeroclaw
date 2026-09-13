@@ -1,6 +1,8 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder, append_timestamp_orientation};
+use crate::agent::prompt::{
+    InteractionContext, PromptContext, SystemPromptBuilder, append_timestamp_orientation,
+};
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -321,7 +323,10 @@ async fn forward_history_trim_notice(
 
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
-    tools: Vec<Box<dyn Tool>>,
+    /// Sealed per-agent tool set. Stored as a [`crate::tools::scoped::ScopedToolRegistry`]
+    /// so it can only be handed to the turn engine after passing through
+    /// `assemble()` (the seal).
+    tools: crate::tools::scoped::ScopedToolRegistry,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -346,6 +351,7 @@ pub struct Agent {
     /// session cwd for IDE-driven sessions (ACP, gateway WS).
     agent_workspace_dir: std::path::PathBuf,
     identity_config: zeroclaw_config::schema::IdentityConfig,
+    interaction_context: Option<InteractionContext>,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
@@ -363,6 +369,12 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// False for isolated / ACP sessions built with `exclude_memory: true`.
+    /// Drives `PromptContext::inject_memory` so `IdentitySection` cannot pull
+    /// `MEMORY.md` into the provider-visible system prompt for a session that
+    /// advertises persistent-memory isolation. Set from the same builder value
+    /// that installs `NoneMemory` and forces `auto_save` off.
+    inject_memory: bool,
     /// The shell this agent's runtime adapter will spawn, so the system
     /// prompt reports the dialect the agent actually executes under.
     /// `None` for a shell-less runtime.
@@ -507,7 +519,7 @@ impl AgentChannelHandles {
 
 pub struct AgentBuilder {
     model_provider: Option<Box<dyn ModelProvider>>,
-    tools: Option<Vec<Box<dyn Tool>>>,
+    tools: Option<crate::tools::scoped::ScopedToolRegistry>,
     memory: Option<Arc<dyn Memory>>,
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
@@ -522,6 +534,7 @@ pub struct AgentBuilder {
     workspace_dir: Option<std::path::PathBuf>,
     agent_workspace_dir: Option<std::path::PathBuf>,
     identity_config: Option<zeroclaw_config::schema::IdentityConfig>,
+    interaction_context: Option<InteractionContext>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<zeroclaw_config::schema::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
@@ -575,6 +588,7 @@ impl AgentBuilder {
             workspace_dir: None,
             agent_workspace_dir: None,
             identity_config: None,
+            interaction_context: None,
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
@@ -609,7 +623,15 @@ impl AgentBuilder {
         self
     }
 
-    pub fn tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+    /// Set the agent's sealed tool set. Production callers obtain the
+    /// [`crate::tools::scoped::ScopedToolRegistry`] from
+    /// `ScopedToolRegistry::assemble(...)` (the `.registry` field of its
+    /// output); raw `Vec<Box<dyn Tool>>` fixtures use
+    /// `ScopedToolRegistry::from_raw_for_test`, available to this crate's unit
+    /// tests and, via the dev-only `test-util` feature, to other crates' test
+    /// builds. [`Self::build`] applies the `allowed_tools` and ACP
+    /// memory-strip filters on top of the sealed set.
+    pub fn tools(mut self, tools: crate::tools::scoped::ScopedToolRegistry) -> Self {
         self.tools = Some(tools);
         self
     }
@@ -701,6 +723,11 @@ impl AgentBuilder {
         identity_config: zeroclaw_config::schema::IdentityConfig,
     ) -> Self {
         self.identity_config = Some(identity_config);
+        self
+    }
+
+    pub fn interaction_context(mut self, interaction: Option<InteractionContext>) -> Self {
+        self.interaction_context = interaction;
         self
     }
 
@@ -955,6 +982,7 @@ impl AgentBuilder {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
             }),
             identity_config: self.identity_config.unwrap_or_default(),
+            interaction_context: self.interaction_context,
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: if exclude_memory {
@@ -974,6 +1002,10 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            // One policy, one source: the same `exclude_memory` that strips
+            // memory tools and installs `NoneMemory` also withholds MEMORY.md
+            // from the prompt.
+            inject_memory: !exclude_memory,
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
@@ -1047,6 +1079,13 @@ impl Agent {
 
     pub fn set_channel_name(&mut self, name: String) {
         self.channel_name = name;
+    }
+
+    /// Set the host-resolved, descriptive interaction context for this live
+    /// session. This does not alter tools, policy, routing, memory, or storage.
+    pub fn set_interaction_context(&mut self, interaction: Option<InteractionContext>) {
+        self.interaction_context = interaction;
+        self.refresh_system_prompt();
     }
 
     fn new_turn_id() -> String {
@@ -1717,7 +1756,9 @@ impl Agent {
             // already-consumed sibling fields via `..`.
             ..
         } = assembled;
-        let tools = registry.into_inner();
+        // Thread the sealed registry straight to the builder - `.tools(...)` now
+        // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
+        let tools = registry;
 
         let model_name = match agent_model_provider
             .and_then(|e| e.model.as_deref())
@@ -2041,7 +2082,10 @@ impl Agent {
         let expose_text_tool_protocol =
             !self.config.resolved.strict_tool_parsing || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();
-        let prompt_tools = if expose_text_tool_protocol {
+        // Both arms resolve to `&[Box<dyn Tool>]`: the sealed registry derefs to
+        // the same slice the raw `Vec` used to expose, so downstream prompt
+        // construction is unchanged.
+        let prompt_tools: &[Box<dyn Tool>] = if expose_text_tool_protocol {
             &self.tools
         } else {
             &no_tools
@@ -2055,11 +2099,13 @@ impl Agent {
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
+            interaction: self.interaction_context.as_ref(),
             dispatcher_instructions: &instructions,
             sends_native_tool_specs: dispatcher.should_send_tool_specs()
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            inject_memory: self.inject_memory,
             shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
@@ -3484,7 +3530,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(Vec::new())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -3679,6 +3727,7 @@ mod tests {
                             input_tokens: Some(13),
                             output_tokens: Some(7),
                             cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
                         },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
@@ -3951,7 +4000,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(Box::new(reliable))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(memory)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -4073,7 +4124,9 @@ mod tests {
         );
         let mut agent = Agent::builder()
             .model_provider(Box::new(reliable))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(Arc::from(
                 zeroclaw_memory::create_memory(
                     &zeroclaw_config::schema::MemoryConfig {
@@ -4811,7 +4864,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5005,7 +5060,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -5050,9 +5107,11 @@ mod tests {
         };
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(CountingTool {
-                calls: Arc::clone(&calls),
-            })])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(CountingTool {
+                    calls: Arc::clone(&calls),
+                })],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -5096,7 +5155,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(Arc::clone(&mem))
             .observer(Arc::clone(&observer))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5111,7 +5172,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -5264,7 +5327,9 @@ mod tests {
             let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
             let mut builder = Agent::builder()
                 .model_provider(provider)
-                .tools(tools)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    tools,
+                ))
                 .memory(mem)
                 .observer(observer)
                 .workspace_dir(workspace.path().to_path_buf());
@@ -5277,6 +5342,83 @@ mod tests {
                 builder = builder.multimodal_config(mm);
             }
             builder.build().expect("agent builder should succeed")
+        }
+
+        /// Builds an Agent over a temp workspace holding a `MEMORY.md` sentinel
+        /// and a `SOUL.md` control, at the given `exclude_memory` setting, and
+        /// returns its assembled system prompt.
+        fn system_prompt_with_memory_sentinel(exclude_memory: bool) -> String {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            std::fs::write(
+                workspace.path().join("MEMORY.md"),
+                "MEMORY_MD_SENTINEL_9341",
+            )
+            .expect("write MEMORY.md");
+            std::fs::write(workspace.path().join("SOUL.md"), "SOUL_MD_CONTROL_9341")
+                .expect("write SOUL.md");
+
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .agent_workspace_dir(workspace.path().to_path_buf())
+                .exclude_memory(exclude_memory)
+                .build()
+                .expect("agent builder should succeed");
+
+            agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .expect("system prompt builds")
+        }
+
+        /// `exclude_memory: true` is the ACP / isolated-session policy. It
+        /// already strips memory tools, installs `NoneMemory` and forces
+        /// `auto_save` off; it must also keep curated `MEMORY.md` *content* out
+        /// of the provider-visible system prompt, otherwise the "persistent
+        /// memory isolated" copy is a claim the prompt path violates.
+        #[test]
+        fn build_system_prompt_omits_memory_md_when_exclude_memory() {
+            let prompt = system_prompt_with_memory_sentinel(true);
+
+            assert!(
+                !prompt.contains("MEMORY_MD_SENTINEL_9341"),
+                "MEMORY.md must not reach the ACP system prompt"
+            );
+            assert!(
+                prompt.contains("SOUL_MD_CONTROL_9341"),
+                "other personality files must still load under exclude_memory"
+            );
+        }
+
+        /// Chat sessions (`exclude_memory: false`) are unchanged.
+        #[test]
+        fn build_system_prompt_includes_memory_md_without_exclude_memory() {
+            let prompt = system_prompt_with_memory_sentinel(false);
+
+            assert!(
+                prompt.contains("MEMORY_MD_SENTINEL_9341"),
+                "MEMORY.md must still reach the Chat system prompt"
+            );
+            assert!(
+                prompt.contains("SOUL_MD_CONTROL_9341"),
+                "SOUL.md must still reach the Chat system prompt"
+            );
         }
 
         #[tokio::test]
@@ -5331,7 +5473,9 @@ mod tests {
                 .model_provider(Box::new(MockModelProvider {
                     responses: Mutex::new(vec![]),
                 }))
-                .tools(vec![Box::new(MockTool)])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
                 .memory(mem)
                 .observer(observer)
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5353,6 +5497,50 @@ mod tests {
             assert!(
                 xml_prompt.contains(XML_TOOLS_MARKER),
                 "xml dispatcher must emit XML tool listing"
+            );
+        }
+
+        #[test]
+        fn build_system_prompt_with_dispatcher_uses_assembled_skill_tool_names() {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(NamedMockTool::new("ops__shell"))],
+                ))
+                .skills(vec![make_skill("ops", &["fetch", "shell"])])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .build()
+                .expect("agent builder should succeed");
+
+            let prompt = agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher)
+                .expect("system prompt should build");
+            let callable = prompt
+                .split_once("<callable_tools")
+                .and_then(|(_, rest)| rest.split_once("</callable_tools>"))
+                .map(|(block, _)| block)
+                .expect("surviving skill tool should create callable block");
+
+            assert!(callable.contains("<name>ops__shell</name>"));
+            assert!(!callable.contains("<name>ops__fetch</name>"));
+            assert!(
+                prompt.contains("<name>fetch</name>"),
+                "unavailable tool metadata should remain descriptive"
             );
         }
 
@@ -5448,7 +5636,9 @@ mod tests {
             }];
             let mut agent = Agent::builder()
                 .model_provider(provider)
-                .tools(vec![Box::new(MockTool)])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
                 .memory(mem)
                 .observer(observer)
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5656,7 +5846,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5701,7 +5893,9 @@ mod tests {
         route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -5964,6 +6158,7 @@ mod tests {
             input_tokens: Some(1_000_000),
             output_tokens: Some(1_000_000),
             cached_input_tokens: Some(0),
+            cache_creation_input_tokens: None,
         };
 
         let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -5999,7 +6194,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6030,7 +6227,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6094,7 +6293,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6140,7 +6341,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -6191,7 +6394,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6584,7 +6789,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6700,7 +6907,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6782,7 +6991,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -6968,7 +7179,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7121,7 +7334,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7187,7 +7402,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7240,7 +7457,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7285,7 +7504,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7491,7 +7712,9 @@ mod tests {
             .model_provider(Box::new(ToolThenFailingModelProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -7559,7 +7782,10 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        let capability_error = error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.capability, "vision");
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(
             capturing
@@ -7589,7 +7815,10 @@ mod tests {
             .await
             .expect_err("missing vision support should fail before provider dispatch");
 
-        assert!(error.to_string().contains("does not support vision input"));
+        let capability_error = error
+            .downcast_ref::<zeroclaw_providers::ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.capability, "vision");
         assert_old_trim_test_turn_was_removed(&agent);
         assert_eq!(drain_history_trim_events(&mut event_rx), 1);
     }
@@ -7861,7 +8090,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -8005,7 +8236,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -8079,7 +8312,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent_a = Agent::builder()
             .model_provider(provider_a)
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_a)
             .observer(observer.clone())
             .response_cache(Some(cache.clone()))
@@ -8096,7 +8331,9 @@ mod tests {
 
         let mut agent_b = Agent::builder()
             .model_provider(provider_b)
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_b)
             .observer(observer)
             .response_cache(Some(cache))
@@ -8154,7 +8391,9 @@ mod tests {
                 seen_messages: seed_seen,
             }))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory())
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .response_cache(Some(cache.clone()))
@@ -8186,7 +8425,9 @@ mod tests {
                 seen_messages: guarded_seen.clone(),
             }))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory())
             .observer(capturing.clone())
             .response_cache(Some(cache))
@@ -8254,6 +8495,7 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
@@ -8307,7 +8549,9 @@ mod tests {
                 seen_models: seen_models.clone(),
             }))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory)
             .observer(capturing.clone())
             .hook_runner(Some(Arc::new(hooks)))
@@ -8425,7 +8669,9 @@ mod tests {
             .model_provider(Box::new(router))
             .model_provider_name("hook-router".into())
             .model_name("native-model".into())
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .hook_runner(Some(Arc::new(hooks)))
@@ -8543,7 +8789,9 @@ mod tests {
             .model_provider(Box::new(router))
             .model_provider_name("hook-router".into())
             .model_name("native-model".into())
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .hook_runner(Some(Arc::new(hooks)))
@@ -8587,7 +8835,9 @@ mod tests {
         let mut agent = Agent::builder()
             .model_provider(Box::new(FailingModelProvider))
             .model_provider_name("provider-a".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory)
             .observer(capturing.clone())
             .hook_runner(Some(Arc::new(hooks)))
@@ -8661,7 +8911,9 @@ mod tests {
                         seen_messages: seen,
                     }))
                     .model_provider_name("provider-family".into())
-                    .tools(vec![])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
                     .memory(memory())
                     .observer(Arc::from(crate::observability::NoopObserver {}))
                     .response_cache(Some(cache))
@@ -8717,7 +8969,9 @@ mod tests {
                 ),
             ))
             .model_provider_name("provider-family".into())
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(memory)
             .observer(Arc::from(crate::observability::NoopObserver {}))
             .response_cache(Some(cache))
@@ -8869,7 +9123,9 @@ mod tests {
                     ),
                 ))
                 .model_provider_name("provider-family".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -8946,7 +9202,9 @@ mod tests {
                     ),
                 ))
                 .model_provider_name("provider-family".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -9023,7 +9281,9 @@ mod tests {
             Agent::builder()
                 .model_provider(Box::new(reliable))
                 .model_provider_name("provider-family".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -9103,7 +9363,9 @@ mod tests {
             Agent::builder()
                 .model_provider(Box::new(router))
                 .model_provider_name("router".into())
-                .tools(vec![])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
                 .memory(memory())
                 .observer(Arc::from(crate::observability::NoopObserver {}))
                 .response_cache(Some(cache.clone()))
@@ -9182,7 +9444,9 @@ mod tests {
                         seen_messages: seen,
                     }))
                     .model_provider_name("provider-family".into())
-                    .tools(vec![])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
                     .memory(memory())
                     .observer(Arc::from(crate::observability::NoopObserver {}))
                     .response_cache(Some(cache))
@@ -9201,6 +9465,7 @@ mod tests {
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 1_024,
+                    display: None,
                 }),
                 agent_a.turn("same request"),
             )
@@ -9210,6 +9475,7 @@ mod tests {
             .scope(
                 Some(zeroclaw_api::model_provider::NativeThinkingParams {
                     budget_tokens: 2_048,
+                    display: None,
                 }),
                 agent_b.turn("same request"),
             )
@@ -9257,7 +9523,9 @@ mod tests {
                         seen_messages: seen,
                     }))
                     .model_provider_name("provider-a".into())
-                    .tools(vec![Box::new(MockTool)])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![Box::new(MockTool)],
+                    ))
                     .memory(memory())
                     .observer(Arc::from(crate::observability::NoopObserver {}))
                     .response_cache(Some(cache))
@@ -9419,7 +9687,9 @@ mod tests {
                 });
                 Agent::builder()
                     .model_provider(provider)
-                    .tools(vec![])
+                    .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                        vec![],
+                    ))
                     .memory(mem)
                     .observer(observer.clone())
                     .response_cache(Some(cache))
@@ -9521,7 +9791,9 @@ mod tests {
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::from(
                 zeroclaw_memory::create_memory(
                     &zeroclaw_config::schema::MemoryConfig {
@@ -9617,7 +9889,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9743,7 +10017,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9814,7 +10090,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9879,7 +10157,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -9951,7 +10231,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10014,7 +10296,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10071,7 +10355,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10174,7 +10460,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10553,7 +10841,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -10839,12 +11129,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_a)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .response_cache(Some(cache.clone()))
@@ -10870,7 +11163,9 @@ mod tests {
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem_b)
             .observer(observer)
             .response_cache(Some(cache))
@@ -10921,12 +11216,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(10),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(5),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(SlowTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(SlowTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11023,12 +11321,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11122,12 +11423,15 @@ mod tests {
                     usage: Some(zeroclaw_providers::traits::TokenUsage {
                         input_tokens: Some(1_000),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                         output_tokens: Some(200),
                     }),
                     reasoning_content: None,
                 }]),
             }))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11192,7 +11496,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(Box::new(FailingModelProvider))
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11239,7 +11545,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11285,7 +11593,9 @@ mod tests {
         let observer: Arc<dyn Observer> = capturing.clone();
         let mut agent = Agent::builder()
             .model_provider(model_provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11331,7 +11641,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut builder = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(MockTool)])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11667,10 +11979,12 @@ mod tests {
 
         let mut agent = Agent::builder()
             .model_provider(provider)
-            .tools(vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "ollama".to_string(),
-                target_model: "llama3".to_string(),
-            })])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "ollama".to_string(),
+                    target_model: "llama3".to_string(),
+                })],
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11763,7 +12077,9 @@ mod tests {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         Agent::builder()
             .model_provider(model_provider)
-            .tools(Vec::new())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                Vec::new(),
+            ))
             .memory(mem)
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -11928,6 +12244,7 @@ mod approval_route_tests {
             tool_name: "shell".into(),
             arguments_summary: "rm -rf /".into(),
             raw_arguments: None,
+            position: None,
         }
     }
 

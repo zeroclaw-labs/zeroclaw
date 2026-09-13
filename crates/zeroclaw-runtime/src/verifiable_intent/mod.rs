@@ -6,4 +6,4 @@ pub mod issuance;
 pub mod types;
 pub mod verification;
 
-pub use verification::StrictnessMode;
+pub use verification::{StrictnessMode, VerifiedCredentialChain, VerifiedMandatePair};

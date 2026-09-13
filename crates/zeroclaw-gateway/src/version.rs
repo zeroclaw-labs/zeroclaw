@@ -41,7 +41,9 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // ── Restart classification (advisory) ────────────────────────────
 
 /// How a post-upgrade restart is achieved in this environment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
 pub enum RestartMode {
     /// A supervisor (systemd/launchd) relaunches us after a clean exit.
     Supervised,
@@ -797,10 +799,18 @@ mod tests {
     }
 
     #[test]
-    fn restart_mode_as_str_is_stable() {
-        assert_eq!(RestartMode::Supervised.as_str(), "supervised");
-        assert_eq!(RestartMode::SelfRespawn.as_str(), "self_respawn");
-        assert_eq!(RestartMode::Manual.as_str(), "manual");
+    fn restart_mode_wire_values_are_stable() {
+        for (mode, expected) in [
+            (RestartMode::Supervised, "supervised"),
+            (RestartMode::SelfRespawn, "self_respawn"),
+            (RestartMode::Manual, "manual"),
+        ] {
+            assert_eq!(mode.as_str(), expected);
+            assert_eq!(
+                serde_json::to_value(mode).expect("serialize mode"),
+                expected
+            );
+        }
         assert!(RestartMode::Supervised.auto_restartable());
         assert!(RestartMode::SelfRespawn.auto_restartable());
         assert!(!RestartMode::Manual.auto_restartable());
