@@ -225,13 +225,29 @@ impl SessionStore {
     pub async fn insert_if_absent(
         &self,
         id: String,
+        session: RpcSession,
+    ) -> Result<(), &'static str> {
+        self.publish_prepared(id, session, None).await
+    }
+
+    /// Publish a fully prepared incarnation without exposing an empty slot.
+    /// The caller holds session admission; the generation check also protects
+    /// against removal or replacement by another store-level owner.
+    pub(crate) async fn publish_prepared(
+        &self,
+        id: String,
         mut session: RpcSession,
+        expected_generation: Option<u64>,
     ) -> Result<(), &'static str> {
         let mut sessions = self.sessions.lock().await;
-        if sessions.contains_key(&id) {
-            return Err("session already exists");
+        if sessions.get(&id).map(|s| s.generation) != expected_generation {
+            return Err(if expected_generation.is_some() {
+                "session changed during preparation"
+            } else {
+                "session already exists"
+            });
         }
-        if sessions.len() >= self.max_sessions {
+        if expected_generation.is_none() && sessions.len() >= self.max_sessions {
             return Err("session limit reached");
         }
         let generation = self
@@ -985,6 +1001,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_publication_is_capacity_neutral_and_fenced() {
+        let store = make_store(1);
+        let candidate =
+            || RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat);
+        store
+            .insert_if_absent("s".into(), candidate())
+            .await
+            .unwrap();
+        let first = store.get_agent("s").await.unwrap();
+        let first_generation = store.get_generation("s").await.unwrap();
+        store
+            .publish_prepared("s".into(), candidate(), Some(first_generation))
+            .await
+            .unwrap();
+        let successor = store.get_agent("s").await.unwrap();
+        let successor_generation = store.get_generation("s").await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &successor));
+        assert_eq!(successor_generation, first_generation + 1);
+        assert_eq!(store.count().await, 1);
+        assert_eq!(
+            store.insert_if_absent("other".into(), candidate()).await,
+            Err("session limit reached")
+        );
+
+        // A stale candidate must neither replace the successor nor advance its generation.
+        assert_eq!(
+            store
+                .publish_prepared("s".into(), candidate(), Some(first_generation))
+                .await,
+            Err("session changed during preparation")
+        );
+        assert!(Arc::ptr_eq(
+            &successor,
+            &store.get_agent("s").await.unwrap()
+        ));
+        assert_eq!(store.get_generation("s").await, Some(successor_generation));
+        assert_eq!(
+            store.insert_if_absent("s".into(), candidate()).await,
+            Err("session already exists")
+        );
+
+        store.remove("s").await;
+        assert_eq!(
+            store
+                .publish_prepared("s".into(), candidate(), Some(successor_generation))
+                .await,
+            Err("session changed during preparation")
+        );
+        assert_eq!(
+            store.count().await,
+            0,
+            "removed session must not be resurrected"
+        );
     }
 
     #[tokio::test]

@@ -1575,6 +1575,7 @@ impl RpcDispatcher {
         // The mode may have changed while this request waited for admission.
         // Re-read under the permit so concurrent replacements cannot remove a
         // newly installed same-mode canonical session based on stale state.
+        let expected_generation = self.ctx.sessions.get_generation(&session_id).await;
         let admitted_mode = self.ctx.sessions.chat_mode(&session_id).await;
         if admitted_mode.as_ref() == Some(&chat_mode)
             && let Some(existing) = self
@@ -1593,10 +1594,6 @@ impl RpcDispatcher {
                 .finish_existing_session_resume(session_id, &chat_mode, existing)
                 .await;
         }
-        if admitted_mode.is_some() {
-            self.ctx.sessions.remove(&session_id).await;
-        }
-
         // Load resumed ACP metadata once, before constructing the live Agent.
         // The durable row owns the original workspace and interaction surface.
         let mut preloaded_acp: Option<zeroclaw_infra::acp_session_store::AcpSessionData> = None;
@@ -1752,21 +1749,194 @@ impl RpcDispatcher {
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
 
-        self.ctx
-            .sessions
-            .insert_if_absent(
-                session_id.clone(),
-                super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
-                    .with_owner(self.tui_id.clone()),
-            )
-            .await
-            .map_err(|message| {
-                if message == "session already exists" {
-                    rpc_err(SESSION_BUSY, "Session resume already in progress")
-                } else {
-                    rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+        let candidate =
+            super::session::RpcSession::new(agent, &req.agent_alias, &cwd, chat_mode.clone())
+                .with_owner(self.tui_id.clone());
+        let candidate_agent = Arc::clone(&candidate.agent);
+        // Fresh sessions must claim capacity before creating durable rows.
+        // Only a replacement can keep its existing slot throughout preparation.
+        let unpublished = if expected_generation.is_none() {
+            self.ctx
+                .sessions
+                .insert_if_absent(session_id.clone(), candidate)
+                .await
+                .map_err(|message| {
+                    if message == "session already exists" {
+                        rpc_err(SESSION_BUSY, "Session resume already in progress")
+                    } else {
+                        rpc_err(SESSION_LIMIT_REACHED, "Session limit reached")
+                    }
+                })?;
+            None
+        } else {
+            Some(candidate)
+        };
+
+        enum AcpSessionNewLoad {
+            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
+            Created,
+            Killed,
+        }
+
+        // Prepare replacement history without touching the original Agent.
+        let prepared = async {
+            let mut agent = candidate_agent.lock().await;
+            let mut message_count = 0;
+            let mut seed_event = None;
+            let mut plan = Vec::new();
+            match chat_mode {
+                crate::rpc::types::ChatMode::Acp => {
+                    // Reuse the data already loaded for cwd recovery on resume so the
+                    // store isn't hit twice; otherwise fall through to the restore-
+                    // aware load-or-create path below.
+                    let loaded = if let Some(data) = preloaded_acp.take() {
+                        Ok(Ok(AcpSessionNewLoad::Restored(data)))
+                    } else {
+                        let Some(ref store) = self.ctx.acp_session_store else {
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                "ACP session store is not available",
+                            ));
+                        };
+
+                        let store_cloned = store.clone();
+                        let sid = session_id.clone();
+                        let alias = req.agent_alias.clone();
+                        let cwd_owned = cwd.clone();
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
+                            match store_cloned.load_session_for_restore(&sid)? {
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
+                                data,
+                            ) => Ok(AcpSessionNewLoad::Restored(data)),
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
+                                store_cloned.create_session_with_interaction_surface(
+                                    &sid,
+                                    &alias,
+                                    &cwd_owned,
+                                    resolved_interaction_surface.map(|surface| surface.as_str()),
+                                )?;
+                                Ok(AcpSessionNewLoad::Created)
+                            }
+                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
+                                Ok(AcpSessionNewLoad::Killed)
+                            }
+                        }
+                        })
+                        .await
+                    };
+                    match loaded {
+                        Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
+                            if data.agent_alias != req.agent_alias {
+                                return Err(rpc_err(
+                                    INVALID_PARAMS,
+                                    "ACP session belongs to a different agent",
+                                ));
+                            }
+                            message_count = conversation_message_entries(&data.messages).len();
+                            seed_event = agent.seed_conversation_history_with_event(data.messages);
+                            // Restore the durable TodoWrite plan into the fresh
+                            // in-memory session and re-emit it so the resuming /
+                            // reconnecting client's tracker repopulates without a
+                            // model round-trip. Robust against tmux detach, socket
+                            // drop, suspend/resume, and daemon restart.
+                            if let Some(ref store) = self.ctx.acp_session_store {
+                                let store = store.clone();
+                                let sid = session_id.clone();
+                                plan = tokio::task::spawn_blocking(move || {
+                                    store.get_plan(&sid).unwrap_or_default()
+                                })
+                                .await
+                                .unwrap_or_default();
+                            }
+                        }
+                        Ok(Ok(AcpSessionNewLoad::Created)) => {}
+                        Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+                        }
+                        Ok(Err(e)) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "session_id": session_id,
+                                    "error": e.to_string(),
+                                })),
+                                "Failed to load or create ACP session"
+                            );
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("Failed to load or create ACP session: {e}"),
+                            ));
+                        }
+                        Err(join) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "session_id": session_id,
+                                    "error": join.to_string(),
+                                })),
+                                "ACP session load task failed"
+                            );
+                            return Err(rpc_err(
+                                INTERNAL_ERROR,
+                                format!("ACP session load task failed: {join}"),
+                            ));
+                        }
+                    }
                 }
-            })?;
+                crate::rpc::types::ChatMode::Chat => {
+                    if let Some(ref backend) = self.ctx.session_backend {
+                        let session_key = format!("rpc_{session_id}");
+                        let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
+                        let stored = backend.load(&session_key);
+                        if !stored.is_empty() {
+                            seed_event = agent.seed_history_with_event(&stored);
+                            message_count = stored.len();
+                        }
+                    }
+                }
+            }
+
+            Ok::<_, JsonRpcError>((message_count, seed_event, plan))
+        }
+        .await;
+        let (message_count, seed_event, plan) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if unpublished.is_none() {
+                    if let Some(ref hooks) = self.ctx.hooks {
+                        hooks.fire_session_end(&session_id, "rpc").await;
+                    }
+                    self.ctx.sessions.remove(&session_id).await;
+                }
+                return Err(error);
+            }
+        };
+
+        let plan_notification = plan_replay_notification(&session_id, &plan);
+        if let Some(mut candidate) = unpublished {
+            candidate.plan = plan;
+            self.ctx
+                .sessions
+                .publish_prepared(session_id.clone(), candidate, expected_generation)
+                .await
+                .map_err(|message| rpc_err(SESSION_BUSY, message))?;
+        } else {
+            self.ctx.sessions.set_plan(&session_id, plan).await;
+        }
+        self.forward_seed_event(&session_id, seed_event).await;
+        if let Some(notification) = plan_notification {
+            let _ = self.rpc.send_raw(notification).await;
+        }
 
         if let Some(ref tui_id) = self.tui_id
             && req.keep_siblings != Some(true)
@@ -1815,159 +1985,6 @@ impl RpcDispatcher {
                         })),
                     "Trimmed glibc arenas after same-mode session eviction"
                 );
-            }
-        }
-
-        enum AcpSessionNewLoad {
-            Restored(zeroclaw_infra::acp_session_store::AcpSessionData),
-            Created,
-            Killed,
-        }
-
-        let mut message_count = 0;
-        match chat_mode {
-            crate::rpc::types::ChatMode::Acp => {
-                // Reuse the data already loaded for cwd recovery on resume so the
-                // store isn't hit twice; otherwise fall through to the restore-
-                // aware load-or-create path below.
-                let loaded = if let Some(data) = preloaded_acp.take() {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data)))
-                } else {
-                    let Some(ref store) = self.ctx.acp_session_store else {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            "ACP session store is not available",
-                        ));
-                    };
-
-                    let store_cloned = store.clone();
-                    let sid = session_id.clone();
-                    let alias = req.agent_alias.clone();
-                    let cwd_owned = cwd.clone();
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<AcpSessionNewLoad> {
-                        match store_cloned.load_session_for_restore(&sid)? {
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(
-                                data,
-                            ) => Ok(AcpSessionNewLoad::Restored(data)),
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Missing => {
-                                store_cloned.create_session_with_interaction_surface(
-                                    &sid,
-                                    &alias,
-                                    &cwd_owned,
-                                    resolved_interaction_surface.map(|surface| surface.as_str()),
-                                )?;
-                                Ok(AcpSessionNewLoad::Created)
-                            }
-                            zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed => {
-                                Ok(AcpSessionNewLoad::Killed)
-                            }
-                        }
-                    })
-                    .await
-                };
-                match loaded {
-                    Ok(Ok(AcpSessionNewLoad::Restored(data))) => {
-                        if data.agent_alias != req.agent_alias {
-                            if let Some(ref hooks) = self.ctx.hooks {
-                                hooks.fire_session_end(&session_id, "rpc").await;
-                            }
-                            self.ctx.sessions.remove(&session_id).await;
-                            return Err(rpc_err(
-                                INVALID_PARAMS,
-                                "ACP session belongs to a different agent",
-                            ));
-                        }
-                        message_count = conversation_message_entries(&data.messages).len();
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_conversation_history_with_event(&session_id, data.messages)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        // Restore the durable TodoWrite plan into the fresh
-                        // in-memory session and re-emit it so the resuming /
-                        // reconnecting client's tracker repopulates without a
-                        // model round-trip. Robust against tmux detach, socket
-                        // drop, suspend/resume, and daemon restart.
-                        if let Some(ref store) = self.ctx.acp_session_store {
-                            let store = store.clone();
-                            let sid = session_id.clone();
-                            let plan = tokio::task::spawn_blocking(move || {
-                                store.get_plan(&sid).unwrap_or_default()
-                            })
-                            .await
-                            .unwrap_or_default();
-                            if !plan.is_empty() {
-                                self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
-                            }
-                        }
-                    }
-                    Ok(Ok(AcpSessionNewLoad::Created)) => {}
-                    Ok(Ok(AcpSessionNewLoad::Killed)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
-                    }
-                    Ok(Err(e)) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": e.to_string()})),
-                            "Failed to load or create ACP session"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("Failed to load or create ACP session: {e}"),
-                        ));
-                    }
-                    Err(join) => {
-                        if let Some(ref hooks) = self.ctx.hooks {
-                            hooks.fire_session_end(&session_id, "rpc").await;
-                        }
-                        self.ctx.sessions.remove(&session_id).await;
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"session_id": session_id, "error": join.to_string()})),
-                            "ACP session load task failed"
-                        );
-                        return Err(rpc_err(
-                            INTERNAL_ERROR,
-                            format!("ACP session load task failed: {join}"),
-                        ));
-                    }
-                }
-            }
-            crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend {
-                    let session_key = format!("rpc_{session_id}");
-                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    let stored = backend.load(&session_key);
-                    if !stored.is_empty() {
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_history_with_event(&session_id, &stored)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
-                        message_count = stored.len();
-                    }
-                }
             }
         }
 
@@ -9717,6 +9734,294 @@ mod tests {
             assert_eq!(running["turn_id"], generation.to_string());
             sessions.remove_cancel_token(session_id, generation);
             assert_eq!(read_state().await["state"], "idle");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_construction_failure_preserves_both_modes() {
+        for (original_mode, target_mode) in [("chat", "acp"), ("acp", "chat")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let (dispatcher, sessions, chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, tmp.path());
+            let sid = "failed-mode-replacement";
+            let original_params = json!({
+                "agent_alias": "test-agent", "chat_mode": original_mode,
+                "session_id": sid, "keep_siblings": true,
+            });
+            dispatcher
+                .handle_session_new(&original_params)
+                .await
+                .unwrap();
+            let original = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            let history = vec![ChatMessage::assistant("retained live history")];
+            sessions.seed_history(sid, &history).await;
+            let original_history = original.lock().await.history().to_vec();
+            chat_backend
+                .append(
+                    &format!("rpc_{sid}"),
+                    &ChatMessage::assistant("durable Chat history"),
+                )
+                .unwrap();
+            if original_mode == "chat" {
+                acp_store
+                    .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+                    .unwrap();
+            }
+            acp_store
+                .append_turn(
+                    sid,
+                    &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                        ChatMessage::assistant("durable ACP history"),
+                    )],
+                )
+                .unwrap();
+            let chat_before = chat_backend.load(&format!("rpc_{sid}"));
+            let acp_before = acp_store.load_session(sid).unwrap();
+
+            dispatcher
+                .ctx
+                .config
+                .write()
+                .agents
+                .get_mut("test-agent")
+                .unwrap()
+                .model_provider = "openai.missing-profile".into();
+            let failure = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": target_mode,
+                    "session_id": sid,
+                }))
+                .await
+                .unwrap_err();
+            assert!(failure.message.contains("Failed to create agent"));
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent(sid).await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation(sid).await, Some(generation));
+            assert_eq!(
+                serde_json::to_value(original.lock().await.history()).unwrap(),
+                serde_json::to_value(&original_history).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(chat_backend.load(&format!("rpc_{sid}"))).unwrap(),
+                serde_json::to_value(chat_before).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    acp_store
+                        .load_session(sid)
+                        .unwrap()
+                        .map(|data| data.messages)
+                )
+                .unwrap(),
+                serde_json::to_value(acp_before.map(|data| data.messages)).unwrap()
+            );
+            dispatcher
+                .handle_session_new(&original_params)
+                .await
+                .unwrap();
+            assert_eq!(sessions.get_generation(sid).await, Some(generation));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_store_failure_preserves_usable_original() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(Arc::clone(&dispatcher.ctx), tx, "test-peer".into());
+        let sid = "late-failed-mode-replacement";
+        let mut agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(DummyModelProvider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.seed_history(&[ChatMessage::assistant("original conversation")]);
+        sessions
+            .insert(
+                sid.into(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "test-agent",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+        let original = sessions.get_agent(sid).await.unwrap();
+        let generation = sessions.get_generation(sid).await;
+        let before = serde_json::to_value(original.lock().await.history()).unwrap();
+
+        // The candidate Agent builds successfully, then ACP store lookup fails.
+        let error = dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "chat_mode": "acp", "session_id": sid,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.message, "ACP session store is not available");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+        assert_eq!(sessions.get_generation(sid).await, generation);
+        assert_eq!(
+            sessions.chat_mode(sid).await,
+            Some(crate::rpc::types::ChatMode::Chat)
+        );
+        assert_eq!(
+            serde_json::to_value(original.lock().await.history()).unwrap(),
+            before
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failure must not emit replacement notifications"
+        );
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid, "prompt": "continue original conversation",
+            }))
+            .await
+            .expect("the original Agent must still serve the next turn");
+        assert_eq!(result["content"], "ok");
+        assert!(Arc::ptr_eq(
+            &original,
+            &sessions.get_agent(sid).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_preserves_fresh_capacity_rejection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(
+            1,
+            Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+                4, 10, 60,
+            )),
+        ));
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend.clone()),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher
+            .handle_session_new(&json!({
+                "agent_alias": "test-agent", "session_id": "occupant", "chat_mode": "chat",
+            }))
+            .await
+            .unwrap();
+        let original = sessions.get_agent("occupant").await.unwrap();
+        let generation = sessions.get_generation("occupant").await;
+        for mode in ["chat", "acp"] {
+            let sid = format!("rejected-{mode}");
+            let error = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "session_id": sid, "chat_mode": mode,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, SESSION_LIMIT_REACHED);
+            assert!(sessions.get_agent(&sid).await.is_none());
+            assert!(acp_store.load_session(&sid).unwrap().is_none());
+            assert!(
+                !chat_backend
+                    .list_sessions_with_metadata()
+                    .iter()
+                    .any(|row| row.key == format!("rpc_{sid}"))
+            );
+            assert!(Arc::ptr_eq(
+                &original,
+                &sessions.get_agent("occupant").await.unwrap()
+            ));
+            assert_eq!(sessions.get_generation("occupant").await, generation);
+            let error = dispatcher
+                .handle_session_prompt(&json!({
+                    "session_id": sid, "prompt": "must not rehydrate",
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, SESSION_NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mode_replacement_success_restores_target_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+        let sid = "successful-mode-replacement";
+        acp_store
+            .create_session(sid, "test-agent", tmp.path().to_str().unwrap())
+            .unwrap();
+        acp_store
+            .append_turn(
+                sid,
+                &[zeroclaw_api::model_provider::ConversationMessage::Chat(
+                    ChatMessage::assistant("ACP history"),
+                )],
+            )
+            .unwrap();
+        let plan = vec![zeroclaw_api::plan::PlanEntry {
+            content: "Retained ACP plan".into(),
+            status: zeroclaw_api::plan::PlanStatus::InProgress,
+            priority: zeroclaw_api::plan::PlanPriority::High,
+            active_form: None,
+        }];
+        acp_store.set_plan(sid, &plan).unwrap();
+        chat_backend
+            .append(
+                &format!("rpc_{sid}"),
+                &ChatMessage::assistant("Chat history"),
+            )
+            .unwrap();
+        let mut previous = None;
+        for (mode, expected_history) in [
+            ("chat", "Chat history"),
+            ("acp", "ACP history"),
+            ("chat", "Chat history"),
+        ] {
+            let result = dispatcher
+                .handle_session_new(&json!({
+                    "agent_alias": "test-agent", "chat_mode": mode, "session_id": sid,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result["message_count"], 1);
+            let current = sessions.get_agent(sid).await.unwrap();
+            let generation = sessions.get_generation(sid).await.unwrap();
+            if let Some((old_agent, old_generation)) = previous.take() {
+                assert!(!Arc::ptr_eq(&old_agent, &current));
+                assert_eq!(generation, old_generation + 1);
+            }
+            assert!(current.lock().await.history().iter().any(|message| matches!(message,
+                zeroclaw_api::model_provider::ConversationMessage::Chat(chat) if chat.content == expected_history)));
+            assert_eq!(
+                sessions.get_plan(sid).await.unwrap().len(),
+                usize::from(mode == "acp")
+            );
+            assert_eq!(sessions.count().await, 1);
+            previous = Some((current, generation));
         }
     }
 
