@@ -3872,7 +3872,7 @@ mod tests {
         // 64 MiB per-image admission check without entering the decoder.
         let bytes = jpeg_sof_header(6000, 6000, &[(1, 1)]);
         let auxiliary = jpeg_auxiliary_allocation(&bytes, 6000, 6000).unwrap();
-        let projected = 6000u64 * 6000 * 1 + auxiliary;
+        let projected = 6000u64 * 6000 + auxiliary;
         assert!(projected > MAX_DECODED_IMAGE_ALLOC_BYTES);
         assert!(per_image_cap_refusal("large.jpg", "image/jpeg", projected).is_some());
     }
