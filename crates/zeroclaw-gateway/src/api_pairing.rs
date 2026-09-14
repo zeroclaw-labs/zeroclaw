@@ -3,7 +3,7 @@
 use super::AppState;
 use axum::{
     extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use chrono::{DateTime, Utc};
@@ -328,22 +328,7 @@ impl PairingStore {
     }
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
-}
-
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
-    if state.pairing.require_pairing() {
-        let token = extract_bearer(headers).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return Err((StatusCode::UNAUTHORIZED, "Unauthorized"));
-        }
-    }
-    Ok(())
-}
+use crate::api::{extract_bearer_token, require_auth};
 
 /// POST /api/pairing/initiate — initiate a new pairing session
 pub async fn initiate_pairing(
@@ -613,7 +598,7 @@ pub async fn update_my_capabilities(
         return e.into_response();
     }
 
-    let token = match extract_bearer(&headers) {
+    let token = match extract_bearer_token(&headers) {
         Some(t) => t,
         None => return (StatusCode::UNAUTHORIZED, "Missing bearer token").into_response(),
     };

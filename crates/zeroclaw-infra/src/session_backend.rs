@@ -31,6 +31,10 @@ pub struct SessionMetadata {
     /// Inbound sender id verbatim (Discord username, phone number, ...).
     /// Not an FK — sessions can survive deletion of the upstream user.
     pub sender_id: Option<String>,
+    /// Stable id of the authenticated principal that created the session
+    /// (RFC 7141). `None` for sessions persisted before principal-keying
+    /// landed, channel-originated sessions, or backends without the column.
+    pub principal_id: Option<String>,
 }
 
 /// Structured routing context recorded alongside a session. Mirrors the
@@ -119,6 +123,7 @@ pub trait SessionBackend: Send + Sync {
                     channel_id: None,
                     room_id: None,
                     sender_id: None,
+                    principal_id: None,
                 }
             })
             .collect()
@@ -217,7 +222,32 @@ pub trait SessionBackend: Send + Sync {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            principal_id: None,
         })
+    }
+
+    /// Record the authenticated principal that owns a session (RFC 7141).
+    /// Called at `session/new` when the dispatcher has a real (non-sentinel)
+    /// principal bound. No-op for backends without the column.
+    fn set_session_principal(
+        &self,
+        _session_key: &str,
+        _principal_id: &str,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Delete a session ONLY if `owner_principal_id` matches the stored
+    /// owner: the ownership check and the destruction of the ownership row
+    /// are one SQL statement (the RFC 7141 atomic storage predicate), so a
+    /// concurrent re-stamp cannot race them apart. Backends without
+    /// ownership support fail closed: `Ok(false)`, nothing deleted.
+    fn delete_session_owned(
+        &self,
+        _session_key: &str,
+        _owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
     }
 
     /// Set the session state (e.g. "idle", "running", "error").
@@ -274,6 +304,7 @@ mod tests {
             channel_id: None,
             room_id: None,
             sender_id: None,
+            principal_id: None,
         };
         assert_eq!(meta.key, "test");
         assert_eq!(meta.message_count, 5);
