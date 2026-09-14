@@ -23855,6 +23855,18 @@ impl Config {
         Ok(())
     }
 
+    /// True when `error` is an empty agent required field that staged repair is
+    /// expected to leave behind, rather than a complaint about the value just
+    /// written to `edited_path`.
+    ///
+    /// Two shapes qualify. The complementary field of the agent being edited:
+    /// an agent completed field-by-field is invalid between writes. And any
+    /// required field of a *different* agent: `validate()` walks agents in
+    /// sorted alias order and stops at its first error, so an unrelated staged
+    /// agent must not block this one from being repaired.
+    ///
+    /// The edited field itself never qualifies -- if the value just written is
+    /// the empty one, that is this write's own error.
     fn is_complementary_required_agent_field(
         edited_path: &str,
         error: &crate::api_error::ConfigApiError,
@@ -23874,7 +23886,10 @@ impl Config {
             return false;
         };
 
-        edited_agent == error_agent && edited_field != error_field
+        if edited_agent != error_agent {
+            return true;
+        }
+        edited_field != error_field
     }
 
     fn agent_required_field(path: &str) -> Option<(&str, &str)> {
@@ -23918,30 +23933,46 @@ impl Config {
         Ok(())
     }
 
-    /// Clones `self` with the *other* required fields of `edited_path`'s agent
-    /// filled with placeholders that satisfy their existence checks.
+    /// Clones `self` with every empty agent required field filled with a
+    /// placeholder that satisfies its existence check, except the field named by
+    /// `edited_path`.
     ///
-    /// Staged repair means the agent is legitimately incomplete, so
-    /// `validate()` keeps reporting the empty complementary field and never
-    /// reaches the checks that would judge the value just written. Filling the
-    /// complementary fields with references that are known to resolve lets the
-    /// next `validate()` pass move on to those checks. Returns `None` when
-    /// `edited_path` is not an agent required field or no placeholder is
-    /// available, in which case the caller keeps its original decision.
+    /// Staged repair means agents are legitimately incomplete, so `validate()`
+    /// keeps reporting an empty required field and never reaches the checks that
+    /// would judge the value just written. `validate()` also walks agents in
+    /// sorted alias order and stops at its first error, so an unrelated
+    /// incomplete agent can be the one it reports about. Filling every staged
+    /// field except the edited one lets the next `validate()` pass move past all
+    /// of that, leaving only errors that genuinely belong to this write.
+    ///
+    /// The edited field keeps the caller's value so it is the thing under test.
+    /// Returns `None` when `edited_path` is not an agent required field or no
+    /// placeholder is available, in which case the caller keeps its original
+    /// decision.
     fn probe_with_complementary_agent_fields_filled(&self, edited_path: &str) -> Option<Self> {
-        let (agent_alias, edited_field) = Self::agent_required_field(edited_path)?;
-        let agent = self.agents.get(agent_alias)?;
+        let (edited_agent, edited_field) = Self::agent_required_field(edited_path)?;
+        self.agents.get(edited_agent)?;
 
         let mut probe = self.clone();
-        let probe_agent = probe.agents.get_mut(agent_alias)?;
+        let placeholder_provider = self.any_configured_model_provider();
+        let placeholder_risk_profile = self
+            .get_map_keys("risk_profiles")
+            .and_then(|keys| keys.first().cloned());
 
-        if edited_field != "model_provider" && agent.model_provider.trim().is_empty() {
-            let (family, alias) = self.any_configured_model_provider()?;
-            probe_agent.model_provider = format!("{family}.{alias}").into();
-        }
-        if edited_field != "risk_profile" && agent.risk_profile.trim().is_empty() {
-            let alias = self.get_map_keys("risk_profiles")?.first()?.clone();
-            probe_agent.risk_profile = alias.into();
+        for (alias, agent) in probe.agents.iter_mut() {
+            let editing_this_agent = alias == edited_agent;
+
+            if agent.model_provider.trim().is_empty()
+                && !(editing_this_agent && edited_field == "model_provider")
+            {
+                let (family, provider_alias) = placeholder_provider.clone()?;
+                agent.model_provider = format!("{family}.{provider_alias}").into();
+            }
+            if agent.risk_profile.trim().is_empty()
+                && !(editing_this_agent && edited_field == "risk_profile")
+            {
+                agent.risk_profile = placeholder_risk_profile.clone()?.into();
+            }
         }
 
         Some(probe)
@@ -27859,6 +27890,31 @@ enabled = true
             config.agents["worker"].risk_profile, "",
             "a rejected write must not persist a dangling reference"
         );
+    }
+
+    #[test]
+    async fn set_prop_persistent_validated_repairs_agent_despite_other_incomplete_agent() {
+        // Two staged agents, both incomplete. `validate()` walks agents in
+        // sorted alias order and stops at the first error, so "alpha" is the
+        // one it reports about. Repairing "worker" must still be possible: the
+        // staged-repair exception has to recognise that the surfaced error
+        // belongs to a different agent than the one being edited, otherwise an
+        // alphabetically earlier incomplete agent permanently blocks every
+        // later agent from being completed field-by-field.
+        let mut config = staged_agent_repair_config();
+        config
+            .agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+
+        config
+            .set_prop_persistent_validated("agents.worker.model_provider", "openai.primary")
+            .expect("an unrelated incomplete agent must not block repairing this one");
+        assert_eq!(config.agents["worker"].model_provider, "openai.primary");
+
+        config
+            .set_prop_persistent_validated("agents.worker.risk_profile", "standard")
+            .expect("an unrelated incomplete agent must not block repairing this one");
+        assert_eq!(config.agents["worker"].risk_profile, "standard");
     }
 
     #[test]
