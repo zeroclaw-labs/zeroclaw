@@ -315,6 +315,7 @@ mod tests {
 
     fn entry(id: &str, content: &str, score: f64, importance: f64) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: id.into(),
             key: id.into(),
             content: content.into(),
